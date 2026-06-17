@@ -21,7 +21,7 @@ use tokio::process::Command;
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{info, warn};
 
-use crate::events::{AppEvent, EventTx};
+use crate::events::{AppEvent, EventTx, LiveSignal};
 use crate::models::{Container, MonitorWithChannel, Platform, Tool, now_unix};
 use crate::platform::ProcessJob;
 use crate::store::Store;
@@ -165,8 +165,9 @@ impl Supervisor {
     }
 
     /// Consume "monitor is live" signals and start recordings as needed.
-    pub async fn run(self, mut live_rx: mpsc::UnboundedReceiver<i64>) {
-        while let Some(monitor_id) = live_rx.recv().await {
+    pub async fn run(self, mut live_rx: mpsc::UnboundedReceiver<LiveSignal>) {
+        while let Some(signal) = live_rx.recv().await {
+            let monitor_id = signal.monitor_id;
             if self.shutdown.load(Ordering::SeqCst) {
                 continue; // draining: don't start new recordings
             }
@@ -192,7 +193,7 @@ impl Supervisor {
 
             let this = self.clone();
             tokio::spawn(async move {
-                this.record(row).await;
+                this.record(row, signal.went_live_at, signal.approximate).await;
             });
         }
     }
@@ -222,7 +223,7 @@ impl Supervisor {
         }
     }
 
-    async fn record(&self, row: MonitorWithChannel) {
+    async fn record(&self, row: MonitorWithChannel, went_live_at: Option<i64>, approximate: bool) {
         let monitor_id = row.monitor.id;
         let _permit = self.sem.acquire().await.expect("semaphore");
 
@@ -234,7 +235,13 @@ impl Supervisor {
 
         let rec_id = self
             .store
-            .insert_recording(monitor_id, started_at, &plan.final_path.to_string_lossy())
+            .insert_recording(
+                monitor_id,
+                started_at,
+                &plan.final_path.to_string_lossy(),
+                went_live_at,
+                approximate,
+            )
             .unwrap_or(0);
         let _ = self
             .store
@@ -508,6 +515,11 @@ mod tests {
                 last_checked_at: None,
                 last_state: "idle".into(),
             },
+            last_recording_started: None,
+            last_recording_ended: None,
+            last_recording_status: None,
+            last_recording_went_live: None,
+            last_recording_went_live_approx: false,
         }
     }
 

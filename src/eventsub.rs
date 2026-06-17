@@ -29,6 +29,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
+use crate::events::LiveSignal;
 use crate::models::{DetectionMethod, Platform};
 use crate::store::Store;
 
@@ -39,7 +40,7 @@ const IDLE_RETRY: Duration = Duration::from_secs(30);
 
 /// Run the EventSub manager until shutdown. Idles cheaply when there are no
 /// Twitch monitors using the EventSub method.
-pub async fn run(store: Arc<Store>, live_tx: UnboundedSender<i64>, shutdown: Arc<AtomicBool>) {
+pub async fn run(store: Arc<Store>, live_tx: UnboundedSender<LiveSignal>, shutdown: Arc<AtomicBool>) {
     while !shutdown.load(Ordering::SeqCst) {
         match run_session(&store, &live_tx, &shutdown).await {
             Ok(true) => {}                       // session ran; reconnect promptly
@@ -56,7 +57,7 @@ pub async fn run(store: Arc<Store>, live_tx: UnboundedSender<i64>, shutdown: Arc
 /// was nothing to do (no eventsub monitors / missing creds).
 async fn run_session(
     store: &Arc<Store>,
-    live_tx: &UnboundedSender<i64>,
+    live_tx: &UnboundedSender<LiveSignal>,
     shutdown: &Arc<AtomicBool>,
 ) -> Result<bool> {
     // login(lowercased) -> [monitor_id]
@@ -138,7 +139,7 @@ async fn run_session(
 fn handle_message(
     text: &str,
     uid_to_monitors: &HashMap<String, Vec<i64>>,
-    live_tx: &UnboundedSender<i64>,
+    live_tx: &UnboundedSender<LiveSignal>,
 ) -> bool {
     let Ok(v) = serde_json::from_str::<Value>(text) else {
         return false;
@@ -148,11 +149,13 @@ fn handle_message(
         "session_reconnect" => return true,
         "notification" => {
             if v["payload"]["subscription"]["type"].as_str() == Some("stream.online") {
-                if let Some(uid) = v["payload"]["event"]["broadcaster_user_id"].as_str() {
+                let event = &v["payload"]["event"];
+                let went_live = event["started_at"].as_str().and_then(parse_ts);
+                if let Some(uid) = event["broadcaster_user_id"].as_str() {
                     if let Some(mons) = uid_to_monitors.get(uid) {
                         for &mid in mons {
                             info!("eventsub: stream.online -> monitor {mid}");
-                            let _ = live_tx.send(mid);
+                            let _ = live_tx.send(LiveSignal::new(mid, went_live, false));
                         }
                     }
                 }
@@ -391,7 +394,7 @@ async fn reconcile(
     client_id: &str,
     token: &str,
     login_to_monitors: &HashMap<String, Vec<i64>>,
-    live_tx: &UnboundedSender<i64>,
+    live_tx: &UnboundedSender<LiveSignal>,
 ) {
     let logins: Vec<String> = login_to_monitors.keys().cloned().collect();
     for chunk in logins.chunks(100) {
@@ -408,10 +411,11 @@ async fn reconcile(
                 if let Some(arr) = v["data"].as_array() {
                     for s in arr {
                         if s["type"].as_str() == Some("live") {
+                            let went_live = s["started_at"].as_str().and_then(parse_ts);
                             if let Some(login) = s["user_login"].as_str() {
                                 if let Some(mons) = login_to_monitors.get(&login.to_lowercase()) {
                                     for &mid in mons {
-                                        let _ = live_tx.send(mid);
+                                        let _ = live_tx.send(LiveSignal::new(mid, went_live, false));
                                     }
                                 }
                             }
@@ -431,6 +435,11 @@ async fn sleep_cancellable(dur: Duration, shutdown: &Arc<AtomicBool>) {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+}
+
+/// Parse an RFC3339 timestamp (Twitch `started_at`) to unix seconds.
+fn parse_ts(s: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.timestamp())
 }
 
 /// Extract the Twitch login from a channel URL (`twitch.tv/<login>`).

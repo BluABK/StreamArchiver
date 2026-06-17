@@ -290,6 +290,11 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
             last_checked_at: None,
             last_state: "idle".into(),
         },
+        last_recording_started: None,
+        last_recording_ended: None,
+        last_recording_status: None,
+        last_recording_went_live: None,
+        last_recording_went_live_approx: false,
     };
     let plan = downloader::build_plan(&row, models::now_unix());
     println!("plan: {} {:?}", plan.program, plan.args);
@@ -347,9 +352,18 @@ fn run_headless(secs: u64) -> Result<()> {
 /// `--recordings` prints the recent recording log.
 fn run_recordings() -> Result<()> {
     let store = Store::open(&app_paths::db_path()).context("opening data store")?;
-    for (id, monitor_id, status, bytes, path) in store.recent_recordings(50)? {
+    for r in store.recent_recordings(50)? {
+        let went = match r.went_live_at {
+            Some(w) => format!("{}{}", if r.went_live_approx { "~" } else { "" }, w),
+            None => "-".into(),
+        };
+        let lost = match r.went_live_at {
+            Some(w) => format!("{}s", (r.started_at - w).max(0)),
+            None => "-".into(),
+        };
         println!(
-            "rec[{id}] monitor={monitor_id} status={status:<10} bytes={bytes:<10} {path}"
+            "rec[{}] monitor={} status={:<10} bytes={:<9} started={} went_live={} lost={} {}",
+            r.id, r.monitor_id, r.status, r.bytes, r.started_at, went, lost, r.output_path
         );
     }
     Ok(())

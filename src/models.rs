@@ -259,6 +259,13 @@ pub struct Monitor {
 pub struct MonitorWithChannel {
     pub channel: Channel,
     pub monitor: Monitor,
+    /// Latest recording's start/end/status (for the Started/Duration columns).
+    pub last_recording_started: Option<i64>,
+    pub last_recording_ended: Option<i64>,
+    pub last_recording_status: Option<String>,
+    /// Platform-reported (or approximated) go-live time of the latest recording.
+    pub last_recording_went_live: Option<i64>,
+    pub last_recording_went_live_approx: bool,
 }
 
 /// Current unix timestamp in seconds.

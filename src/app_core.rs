@@ -52,7 +52,7 @@ impl AppCore {
 
     /// Spawn background services (poll scheduler + download supervisor).
     pub fn start(&self) {
-        let (live_tx, live_rx) = tokio::sync::mpsc::unbounded_channel::<i64>();
+        let (live_tx, live_rx) = tokio::sync::mpsc::unbounded_channel::<crate::events::LiveSignal>();
 
         // Scheduler: detection -> live signals.
         let store = self.store.clone();

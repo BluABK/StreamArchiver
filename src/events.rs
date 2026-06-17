@@ -34,6 +34,26 @@ pub fn bus() -> (EventTx, EventRx) {
     broadcast::channel(256)
 }
 
+/// A "monitor is live" signal from a detector to the download supervisor.
+#[derive(Clone, Copy, Debug)]
+pub struct LiveSignal {
+    pub monitor_id: i64,
+    /// Platform-reported go-live time (unix seconds), if known.
+    pub went_live_at: Option<i64>,
+    /// True when `went_live_at` is our first-detected time, not platform-reported.
+    pub approximate: bool,
+}
+
+impl LiveSignal {
+    pub fn new(monitor_id: i64, went_live_at: Option<i64>, approximate: bool) -> LiveSignal {
+        LiveSignal {
+            monitor_id,
+            went_live_at,
+            approximate,
+        }
+    }
+}
+
 /// Commands delivered from the tray thread to the UI/app.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UiCommand {

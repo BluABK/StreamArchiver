@@ -18,7 +18,7 @@ use tracing::warn;
 
 use crate::detectors::{DetectContext, DetectItem, DetectOutcome};
 use crate::downloader::ActiveSet;
-use crate::events::{AppEvent, EventTx};
+use crate::events::{AppEvent, EventTx, LiveSignal};
 use crate::models::{DetectionMethod, now_unix};
 
 /// Max concurrent scrape/probe checks per tick.
@@ -36,7 +36,7 @@ enum PerItemMode {
 pub async fn run(
     ctx: Arc<DetectContext>,
     events: EventTx,
-    live_tx: mpsc::UnboundedSender<i64>,
+    live_tx: mpsc::UnboundedSender<LiveSignal>,
     active: ActiveSet,
     shutdown: Arc<AtomicBool>,
 ) {
@@ -49,7 +49,7 @@ pub async fn run(
 async fn tick(
     ctx: &Arc<DetectContext>,
     events: &EventTx,
-    live_tx: &mpsc::UnboundedSender<i64>,
+    live_tx: &mpsc::UnboundedSender<LiveSignal>,
     active: &ActiveSet,
 ) -> u64 {
     let rows = match ctx.store.list_monitors_with_channels() {
@@ -144,9 +144,15 @@ async fn tick(
                 state: new_state.to_string(),
             });
         }
-        // Signal the supervisor to (consider) starting a recording.
+        // Signal the supervisor to (consider) starting a recording. Use the
+        // platform-reported go-live time when available, else approximate it
+        // with our detection time.
         if o.live && !o.error {
-            let _ = live_tx.send(o.monitor_id);
+            let signal = match o.went_live_at {
+                Some(t) => LiveSignal::new(o.monitor_id, Some(t), false),
+                None => LiveSignal::new(o.monitor_id, Some(checked_at), true),
+            };
+            let _ = live_tx.send(signal);
         }
     }
 

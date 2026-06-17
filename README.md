@@ -44,7 +44,15 @@ recordings (finalizing the MKV) before exiting.
 2. **＋Inst** adds another capture *instance* for the same channel — e.g. run both
    `streamlink` and `yt-dlp` on one channel into different folders.
 3. **Settings** → Twitch/YouTube credentials, default output folder, max concurrent
-   downloads, and **start at login** (autostart).
+   downloads, and **start at login** (autostart). Folder fields have a **Browse…**
+   button.
+
+The channel table shows, per monitor: On (enable/disable), Name, Platform (with a
+brand badge), Tool, Detection, poll interval, State, **Went Live** (the platform's
+go-live time — `~`-prefixed when only our first-detected time is known, e.g. for
+scrape), **Started On** (when we began recording), **Lost time** (Started On −
+Went Live, i.e. how much of the stream we missed), **Duration** (live, `HH:MM:SS`),
+and **Added** (when the channel was added).
 
 ### Detection methods
 

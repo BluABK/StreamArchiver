@@ -16,10 +16,22 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 pub struct Store {
     conn: Mutex<Connection>,
+}
+
+/// Row summary for the `--recordings` diagnostic.
+pub struct RecInfo {
+    pub id: i64,
+    pub monitor_id: i64,
+    pub status: String,
+    pub bytes: i64,
+    pub started_at: i64,
+    pub went_live_at: Option<i64>,
+    pub went_live_approx: bool,
+    pub output_path: String,
 }
 
 impl Store {
@@ -115,7 +127,14 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 2)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 2);
+        if version < 3 {
+            conn.execute_batch(
+                "ALTER TABLE recording ADD COLUMN went_live_at INTEGER;
+                 ALTER TABLE recording ADD COLUMN went_live_approx INTEGER NOT NULL DEFAULT 0;",
+            )?;
+            conn.pragma_update(None, "user_version", 3)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 3);
         Ok(())
     }
 
@@ -267,11 +286,19 @@ impl Store {
 
     // ----- recordings -----
 
-    pub fn insert_recording(&self, monitor_id: i64, started_at: i64, output_path: &str) -> Result<i64> {
+    pub fn insert_recording(
+        &self,
+        monitor_id: i64,
+        started_at: i64,
+        output_path: &str,
+        went_live_at: Option<i64>,
+        went_live_approx: bool,
+    ) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO recording(monitor_id, started_at, output_path, status) VALUES(?1, ?2, ?3, 'recording')",
-            params![monitor_id, started_at, output_path],
+            "INSERT INTO recording(monitor_id, started_at, output_path, status, went_live_at, went_live_approx)
+             VALUES(?1, ?2, ?3, 'recording', ?4, ?5)",
+            params![monitor_id, started_at, output_path, went_live_at, went_live_approx as i64],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -314,9 +341,12 @@ impl Store {
                 c.id, c.name, c.url, c.platform, c.created_at,
                 m.id, m.channel_id, m.enabled, m.tool, m.detection_method, m.poll_interval_secs,
                 m.quality, m.output_dir, m.filename_template, m.container, m.capture_from_start,
-                m.extra_args, m.max_concurrent, m.last_checked_at, m.last_state
+                m.extra_args, m.max_concurrent, m.last_checked_at, m.last_state,
+                r.started_at, r.ended_at, r.status, r.went_live_at, r.went_live_approx
              FROM monitor m
              JOIN channel c ON c.id = m.channel_id
+             LEFT JOIN recording r
+                ON r.id = (SELECT id FROM recording r2 WHERE r2.monitor_id = m.id ORDER BY r2.id DESC LIMIT 1)
              ORDER BY c.name COLLATE NOCASE, m.id",
         )?;
         let rows = stmt
@@ -345,22 +375,40 @@ impl Store {
                     last_checked_at: r.get(18)?,
                     last_state: r.get(19)?,
                 };
-                Ok(MonitorWithChannel { channel, monitor })
+                Ok(MonitorWithChannel {
+                    channel,
+                    monitor,
+                    last_recording_started: r.get(20)?,
+                    last_recording_ended: r.get(21)?,
+                    last_recording_status: r.get(22)?,
+                    last_recording_went_live: r.get(23)?,
+                    last_recording_went_live_approx: r.get::<_, Option<i64>>(24)?.unwrap_or(0) != 0,
+                })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
-    /// Recent recordings (id, monitor_id, status, bytes, output_path), newest first.
-    pub fn recent_recordings(&self, limit: i64) -> Result<Vec<(i64, i64, String, i64, String)>> {
+    /// Recent recordings, newest first.
+    pub fn recent_recordings(&self, limit: i64) -> Result<Vec<RecInfo>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, monitor_id, status, bytes, COALESCE(output_path, '')
+            "SELECT id, monitor_id, status, bytes, started_at, went_live_at, went_live_approx,
+                    COALESCE(output_path, '')
              FROM recording ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt
             .query_map(params![limit], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                Ok(RecInfo {
+                    id: r.get(0)?,
+                    monitor_id: r.get(1)?,
+                    status: r.get(2)?,
+                    bytes: r.get(3)?,
+                    started_at: r.get(4)?,
+                    went_live_at: r.get(5)?,
+                    went_live_approx: r.get::<_, i64>(6)? != 0,
+                    output_path: r.get(7)?,
+                })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)

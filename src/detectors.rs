@@ -10,7 +10,7 @@
 //! All methods take/return plain data so the scheduler can batch and dispatch
 //! without trait objects.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -45,6 +45,9 @@ pub struct DetectOutcome {
     pub live: bool,
     pub detail: String,
     pub error: bool,
+    /// Platform-reported go-live time (unix seconds), when the source provides it
+    /// (Twitch Helix). `None` means callers should approximate it.
+    pub went_live_at: Option<i64>,
 }
 
 impl DetectOutcome {
@@ -54,6 +57,13 @@ impl DetectOutcome {
             live: true,
             detail: detail.into(),
             error: false,
+            went_live_at: None,
+        }
+    }
+    fn live_at(monitor_id: i64, detail: impl Into<String>, went_live_at: Option<i64>) -> DetectOutcome {
+        DetectOutcome {
+            went_live_at,
+            ..DetectOutcome::live(monitor_id, detail)
         }
     }
     fn offline(monitor_id: i64) -> DetectOutcome {
@@ -62,6 +72,7 @@ impl DetectOutcome {
             live: false,
             detail: String::new(),
             error: false,
+            went_live_at: None,
         }
     }
     fn err(monitor_id: i64, detail: impl Into<String>) -> DetectOutcome {
@@ -70,8 +81,14 @@ impl DetectOutcome {
             live: false,
             detail: detail.into(),
             error: true,
+            went_live_at: None,
         }
     }
+}
+
+/// Parse an RFC3339/ISO8601 timestamp (e.g. Twitch `started_at`) to unix seconds.
+fn parse_rfc3339(s: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.timestamp())
 }
 
 struct TwitchToken {
@@ -195,17 +212,22 @@ impl DetectContext {
                         user_login: String,
                         #[serde(rename = "type")]
                         kind: String,
+                        started_at: Option<String>,
                     }
                     #[derive(Deserialize)]
                     struct StreamsResp {
                         data: Vec<Stream>,
                     }
-                    let live: HashSet<String> = match r.json::<StreamsResp>().await {
+                    // login -> go-live time (unix), for currently-live channels.
+                    let live: HashMap<String, Option<i64>> = match r.json::<StreamsResp>().await {
                         Ok(sr) => sr
                             .data
                             .into_iter()
                             .filter(|s| s.kind == "live")
-                            .map(|s| s.user_login.to_lowercase())
+                            .map(|s| {
+                                let when = s.started_at.as_deref().and_then(parse_rfc3339);
+                                (s.user_login.to_lowercase(), when)
+                            })
                             .collect(),
                         Err(e) => {
                             for l in chunk {
@@ -217,12 +239,11 @@ impl DetectContext {
                         }
                     };
                     for l in chunk {
-                        let is_live = live.contains(&l.to_lowercase());
+                        let key = l.to_lowercase();
                         for mid in &login_to_mons[l] {
-                            outcomes.push(if is_live {
-                                DetectOutcome::live(*mid, "live")
-                            } else {
-                                DetectOutcome::offline(*mid)
+                            outcomes.push(match live.get(&key) {
+                                Some(went) => DetectOutcome::live_at(*mid, "live", *went),
+                                None => DetectOutcome::offline(*mid),
                             });
                         }
                     }
