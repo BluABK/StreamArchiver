@@ -8,6 +8,7 @@ mod detectors;
 mod downloader;
 mod events;
 mod models;
+mod notifications;
 mod platform;
 mod scheduler;
 mod store;

@@ -246,6 +246,7 @@ impl Supervisor {
         let _ = self.events.send(AppEvent::RecordingStarted {
             monitor_id,
             recording_id: rec_id,
+            channel: row.channel.name.clone(),
         });
         info!(monitor_id, program = %plan.program, "starting recording -> {}", plan.final_path.display());
 
@@ -287,6 +288,7 @@ impl Supervisor {
             .set_monitor_check_result(monitor_id, status, now_unix());
         let _ = self.events.send(AppEvent::RecordingFinished {
             recording_id: rec_id,
+            channel: row.channel.name.clone(),
             status: status.into(),
         });
         info!(monitor_id, bytes, status, "recording finished");

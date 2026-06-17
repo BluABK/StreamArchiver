@@ -83,6 +83,12 @@ impl AppCore {
         self.rt.spawn(async move {
             supervisor.run(live_rx).await;
         });
+
+        // Desktop notifications for recording lifecycle events.
+        let notif_rx = self.events.subscribe();
+        self.rt.spawn(async move {
+            crate::notifications::run(notif_rx).await;
+        });
     }
 
     /// Gracefully stop all recordings: signal shutdown, kill the tool process
