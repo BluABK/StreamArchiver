@@ -223,6 +223,16 @@ impl Store {
         Ok(())
     }
 
+    /// Persist a detection result: last observed state + check timestamp.
+    pub fn set_monitor_check_result(&self, id: i64, state: &str, checked_at: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE monitor SET last_state = ?2, last_checked_at = ?3 WHERE id = ?1",
+            params![id, state, checked_at],
+        )?;
+        Ok(())
+    }
+
     pub fn set_monitor_enabled(&self, id: i64, enabled: bool) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(

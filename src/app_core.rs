@@ -34,4 +34,14 @@ impl AppCore {
     pub fn subscribe(&self) -> crate::events::EventRx {
         self.events.subscribe()
     }
+
+    /// Spawn background services (the poll scheduler) on the async runtime.
+    pub fn start(&self) {
+        let store = self.store.clone();
+        let events = self.events.clone();
+        self.rt.spawn(async move {
+            let ctx = Arc::new(crate::detectors::DetectContext::new(store));
+            crate::scheduler::run(ctx, events).await;
+        });
+    }
 }

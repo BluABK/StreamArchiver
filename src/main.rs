@@ -23,11 +23,25 @@ use tray_icon::TrayIcon;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 
 use app_core::AppCore;
+use detectors::{DetectContext, DetectItem};
 use events::UiCommand;
+use models::Platform;
 use store::Store;
 
 fn main() -> Result<()> {
     init_tracing();
+
+    // Diagnostics that run and exit (also handy for scripting/headless use).
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--probe") {
+        return run_probe(args.get(pos + 1).cloned().unwrap_or_default());
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--add") {
+        return run_add(&args, pos);
+    }
+    if args.iter().any(|a| a == "--list") {
+        return run_list();
+    }
 
     // Single-instance guard: hold the loopback bind for the process lifetime.
     let _instance_guard = match platform::acquire_single_instance() {
@@ -40,6 +54,7 @@ fn main() -> Result<()> {
 
     let store = Store::open(&app_paths::db_path()).context("opening data store")?;
     let core = AppCore::new(Arc::new(store)).context("starting core runtime")?;
+    core.start(); // launch the background poll scheduler
 
     // `--hidden` (used by the autostart entry) launches straight to the tray.
     let start_hidden = std::env::args().any(|a| a == "--hidden");
@@ -129,6 +144,82 @@ fn build_tray(ctx: egui::Context) -> Result<(TrayIcon, Receiver<UiCommand>)> {
     std::mem::forget(quit_item);
 
     Ok((tray, rx))
+}
+
+/// One-shot detection for diagnostics. Uses scrape/probe (no credentials),
+/// except Twitch which falls through to the generic streamlink probe.
+fn run_probe(url: String) -> Result<()> {
+    if url.is_empty() {
+        anyhow::bail!("usage: streamarchiver --probe <url>");
+    }
+    let store = Arc::new(Store::open(&app_paths::db_path()).context("opening data store")?);
+    let rt = tokio::runtime::Runtime::new()?;
+    let ctx = DetectContext::new(store);
+    let platform = Platform::detect(&url);
+    let item = DetectItem {
+        monitor_id: 0,
+        url: url.clone(),
+        platform,
+    };
+    let outcome = rt.block_on(ctx.detect_scrape(&item));
+    println!(
+        "url={url}\nplatform={platform:?}\nlive={}\nerror={}\ndetail={}",
+        outcome.live, outcome.error, outcome.detail
+    );
+    Ok(())
+}
+
+/// `--add <name> <url> [method]` inserts a channel + one monitor.
+fn run_add(args: &[String], pos: usize) -> Result<()> {
+    let name = args.get(pos + 1).cloned().unwrap_or_default();
+    let url = args.get(pos + 2).cloned().unwrap_or_default();
+    if name.is_empty() || url.is_empty() {
+        anyhow::bail!("usage: streamarchiver --add <name> <url> [detection_method]");
+    }
+    let platform = Platform::detect(&url);
+    let method = args
+        .get(pos + 3)
+        .map(|s| models::DetectionMethod::parse(s))
+        .unwrap_or_else(|| platform.default_detection());
+
+    let store = Store::open(&app_paths::db_path()).context("opening data store")?;
+    let channel_id = store.upsert_channel(&name, &url, platform)?;
+    let monitor = models::Monitor {
+        id: 0,
+        channel_id,
+        enabled: true,
+        tool: platform.default_tool(),
+        detection_method: method,
+        poll_interval_secs: 30,
+        quality: "best".into(),
+        output_dir: app_paths::default_output_dir().to_string_lossy().to_string(),
+        filename_template: "{author}_{time}".into(),
+        container: models::Container::Mkv,
+        extra_args: String::new(),
+        max_concurrent: 1,
+        last_checked_at: None,
+        last_state: "idle".into(),
+    };
+    let monitor_id = store.insert_monitor(&monitor)?;
+    println!("added monitor {monitor_id} (channel {channel_id}, {platform:?}, {method:?})");
+    Ok(())
+}
+
+/// `--list` prints all monitors with their current detection state.
+fn run_list() -> Result<()> {
+    let store = Store::open(&app_paths::db_path()).context("opening data store")?;
+    for r in store.list_monitors_with_channels()? {
+        println!(
+            "[{}] {:<20} {:<8} {:<14} state={:<8} checked={:?}",
+            r.monitor.id,
+            r.channel.name,
+            r.channel.platform.as_str(),
+            r.monitor.detection_method.as_str(),
+            r.monitor.last_state,
+            r.monitor.last_checked_at,
+        );
+    }
+    Ok(())
 }
 
 fn init_tracing() {

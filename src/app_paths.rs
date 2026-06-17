@@ -15,7 +15,13 @@ pub fn data_dir() -> PathBuf {
 }
 
 /// Path to the SQLite database. Kept on local disk (WAL requires it).
+///
+/// The `STREAMARCHIVER_DB` environment variable overrides the location (useful
+/// for tests and portable installs).
 pub fn db_path() -> PathBuf {
+    if let Some(p) = std::env::var_os("STREAMARCHIVER_DB") {
+        return PathBuf::from(p);
+    }
     data_dir().join("streamarchiver.sqlite3")
 }
 
