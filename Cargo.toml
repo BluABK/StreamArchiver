@@ -19,6 +19,7 @@ tokio-util = { version = "0.7.18", features = ["time", "codec"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tray-icon = "0.24.1"
+windows = { version = "0.62.2", features = ["Win32_System_JobObjects", "Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }
 
 [profile.release]
 opt-level = "z"

@@ -1,9 +1,545 @@
-//! Download supervisor + per-tool adapters (Phase 3).
+//! Download supervisor + per-tool adapters.
 //!
-//! Will own a bounded concurrency semaphore, spawn streamlink/yt-dlp/ffmpeg via
-//! `tokio::process` with piped stdout/stderr, tail logs, classify completion
-//! (exit + file finalized + stderr patterns), apply exponential backoff, kill
-//! whole process trees (Win32 Job Object), and remux TS -> MKV. Default output
-//! container is MKV; never MP4.
+//! When the scheduler reports a monitor live, the supervisor (bounded by a
+//! global concurrency semaphore) spawns the configured tool as a child process,
+//! captures its stderr into a ring buffer, waits for exit, classifies the
+//! outcome, optionally remuxes TS -> MKV, and records the run in the store. A
+//! Win32 Job Object guarantees the whole process tree is killed on stop/exit.
 //!
-//! Intentionally empty in Phase 1.
+//! Default container is MKV (never MP4): streamlink records to `.ts` then remuxes
+//! losslessly to `.mkv`; yt-dlp merges straight to `.mkv`.
+
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
+use tokio::sync::{Semaphore, mpsc};
+use tracing::{info, warn};
+
+use crate::events::{AppEvent, EventTx};
+use crate::models::{Container, MonitorWithChannel, Platform, Tool, now_unix};
+use crate::platform::ProcessJob;
+use crate::store::Store;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Monitors currently being recorded, mapped to their child PID (0 until the
+/// process has spawned). Shared with the scheduler (so it doesn't re-trigger an
+/// active recording) and used at shutdown to kill the process trees.
+pub type ActiveSet = Arc<Mutex<HashMap<i64, u32>>>;
+
+const RING_MAX_LINES: usize = 80;
+/// A recording that fails faster than this is treated as a transient failure
+/// and subject to backoff.
+const SHORT_RUN_SECS: i64 = 15;
+
+/// The plan for one recording: the command to run plus the files involved.
+#[derive(Debug, Clone)]
+pub struct DownloadPlan {
+    pub program: String,
+    pub args: Vec<String>,
+    /// File the tool writes directly.
+    pub capture_path: PathBuf,
+    /// Final file after any remux (== capture_path when no remux).
+    pub final_path: PathBuf,
+    pub remux_to_mkv: bool,
+}
+
+/// Build the command + file plan for a monitor.
+///
+/// All tools capture to a progressively-flushed `.ts` (so an abrupt
+/// kill/crash leaves usable data) and remux losslessly to `.mkv` on clean
+/// stop. If the user picked the TS container, the `.ts` is kept as-is.
+pub fn build_plan(row: &MonitorWithChannel, started_at: i64) -> DownloadPlan {
+    let m = &row.monitor;
+    let ch = &row.channel;
+    let dir = PathBuf::from(&m.output_dir);
+    let stem = expand_template(&m.filename_template, &ch.name, started_at);
+    let quality = if m.quality.trim().is_empty() {
+        "best".to_string()
+    } else {
+        m.quality.clone()
+    };
+    let extra = split_args(&m.extra_args);
+
+    let ts_path = dir.join(format!("{stem}.ts"));
+    let ts_str = ts_path.to_string_lossy().into_owned();
+    let (final_path, remux_to_mkv) = match m.container {
+        Container::Mkv => (dir.join(format!("{stem}.mkv")), true),
+        Container::Ts => (ts_path.clone(), false),
+    };
+
+    let (program, args) = match m.tool {
+        Tool::Streamlink => {
+            let mut args = Vec::new();
+            if ch.platform == Platform::Twitch {
+                // Reach 1440p/2K (HEVC) enhanced-broadcasting sources.
+                args.push("--twitch-supported-codecs=h264,h265,av1".to_string());
+            }
+            if m.capture_from_start {
+                // Rewind to the start of the DVR window (best-effort on Twitch).
+                args.push("--hls-live-restart".into());
+            }
+            args.push("--retry-streams".into());
+            args.push("3".into());
+            args.push("--retry-max".into());
+            args.push("5".into());
+            args.extend(extra);
+            args.push("-o".into());
+            args.push(ts_str);
+            args.push(ch.url.clone());
+            args.push(quality);
+            ("streamlink".to_string(), args)
+        }
+        Tool::YtDlp => {
+            let mut args = vec![
+                "--no-part".to_string(),
+                "--hls-use-mpegts".into(), // progressive .ts output
+                "-o".into(),
+                ts_str,
+            ];
+            if m.capture_from_start {
+                args.push("--live-from-start".into());
+            } else {
+                args.push("--no-live-from-start".into());
+            }
+            args.extend(extra);
+            args.push(ch.url.clone());
+            ("yt-dlp".to_string(), args)
+        }
+        Tool::Ffmpeg => {
+            let mut args = vec!["-y".to_string(), "-i".into(), ch.url.clone(), "-c".into(), "copy".into()];
+            args.extend(extra);
+            args.push(ts_str);
+            ("ffmpeg".to_string(), args)
+        }
+    };
+
+    DownloadPlan {
+        program,
+        args,
+        capture_path: ts_path,
+        final_path,
+        remux_to_mkv,
+    }
+}
+
+#[derive(Clone)]
+pub struct Supervisor {
+    store: Arc<Store>,
+    events: EventTx,
+    active: ActiveSet,
+    sem: Arc<Semaphore>,
+    backoff: Arc<Mutex<HashMap<i64, BackoffEntry>>>,
+}
+
+#[derive(Clone, Copy)]
+struct BackoffEntry {
+    fails: u32,
+    until: Instant,
+}
+
+impl Supervisor {
+    pub fn new(
+        store: Arc<Store>,
+        events: EventTx,
+        active: ActiveSet,
+        max_concurrent: usize,
+    ) -> Supervisor {
+        Supervisor {
+            store,
+            events,
+            active,
+            sem: Arc::new(Semaphore::new(max_concurrent.max(1))),
+            backoff: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Consume "monitor is live" signals and start recordings as needed.
+    pub async fn run(self, mut live_rx: mpsc::UnboundedReceiver<i64>) {
+        while let Some(monitor_id) = live_rx.recv().await {
+            // Dedup against active recordings and honor backoff.
+            {
+                let mut active = self.active.lock().unwrap();
+                if active.contains_key(&monitor_id) {
+                    continue;
+                }
+                if self.in_backoff(monitor_id) {
+                    continue;
+                }
+                active.insert(monitor_id, 0); // reserve; real PID set after spawn
+            }
+
+            let row = match self.store.get_monitor_with_channel(monitor_id) {
+                Ok(Some(r)) => r,
+                _ => {
+                    self.active.lock().unwrap().remove(&monitor_id);
+                    continue;
+                }
+            };
+
+            let this = self.clone();
+            tokio::spawn(async move {
+                this.record(row).await;
+            });
+        }
+    }
+
+    fn in_backoff(&self, monitor_id: i64) -> bool {
+        self.backoff
+            .lock()
+            .unwrap()
+            .get(&monitor_id)
+            .map(|b| Instant::now() < b.until)
+            .unwrap_or(false)
+    }
+
+    fn note_result(&self, monitor_id: i64, duration_secs: i64, ok: bool) {
+        let mut map = self.backoff.lock().unwrap();
+        if ok || duration_secs >= SHORT_RUN_SECS {
+            map.remove(&monitor_id);
+        } else {
+            let entry = map.entry(monitor_id).or_insert(BackoffEntry {
+                fails: 0,
+                until: Instant::now(),
+            });
+            entry.fails = entry.fails.saturating_add(1);
+            let wait = (30u64 * entry.fails as u64).min(600);
+            entry.until = Instant::now() + Duration::from_secs(wait);
+            warn!(monitor_id, fails = entry.fails, wait, "recording failed quickly; backing off");
+        }
+    }
+
+    async fn record(&self, row: MonitorWithChannel) {
+        let monitor_id = row.monitor.id;
+        let _permit = self.sem.acquire().await.expect("semaphore");
+
+        let started_at = now_unix();
+        let plan = build_plan(&row, started_at);
+        if let Some(parent) = plan.capture_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+
+        let rec_id = self
+            .store
+            .insert_recording(monitor_id, started_at, &plan.final_path.to_string_lossy())
+            .unwrap_or(0);
+        let _ = self
+            .store
+            .set_monitor_check_result(monitor_id, "recording", started_at);
+        let _ = self.events.send(AppEvent::MonitorState {
+            monitor_id,
+            state: "recording".into(),
+        });
+        let _ = self.events.send(AppEvent::RecordingStarted {
+            monitor_id,
+            recording_id: rec_id,
+        });
+        info!(monitor_id, program = %plan.program, "starting recording -> {}", plan.final_path.display());
+
+        let outcome = self.run_process(monitor_id, &plan).await;
+
+        // Remux TS -> MKV if requested and we captured something.
+        let mut final_path = plan.final_path.clone();
+        if plan.remux_to_mkv {
+            if file_len(&plan.capture_path).await > 0 {
+                match remux_ts_to_mkv(&plan.capture_path, &plan.final_path).await {
+                    Ok(()) => {
+                        let _ = tokio::fs::remove_file(&plan.capture_path).await;
+                    }
+                    Err(e) => {
+                        warn!(monitor_id, "remux failed, keeping .ts: {e:#}");
+                        final_path = plan.capture_path.clone();
+                    }
+                }
+            } else {
+                final_path = plan.capture_path.clone();
+            }
+        }
+
+        let bytes = file_len(&final_path).await as i64;
+        let duration = now_unix() - started_at;
+        let ok = bytes > 0;
+        let status = if ok { "completed" } else { "failed" };
+        let _ = self.store.finish_recording(
+            rec_id,
+            now_unix(),
+            bytes,
+            outcome.exit_code,
+            status,
+            &final_path.to_string_lossy(),
+            &outcome.log,
+        );
+        let _ = self
+            .store
+            .set_monitor_check_result(monitor_id, status, now_unix());
+        let _ = self.events.send(AppEvent::RecordingFinished {
+            recording_id: rec_id,
+            status: status.into(),
+        });
+        info!(monitor_id, bytes, status, "recording finished");
+
+        self.note_result(monitor_id, duration, ok);
+        self.active.lock().unwrap().remove(&monitor_id);
+    }
+
+    async fn run_process(&self, monitor_id: i64, plan: &DownloadPlan) -> ProcessOutcome {
+        let job = match ProcessJob::new() {
+            Ok(j) => Some(j),
+            Err(e) => {
+                warn!("job object create failed: {e:#}");
+                None
+            }
+        };
+        let mut cmd = Command::new(&plan.program);
+        cmd.args(&plan.args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                return ProcessOutcome {
+                    exit_code: None,
+                    log: format!("failed to spawn {}: {e}", plan.program),
+                };
+            }
+        };
+        if let Some(j) = &job {
+            if let Err(e) = j.assign_child(&child) {
+                warn!("job assign failed: {e:#}");
+            }
+        }
+        // Register the real PID so the scheduler skips this monitor and shutdown
+        // can kill the whole process tree.
+        if let Some(pid) = child.id() {
+            self.active.lock().unwrap().insert(monitor_id, pid);
+        }
+
+        let ring: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+        if let Some(stderr) = child.stderr.take() {
+            let ring = ring.clone();
+            let program = plan.program.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::trace!(target: "streamarchiver::recproc", "[{program}] {line}");
+                    let mut r = ring.lock().unwrap();
+                    if r.len() >= RING_MAX_LINES {
+                        r.pop_front();
+                    }
+                    r.push_back(line);
+                }
+            });
+        }
+
+        let status = child.wait().await;
+        // Closing the job here terminates any stragglers (e.g. yt-dlp's ffmpeg).
+        if let Some(j) = &job {
+            j.kill();
+        }
+        drop(job);
+
+        let exit_code = status.ok().and_then(|s| s.code()).map(|c| c as i64);
+        let log = {
+            let r = ring.lock().unwrap();
+            r.iter().cloned().collect::<Vec<_>>().join("\n")
+        };
+        ProcessOutcome { exit_code, log }
+    }
+}
+
+struct ProcessOutcome {
+    exit_code: Option<i64>,
+    log: String,
+}
+
+pub async fn remux_ts_to_mkv(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-y")
+        .arg("-i")
+        .arg(src)
+        .arg("-c")
+        .arg("copy")
+        .arg(dst)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let status = cmd.status().await?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("ffmpeg remux exited with {:?}", status.code())
+    }
+}
+
+async fn file_len(path: &Path) -> u64 {
+    tokio::fs::metadata(path).await.map(|m| m.len()).unwrap_or(0)
+}
+
+/// Minimal whitespace arg splitter (double-quoted segments kept together).
+fn split_args(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    for c in s.chars() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            c if c.is_whitespace() && !in_quotes => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Expand a filename template using our own (tool-agnostic) variables so the
+/// output path is known in advance: `{name} {date} {time} {timestamp}`.
+fn expand_template(template: &str, channel_name: &str, secs: i64) -> String {
+    let (y, mo, d, h, mi, s) = civil_from_unix_utc(secs);
+    let date = format!("{y:04}{mo:02}{d:02}");
+    let time = format!("{h:02}{mi:02}{s:02}");
+    let tmpl = if template.trim().is_empty() {
+        "{name}_{date}_{time}"
+    } else {
+        template
+    };
+    let expanded = tmpl
+        .replace("{name}", channel_name)
+        .replace("{date}", &date)
+        .replace("{time}", &time)
+        .replace("{timestamp}", &secs.to_string());
+    let cleaned = sanitize_filename(&expanded);
+    if cleaned.is_empty() {
+        format!("{}_{date}_{time}", sanitize_filename(channel_name))
+    } else {
+        cleaned
+    }
+}
+
+fn sanitize_filename(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if "<>:\"/\\|?*".contains(c) || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Convert a unix timestamp to a UTC civil date/time (Howard Hinnant's algorithm).
+fn civil_from_unix_utc(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (hh, mm, ss) = ((rem / 3600) as u32, ((rem % 3600) / 60) as u32, (rem % 60) as u32);
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let year = if month <= 2 { y + 1 } else { y };
+    (year, month, day, hh, mm, ss)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{Channel, Container, DetectionMethod, Monitor, Tool};
+
+    fn row(tool: Tool, container: Container, platform: Platform) -> MonitorWithChannel {
+        MonitorWithChannel {
+            channel: Channel {
+                id: 1,
+                name: "Cool Streamer".into(),
+                url: "https://twitch.tv/cool".into(),
+                platform,
+                created_at: 0,
+            },
+            monitor: Monitor {
+                id: 7,
+                channel_id: 1,
+                enabled: true,
+                tool,
+                detection_method: DetectionMethod::TwitchApi,
+                poll_interval_secs: 60,
+                quality: "best".into(),
+                output_dir: "C:/rec".into(),
+                filename_template: "{name}_{date}_{time}".into(),
+                container,
+                capture_from_start: true,
+                extra_args: String::new(),
+                max_concurrent: 1,
+                last_checked_at: None,
+                last_state: "idle".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn civil_date_known_value() {
+        // 1700000000 = 2023-11-14 22:13:20 UTC
+        assert_eq!(civil_from_unix_utc(1_700_000_000), (2023, 11, 14, 22, 13, 20));
+    }
+
+    #[test]
+    fn template_expands_and_sanitizes() {
+        let name = expand_template("{name}_{date}", "Bad/Name?", 1_700_000_000);
+        assert_eq!(name, "Bad_Name__20231114");
+    }
+
+    #[test]
+    fn streamlink_mkv_records_ts_then_remuxes() {
+        let plan = build_plan(&row(Tool::Streamlink, Container::Mkv, Platform::Twitch), 1_700_000_000);
+        assert_eq!(plan.program, "streamlink");
+        assert!(plan.capture_path.to_string_lossy().ends_with(".ts"));
+        assert!(plan.final_path.to_string_lossy().ends_with(".mkv"));
+        assert!(plan.remux_to_mkv);
+        assert!(plan.args.iter().any(|a| a.contains("twitch-supported-codecs")));
+        assert!(plan.args.iter().any(|a| a == "best"));
+    }
+
+    #[test]
+    fn ytdlp_mkv_records_ts_then_remuxes() {
+        let plan = build_plan(&row(Tool::YtDlp, Container::Mkv, Platform::YouTube), 1_700_000_000);
+        assert_eq!(plan.program, "yt-dlp");
+        assert!(plan.capture_path.to_string_lossy().ends_with(".ts"));
+        assert!(plan.final_path.to_string_lossy().ends_with(".mkv"));
+        assert!(plan.remux_to_mkv);
+        assert!(plan.args.iter().any(|a| a == "--live-from-start"));
+        assert!(plan.args.iter().any(|a| a == "--hls-use-mpegts"));
+    }
+
+    #[test]
+    fn streamlink_ts_keeps_ts() {
+        let plan = build_plan(&row(Tool::Streamlink, Container::Ts, Platform::Twitch), 1_700_000_000);
+        assert!(plan.final_path.to_string_lossy().ends_with(".ts"));
+        assert!(!plan.remux_to_mkv);
+    }
+}

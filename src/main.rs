@@ -42,6 +42,12 @@ fn main() -> Result<()> {
     if args.iter().any(|a| a == "--list") {
         return run_list();
     }
+    if args.iter().any(|a| a == "--recordings") {
+        return run_recordings();
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--capture-test") {
+        return run_capture_test(&args, pos);
+    }
 
     // Single-instance guard: hold the loopback bind for the process lifetime.
     let _instance_guard = match platform::acquire_single_instance() {
@@ -53,8 +59,14 @@ fn main() -> Result<()> {
     };
 
     let store = Store::open(&app_paths::db_path()).context("opening data store")?;
+    // Crash recovery: any recording left mid-flight by a previous run is stale.
+    match store.mark_orphaned_recordings(models::now_unix()) {
+        Ok(n) if n > 0 => info!("marked {n} orphaned recording(s) from a previous run"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("orphan recovery failed: {e:#}"),
+    }
     let core = AppCore::new(Arc::new(store)).context("starting core runtime")?;
-    core.start(); // launch the background poll scheduler
+    core.start(); // launch the background scheduler + download supervisor
 
     // `--hidden` (used by the autostart entry) launches straight to the tray.
     let start_hidden = std::env::args().any(|a| a == "--hidden");
@@ -90,6 +102,11 @@ fn main() -> Result<()> {
         }),
     )
     .map_err(|e| anyhow::anyhow!("eframe failed: {e}"))?;
+
+    // The UI loop has exited (Quit) — tear down any active recording trees so we
+    // don't orphan streamlink/yt-dlp/ffmpeg processes.
+    info!("shutting down; stopping active recordings");
+    core.stop_all_recordings();
 
     Ok(())
 }
@@ -169,18 +186,25 @@ fn run_probe(url: String) -> Result<()> {
     Ok(())
 }
 
-/// `--add <name> <url> [method]` inserts a channel + one monitor.
+/// `--add <name> <url> [method] [tool]` inserts a channel + one monitor.
+/// Output dir honors the `STREAMARCHIVER_OUT` env var (else the default).
 fn run_add(args: &[String], pos: usize) -> Result<()> {
     let name = args.get(pos + 1).cloned().unwrap_or_default();
     let url = args.get(pos + 2).cloned().unwrap_or_default();
     if name.is_empty() || url.is_empty() {
-        anyhow::bail!("usage: streamarchiver --add <name> <url> [detection_method]");
+        anyhow::bail!("usage: streamarchiver --add <name> <url> [detection_method] [tool]");
     }
     let platform = Platform::detect(&url);
     let method = args
         .get(pos + 3)
         .map(|s| models::DetectionMethod::parse(s))
         .unwrap_or_else(|| platform.default_detection());
+    let tool = args
+        .get(pos + 4)
+        .map(|s| models::Tool::parse(s))
+        .unwrap_or_else(|| platform.default_tool());
+    let output_dir = std::env::var("STREAMARCHIVER_OUT")
+        .unwrap_or_else(|_| app_paths::default_output_dir().to_string_lossy().to_string());
 
     let store = Store::open(&app_paths::db_path()).context("opening data store")?;
     let channel_id = store.upsert_channel(&name, &url, platform)?;
@@ -188,13 +212,14 @@ fn run_add(args: &[String], pos: usize) -> Result<()> {
         id: 0,
         channel_id,
         enabled: true,
-        tool: platform.default_tool(),
+        tool,
         detection_method: method,
         poll_interval_secs: 30,
         quality: "best".into(),
-        output_dir: app_paths::default_output_dir().to_string_lossy().to_string(),
-        filename_template: "{author}_{time}".into(),
+        output_dir,
+        filename_template: "{name}_{date}_{time}".into(),
         container: models::Container::Mkv,
+        capture_from_start: std::env::var("STREAMARCHIVER_FROM_START").as_deref() != Ok("0"),
         extra_args: String::new(),
         max_concurrent: 1,
         last_checked_at: None,
@@ -217,6 +242,93 @@ fn run_list() -> Result<()> {
             r.monitor.detection_method.as_str(),
             r.monitor.last_state,
             r.monitor.last_checked_at,
+        );
+    }
+    Ok(())
+}
+
+/// `--capture-test <tool> <url> <secs>` records for a fixed time, kills the tree
+/// (taskkill /T), and remuxes — exercising the real capture lifecycle end-to-end.
+fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
+    use std::process::Stdio;
+    let tool = models::Tool::parse(&args.get(pos + 1).cloned().unwrap_or_default());
+    let url = args.get(pos + 2).cloned().unwrap_or_default();
+    let secs: u64 = args.get(pos + 3).and_then(|s| s.parse().ok()).unwrap_or(15);
+    if url.is_empty() {
+        anyhow::bail!("usage: streamarchiver --capture-test <tool> <url> <secs>");
+    }
+    let out_dir = std::env::var("STREAMARCHIVER_OUT")
+        .unwrap_or_else(|_| app_paths::default_output_dir().to_string_lossy().to_string());
+    let row = models::MonitorWithChannel {
+        channel: models::Channel {
+            id: 0,
+            name: "captest".into(),
+            url: url.clone(),
+            platform: Platform::detect(&url),
+            created_at: 0,
+        },
+        monitor: models::Monitor {
+            id: 0,
+            channel_id: 0,
+            enabled: true,
+            tool,
+            detection_method: models::DetectionMethod::GenericProbe,
+            poll_interval_secs: 60,
+            quality: "best".into(),
+            output_dir: out_dir,
+            filename_template: "captest_{time}".into(),
+            container: models::Container::Mkv,
+            capture_from_start: false,
+            extra_args: String::new(),
+            max_concurrent: 1,
+            last_checked_at: None,
+            last_state: "idle".into(),
+        },
+    };
+    let plan = downloader::build_plan(&row, models::now_unix());
+    println!("plan: {} {:?}", plan.program, plan.args);
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        if let Some(parent) = plan.capture_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        let mut cmd = tokio::process::Command::new(&plan.program);
+        cmd.args(&plan.args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = cmd.spawn().context("spawn tool")?;
+        let pid = child.id().unwrap_or(0);
+        println!("spawned {} pid={pid}; recording {secs}s -> {}", plan.program, plan.capture_path.display());
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+
+        platform::kill_process_tree(pid);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let ts_len = tokio::fs::metadata(&plan.capture_path).await.map(|m| m.len()).unwrap_or(0);
+        println!("captured .ts: {} KB (survives the hard kill)", ts_len / 1024);
+        if plan.remux_to_mkv && ts_len > 0 {
+            match downloader::remux_ts_to_mkv(&plan.capture_path, &plan.final_path).await {
+                Ok(()) => {
+                    let mkv = tokio::fs::metadata(&plan.final_path).await.map(|m| m.len()).unwrap_or(0);
+                    println!("remuxed -> {} ({} KB)", plan.final_path.display(), mkv / 1024);
+                }
+                Err(e) => println!("remux failed: {e:#}"),
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+/// `--recordings` prints the recent recording log.
+fn run_recordings() -> Result<()> {
+    let store = Store::open(&app_paths::db_path()).context("opening data store")?;
+    for (id, monitor_id, status, bytes, path) in store.recent_recordings(50)? {
+        println!(
+            "rec[{id}] monitor={monitor_id} status={status:<10} bytes={bytes:<10} {path}"
         );
     }
     Ok(())

@@ -44,6 +44,7 @@ struct MonitorForm {
     output_dir: String,
     filename_template: String,
     container: Container,
+    capture_from_start: bool,
     extra_args: String,
 }
 
@@ -59,8 +60,9 @@ impl MonitorForm {
             poll_interval_secs: 60,
             quality: "best".into(),
             output_dir: default_output_dir,
-            filename_template: "{author}_{time}".into(),
+            filename_template: "{name}_{date}_{time}".into(),
             container: Container::Mkv,
+            capture_from_start: true,
             extra_args: String::new(),
         }
     }
@@ -79,6 +81,7 @@ impl MonitorForm {
             output_dir: m.output_dir.clone(),
             filename_template: m.filename_template.clone(),
             container: m.container,
+            capture_from_start: m.capture_from_start,
             extra_args: m.extra_args.clone(),
         }
     }
@@ -95,8 +98,9 @@ impl MonitorForm {
             poll_interval_secs: 60,
             quality: "best".into(),
             output_dir: default_output_dir,
-            filename_template: "{author}_{time}".into(),
+            filename_template: "{name}_{date}_{time}".into(),
             container: Container::Mkv,
+            capture_from_start: true,
             extra_args: String::new(),
         }
     }
@@ -249,6 +253,7 @@ impl StreamArchiverApp {
             output_dir: form.output_dir.clone(),
             filename_template: form.filename_template.clone(),
             container: form.container,
+            capture_from_start: form.capture_from_start,
             extra_args: form.extra_args.clone(),
             max_concurrent: 1,
             last_checked_at: None,
@@ -600,6 +605,11 @@ impl StreamArchiverApp {
                                     ui.selectable_value(&mut form.container, c, c.label());
                                 }
                             });
+                        ui.end_row();
+
+                        ui.label("Capture from start");
+                        ui.checkbox(&mut form.capture_from_start, "")
+                            .on_hover_text("yt-dlp --live-from-start / streamlink --hls-live-restart");
                         ui.end_row();
 
                         ui.label("Output folder");

@@ -16,7 +16,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -107,8 +107,15 @@ impl Store {
                 CREATE INDEX idx_recording_monitor ON recording(monitor_id);
                 "#,
             )?;
-            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            conn.pragma_update(None, "user_version", 1)?;
         }
+        if version < 2 {
+            conn.execute_batch(
+                "ALTER TABLE monitor ADD COLUMN capture_from_start INTEGER NOT NULL DEFAULT 1;",
+            )?;
+            conn.pragma_update(None, "user_version", 2)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 2);
         Ok(())
     }
 
@@ -180,8 +187,8 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO monitor(channel_id, enabled, tool, detection_method, poll_interval_secs,
-                quality, output_dir, filename_template, container, extra_args, max_concurrent, last_state)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                quality, output_dir, filename_template, container, capture_from_start, extra_args, max_concurrent, last_state)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 m.channel_id,
                 m.enabled as i64,
@@ -192,6 +199,7 @@ impl Store {
                 m.output_dir,
                 m.filename_template,
                 m.container.as_str(),
+                m.capture_from_start as i64,
                 m.extra_args,
                 m.max_concurrent,
                 m.last_state,
@@ -204,8 +212,8 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE monitor SET enabled=?2, tool=?3, detection_method=?4, poll_interval_secs=?5,
-                quality=?6, output_dir=?7, filename_template=?8, container=?9, extra_args=?10,
-                max_concurrent=?11 WHERE id=?1",
+                quality=?6, output_dir=?7, filename_template=?8, container=?9, capture_from_start=?10,
+                extra_args=?11, max_concurrent=?12 WHERE id=?1",
             params![
                 m.id,
                 m.enabled as i64,
@@ -216,6 +224,7 @@ impl Store {
                 m.output_dir,
                 m.filename_template,
                 m.container.as_str(),
+                m.capture_from_start as i64,
                 m.extra_args,
                 m.max_concurrent,
             ],
@@ -248,6 +257,55 @@ impl Store {
         Ok(())
     }
 
+    /// Fetch a single monitor (joined with its channel) by monitor id.
+    pub fn get_monitor_with_channel(&self, id: i64) -> Result<Option<MonitorWithChannel>> {
+        Ok(self
+            .list_monitors_with_channels()?
+            .into_iter()
+            .find(|r| r.monitor.id == id))
+    }
+
+    // ----- recordings -----
+
+    pub fn insert_recording(&self, monitor_id: i64, started_at: i64, output_path: &str) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO recording(monitor_id, started_at, output_path, status) VALUES(?1, ?2, ?3, 'recording')",
+            params![monitor_id, started_at, output_path],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_recording(
+        &self,
+        id: i64,
+        ended_at: i64,
+        bytes: i64,
+        exit_code: Option<i64>,
+        status: &str,
+        output_path: &str,
+        log_excerpt: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE recording SET ended_at=?2, bytes=?3, exit_code=?4, status=?5, output_path=?6, log_excerpt=?7 WHERE id=?1",
+            params![id, ended_at, bytes, exit_code, status, output_path, log_excerpt],
+        )?;
+        Ok(())
+    }
+
+    /// Mark any recordings still flagged 'recording' (i.e. left over from a
+    /// crash) as 'orphaned'. Returns the number updated. Called on startup.
+    pub fn mark_orphaned_recordings(&self, ended_at: i64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE recording SET status='orphaned', ended_at=?1 WHERE status='recording'",
+            params![ended_at],
+        )?;
+        Ok(n)
+    }
+
     /// All monitors joined with their channel, ordered by channel name.
     pub fn list_monitors_with_channels(&self) -> Result<Vec<MonitorWithChannel>> {
         let conn = self.conn.lock().unwrap();
@@ -255,8 +313,8 @@ impl Store {
             "SELECT
                 c.id, c.name, c.url, c.platform, c.created_at,
                 m.id, m.channel_id, m.enabled, m.tool, m.detection_method, m.poll_interval_secs,
-                m.quality, m.output_dir, m.filename_template, m.container, m.extra_args,
-                m.max_concurrent, m.last_checked_at, m.last_state
+                m.quality, m.output_dir, m.filename_template, m.container, m.capture_from_start,
+                m.extra_args, m.max_concurrent, m.last_checked_at, m.last_state
              FROM monitor m
              JOIN channel c ON c.id = m.channel_id
              ORDER BY c.name COLLATE NOCASE, m.id",
@@ -281,12 +339,28 @@ impl Store {
                     output_dir: r.get(12)?,
                     filename_template: r.get(13)?,
                     container: Container::parse(&r.get::<_, String>(14)?),
-                    extra_args: r.get(15)?,
-                    max_concurrent: r.get(16)?,
-                    last_checked_at: r.get(17)?,
-                    last_state: r.get(18)?,
+                    capture_from_start: r.get::<_, i64>(15)? != 0,
+                    extra_args: r.get(16)?,
+                    max_concurrent: r.get(17)?,
+                    last_checked_at: r.get(18)?,
+                    last_state: r.get(19)?,
                 };
                 Ok(MonitorWithChannel { channel, monitor })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Recent recordings (id, monitor_id, status, bytes, output_path), newest first.
+    pub fn recent_recordings(&self, limit: i64) -> Result<Vec<(i64, i64, String, i64, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, monitor_id, status, bytes, COALESCE(output_path, '')
+             FROM recording ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
@@ -317,8 +391,9 @@ mod tests {
             poll_interval_secs: 60,
             quality: "best".into(),
             output_dir: "C:/tmp".into(),
-            filename_template: "{author}_{time}".into(),
+            filename_template: "{name}_{date}_{time}".into(),
             container: Container::Mkv,
+            capture_from_start: true,
             extra_args: String::new(),
             max_concurrent: 1,
             last_checked_at: None,

@@ -11,11 +11,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tracing::warn;
 
 use crate::detectors::{DetectContext, DetectItem, DetectOutcome};
+use crate::downloader::ActiveSet;
 use crate::events::{AppEvent, EventTx};
 use crate::models::{DetectionMethod, now_unix};
 
@@ -31,14 +32,24 @@ enum PerItemMode {
 }
 
 /// Run the scheduler forever.
-pub async fn run(ctx: Arc<DetectContext>, events: EventTx) {
+pub async fn run(
+    ctx: Arc<DetectContext>,
+    events: EventTx,
+    live_tx: mpsc::UnboundedSender<i64>,
+    active: ActiveSet,
+) {
     loop {
-        let wait = tick(&ctx, &events).await;
+        let wait = tick(&ctx, &events, &live_tx, &active).await;
         tokio::time::sleep(Duration::from_secs(wait)).await;
     }
 }
 
-async fn tick(ctx: &Arc<DetectContext>, events: &EventTx) -> u64 {
+async fn tick(
+    ctx: &Arc<DetectContext>,
+    events: &EventTx,
+    live_tx: &mpsc::UnboundedSender<i64>,
+    active: &ActiveSet,
+) -> u64 {
     let rows = match ctx.store.list_monitors_with_channels() {
         Ok(rows) => rows,
         Err(e) => {
@@ -54,10 +65,18 @@ async fn tick(ctx: &Arc<DetectContext>, events: &EventTx) -> u64 {
     let mut generic_items: Vec<DetectItem> = Vec::new();
     let mut prev_state: HashMap<i64, String> = HashMap::new();
 
+    let recording: std::collections::HashSet<i64> =
+        active.lock().unwrap().keys().copied().collect();
+
     for row in &rows {
         let m = &row.monitor;
         prev_state.insert(m.id, m.last_state.clone());
         if !m.enabled {
+            continue;
+        }
+        // Don't poll a monitor that's currently being recorded — the supervisor
+        // owns its state until the tool exits.
+        if recording.contains(&m.id) {
             continue;
         }
         // Methods handled by the scheduler today; others are driven elsewhere
@@ -122,6 +141,10 @@ async fn tick(ctx: &Arc<DetectContext>, events: &EventTx) -> u64 {
                 monitor_id: o.monitor_id,
                 state: new_state.to_string(),
             });
+        }
+        // Signal the supervisor to (consider) starting a recording.
+        if o.live && !o.error {
+            let _ = live_tx.send(o.monitor_id);
         }
     }
 

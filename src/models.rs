@@ -85,28 +85,18 @@ impl Platform {
         }
     }
 
-    /// Detection methods that make sense to offer for this platform.
+    /// Detection methods currently implemented for this platform (offered in the
+    /// UI). YouTube Data API and Twitch EventSub are planned for a later phase.
     pub fn detection_methods(self) -> &'static [DetectionMethod] {
         match self {
             Platform::Twitch => &[
                 DetectionMethod::TwitchApi,
                 DetectionMethod::Scrape,
-                DetectionMethod::CliSelfPoll,
-                DetectionMethod::EventSub,
-            ],
-            Platform::YouTube => &[
-                DetectionMethod::YouTubeApi,
-                DetectionMethod::Scrape,
-                DetectionMethod::CliSelfPoll,
-            ],
-            Platform::Kick => &[
-                DetectionMethod::Scrape,
-                DetectionMethod::CliSelfPoll,
-            ],
-            Platform::Generic => &[
                 DetectionMethod::GenericProbe,
-                DetectionMethod::CliSelfPoll,
             ],
+            Platform::YouTube => &[DetectionMethod::Scrape, DetectionMethod::GenericProbe],
+            Platform::Kick => &[DetectionMethod::Scrape, DetectionMethod::GenericProbe],
+            Platform::Generic => &[DetectionMethod::GenericProbe],
         }
     }
 }
@@ -254,6 +244,9 @@ pub struct Monitor {
     pub output_dir: String,
     pub filename_template: String,
     pub container: Container,
+    /// Capture from the start of the broadcast (yt-dlp `--live-from-start`,
+    /// streamlink `--hls-live-restart`) vs. from the live edge. Default true.
+    pub capture_from_start: bool,
     pub extra_args: String,
     pub max_concurrent: i64,
     pub last_checked_at: Option<i64>,
