@@ -1,0 +1,27 @@
+[package]
+name = "streamarchiver"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+auto-launch = "0.6.0"
+directories = "6.0.0"
+eframe = { version = "0.34.3", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+egui_extras = "0.34.3"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "sync", "process", "io-util", "fs", "signal"] }
+tokio-util = { version = "0.7.18", features = ["time", "codec"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tray-icon = "0.24.1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

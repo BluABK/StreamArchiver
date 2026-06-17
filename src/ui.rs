@@ -1,0 +1,635 @@
+//! The on-demand egui window: channel table, add/edit form, and settings.
+//!
+//! Runs reactive (repaints only on input/events). The tray thread wakes it via
+//! `Context::request_repaint`. Closing the window hides it to the tray; the
+//! tray "Quit" item triggers a real close.
+
+use std::sync::Arc;
+use std::sync::mpsc::Receiver;
+
+use eframe::egui;
+use egui_extras::{Column, TableBuilder};
+use tracing::warn;
+use tray_icon::TrayIcon;
+
+use crate::app_core::AppCore;
+use crate::events::UiCommand;
+use crate::models::{
+    Channel, Container, DetectionMethod, Monitor, MonitorWithChannel, Platform, Tool,
+};
+use crate::platform::AutoStart;
+
+const K_TWITCH_ID: &str = "twitch_client_id";
+const K_TWITCH_SECRET: &str = "twitch_client_secret";
+const K_YT_KEY: &str = "youtube_api_key";
+const K_DEFAULT_OUT: &str = "default_output_dir";
+const K_MAX_CONCURRENT: &str = "max_concurrent_downloads";
+
+#[derive(PartialEq, Eq)]
+enum View {
+    Channels,
+    Settings,
+}
+
+/// Backing state for the add/edit dialog.
+struct MonitorForm {
+    monitor_id: Option<i64>,
+    channel_id: Option<i64>,
+    name: String,
+    url: String,
+    tool: Tool,
+    detection_method: DetectionMethod,
+    poll_interval_secs: i64,
+    quality: String,
+    output_dir: String,
+    filename_template: String,
+    container: Container,
+    extra_args: String,
+}
+
+impl MonitorForm {
+    fn new_channel(default_output_dir: String) -> MonitorForm {
+        MonitorForm {
+            monitor_id: None,
+            channel_id: None,
+            name: String::new(),
+            url: String::new(),
+            tool: Tool::Streamlink,
+            detection_method: DetectionMethod::GenericProbe,
+            poll_interval_secs: 60,
+            quality: "best".into(),
+            output_dir: default_output_dir,
+            filename_template: "{author}_{time}".into(),
+            container: Container::Mkv,
+            extra_args: String::new(),
+        }
+    }
+
+    fn from_existing(row: &MonitorWithChannel) -> MonitorForm {
+        let m = &row.monitor;
+        MonitorForm {
+            monitor_id: Some(m.id),
+            channel_id: Some(row.channel.id),
+            name: row.channel.name.clone(),
+            url: row.channel.url.clone(),
+            tool: m.tool,
+            detection_method: m.detection_method,
+            poll_interval_secs: m.poll_interval_secs,
+            quality: m.quality.clone(),
+            output_dir: m.output_dir.clone(),
+            filename_template: m.filename_template.clone(),
+            container: m.container,
+            extra_args: m.extra_args.clone(),
+        }
+    }
+
+    fn add_instance(channel: &Channel, default_output_dir: String) -> MonitorForm {
+        let platform = channel.platform;
+        MonitorForm {
+            monitor_id: None,
+            channel_id: Some(channel.id),
+            name: channel.name.clone(),
+            url: channel.url.clone(),
+            tool: platform.default_tool(),
+            detection_method: platform.default_detection(),
+            poll_interval_secs: 60,
+            quality: "best".into(),
+            output_dir: default_output_dir,
+            filename_template: "{author}_{time}".into(),
+            container: Container::Mkv,
+            extra_args: String::new(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct SettingsForm {
+    twitch_client_id: String,
+    twitch_client_secret: String,
+    youtube_api_key: String,
+    default_output_dir: String,
+    max_concurrent_downloads: String,
+}
+
+pub struct StreamArchiverApp {
+    core: Arc<AppCore>,
+    _tray: TrayIcon,
+    ui_rx: Receiver<UiCommand>,
+    events_rx: crate::events::EventRx,
+    autostart: AutoStart,
+    autostart_on: bool,
+    quitting: bool,
+
+    view: View,
+    rows: Vec<MonitorWithChannel>,
+    form: Option<MonitorForm>,
+    settings: SettingsForm,
+    status: String,
+}
+
+impl StreamArchiverApp {
+    pub fn new(
+        core: Arc<AppCore>,
+        tray: TrayIcon,
+        ui_rx: Receiver<UiCommand>,
+    ) -> StreamArchiverApp {
+        let events_rx = core.subscribe();
+        let autostart = AutoStart::new();
+        let autostart_on = autostart.is_enabled();
+
+        let default_out = core
+            .store
+            .get_setting(K_DEFAULT_OUT)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| crate::app_paths::default_output_dir().to_string_lossy().to_string());
+
+        let settings = SettingsForm {
+            twitch_client_id: setting_or_empty(&core, K_TWITCH_ID),
+            twitch_client_secret: setting_or_empty(&core, K_TWITCH_SECRET),
+            youtube_api_key: setting_or_empty(&core, K_YT_KEY),
+            default_output_dir: default_out,
+            max_concurrent_downloads: core
+                .store
+                .get_setting(K_MAX_CONCURRENT)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "3".into()),
+        };
+
+        let mut app = StreamArchiverApp {
+            core,
+            _tray: tray,
+            ui_rx,
+            events_rx,
+            autostart,
+            autostart_on,
+            quitting: false,
+            view: View::Channels,
+            rows: Vec::new(),
+            form: None,
+            settings,
+            status: String::new(),
+        };
+        app.reload_rows();
+        app
+    }
+
+    fn reload_rows(&mut self) {
+        match self.core.store.list_monitors_with_channels() {
+            Ok(rows) => self.rows = rows,
+            Err(e) => {
+                warn!("failed to load monitors: {e:#}");
+                self.status = format!("Error loading channels: {e}");
+            }
+        }
+    }
+
+    /// Handle tray commands and bus events; returns true if a repaint is needed.
+    fn pump_messages(&mut self, ctx: &egui::Context) {
+        while let Ok(cmd) = self.ui_rx.try_recv() {
+            match cmd {
+                UiCommand::ShowWindow => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                UiCommand::Quit => {
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+
+        let mut dirty = false;
+        loop {
+            match self.events_rx.try_recv() {
+                Ok(_event) => dirty = true,
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+            }
+        }
+        if dirty {
+            self.reload_rows();
+        }
+    }
+
+    fn save_form(&mut self) {
+        let Some(form) = self.form.as_ref() else {
+            return;
+        };
+        if form.name.trim().is_empty() || form.url.trim().is_empty() {
+            self.status = "Name and URL are required.".into();
+            return;
+        }
+        let platform = Platform::detect(&form.url);
+        let channel_id = match form.channel_id {
+            Some(id) => id,
+            None => match self
+                .core
+                .store
+                .upsert_channel(form.name.trim(), form.url.trim(), platform)
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    self.status = format!("Error saving channel: {e}");
+                    return;
+                }
+            },
+        };
+
+        let monitor = Monitor {
+            id: form.monitor_id.unwrap_or(0),
+            channel_id,
+            enabled: true,
+            tool: form.tool,
+            detection_method: form.detection_method,
+            poll_interval_secs: form.poll_interval_secs.max(5),
+            quality: form.quality.clone(),
+            output_dir: form.output_dir.clone(),
+            filename_template: form.filename_template.clone(),
+            container: form.container,
+            extra_args: form.extra_args.clone(),
+            max_concurrent: 1,
+            last_checked_at: None,
+            last_state: "idle".into(),
+        };
+
+        let result = match form.monitor_id {
+            Some(_) => self.core.store.update_monitor(&monitor),
+            None => self.core.store.insert_monitor(&monitor).map(|_| ()),
+        };
+        match result {
+            Ok(()) => {
+                self.status = "Saved.".into();
+                self.form = None;
+                self.reload_rows();
+            }
+            Err(e) => self.status = format!("Error saving monitor: {e}"),
+        }
+    }
+
+    fn save_settings(&mut self) {
+        let s = &self.settings;
+        let pairs = [
+            (K_TWITCH_ID, s.twitch_client_id.trim()),
+            (K_TWITCH_SECRET, s.twitch_client_secret.trim()),
+            (K_YT_KEY, s.youtube_api_key.trim()),
+            (K_DEFAULT_OUT, s.default_output_dir.trim()),
+            (K_MAX_CONCURRENT, s.max_concurrent_downloads.trim()),
+        ];
+        for (k, v) in pairs {
+            if let Err(e) = self.core.store.set_setting(k, v) {
+                self.status = format!("Error saving settings: {e}");
+                return;
+            }
+        }
+        self.status = "Settings saved.".into();
+    }
+}
+
+fn setting_or_empty(core: &AppCore, key: &str) -> String {
+    core.store.get_setting(key).ok().flatten().unwrap_or_default()
+}
+
+impl eframe::App for StreamArchiverApp {
+    /// Non-drawing logic. eframe also calls this while the window is hidden when
+    /// `request_repaint` was called — which is how the tray's "Open" wakes us.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.pump_messages(ctx);
+
+        // Close button hides to tray unless we're really quitting.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        egui::Panel::top("top").resizable(false).show_inside(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("StreamArchiver");
+                ui.separator();
+                ui.selectable_value(&mut self.view, View::Channels, "Channels");
+                ui.selectable_value(&mut self.view, View::Settings, "Settings");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.view == View::Channels && ui.button("➕ Add channel").clicked() {
+                        self.form =
+                            Some(MonitorForm::new_channel(self.settings.default_output_dir.clone()));
+                    }
+                });
+            });
+        });
+
+        egui::Panel::bottom("status")
+            .resizable(false)
+            .show_inside(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(if self.status.is_empty() {
+                        "Ready."
+                    } else {
+                        &self.status
+                    });
+                });
+            });
+
+        egui::CentralPanel::default().show_inside(ui, |ui| match self.view {
+            View::Channels => self.channels_view(ui),
+            View::Settings => self.settings_view(ui),
+        });
+
+        self.form_window(ui.ctx());
+    }
+}
+
+impl StreamArchiverApp {
+    fn channels_view(&mut self, ui: &mut egui::Ui) {
+        if self.rows.is_empty() {
+            ui.add_space(24.0);
+            ui.vertical_centered(|ui| {
+                ui.label("No channels yet.");
+                ui.label("Click “Add channel” to start monitoring a livestream.");
+            });
+            return;
+        }
+
+        // Deferred actions to avoid borrowing self mutably inside the table closure.
+        let mut to_edit: Option<usize> = None;
+        let mut to_add_instance: Option<usize> = None;
+        let mut to_delete: Option<i64> = None;
+        let mut toggle: Option<(i64, bool)> = None;
+
+        egui::ScrollArea::both().show(ui, |ui| {
+            TableBuilder::new(ui)
+                .striped(true)
+                .resizable(true)
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(Column::auto().at_least(40.0)) // enabled
+                .column(Column::auto().at_least(120.0)) // name
+                .column(Column::auto().at_least(90.0)) // platform
+                .column(Column::auto().at_least(90.0)) // tool
+                .column(Column::auto().at_least(150.0)) // method
+                .column(Column::auto().at_least(60.0)) // interval
+                .column(Column::auto().at_least(80.0)) // state
+                .column(Column::remainder().at_least(160.0)) // actions
+                .header(20.0, |mut header| {
+                    for title in [
+                        "On", "Name", "Platform", "Tool", "Detection", "Every", "State", "Actions",
+                    ] {
+                        header.col(|ui| {
+                            ui.strong(title);
+                        });
+                    }
+                })
+                .body(|mut body| {
+                    for (i, row) in self.rows.iter().enumerate() {
+                        let m = &row.monitor;
+                        body.row(24.0, |mut tr| {
+                            tr.col(|ui| {
+                                let mut on = m.enabled;
+                                if ui.checkbox(&mut on, "").changed() {
+                                    toggle = Some((m.id, on));
+                                }
+                            });
+                            tr.col(|ui| {
+                                ui.label(&row.channel.name).on_hover_text(&row.channel.url);
+                            });
+                            tr.col(|ui| {
+                                ui.label(row.channel.platform.label());
+                            });
+                            tr.col(|ui| {
+                                ui.label(m.tool.label());
+                            });
+                            tr.col(|ui| {
+                                ui.label(m.detection_method.label());
+                            });
+                            tr.col(|ui| {
+                                ui.label(format!("{}s", m.poll_interval_secs));
+                            });
+                            tr.col(|ui| {
+                                ui.label(&m.last_state);
+                            });
+                            tr.col(|ui| {
+                                ui.push_id(m.id, |ui| {
+                                    if ui.button("Edit").clicked() {
+                                        to_edit = Some(i);
+                                    }
+                                    if ui.button("＋Inst").on_hover_text("Add another tool instance for this channel").clicked() {
+                                        to_add_instance = Some(i);
+                                    }
+                                    if ui.button("🗑").on_hover_text("Delete this instance").clicked() {
+                                        to_delete = Some(m.id);
+                                    }
+                                });
+                            });
+                        });
+                    }
+                });
+        });
+
+        if let Some(i) = to_edit {
+            self.form = Some(MonitorForm::from_existing(&self.rows[i]));
+        }
+        if let Some(i) = to_add_instance {
+            self.form = Some(MonitorForm::add_instance(
+                &self.rows[i].channel,
+                self.settings.default_output_dir.clone(),
+            ));
+        }
+        if let Some((id, on)) = toggle {
+            if let Err(e) = self.core.store.set_monitor_enabled(id, on) {
+                self.status = format!("Error: {e}");
+            }
+            self.reload_rows();
+        }
+        if let Some(id) = to_delete {
+            if let Err(e) = self.core.store.delete_monitor(id) {
+                self.status = format!("Error: {e}");
+            }
+            self.reload_rows();
+        }
+    }
+
+    fn settings_view(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.add_space(8.0);
+            ui.heading("Detection credentials (optional)");
+            ui.label("Used only by monitors set to an API detection method.");
+            egui::Grid::new("creds_grid")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("Twitch Client ID");
+                    ui.text_edit_singleline(&mut self.settings.twitch_client_id);
+                    ui.end_row();
+                    ui.label("Twitch Client Secret");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.twitch_client_secret)
+                            .password(true),
+                    );
+                    ui.end_row();
+                    ui.label("YouTube API Key");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.youtube_api_key)
+                            .password(true),
+                    );
+                    ui.end_row();
+                });
+
+            ui.add_space(12.0);
+            ui.heading("Defaults");
+            egui::Grid::new("defaults_grid")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("Default output folder");
+                    ui.text_edit_singleline(&mut self.settings.default_output_dir);
+                    ui.end_row();
+                    ui.label("Max concurrent downloads");
+                    ui.text_edit_singleline(&mut self.settings.max_concurrent_downloads);
+                    ui.end_row();
+                });
+
+            ui.add_space(12.0);
+            ui.heading("Startup");
+            let mut on = self.autostart_on;
+            if ui.checkbox(&mut on, "Start StreamArchiver at login").changed() {
+                match self.autostart.set(on) {
+                    Ok(()) => {
+                        self.autostart_on = on;
+                        self.status = if on {
+                            "Autostart enabled.".into()
+                        } else {
+                            "Autostart disabled.".into()
+                        };
+                    }
+                    Err(e) => self.status = format!("Autostart error: {e}"),
+                }
+            }
+
+            ui.add_space(16.0);
+            if ui.button("💾 Save settings").clicked() {
+                self.save_settings();
+            }
+        });
+    }
+
+    fn form_window(&mut self, ctx: &egui::Context) {
+        if self.form.is_none() {
+            return;
+        }
+        let mut open = true;
+        let mut do_save = false;
+        let mut do_cancel = false;
+
+        let title = if self.form.as_ref().unwrap().monitor_id.is_some() {
+            "Edit monitor"
+        } else {
+            "Add monitor"
+        };
+
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                let form = self.form.as_mut().unwrap();
+                let editing_channel = form.channel_id.is_none();
+                let platform = Platform::detect(&form.url);
+
+                egui::Grid::new("form_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Name");
+                        ui.add_enabled(
+                            editing_channel,
+                            egui::TextEdit::singleline(&mut form.name),
+                        );
+                        ui.end_row();
+
+                        ui.label("URL");
+                        ui.add_enabled(
+                            editing_channel,
+                            egui::TextEdit::singleline(&mut form.url).desired_width(320.0),
+                        );
+                        ui.end_row();
+
+                        ui.label("Platform");
+                        ui.label(platform.label());
+                        ui.end_row();
+
+                        ui.label("Tool");
+                        egui::ComboBox::from_id_salt("tool_cb")
+                            .selected_text(form.tool.label())
+                            .show_ui(ui, |ui| {
+                                for t in Tool::ALL {
+                                    ui.selectable_value(&mut form.tool, t, t.label());
+                                }
+                            });
+                        ui.end_row();
+
+                        ui.label("Detection");
+                        let methods = platform.detection_methods();
+                        if !methods.contains(&form.detection_method) {
+                            form.detection_method = platform.default_detection();
+                        }
+                        egui::ComboBox::from_id_salt("method_cb")
+                            .selected_text(form.detection_method.label())
+                            .show_ui(ui, |ui| {
+                                for &dm in methods {
+                                    ui.selectable_value(&mut form.detection_method, dm, dm.label());
+                                }
+                            });
+                        ui.end_row();
+
+                        ui.label("Poll interval (s)");
+                        ui.add(egui::DragValue::new(&mut form.poll_interval_secs).range(5..=86400));
+                        ui.end_row();
+
+                        ui.label("Quality");
+                        ui.text_edit_singleline(&mut form.quality);
+                        ui.end_row();
+
+                        ui.label("Container");
+                        egui::ComboBox::from_id_salt("container_cb")
+                            .selected_text(form.container.label())
+                            .show_ui(ui, |ui| {
+                                for c in Container::ALL {
+                                    ui.selectable_value(&mut form.container, c, c.label());
+                                }
+                            });
+                        ui.end_row();
+
+                        ui.label("Output folder");
+                        ui.text_edit_singleline(&mut form.output_dir);
+                        ui.end_row();
+
+                        ui.label("Filename template");
+                        ui.text_edit_singleline(&mut form.filename_template);
+                        ui.end_row();
+
+                        ui.label("Extra args");
+                        ui.text_edit_singleline(&mut form.extra_args);
+                        ui.end_row();
+                    });
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        do_save = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        do_cancel = true;
+                    }
+                });
+            });
+
+        if do_save {
+            self.save_form();
+        } else if do_cancel || !open {
+            self.form = None;
+        }
+    }
+}
