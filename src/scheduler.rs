@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Semaphore, mpsc};
@@ -31,14 +32,15 @@ enum PerItemMode {
     Generic,
 }
 
-/// Run the scheduler forever.
+/// Run the scheduler until shutdown is signaled.
 pub async fn run(
     ctx: Arc<DetectContext>,
     events: EventTx,
     live_tx: mpsc::UnboundedSender<i64>,
     active: ActiveSet,
+    shutdown: Arc<AtomicBool>,
 ) {
-    loop {
+    while !shutdown.load(Ordering::SeqCst) {
         let wait = tick(&ctx, &events, &live_tx, &active).await;
         tokio::time::sleep(Duration::from_secs(wait)).await;
     }

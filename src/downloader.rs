@@ -12,6 +12,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -134,6 +135,7 @@ pub struct Supervisor {
     store: Arc<Store>,
     events: EventTx,
     active: ActiveSet,
+    shutdown: Arc<AtomicBool>,
     sem: Arc<Semaphore>,
     backoff: Arc<Mutex<HashMap<i64, BackoffEntry>>>,
 }
@@ -149,12 +151,14 @@ impl Supervisor {
         store: Arc<Store>,
         events: EventTx,
         active: ActiveSet,
+        shutdown: Arc<AtomicBool>,
         max_concurrent: usize,
     ) -> Supervisor {
         Supervisor {
             store,
             events,
             active,
+            shutdown,
             sem: Arc::new(Semaphore::new(max_concurrent.max(1))),
             backoff: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -163,6 +167,9 @@ impl Supervisor {
     /// Consume "monitor is live" signals and start recordings as needed.
     pub async fn run(self, mut live_rx: mpsc::UnboundedReceiver<i64>) {
         while let Some(monitor_id) = live_rx.recv().await {
+            if self.shutdown.load(Ordering::SeqCst) {
+                continue; // draining: don't start new recordings
+            }
             // Dedup against active recordings and honor backoff.
             {
                 let mut active = self.active.lock().unwrap();

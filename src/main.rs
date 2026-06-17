@@ -48,6 +48,10 @@ fn main() -> Result<()> {
     if let Some(pos) = args.iter().position(|a| a == "--capture-test") {
         return run_capture_test(&args, pos);
     }
+    if let Some(pos) = args.iter().position(|a| a == "--run-for") {
+        let secs: u64 = args.get(pos + 1).and_then(|s| s.parse().ok()).unwrap_or(30);
+        return run_headless(secs);
+    }
 
     // Single-instance guard: hold the loopback bind for the process lifetime.
     let _instance_guard = match platform::acquire_single_instance() {
@@ -320,6 +324,21 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
         }
         Ok::<_, anyhow::Error>(())
     })?;
+    Ok(())
+}
+
+/// `--run-for <secs>` runs the full core (scheduler + supervisor) headlessly for
+/// a fixed time, then gracefully stops — for testing the real pipeline and as a
+/// no-UI daemon mode.
+fn run_headless(secs: u64) -> Result<()> {
+    let store = Store::open(&app_paths::db_path()).context("opening data store")?;
+    let _ = store.mark_orphaned_recordings(models::now_unix());
+    let core = AppCore::new(Arc::new(store)).context("starting core runtime")?;
+    core.start();
+    info!("headless: running core for {secs}s");
+    std::thread::sleep(std::time::Duration::from_secs(secs));
+    info!("headless: stopping");
+    core.stop_all_recordings();
     Ok(())
 }
 
