@@ -26,6 +26,8 @@ pub struct AppCore {
     pub active: ActiveSet,
     /// Set during shutdown so the scheduler/supervisor stop starting new work.
     pub shutdown: Arc<AtomicBool>,
+    /// Sends on-demand Start/Stop commands to the supervisor (set in `start`).
+    manual_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::events::ManualCommand>>>,
 }
 
 impl AppCore {
@@ -42,6 +44,7 @@ impl AppCore {
             rt,
             active: Arc::new(Mutex::new(HashMap::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
+            manual_tx: Mutex::new(None),
         }))
     }
 
@@ -54,16 +57,28 @@ impl AppCore {
     pub fn start(&self) {
         let (live_tx, live_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::events::LiveSignal>();
+        let (manual_tx, manual_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::events::ManualCommand>();
+        *self.manual_tx.lock().unwrap() = Some(manual_tx);
+
+        // One shared detection context (HTTP client + cached Twitch token).
+        let ctx = Arc::new(crate::detectors::DetectContext::new(self.store.clone()));
 
         // Scheduler: detection -> live signals.
-        let store = self.store.clone();
         let events = self.events.clone();
         let active_sched = self.active.clone();
         let shutdown_sched = self.shutdown.clone();
         let live_tx_sched = live_tx.clone();
+        let ctx_sched = ctx.clone();
         self.rt.spawn(async move {
-            let ctx = Arc::new(crate::detectors::DetectContext::new(store));
-            crate::scheduler::run(ctx, events, live_tx_sched, active_sched, shutdown_sched).await;
+            crate::scheduler::run(
+                ctx_sched,
+                events,
+                live_tx_sched,
+                active_sched,
+                shutdown_sched,
+            )
+            .await;
         });
 
         // Twitch EventSub real-time push -> live signals (idles if unused).
@@ -73,7 +88,7 @@ impl AppCore {
             crate::eventsub::run(es_store, live_tx, es_shutdown).await;
         });
 
-        // Supervisor: live signals -> recordings.
+        // Supervisor: live signals + manual commands -> recordings.
         let max_concurrent = self
             .store
             .get_setting("max_concurrent_downloads")
@@ -87,10 +102,11 @@ impl AppCore {
             self.events.clone(),
             self.active.clone(),
             self.shutdown.clone(),
+            ctx,
             max_concurrent,
         );
         self.rt.spawn(async move {
-            supervisor.run(live_rx).await;
+            supervisor.run(live_rx, manual_rx).await;
         });
 
         // Desktop notifications for recording lifecycle events.
@@ -98,6 +114,13 @@ impl AppCore {
         self.rt.spawn(async move {
             crate::notifications::run(notif_rx).await;
         });
+    }
+
+    /// Send an on-demand recording command (Start/Stop) to the supervisor.
+    pub fn manual(&self, cmd: crate::events::ManualCommand) {
+        if let Some(tx) = self.manual_tx.lock().unwrap().as_ref() {
+            let _ = tx.send(cmd);
+        }
     }
 
     /// Gracefully stop all recordings: signal shutdown, kill the tool process

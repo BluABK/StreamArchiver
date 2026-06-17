@@ -13,7 +13,7 @@ use tracing::warn;
 use tray_icon::TrayIcon;
 
 use crate::app_core::AppCore;
-use crate::events::UiCommand;
+use crate::events::{ManualCommand, UiCommand};
 use crate::models::{
     Channel, Container, DetectionMethod, Monitor, MonitorWithChannel, Platform, Tool,
 };
@@ -215,7 +215,11 @@ impl StreamArchiverApp {
         let mut dirty = false;
         loop {
             match self.events_rx.try_recv() {
-                Ok(_event) => dirty = true,
+                Ok(crate::events::AppEvent::Error { context, message }) => {
+                    self.status = format!("{context}: {message}");
+                    dirty = true;
+                }
+                Ok(_) => dirty = true,
                 Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
@@ -310,20 +314,6 @@ fn setting_or_empty(core: &AppCore, key: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Format a unix timestamp as local `YYYY-MM-DD HH:MM:SS` (empty if unset).
-fn fmt_datetime(secs: i64) -> String {
-    if secs <= 0 {
-        return String::new();
-    }
-    chrono::DateTime::from_timestamp(secs, 0)
-        .map(|dt| {
-            dt.with_timezone(&chrono::Local)
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string()
-        })
-        .unwrap_or_default()
-}
-
 /// Format a unix timestamp as a local `YYYY-MM-DD` date (empty if unset).
 fn fmt_date(secs: i64) -> String {
     if secs <= 0 {
@@ -333,6 +323,20 @@ fn fmt_date(secs: i64) -> String {
         .map(|dt| {
             dt.with_timezone(&chrono::Local)
                 .format("%Y-%m-%d")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+/// Compact local timestamp `MM-DD HH:MM:SS` (drops the year to save table width).
+fn fmt_datetime_short(secs: i64) -> String {
+    if secs <= 0 {
+        return String::new();
+    }
+    chrono::DateTime::from_timestamp(secs, 0)
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%m-%d %H:%M:%S")
                 .to_string()
         })
         .unwrap_or_default()
@@ -354,7 +358,6 @@ struct RecordingCells {
     went_live: String,
     /// How much of the stream we missed = started_on - went_live.
     lost: String,
-    active: bool,
 }
 
 fn recording_cells(row: &MonitorWithChannel, now: i64) -> RecordingCells {
@@ -367,7 +370,7 @@ fn recording_cells(row: &MonitorWithChannel, now: i64) -> RecordingCells {
     };
     let went_live = match row.last_recording_went_live {
         Some(w) => {
-            let s = fmt_datetime(w);
+            let s = fmt_datetime_short(w);
             if row.last_recording_went_live_approx {
                 format!("~{s}")
             } else {
@@ -381,11 +384,10 @@ fn recording_cells(row: &MonitorWithChannel, now: i64) -> RecordingCells {
         _ => String::new(),
     };
     RecordingCells {
-        started_on: started.map(fmt_datetime).unwrap_or_default(),
+        started_on: started.map(fmt_datetime_short).unwrap_or_default(),
         duration: dur.map(fmt_duration).unwrap_or_default(),
         went_live,
         lost,
-        active,
     }
 }
 
@@ -487,6 +489,8 @@ impl StreamArchiverApp {
         let mut to_add_instance: Option<usize> = None;
         let mut to_delete: Option<i64> = None;
         let mut toggle: Option<(i64, bool)> = None;
+        let mut to_start: Option<i64> = None;
+        let mut to_stop: Option<i64> = None;
 
         let now = crate::models::now_unix();
         let any_active = self
@@ -503,19 +507,19 @@ impl StreamArchiverApp {
                     .striped(true)
                     .resizable(true)
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                    .column(Column::auto().at_least(36.0)) // enabled
-                    .column(Column::auto().at_least(120.0)) // name
-                    .column(Column::auto().at_least(100.0)) // platform
-                    .column(Column::auto().at_least(80.0)) // tool
-                    .column(Column::auto().at_least(150.0)) // method
-                    .column(Column::auto().at_least(56.0)) // interval
-                    .column(Column::auto().at_least(80.0)) // state
-                    .column(Column::auto().at_least(150.0)) // went live
-                    .column(Column::auto().at_least(150.0)) // started on
-                    .column(Column::auto().at_least(72.0)) // lost time
-                    .column(Column::auto().at_least(72.0)) // duration
-                    .column(Column::auto().at_least(90.0)) // added
-                    .column(Column::remainder().at_least(150.0)) // actions
+                    .column(Column::auto().at_least(28.0)) // enabled
+                    .column(Column::auto().at_least(100.0)) // name
+                    .column(Column::auto().at_least(90.0)) // platform
+                    .column(Column::auto().at_least(72.0)) // tool
+                    .column(Column::auto().at_least(76.0)) // method
+                    .column(Column::auto().at_least(44.0)) // interval
+                    .column(Column::auto().at_least(64.0)) // state
+                    .column(Column::auto().at_least(112.0)) // went live
+                    .column(Column::auto().at_least(104.0)) // started on
+                    .column(Column::auto().at_least(58.0)) // lost time
+                    .column(Column::auto().at_least(58.0)) // duration
+                    .column(Column::auto().at_least(80.0)) // added
+                    .column(Column::remainder().at_least(140.0)) // actions
                     .header(20.0, |mut header| {
                         for title in [
                             "On",
@@ -559,7 +563,8 @@ impl StreamArchiverApp {
                                     ui.label(m.tool.label());
                                 });
                                 tr.col(|ui| {
-                                    ui.label(m.detection_method.label());
+                                    ui.label(m.detection_method.short_label())
+                                        .on_hover_text(m.detection_method.label());
                                 });
                                 tr.col(|ui| {
                                     ui.label(format!("{}s", m.poll_interval_secs));
@@ -583,21 +588,36 @@ impl StreamArchiverApp {
                                     ui.label(fmt_date(row.channel.created_at));
                                 });
                                 tr.col(|ui| {
+                                    let recording =
+                                        self.core.active.lock().unwrap().contains_key(&m.id);
                                     ui.push_id(m.id, |ui| {
-                                        if ui.button("Edit").clicked() {
+                                        if recording {
+                                            if ui
+                                                .small_button("⏹")
+                                                .on_hover_text("Stop / abort recording")
+                                                .clicked()
+                                            {
+                                                to_stop = Some(m.id);
+                                            }
+                                        } else if ui
+                                            .small_button("▶")
+                                            .on_hover_text("Start recording now (checks if live)")
+                                            .clicked()
+                                        {
+                                            to_start = Some(m.id);
+                                        }
+                                        if ui.small_button("✏").on_hover_text("Edit").clicked() {
                                             to_edit = Some(i);
                                         }
                                         if ui
-                                            .button("＋Inst")
-                                            .on_hover_text(
-                                                "Add another tool instance for this channel",
-                                            )
+                                            .small_button("➕")
+                                            .on_hover_text("Add another tool instance")
                                             .clicked()
                                         {
                                             to_add_instance = Some(i);
                                         }
                                         if ui
-                                            .button("🗑")
+                                            .small_button("🗑")
                                             .on_hover_text("Delete this instance")
                                             .clicked()
                                         {
@@ -636,6 +656,14 @@ impl StreamArchiverApp {
                 self.status = format!("Error: {e}");
             }
             self.reload_rows();
+        }
+        if let Some(id) = to_start {
+            self.core.manual(ManualCommand::Start(id));
+            self.status = "Checking channel… will record if live.".into();
+        }
+        if let Some(id) = to_stop {
+            self.core.manual(ManualCommand::Stop(id));
+            self.status = "Stopping recording…".into();
         }
     }
 

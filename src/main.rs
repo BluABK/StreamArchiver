@@ -54,6 +54,11 @@ fn main() -> Result<()> {
         let secs: u64 = args.get(pos + 1).and_then(|s| s.parse().ok()).unwrap_or(30);
         return run_headless(secs);
     }
+    if let Some(pos) = args.iter().position(|a| a == "--manual-test") {
+        let id: i64 = args.get(pos + 1).and_then(|s| s.parse().ok()).unwrap_or(1);
+        let secs: u64 = args.get(pos + 2).and_then(|s| s.parse().ok()).unwrap_or(12);
+        return run_manual_test(id, secs);
+    }
 
     // Single-instance guard: hold the loopback bind for the process lifetime.
     let _instance_guard = match platform::acquire_single_instance() {
@@ -368,6 +373,25 @@ fn run_headless(secs: u64) -> Result<()> {
     info!("headless: running core for {secs}s");
     std::thread::sleep(std::time::Duration::from_secs(secs));
     info!("headless: stopping");
+    core.stop_all_recordings();
+    Ok(())
+}
+
+/// `--manual-test <monitor_id> <secs>` exercises the on-demand Start/Stop path:
+/// it DISABLES the monitor (so the scheduler won't touch it), then manually
+/// Starts it, records for <secs>, and Stops it.
+fn run_manual_test(id: i64, secs: u64) -> Result<()> {
+    use events::ManualCommand;
+    let store = Store::open(&app_paths::db_path()).context("opening data store")?;
+    store.set_monitor_enabled(id, false)?; // prove the scheduler isn't doing it
+    let core = AppCore::new(Arc::new(store)).context("starting core")?;
+    core.start();
+    info!("manual-test: Start({id})");
+    core.manual(ManualCommand::Start(id));
+    std::thread::sleep(std::time::Duration::from_secs(secs));
+    info!("manual-test: Stop({id})");
+    core.manual(ManualCommand::Stop(id));
+    std::thread::sleep(std::time::Duration::from_secs(5));
     core.stop_all_recordings();
     Ok(())
 }

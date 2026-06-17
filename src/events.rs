@@ -71,3 +71,12 @@ pub enum UiCommand {
     /// Begin application shutdown.
     Quit,
 }
+
+/// On-demand recording commands from the UI to the download supervisor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManualCommand {
+    /// Check the channel now and, if live, start recording (bypassing backoff).
+    Start(i64),
+    /// Abort the channel's active recording.
+    Stop(i64),
+}

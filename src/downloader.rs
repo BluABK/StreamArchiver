@@ -21,8 +21,9 @@ use tokio::process::Command;
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{info, warn};
 
-use crate::events::{AppEvent, EventTx, LiveSignal};
-use crate::models::{Container, MonitorWithChannel, Platform, Tool, now_unix};
+use crate::detectors::{DetectContext, DetectItem, DetectOutcome};
+use crate::events::{AppEvent, EventTx, LiveSignal, ManualCommand};
+use crate::models::{Container, DetectionMethod, MonitorWithChannel, Platform, Tool, now_unix};
 use crate::platform::ProcessJob;
 use crate::store::Store;
 
@@ -142,6 +143,8 @@ pub struct Supervisor {
     events: EventTx,
     active: ActiveSet,
     shutdown: Arc<AtomicBool>,
+    /// Shared detection context for on-demand (manual Start) liveness checks.
+    ctx: Arc<DetectContext>,
     sem: Arc<Semaphore>,
     backoff: Arc<Mutex<HashMap<i64, BackoffEntry>>>,
 }
@@ -158,6 +161,7 @@ impl Supervisor {
         events: EventTx,
         active: ActiveSet,
         shutdown: Arc<AtomicBool>,
+        ctx: Arc<DetectContext>,
         max_concurrent: usize,
     ) -> Supervisor {
         Supervisor {
@@ -165,43 +169,148 @@ impl Supervisor {
             events,
             active,
             shutdown,
+            ctx,
             sem: Arc::new(Semaphore::new(max_concurrent.max(1))),
             backoff: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Consume "monitor is live" signals and start recordings as needed.
-    pub async fn run(self, mut live_rx: mpsc::UnboundedReceiver<LiveSignal>) {
-        while let Some(signal) = live_rx.recv().await {
-            let monitor_id = signal.monitor_id;
-            if self.shutdown.load(Ordering::SeqCst) {
-                continue; // draining: don't start new recordings
-            }
-            // Dedup against active recordings and honor backoff.
-            {
-                let mut active = self.active.lock().unwrap();
-                if active.contains_key(&monitor_id) {
-                    continue;
+    /// Consume live signals (from detectors) and manual Start/Stop commands.
+    pub async fn run(
+        self,
+        mut live_rx: mpsc::UnboundedReceiver<LiveSignal>,
+        mut manual_rx: mpsc::UnboundedReceiver<ManualCommand>,
+    ) {
+        loop {
+            tokio::select! {
+                Some(signal) = live_rx.recv() => {
+                    if self.shutdown.load(Ordering::SeqCst) {
+                        continue; // draining: don't start new recordings
+                    }
+                    self.try_begin(signal.monitor_id, signal.went_live_at, signal.approximate, false);
                 }
-                if self.in_backoff(monitor_id) {
-                    continue;
-                }
-                active.insert(monitor_id, 0); // reserve; real PID set after spawn
+                Some(cmd) = manual_rx.recv() => match cmd {
+                    ManualCommand::Start(id) => {
+                        let this = self.clone();
+                        tokio::spawn(async move { this.manual_start(id).await });
+                    }
+                    ManualCommand::Stop(id) => self.manual_stop(id),
+                },
+                else => break,
             }
+        }
+    }
 
-            let row = match self.store.get_monitor_with_channel(monitor_id) {
-                Ok(Some(r)) => r,
-                _ => {
-                    self.active.lock().unwrap().remove(&monitor_id);
-                    continue;
-                }
+    /// Reserve the monitor and spawn its recording task. Returns false if it was
+    /// skipped (already active, or in backoff when not bypassing).
+    fn try_begin(
+        &self,
+        monitor_id: i64,
+        went_live_at: Option<i64>,
+        approximate: bool,
+        bypass_backoff: bool,
+    ) -> bool {
+        {
+            let mut active = self.active.lock().unwrap();
+            if active.contains_key(&monitor_id) {
+                return false;
+            }
+            if !bypass_backoff && self.in_backoff(monitor_id) {
+                return false;
+            }
+            active.insert(monitor_id, 0); // reserve; real PID set after spawn
+        }
+        if bypass_backoff {
+            self.backoff.lock().unwrap().remove(&monitor_id);
+        }
+
+        let row = match self.store.get_monitor_with_channel(monitor_id) {
+            Ok(Some(r)) => r,
+            _ => {
+                self.active.lock().unwrap().remove(&monitor_id);
+                return false;
+            }
+        };
+        let this = self.clone();
+        tokio::spawn(async move {
+            this.record(row, went_live_at, approximate).await;
+        });
+        true
+    }
+
+    /// Manual "Start": check the channel now and record if live.
+    async fn manual_start(&self, monitor_id: i64) {
+        if self.active.lock().unwrap().contains_key(&monitor_id) {
+            return; // already recording
+        }
+        let row = match self.store.get_monitor_with_channel(monitor_id) {
+            Ok(Some(r)) => r,
+            _ => return,
+        };
+        let name = row.channel.name.clone();
+        let outcome = self.check_one(&row).await;
+        if outcome.live {
+            let (went, approx) = match outcome.went_live_at {
+                Some(t) => (Some(t), false),
+                None => (Some(now_unix()), true),
             };
-
-            let this = self.clone();
-            tokio::spawn(async move {
-                this.record(row, signal.went_live_at, signal.approximate)
-                    .await;
+            self.try_begin(monitor_id, went, approx, true);
+        } else {
+            let message = if outcome.error && !outcome.detail.is_empty() {
+                format!("{name}: {}", outcome.detail)
+            } else {
+                format!("{name} is not live")
+            };
+            let _ = self.events.send(AppEvent::Error {
+                context: "Start".into(),
+                message,
             });
+        }
+    }
+
+    /// Manual "Stop": abort the active recording and apply a short cooldown so it
+    /// doesn't immediately restart on the next poll.
+    fn manual_stop(&self, monitor_id: i64) {
+        let pid = self.active.lock().unwrap().get(&monitor_id).copied();
+        if let Some(pid) = pid {
+            if pid > 0 {
+                crate::platform::kill_process_tree(pid);
+            }
+            self.backoff.lock().unwrap().insert(
+                monitor_id,
+                BackoffEntry {
+                    fails: 0,
+                    until: Instant::now() + Duration::from_secs(120),
+                },
+            );
+            info!(monitor_id, "manual stop");
+        }
+    }
+
+    /// One-shot liveness check for a monitor, dispatched by detection method.
+    async fn check_one(&self, row: &MonitorWithChannel) -> DetectOutcome {
+        let item = DetectItem {
+            monitor_id: row.monitor.id,
+            url: row.channel.url.clone(),
+            platform: row.channel.platform,
+        };
+        match row.monitor.detection_method {
+            // EventSub is push-only; check liveness now via Helix.
+            DetectionMethod::TwitchApi | DetectionMethod::EventSub => self
+                .ctx
+                .detect_twitch(std::slice::from_ref(&item))
+                .await
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| DetectOutcome {
+                    monitor_id: item.monitor_id,
+                    live: false,
+                    detail: "no result".into(),
+                    error: true,
+                    went_live_at: None,
+                }),
+            DetectionMethod::GenericProbe => self.ctx.detect_generic(&item).await,
+            _ => self.ctx.detect_scrape(&item).await,
         }
     }
 

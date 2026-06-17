@@ -174,6 +174,18 @@ impl DetectionMethod {
         }
     }
 
+    /// Compact label for the channel table column.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            DetectionMethod::TwitchApi => "Helix API",
+            DetectionMethod::YouTubeApi => "YT API",
+            DetectionMethod::Scrape => "Scrape",
+            DetectionMethod::CliSelfPoll => "CLI",
+            DetectionMethod::GenericProbe => "Probe",
+            DetectionMethod::EventSub => "EventSub",
+        }
+    }
+
     pub fn parse(s: &str) -> DetectionMethod {
         match s {
             "twitch_api" => DetectionMethod::TwitchApi,
