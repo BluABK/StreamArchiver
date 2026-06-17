@@ -91,6 +91,7 @@ impl Platform {
         match self {
             Platform::Twitch => &[
                 DetectionMethod::TwitchApi,
+                DetectionMethod::EventSub,
                 DetectionMethod::Scrape,
                 DetectionMethod::GenericProbe,
             ],

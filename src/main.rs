@@ -6,6 +6,7 @@ mod app_core;
 mod app_paths;
 mod detectors;
 mod downloader;
+mod eventsub;
 mod events;
 mod models;
 mod notifications;

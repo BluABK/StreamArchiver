@@ -59,9 +59,17 @@ impl AppCore {
         let events = self.events.clone();
         let active_sched = self.active.clone();
         let shutdown_sched = self.shutdown.clone();
+        let live_tx_sched = live_tx.clone();
         self.rt.spawn(async move {
             let ctx = Arc::new(crate::detectors::DetectContext::new(store));
-            crate::scheduler::run(ctx, events, live_tx, active_sched, shutdown_sched).await;
+            crate::scheduler::run(ctx, events, live_tx_sched, active_sched, shutdown_sched).await;
+        });
+
+        // Twitch EventSub real-time push -> live signals (idles if unused).
+        let es_store = self.store.clone();
+        let es_shutdown = self.shutdown.clone();
+        self.rt.spawn(async move {
+            crate::eventsub::run(es_store, live_tx, es_shutdown).await;
         });
 
         // Supervisor: live signals -> recordings.

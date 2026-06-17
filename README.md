@@ -15,8 +15,9 @@ small.
 | 1 — Tray app, on-demand UI, SQLite store, settings, autostart | ✅ |
 | 2 — Shared batched poll scheduler + detectors (Twitch API, YouTube/Kick scrape, generic probe) | ✅ |
 | 3 — Download supervisor (record → `.ts`, remux → MKV, tree-kill, backoff, orphan recovery) | ✅ |
-| 4 — Graceful finalize-on-stop, desktop notifications | ✅ (in progress) |
-| 4 — Twitch EventSub real-time push, installer | ⏳ planned |
+| 4 — Graceful finalize-on-stop, desktop notifications | ✅ |
+| 4 — Twitch EventSub real-time push (conduit) | ✅ (needs live Twitch creds to verify) |
+| 4 — Installer / packaging | ⏳ planned |
 
 ## Requirements
 
@@ -50,8 +51,14 @@ recordings (finalizing the MKV) before exiting.
 | Method | Platforms | Needs creds | Notes |
 |---|---|---|---|
 | Twitch API (Helix) | Twitch | Yes | Batched, scales to many channels; **default for Twitch**. |
+| Twitch EventSub | Twitch | Yes (same app creds) | Real-time push via conduit + websocket (no polling, no public endpoint). Reconciles on connect. |
 | Scrape poll | YouTube `/live`, Kick, generic | No | **Default for YouTube/Kick**; fragile to site changes. |
 | Generic probe | any streamlink/yt-dlp URL | No | Uses `streamlink --stream-url` to test liveness. |
+
+> To verify EventSub: set Twitch creds, add a Twitch channel with method **Twitch
+> EventSub**, then `streamarchiver --run-for 120` with `RUST_LOG=info` — it logs
+> `eventsub: connected (conduit …); N channel(s) subscribed` and
+> `stream.online -> monitor N` when a channel goes live.
 
 > Tool tip: use **streamlink for Twitch** (reaches 1440p/2K HEVC) and **yt-dlp for
 > YouTube** (`--live-from-start`; streamlink hits YouTube segment 403s). The app
@@ -105,7 +112,6 @@ egui window (on demand) ◄── events ──┘
 
 ## Roadmap
 
-- Twitch **EventSub** conduit (real-time push; lower latency than polling).
-- YouTube Data API / Kick official API detectors.
+- YouTube Data API / Kick official API detectors (current scrape works without keys).
 - Installer + AppUserModelID (for branded Windows toast notifications).
 - macOS/Linux polish (tray via `ksni`, process-group kill).
