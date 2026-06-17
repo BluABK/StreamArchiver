@@ -477,7 +477,14 @@ mod tests {
 
         store.set_monitor_enabled(m1, false).unwrap();
         let rows = store.list_monitors_with_channels().unwrap();
-        assert!(!rows.iter().find(|r| r.monitor.id == m1).unwrap().monitor.enabled);
+        assert!(
+            !rows
+                .iter()
+                .find(|r| r.monitor.id == m1)
+                .unwrap()
+                .monitor
+                .enabled
+        );
 
         store.delete_monitor(m2).unwrap();
         assert_eq!(store.list_monitors_with_channels().unwrap().len(), 1);

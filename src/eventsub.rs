@@ -40,10 +40,14 @@ const IDLE_RETRY: Duration = Duration::from_secs(30);
 
 /// Run the EventSub manager until shutdown. Idles cheaply when there are no
 /// Twitch monitors using the EventSub method.
-pub async fn run(store: Arc<Store>, live_tx: UnboundedSender<LiveSignal>, shutdown: Arc<AtomicBool>) {
+pub async fn run(
+    store: Arc<Store>,
+    live_tx: UnboundedSender<LiveSignal>,
+    shutdown: Arc<AtomicBool>,
+) {
     while !shutdown.load(Ordering::SeqCst) {
         match run_session(&store, &live_tx, &shutdown).await {
-            Ok(true) => {}                       // session ran; reconnect promptly
+            Ok(true) => {} // session ran; reconnect promptly
             Ok(false) => sleep_cancellable(IDLE_RETRY, &shutdown).await, // nothing to do
             Err(e) => {
                 warn!("eventsub: {e:#}");
@@ -95,7 +99,8 @@ async fn run_session(
         .context("connecting eventsub websocket")?;
     let (session_id, keepalive) = read_welcome(&mut ws).await?;
     bind_shard(&http, &client_id, &token, &conduit_id, &session_id).await?;
-    let subscribed = subscribe_online(&http, &client_id, &token, &conduit_id, &uid_to_monitors).await;
+    let subscribed =
+        subscribe_online(&http, &client_id, &token, &conduit_id, &uid_to_monitors).await;
     info!(
         "eventsub: connected (conduit {conduit_id}); {subscribed}/{} channel(s) subscribed",
         uid_to_monitors.len()
@@ -253,7 +258,11 @@ async fn ensure_conduit(http: &Client, client_id: &str, token: &str) -> Result<S
         .await?;
     if resp.status().is_success() {
         let v: Value = resp.json().await?;
-        if let Some(id) = v["data"].as_array().and_then(|a| a.first()).and_then(|c| c["id"].as_str()) {
+        if let Some(id) = v["data"]
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|c| c["id"].as_str())
+        {
             return Ok(id.to_string());
         }
     }
@@ -290,7 +299,10 @@ async fn read_welcome(
     };
     let v: Value = serde_json::from_str(&text)?;
     if v["metadata"]["message_type"].as_str() != Some("session_welcome") {
-        bail!("expected session_welcome, got {}", v["metadata"]["message_type"]);
+        bail!(
+            "expected session_welcome, got {}",
+            v["metadata"]["message_type"]
+        );
     }
     let session_id = v["payload"]["session"]["id"]
         .as_str()
@@ -362,7 +374,11 @@ async fn subscribe_online(
     covered
 }
 
-async fn existing_online_subs(http: &Client, client_id: &str, token: &str) -> std::collections::HashSet<String> {
+async fn existing_online_subs(
+    http: &Client,
+    client_id: &str,
+    token: &str,
+) -> std::collections::HashSet<String> {
     let mut set = std::collections::HashSet::new();
     let resp = http
         .get(format!("{HELIX}/eventsub/subscriptions"))
@@ -415,7 +431,8 @@ async fn reconcile(
                             if let Some(login) = s["user_login"].as_str() {
                                 if let Some(mons) = login_to_monitors.get(&login.to_lowercase()) {
                                     for &mid in mons {
-                                        let _ = live_tx.send(LiveSignal::new(mid, went_live, false));
+                                        let _ =
+                                            live_tx.send(LiveSignal::new(mid, went_live, false));
                                     }
                                 }
                             }
@@ -439,7 +456,9 @@ async fn sleep_cancellable(dur: Duration, shutdown: &Arc<AtomicBool>) {
 
 /// Parse an RFC3339 timestamp (Twitch `started_at`) to unix seconds.
 fn parse_ts(s: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.timestamp())
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.timestamp())
 }
 
 /// Extract the Twitch login from a channel URL (`twitch.tv/<login>`).

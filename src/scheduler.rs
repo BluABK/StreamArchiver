@@ -135,7 +135,10 @@ async fn tick(
             .store
             .set_monitor_check_result(o.monitor_id, new_state, checked_at)
         {
-            warn!("scheduler: failed to persist state for {}: {e:#}", o.monitor_id);
+            warn!(
+                "scheduler: failed to persist state for {}: {e:#}",
+                o.monitor_id
+            );
         }
         let changed = prev_state.get(&o.monitor_id).map(String::as_str) != Some(new_state);
         if changed {

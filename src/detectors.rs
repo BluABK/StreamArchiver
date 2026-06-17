@@ -24,8 +24,7 @@ use tracing::debug;
 use crate::models::Platform;
 use crate::store::Store;
 
-const UA: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -60,7 +59,11 @@ impl DetectOutcome {
             went_live_at: None,
         }
     }
-    fn live_at(monitor_id: i64, detail: impl Into<String>, went_live_at: Option<i64>) -> DetectOutcome {
+    fn live_at(
+        monitor_id: i64,
+        detail: impl Into<String>,
+        went_live_at: Option<i64>,
+    ) -> DetectOutcome {
         DetectOutcome {
             went_live_at,
             ..DetectOutcome::live(monitor_id, detail)
@@ -88,7 +91,9 @@ impl DetectOutcome {
 
 /// Parse an RFC3339/ISO8601 timestamp (e.g. Twitch `started_at`) to unix seconds.
 fn parse_rfc3339(s: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.timestamp())
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.timestamp())
 }
 
 struct TwitchToken {
@@ -125,7 +130,10 @@ impl DetectContext {
                 return Ok(tok.access_token.clone());
             }
         }
-        let client_id = self.store.get_setting("twitch_client_id")?.unwrap_or_default();
+        let client_id = self
+            .store
+            .get_setting("twitch_client_id")?
+            .unwrap_or_default();
         let client_secret = self
             .store
             .get_setting("twitch_client_secret")?
@@ -188,7 +196,10 @@ impl DetectContext {
         for it in items {
             match twitch_login(&it.url) {
                 Some(login) => login_to_mons.entry(login).or_default().push(it.monitor_id),
-                None => outcomes.push(DetectOutcome::err(it.monitor_id, "cannot parse twitch login")),
+                None => outcomes.push(DetectOutcome::err(
+                    it.monitor_id,
+                    "cannot parse twitch login",
+                )),
             }
         }
 
@@ -232,7 +243,10 @@ impl DetectContext {
                         Err(e) => {
                             for l in chunk {
                                 for mid in &login_to_mons[l] {
-                                    outcomes.push(DetectOutcome::err(*mid, format!("helix parse: {e}")));
+                                    outcomes.push(DetectOutcome::err(
+                                        *mid,
+                                        format!("helix parse: {e}"),
+                                    ));
                                 }
                             }
                             continue;
@@ -424,7 +438,10 @@ mod tests {
 
     #[test]
     fn parse_twitch_login() {
-        assert_eq!(twitch_login("https://twitch.tv/Foo").as_deref(), Some("foo"));
+        assert_eq!(
+            twitch_login("https://twitch.tv/Foo").as_deref(),
+            Some("foo")
+        );
         assert_eq!(
             twitch_login("https://www.twitch.tv/foo/videos?x=1").as_deref(),
             Some("foo")

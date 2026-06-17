@@ -6,8 +6,8 @@ mod app_core;
 mod app_paths;
 mod detectors;
 mod downloader;
-mod eventsub;
 mod events;
+mod eventsub;
 mod models;
 mod notifications;
 mod platform;
@@ -209,8 +209,11 @@ fn run_add(args: &[String], pos: usize) -> Result<()> {
         .get(pos + 4)
         .map(|s| models::Tool::parse(s))
         .unwrap_or_else(|| platform.default_tool());
-    let output_dir = std::env::var("STREAMARCHIVER_OUT")
-        .unwrap_or_else(|_| app_paths::default_output_dir().to_string_lossy().to_string());
+    let output_dir = std::env::var("STREAMARCHIVER_OUT").unwrap_or_else(|_| {
+        app_paths::default_output_dir()
+            .to_string_lossy()
+            .to_string()
+    });
 
     let store = Store::open(&app_paths::db_path()).context("opening data store")?;
     let channel_id = store.upsert_channel(&name, &url, platform)?;
@@ -263,8 +266,11 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
     if url.is_empty() {
         anyhow::bail!("usage: streamarchiver --capture-test <tool> <url> <secs>");
     }
-    let out_dir = std::env::var("STREAMARCHIVER_OUT")
-        .unwrap_or_else(|_| app_paths::default_output_dir().to_string_lossy().to_string());
+    let out_dir = std::env::var("STREAMARCHIVER_OUT").unwrap_or_else(|_| {
+        app_paths::default_output_dir()
+            .to_string_lossy()
+            .to_string()
+    });
     let row = models::MonitorWithChannel {
         channel: models::Channel {
             id: 0,
@@ -311,20 +317,37 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
             .stderr(Stdio::null());
         let mut child = cmd.spawn().context("spawn tool")?;
         let pid = child.id().unwrap_or(0);
-        println!("spawned {} pid={pid}; recording {secs}s -> {}", plan.program, plan.capture_path.display());
+        println!(
+            "spawned {} pid={pid}; recording {secs}s -> {}",
+            plan.program,
+            plan.capture_path.display()
+        );
         tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
 
         platform::kill_process_tree(pid);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-        let ts_len = tokio::fs::metadata(&plan.capture_path).await.map(|m| m.len()).unwrap_or(0);
-        println!("captured .ts: {} KB (survives the hard kill)", ts_len / 1024);
+        let ts_len = tokio::fs::metadata(&plan.capture_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        println!(
+            "captured .ts: {} KB (survives the hard kill)",
+            ts_len / 1024
+        );
         if plan.remux_to_mkv && ts_len > 0 {
             match downloader::remux_ts_to_mkv(&plan.capture_path, &plan.final_path).await {
                 Ok(()) => {
-                    let mkv = tokio::fs::metadata(&plan.final_path).await.map(|m| m.len()).unwrap_or(0);
-                    println!("remuxed -> {} ({} KB)", plan.final_path.display(), mkv / 1024);
+                    let mkv = tokio::fs::metadata(&plan.final_path)
+                        .await
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    println!(
+                        "remuxed -> {} ({} KB)",
+                        plan.final_path.display(),
+                        mkv / 1024
+                    );
                 }
                 Err(e) => println!("remux failed: {e:#}"),
             }

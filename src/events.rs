@@ -11,19 +11,28 @@ use tokio::sync::broadcast;
 #[derive(Clone, Debug)]
 pub enum AppEvent {
     /// A monitor's live/recording state changed (e.g. "idle" -> "live").
-    MonitorState { monitor_id: i64, state: String },
+    MonitorState {
+        monitor_id: i64,
+        state: String,
+    },
     RecordingStarted {
         monitor_id: i64,
         recording_id: i64,
         channel: String,
     },
-    Progress { recording_id: i64, bytes: u64 },
+    Progress {
+        recording_id: i64,
+        bytes: u64,
+    },
     RecordingFinished {
         recording_id: i64,
         channel: String,
         status: String,
     },
-    Error { context: String, message: String },
+    Error {
+        context: String,
+        message: String,
+    },
 }
 
 pub type EventTx = broadcast::Sender<AppEvent>;

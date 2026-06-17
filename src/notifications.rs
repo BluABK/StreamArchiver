@@ -19,7 +19,9 @@ pub async fn run(mut rx: EventRx) {
             Ok(AppEvent::RecordingStarted { channel, .. }) => {
                 notify("Recording started", &channel);
             }
-            Ok(AppEvent::RecordingFinished { channel, status, .. }) => {
+            Ok(AppEvent::RecordingFinished {
+                channel, status, ..
+            }) => {
                 notify("Recording finished", &format!("{channel} — {status}"));
             }
             Ok(AppEvent::Error { context, message }) => {

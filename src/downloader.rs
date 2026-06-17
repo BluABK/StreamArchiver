@@ -114,7 +114,13 @@ pub fn build_plan(row: &MonitorWithChannel, started_at: i64) -> DownloadPlan {
             ("yt-dlp".to_string(), args)
         }
         Tool::Ffmpeg => {
-            let mut args = vec!["-y".to_string(), "-i".into(), ch.url.clone(), "-c".into(), "copy".into()];
+            let mut args = vec![
+                "-y".to_string(),
+                "-i".into(),
+                ch.url.clone(),
+                "-c".into(),
+                "copy".into(),
+            ];
             args.extend(extra);
             args.push(ts_str);
             ("ffmpeg".to_string(), args)
@@ -193,7 +199,8 @@ impl Supervisor {
 
             let this = self.clone();
             tokio::spawn(async move {
-                this.record(row, signal.went_live_at, signal.approximate).await;
+                this.record(row, signal.went_live_at, signal.approximate)
+                    .await;
             });
         }
     }
@@ -219,7 +226,12 @@ impl Supervisor {
             entry.fails = entry.fails.saturating_add(1);
             let wait = (30u64 * entry.fails as u64).min(600);
             entry.until = Instant::now() + Duration::from_secs(wait);
-            warn!(monitor_id, fails = entry.fails, wait, "recording failed quickly; backing off");
+            warn!(
+                monitor_id,
+                fails = entry.fails,
+                wait,
+                "recording failed quickly; backing off"
+            );
         }
     }
 
@@ -402,7 +414,10 @@ pub async fn remux_ts_to_mkv(src: &Path, dst: &Path) -> anyhow::Result<()> {
 }
 
 async fn file_len(path: &Path) -> u64 {
-    tokio::fs::metadata(path).await.map(|m| m.len()).unwrap_or(0)
+    tokio::fs::metadata(path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0)
 }
 
 /// Minimal whitespace arg splitter (double-quoted segments kept together).
@@ -469,7 +484,11 @@ fn sanitize_filename(s: &str) -> String {
 fn civil_from_unix_utc(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);
-    let (hh, mm, ss) = ((rem / 3600) as u32, ((rem % 3600) / 60) as u32, (rem % 60) as u32);
+    let (hh, mm, ss) = (
+        (rem / 3600) as u32,
+        ((rem % 3600) / 60) as u32,
+        (rem % 60) as u32,
+    );
 
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -526,7 +545,10 @@ mod tests {
     #[test]
     fn civil_date_known_value() {
         // 1700000000 = 2023-11-14 22:13:20 UTC
-        assert_eq!(civil_from_unix_utc(1_700_000_000), (2023, 11, 14, 22, 13, 20));
+        assert_eq!(
+            civil_from_unix_utc(1_700_000_000),
+            (2023, 11, 14, 22, 13, 20)
+        );
     }
 
     #[test]
@@ -537,18 +559,28 @@ mod tests {
 
     #[test]
     fn streamlink_mkv_records_ts_then_remuxes() {
-        let plan = build_plan(&row(Tool::Streamlink, Container::Mkv, Platform::Twitch), 1_700_000_000);
+        let plan = build_plan(
+            &row(Tool::Streamlink, Container::Mkv, Platform::Twitch),
+            1_700_000_000,
+        );
         assert_eq!(plan.program, "streamlink");
         assert!(plan.capture_path.to_string_lossy().ends_with(".ts"));
         assert!(plan.final_path.to_string_lossy().ends_with(".mkv"));
         assert!(plan.remux_to_mkv);
-        assert!(plan.args.iter().any(|a| a.contains("twitch-supported-codecs")));
+        assert!(
+            plan.args
+                .iter()
+                .any(|a| a.contains("twitch-supported-codecs"))
+        );
         assert!(plan.args.iter().any(|a| a == "best"));
     }
 
     #[test]
     fn ytdlp_mkv_records_ts_then_remuxes() {
-        let plan = build_plan(&row(Tool::YtDlp, Container::Mkv, Platform::YouTube), 1_700_000_000);
+        let plan = build_plan(
+            &row(Tool::YtDlp, Container::Mkv, Platform::YouTube),
+            1_700_000_000,
+        );
         assert_eq!(plan.program, "yt-dlp");
         assert!(plan.capture_path.to_string_lossy().ends_with(".ts"));
         assert!(plan.final_path.to_string_lossy().ends_with(".mkv"));
@@ -559,7 +591,10 @@ mod tests {
 
     #[test]
     fn streamlink_ts_keeps_ts() {
-        let plan = build_plan(&row(Tool::Streamlink, Container::Ts, Platform::Twitch), 1_700_000_000);
+        let plan = build_plan(
+            &row(Tool::Streamlink, Container::Ts, Platform::Twitch),
+            1_700_000_000,
+        );
         assert!(plan.final_path.to_string_lossy().ends_with(".ts"));
         assert!(!plan.remux_to_mkv);
     }
