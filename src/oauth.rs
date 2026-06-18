@@ -207,8 +207,15 @@ pub fn connected_login(store: &Store) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Return a valid user access token, refreshing it if it's near expiry. Returns
-/// `None` if not connected (or refresh failed with no usable token).
+/// Return a *usable* user access token, refreshing it if it's near/past expiry.
+///
+/// Returns `None` when not connected, or when the token is expired and can't be
+/// refreshed — so the caller falls back (app token) or prompts a reconnect
+/// rather than sending a known-dead token (which Helix rejects with 401).
+///
+/// Device-code public clients refresh without a Client Secret; the refresh token
+/// is one-time-use and rotates, so the rotated token is persisted on success.
+/// Callers should serialize calls to avoid double-spending the refresh token.
 pub async fn valid_user_token(http: &Client, store: &Store) -> Option<String> {
     let token = store.get_setting(K_USER_TOKEN).ok().flatten()?;
     if token.is_empty() {
@@ -220,10 +227,12 @@ pub async fn valid_user_token(http: &Client, store: &Store) -> Option<String> {
         .flatten()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    // Comfortably within the token's lifetime — use it as-is.
     if now_unix() < expiry - 60 {
         return Some(token);
     }
-    // Near/!past expiry — try to refresh.
+
+    // At/near/past expiry: attempt a refresh.
     let refresh_token = store
         .get_setting(K_REFRESH)
         .ok()
@@ -239,15 +248,51 @@ pub async fn valid_user_token(http: &Client, store: &Store) -> Option<String> {
         .ok()
         .flatten()
         .unwrap_or_default();
-    if refresh_token.is_empty() || client_id.is_empty() {
-        return Some(token); // best effort with the (possibly stale) token
-    }
-    match refresh(http, &client_id, &client_secret, &refresh_token).await {
-        Ok(t) => {
+    if !refresh_token.is_empty() && !client_id.is_empty() {
+        if let Ok(t) = refresh(http, &client_id, &client_secret, &refresh_token).await {
             let login = connected_login(store).unwrap_or_default();
             let _ = store_tokens(store, &t, &login);
-            Some(t.access)
+            return Some(t.access);
         }
-        Err(_) => Some(token),
+    }
+
+    // Refresh unavailable or failed. Hand back the old token only if it's still
+    // within its lifetime (a brief best-effort window); once actually expired,
+    // return None so we don't 401-loop on a dead token.
+    if now_unix() < expiry {
+        Some(token)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn valid_user_token_drops_dead_token() {
+        let store = Store::open_in_memory().unwrap();
+        let http = Client::new();
+
+        // Not connected -> None.
+        assert!(valid_user_token(&http, &store).await.is_none());
+
+        // Expired token with no refresh token -> None (don't return a dead token
+        // that Helix would 401). No network call: refresh is skipped.
+        store.set_setting(K_USER_TOKEN, "deadbeef").unwrap();
+        store
+            .set_setting(K_EXPIRY, &(now_unix() - 3600).to_string())
+            .unwrap();
+        assert!(valid_user_token(&http, &store).await.is_none());
+
+        // Comfortably valid token -> returned as-is (no refresh attempted).
+        store
+            .set_setting(K_EXPIRY, &(now_unix() + 3600).to_string())
+            .unwrap();
+        assert_eq!(
+            valid_user_token(&http, &store).await.as_deref(),
+            Some("deadbeef")
+        );
     }
 }

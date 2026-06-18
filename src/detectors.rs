@@ -97,6 +97,15 @@ fn parse_rfc3339(s: &str) -> Option<i64> {
         .map(|dt| dt.timestamp())
 }
 
+/// Turn a raw "no Twitch auth available" error into actionable UI guidance.
+fn twitch_auth_error(raw: &str) -> String {
+    if raw.contains("credentials not set") {
+        "Twitch not authenticated — Connect Twitch in Settings, or set Client ID + Secret".into()
+    } else {
+        raw.to_string()
+    }
+}
+
 struct TwitchToken {
     access_token: String,
     expires_at: Instant,
@@ -108,6 +117,9 @@ pub struct DetectContext {
     pub store: Arc<Store>,
     twitch_token: Mutex<Option<TwitchToken>>,
     kick_token: Mutex<Option<TwitchToken>>,
+    /// Serializes user-token refresh: Twitch device-code refresh tokens are
+    /// one-time-use, so concurrent detection passes must not double-spend one.
+    twitch_refresh: Mutex<()>,
 }
 
 impl DetectContext {
@@ -122,6 +134,7 @@ impl DetectContext {
             store,
             twitch_token: Mutex::new(None),
             kick_token: Mutex::new(None),
+            twitch_refresh: Mutex::new(()),
         }
     }
 
@@ -178,20 +191,6 @@ impl DetectContext {
     }
 
     pub async fn detect_twitch(&self, items: &[DetectItem]) -> Vec<DetectOutcome> {
-        // Prefer a connected user token (OAuth "Connect Twitch"); fall back to an
-        // app token (client-credentials, which needs the Client Secret).
-        let token = match crate::oauth::valid_user_token(&self.http, self.store.as_ref()).await {
-            Some(t) => t,
-            None => match self.twitch_app_token().await {
-                Ok(t) => t,
-                Err(e) => {
-                    return items
-                        .iter()
-                        .map(|it| DetectOutcome::err(it.monitor_id, e.to_string()))
-                        .collect();
-                }
-            },
-        };
         let client_id = self
             .store
             .get_setting("twitch_client_id")
@@ -211,78 +210,139 @@ impl DetectContext {
             }
         }
 
+        // Resolve an auth token: a connected user token (refreshed if needed,
+        // serialized because device-code refresh tokens are one-time-use), else an
+        // app token (client-credentials, which needs the Client Secret).
+        let user_token = {
+            let _guard = self.twitch_refresh.lock().await;
+            crate::oauth::valid_user_token(&self.http, self.store.as_ref()).await
+        };
+        let mut using_user_token = user_token.is_some();
+        let mut token = match user_token {
+            Some(t) => t,
+            None => match self.twitch_app_token().await {
+                Ok(t) => t,
+                Err(e) => {
+                    let msg = twitch_auth_error(&e.to_string());
+                    for mons in login_to_mons.values() {
+                        for mid in mons {
+                            outcomes.push(DetectOutcome::err(*mid, msg.clone()));
+                        }
+                    }
+                    return outcomes;
+                }
+            },
+        };
+
+        #[derive(Deserialize)]
+        struct Stream {
+            user_login: String,
+            #[serde(rename = "type")]
+            kind: String,
+            started_at: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct StreamsResp {
+            data: Vec<Stream>,
+        }
+
         let logins: Vec<String> = login_to_mons.keys().cloned().collect();
         for chunk in logins.chunks(100) {
             let query: Vec<(&str, &str)> =
                 chunk.iter().map(|l| ("user_login", l.as_str())).collect();
-            let resp = self
-                .http
-                .get("https://api.twitch.tv/helix/streams")
-                .header("Client-Id", &client_id)
-                .bearer_auth(&token)
-                .query(&query)
-                .send()
-                .await;
+            // Up to two attempts: the chosen token, then an app-token fallback if a
+            // user token is rejected (stale/revoked/Client-Id mismatch -> 401).
+            loop {
+                let resp = self
+                    .http
+                    .get("https://api.twitch.tv/helix/streams")
+                    .header("Client-Id", &client_id)
+                    .bearer_auth(&token)
+                    .query(&query)
+                    .send()
+                    .await;
 
-            match resp {
-                Ok(r) if r.status().is_success() => {
-                    #[derive(Deserialize)]
-                    struct Stream {
-                        user_login: String,
-                        #[serde(rename = "type")]
-                        kind: String,
-                        started_at: Option<String>,
-                    }
-                    #[derive(Deserialize)]
-                    struct StreamsResp {
-                        data: Vec<Stream>,
-                    }
-                    // login -> go-live time (unix), for currently-live channels.
-                    let live: HashMap<String, Option<i64>> = match r.json::<StreamsResp>().await {
-                        Ok(sr) => sr
-                            .data
-                            .into_iter()
-                            .filter(|s| s.kind == "live")
-                            .map(|s| {
-                                let when = s.started_at.as_deref().and_then(parse_rfc3339);
-                                (s.user_login.to_lowercase(), when)
-                            })
-                            .collect(),
-                        Err(e) => {
-                            for l in chunk {
-                                for mid in &login_to_mons[l] {
-                                    outcomes.push(DetectOutcome::err(
-                                        *mid,
-                                        format!("helix parse: {e}"),
-                                    ));
+                match resp {
+                    Ok(r) if r.status().is_success() => {
+                        // login -> go-live time (unix), for currently-live channels.
+                        let live: HashMap<String, Option<i64>> = match r.json::<StreamsResp>().await
+                        {
+                            Ok(sr) => sr
+                                .data
+                                .into_iter()
+                                .filter(|s| s.kind == "live")
+                                .map(|s| {
+                                    let when = s.started_at.as_deref().and_then(parse_rfc3339);
+                                    (s.user_login.to_lowercase(), when)
+                                })
+                                .collect(),
+                            Err(e) => {
+                                for l in chunk {
+                                    for mid in &login_to_mons[l] {
+                                        outcomes.push(DetectOutcome::err(
+                                            *mid,
+                                            format!("helix parse: {e}"),
+                                        ));
+                                    }
                                 }
+                                break;
                             }
-                            continue;
+                        };
+                        for l in chunk {
+                            let key = l.to_lowercase();
+                            for mid in &login_to_mons[l] {
+                                outcomes.push(match live.get(&key) {
+                                    Some(went) => DetectOutcome::live_at(*mid, "live", *went),
+                                    None => DetectOutcome::offline(*mid),
+                                });
+                            }
                         }
-                    };
-                    for l in chunk {
-                        let key = l.to_lowercase();
-                        for mid in &login_to_mons[l] {
-                            outcomes.push(match live.get(&key) {
-                                Some(went) => DetectOutcome::live_at(*mid, "live", *went),
-                                None => DetectOutcome::offline(*mid),
-                            });
+                        break;
+                    }
+                    // A user token was rejected — fall back to the app token once.
+                    Ok(r)
+                        if r.status() == reqwest::StatusCode::UNAUTHORIZED && using_user_token =>
+                    {
+                        match self.twitch_app_token().await {
+                            Ok(app) => {
+                                token = app;
+                                using_user_token = false;
+                                continue;
+                            }
+                            Err(_) => {
+                                for l in chunk {
+                                    for mid in &login_to_mons[l] {
+                                        outcomes.push(DetectOutcome::err(
+                                            *mid,
+                                            "Twitch token expired — reconnect in Settings, or set a Client Secret",
+                                        ));
+                                    }
+                                }
+                                break;
+                            }
                         }
                     }
-                }
-                Ok(r) => {
-                    let status = r.status();
-                    for l in chunk {
-                        for mid in &login_to_mons[l] {
-                            outcomes.push(DetectOutcome::err(*mid, format!("helix {status}")));
+                    Ok(r) => {
+                        let status = r.status();
+                        let msg = if status == reqwest::StatusCode::UNAUTHORIZED {
+                            "Twitch auth rejected (401) — reconnect in Settings or check Client ID/Secret".to_string()
+                        } else {
+                            format!("helix {status}")
+                        };
+                        for l in chunk {
+                            for mid in &login_to_mons[l] {
+                                outcomes.push(DetectOutcome::err(*mid, msg.clone()));
+                            }
                         }
+                        break;
                     }
-                }
-                Err(e) => {
-                    for l in chunk {
-                        for mid in &login_to_mons[l] {
-                            outcomes.push(DetectOutcome::err(*mid, e.to_string()));
+                    Err(e) => {
+                        for l in chunk {
+                            for mid in &login_to_mons[l] {
+                                outcomes.push(DetectOutcome::err(*mid, e.to_string()));
+                            }
                         }
+                        break;
                     }
                 }
             }
