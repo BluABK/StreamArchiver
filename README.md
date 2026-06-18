@@ -57,10 +57,19 @@ The window has three tabs: **Streams** (monitor channels for live broadcasts),
 The **Videos** tab downloads a *specific* video or VOD now — a YouTube video, a
 Twitch VOD, or any `streamlink`/`yt-dlp` URL — rather than watching a channel for
 live streams. Paste a URL in the form at the bottom, adjust the settings shown
-alongside it (**tool** — auto-picked from the platform, **quality**, **auth**,
-output folder, filename template, extra args), and click **Download**. Output is
-always **MKV** (yt-dlp remuxes to MKV; streamlink/ffmpeg capture to `.ts` then
-remux). Downloads share the same global concurrency limit as live recordings.
+alongside it (**tool**, **quality**, **auth**, output folder, filename template,
+extra args), and click **Download**. Output is always **MKV** (yt-dlp remuxes to
+MKV; streamlink/ffmpeg capture to `.ts` then remux). Downloads share the same
+global concurrency limit as live recordings.
+
+**Per-platform defaults.** The form pre-fills from saved defaults for the pasted
+URL's platform; edit any field to override it for that download. Expand
+**⚙ Per-platform download defaults** (collapsible, on the Videos tab) to set the
+default tool/quality/auth/output/filename/extra args for Twitch, YouTube, Kick,
+and Generic — saved automatically. The form's **Auth** has a **Default
+(per-platform)** option (selected by default, uses the platform default's auth)
+plus the explicit choices; **Inherit (global)** stays available and chains to the
+Settings → *Download authentication* default.
 
 Each row shows status (`queued` → `downloading` → `completed`/`failed`/`stopped`)
 and size, with per-row actions: **Stop**, **Retry**, **Open folder**, **Open

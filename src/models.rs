@@ -389,6 +389,77 @@ impl Video {
     }
 }
 
+/// Default download settings for one platform, used to pre-fill the Videos-tab
+/// download form. The form copies these in when the pasted URL's platform
+/// changes; the user can then override any field per download.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlatformDownloadDefault {
+    pub tool: Tool,
+    pub quality: String,
+    /// Auth used when the form's auth is left at "Default" (`Inherit` chains to
+    /// the global Settings download-auth method).
+    pub auth_kind: AuthKind,
+    pub auth_value: String,
+    pub output_dir: String,
+    pub filename_template: String,
+    pub extra_args: String,
+}
+
+impl PlatformDownloadDefault {
+    /// Built-in starting values for a platform (best quality, platform's
+    /// preferred tool, global auth, the app's default output folder).
+    pub fn seeded(platform: Platform, default_output_dir: &str) -> PlatformDownloadDefault {
+        PlatformDownloadDefault {
+            tool: platform.default_tool(),
+            quality: "best".into(),
+            auth_kind: AuthKind::Inherit,
+            auth_value: String::new(),
+            output_dir: default_output_dir.to_string(),
+            filename_template: "{name}_{date}_{time}".into(),
+            extra_args: String::new(),
+        }
+    }
+}
+
+/// Per-platform download defaults for the Videos tab, persisted as JSON in
+/// `app_settings`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DownloadDefaults {
+    pub twitch: PlatformDownloadDefault,
+    pub youtube: PlatformDownloadDefault,
+    pub kick: PlatformDownloadDefault,
+    pub generic: PlatformDownloadDefault,
+}
+
+impl DownloadDefaults {
+    pub fn seeded(default_output_dir: &str) -> DownloadDefaults {
+        DownloadDefaults {
+            twitch: PlatformDownloadDefault::seeded(Platform::Twitch, default_output_dir),
+            youtube: PlatformDownloadDefault::seeded(Platform::YouTube, default_output_dir),
+            kick: PlatformDownloadDefault::seeded(Platform::Kick, default_output_dir),
+            generic: PlatformDownloadDefault::seeded(Platform::Generic, default_output_dir),
+        }
+    }
+
+    pub fn get(&self, platform: Platform) -> &PlatformDownloadDefault {
+        match platform {
+            Platform::Twitch => &self.twitch,
+            Platform::YouTube => &self.youtube,
+            Platform::Kick => &self.kick,
+            Platform::Generic => &self.generic,
+        }
+    }
+
+    pub fn get_mut(&mut self, platform: Platform) -> &mut PlatformDownloadDefault {
+        match platform {
+            Platform::Twitch => &mut self.twitch,
+            Platform::YouTube => &mut self.youtube,
+            Platform::Kick => &mut self.kick,
+            Platform::Generic => &mut self.generic,
+        }
+    }
+}
+
 /// Current unix timestamp in seconds.
 pub fn now_unix() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};

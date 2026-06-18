@@ -15,8 +15,8 @@ use tray_icon::TrayIcon;
 use crate::app_core::AppCore;
 use crate::events::{ManualCommand, UiCommand};
 use crate::models::{
-    AuthKind, Channel, Container, DetectionMethod, Monitor, MonitorWithChannel, Platform, Tool,
-    Video,
+    AuthKind, Channel, Container, DetectionMethod, DownloadDefaults, Monitor, MonitorWithChannel,
+    Platform, Tool, Video,
 };
 use crate::oauth::{self, AuthFlow};
 use crate::platform::AutoStart;
@@ -142,33 +142,44 @@ impl MonitorForm {
 }
 
 /// Backing state for the always-visible "download a video" form on the Videos tab.
+///
+/// Fields are pre-filled from the detected platform's saved defaults whenever the
+/// platform changes; the user can override any of them per download.
 struct VideoForm {
     url: String,
     title: String,
     tool: Tool,
-    /// Once the user picks a tool, stop auto-selecting it from the URL's platform.
-    tool_locked: bool,
     quality: String,
     output_dir: String,
     filename_template: String,
-    auth_kind: AuthKind,
+    /// `None` = "Default (per-platform)": use the snapshotted platform-default
+    /// auth below. `Some(kind)` overrides it with `auth_value` for this download.
+    auth_override: Option<AuthKind>,
     auth_value: String,
+    /// The platform default's auth, snapshotted at pre-fill (used when
+    /// `auth_override` is `None`) so every field resolves from one snapshot.
+    default_auth_kind: AuthKind,
+    default_auth_value: String,
     extra_args: String,
+    /// Platform the form is currently filled for; a change triggers a re-fill.
+    last_platform: Option<Platform>,
 }
 
 impl VideoForm {
-    fn new(default_output_dir: String) -> VideoForm {
+    fn new() -> VideoForm {
         VideoForm {
             url: String::new(),
             title: String::new(),
             tool: Tool::YtDlp,
-            tool_locked: false,
             quality: "best".into(),
-            output_dir: default_output_dir,
+            output_dir: String::new(),
             filename_template: "{name}_{date}_{time}".into(),
-            auth_kind: AuthKind::Inherit,
+            auth_override: None,
             auth_value: String::new(),
+            default_auth_kind: AuthKind::Inherit,
+            default_auth_value: String::new(),
             extra_args: String::new(),
+            last_platform: None,
         }
     }
 }
@@ -201,6 +212,8 @@ pub struct StreamArchiverApp {
     videos: Vec<Video>,
     form: Option<MonitorForm>,
     video_form: VideoForm,
+    /// Per-platform download defaults editable on the Videos tab (persisted JSON).
+    download_defaults: DownloadDefaults,
     settings: SettingsForm,
     status: String,
     /// Monitor id of the currently selected row (target for keyboard shortcuts).
@@ -259,7 +272,13 @@ impl StreamArchiverApp {
             None => AuthFlow::Idle,
         }));
 
-        let video_form = VideoForm::new(settings.default_output_dir.clone());
+        let download_defaults = core
+            .store
+            .get_setting("download_defaults")
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str::<DownloadDefaults>(&s).ok())
+            .unwrap_or_else(|| DownloadDefaults::seeded(&settings.default_output_dir));
 
         let mut app = StreamArchiverApp {
             core,
@@ -273,7 +292,8 @@ impl StreamArchiverApp {
             rows: Vec::new(),
             videos: Vec::new(),
             form: None,
-            video_form,
+            video_form: VideoForm::new(),
+            download_defaults,
             settings,
             status: String::new(),
             selected_monitor: None,
@@ -299,6 +319,15 @@ impl StreamArchiverApp {
         match self.core.store.list_videos() {
             Ok(v) => self.videos = v,
             Err(e) => warn!("failed to load videos: {e:#}"),
+        }
+    }
+
+    fn persist_download_defaults(&self) {
+        match serde_json::to_string(&self.download_defaults) {
+            Ok(json) => {
+                let _ = self.core.store.set_setting("download_defaults", &json);
+            }
+            Err(e) => warn!("failed to serialize download defaults: {e:#}"),
         }
     }
 
@@ -729,13 +758,164 @@ impl StreamArchiverApp {
     /// "paste a URL" form pinned to the bottom.
     fn videos_view(&mut self, ui: &mut egui::Ui) {
         egui::TopBottomPanel::bottom("video_add_panel")
-            .resizable(false)
+            .resizable(true)
             .show_inside(ui, |ui| {
-                self.video_add_form(ui);
+                // Cap the height so an expanded defaults editor can't crowd out
+                // the list; it scrolls instead.
+                egui::ScrollArea::vertical()
+                    .max_height(340.0)
+                    .show(ui, |ui| {
+                        self.video_defaults_editor(ui);
+                        self.video_add_form(ui);
+                    });
             });
         egui::CentralPanel::default().show_inside(ui, |ui| {
             self.videos_list(ui);
         });
+    }
+
+    /// Collapsible per-platform download defaults editor (Twitch / YouTube /
+    /// Kick / Generic). Edits persist immediately; the download form below
+    /// pre-fills from these per detected platform.
+    fn video_defaults_editor(&mut self, ui: &mut egui::Ui) {
+        let mut dirty = false;
+        // Borrow the defaults (not `self`) so the nested egui closures don't
+        // alias `self`; persist afterwards.
+        let defs = &mut self.download_defaults;
+        egui::CollapsingHeader::new("⚙  Per-platform download defaults")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "New downloads pre-fill from these by platform; override any field per download.",
+                    )
+                    .small()
+                    .color(egui::Color32::from_gray(0x90)),
+                );
+                for platform in Platform::ALL {
+                    egui::CollapsingHeader::new(platform.label())
+                        .id_salt(("dl_def", platform.as_str()))
+                        .show(ui, |ui| {
+                            let d = defs.get_mut(platform);
+                            egui::Grid::new(("dl_def_grid", platform.as_str()))
+                                .num_columns(2)
+                                .spacing([12.0, 6.0])
+                                .show(ui, |ui| {
+                                    ui.label("Tool");
+                                    egui::ComboBox::from_id_salt(("dl_tool", platform.as_str()))
+                                        .selected_text(d.tool.label())
+                                        .show_ui(ui, |ui| {
+                                            for t in Tool::ALL {
+                                                if ui
+                                                    .selectable_value(&mut d.tool, t, t.label())
+                                                    .changed()
+                                                {
+                                                    dirty = true;
+                                                }
+                                            }
+                                        });
+                                    ui.end_row();
+
+                                    ui.label("Quality");
+                                    if ui.text_edit_singleline(&mut d.quality).changed() {
+                                        dirty = true;
+                                    }
+                                    ui.end_row();
+
+                                    ui.label("Auth");
+                                    egui::ComboBox::from_id_salt(("dl_auth", platform.as_str()))
+                                        .selected_text(d.auth_kind.label())
+                                        .show_ui(ui, |ui| {
+                                            for k in AuthKind::ALL {
+                                                if ui
+                                                    .selectable_value(&mut d.auth_kind, k, k.label())
+                                                    .changed()
+                                                {
+                                                    dirty = true;
+                                                }
+                                            }
+                                        });
+                                    ui.end_row();
+
+                                    match d.auth_kind {
+                                        AuthKind::CookiesBrowser => {
+                                            ui.label("Browser");
+                                            if ui
+                                                .text_edit_singleline(&mut d.auth_value)
+                                                .on_hover_text("e.g. firefox, chrome, edge")
+                                                .changed()
+                                            {
+                                                dirty = true;
+                                            }
+                                            ui.end_row();
+                                        }
+                                        AuthKind::CookiesFile => {
+                                            ui.label("Cookies file");
+                                            ui.horizontal(|ui| {
+                                                if ui
+                                                    .text_edit_singleline(&mut d.auth_value)
+                                                    .changed()
+                                                {
+                                                    dirty = true;
+                                                }
+                                                if ui.button("Browse…").clicked() {
+                                                    if let Some(p) = browse_file(&d.auth_value) {
+                                                        d.auth_value = p;
+                                                        dirty = true;
+                                                    }
+                                                }
+                                            });
+                                            ui.end_row();
+                                        }
+                                        AuthKind::Token => {
+                                            ui.label("Auth token");
+                                            if ui
+                                                .add(
+                                                    egui::TextEdit::singleline(&mut d.auth_value)
+                                                        .password(true),
+                                                )
+                                                .changed()
+                                            {
+                                                dirty = true;
+                                            }
+                                            ui.end_row();
+                                        }
+                                        AuthKind::Inherit | AuthKind::Disabled => {}
+                                    }
+
+                                    ui.label("Output folder");
+                                    ui.horizontal(|ui| {
+                                        if ui.text_edit_singleline(&mut d.output_dir).changed() {
+                                            dirty = true;
+                                        }
+                                        if ui.button("Browse…").clicked() {
+                                            if let Some(p) = browse_folder(&d.output_dir) {
+                                                d.output_dir = p;
+                                                dirty = true;
+                                            }
+                                        }
+                                    });
+                                    ui.end_row();
+
+                                    ui.label("Filename template");
+                                    if ui.text_edit_singleline(&mut d.filename_template).changed() {
+                                        dirty = true;
+                                    }
+                                    ui.end_row();
+
+                                    ui.label("Extra args");
+                                    if ui.text_edit_singleline(&mut d.extra_args).changed() {
+                                        dirty = true;
+                                    }
+                                    ui.end_row();
+                                });
+                        });
+                }
+            });
+        if dirty {
+            self.persist_download_defaults();
+        }
+        ui.separator();
     }
 
     fn videos_list(&mut self, ui: &mut egui::Ui) {
@@ -895,14 +1075,30 @@ impl StreamArchiverApp {
     /// The bottom "paste a URL + settings + Download" form on the Videos tab.
     fn video_add_form(&mut self, ui: &mut egui::Ui) {
         let platform = Platform::detect(&self.video_form.url);
+
+        // Re-fill the form from this platform's saved defaults whenever the
+        // detected platform changes; the user can then override any field.
+        if self.video_form.last_platform != Some(platform) {
+            let d = self.download_defaults.get(platform).clone();
+            let vf = &mut self.video_form;
+            vf.tool = d.tool;
+            vf.quality = d.quality;
+            vf.output_dir = d.output_dir;
+            vf.filename_template = d.filename_template;
+            vf.extra_args = d.extra_args;
+            vf.auth_override = None; // "Default (per-platform)"
+            vf.auth_value = String::new();
+            // Snapshot the default auth too, so a later edit to the default
+            // doesn't desync from the other (already snapshotted) fields.
+            vf.default_auth_kind = d.auth_kind;
+            vf.default_auth_value = d.auth_value;
+            vf.last_platform = Some(platform);
+        }
+
         let mut do_download = false;
 
         {
             let vf = &mut self.video_form;
-            // Auto-pick the tool from the URL's platform until the user overrides it.
-            if !vf.tool_locked {
-                vf.tool = platform.default_tool();
-            }
 
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -944,9 +1140,7 @@ impl StreamArchiverApp {
                         .selected_text(vf.tool.label())
                         .show_ui(ui, |ui| {
                             for t in Tool::ALL {
-                                if ui.selectable_value(&mut vf.tool, t, t.label()).clicked() {
-                                    vf.tool_locked = true;
-                                }
+                                ui.selectable_value(&mut vf.tool, t, t.label());
                             }
                         });
                     ui.end_row();
@@ -959,23 +1153,32 @@ impl StreamArchiverApp {
                     ui.end_row();
 
                     ui.label("Auth");
+                    let auth_text = match vf.auth_override {
+                        None => "Default (per-platform)".to_string(),
+                        Some(k) => k.label().to_string(),
+                    };
                     egui::ComboBox::from_id_salt("video_auth_cb")
-                        .selected_text(vf.auth_kind.label())
+                        .selected_text(auth_text)
                         .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut vf.auth_override,
+                                None,
+                                "Default (per-platform)",
+                            );
                             for k in AuthKind::ALL {
-                                ui.selectable_value(&mut vf.auth_kind, k, k.label());
+                                ui.selectable_value(&mut vf.auth_override, Some(k), k.label());
                             }
                         });
                     ui.end_row();
 
-                    match vf.auth_kind {
-                        AuthKind::CookiesBrowser => {
+                    match vf.auth_override {
+                        Some(AuthKind::CookiesBrowser) => {
                             ui.label("Browser");
                             ui.text_edit_singleline(&mut vf.auth_value)
-                                .on_hover_text("e.g. firefox, chrome, edge (blank = global)");
+                                .on_hover_text("e.g. firefox, chrome, edge");
                             ui.end_row();
                         }
-                        AuthKind::CookiesFile => {
+                        Some(AuthKind::CookiesFile) => {
                             ui.label("Cookies file");
                             ui.horizontal(|ui| {
                                 ui.text_edit_singleline(&mut vf.auth_value);
@@ -987,13 +1190,14 @@ impl StreamArchiverApp {
                             });
                             ui.end_row();
                         }
-                        AuthKind::Token => {
+                        Some(AuthKind::Token) => {
                             ui.label("Auth token");
                             ui.add(egui::TextEdit::singleline(&mut vf.auth_value).password(true))
                                 .on_hover_text("Twitch OAuth token (streamlink)");
                             ui.end_row();
                         }
-                        AuthKind::Inherit | AuthKind::Disabled => {}
+                        // Default (None), Global (Inherit), and None (Disabled) need no value.
+                        _ => {}
                     }
 
                     ui.label("Output folder");
@@ -1038,17 +1242,27 @@ impl StreamArchiverApp {
         if url.is_empty() {
             return;
         }
+        let platform = Platform::detect(&url);
+        // "Default" auth uses the snapshotted platform default; an explicit
+        // choice overrides it. (All fields resolve from the same snapshot.)
+        let (auth_kind, auth_value) = match self.video_form.auth_override {
+            Some(kind) => (kind, self.video_form.auth_value.clone()),
+            None => (
+                self.video_form.default_auth_kind,
+                self.video_form.default_auth_value.clone(),
+            ),
+        };
         let video = Video {
             id: 0,
-            platform: Platform::detect(&url),
+            platform,
             url,
             title: self.video_form.title.trim().to_string(),
             tool: self.video_form.tool,
             quality: self.video_form.quality.clone(),
             output_dir: self.video_form.output_dir.clone(),
             filename_template: self.video_form.filename_template.clone(),
-            auth_kind: self.video_form.auth_kind,
-            auth_value: self.video_form.auth_value.clone(),
+            auth_kind,
+            auth_value,
             extra_args: self.video_form.extra_args.clone(),
             status: "queued".into(),
             output_path: String::new(),
@@ -1062,10 +1276,10 @@ impl StreamArchiverApp {
             Ok(id) => {
                 self.core.manual(ManualCommand::StartVideo(id));
                 self.status = "Queued video download.".into();
-                // Clear the URL/name for the next one; keep tool/auth/folder settings.
+                // Clear the URL/name; re-fill defaults for the next download.
                 self.video_form.url.clear();
                 self.video_form.title.clear();
-                self.video_form.tool_locked = false;
+                self.video_form.last_platform = None;
                 self.reload_videos();
             }
             Err(e) => self.status = format!("Error: {e}"),
