@@ -242,6 +242,12 @@ pub struct StreamArchiverApp {
     selected_monitor: Option<i64>,
     /// Pending delete confirmation: (monitor id, channel name).
     confirm_delete: Option<(i64, String)>,
+    /// Sort + per-column filters for the Streams table.
+    streams_sort: SortState,
+    streams_filters: Vec<String>,
+    /// Sort + per-column filters for the Videos table.
+    videos_sort: SortState,
+    videos_filters: Vec<String>,
     /// Shared state of the interactive "Connect Twitch" device-code flow.
     twitch_flow: Arc<Mutex<AuthFlow>>,
 }
@@ -321,6 +327,10 @@ impl StreamArchiverApp {
             status: String::new(),
             selected_monitor: None,
             confirm_delete: None,
+            streams_sort: SortState::default(),
+            streams_filters: vec![String::new(); STREAM_COLS],
+            videos_sort: SortState::default(),
+            videos_filters: vec![String::new(); VIDEO_COLS],
             twitch_flow,
         };
         app.reload_rows();
@@ -538,6 +548,225 @@ fn video_status_color(status: &str) -> egui::Color32 {
         "failed" => Color32::from_rgb(0xe0, 0x6c, 0x6c),
         _ => Color32::from_gray(0xa0), // queued / stopped / orphaned
     }
+}
+
+/// Human-readable download speed (e.g. `1.2 MB/s`); empty when not downloading.
+fn fmt_speed(bytes_per_sec: f64) -> String {
+    if bytes_per_sec <= 0.0 {
+        return String::new();
+    }
+    format!("{}/s", fmt_bytes(bytes_per_sec as i64))
+}
+
+// ─── Sortable + filterable tables ───────────────────────────────────────────
+//
+// Both tables share a tiny model: each row is turned into a `Vec<Cell>` (one per
+// sortable/filterable column, in header order; the trailing "Actions" column is
+// excluded). The header renders a click-to-sort title + a per-column filter box;
+// `ordered_rows` filters then sorts and returns the surviving original-row
+// indices in display order. The data cells themselves are still drawn by the
+// existing per-row code, indexed by those original indices.
+
+/// Sortable/filterable Videos columns (Video..File; excludes Actions).
+const VIDEO_COLS: usize = 9;
+/// Sortable/filterable Streams columns (On..Added; excludes Actions).
+const STREAM_COLS: usize = 12;
+
+/// Which column a table is sorted by and in what direction. `col == None` keeps
+/// the natural (database) order.
+#[derive(Clone, Copy, Default)]
+struct SortState {
+    col: Option<usize>,
+    ascending: bool,
+}
+
+/// A cell's sort key: numeric columns sort numerically, text columns sort
+/// case-insensitively. (Filtering always uses the cell's displayed `text`.)
+enum SortKey {
+    Num(f64),
+    Text(String),
+}
+
+/// A precomputed cell: `text` is what's shown/filtered (case-insensitive
+/// substring), `key` is what's sorted.
+struct Cell {
+    text: String,
+    key: SortKey,
+}
+
+impl Cell {
+    /// A text cell — filter and sort both use the string.
+    fn text(s: impl Into<String>) -> Cell {
+        let s = s.into();
+        Cell {
+            key: SortKey::Text(s.clone()),
+            text: s,
+        }
+    }
+    /// A numeric cell — sorts by `n`, filters/shows `display`.
+    fn num(n: f64, display: impl Into<String>) -> Cell {
+        Cell {
+            text: display.into(),
+            key: SortKey::Num(n),
+        }
+    }
+}
+
+fn cmp_sort_key(a: &SortKey, b: &SortKey) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (SortKey::Num(x), SortKey::Num(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        (SortKey::Text(x), SortKey::Text(y)) => x.to_lowercase().cmp(&y.to_lowercase()),
+        _ => Ordering::Equal,
+    }
+}
+
+/// Filter then sort `rows`, returning surviving original indices in display
+/// order. `filters[c]` is a case-insensitive substring filter for column `c`.
+fn ordered_rows(rows: &[Vec<Cell>], sort: &SortState, filters: &[String]) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..rows.len())
+        .filter(|&i| {
+            filters.iter().enumerate().all(|(c, f)| {
+                let f = f.trim().to_lowercase();
+                f.is_empty()
+                    || rows[i]
+                        .get(c)
+                        .map(|cell| cell.text.to_lowercase().contains(&f))
+                        .unwrap_or(true)
+            })
+        })
+        .collect();
+    if let Some(c) = sort.col {
+        // `sort_by` is stable, so equal keys keep their natural order.
+        idx.sort_by(|&a, &b| {
+            let o = match (rows[a].get(c), rows[b].get(c)) {
+                (Some(x), Some(y)) => cmp_sort_key(&x.key, &y.key),
+                _ => std::cmp::Ordering::Equal,
+            };
+            if sort.ascending { o } else { o.reverse() }
+        });
+    }
+    idx
+}
+
+/// Render one sortable + optionally filterable header cell for column `idx`: a
+/// click-to-sort title (with ▲/▼ when active) above a filter box.
+fn sort_filter_header(
+    ui: &mut egui::Ui,
+    idx: usize,
+    title: &str,
+    filterable: bool,
+    sort: &mut SortState,
+    filter: &mut String,
+) {
+    ui.vertical(|ui| {
+        let active = sort.col == Some(idx);
+        let arrow = if active {
+            if sort.ascending { " ▲" } else { " ▼" }
+        } else {
+            ""
+        };
+        let resp = ui
+            .add(egui::Button::new(egui::RichText::new(format!("{title}{arrow}")).strong()).frame(false))
+            .on_hover_text("Click to sort (click again to reverse)");
+        if resp.clicked() {
+            if active {
+                sort.ascending = !sort.ascending;
+            } else {
+                *sort = SortState {
+                    col: Some(idx),
+                    ascending: true,
+                };
+            }
+        }
+        if filterable {
+            ui.add(
+                egui::TextEdit::singleline(filter)
+                    .hint_text("filter")
+                    .desired_width(f32::INFINITY),
+            );
+        }
+    });
+}
+
+/// Sort/filter cells for one video row, in Videos-table column order:
+/// Video, Channel, Platform, Tool, Status, Speed, Size, Added, File.
+fn video_cells(
+    v: &Video,
+    speed: &std::collections::HashMap<i64, f64>,
+) -> Vec<Cell> {
+    let label = if v.title.trim().is_empty() {
+        v.url.clone()
+    } else {
+        v.title.clone()
+    };
+    // Speed is only meaningful while actively downloading.
+    let spd = if v.status == "downloading" {
+        speed.get(&v.id).copied().unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    vec![
+        Cell::text(label),
+        Cell::text(v.channel.clone()),
+        Cell::text(v.platform.label()),
+        Cell::text(v.tool.label()),
+        Cell::text(v.status.clone()),
+        Cell::num(spd, fmt_speed(spd)),
+        Cell::num(
+            v.bytes as f64,
+            if v.bytes > 0 { fmt_bytes(v.bytes) } else { String::new() },
+        ),
+        Cell::num(v.created_at as f64, fmt_date(v.created_at)),
+        Cell::text(v.output_path.clone()),
+    ]
+}
+
+/// Sort/filter cells for one stream row, in Streams-table column order: On,
+/// Name, Platform, Tool, Detection, Every, State, Went Live, Started On, Lost
+/// time, Duration, Added.
+fn stream_cells(row: &MonitorWithChannel, now: i64) -> Vec<Cell> {
+    let m = &row.monitor;
+    let rec = recording_cells(row, now);
+    let active = row.last_recording_status.as_deref() == Some("recording");
+    let started = row.last_recording_started;
+    let dur = match (started, row.last_recording_ended, active) {
+        (Some(s), _, true) => (now - s).max(0),
+        (Some(s), Some(e), false) => (e - s).max(0),
+        _ => 0,
+    };
+    let went_live_ts = row.last_recording_went_live.unwrap_or(0);
+    let started_ts = started.unwrap_or(0);
+    let lost = match (started, row.last_recording_went_live) {
+        (Some(s), Some(w)) => (s - w).max(0),
+        _ => 0,
+    };
+    vec![
+        Cell::num(
+            if m.enabled { 1.0 } else { 0.0 },
+            if m.enabled { "on" } else { "off" },
+        ),
+        Cell::text(row.channel.name.clone()),
+        Cell::text(row.channel.platform.label()),
+        Cell::text(m.tool.label()),
+        // Sort by the SHORT label that's actually shown in the cell, but let the
+        // filter match the long label too (so e.g. "youtube" finds "YT API").
+        Cell {
+            text: format!(
+                "{} {}",
+                m.detection_method.short_label(),
+                m.detection_method.label()
+            ),
+            key: SortKey::Text(m.detection_method.short_label().to_string()),
+        },
+        Cell::num(m.poll_interval_secs as f64, format!("{}s", m.poll_interval_secs)),
+        Cell::text(m.last_state.clone()),
+        Cell::num(went_live_ts as f64, rec.went_live.clone()),
+        Cell::num(started_ts as f64, rec.started_on.clone()),
+        Cell::num(lost as f64, rec.lost.clone()),
+        Cell::num(dur as f64, rec.duration.clone()),
+        Cell::num(row.channel.created_at as f64, fmt_date(row.channel.created_at)),
+    ]
 }
 
 /// Columns derived from a monitor's latest recording.
@@ -968,16 +1197,28 @@ impl StreamArchiverApp {
         let mut to_retry: Option<i64> = None;
         let mut to_delete: Option<i64> = None;
         let any_active = self.videos.iter().any(|v| v.is_active());
-        // Snapshot live download progress (video_id -> 0.0..=1.0) for the bar.
+        // Snapshot live download progress (video_id -> 0.0..=1.0) and speed
+        // (video_id -> bytes/sec) for the progress bar + Speed column.
         let progress: std::collections::HashMap<i64, f32> =
             self.core.video_progress.lock().unwrap().clone();
+        let speed: std::collections::HashMap<i64, f64> =
+            self.core.video_speed.lock().unwrap().clone();
+
+        // Build the sort/filter model and take the persisted sort/filter state
+        // into locals (written back after the table is drawn).
+        let model: Vec<Vec<Cell>> = self.videos.iter().map(|v| video_cells(v, &speed)).collect();
+        let mut sort = self.videos_sort;
+        let mut filters = self.videos_filters.clone();
+        if filters.len() != VIDEO_COLS {
+            filters = vec![String::new(); VIDEO_COLS];
+        }
 
         egui::ScrollArea::both()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 // Non-selectable labels so a right-click reaches the row (menu).
                 ui.style_mut().interaction.selectable_labels = false;
-                TableBuilder::new(ui)
+                let table = TableBuilder::new(ui)
                     .striped(true)
                     .resizable(true)
                     .sense(egui::Sense::click())
@@ -986,23 +1227,30 @@ impl StreamArchiverApp {
                     .column(Column::auto().at_least(110.0)) // channel
                     .column(Column::auto().at_least(86.0)) // platform
                     .column(Column::auto().at_least(72.0)) // tool
-                    .column(Column::auto().at_least(90.0)) // status
+                    .column(Column::auto().at_least(96.0)) // status
+                    .column(Column::auto().at_least(82.0)) // speed
                     .column(Column::auto().at_least(72.0)) // size
                     .column(Column::auto().at_least(80.0)) // added
                     .column(Column::auto().at_least(160.0)) // file
                     .column(Column::remainder().at_least(150.0)) // actions
-                    .header(20.0, |mut header| {
-                        for title in [
-                            "Video", "Channel", "Platform", "Tool", "Status", "Size", "Added",
-                            "File", "Actions",
-                        ] {
+                    .header(46.0, |mut header| {
+                        let titles = [
+                            "Video", "Channel", "Platform", "Tool", "Status", "Speed", "Size",
+                            "Added", "File",
+                        ];
+                        for (i, t) in titles.into_iter().enumerate() {
                             header.col(|ui| {
-                                ui.strong(title);
+                                sort_filter_header(ui, i, t, true, &mut sort, &mut filters[i]);
                             });
                         }
-                    })
-                    .body(|mut body| {
-                        for v in &self.videos {
+                        header.col(|ui| {
+                            ui.strong("Actions");
+                        });
+                    });
+                table.body(|mut body| {
+                        let order = ordered_rows(&model, &sort, &filters);
+                        for &vi in &order {
+                            let v = &self.videos[vi];
                             body.row(24.0, |mut tr| {
                                 // Reusable menu body (a `Fn`), attached to the row and
                                 // each inline action button so right-clicking anywhere
@@ -1100,6 +1348,15 @@ impl StreamArchiverApp {
                                     }
                                 });
                                 tr.col(|ui| {
+                                    if v.status == "downloading" {
+                                        if let Some(&bps) = speed.get(&v.id) {
+                                            if bps > 0.0 {
+                                                ui.label(fmt_speed(bps));
+                                            }
+                                        }
+                                    }
+                                });
+                                tr.col(|ui| {
                                     if v.bytes > 0 {
                                         ui.label(fmt_bytes(v.bytes));
                                     }
@@ -1186,6 +1443,8 @@ impl StreamArchiverApp {
                         }
                     });
             });
+        self.videos_sort = sort;
+        self.videos_filters = filters;
 
         // Tick while a download is queued/running so the progress bar, status and
         // size update live (a bit faster than 1s for a smoother bar).
@@ -1556,6 +1815,15 @@ impl StreamArchiverApp {
             .iter()
             .any(|r| r.last_recording_status.as_deref() == Some("recording"));
 
+        // Build the sort/filter model and take the persisted sort/filter state
+        // into locals (written back after the table is drawn).
+        let model: Vec<Vec<Cell>> = self.rows.iter().map(|r| stream_cells(r, now)).collect();
+        let mut sort = self.streams_sort;
+        let mut filters = self.streams_filters.clone();
+        if filters.len() != STREAM_COLS {
+            filters = vec![String::new(); STREAM_COLS];
+        }
+
         // Fill the available height so the horizontal scrollbar sits at the
         // bottom of the window rather than directly under the (short) row list.
         egui::ScrollArea::both()
@@ -1566,19 +1834,19 @@ impl StreamArchiverApp {
                 // breaking the row context menu. Turn it off for the table so the
                 // row's click sense wins (the menu offers "Copy URL" instead).
                 ui.style_mut().interaction.selectable_labels = false;
-                TableBuilder::new(ui)
+                let table = TableBuilder::new(ui)
                     .striped(true)
                     .resizable(true)
                     // Make rows sense clicks so they can be selected and carry a
                     // right-click context menu.
                     .sense(egui::Sense::click())
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                    .column(Column::auto().at_least(28.0)) // enabled
+                    .column(Column::auto().at_least(40.0)) // enabled
                     .column(Column::auto().at_least(100.0)) // name
                     .column(Column::auto().at_least(90.0)) // platform
                     .column(Column::auto().at_least(72.0)) // tool
-                    .column(Column::auto().at_least(76.0)) // method
-                    .column(Column::auto().at_least(44.0)) // interval
+                    .column(Column::auto().at_least(80.0)) // method
+                    .column(Column::auto().at_least(52.0)) // interval
                     .column(Column::auto().at_least(64.0)) // state
                     .column(Column::auto().at_least(112.0)) // went live
                     .column(Column::auto().at_least(104.0)) // started on
@@ -1586,8 +1854,8 @@ impl StreamArchiverApp {
                     .column(Column::auto().at_least(58.0)) // duration
                     .column(Column::auto().at_least(80.0)) // added
                     .column(Column::remainder().at_least(140.0)) // actions
-                    .header(20.0, |mut header| {
-                        for title in [
+                    .header(46.0, |mut header| {
+                        let titles = [
                             "On",
                             "Name",
                             "Platform",
@@ -1600,15 +1868,20 @@ impl StreamArchiverApp {
                             "Lost time",
                             "Duration",
                             "Added",
-                            "Actions",
-                        ] {
+                        ];
+                        for (i, t) in titles.into_iter().enumerate() {
                             header.col(|ui| {
-                                ui.strong(title);
+                                sort_filter_header(ui, i, t, true, &mut sort, &mut filters[i]);
                             });
                         }
-                    })
-                    .body(|mut body| {
-                        for (i, row) in self.rows.iter().enumerate() {
+                        header.col(|ui| {
+                            ui.strong("Actions");
+                        });
+                    });
+                table.body(|mut body| {
+                        let order = ordered_rows(&model, &sort, &filters);
+                        for &i in &order {
+                            let row = &self.rows[i];
                             let m = &row.monitor;
                             let rec = recording_cells(row, now);
                             let recording = self.core.active.lock().unwrap().contains_key(&m.id);
@@ -1806,6 +2079,8 @@ impl StreamArchiverApp {
                         }
                     });
             });
+        self.streams_sort = sort;
+        self.streams_filters = filters;
 
         // Tick the live Duration column ~1/sec while anything is recording.
         if any_active {

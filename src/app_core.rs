@@ -28,6 +28,8 @@ pub struct AppCore {
     pub active_videos: ActiveSet,
     /// video_id -> live download progress fraction (for the UI progress bar).
     pub video_progress: crate::downloader::VideoProgress,
+    /// video_id -> live download speed in bytes/sec (for the UI Speed column).
+    pub video_speed: crate::downloader::VideoSpeed,
     /// Set during shutdown so the scheduler/supervisor stop starting new work.
     pub shutdown: Arc<AtomicBool>,
     /// Sends on-demand Start/Stop commands to the supervisor (set in `start`).
@@ -49,6 +51,7 @@ impl AppCore {
             active: Arc::new(Mutex::new(HashMap::new())),
             active_videos: Arc::new(Mutex::new(HashMap::new())),
             video_progress: Arc::new(Mutex::new(HashMap::new())),
+            video_speed: Arc::new(Mutex::new(HashMap::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             manual_tx: Mutex::new(None),
         }))
@@ -109,6 +112,7 @@ impl AppCore {
             self.active.clone(),
             self.active_videos.clone(),
             self.video_progress.clone(),
+            self.video_speed.clone(),
             self.shutdown.clone(),
             ctx,
             max_concurrent,

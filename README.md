@@ -83,11 +83,17 @@ plus the explicit choices; **Inherit (global)** stays available and chains to th
 Settings → *Download authentication* default.
 
 Each row shows the title, **Channel** (when detected), status (`queued` →
-`downloading` → `completed`/`failed`/`stopped`), size, and the **File** path on
-disk. Per-row inline actions plus a **right-click context menu** offer: **Open
-file**, **Open folder**, **Copy URL**, **Copy file path**, **Stop**/**Retry**, and
-**Delete** (removes the row; the file is kept). A download left in flight by a
-crash/quit is marked `orphaned` on the next start.
+`downloading` → `completed`/`failed`/`stopped`), live **Speed** (download rate
+while active; yt-dlp downloads only), size, and the **File** path on disk. Per-row
+inline actions plus a **right-click context menu** offer: **Open file**, **Open
+folder**, **Copy URL**, **Copy file path**, **Stop**/**Retry**, and **Delete**
+(removes the row; the file is kept). A download left in flight by a crash/quit is
+marked `orphaned` on the next start.
+
+**Sort & filter.** Click any column header to sort by it (click again to reverse;
+a ▲/▼ shows the active column); type in the box under a header to filter that
+column (case-insensitive substring). Filters combine across columns. This works on
+the **Videos** and **Streams** tables alike.
 
 The channel table shows, per monitor: On (enable/disable), Name, Platform (with a
 brand badge), Tool, Detection, poll interval, State, **Went Live** (the platform's

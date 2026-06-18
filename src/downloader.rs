@@ -42,6 +42,11 @@ pub type ActiveSet = Arc<Mutex<HashMap<i64, u32>>>;
 /// it finishes. (Live recordings have no meaningful total, so they don't use it.)
 pub type VideoProgress = Arc<Mutex<HashMap<i64, f32>>>;
 
+/// video_id -> current download speed in bytes/sec, for the UI Speed column.
+/// Populated alongside `VideoProgress` from the tool's progress output; cleared
+/// when the download finishes.
+pub type VideoSpeed = Arc<Mutex<HashMap<i64, f64>>>;
+
 const RING_MAX_LINES: usize = 80;
 /// A recording that fails faster than this is treated as a transient failure
 /// and subject to backoff.
@@ -272,10 +277,11 @@ pub fn build_video_plan(
                 "mkv".into(),
                 "--remux-video".into(),
                 "mkv".into(),
-                // Emit a parseable percent per line for the UI progress bar.
+                // Emit a parseable percent + speed per line for the UI progress
+                // bar and Speed column (`;;` separates the two fields).
                 "--newline".into(),
                 "--progress-template".into(),
-                "download:DLPCT=%(progress._percent_str)s".into(),
+                "download:DLPCT=%(progress._percent_str)s;;SPEED=%(progress.speed)s".into(),
                 "-o".into(),
                 out_tmpl,
             ];
@@ -358,6 +364,8 @@ pub struct Supervisor {
     active_videos: ActiveSet,
     /// video_id -> live download progress fraction, for the UI bar.
     video_progress: VideoProgress,
+    /// video_id -> live download speed (bytes/sec), for the UI Speed column.
+    video_speed: VideoSpeed,
     /// video_ids whose download was asked to stop (so it finalizes as `stopped`).
     stopping_videos: Arc<Mutex<HashSet<i64>>>,
     shutdown: Arc<AtomicBool>,
@@ -381,6 +389,7 @@ impl Supervisor {
         active: ActiveSet,
         active_videos: ActiveSet,
         video_progress: VideoProgress,
+        video_speed: VideoSpeed,
         shutdown: Arc<AtomicBool>,
         ctx: Arc<DetectContext>,
         max_concurrent: usize,
@@ -391,6 +400,7 @@ impl Supervisor {
             active,
             active_videos,
             video_progress,
+            video_speed,
             stopping_videos: Arc::new(Mutex::new(HashSet::new())),
             shutdown,
             ctx,
@@ -574,6 +584,7 @@ impl Supervisor {
         let stopped = self.stopping_videos.lock().unwrap().remove(&id);
         active.remove(&id);
         self.video_progress.lock().unwrap().remove(&id);
+        self.video_speed.lock().unwrap().remove(&id);
         if stopped {
             "stopped"
         } else if shutting_down {
@@ -655,6 +666,7 @@ impl Supervisor {
                 id,
                 &plan,
                 Some(self.video_progress.clone()),
+                Some(self.video_speed.clone()),
             )
             .await;
 
@@ -812,7 +824,7 @@ impl Supervisor {
         info!(monitor_id, program = %plan.program, "starting recording -> {}", plan.final_path.display());
 
         let outcome = self
-            .run_process(&self.active, monitor_id, &plan, None)
+            .run_process(&self.active, monitor_id, &plan, None, None)
             .await;
 
         // Remux TS -> MKV if requested and we captured something.
@@ -866,6 +878,7 @@ impl Supervisor {
         id: i64,
         plan: &DownloadPlan,
         progress: Option<VideoProgress>,
+        speed: Option<VideoSpeed>,
     ) -> ProcessOutcome {
         let job = match ProcessJob::new() {
             Ok(j) => Some(j),
@@ -877,9 +890,9 @@ impl Supervisor {
         let mut cmd = Command::new(&plan.program);
         cmd.args(&plan.args)
             .stdin(Stdio::null())
-            // Capture stdout only when we want to parse progress (yt-dlp prints
-            // the progress line there); otherwise discard it.
-            .stdout(if progress.is_some() {
+            // Capture stdout only when we want to parse progress/speed (yt-dlp
+            // prints the progress line there); otherwise discard it.
+            .stdout(if progress.is_some() || speed.is_some() {
                 Stdio::piped()
             } else {
                 Stdio::null()
@@ -909,13 +922,19 @@ impl Supervisor {
             active.lock().unwrap().insert(id, pid);
         }
 
-        // Parse progress lines from stdout (yt-dlp `--progress-template`).
-        if let (Some(prog), Some(stdout)) = (progress.clone(), child.stdout.take()) {
+        // Parse progress + speed lines from stdout (yt-dlp `--progress-template`).
+        if let Some(stdout) = child.stdout.take() {
+            let prog = progress.clone();
+            let spd = speed.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    if let Some(f) = parse_progress(&line) {
-                        prog.lock().unwrap().insert(id, f);
+                    let (f, s) = parse_progress_fields(&line);
+                    if let (Some(f), Some(m)) = (f, prog.as_ref()) {
+                        m.lock().unwrap().insert(id, f);
+                    }
+                    if let (Some(s), Some(m)) = (s, spd.as_ref()) {
+                        m.lock().unwrap().insert(id, s);
                     }
                 }
             });
@@ -926,13 +945,18 @@ impl Supervisor {
             let ring = ring.clone();
             let program = plan.program.clone();
             let prog = progress.clone();
+            let spd = speed.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     // Some tools emit progress on stderr; catch it there too.
-                    if let Some(p) = &prog {
-                        if let Some(f) = parse_progress(&line) {
-                            p.lock().unwrap().insert(id, f);
+                    if prog.is_some() || spd.is_some() {
+                        let (f, s) = parse_progress_fields(&line);
+                        if let (Some(f), Some(m)) = (f, prog.as_ref()) {
+                            m.lock().unwrap().insert(id, f);
+                        }
+                        if let (Some(s), Some(m)) = (s, spd.as_ref()) {
+                            m.lock().unwrap().insert(id, s);
                         }
                     }
                     tracing::trace!(target: "streamarchiver::recproc", "[{program}] {line}");
@@ -966,13 +990,36 @@ struct ProcessOutcome {
     log: String,
 }
 
-/// Parse a yt-dlp progress line (`--progress-template "download:DLPCT=%(progress._percent_str)s"`)
-/// into a 0.0..=1.0 fraction. Returns None for non-progress lines or unknown values.
+/// Parse a yt-dlp progress line
+/// (`--progress-template "download:DLPCT=%(progress._percent_str)s;;SPEED=%(progress.speed)s"`)
+/// into `(percent fraction 0.0..=1.0, speed bytes/sec)`. Either may be `None`
+/// (non-progress line or an unknown/`NA` value).
+fn parse_progress_fields(line: &str) -> (Option<f32>, Option<f64>) {
+    let mut pct = None;
+    let mut speed = None;
+    for part in line.trim().split(";;") {
+        let part = part.trim();
+        if let Some(rest) = part.strip_prefix("DLPCT=") {
+            let s = rest.trim().trim_end_matches('%').trim();
+            if let Ok(v) = s.parse::<f32>() {
+                pct = Some((v / 100.0).clamp(0.0, 1.0));
+            }
+        } else if let Some(rest) = part.strip_prefix("SPEED=") {
+            // yt-dlp's raw `speed` is bytes/sec (or "NA" when unknown).
+            if let Ok(v) = rest.trim().parse::<f64>() {
+                if v.is_finite() && v > 0.0 {
+                    speed = Some(v);
+                }
+            }
+        }
+    }
+    (pct, speed)
+}
+
+/// Percent-only convenience wrapper around [`parse_progress_fields`].
+#[cfg(test)]
 fn parse_progress(line: &str) -> Option<f32> {
-    let rest = line.trim().strip_prefix("DLPCT=")?;
-    let pct = rest.trim().trim_end_matches('%').trim();
-    let v: f32 = pct.parse().ok()?;
-    Some((v / 100.0).clamp(0.0, 1.0))
+    parse_progress_fields(line).0
 }
 
 /// Resolve a video/stream's real title and channel/uploader via yt-dlp (no
@@ -1289,6 +1336,24 @@ mod tests {
         assert_eq!(parse_progress("[download]  45% of 100MiB"), None);
         assert_eq!(parse_progress("DLPCT=NA%"), None);
         assert_eq!(parse_progress("some other log line"), None);
+    }
+
+    #[test]
+    fn parses_ytdlp_progress_and_speed() {
+        // The combined template emits percent + speed (bytes/sec) per line.
+        let (p, s) = parse_progress_fields("DLPCT= 42.0%;;SPEED=1258291.2");
+        assert_eq!(p, Some(0.42));
+        assert_eq!(s, Some(1_258_291.2));
+        // Unknown speed ("NA") -> no speed, but the percent still parses.
+        let (p, s) = parse_progress_fields("DLPCT= 5.0%;;SPEED=NA");
+        assert_eq!(p, Some(0.05));
+        assert_eq!(s, None);
+        // Zero/negative speeds are ignored.
+        assert_eq!(parse_progress_fields("DLPCT=10.0%;;SPEED=0").1, None);
+        // A bare percent line (old format) still yields the fraction, no speed.
+        assert_eq!(parse_progress_fields("DLPCT= 50.0%"), (Some(0.5), None));
+        // Non-marker lines yield nothing.
+        assert_eq!(parse_progress_fields("some other log line"), (None, None));
     }
 
     #[test]
