@@ -594,7 +594,10 @@ impl StreamArchiverApp {
                         for (i, row) in self.rows.iter().enumerate() {
                             let m = &row.monitor;
                             let rec = recording_cells(row, now);
+                            let recording = self.core.active.lock().unwrap().contains_key(&m.id);
                             body.row(24.0, |mut tr| {
+                                // Tint active (recording) rows with the theme accent (blue).
+                                tr.set_selected(recording);
                                 tr.col(|ui| {
                                     let mut on = m.enabled;
                                     if ui.checkbox(&mut on, "").changed() {
@@ -637,8 +640,6 @@ impl StreamArchiverApp {
                                     ui.label(fmt_date(row.channel.created_at));
                                 });
                                 tr.col(|ui| {
-                                    let recording =
-                                        self.core.active.lock().unwrap().contains_key(&m.id);
                                     ui.push_id(m.id, |ui| {
                                         if recording {
                                             if ui
