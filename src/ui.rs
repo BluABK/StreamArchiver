@@ -54,6 +54,23 @@ enum MenuChoice {
     Delete,
 }
 
+/// State of the on-demand "List formats" probe (Videos tab), shown in a window.
+#[derive(Clone)]
+enum FormatProbe {
+    Idle,
+    Running,
+    Done(String),
+    Failed(String),
+}
+
+/// A self-mutating action picked from a video row's context menu (open/copy are
+/// handled inline; these need deferred access to `self`).
+enum VideoMenuChoice {
+    Stop,
+    Retry,
+    Delete,
+}
+
 /// Backing state for the add/edit dialog.
 struct MonitorForm {
     monitor_id: Option<i64>,
@@ -161,6 +178,8 @@ struct VideoForm {
     default_auth_kind: AuthKind,
     default_auth_value: String,
     extra_args: String,
+    /// Resolve and use the real stream/video title (sticky across downloads).
+    auto_title: bool,
     /// Platform the form is currently filled for; a change triggers a re-fill.
     last_platform: Option<Platform>,
 }
@@ -179,6 +198,7 @@ impl VideoForm {
             default_auth_kind: AuthKind::Inherit,
             default_auth_value: String::new(),
             extra_args: String::new(),
+            auto_title: false,
             last_platform: None,
         }
     }
@@ -214,6 +234,8 @@ pub struct StreamArchiverApp {
     video_form: VideoForm,
     /// Per-platform download defaults editable on the Videos tab (persisted JSON).
     download_defaults: DownloadDefaults,
+    /// Shared state of the async "List formats" probe (Videos tab).
+    format_probe: Arc<Mutex<FormatProbe>>,
     settings: SettingsForm,
     status: String,
     /// Monitor id of the currently selected row (target for keyboard shortcuts).
@@ -294,6 +316,7 @@ impl StreamArchiverApp {
             form: None,
             video_form: VideoForm::new(),
             download_defaults,
+            format_probe: Arc::new(Mutex::new(FormatProbe::Idle)),
             settings,
             status: String::new(),
             selected_monitor: None,
@@ -655,6 +678,7 @@ impl eframe::App for StreamArchiverApp {
 
         self.form_window(ui.ctx());
         self.confirm_delete_window(ui.ctx());
+        self.format_probe_window(ui.ctx());
     }
 }
 
@@ -948,9 +972,12 @@ impl StreamArchiverApp {
         egui::ScrollArea::both()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                // Non-selectable labels so a right-click reaches the row (menu).
+                ui.style_mut().interaction.selectable_labels = false;
                 TableBuilder::new(ui)
                     .striped(true)
                     .resizable(true)
+                    .sense(egui::Sense::click())
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                     .column(Column::auto().at_least(200.0)) // video
                     .column(Column::auto().at_least(86.0)) // platform
@@ -958,10 +985,12 @@ impl StreamArchiverApp {
                     .column(Column::auto().at_least(90.0)) // status
                     .column(Column::auto().at_least(72.0)) // size
                     .column(Column::auto().at_least(80.0)) // added
+                    .column(Column::auto().at_least(160.0)) // file
                     .column(Column::remainder().at_least(150.0)) // actions
                     .header(20.0, |mut header| {
                         for title in [
-                            "Video", "Platform", "Tool", "Status", "Size", "Added", "Actions",
+                            "Video", "Platform", "Tool", "Status", "Size", "Added", "File",
+                            "Actions",
                         ] {
                             header.col(|ui| {
                                 ui.strong(title);
@@ -971,6 +1000,69 @@ impl StreamArchiverApp {
                     .body(|mut body| {
                         for v in &self.videos {
                             body.row(24.0, |mut tr| {
+                                // Reusable menu body (a `Fn`), attached to the row and
+                                // each inline action button so right-clicking anywhere
+                                // on the row opens it. Open/copy are handled inline;
+                                // self-mutating picks go through `menu_pick`.
+                                let mut menu_pick: Option<VideoMenuChoice> = None;
+                                let add_menu =
+                                    |ui: &mut egui::Ui, pick: &mut Option<VideoMenuChoice>| {
+                                        ui.set_min_width(180.0);
+                                        if v.is_active() {
+                                            if ui.button("⏹  Stop download").clicked() {
+                                                *pick = Some(VideoMenuChoice::Stop);
+                                                ui.close();
+                                            }
+                                        } else if ui.button("↻  Retry download").clicked() {
+                                            *pick = Some(VideoMenuChoice::Retry);
+                                            ui.close();
+                                        }
+                                        ui.separator();
+                                        let file_ok = !v.output_path.is_empty()
+                                            && std::path::Path::new(&v.output_path).is_file();
+                                        if ui
+                                            .add_enabled(file_ok, egui::Button::new("▶  Open file"))
+                                            .clicked()
+                                        {
+                                            crate::platform::open_path(std::path::Path::new(
+                                                &v.output_path,
+                                            ));
+                                            ui.close();
+                                        }
+                                        let dir_ok = std::path::Path::new(&v.output_dir).is_dir();
+                                        if ui
+                                            .add_enabled(
+                                                dir_ok,
+                                                egui::Button::new("📂  Open folder"),
+                                            )
+                                            .clicked()
+                                        {
+                                            crate::platform::open_path(std::path::Path::new(
+                                                &v.output_dir,
+                                            ));
+                                            ui.close();
+                                        }
+                                        if ui.button("🔗  Copy URL").clicked() {
+                                            ui.ctx().copy_text(v.url.clone());
+                                            ui.close();
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                !v.output_path.is_empty(),
+                                                egui::Button::new("📋  Copy file path"),
+                                            )
+                                            .clicked()
+                                        {
+                                            ui.ctx().copy_text(v.output_path.clone());
+                                            ui.close();
+                                        }
+                                        ui.separator();
+                                        if ui.button("🗑  Delete from list").clicked() {
+                                            *pick = Some(VideoMenuChoice::Delete);
+                                            ui.close();
+                                        }
+                                    };
+
                                 tr.col(|ui| {
                                     let label = if v.title.trim().is_empty() {
                                         v.url.as_str()
@@ -998,56 +1090,80 @@ impl StreamArchiverApp {
                                     ui.label(fmt_date(v.created_at));
                                 });
                                 tr.col(|ui| {
+                                    if !v.output_path.is_empty() {
+                                        ui.label(&v.output_path).on_hover_text(&v.output_path);
+                                    }
+                                });
+                                tr.col(|ui| {
                                     ui.push_id(v.id, |ui| {
+                                        let mut btns: Vec<egui::Response> = Vec::with_capacity(5);
                                         if v.is_active() {
-                                            if ui
-                                                .small_button("⏹")
-                                                .on_hover_text("Stop download")
-                                                .clicked()
-                                            {
+                                            let b =
+                                                ui.small_button("⏹").on_hover_text("Stop download");
+                                            if b.clicked() {
                                                 to_stop = Some(v.id);
                                             }
-                                        } else if ui
-                                            .small_button("↻")
-                                            .on_hover_text("Retry download")
-                                            .clicked()
-                                        {
-                                            to_retry = Some(v.id);
+                                            btns.push(b);
+                                        } else {
+                                            let b = ui
+                                                .small_button("↻")
+                                                .on_hover_text("Retry download");
+                                            if b.clicked() {
+                                                to_retry = Some(v.id);
+                                            }
+                                            btns.push(b);
                                         }
                                         let dir_ok = std::path::Path::new(&v.output_dir).is_dir();
-                                        if ui
+                                        let b = ui
                                             .add_enabled(dir_ok, egui::Button::new("📂").small())
-                                            .on_hover_text("Open output folder")
-                                            .clicked()
-                                        {
+                                            .on_hover_text("Open output folder");
+                                        if b.clicked() {
                                             crate::platform::open_path(std::path::Path::new(
                                                 &v.output_dir,
                                             ));
                                         }
+                                        btns.push(b);
                                         let file_ok = !v.output_path.is_empty()
                                             && std::path::Path::new(&v.output_path).is_file();
-                                        if ui
+                                        let b = ui
                                             .add_enabled(file_ok, egui::Button::new("▶").small())
-                                            .on_hover_text("Open file")
-                                            .clicked()
-                                        {
+                                            .on_hover_text("Open file");
+                                        if b.clicked() {
                                             crate::platform::open_path(std::path::Path::new(
                                                 &v.output_path,
                                             ));
                                         }
-                                        if ui.small_button("📋").on_hover_text("Copy URL").clicked()
-                                        {
+                                        btns.push(b);
+                                        let b = ui.small_button("📋").on_hover_text("Copy URL");
+                                        if b.clicked() {
                                             ui.ctx().copy_text(v.url.clone());
                                         }
-                                        if ui
+                                        btns.push(b);
+                                        let b = ui
                                             .small_button("🗑")
-                                            .on_hover_text("Delete from list (keeps the file)")
-                                            .clicked()
-                                        {
+                                            .on_hover_text("Delete from list (keeps the file)");
+                                        if b.clicked() {
                                             to_delete = Some(v.id);
+                                        }
+                                        btns.push(b);
+                                        // Buttons swallow the right-click, so give each
+                                        // the row menu too.
+                                        for b in &btns {
+                                            b.context_menu(|ui| add_menu(ui, &mut menu_pick));
                                         }
                                     });
                                 });
+
+                                // Right-click anywhere on the row opens the menu.
+                                tr.response()
+                                    .context_menu(|ui| add_menu(ui, &mut menu_pick));
+
+                                match menu_pick {
+                                    Some(VideoMenuChoice::Stop) => to_stop = Some(v.id),
+                                    Some(VideoMenuChoice::Retry) => to_retry = Some(v.id),
+                                    Some(VideoMenuChoice::Delete) => to_delete = Some(v.id),
+                                    None => {}
+                                }
                             });
                         }
                     });
@@ -1105,6 +1221,7 @@ impl StreamArchiverApp {
         }
 
         let mut do_download = false;
+        let mut do_list_formats = false;
 
         {
             let vf = &mut self.video_form;
@@ -1138,10 +1255,17 @@ impl StreamArchiverApp {
                     ui.end_row();
 
                     ui.label("Name");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut vf.title)
-                            .hint_text("optional — used for the filename (default: video)"),
-                    );
+                    ui.add(egui::TextEdit::singleline(&mut vf.title).hint_text(
+                        "optional — used for the filename (default: the title, else \"video\")",
+                    ));
+                    ui.end_row();
+
+                    ui.label("Auto-detect title");
+                    ui.checkbox(&mut vf.auto_title, "Use the stream's own title")
+                        .on_hover_text(
+                            "Looks up the real title via yt-dlp at download time and uses it for \
+                             {title} (and for {name} when Name is left blank).",
+                        );
                     ui.end_row();
 
                     ui.label("Tool").on_hover_text(vf.tool.tooltip());
@@ -1221,8 +1345,10 @@ impl StreamArchiverApp {
                     });
                     ui.end_row();
 
-                    ui.label("Filename template");
-                    ui.text_edit_singleline(&mut vf.filename_template);
+                    let tmpl_hint = "Variables: {name} {title} {date} {time} {timestamp}";
+                    ui.label("Filename template").on_hover_text(tmpl_hint);
+                    ui.text_edit_singleline(&mut vf.filename_template)
+                        .on_hover_text(tmpl_hint);
                     ui.end_row();
 
                     ui.label("Extra args");
@@ -1231,18 +1357,32 @@ impl StreamArchiverApp {
                 });
 
             ui.add_space(6.0);
-            let can_download = !vf.url.trim().is_empty();
-            if ui
-                .add_enabled(can_download, egui::Button::new("⬇  Download"))
-                .clicked()
-            {
-                do_download = true;
-            }
+            ui.horizontal(|ui| {
+                let can = !vf.url.trim().is_empty();
+                if ui
+                    .add_enabled(can, egui::Button::new("⬇  Download"))
+                    .clicked()
+                {
+                    do_download = true;
+                }
+                if ui
+                    .add_enabled(can, egui::Button::new("List formats"))
+                    .on_hover_text(
+                        "Show available formats/qualities for this URL using the selected tool",
+                    )
+                    .clicked()
+                {
+                    do_list_formats = true;
+                }
+            });
             ui.add_space(6.0);
         }
 
         if do_download {
             self.start_video_download();
+        }
+        if do_list_formats {
+            self.start_format_probe(ui.ctx().clone());
         }
     }
 
@@ -1274,6 +1414,7 @@ impl StreamArchiverApp {
             auth_kind,
             auth_value,
             extra_args: self.video_form.extra_args.clone(),
+            auto_title: self.video_form.auto_title,
             status: "queued".into(),
             output_path: String::new(),
             bytes: 0,
@@ -1293,6 +1434,78 @@ impl StreamArchiverApp {
                 self.reload_videos();
             }
             Err(e) => self.status = format!("Error: {e}"),
+        }
+    }
+
+    /// Probe available formats/qualities for the form's URL with the selected
+    /// tool, on the async runtime; the result appears in a window.
+    fn start_format_probe(&mut self, ctx: egui::Context) {
+        let url = self.video_form.url.trim().to_string();
+        if url.is_empty() {
+            self.status = "Enter a URL first.".into();
+            return;
+        }
+        let tool = self.video_form.tool;
+        let (auth_kind, auth_value) = match self.video_form.auth_override {
+            Some(kind) => (kind, self.video_form.auth_value.clone()),
+            None => (
+                self.video_form.default_auth_kind,
+                self.video_form.default_auth_value.clone(),
+            ),
+        };
+        let global_method = setting_or_empty(&self.core, K_DOWNLOAD_AUTH);
+        let global_browser = setting_or_empty(&self.core, K_COOKIES_BROWSER);
+        let auth = crate::downloader::resolve_auth_for(
+            auth_kind,
+            &auth_value,
+            &global_method,
+            &global_browser,
+        );
+
+        let probe = self.format_probe.clone();
+        *probe.lock().unwrap() = FormatProbe::Running;
+        self.status = "Listing formats…".into();
+        self.core.rt.spawn(async move {
+            let result = crate::downloader::probe_formats(tool, &url, &auth).await;
+            *probe.lock().unwrap() = match result {
+                Ok(s) => FormatProbe::Done(s),
+                Err(e) => FormatProbe::Failed(e),
+            };
+            ctx.request_repaint();
+        });
+    }
+
+    /// Window showing the result of a "List formats" probe.
+    fn format_probe_window(&mut self, ctx: &egui::Context) {
+        let probe = self.format_probe.lock().unwrap().clone();
+        let (title, body, done) = match &probe {
+            FormatProbe::Idle => return,
+            FormatProbe::Running => ("Listing formats…", "Running…".to_string(), false),
+            FormatProbe::Done(s) => ("Available formats", s.clone(), true),
+            FormatProbe::Failed(e) => ("Format probe failed", e.clone(), true),
+        };
+        let mut open = true;
+        egui::Window::new(title)
+            .collapsible(true)
+            .resizable(true)
+            .default_size([680.0, 460.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                if done && ui.button("📋  Copy").clicked() {
+                    ui.ctx().copy_text(body.clone());
+                }
+                ui.add_space(4.0);
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&body).monospace())
+                                .selectable(true),
+                        );
+                    });
+            });
+        if !open {
+            *self.format_probe.lock().unwrap() = FormatProbe::Idle;
         }
     }
 

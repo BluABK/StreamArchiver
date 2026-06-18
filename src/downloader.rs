@@ -119,7 +119,7 @@ pub fn build_plan(row: &MonitorWithChannel, started_at: i64, auth: &AuthSource) 
     let m = &row.monitor;
     let ch = &row.channel;
     let dir = PathBuf::from(&m.output_dir);
-    let stem = expand_template(&m.filename_template, &ch.name, started_at);
+    let stem = expand_template(&m.filename_template, &ch.name, "", started_at);
     let quality = if m.quality.trim().is_empty() {
         "best".to_string()
     } else {
@@ -217,14 +217,25 @@ pub fn build_plan(row: &MonitorWithChannel, started_at: i64, auth: &AuthSource) 
 /// directly; streamlink/ffmpeg capture to `.ts` then remux losslessly. Unlike
 /// [`build_plan`], there are no live-stream flags (`--live-from-start`,
 /// `--retry-streams`).
-pub fn build_video_plan(v: &Video, started_at: i64, auth: &AuthSource) -> DownloadPlan {
+pub fn build_video_plan(
+    v: &Video,
+    started_at: i64,
+    title: &str,
+    auth: &AuthSource,
+) -> DownloadPlan {
     let dir = PathBuf::from(&v.output_dir);
-    let name = if v.title.trim().is_empty() {
-        "video"
+    // `{name}` prefers the user's Name field, then the resolved title, then a
+    // generic fallback. `{title}` is the resolved title (may be empty).
+    let name_field = v.title.trim();
+    let resolved = title.trim();
+    let name = if !name_field.is_empty() {
+        name_field
+    } else if !resolved.is_empty() {
+        resolved
     } else {
-        v.title.trim()
+        "video"
     };
-    let stem = expand_template(&v.filename_template, name, started_at);
+    let stem = expand_template(&v.filename_template, name, resolved, started_at);
     let quality = if v.quality.trim().is_empty() {
         "best".to_string()
     } else {
@@ -591,14 +602,26 @@ impl Supervisor {
             &global_method,
             &global_browser,
         );
-        let plan = build_video_plan(&video, started_at, &auth);
+        // Optionally resolve the real stream/video title (for {title}/{name} and
+        // the list display).
+        let title = if video.auto_title {
+            resolve_title(&video, &auth).await
+        } else {
+            String::new()
+        };
+        if !title.is_empty() && video.title.trim().is_empty() {
+            let _ = self.store.set_video_title(id, &title);
+        }
+        let plan = build_video_plan(&video, started_at, &title, &auth);
         if let Some(parent) = plan.capture_path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
-        let label = if video.title.trim().is_empty() {
-            video.url.clone()
-        } else {
+        let label = if !video.title.trim().is_empty() {
             video.title.clone()
+        } else if !title.is_empty() {
+            title.clone()
+        } else {
+            video.url.clone()
         };
         info!(video = id, program = %plan.program, "downloading video -> {}", plan.final_path.display());
 
@@ -884,6 +907,110 @@ struct ProcessOutcome {
     log: String,
 }
 
+/// Resolve a video/stream's real title via yt-dlp (no download). Works for
+/// YouTube, Twitch VODs, Kick, and many sites; returns an empty string on any
+/// failure (caller falls back to the Name field or "video"). Truncated to keep
+/// filenames sane.
+async fn resolve_title(video: &Video, auth: &AuthSource) -> String {
+    let mut args: Vec<String> = vec![
+        "--no-playlist".into(),
+        "--no-warnings".into(),
+        "--skip-download".into(),
+        "--print".into(),
+        "%(title)s".into(),
+    ];
+    match auth {
+        AuthSource::CookiesBrowser(b) => {
+            args.push("--cookies-from-browser".into());
+            args.push(b.clone());
+        }
+        AuthSource::CookiesFile(p) => {
+            args.push("--cookies".into());
+            args.push(p.clone());
+        }
+        _ => {}
+    }
+    args.push(video.url.clone());
+
+    let mut cmd = Command::new("yt-dlp");
+    cmd.args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let out = match cmd.output().await {
+        Ok(o) if o.status.success() => o,
+        _ => return String::new(),
+    };
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let title = raw.lines().next().unwrap_or("").trim();
+    if title.is_empty() || title == "NA" {
+        String::new()
+    } else {
+        title.chars().take(120).collect()
+    }
+}
+
+/// Probe available formats/qualities for a URL with the given tool, returning
+/// combined stdout+stderr for the Videos-tab "List formats" window. yt-dlp gets
+/// `--list-formats`, streamlink lists its stream qualities, ffmpeg uses ffprobe.
+pub async fn probe_formats(tool: Tool, url: &str, auth: &AuthSource) -> Result<String, String> {
+    let (program, mut args): (&str, Vec<String>) = match tool {
+        Tool::YtDlp => (
+            "yt-dlp",
+            vec!["--list-formats".into(), "--no-playlist".into()],
+        ),
+        Tool::Streamlink => ("streamlink", Vec::new()),
+        Tool::Ffmpeg => ("ffprobe", vec!["-hide_banner".into()]),
+    };
+    if let Tool::YtDlp = tool {
+        match auth {
+            AuthSource::CookiesBrowser(b) => {
+                args.push("--cookies-from-browser".into());
+                args.push(b.clone());
+            }
+            AuthSource::CookiesFile(p) => {
+                args.push("--cookies".into());
+                args.push(p.clone());
+            }
+            _ => {}
+        }
+    }
+    args.push(url.to_string());
+
+    let mut cmd = Command::new(program);
+    cmd.args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let out = match tokio::time::timeout(Duration::from_secs(45), cmd.output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return Err(format!("failed to run {program}: {e}")),
+        Err(_) => return Err(format!("{program} timed out")),
+    };
+    let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+    let err = String::from_utf8_lossy(&out.stderr);
+    if !err.trim().is_empty() {
+        if !s.trim().is_empty() {
+            s.push('\n');
+        }
+        s.push_str(&err);
+    }
+    let s = s.trim().to_string();
+    if s.is_empty() {
+        Ok(format!("(no output; exit {:?})", out.status.code()))
+    } else {
+        Ok(s)
+    }
+}
+
 pub async fn remux_ts_to_mkv(src: &Path, dst: &Path) -> anyhow::Result<()> {
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-y")
@@ -956,8 +1083,9 @@ fn split_args(s: &str) -> Vec<String> {
 }
 
 /// Expand a filename template using our own (tool-agnostic) variables so the
-/// output path is known in advance: `{name} {date} {time} {timestamp}`.
-fn expand_template(template: &str, channel_name: &str, secs: i64) -> String {
+/// output path is known in advance: `{name} {title} {date} {time} {timestamp}`.
+/// `title` is the resolved stream/video title (empty when not auto-detected).
+fn expand_template(template: &str, name: &str, title: &str, secs: i64) -> String {
     let (y, mo, d, h, mi, s) = civil_from_unix_utc(secs);
     let date = format!("{y:04}{mo:02}{d:02}");
     let time = format!("{h:02}{mi:02}{s:02}");
@@ -967,13 +1095,14 @@ fn expand_template(template: &str, channel_name: &str, secs: i64) -> String {
         template
     };
     let expanded = tmpl
-        .replace("{name}", channel_name)
+        .replace("{name}", name)
+        .replace("{title}", title)
         .replace("{date}", &date)
         .replace("{time}", &time)
         .replace("{timestamp}", &secs.to_string());
     let cleaned = sanitize_filename(&expanded);
     if cleaned.is_empty() {
-        format!("{}_{date}_{time}", sanitize_filename(channel_name))
+        format!("{}_{date}_{time}", sanitize_filename(name))
     } else {
         cleaned
     }
@@ -1068,8 +1197,18 @@ mod tests {
 
     #[test]
     fn template_expands_and_sanitizes() {
-        let name = expand_template("{name}_{date}", "Bad/Name?", 1_700_000_000);
+        let name = expand_template("{name}_{date}", "Bad/Name?", "", 1_700_000_000);
         assert_eq!(name, "Bad_Name__20231114");
+    }
+
+    #[test]
+    fn template_expands_title() {
+        let out = expand_template("{title}_{date}", "ignored", "My Stream!", 1_700_000_000);
+        assert_eq!(out, "My Stream!_20231114");
+        // {name} falls back to the resolved title via build_video_plan, but
+        // expand_template itself keeps name and title distinct.
+        let out2 = expand_template("{name}-{title}", "Nm", "Ttl", 1_700_000_000);
+        assert_eq!(out2, "Nm-Ttl");
     }
 
     #[test]
@@ -1182,6 +1321,7 @@ mod tests {
             auth_kind: AuthKind::Inherit,
             auth_value: String::new(),
             extra_args: String::new(),
+            auto_title: false,
             status: "queued".into(),
             output_path: String::new(),
             bytes: 0,
@@ -1197,6 +1337,7 @@ mod tests {
         let plan = build_video_plan(
             &video(Tool::YtDlp, "https://youtube.com/watch?v=abc"),
             1_700_000_000,
+            "",
             &AuthSource::None,
         );
         assert_eq!(plan.program, "yt-dlp");
@@ -1214,6 +1355,7 @@ mod tests {
         let plan = build_video_plan(
             &v,
             1_700_000_000,
+            "",
             &AuthSource::CookiesBrowser("edge".into()),
         );
         let joined = plan.args.join(" ");
@@ -1226,6 +1368,7 @@ mod tests {
         let plan = build_video_plan(
             &video(Tool::Streamlink, "https://twitch.tv/videos/123"),
             1_700_000_000,
+            "",
             &AuthSource::None,
         );
         assert_eq!(plan.program, "streamlink");

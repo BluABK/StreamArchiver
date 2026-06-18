@@ -45,9 +45,11 @@ pub async fn run(
     live_tx: UnboundedSender<LiveSignal>,
     shutdown: Arc<AtomicBool>,
 ) {
+    // Log the "have monitors but no creds" idle reason once, not every retry.
+    let mut warned_no_creds = false;
     while !shutdown.load(Ordering::SeqCst) {
-        match run_session(&store, &live_tx, &shutdown).await {
-            Ok(true) => {} // session ran; reconnect promptly
+        match run_session(&store, &live_tx, &shutdown, &mut warned_no_creds).await {
+            Ok(true) => warned_no_creds = false, // session ran; reset the one-shot warning
             Ok(false) => sleep_cancellable(IDLE_RETRY, &shutdown).await, // nothing to do
             Err(e) => {
                 warn!("eventsub: {e:#}");
@@ -63,6 +65,7 @@ async fn run_session(
     store: &Arc<Store>,
     live_tx: &UnboundedSender<LiveSignal>,
     shutdown: &Arc<AtomicBool>,
+    warned_no_creds: &mut bool,
 ) -> Result<bool> {
     // login(lowercased) -> [monitor_id]
     let login_to_monitors = load_eventsub_monitors(store)?;
@@ -70,7 +73,14 @@ async fn run_session(
         return Ok(false);
     }
     let Some((client_id, secret)) = credentials(store) else {
-        debug!("eventsub: Twitch credentials not set; idling");
+        // We have EventSub monitors but no Client Secret — log the reason once.
+        if !*warned_no_creds {
+            debug!(
+                "eventsub: have EventSub monitor(s) but no Twitch Client Secret; idling \
+                 (set a Client Secret in Settings to enable EventSub push)"
+            );
+            *warned_no_creds = true;
+        }
         return Ok(false);
     };
 

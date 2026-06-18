@@ -442,6 +442,9 @@ pub struct Video {
     pub auth_kind: AuthKind,
     pub auth_value: String,
     pub extra_args: String,
+    /// Resolve the real stream/video title at download time (via yt-dlp) and use
+    /// it for `{title}` (and `{name}` when no Name is set).
+    pub auto_title: bool,
     pub status: String,
     pub output_path: String,
     pub bytes: i64,

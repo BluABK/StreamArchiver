@@ -62,6 +62,16 @@ extra args), and click **Download**. Output is always **MKV** (yt-dlp remuxes to
 MKV; streamlink/ffmpeg capture to `.ts` then remux). Downloads share the same
 global concurrency limit as live recordings.
 
+**List formats.** Click **List formats** to probe the URL with the selected tool
+(`yt-dlp --list-formats`, streamlink's stream list, or `ffprobe`) and show the
+available formats/qualities in a window — handy for picking a **Quality** value.
+
+**Auto-detect title.** Tick **Auto-detect title** to look up the real
+stream/video title (via yt-dlp) at download time and use it for the `{title}`
+template variable — and for `{name}` when **Name** is left blank (so files aren't
+named `video_…`). Filename template variables: `{name} {title} {date} {time}
+{timestamp}`.
+
 **Per-platform defaults.** The form pre-fills from saved defaults for the pasted
 URL's platform; edit any field to override it for that download. The
 **⚙ Per-platform defaults** panel to the right of the download form sets the
@@ -71,9 +81,10 @@ and Generic (each collapsible) — saved automatically. The form's **Auth** has 
 plus the explicit choices; **Inherit (global)** stays available and chains to the
 Settings → *Download authentication* default.
 
-Each row shows status (`queued` → `downloading` → `completed`/`failed`/`stopped`)
-and size, with per-row actions: **Stop**, **Retry**, **Open folder**, **Open
-file**, **Copy URL**, and **Delete** (removes the row; the file is kept). A
+Each row shows status (`queued` → `downloading` → `completed`/`failed`/`stopped`),
+size, and the **File** path on disk. Per-row inline actions plus a **right-click
+context menu** offer: **Open file**, **Open folder**, **Copy URL**, **Copy file
+path**, **Stop**/**Retry**, and **Delete** (removes the row; the file is kept). A
 download left in flight by a crash/quit is marked `orphaned` on the next start.
 
 The channel table shows, per monitor: On (enable/disable), Name, Platform (with a
@@ -147,7 +158,8 @@ rather not reconnect, set a Client Secret and the app token is used.)
 Recordings capture to a progressively-flushed `.ts` (so a crash/forced-stop leaves
 usable data) and are remuxed losslessly to **`.mkv`** on clean stop. MKV is the
 default; pick TS per channel if you prefer. **MP4 is never produced** (poor for
-interrupted writes). Filename template variables: `{name} {date} {time} {timestamp}`.
+interrupted writes). Filename template variables: `{name} {title} {date} {time} {timestamp}`
+(`{title}` is the auto-detected stream title; empty unless **Auto-detect title** is on).
 
 ### Authentication
 

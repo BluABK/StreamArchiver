@@ -17,7 +17,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -170,7 +170,13 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 5)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 5);
+        if version < 6 {
+            conn.execute_batch(
+                "ALTER TABLE video ADD COLUMN auto_title INTEGER NOT NULL DEFAULT 0;",
+            )?;
+            conn.pragma_update(None, "user_version", 6)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 6);
         Ok(())
     }
 
@@ -465,8 +471,8 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO video(url, title, platform, tool, quality, output_dir, filename_template,
-                auth_kind, auth_value, extra_args, status, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'queued', ?11)",
+                auth_kind, auth_value, extra_args, auto_title, status, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'queued', ?12)",
             params![
                 v.url,
                 v.title,
@@ -478,10 +484,18 @@ impl Store {
                 v.auth_kind.as_str(),
                 v.auth_value,
                 v.extra_args,
+                v.auto_title as i64,
                 now_unix(),
             ],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// Persist a resolved/display title for a video (used by auto-detect title).
+    pub fn set_video_title(&self, id: i64, title: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE video SET title=?2 WHERE id=?1", params![id, title])?;
+        Ok(())
     }
 
     /// Mark a video as started (status `downloading` + start time).
@@ -566,7 +580,7 @@ impl Store {
             .query_row(
                 "SELECT id, url, title, platform, tool, quality, output_dir, filename_template,
                     auth_kind, auth_value, extra_args, status, output_path, bytes, exit_code,
-                    created_at, started_at, ended_at
+                    created_at, started_at, ended_at, auto_title
                  FROM video WHERE id=?1",
                 params![id],
                 Self::map_video,
@@ -581,7 +595,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT id, url, title, platform, tool, quality, output_dir, filename_template,
                 auth_kind, auth_value, extra_args, status, output_path, bytes, exit_code,
-                created_at, started_at, ended_at
+                created_at, started_at, ended_at, auto_title
              FROM video ORDER BY id DESC",
         )?;
         let rows = stmt
@@ -610,6 +624,7 @@ impl Store {
             created_at: r.get(15)?,
             started_at: r.get(16)?,
             ended_at: r.get(17)?,
+            auto_title: r.get::<_, i64>(18)? != 0,
         })
     }
 
@@ -708,6 +723,7 @@ mod tests {
             auth_kind: AuthKind::Inherit,
             auth_value: String::new(),
             extra_args: String::new(),
+            auto_title: false,
             status: "queued".into(),
             output_path: String::new(),
             bytes: 0,
@@ -721,11 +737,21 @@ mod tests {
     #[test]
     fn video_crud_roundtrip() {
         let store = Store::open_in_memory().unwrap();
-        let id = store.insert_video(&sample_video()).unwrap();
+        let mut sample = sample_video();
+        sample.auto_title = true;
+        let id = store.insert_video(&sample).unwrap();
 
         let v = store.get_video(id).unwrap().unwrap();
         assert_eq!(v.status, "queued");
         assert_eq!(v.tool, Tool::YtDlp);
+        // auto_title must survive the round-trip (guards the insert/select/map
+        // param + column-index wiring for the v6 column).
+        assert!(v.auto_title);
+        store.set_video_title(id, "Resolved Title").unwrap();
+        assert_eq!(
+            store.get_video(id).unwrap().unwrap().title,
+            "Resolved Title"
+        );
 
         store.set_video_started(id, 123).unwrap();
         assert_eq!(store.get_video(id).unwrap().unwrap().status, "downloading");
