@@ -60,6 +60,8 @@ and **Added** (when the channel was added).
 |---|---|---|---|
 | Twitch API (Helix) | Twitch | Yes | Batched, scales to many channels; **default for Twitch**. |
 | Twitch EventSub | Twitch | Yes (same app creds) | Real-time push via conduit + websocket (no polling, no public endpoint). Reconciles on connect. |
+| YouTube Data API | YouTube | Yes (API key) | `search.list?eventType=live`; reports the real go-live time. **Quota-limited (~100 checks/day)** — use sparingly. |
+| Kick official API | Kick | Yes (Client ID/Secret) | client-credentials app token; more reliable than scraping (no Cloudflare). |
 | Scrape poll | YouTube `/live`, Kick, generic | No | **Default for YouTube/Kick**; fragile to site changes. |
 | Generic probe | any streamlink/yt-dlp URL | No | Uses `streamlink --stream-url` to test liveness. |
 
@@ -83,12 +85,16 @@ interrupted writes). Filename template variables: `{name} {date} {time} {timesta
 
 Two separate concerns:
 
-**Platform API (detection).** Twitch detection uses OAuth2. Either:
-- **Client ID + Secret** in Settings → app-token (client-credentials) flow, or
-- **Connect Twitch** (Settings → *Twitch account*) → OAuth2 **device-code** login
-  (also `streamarchiver --twitch-login`). Stores a refreshable **user token**;
-  detection then prefers it, so the Client Secret becomes optional. Register a
-  free app at <https://dev.twitch.tv/console/apps> to get a Client ID.
+**Platform API (detection).** OAuth2 / API-key, per platform (all optional —
+scrape works without any):
+- **Twitch** → Client ID + Secret (app token) *or* **Connect Twitch** (Settings →
+  *Twitch account*) OAuth2 **device-code** login (also `--twitch-login`), which
+  stores a refreshable user token detection prefers (Secret then optional).
+  Register at <https://dev.twitch.tv/console/apps>.
+- **YouTube** → **API key** (Settings) enables the *YouTube Data API* method.
+  Create one in a Google Cloud project with the YouTube Data API v3 enabled.
+- **Kick** → **Client ID + Secret** (Settings) enables the *Kick official API*
+  method (client-credentials app token). Register at <https://kick.com/settings/developer>.
 
 **Authenticated downloads** (sub-only / members-only / ad-reduced / higher quality).
 Set a global default in Settings → *Download authentication*, and/or override

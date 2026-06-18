@@ -368,6 +368,8 @@ impl Supervisor {
                     went_live_at: None,
                 }),
             DetectionMethod::GenericProbe => self.ctx.detect_generic(&item).await,
+            DetectionMethod::YouTubeApi => self.ctx.detect_youtube_api(&item).await,
+            DetectionMethod::KickApi => self.ctx.detect_kick_api(&item).await,
             _ => self.ctx.detect_scrape(&item).await,
         }
     }

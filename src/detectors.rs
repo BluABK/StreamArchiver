@@ -15,9 +15,10 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use serde::Deserialize;
+use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::debug;
 
@@ -101,11 +102,12 @@ struct TwitchToken {
     expires_at: Instant,
 }
 
-/// Shared detection state: one HTTP client + cached Twitch app token.
+/// Shared detection state: one HTTP client + cached app tokens.
 pub struct DetectContext {
     http: Client,
     pub store: Arc<Store>,
     twitch_token: Mutex<Option<TwitchToken>>,
+    kick_token: Mutex<Option<TwitchToken>>,
 }
 
 impl DetectContext {
@@ -119,6 +121,7 @@ impl DetectContext {
             http,
             store,
             twitch_token: Mutex::new(None),
+            kick_token: Mutex::new(None),
         }
     }
 
@@ -287,6 +290,186 @@ impl DetectContext {
         outcomes
     }
 
+    // ----- YouTube Data API (API key) -----
+
+    pub async fn detect_youtube_api(&self, item: &DetectItem) -> DetectOutcome {
+        let key = self
+            .store
+            .get_setting("youtube_api_key")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if key.is_empty() {
+            return DetectOutcome::err(item.monitor_id, "no YouTube API key (Settings)");
+        }
+        let channel_id = match self.youtube_channel_id(&item.url, &key).await {
+            Ok(id) => id,
+            Err(e) => return DetectOutcome::err(item.monitor_id, e.to_string()),
+        };
+        // search.list?eventType=live (note: 100 quota units per call).
+        let resp = self
+            .http
+            .get("https://www.googleapis.com/youtube/v3/search")
+            .query(&[
+                ("part", "id"),
+                ("channelId", channel_id.as_str()),
+                ("eventType", "live"),
+                ("type", "video"),
+                ("key", key.as_str()),
+            ])
+            .send()
+            .await;
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                let v: Value = r.json().await.unwrap_or_default();
+                match v["items"][0]["id"]["videoId"].as_str() {
+                    Some(vid) => {
+                        let went = self.youtube_actual_start(vid, &key).await;
+                        DetectOutcome::live_at(item.monitor_id, "live", went)
+                    }
+                    None => DetectOutcome::offline(item.monitor_id),
+                }
+            }
+            Ok(r) => DetectOutcome::err(item.monitor_id, format!("youtube api {}", r.status())),
+            Err(e) => DetectOutcome::err(item.monitor_id, e.to_string()),
+        }
+    }
+
+    /// Resolve a YouTube channel URL to its UC… channel id.
+    async fn youtube_channel_id(&self, url: &str, key: &str) -> Result<String> {
+        if let Some(pos) = url.find("/channel/") {
+            let id = url[pos + "/channel/".len()..]
+                .split(['/', '?', '#'])
+                .next()
+                .unwrap_or("");
+            if id.starts_with("UC") {
+                return Ok(id.to_string());
+            }
+        }
+        if let Some(handle) = youtube_handle(url) {
+            let resp = self
+                .http
+                .get("https://www.googleapis.com/youtube/v3/channels")
+                .query(&[("part", "id"), ("forHandle", handle.as_str()), ("key", key)])
+                .send()
+                .await?;
+            let v: Value = resp.json().await?;
+            if let Some(id) = v["items"][0]["id"].as_str() {
+                return Ok(id.to_string());
+            }
+            bail!("could not resolve YouTube handle {handle}");
+        }
+        bail!("unsupported YouTube URL (use /channel/UC… or @handle)")
+    }
+
+    async fn youtube_actual_start(&self, video_id: &str, key: &str) -> Option<i64> {
+        let resp = self
+            .http
+            .get("https://www.googleapis.com/youtube/v3/videos")
+            .query(&[
+                ("part", "liveStreamingDetails"),
+                ("id", video_id),
+                ("key", key),
+            ])
+            .send()
+            .await
+            .ok()?;
+        let v: Value = resp.json().await.ok()?;
+        let s = v["items"][0]["liveStreamingDetails"]["actualStartTime"].as_str()?;
+        parse_rfc3339(s)
+    }
+
+    // ----- Kick official API (client-credentials app token) -----
+
+    async fn kick_app_token(&self) -> Result<String> {
+        if let Some(tok) = self.kick_token.lock().await.as_ref() {
+            if tok.expires_at > Instant::now() {
+                return Ok(tok.access_token.clone());
+            }
+        }
+        let client_id = self
+            .store
+            .get_setting("kick_client_id")?
+            .unwrap_or_default();
+        let client_secret = self
+            .store
+            .get_setting("kick_client_secret")?
+            .unwrap_or_default();
+        if client_id.is_empty() || client_secret.is_empty() {
+            bail!("Kick credentials not set (Settings)");
+        }
+        let resp = self
+            .http
+            .post("https://id.kick.com/oauth/token")
+            .form(&[
+                ("client_id", client_id.as_str()),
+                ("client_secret", client_secret.as_str()),
+                ("grant_type", "client_credentials"),
+            ])
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            bail!("Kick token request failed: {}", resp.status());
+        }
+        let v: Value = resp.json().await?;
+        let access = v["access_token"]
+            .as_str()
+            .context("no access_token")?
+            .to_string();
+        let ttl = v["expires_in"]
+            .as_u64()
+            .unwrap_or(3600)
+            .saturating_sub(60)
+            .max(60);
+        *self.kick_token.lock().await = Some(TwitchToken {
+            access_token: access.clone(),
+            expires_at: Instant::now() + Duration::from_secs(ttl),
+        });
+        Ok(access)
+    }
+
+    pub async fn detect_kick_api(&self, item: &DetectItem) -> DetectOutcome {
+        let token = match self.kick_app_token().await {
+            Ok(t) => t,
+            Err(e) => return DetectOutcome::err(item.monitor_id, e.to_string()),
+        };
+        let Some(slug) = kick_slug(&item.url) else {
+            return DetectOutcome::err(item.monitor_id, "cannot parse kick slug");
+        };
+        let resp = self
+            .http
+            .get("https://api.kick.com/public/v1/channels")
+            .query(&[("slug", slug.as_str())])
+            .bearer_auth(&token)
+            .send()
+            .await;
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                let v: Value = r.json().await.unwrap_or_default();
+                // Defensive: the public API exposes the channel under data[0];
+                // a live stream populates a stream/livestream object.
+                let ch = &v["data"][0];
+                let stream = if ch["stream"].is_object() {
+                    &ch["stream"]
+                } else {
+                    &ch["livestream"]
+                };
+                let live = stream["is_live"].as_bool().unwrap_or(stream.is_object());
+                let went = stream["start_time"]
+                    .as_str()
+                    .or_else(|| stream["created_at"].as_str())
+                    .and_then(parse_rfc3339);
+                if live {
+                    DetectOutcome::live_at(item.monitor_id, "live", went)
+                } else {
+                    DetectOutcome::offline(item.monitor_id)
+                }
+            }
+            Ok(r) => DetectOutcome::err(item.monitor_id, format!("kick api {}", r.status())),
+            Err(e) => DetectOutcome::err(item.monitor_id, e.to_string()),
+        }
+    }
+
     // ----- scrape (no credentials) -----
 
     pub async fn detect_scrape(&self, item: &DetectItem) -> DetectOutcome {
@@ -424,6 +607,17 @@ fn kick_slug(url: &str) -> Option<String> {
         None
     } else {
         Some(slug.to_string())
+    }
+}
+
+/// Extract a YouTube `@handle` from a channel URL (e.g. `.../@LofiGirl/live`).
+fn youtube_handle(url: &str) -> Option<String> {
+    let pos = url.find("/@")?;
+    let handle = url[pos + 1..].split(['/', '?', '#']).next()?.trim();
+    if handle.len() > 1 {
+        Some(handle.to_string())
+    } else {
+        None
     }
 }
 

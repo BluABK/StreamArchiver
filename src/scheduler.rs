@@ -30,6 +30,8 @@ const MAX_SLEEP_SECS: i64 = 30;
 enum PerItemMode {
     Scrape,
     Generic,
+    YouTubeApi,
+    KickApi,
 }
 
 /// Run the scheduler until shutdown is signaled.
@@ -65,6 +67,8 @@ async fn tick(
     let mut twitch_items: Vec<DetectItem> = Vec::new();
     let mut scrape_items: Vec<DetectItem> = Vec::new();
     let mut generic_items: Vec<DetectItem> = Vec::new();
+    let mut youtube_api_items: Vec<DetectItem> = Vec::new();
+    let mut kick_api_items: Vec<DetectItem> = Vec::new();
     let mut prev_state: HashMap<i64, String> = HashMap::new();
 
     let recording: std::collections::HashSet<i64> =
@@ -85,7 +89,11 @@ async fn tick(
         // (CLI self-poll/EventSub in later phases).
         let handled = matches!(
             m.detection_method,
-            DetectionMethod::TwitchApi | DetectionMethod::Scrape | DetectionMethod::GenericProbe
+            DetectionMethod::TwitchApi
+                | DetectionMethod::Scrape
+                | DetectionMethod::GenericProbe
+                | DetectionMethod::YouTubeApi
+                | DetectionMethod::KickApi
         );
         if !handled {
             continue;
@@ -103,6 +111,8 @@ async fn tick(
                 DetectionMethod::TwitchApi => twitch_items.push(item),
                 DetectionMethod::Scrape => scrape_items.push(item),
                 DetectionMethod::GenericProbe => generic_items.push(item),
+                DetectionMethod::YouTubeApi => youtube_api_items.push(item),
+                DetectionMethod::KickApi => kick_api_items.push(item),
                 _ => {}
             }
             min_wait = min_wait.min(interval);
@@ -120,6 +130,12 @@ async fn tick(
     }
     if !generic_items.is_empty() {
         outcomes.extend(run_per_item(ctx, generic_items, PerItemMode::Generic).await);
+    }
+    if !youtube_api_items.is_empty() {
+        outcomes.extend(run_per_item(ctx, youtube_api_items, PerItemMode::YouTubeApi).await);
+    }
+    if !kick_api_items.is_empty() {
+        outcomes.extend(run_per_item(ctx, kick_api_items, PerItemMode::KickApi).await);
     }
 
     let checked_at = now_unix();
@@ -177,6 +193,8 @@ async fn run_per_item(
             match mode {
                 PerItemMode::Scrape => ctx.detect_scrape(&item).await,
                 PerItemMode::Generic => ctx.detect_generic(&item).await,
+                PerItemMode::YouTubeApi => ctx.detect_youtube_api(&item).await,
+                PerItemMode::KickApi => ctx.detect_kick_api(&item).await,
             }
         });
     }

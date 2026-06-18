@@ -95,8 +95,16 @@ impl Platform {
                 DetectionMethod::Scrape,
                 DetectionMethod::GenericProbe,
             ],
-            Platform::YouTube => &[DetectionMethod::Scrape, DetectionMethod::GenericProbe],
-            Platform::Kick => &[DetectionMethod::Scrape, DetectionMethod::GenericProbe],
+            Platform::YouTube => &[
+                DetectionMethod::Scrape,
+                DetectionMethod::YouTubeApi,
+                DetectionMethod::GenericProbe,
+            ],
+            Platform::Kick => &[
+                DetectionMethod::Scrape,
+                DetectionMethod::KickApi,
+                DetectionMethod::GenericProbe,
+            ],
             Platform::Generic => &[DetectionMethod::GenericProbe],
         }
     }
@@ -149,6 +157,8 @@ pub enum DetectionMethod {
     GenericProbe,
     /// Twitch EventSub push (websocket/conduit). Phase 4.
     EventSub,
+    /// Kick official API polling (client-credentials app token). Needs creds.
+    KickApi,
 }
 
 impl DetectionMethod {
@@ -160,17 +170,19 @@ impl DetectionMethod {
             DetectionMethod::CliSelfPoll => "cli_selfpoll",
             DetectionMethod::GenericProbe => "generic_probe",
             DetectionMethod::EventSub => "eventsub",
+            DetectionMethod::KickApi => "kick_api",
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             DetectionMethod::TwitchApi => "Twitch API (Helix polling)",
-            DetectionMethod::YouTubeApi => "YouTube Data API",
+            DetectionMethod::YouTubeApi => "YouTube Data API (key)",
             DetectionMethod::Scrape => "Scrape poll (no API)",
             DetectionMethod::CliSelfPoll => "CLI self-poll loop",
             DetectionMethod::GenericProbe => "Generic HTTP probe",
-            DetectionMethod::EventSub => "Twitch EventSub push (Phase 4)",
+            DetectionMethod::EventSub => "Twitch EventSub push",
+            DetectionMethod::KickApi => "Kick official API",
         }
     }
 
@@ -183,6 +195,7 @@ impl DetectionMethod {
             DetectionMethod::CliSelfPoll => "CLI",
             DetectionMethod::GenericProbe => "Probe",
             DetectionMethod::EventSub => "EventSub",
+            DetectionMethod::KickApi => "Kick API",
         }
     }
 
@@ -193,6 +206,7 @@ impl DetectionMethod {
             "scrape" => DetectionMethod::Scrape,
             "cli_selfpoll" => DetectionMethod::CliSelfPoll,
             "eventsub" => DetectionMethod::EventSub,
+            "kick_api" => DetectionMethod::KickApi,
             _ => DetectionMethod::GenericProbe,
         }
     }

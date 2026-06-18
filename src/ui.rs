@@ -23,6 +23,8 @@ use crate::platform::AutoStart;
 const K_TWITCH_ID: &str = "twitch_client_id";
 const K_TWITCH_SECRET: &str = "twitch_client_secret";
 const K_YT_KEY: &str = "youtube_api_key";
+const K_KICK_ID: &str = "kick_client_id";
+const K_KICK_SECRET: &str = "kick_client_secret";
 const K_DEFAULT_OUT: &str = "default_output_dir";
 const K_MAX_CONCURRENT: &str = "max_concurrent_downloads";
 const K_DOWNLOAD_AUTH: &str = "download_auth_method";
@@ -131,6 +133,8 @@ struct SettingsForm {
     twitch_client_id: String,
     twitch_client_secret: String,
     youtube_api_key: String,
+    kick_client_id: String,
+    kick_client_secret: String,
     default_output_dir: String,
     max_concurrent_downloads: String,
     /// Global download-auth default: "none" or "cookies".
@@ -181,6 +185,8 @@ impl StreamArchiverApp {
             twitch_client_id: setting_or_empty(&core, K_TWITCH_ID),
             twitch_client_secret: setting_or_empty(&core, K_TWITCH_SECRET),
             youtube_api_key: setting_or_empty(&core, K_YT_KEY),
+            kick_client_id: setting_or_empty(&core, K_KICK_ID),
+            kick_client_secret: setting_or_empty(&core, K_KICK_SECRET),
             default_output_dir: default_out,
             max_concurrent_downloads: core
                 .store
@@ -329,6 +335,8 @@ impl StreamArchiverApp {
             (K_TWITCH_ID, s.twitch_client_id.trim()),
             (K_TWITCH_SECRET, s.twitch_client_secret.trim()),
             (K_YT_KEY, s.youtube_api_key.trim()),
+            (K_KICK_ID, s.kick_client_id.trim()),
+            (K_KICK_SECRET, s.kick_client_secret.trim()),
             (K_DEFAULT_OUT, s.default_output_dir.trim()),
             (K_MAX_CONCURRENT, s.max_concurrent_downloads.trim()),
             (K_DOWNLOAD_AUTH, s.download_auth_method.trim()),
@@ -802,6 +810,15 @@ impl StreamArchiverApp {
                     ui.label("YouTube API Key");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.settings.youtube_api_key)
+                            .password(true),
+                    );
+                    ui.end_row();
+                    ui.label("Kick Client ID");
+                    ui.text_edit_singleline(&mut self.settings.kick_client_id);
+                    ui.end_row();
+                    ui.label("Kick Client Secret");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.kick_client_secret)
                             .password(true),
                     );
                     ui.end_row();
