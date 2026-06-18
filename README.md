@@ -54,6 +54,26 @@ scrape), **Started On** (when we began recording), **Lost time** (Started On −
 Went Live, i.e. how much of the stream we missed), **Duration** (live, `HH:MM:SS`),
 and **Added** (when the channel was added).
 
+### Row actions & shortcuts
+
+Left-click a row to select it; **right-click** any row for a context menu:
+Start/Stop recording, **Open channel URL** (browser), **Open output folder** (file
+manager), **Copy URL**, Edit…, Add tool instance, Enable/Disable, and Delete. The
+inline per-row buttons (▶/⏹ ✏ ➕ 🗑) do the same.
+
+Keyboard shortcuts:
+
+| Key | Action |
+|---|---|
+| `Ctrl/Cmd+N` | Add channel |
+| `Ctrl/Cmd+,` | Open Settings |
+| `F5` | Refresh the list |
+| `Enter` | Edit the selected row |
+| `Delete` | Delete the selected row |
+| `Esc` | Close the open dialog |
+
+Deleting always asks for confirmation (the recorded files are kept either way).
+
 ### Detection methods
 
 | Method | Platforms | Needs creds | Notes |

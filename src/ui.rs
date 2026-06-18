@@ -41,6 +41,17 @@ enum View {
     Settings,
 }
 
+/// A self-mutating action picked from a row's right-click context menu. (URL /
+/// folder / clipboard actions are handled inline in the menu and aren't here.)
+enum MenuChoice {
+    Start,
+    Stop,
+    Edit,
+    AddInstance,
+    Toggle,
+    Delete,
+}
+
 /// Backing state for the add/edit dialog.
 struct MonitorForm {
     monitor_id: Option<i64>,
@@ -156,6 +167,10 @@ pub struct StreamArchiverApp {
     form: Option<MonitorForm>,
     settings: SettingsForm,
     status: String,
+    /// Monitor id of the currently selected row (target for keyboard shortcuts).
+    selected_monitor: Option<i64>,
+    /// Pending delete confirmation: (monitor id, channel name).
+    confirm_delete: Option<(i64, String)>,
     /// Shared state of the interactive "Connect Twitch" device-code flow.
     twitch_flow: Arc<Mutex<AuthFlow>>,
 }
@@ -221,6 +236,8 @@ impl StreamArchiverApp {
             form: None,
             settings,
             status: String::new(),
+            selected_monitor: None,
+            confirm_delete: None,
             twitch_flow,
         };
         app.reload_rows();
@@ -491,6 +508,8 @@ impl eframe::App for StreamArchiverApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.handle_shortcuts(ui.ctx());
+
         egui::Panel::top("top")
             .resizable(false)
             .show_inside(ui, |ui| {
@@ -527,10 +546,106 @@ impl eframe::App for StreamArchiverApp {
         });
 
         self.form_window(ui.ctx());
+        self.confirm_delete_window(ui.ctx());
     }
 }
 
 impl StreamArchiverApp {
+    /// Process global keyboard shortcuts once per frame, before drawing.
+    ///
+    /// While a modal (add/edit form or delete confirmation) is open, only `Esc`
+    /// is handled — it dismisses the modal — and other shortcuts are suppressed.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        use egui::{Key, KeyboardShortcut, Modifiers};
+        const ADD: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::N);
+        const SETTINGS: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Comma);
+        const REFRESH: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F5);
+
+        // A modal is open: Esc closes it, everything else is swallowed.
+        if self.form.is_some() || self.confirm_delete.is_some() {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                self.form = None;
+                self.confirm_delete = None;
+            }
+            return;
+        }
+
+        if ctx.input_mut(|i| i.consume_shortcut(&ADD)) {
+            self.view = View::Channels;
+            self.form = Some(MonitorForm::new_channel(
+                self.settings.default_output_dir.clone(),
+            ));
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&SETTINGS)) {
+            self.view = View::Settings;
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&REFRESH)) {
+            self.reload_rows();
+            self.status = "Refreshed.".into();
+        }
+
+        // Row-targeted keys only fire on the channel list when not typing.
+        if self.view == View::Channels && !ctx.egui_wants_keyboard_input() {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Delete)) {
+                if let Some(id) = self.selected_monitor {
+                    if let Some(row) = self.rows.iter().find(|r| r.monitor.id == id) {
+                        self.confirm_delete = Some((id, row.channel.name.clone()));
+                    }
+                }
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
+                if let Some(id) = self.selected_monitor {
+                    if let Some(idx) = self.rows.iter().position(|r| r.monitor.id == id) {
+                        self.form = Some(MonitorForm::from_existing(&self.rows[idx]));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Modal confirmation for deleting a monitor (the only destructive action).
+    fn confirm_delete_window(&mut self, ctx: &egui::Context) {
+        let Some((id, name)) = self.confirm_delete.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut do_delete = false;
+        let mut do_cancel = false;
+
+        egui::Window::new("Delete monitor")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(format!("Delete this capture instance for “{name}”?"));
+                ui.label("Removes the monitor and its settings. Recorded files are kept.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Delete").clicked() {
+                        do_delete = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        do_cancel = true;
+                    }
+                });
+            });
+
+        if do_delete {
+            match self.core.store.delete_monitor(id) {
+                Ok(()) => self.status = "Deleted.".into(),
+                Err(e) => self.status = format!("Error: {e}"),
+            }
+            if self.selected_monitor == Some(id) {
+                self.selected_monitor = None;
+            }
+            self.confirm_delete = None;
+            self.reload_rows();
+        } else if do_cancel || !open {
+            self.confirm_delete = None;
+        }
+    }
+
     fn channels_view(&mut self, ui: &mut egui::Ui) {
         if self.rows.is_empty() {
             ui.add_space(24.0);
@@ -544,11 +659,13 @@ impl StreamArchiverApp {
         // Deferred actions to avoid borrowing self mutably inside the table closure.
         let mut to_edit: Option<usize> = None;
         let mut to_add_instance: Option<usize> = None;
-        let mut to_delete: Option<i64> = None;
+        let mut to_delete: Option<(i64, String)> = None;
         let mut toggle: Option<(i64, bool)> = None;
         let mut to_start: Option<i64> = None;
         let mut to_stop: Option<i64> = None;
+        let mut to_select: Option<i64> = None;
 
+        let selected_monitor = self.selected_monitor;
         let now = crate::models::now_unix();
         let any_active = self
             .rows
@@ -563,6 +680,9 @@ impl StreamArchiverApp {
                 TableBuilder::new(ui)
                     .striped(true)
                     .resizable(true)
+                    // Make rows sense clicks so they can be selected and carry a
+                    // right-click context menu.
+                    .sense(egui::Sense::click())
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                     .column(Column::auto().at_least(28.0)) // enabled
                     .column(Column::auto().at_least(100.0)) // name
@@ -603,9 +723,80 @@ impl StreamArchiverApp {
                             let m = &row.monitor;
                             let rec = recording_cells(row, now);
                             let recording = self.core.active.lock().unwrap().contains_key(&m.id);
+                            let is_selected = selected_monitor == Some(m.id);
                             body.row(24.0, |mut tr| {
-                                // Tint active (recording) rows with the theme accent (blue).
-                                tr.set_selected(recording);
+                                // Tint active (recording) rows and the user-selected
+                                // row with the theme accent (blue).
+                                tr.set_selected(recording || is_selected);
+
+                                // Reusable context-menu body (a `Fn`), attached below
+                                // to both the row and each inline action button so a
+                                // right-click anywhere on the row opens it. Self-mutating
+                                // picks go through `menu_choice`; URL/folder/clipboard
+                                // actions are handled inline (they only need `ctx`).
+                                let mut menu_choice: Option<MenuChoice> = None;
+                                let add_menu =
+                                    |ui: &mut egui::Ui, choice: &mut Option<MenuChoice>| {
+                                        ui.set_min_width(180.0);
+                                        if recording {
+                                            if ui.button("⏹  Stop recording").clicked() {
+                                                *choice = Some(MenuChoice::Stop);
+                                                ui.close();
+                                            }
+                                        } else if ui.button("▶  Start recording").clicked() {
+                                            *choice = Some(MenuChoice::Start);
+                                            ui.close();
+                                        }
+                                        ui.separator();
+                                        if ui.button("🔗  Open channel URL").clicked() {
+                                            ui.ctx().open_url(egui::OpenUrl::new_tab(
+                                                row.channel.url.clone(),
+                                            ));
+                                            ui.close();
+                                        }
+                                        let folder_exists =
+                                            std::path::Path::new(&m.output_dir).is_dir();
+                                        if ui
+                                            .add_enabled(
+                                                folder_exists,
+                                                egui::Button::new("📂  Open output folder"),
+                                            )
+                                            .clicked()
+                                        {
+                                            crate::platform::open_path(std::path::Path::new(
+                                                &m.output_dir,
+                                            ));
+                                            ui.close();
+                                        }
+                                        if ui.button("📋  Copy URL").clicked() {
+                                            ui.ctx().copy_text(row.channel.url.clone());
+                                            ui.close();
+                                        }
+                                        ui.separator();
+                                        if ui.button("✏  Edit…").clicked() {
+                                            *choice = Some(MenuChoice::Edit);
+                                            ui.close();
+                                        }
+                                        if ui.button("➕  Add tool instance").clicked() {
+                                            *choice = Some(MenuChoice::AddInstance);
+                                            ui.close();
+                                        }
+                                        let toggle_label = if m.enabled {
+                                            "⏸  Disable"
+                                        } else {
+                                            "✔  Enable"
+                                        };
+                                        if ui.button(toggle_label).clicked() {
+                                            *choice = Some(MenuChoice::Toggle);
+                                            ui.close();
+                                        }
+                                        ui.separator();
+                                        if ui.button("🗑  Delete").clicked() {
+                                            *choice = Some(MenuChoice::Delete);
+                                            ui.close();
+                                        }
+                                    };
+
                                 tr.col(|ui| {
                                     let mut on = m.enabled;
                                     if ui.checkbox(&mut on, "").changed() {
@@ -649,40 +840,71 @@ impl StreamArchiverApp {
                                 });
                                 tr.col(|ui| {
                                     ui.push_id(m.id, |ui| {
+                                        let mut btns: Vec<egui::Response> = Vec::with_capacity(4);
                                         if recording {
-                                            if ui
+                                            let b = ui
                                                 .small_button("⏹")
-                                                .on_hover_text("Stop / abort recording")
-                                                .clicked()
-                                            {
+                                                .on_hover_text("Stop / abort recording");
+                                            if b.clicked() {
                                                 to_stop = Some(m.id);
                                             }
-                                        } else if ui
-                                            .small_button("▶")
-                                            .on_hover_text("Start recording now (checks if live)")
-                                            .clicked()
-                                        {
-                                            to_start = Some(m.id);
+                                            btns.push(b);
+                                        } else {
+                                            let b = ui.small_button("▶").on_hover_text(
+                                                "Start recording now (checks if live)",
+                                            );
+                                            if b.clicked() {
+                                                to_start = Some(m.id);
+                                            }
+                                            btns.push(b);
                                         }
-                                        if ui.small_button("✏").on_hover_text("Edit").clicked() {
+                                        let b = ui.small_button("✏").on_hover_text("Edit");
+                                        if b.clicked() {
                                             to_edit = Some(i);
                                         }
-                                        if ui
+                                        btns.push(b);
+                                        let b = ui
                                             .small_button("➕")
-                                            .on_hover_text("Add another tool instance")
-                                            .clicked()
-                                        {
+                                            .on_hover_text("Add another tool instance");
+                                        if b.clicked() {
                                             to_add_instance = Some(i);
                                         }
-                                        if ui
+                                        btns.push(b);
+                                        let b = ui
                                             .small_button("🗑")
-                                            .on_hover_text("Delete this instance")
-                                            .clicked()
-                                        {
-                                            to_delete = Some(m.id);
+                                            .on_hover_text("Delete this instance");
+                                        if b.clicked() {
+                                            to_delete = Some((m.id, row.channel.name.clone()));
+                                        }
+                                        btns.push(b);
+                                        // Buttons sense clicks and would otherwise swallow
+                                        // the right-click, so give each the row menu too.
+                                        for b in &btns {
+                                            b.context_menu(|ui| add_menu(ui, &mut menu_choice));
                                         }
                                     });
                                 });
+
+                                // Left-click selects the row; right-click anywhere on it
+                                // (cells or buttons) opens the context menu, which also
+                                // selects it. `response()` is the union of all cells.
+                                let row_resp = tr.response();
+                                if row_resp.clicked() || row_resp.secondary_clicked() {
+                                    to_select = Some(m.id);
+                                }
+                                row_resp.context_menu(|ui| add_menu(ui, &mut menu_choice));
+
+                                match menu_choice {
+                                    Some(MenuChoice::Start) => to_start = Some(m.id),
+                                    Some(MenuChoice::Stop) => to_stop = Some(m.id),
+                                    Some(MenuChoice::Edit) => to_edit = Some(i),
+                                    Some(MenuChoice::AddInstance) => to_add_instance = Some(i),
+                                    Some(MenuChoice::Toggle) => toggle = Some((m.id, !m.enabled)),
+                                    Some(MenuChoice::Delete) => {
+                                        to_delete = Some((m.id, row.channel.name.clone()))
+                                    }
+                                    None => {}
+                                }
                             });
                         }
                     });
@@ -703,17 +925,17 @@ impl StreamArchiverApp {
                 self.settings.default_output_dir.clone(),
             ));
         }
+        if let Some(id) = to_select {
+            self.selected_monitor = Some(id);
+        }
         if let Some((id, on)) = toggle {
             if let Err(e) = self.core.store.set_monitor_enabled(id, on) {
                 self.status = format!("Error: {e}");
             }
             self.reload_rows();
         }
-        if let Some(id) = to_delete {
-            if let Err(e) = self.core.store.delete_monitor(id) {
-                self.status = format!("Error: {e}");
-            }
-            self.reload_rows();
+        if let Some((id, name)) = to_delete {
+            self.confirm_delete = Some((id, name));
         }
         if let Some(id) = to_start {
             self.core.manual(ManualCommand::Start(id));

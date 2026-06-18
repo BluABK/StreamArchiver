@@ -207,6 +207,20 @@ pub fn kill_process_tree(pid: u32) {
         .status();
 }
 
+/// Reveal a path in the OS file manager (Explorer on Windows, Finder on macOS,
+/// the default handler via `xdg-open` elsewhere).
+///
+/// Best-effort: spawn failures are ignored. Note that `explorer.exe` returns a
+/// non-zero exit code even on success, so we never inspect the status.
+pub fn open_path(path: &std::path::Path) {
+    #[cfg(windows)]
+    let _ = std::process::Command::new("explorer").arg(path).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(path).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+}
+
 /// Manages launch-on-login via the OS autostart mechanism (HKCU Run key on
 /// Windows), keyed to the current executable path.
 pub struct AutoStart {
