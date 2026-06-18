@@ -968,6 +968,9 @@ impl StreamArchiverApp {
         let mut to_retry: Option<i64> = None;
         let mut to_delete: Option<i64> = None;
         let any_active = self.videos.iter().any(|v| v.is_active());
+        // Snapshot live download progress (video_id -> 0.0..=1.0) for the bar.
+        let progress: std::collections::HashMap<i64, f32> =
+            self.core.video_progress.lock().unwrap().clone();
 
         egui::ScrollArea::both()
             .auto_shrink([false, false])
@@ -1084,8 +1087,17 @@ impl StreamArchiverApp {
                                 tr.col(|ui| {
                                     ui.label(v.tool.label());
                                 });
-                                tr.col(|ui| {
-                                    ui.colored_label(video_status_color(&v.status), &v.status);
+                                tr.col(|ui| match progress.get(&v.id) {
+                                    Some(&f) if v.status == "downloading" => {
+                                        ui.add(
+                                            egui::ProgressBar::new(f)
+                                                .desired_width(84.0)
+                                                .text(format!("{:.0}%", f * 100.0)),
+                                        );
+                                    }
+                                    _ => {
+                                        ui.colored_label(video_status_color(&v.status), &v.status);
+                                    }
                                 });
                                 tr.col(|ui| {
                                     if v.bytes > 0 {
@@ -1175,10 +1187,11 @@ impl StreamArchiverApp {
                     });
             });
 
-        // Tick while a download is queued/running so status + size update live.
+        // Tick while a download is queued/running so the progress bar, status and
+        // size update live (a bit faster than 1s for a smoother bar).
         if any_active {
             ui.ctx()
-                .request_repaint_after(std::time::Duration::from_secs(1));
+                .request_repaint_after(std::time::Duration::from_millis(500));
         }
 
         if let Some(id) = to_stop {

@@ -37,6 +37,11 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// active recording) and used at shutdown to kill the process trees.
 pub type ActiveSet = Arc<Mutex<HashMap<i64, u32>>>;
 
+/// video_id -> download progress fraction (0.0..=1.0), for the UI progress bar.
+/// Populated by the tool's progress output while a video downloads; cleared when
+/// it finishes. (Live recordings have no meaningful total, so they don't use it.)
+pub type VideoProgress = Arc<Mutex<HashMap<i64, f32>>>;
+
 const RING_MAX_LINES: usize = 80;
 /// A recording that fails faster than this is treated as a transient failure
 /// and subject to backoff.
@@ -267,6 +272,10 @@ pub fn build_video_plan(
                 "mkv".into(),
                 "--remux-video".into(),
                 "mkv".into(),
+                // Emit a parseable percent per line for the UI progress bar.
+                "--newline".into(),
+                "--progress-template".into(),
+                "download:DLPCT=%(progress._percent_str)s".into(),
                 "-o".into(),
                 out_tmpl,
             ];
@@ -347,6 +356,8 @@ pub struct Supervisor {
     active: ActiveSet,
     /// video_id -> child PID of in-flight on-demand video downloads.
     active_videos: ActiveSet,
+    /// video_id -> live download progress fraction, for the UI bar.
+    video_progress: VideoProgress,
     /// video_ids whose download was asked to stop (so it finalizes as `stopped`).
     stopping_videos: Arc<Mutex<HashSet<i64>>>,
     shutdown: Arc<AtomicBool>,
@@ -369,6 +380,7 @@ impl Supervisor {
         events: EventTx,
         active: ActiveSet,
         active_videos: ActiveSet,
+        video_progress: VideoProgress,
         shutdown: Arc<AtomicBool>,
         ctx: Arc<DetectContext>,
         max_concurrent: usize,
@@ -378,6 +390,7 @@ impl Supervisor {
             events,
             active,
             active_videos,
+            video_progress,
             stopping_videos: Arc::new(Mutex::new(HashSet::new())),
             shutdown,
             ctx,
@@ -560,6 +573,7 @@ impl Supervisor {
         let mut active = self.active_videos.lock().unwrap();
         let stopped = self.stopping_videos.lock().unwrap().remove(&id);
         active.remove(&id);
+        self.video_progress.lock().unwrap().remove(&id);
         if stopped {
             "stopped"
         } else if shutting_down {
@@ -635,7 +649,14 @@ impl Supervisor {
         };
         info!(video = id, program = %plan.program, "downloading video -> {}", plan.final_path.display());
 
-        let outcome = self.run_process(&self.active_videos, id, &plan).await;
+        let outcome = self
+            .run_process(
+                &self.active_videos,
+                id,
+                &plan,
+                Some(self.video_progress.clone()),
+            )
+            .await;
 
         // Remux TS -> MKV (streamlink/ffmpeg); yt-dlp already produced the MKV.
         let mut final_path = plan.final_path.clone();
@@ -790,7 +811,9 @@ impl Supervisor {
         });
         info!(monitor_id, program = %plan.program, "starting recording -> {}", plan.final_path.display());
 
-        let outcome = self.run_process(&self.active, monitor_id, &plan).await;
+        let outcome = self
+            .run_process(&self.active, monitor_id, &plan, None)
+            .await;
 
         // Remux TS -> MKV if requested and we captured something.
         let mut final_path = plan.final_path.clone();
@@ -842,6 +865,7 @@ impl Supervisor {
         active: &ActiveSet,
         id: i64,
         plan: &DownloadPlan,
+        progress: Option<VideoProgress>,
     ) -> ProcessOutcome {
         let job = match ProcessJob::new() {
             Ok(j) => Some(j),
@@ -853,7 +877,13 @@ impl Supervisor {
         let mut cmd = Command::new(&plan.program);
         cmd.args(&plan.args)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            // Capture stdout only when we want to parse progress (yt-dlp prints
+            // the progress line there); otherwise discard it.
+            .stdout(if progress.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         #[cfg(windows)]
@@ -879,13 +909,32 @@ impl Supervisor {
             active.lock().unwrap().insert(id, pid);
         }
 
+        // Parse progress lines from stdout (yt-dlp `--progress-template`).
+        if let (Some(prog), Some(stdout)) = (progress.clone(), child.stdout.take()) {
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if let Some(f) = parse_progress(&line) {
+                        prog.lock().unwrap().insert(id, f);
+                    }
+                }
+            });
+        }
+
         let ring: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
         if let Some(stderr) = child.stderr.take() {
             let ring = ring.clone();
             let program = plan.program.clone();
+            let prog = progress.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
+                    // Some tools emit progress on stderr; catch it there too.
+                    if let Some(p) = &prog {
+                        if let Some(f) = parse_progress(&line) {
+                            p.lock().unwrap().insert(id, f);
+                        }
+                    }
                     tracing::trace!(target: "streamarchiver::recproc", "[{program}] {line}");
                     let mut r = ring.lock().unwrap();
                     if r.len() >= RING_MAX_LINES {
@@ -915,6 +964,15 @@ impl Supervisor {
 struct ProcessOutcome {
     exit_code: Option<i64>,
     log: String,
+}
+
+/// Parse a yt-dlp progress line (`--progress-template "download:DLPCT=%(progress._percent_str)s"`)
+/// into a 0.0..=1.0 fraction. Returns None for non-progress lines or unknown values.
+fn parse_progress(line: &str) -> Option<f32> {
+    let rest = line.trim().strip_prefix("DLPCT=")?;
+    let pct = rest.trim().trim_end_matches('%').trim();
+    let v: f32 = pct.parse().ok()?;
+    Some((v / 100.0).clamp(0.0, 1.0))
 }
 
 /// Resolve a video/stream's real title and channel/uploader via yt-dlp (no
@@ -1220,6 +1278,17 @@ mod tests {
     fn template_expands_and_sanitizes() {
         let name = expand_template("{name}_{date}", "Bad/Name?", "", "", 1_700_000_000);
         assert_eq!(name, "Bad_Name__20231114");
+    }
+
+    #[test]
+    fn parses_ytdlp_progress() {
+        assert_eq!(parse_progress("DLPCT= 50.0%"), Some(0.5));
+        assert_eq!(parse_progress("DLPCT=100.0%"), Some(1.0));
+        assert_eq!(parse_progress("DLPCT=0.0%"), Some(0.0));
+        // Non-marker lines and unknown values yield nothing.
+        assert_eq!(parse_progress("[download]  45% of 100MiB"), None);
+        assert_eq!(parse_progress("DLPCT=NA%"), None);
+        assert_eq!(parse_progress("some other log line"), None);
     }
 
     #[test]
