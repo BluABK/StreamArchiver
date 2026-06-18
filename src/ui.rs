@@ -814,12 +814,15 @@ impl StreamArchiverApp {
                         .num_columns(2)
                         .spacing([12.0, 6.0])
                         .show(ui, |ui| {
-                            ui.label("Tool");
+                            ui.label("Tool").on_hover_text(d.tool.tooltip());
                             egui::ComboBox::from_id_salt(("dl_tool", platform.as_str()))
                                 .selected_text(d.tool.label())
                                 .show_ui(ui, |ui| {
                                     for t in Tool::ALL {
-                                        if ui.selectable_value(&mut d.tool, t, t.label()).changed()
+                                        if ui
+                                            .selectable_value(&mut d.tool, t, t.label())
+                                            .on_hover_text(t.tooltip())
+                                            .changed()
                                         {
                                             dirty = true;
                                         }
@@ -1141,12 +1144,13 @@ impl StreamArchiverApp {
                     );
                     ui.end_row();
 
-                    ui.label("Tool");
+                    ui.label("Tool").on_hover_text(vf.tool.tooltip());
                     egui::ComboBox::from_id_salt("video_tool_cb")
                         .selected_text(vf.tool.label())
                         .show_ui(ui, |ui| {
                             for t in Tool::ALL {
-                                ui.selectable_value(&mut vf.tool, t, t.label());
+                                ui.selectable_value(&mut vf.tool, t, t.label())
+                                    .on_hover_text(t.tooltip());
                             }
                         });
                     ui.end_row();
@@ -1465,11 +1469,16 @@ impl StreamArchiverApp {
                                     ui.label(row.channel.platform.label());
                                 });
                                 tr.col(|ui| {
-                                    ui.label(m.tool.label());
+                                    ui.label(m.tool.label()).on_hover_text(m.tool.tooltip());
                                 });
                                 tr.col(|ui| {
-                                    ui.label(m.detection_method.short_label())
-                                        .on_hover_text(m.detection_method.label());
+                                    ui.label(m.detection_method.short_label()).on_hover_text(
+                                        format!(
+                                            "{}\n\n{}",
+                                            m.detection_method.label(),
+                                            m.detection_method.tooltip()
+                                        ),
+                                    );
                                 });
                                 tr.col(|ui| {
                                     ui.label(format!("{}s", m.poll_interval_secs));
@@ -1867,17 +1876,19 @@ impl StreamArchiverApp {
                         ui.label(platform.label());
                         ui.end_row();
 
-                        ui.label("Tool");
+                        ui.label("Tool").on_hover_text(form.tool.tooltip());
                         egui::ComboBox::from_id_salt("tool_cb")
                             .selected_text(form.tool.label())
                             .show_ui(ui, |ui| {
                                 for t in Tool::ALL {
-                                    ui.selectable_value(&mut form.tool, t, t.label());
+                                    ui.selectable_value(&mut form.tool, t, t.label())
+                                        .on_hover_text(t.tooltip());
                                 }
                             });
                         ui.end_row();
 
-                        ui.label("Detection");
+                        ui.label("Detection")
+                            .on_hover_text(form.detection_method.tooltip());
                         let methods = platform.detection_methods();
                         if !methods.contains(&form.detection_method) {
                             form.detection_method = platform.default_detection();
@@ -1886,7 +1897,8 @@ impl StreamArchiverApp {
                             .selected_text(form.detection_method.label())
                             .show_ui(ui, |ui| {
                                 for &dm in methods {
-                                    ui.selectable_value(&mut form.detection_method, dm, dm.label());
+                                    ui.selectable_value(&mut form.detection_method, dm, dm.label())
+                                        .on_hover_text(dm.tooltip());
                                 }
                             });
                         ui.end_row();

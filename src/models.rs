@@ -140,6 +140,24 @@ impl Tool {
             _ => Tool::Streamlink,
         }
     }
+
+    /// One-line explanation for UI hover tooltips.
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            Tool::Streamlink => {
+                "Best for Twitch (reaches 1440p/2K HEVC via enhanced codecs) and Kick. \
+                 Records to .ts, then remuxes to MKV."
+            }
+            Tool::YtDlp => {
+                "Best for YouTube (supports capture-from-start). Also downloads VODs and many \
+                 other sites."
+            }
+            Tool::Ffmpeg => {
+                "Direct capture/remux of a known stream URL; a lowest-level fallback when \
+                 streamlink/yt-dlp don't fit."
+            }
+        }
+    }
 }
 
 /// Per-channel live-detection strategy (the UI "method" dropdown).
@@ -208,6 +226,42 @@ impl DetectionMethod {
             "eventsub" => DetectionMethod::EventSub,
             "kick_api" => DetectionMethod::KickApi,
             _ => DetectionMethod::GenericProbe,
+        }
+    }
+
+    /// One-line explanation for UI hover tooltips.
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            DetectionMethod::TwitchApi => {
+                "Polls Twitch Helix (Get Streams) each interval, batched up to 100 channels. \
+                 Reliable; detects within one poll interval. Needs Twitch Client ID + Secret, \
+                 or a connected Twitch account."
+            }
+            DetectionMethod::EventSub => {
+                "Real-time push over a WebSocket (conduit + app token): catches go-live within \
+                 seconds and ignores the poll interval. Needs Twitch Client ID + Secret; \
+                 reconciles current state on (re)connect."
+            }
+            DetectionMethod::YouTubeApi => {
+                "YouTube Data API (search.list eventType=live). Reports the real go-live time but \
+                 is quota-limited (~100 checks/day) — use a long interval. Needs a YouTube API key."
+            }
+            DetectionMethod::Scrape => {
+                "Fetches the channel page/JSON each interval (YouTube /live, Kick). No credentials \
+                 needed; can break when sites change."
+            }
+            DetectionMethod::KickApi => {
+                "Kick official API via a client-credentials app token — more reliable than \
+                 scraping. Needs Kick Client ID + Secret."
+            }
+            DetectionMethod::GenericProbe => {
+                "Probes the URL with streamlink (--stream-url) each interval. No credentials; works \
+                 for anything streamlink/yt-dlp supports."
+            }
+            DetectionMethod::CliSelfPoll => {
+                "A resident streamlink/yt-dlp retry loop per channel. Higher footprint; intended \
+                 only for a few channels."
+            }
         }
     }
 }

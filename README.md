@@ -105,14 +105,30 @@ Deleting always asks for confirmation (the recorded files are kept either way).
 
 ### Detection methods
 
-| Method | Platforms | Needs creds | Notes |
-|---|---|---|---|
-| Twitch API (Helix) | Twitch | Yes | Batched, scales to many channels; **default for Twitch**. |
-| Twitch EventSub | Twitch | Yes (same app creds) | Real-time push via conduit + websocket (no polling, no public endpoint). Reconciles on connect. |
-| YouTube Data API | YouTube | Yes (API key) | `search.list?eventType=live`; reports the real go-live time. **Quota-limited (~100 checks/day)** — use sparingly. |
-| Kick official API | Kick | Yes (Client ID/Secret) | client-credentials app token; more reliable than scraping (no Cloudflare). |
-| Scrape poll | YouTube `/live`, Kick, generic | No | **Default for YouTube/Kick**; fragile to site changes. |
-| Generic probe | any streamlink/yt-dlp URL | No | Uses `streamlink --stream-url` to test liveness. |
+A monitor's **Detection** method is *how* the app learns a channel went live. The
+dropdown is filtered to the methods valid for the channel's platform, with a
+sensible default pre-selected. Hover the **Detection** field (or the table column)
+in-app for a one-line description of each.
+
+| Method | Platforms | Needs creds | Latency | Notes |
+|---|---|---|---|---|
+| **Twitch API (Helix)** | Twitch | Client ID + Secret, or a connected account | one poll interval | Polls `Get Streams`, batched up to 100 channels/call; scales well. **Default for Twitch.** |
+| **Twitch EventSub** | Twitch | Client ID + Secret | ~seconds | Real-time push over a WebSocket (conduit + app token); ignores the poll interval, idles cheaply, reconciles on (re)connect. No public endpoint needed. |
+| **YouTube Data API** | YouTube | API key | one poll interval | `search.list?eventType=live`; reports the real go-live time. **Quota-limited (~100 checks/day)** — use a long interval. |
+| **Kick official API** | Kick | Client ID + Secret | one poll interval | client-credentials app token; more reliable than scraping (no Cloudflare). |
+| **Scrape poll** | YouTube `/live`, Kick, generic | No | one poll interval | **Default for YouTube/Kick**; no credentials, but fragile to site changes. Go-live time is approximate (`~`). |
+| **Generic probe** | any streamlink/yt-dlp URL | No | one poll interval | `streamlink --stream-url` liveness test; works anywhere those tools do. |
+
+**Polling vs. push (Helix vs. EventSub).** Helix *asks* "is it live?" every poll
+interval, so you notice within that interval (and the **Lost time** column ≈ the
+interval). EventSub is *told* the moment a channel goes live, so it catches the
+start within seconds and ignores the per-channel interval — at the cost of holding
+a WebSocket. Both report the real go-live time and use the same Twitch app creds;
+EventSub specifically needs the **Client Secret** (it authenticates with an app
+token). Choose **EventSub** to minimize missed footage, **Helix** for a simpler,
+fully stateless poll. (Connecting a Twitch account also satisfies Helix — its user
+token expires, so the app auto-refreshes it and falls back to the app token; if
+you'd rather not reconnect, set a Client Secret and the app token is used.)
 
 > To verify EventSub: set Twitch creds, add a Twitch channel with method **Twitch
 > EventSub**, then `streamarchiver --run-for 120` with `RUST_LOG=info` — it logs
