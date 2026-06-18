@@ -677,6 +677,11 @@ impl StreamArchiverApp {
         egui::ScrollArea::both()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                // Labels are selectable by default, which makes them sense clicks
+                // (for text selection) and swallow right-clicks over their text —
+                // breaking the row context menu. Turn it off for the table so the
+                // row's click sense wins (the menu offers "Copy URL" instead).
+                ui.style_mut().interaction.selectable_labels = false;
                 TableBuilder::new(ui)
                     .striped(true)
                     .resizable(true)
@@ -799,9 +804,12 @@ impl StreamArchiverApp {
 
                                 tr.col(|ui| {
                                     let mut on = m.enabled;
-                                    if ui.checkbox(&mut on, "").changed() {
+                                    let cb = ui.checkbox(&mut on, "");
+                                    if cb.changed() {
                                         toggle = Some((m.id, on));
                                     }
+                                    // The checkbox senses clicks too, so give it the menu.
+                                    cb.context_menu(|ui| add_menu(ui, &mut menu_choice));
                                 });
                                 tr.col(|ui| {
                                     ui.label(&row.channel.name).on_hover_text(&row.channel.url);
