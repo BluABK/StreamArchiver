@@ -187,7 +187,10 @@ fn load_eventsub_monitors(store: &Store) -> Result<HashMap<String, Vec<i64>>> {
     for row in store.list_monitors_with_channels()? {
         if row.monitor.enabled
             && row.channel.platform == Platform::Twitch
-            && row.monitor.detection_method == DetectionMethod::EventSub
+            && matches!(
+                row.monitor.detection_method,
+                DetectionMethod::EventSub | DetectionMethod::EventSubHelix
+            )
         {
             if let Some(login) = twitch_login(&row.channel.url) {
                 map.entry(login).or_default().push(row.monitor.id);

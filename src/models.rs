@@ -92,6 +92,7 @@ impl Platform {
             Platform::Twitch => &[
                 DetectionMethod::TwitchApi,
                 DetectionMethod::EventSub,
+                DetectionMethod::EventSubHelix,
                 DetectionMethod::Scrape,
                 DetectionMethod::GenericProbe,
             ],
@@ -175,6 +176,10 @@ pub enum DetectionMethod {
     GenericProbe,
     /// Twitch EventSub push (websocket/conduit). Phase 4.
     EventSub,
+    /// Twitch EventSub push **and** Helix polling together: whichever detects
+    /// live first starts the recording (the supervisor dedupes). The poll is a
+    /// safety net for missed events (network drop, app started after go-live).
+    EventSubHelix,
     /// Kick official API polling (client-credentials app token). Needs creds.
     KickApi,
 }
@@ -188,6 +193,7 @@ impl DetectionMethod {
             DetectionMethod::CliSelfPoll => "cli_selfpoll",
             DetectionMethod::GenericProbe => "generic_probe",
             DetectionMethod::EventSub => "eventsub",
+            DetectionMethod::EventSubHelix => "eventsub_helix",
             DetectionMethod::KickApi => "kick_api",
         }
     }
@@ -200,6 +206,7 @@ impl DetectionMethod {
             DetectionMethod::CliSelfPoll => "CLI self-poll loop",
             DetectionMethod::GenericProbe => "Generic HTTP probe",
             DetectionMethod::EventSub => "Twitch EventSub push",
+            DetectionMethod::EventSubHelix => "Twitch EventSub + Helix",
             DetectionMethod::KickApi => "Kick official API",
         }
     }
@@ -213,6 +220,7 @@ impl DetectionMethod {
             DetectionMethod::CliSelfPoll => "CLI",
             DetectionMethod::GenericProbe => "Probe",
             DetectionMethod::EventSub => "EventSub",
+            DetectionMethod::EventSubHelix => "ES+Helix",
             DetectionMethod::KickApi => "Kick API",
         }
     }
@@ -224,6 +232,7 @@ impl DetectionMethod {
             "scrape" => DetectionMethod::Scrape,
             "cli_selfpoll" => DetectionMethod::CliSelfPoll,
             "eventsub" => DetectionMethod::EventSub,
+            "eventsub_helix" => DetectionMethod::EventSubHelix,
             "kick_api" => DetectionMethod::KickApi,
             _ => DetectionMethod::GenericProbe,
         }
@@ -241,6 +250,12 @@ impl DetectionMethod {
                 "Real-time push over a WebSocket (conduit + app token): catches go-live within \
                  seconds and ignores the poll interval. Needs Twitch Client ID + Secret; \
                  reconciles current state on (re)connect."
+            }
+            DetectionMethod::EventSubHelix => {
+                "Best of both: EventSub push for instant go-live AND Helix polling on the \
+                 interval as a safety net. Whichever fires first starts the recording, so a \
+                 missed event (network drop, or the app started after go-live) is still caught. \
+                 Needs Twitch Client ID + Secret. Tip: a longer interval is fine here."
             }
             DetectionMethod::YouTubeApi => {
                 "YouTube Data API (search.list eventType=live). Reports the real go-live time but \

@@ -658,7 +658,9 @@ impl Supervisor {
         };
         match row.monitor.detection_method {
             // EventSub is push-only; check liveness now via Helix.
-            DetectionMethod::TwitchApi | DetectionMethod::EventSub => self
+            DetectionMethod::TwitchApi
+            | DetectionMethod::EventSub
+            | DetectionMethod::EventSubHelix => self
                 .ctx
                 .detect_twitch(std::slice::from_ref(&item))
                 .await

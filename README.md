@@ -114,6 +114,7 @@ in-app for a one-line description of each.
 |---|---|---|---|---|
 | **Twitch API (Helix)** | Twitch | Client ID + Secret, or a connected account | one poll interval | Polls `Get Streams`, batched up to 100 channels/call; scales well. **Default for Twitch.** |
 | **Twitch EventSub** | Twitch | Client ID + Secret | ~seconds | Real-time push over a WebSocket (conduit + app token); ignores the poll interval, idles cheaply, reconciles on (re)connect. No public endpoint needed. |
+| **Twitch EventSub + Helix** | Twitch | Client ID + Secret | ~seconds, with a poll backstop | Does both: EventSub push **and** Helix polling. Whichever sees live first starts the recording, so a missed event (network drop, app started after go-live) is still caught. A longer poll interval is fine — it's just a safety net. |
 | **YouTube Data API** | YouTube | API key | one poll interval | `search.list?eventType=live`; reports the real go-live time. **Quota-limited (~100 checks/day)** — use a long interval. |
 | **Kick official API** | Kick | Client ID + Secret | one poll interval | client-credentials app token; more reliable than scraping (no Cloudflare). |
 | **Scrape poll** | YouTube `/live`, Kick, generic | No | one poll interval | **Default for YouTube/Kick**; no credentials, but fragile to site changes. Go-live time is approximate (`~`). |
@@ -126,9 +127,11 @@ start within seconds and ignores the per-channel interval — at the cost of hol
 a WebSocket. Both report the real go-live time and use the same Twitch app creds;
 EventSub specifically needs the **Client Secret** (it authenticates with an app
 token). Choose **EventSub** to minimize missed footage, **Helix** for a simpler,
-fully stateless poll. (Connecting a Twitch account also satisfies Helix — its user
-token expires, so the app auto-refreshes it and falls back to the app token; if
-you'd rather not reconnect, set a Client Secret and the app token is used.)
+fully stateless poll, or **Twitch EventSub + Helix** for the most robust option —
+instant push with a polling backstop so you still start the recording if an event
+is ever missed. (Connecting a Twitch account also satisfies Helix — its user token
+expires, so the app auto-refreshes it and falls back to the app token; if you'd
+rather not reconnect, set a Client Secret and the app token is used.)
 
 > To verify EventSub: set Twitch creds, add a Twitch channel with method **Twitch
 > EventSub**, then `streamarchiver --run-for 120` with `RUST_LOG=info` — it logs

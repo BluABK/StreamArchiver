@@ -87,9 +87,12 @@ async fn tick(
         }
         // Methods handled by the scheduler today; others are driven elsewhere
         // (CLI self-poll/EventSub in later phases).
+        // EventSubHelix is polled here (Helix) *and* pushed by the EventSub task;
+        // whichever sees live first wins (the supervisor dedupes).
         let handled = matches!(
             m.detection_method,
             DetectionMethod::TwitchApi
+                | DetectionMethod::EventSubHelix
                 | DetectionMethod::Scrape
                 | DetectionMethod::GenericProbe
                 | DetectionMethod::YouTubeApi
@@ -108,7 +111,9 @@ async fn tick(
                 platform: row.channel.platform,
             };
             match m.detection_method {
-                DetectionMethod::TwitchApi => twitch_items.push(item),
+                DetectionMethod::TwitchApi | DetectionMethod::EventSubHelix => {
+                    twitch_items.push(item)
+                }
                 DetectionMethod::Scrape => scrape_items.push(item),
                 DetectionMethod::GenericProbe => generic_items.push(item),
                 DetectionMethod::YouTubeApi => youtube_api_items.push(item),
