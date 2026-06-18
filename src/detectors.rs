@@ -175,14 +175,19 @@ impl DetectContext {
     }
 
     pub async fn detect_twitch(&self, items: &[DetectItem]) -> Vec<DetectOutcome> {
-        let token = match self.twitch_app_token().await {
-            Ok(t) => t,
-            Err(e) => {
-                return items
-                    .iter()
-                    .map(|it| DetectOutcome::err(it.monitor_id, e.to_string()))
-                    .collect();
-            }
+        // Prefer a connected user token (OAuth "Connect Twitch"); fall back to an
+        // app token (client-credentials, which needs the Client Secret).
+        let token = match crate::oauth::valid_user_token(&self.http, self.store.as_ref()).await {
+            Some(t) => t,
+            None => match self.twitch_app_token().await {
+                Ok(t) => t,
+                Err(e) => {
+                    return items
+                        .iter()
+                        .map(|it| DetectOutcome::err(it.monitor_id, e.to_string()))
+                        .collect();
+                }
+            },
         };
         let client_id = self
             .store

@@ -10,6 +10,7 @@ mod events;
 mod eventsub;
 mod models;
 mod notifications;
+mod oauth;
 mod platform;
 mod scheduler;
 mod store;
@@ -46,6 +47,17 @@ fn main() -> Result<()> {
     }
     if args.iter().any(|a| a == "--recordings") {
         return run_recordings();
+    }
+    if args.iter().any(|a| a == "--twitch-login") {
+        return run_twitch_login();
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--set-setting") {
+        let key = args.get(pos + 1).cloned().unwrap_or_default();
+        let value = args.get(pos + 2).cloned().unwrap_or_default();
+        let store = Store::open(&app_paths::db_path())?;
+        store.set_setting(&key, &value)?;
+        println!("set {key}");
+        return Ok(());
     }
     if let Some(pos) = args.iter().position(|a| a == "--capture-test") {
         return run_capture_test(&args, pos);
@@ -397,6 +409,35 @@ fn run_manual_test(id: i64, secs: u64) -> Result<()> {
     core.manual(ManualCommand::Stop(id));
     std::thread::sleep(std::time::Duration::from_secs(5));
     core.stop_all_recordings();
+    Ok(())
+}
+
+/// `--twitch-login` runs the Twitch device-code OAuth flow interactively.
+fn run_twitch_login() -> Result<()> {
+    let store = Store::open(&app_paths::db_path()).context("opening data store")?;
+    let client_id = store.get_setting("twitch_client_id")?.unwrap_or_default();
+    if client_id.is_empty() {
+        anyhow::bail!("set a Twitch Client ID in Settings first");
+    }
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()?;
+        let dc = oauth::start_device(&http, &client_id).await?;
+        println!(
+            "\n  Open: {}\n  Enter code: {}\n",
+            dc.verification_uri, dc.user_code
+        );
+        println!("Waiting for authorization…");
+        let tokens = oauth::poll_token(&http, &client_id, &dc).await?;
+        let login = oauth::fetch_login(&http, &client_id, &tokens.access)
+            .await
+            .unwrap_or_default();
+        oauth::store_tokens(&store, &tokens, &login)?;
+        println!("Connected as {login}.");
+        Ok::<_, anyhow::Error>(())
+    })?;
     Ok(())
 }
 

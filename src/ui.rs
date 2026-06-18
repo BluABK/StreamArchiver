@@ -4,8 +4,8 @@
 //! `Context::request_repaint`. Closing the window hides it to the tray; the
 //! tray "Quit" item triggers a real close.
 
-use std::sync::Arc;
 use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
@@ -17,6 +17,7 @@ use crate::events::{ManualCommand, UiCommand};
 use crate::models::{
     AuthKind, Channel, Container, DetectionMethod, Monitor, MonitorWithChannel, Platform, Tool,
 };
+use crate::oauth::{self, AuthFlow};
 use crate::platform::AutoStart;
 
 const K_TWITCH_ID: &str = "twitch_client_id";
@@ -151,6 +152,8 @@ pub struct StreamArchiverApp {
     form: Option<MonitorForm>,
     settings: SettingsForm,
     status: String,
+    /// Shared state of the interactive "Connect Twitch" device-code flow.
+    twitch_flow: Arc<Mutex<AuthFlow>>,
 }
 
 impl StreamArchiverApp {
@@ -194,6 +197,11 @@ impl StreamArchiverApp {
             cookies_browser: setting_or_empty(&core, K_COOKIES_BROWSER),
         };
 
+        let twitch_flow = Arc::new(Mutex::new(match oauth::connected_login(&core.store) {
+            Some(login) => AuthFlow::Connected { login },
+            None => AuthFlow::Idle,
+        }));
+
         let mut app = StreamArchiverApp {
             core,
             _tray: tray,
@@ -207,6 +215,7 @@ impl StreamArchiverApp {
             form: None,
             settings,
             status: String::new(),
+            twitch_flow,
         };
         app.reload_rows();
         app
@@ -707,6 +716,70 @@ impl StreamArchiverApp {
         }
     }
 
+    /// Kick off the Twitch device-code flow on the async runtime, updating the
+    /// shared `twitch_flow` state as it progresses and waking the UI.
+    fn start_twitch_connect(&mut self, ctx: egui::Context) {
+        let client_id = self.settings.twitch_client_id.trim().to_string();
+        if client_id.is_empty() {
+            self.status = "Enter and save a Twitch Client ID first.".into();
+            return;
+        }
+        // Persist the Client ID so the flow + later refresh can read it.
+        let _ = self.core.store.set_setting(K_TWITCH_ID, &client_id);
+
+        let flow = self.twitch_flow.clone();
+        let store = self.core.store.clone();
+        *flow.lock().unwrap() = AuthFlow::Pending {
+            user_code: String::new(),
+            url: String::new(),
+        };
+        self.core.rt.spawn(async move {
+            let http = match reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(20))
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    *flow.lock().unwrap() = AuthFlow::Failed {
+                        message: e.to_string(),
+                    };
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+            let dc = match oauth::start_device(&http, &client_id).await {
+                Ok(dc) => dc,
+                Err(e) => {
+                    *flow.lock().unwrap() = AuthFlow::Failed {
+                        message: e.to_string(),
+                    };
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+            *flow.lock().unwrap() = AuthFlow::Pending {
+                user_code: dc.user_code.clone(),
+                url: dc.verification_uri.clone(),
+            };
+            ctx.request_repaint();
+            match oauth::poll_token(&http, &client_id, &dc).await {
+                Ok(tokens) => {
+                    let login = oauth::fetch_login(&http, &client_id, &tokens.access)
+                        .await
+                        .unwrap_or_default();
+                    let _ = oauth::store_tokens(&store, &tokens, &login);
+                    *flow.lock().unwrap() = AuthFlow::Connected { login };
+                }
+                Err(e) => {
+                    *flow.lock().unwrap() = AuthFlow::Failed {
+                        message: e.to_string(),
+                    }
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
     fn settings_view(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add_space(8.0);
@@ -732,6 +805,42 @@ impl StreamArchiverApp {
                     );
                     ui.end_row();
                 });
+
+            ui.add_space(12.0);
+            ui.heading("Twitch account (OAuth)");
+            ui.label("Connect to use a user token for detection (Client Secret then optional).");
+            let flow = self.twitch_flow.lock().unwrap().clone();
+            match flow {
+                AuthFlow::Connected { login } => {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("✅ Connected as {login}"));
+                        if ui.button("Disconnect").clicked() {
+                            let _ = oauth::disconnect(&self.core.store);
+                            *self.twitch_flow.lock().unwrap() = AuthFlow::Idle;
+                        }
+                    });
+                }
+                AuthFlow::Pending { user_code, url } => {
+                    ui.label("Authorize in your browser, then wait:");
+                    if url.is_empty() {
+                        ui.label("Requesting code…");
+                    } else {
+                        ui.hyperlink(&url);
+                        ui.label(format!("Enter code: {user_code}"));
+                    }
+                }
+                AuthFlow::Failed { message } => {
+                    ui.colored_label(egui::Color32::from_rgb(0xE0, 0x6C, 0x6C), &message);
+                    if ui.button("🔗 Connect Twitch").clicked() {
+                        self.start_twitch_connect(ui.ctx().clone());
+                    }
+                }
+                AuthFlow::Idle => {
+                    if ui.button("🔗 Connect Twitch").clicked() {
+                        self.start_twitch_connect(ui.ctx().clone());
+                    }
+                }
+            }
 
             ui.add_space(12.0);
             ui.heading("Defaults");

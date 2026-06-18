@@ -79,12 +79,28 @@ usable data) and are remuxed losslessly to **`.mkv`** on clean stop. MKV is the
 default; pick TS per channel if you prefer. **MP4 is never produced** (poor for
 interrupted writes). Filename template variables: `{name} {date} {time} {timestamp}`.
 
-### Twitch credentials (for the Twitch API method)
+### Authentication
 
-1. Create a free app at <https://dev.twitch.tv/console/apps> (any OAuth redirect, e.g.
-   `http://localhost`).
-2. Copy the **Client ID** and a **Client Secret** into **Settings**. Detection uses the
-   client-credentials (app-token) flow — no per-user login.
+Two separate concerns:
+
+**Platform API (detection).** Twitch detection uses OAuth2. Either:
+- **Client ID + Secret** in Settings → app-token (client-credentials) flow, or
+- **Connect Twitch** (Settings → *Twitch account*) → OAuth2 **device-code** login
+  (also `streamarchiver --twitch-login`). Stores a refreshable **user token**;
+  detection then prefers it, so the Client Secret becomes optional. Register a
+  free app at <https://dev.twitch.tv/console/apps> to get a Client ID.
+
+**Authenticated downloads** (sub-only / members-only / ad-reduced / higher quality).
+Set a global default in Settings → *Download authentication*, and/or override
+per channel in the add/edit form (a per-channel value always wins):
+- **Browser cookies** → yt-dlp `--cookies-from-browser <browser>` (works for
+  Twitch sub/Turbo and YouTube members).
+- **Cookies file** → yt-dlp `--cookies <cookies.txt>`.
+- **Auth token** → streamlink `--twitch-api-header=Authorization=OAuth <token>`
+  for Twitch.
+
+> Note: streamlink (Twitch) authenticates via the token header; yt-dlp uses
+> cookies. The form offers each tool the form it actually supports.
 
 ## Data & locations
 
@@ -101,6 +117,7 @@ streamarchiver --list                             # monitors + state
 streamarchiver --recordings                       # recent recording log
 streamarchiver --capture-test <tool> <url> <secs> # record N s, kill tree, remux
 streamarchiver --run-for <secs>                   # headless: run core then stop
+streamarchiver --twitch-login                     # OAuth2 device-code Connect flow
 streamarchiver --hidden                           # start to tray (no window)
 ```
 
