@@ -12,11 +12,12 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::models::{
-    Channel, Container, DetectionMethod, Monitor, MonitorWithChannel, Platform, Tool, now_unix,
+    AuthKind, Channel, Container, DetectionMethod, Monitor, MonitorWithChannel, Platform, Tool,
+    now_unix,
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -134,7 +135,14 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 3)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 3);
+        if version < 4 {
+            conn.execute_batch(
+                "ALTER TABLE monitor ADD COLUMN auth_kind TEXT NOT NULL DEFAULT 'inherit';
+                 ALTER TABLE monitor ADD COLUMN auth_value TEXT NOT NULL DEFAULT '';",
+            )?;
+            conn.pragma_update(None, "user_version", 4)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 4);
         Ok(())
     }
 
@@ -206,8 +214,9 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO monitor(channel_id, enabled, tool, detection_method, poll_interval_secs,
-                quality, output_dir, filename_template, container, capture_from_start, extra_args, max_concurrent, last_state)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                quality, output_dir, filename_template, container, capture_from_start, auth_kind,
+                auth_value, extra_args, max_concurrent, last_state)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 m.channel_id,
                 m.enabled as i64,
@@ -219,6 +228,8 @@ impl Store {
                 m.filename_template,
                 m.container.as_str(),
                 m.capture_from_start as i64,
+                m.auth_kind.as_str(),
+                m.auth_value,
                 m.extra_args,
                 m.max_concurrent,
                 m.last_state,
@@ -232,7 +243,7 @@ impl Store {
         conn.execute(
             "UPDATE monitor SET enabled=?2, tool=?3, detection_method=?4, poll_interval_secs=?5,
                 quality=?6, output_dir=?7, filename_template=?8, container=?9, capture_from_start=?10,
-                extra_args=?11, max_concurrent=?12 WHERE id=?1",
+                auth_kind=?11, auth_value=?12, extra_args=?13, max_concurrent=?14 WHERE id=?1",
             params![
                 m.id,
                 m.enabled as i64,
@@ -244,6 +255,8 @@ impl Store {
                 m.filename_template,
                 m.container.as_str(),
                 m.capture_from_start as i64,
+                m.auth_kind.as_str(),
+                m.auth_value,
                 m.extra_args,
                 m.max_concurrent,
             ],
@@ -341,7 +354,8 @@ impl Store {
                 c.id, c.name, c.url, c.platform, c.created_at,
                 m.id, m.channel_id, m.enabled, m.tool, m.detection_method, m.poll_interval_secs,
                 m.quality, m.output_dir, m.filename_template, m.container, m.capture_from_start,
-                m.extra_args, m.max_concurrent, m.last_checked_at, m.last_state,
+                m.auth_kind, m.auth_value, m.extra_args, m.max_concurrent, m.last_checked_at,
+                m.last_state,
                 r.started_at, r.ended_at, r.status, r.went_live_at, r.went_live_approx
              FROM monitor m
              JOIN channel c ON c.id = m.channel_id
@@ -370,19 +384,21 @@ impl Store {
                     filename_template: r.get(13)?,
                     container: Container::parse(&r.get::<_, String>(14)?),
                     capture_from_start: r.get::<_, i64>(15)? != 0,
-                    extra_args: r.get(16)?,
-                    max_concurrent: r.get(17)?,
-                    last_checked_at: r.get(18)?,
-                    last_state: r.get(19)?,
+                    auth_kind: AuthKind::parse(&r.get::<_, String>(16)?),
+                    auth_value: r.get(17)?,
+                    extra_args: r.get(18)?,
+                    max_concurrent: r.get(19)?,
+                    last_checked_at: r.get(20)?,
+                    last_state: r.get(21)?,
                 };
                 Ok(MonitorWithChannel {
                     channel,
                     monitor,
-                    last_recording_started: r.get(20)?,
-                    last_recording_ended: r.get(21)?,
-                    last_recording_status: r.get(22)?,
-                    last_recording_went_live: r.get(23)?,
-                    last_recording_went_live_approx: r.get::<_, Option<i64>>(24)?.unwrap_or(0) != 0,
+                    last_recording_started: r.get(22)?,
+                    last_recording_ended: r.get(23)?,
+                    last_recording_status: r.get(24)?,
+                    last_recording_went_live: r.get(25)?,
+                    last_recording_went_live_approx: r.get::<_, Option<i64>>(26)?.unwrap_or(0) != 0,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -442,6 +458,8 @@ mod tests {
             filename_template: "{name}_{date}_{time}".into(),
             container: Container::Mkv,
             capture_from_start: true,
+            auth_kind: AuthKind::Inherit,
+            auth_value: String::new(),
             extra_args: String::new(),
             max_concurrent: 1,
             last_checked_at: None,

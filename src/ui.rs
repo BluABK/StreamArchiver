@@ -15,7 +15,7 @@ use tray_icon::TrayIcon;
 use crate::app_core::AppCore;
 use crate::events::{ManualCommand, UiCommand};
 use crate::models::{
-    Channel, Container, DetectionMethod, Monitor, MonitorWithChannel, Platform, Tool,
+    AuthKind, Channel, Container, DetectionMethod, Monitor, MonitorWithChannel, Platform, Tool,
 };
 use crate::platform::AutoStart;
 
@@ -24,6 +24,13 @@ const K_TWITCH_SECRET: &str = "twitch_client_secret";
 const K_YT_KEY: &str = "youtube_api_key";
 const K_DEFAULT_OUT: &str = "default_output_dir";
 const K_MAX_CONCURRENT: &str = "max_concurrent_downloads";
+const K_DOWNLOAD_AUTH: &str = "download_auth_method";
+const K_COOKIES_BROWSER: &str = "cookies_browser";
+
+/// Browsers yt-dlp can read cookies from (for the Settings dropdown).
+const COOKIE_BROWSERS: [&str; 8] = [
+    "firefox", "chrome", "chromium", "edge", "brave", "opera", "vivaldi", "safari",
+];
 
 #[derive(PartialEq, Eq)]
 enum View {
@@ -46,6 +53,8 @@ struct MonitorForm {
     container: Container,
     capture_from_start: bool,
     enabled: bool,
+    auth_kind: AuthKind,
+    auth_value: String,
     extra_args: String,
 }
 
@@ -65,6 +74,8 @@ impl MonitorForm {
             container: Container::Mkv,
             capture_from_start: true,
             enabled: true,
+            auth_kind: AuthKind::Inherit,
+            auth_value: String::new(),
             extra_args: String::new(),
         }
     }
@@ -85,6 +96,8 @@ impl MonitorForm {
             container: m.container,
             capture_from_start: m.capture_from_start,
             enabled: m.enabled,
+            auth_kind: m.auth_kind,
+            auth_value: m.auth_value.clone(),
             extra_args: m.extra_args.clone(),
         }
     }
@@ -105,6 +118,8 @@ impl MonitorForm {
             container: Container::Mkv,
             capture_from_start: true,
             enabled: true,
+            auth_kind: AuthKind::Inherit,
+            auth_value: String::new(),
             extra_args: String::new(),
         }
     }
@@ -117,6 +132,9 @@ struct SettingsForm {
     youtube_api_key: String,
     default_output_dir: String,
     max_concurrent_downloads: String,
+    /// Global download-auth default: "none" or "cookies".
+    download_auth_method: String,
+    cookies_browser: String,
 }
 
 pub struct StreamArchiverApp {
@@ -167,6 +185,13 @@ impl StreamArchiverApp {
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| "3".into()),
+            download_auth_method: core
+                .store
+                .get_setting(K_DOWNLOAD_AUTH)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "none".into()),
+            cookies_browser: setting_or_empty(&core, K_COOKIES_BROWSER),
         };
 
         let mut app = StreamArchiverApp {
@@ -267,6 +292,8 @@ impl StreamArchiverApp {
             filename_template: form.filename_template.clone(),
             container: form.container,
             capture_from_start: form.capture_from_start,
+            auth_kind: form.auth_kind,
+            auth_value: form.auth_value.clone(),
             extra_args: form.extra_args.clone(),
             max_concurrent: 1,
             last_checked_at: None,
@@ -295,6 +322,8 @@ impl StreamArchiverApp {
             (K_YT_KEY, s.youtube_api_key.trim()),
             (K_DEFAULT_OUT, s.default_output_dir.trim()),
             (K_MAX_CONCURRENT, s.max_concurrent_downloads.trim()),
+            (K_DOWNLOAD_AUTH, s.download_auth_method.trim()),
+            (K_COOKIES_BROWSER, s.cookies_browser.trim()),
         ];
         for (k, v) in pairs {
             if let Err(e) = self.core.store.set_setting(k, v) {
@@ -418,6 +447,17 @@ fn browse_folder(current: &str) -> Option<String> {
     dialog
         .pick_folder()
         .map(|p| p.to_string_lossy().to_string())
+}
+
+/// Open a native file picker (for a cookies.txt), seeded at `current`'s folder.
+fn browse_file(current: &str) -> Option<String> {
+    let mut dialog = rfd::FileDialog::new();
+    if let Some(parent) = std::path::Path::new(current).parent() {
+        if parent.is_dir() {
+            dialog = dialog.set_directory(parent);
+        }
+    }
+    dialog.pick_file().map(|p| p.to_string_lossy().to_string())
 }
 
 impl eframe::App for StreamArchiverApp {
@@ -715,6 +755,46 @@ impl StreamArchiverApp {
                 });
 
             ui.add_space(12.0);
+            ui.heading("Download authentication");
+            ui.label("Default for capturing sub-only / members-only / ad-reduced streams. Per-channel settings override this.");
+            egui::Grid::new("auth_grid")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("Method");
+                    let mut cookies = self.settings.download_auth_method == "cookies";
+                    egui::ComboBox::from_id_salt("dl_auth_cb")
+                        .selected_text(if cookies { "Browser cookies" } else { "None" })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut cookies, false, "None");
+                            ui.selectable_value(&mut cookies, true, "Browser cookies");
+                        });
+                    self.settings.download_auth_method =
+                        if cookies { "cookies".into() } else { "none".into() };
+                    ui.end_row();
+
+                    if cookies {
+                        ui.label("Browser");
+                        egui::ComboBox::from_id_salt("cookies_browser_cb")
+                            .selected_text(if self.settings.cookies_browser.is_empty() {
+                                "(choose)"
+                            } else {
+                                &self.settings.cookies_browser
+                            })
+                            .show_ui(ui, |ui| {
+                                for b in COOKIE_BROWSERS {
+                                    ui.selectable_value(
+                                        &mut self.settings.cookies_browser,
+                                        b.to_string(),
+                                        b,
+                                    );
+                                }
+                            });
+                        ui.end_row();
+                    }
+                });
+
+            ui.add_space(12.0);
             ui.heading("Startup");
             let mut on = self.autostart_on;
             if ui
@@ -836,6 +916,47 @@ impl StreamArchiverApp {
                         ui.checkbox(&mut form.enabled, "")
                             .on_hover_text("Monitor this channel for live streams");
                         ui.end_row();
+
+                        ui.label("Auth");
+                        egui::ComboBox::from_id_salt("auth_cb")
+                            .selected_text(form.auth_kind.label())
+                            .show_ui(ui, |ui| {
+                                for k in AuthKind::ALL {
+                                    ui.selectable_value(&mut form.auth_kind, k, k.label());
+                                }
+                            });
+                        ui.end_row();
+
+                        // Value field depends on the chosen auth kind.
+                        match form.auth_kind {
+                            AuthKind::CookiesBrowser => {
+                                ui.label("Browser");
+                                ui.text_edit_singleline(&mut form.auth_value)
+                                    .on_hover_text("e.g. firefox, chrome, edge (blank = global)");
+                                ui.end_row();
+                            }
+                            AuthKind::CookiesFile => {
+                                ui.label("Cookies file");
+                                ui.horizontal(|ui| {
+                                    ui.text_edit_singleline(&mut form.auth_value);
+                                    if ui.button("Browse…").clicked() {
+                                        if let Some(p) = browse_file(&form.auth_value) {
+                                            form.auth_value = p;
+                                        }
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                            AuthKind::Token => {
+                                ui.label("Auth token");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut form.auth_value).password(true),
+                                )
+                                .on_hover_text("Twitch OAuth token (streamlink)");
+                                ui.end_row();
+                            }
+                            AuthKind::Inherit | AuthKind::Disabled => {}
+                        }
 
                         ui.label("Output folder");
                         ui.horizontal(|ui| {

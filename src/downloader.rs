@@ -23,7 +23,9 @@ use tracing::{info, warn};
 
 use crate::detectors::{DetectContext, DetectItem, DetectOutcome};
 use crate::events::{AppEvent, EventTx, LiveSignal, ManualCommand};
-use crate::models::{Container, DetectionMethod, MonitorWithChannel, Platform, Tool, now_unix};
+use crate::models::{
+    AuthKind, Container, DetectionMethod, MonitorWithChannel, Platform, Tool, now_unix,
+};
 use crate::platform::ProcessJob;
 use crate::store::Store;
 
@@ -52,12 +54,52 @@ pub struct DownloadPlan {
     pub remux_to_mkv: bool,
 }
 
+/// Resolved download authentication for a monitor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuthSource {
+    None,
+    /// yt-dlp `--cookies-from-browser <browser>`.
+    CookiesBrowser(String),
+    /// yt-dlp `--cookies <path>`.
+    CookiesFile(String),
+    /// Twitch `--twitch-api-header=Authorization=OAuth <token>` (streamlink).
+    Token(String),
+}
+
+/// Resolve the effective auth for a monitor from its override + the global default.
+pub fn resolve_auth(
+    m: &MonitorWithChannel,
+    global_method: &str,
+    global_browser: &str,
+) -> AuthSource {
+    let val = m.monitor.auth_value.trim();
+    let browser = global_browser.trim();
+    match m.monitor.auth_kind {
+        AuthKind::Inherit => match global_method {
+            "cookies" if !browser.is_empty() => AuthSource::CookiesBrowser(browser.to_string()),
+            _ => AuthSource::None,
+        },
+        AuthKind::Disabled => AuthSource::None,
+        AuthKind::CookiesBrowser => {
+            let b = if val.is_empty() { browser } else { val };
+            if b.is_empty() {
+                AuthSource::None
+            } else {
+                AuthSource::CookiesBrowser(b.to_string())
+            }
+        }
+        AuthKind::CookiesFile if !val.is_empty() => AuthSource::CookiesFile(val.to_string()),
+        AuthKind::Token if !val.is_empty() => AuthSource::Token(val.to_string()),
+        _ => AuthSource::None,
+    }
+}
+
 /// Build the command + file plan for a monitor.
 ///
 /// All tools capture to a progressively-flushed `.ts` (so an abrupt
 /// kill/crash leaves usable data) and remux losslessly to `.mkv` on clean
 /// stop. If the user picked the TS container, the `.ts` is kept as-is.
-pub fn build_plan(row: &MonitorWithChannel, started_at: i64) -> DownloadPlan {
+pub fn build_plan(row: &MonitorWithChannel, started_at: i64, auth: &AuthSource) -> DownloadPlan {
     let m = &row.monitor;
     let ch = &row.channel;
     let dir = PathBuf::from(&m.output_dir);
@@ -82,6 +124,10 @@ pub fn build_plan(row: &MonitorWithChannel, started_at: i64) -> DownloadPlan {
             if ch.platform == Platform::Twitch {
                 // Reach 1440p/2K (HEVC) enhanced-broadcasting sources.
                 args.push("--twitch-supported-codecs=h264,h265,av1".to_string());
+                // Authenticated capture (sub-only / Turbo ad-free) via the token.
+                if let AuthSource::Token(t) = auth {
+                    args.push(format!("--twitch-api-header=Authorization=OAuth {t}"));
+                }
             }
             if m.capture_from_start {
                 // Rewind to the start of the DVR window (best-effort on Twitch).
@@ -109,6 +155,18 @@ pub fn build_plan(row: &MonitorWithChannel, started_at: i64) -> DownloadPlan {
                 args.push("--live-from-start".into());
             } else {
                 args.push("--no-live-from-start".into());
+            }
+            // Authenticated capture (members-only / sub-only) via cookies.
+            match auth {
+                AuthSource::CookiesBrowser(b) => {
+                    args.push("--cookies-from-browser".into());
+                    args.push(b.clone());
+                }
+                AuthSource::CookiesFile(p) => {
+                    args.push("--cookies".into());
+                    args.push(p.clone());
+                }
+                _ => {}
             }
             args.extend(extra);
             args.push(ch.url.clone());
@@ -349,7 +407,20 @@ impl Supervisor {
         let _permit = self.sem.acquire().await.expect("semaphore");
 
         let started_at = now_unix();
-        let plan = build_plan(&row, started_at);
+        let global_method = self
+            .store
+            .get_setting("download_auth_method")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let global_browser = self
+            .store
+            .get_setting("cookies_browser")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let auth = resolve_auth(&row, &global_method, &global_browser);
+        let plan = build_plan(&row, started_at, &auth);
         if let Some(parent) = plan.capture_path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
@@ -638,6 +709,8 @@ mod tests {
                 filename_template: "{name}_{date}_{time}".into(),
                 container,
                 capture_from_start: true,
+                auth_kind: AuthKind::Inherit,
+                auth_value: String::new(),
                 extra_args: String::new(),
                 max_concurrent: 1,
                 last_checked_at: None,
@@ -671,6 +744,7 @@ mod tests {
         let plan = build_plan(
             &row(Tool::Streamlink, Container::Mkv, Platform::Twitch),
             1_700_000_000,
+            &AuthSource::None,
         );
         assert_eq!(plan.program, "streamlink");
         assert!(plan.capture_path.to_string_lossy().ends_with(".ts"));
@@ -689,6 +763,7 @@ mod tests {
         let plan = build_plan(
             &row(Tool::YtDlp, Container::Mkv, Platform::YouTube),
             1_700_000_000,
+            &AuthSource::None,
         );
         assert_eq!(plan.program, "yt-dlp");
         assert!(plan.capture_path.to_string_lossy().ends_with(".ts"));
@@ -699,10 +774,63 @@ mod tests {
     }
 
     #[test]
+    fn streamlink_token_adds_twitch_auth_header() {
+        let plan = build_plan(
+            &row(Tool::Streamlink, Container::Mkv, Platform::Twitch),
+            1_700_000_000,
+            &AuthSource::Token("abc123".into()),
+        );
+        assert!(
+            plan.args
+                .iter()
+                .any(|a| a == "--twitch-api-header=Authorization=OAuth abc123")
+        );
+    }
+
+    #[test]
+    fn ytdlp_cookies_added() {
+        let browser = build_plan(
+            &row(Tool::YtDlp, Container::Mkv, Platform::YouTube),
+            1_700_000_000,
+            &AuthSource::CookiesBrowser("firefox".into()),
+        );
+        let joined = browser.args.join(" ");
+        assert!(joined.contains("--cookies-from-browser firefox"));
+
+        let file = build_plan(
+            &row(Tool::YtDlp, Container::Mkv, Platform::YouTube),
+            1_700_000_000,
+            &AuthSource::CookiesFile("C:/c.txt".into()),
+        );
+        assert!(file.args.join(" ").contains("--cookies C:/c.txt"));
+    }
+
+    #[test]
+    fn resolve_auth_precedence() {
+        // Inherit + global cookies -> browser cookies.
+        let mut r = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
+        assert_eq!(
+            resolve_auth(&r, "cookies", "chrome"),
+            AuthSource::CookiesBrowser("chrome".into())
+        );
+        // Per-channel override wins over global.
+        r.monitor.auth_kind = AuthKind::Token;
+        r.monitor.auth_value = "tok".into();
+        assert_eq!(
+            resolve_auth(&r, "cookies", "chrome"),
+            AuthSource::Token("tok".into())
+        );
+        // Disabled forces none even if a global default exists.
+        r.monitor.auth_kind = AuthKind::Disabled;
+        assert_eq!(resolve_auth(&r, "cookies", "chrome"), AuthSource::None);
+    }
+
+    #[test]
     fn streamlink_ts_keeps_ts() {
         let plan = build_plan(
             &row(Tool::Streamlink, Container::Ts, Platform::Twitch),
             1_700_000_000,
+            &AuthSource::None,
         );
         assert!(plan.final_path.to_string_lossy().ends_with(".ts"));
         assert!(!plan.remux_to_mkv);

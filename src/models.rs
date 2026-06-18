@@ -198,6 +198,62 @@ impl DetectionMethod {
     }
 }
 
+/// Per-monitor authentication source for the downloader tools. `Inherit` uses
+/// the global Settings default; anything else overrides it for this channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthKind {
+    /// Use the global default from Settings.
+    Inherit,
+    /// Force no authentication for this channel.
+    Disabled,
+    /// `--cookies-from-browser <value or global browser>` (yt-dlp).
+    CookiesBrowser,
+    /// `--cookies <path>` (yt-dlp) — a cookies.txt file.
+    CookiesFile,
+    /// An auth token (Twitch: `--twitch-api-header=Authorization=OAuth <value>`).
+    Token,
+}
+
+impl AuthKind {
+    pub const ALL: [AuthKind; 5] = [
+        AuthKind::Inherit,
+        AuthKind::Disabled,
+        AuthKind::CookiesBrowser,
+        AuthKind::CookiesFile,
+        AuthKind::Token,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthKind::Inherit => "inherit",
+            AuthKind::Disabled => "none",
+            AuthKind::CookiesBrowser => "cookies_browser",
+            AuthKind::CookiesFile => "cookies_file",
+            AuthKind::Token => "token",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AuthKind::Inherit => "Inherit (global)",
+            AuthKind::Disabled => "None",
+            AuthKind::CookiesBrowser => "Browser cookies",
+            AuthKind::CookiesFile => "Cookies file",
+            AuthKind::Token => "Auth token",
+        }
+    }
+
+    pub fn parse(s: &str) -> AuthKind {
+        match s {
+            "none" => AuthKind::Disabled,
+            "cookies_browser" => AuthKind::CookiesBrowser,
+            "cookies_file" => AuthKind::CookiesFile,
+            "token" => AuthKind::Token,
+            _ => AuthKind::Inherit,
+        }
+    }
+}
+
 /// Output container. Default MKV (robust to mid-write kills, seekable). Never MP4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Container {
@@ -260,6 +316,10 @@ pub struct Monitor {
     /// Capture from the start of the broadcast (yt-dlp `--live-from-start`,
     /// streamlink `--hls-live-restart`) vs. from the live edge. Default true.
     pub capture_from_start: bool,
+    /// Per-channel auth override for the downloader (Inherit = use global).
+    pub auth_kind: AuthKind,
+    /// Value for `auth_kind`: browser name, cookies.txt path, or token.
+    pub auth_value: String,
     pub extra_args: String,
     pub max_concurrent: i64,
     pub last_checked_at: Option<i64>,
