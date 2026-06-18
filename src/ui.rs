@@ -16,6 +16,7 @@ use crate::app_core::AppCore;
 use crate::events::{ManualCommand, UiCommand};
 use crate::models::{
     AuthKind, Channel, Container, DetectionMethod, Monitor, MonitorWithChannel, Platform, Tool,
+    Video,
 };
 use crate::oauth::{self, AuthFlow};
 use crate::platform::AutoStart;
@@ -37,7 +38,8 @@ const COOKIE_BROWSERS: [&str; 8] = [
 
 #[derive(PartialEq, Eq)]
 enum View {
-    Channels,
+    Streams,
+    Videos,
     Settings,
 }
 
@@ -139,6 +141,38 @@ impl MonitorForm {
     }
 }
 
+/// Backing state for the always-visible "download a video" form on the Videos tab.
+struct VideoForm {
+    url: String,
+    title: String,
+    tool: Tool,
+    /// Once the user picks a tool, stop auto-selecting it from the URL's platform.
+    tool_locked: bool,
+    quality: String,
+    output_dir: String,
+    filename_template: String,
+    auth_kind: AuthKind,
+    auth_value: String,
+    extra_args: String,
+}
+
+impl VideoForm {
+    fn new(default_output_dir: String) -> VideoForm {
+        VideoForm {
+            url: String::new(),
+            title: String::new(),
+            tool: Tool::YtDlp,
+            tool_locked: false,
+            quality: "best".into(),
+            output_dir: default_output_dir,
+            filename_template: "{name}_{date}_{time}".into(),
+            auth_kind: AuthKind::Inherit,
+            auth_value: String::new(),
+            extra_args: String::new(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct SettingsForm {
     twitch_client_id: String,
@@ -164,7 +198,9 @@ pub struct StreamArchiverApp {
 
     view: View,
     rows: Vec<MonitorWithChannel>,
+    videos: Vec<Video>,
     form: Option<MonitorForm>,
+    video_form: VideoForm,
     settings: SettingsForm,
     status: String,
     /// Monitor id of the currently selected row (target for keyboard shortcuts).
@@ -223,6 +259,8 @@ impl StreamArchiverApp {
             None => AuthFlow::Idle,
         }));
 
+        let video_form = VideoForm::new(settings.default_output_dir.clone());
+
         let mut app = StreamArchiverApp {
             core,
             _tray: tray,
@@ -231,9 +269,11 @@ impl StreamArchiverApp {
             autostart,
             autostart_on,
             quitting: false,
-            view: View::Channels,
+            view: View::Streams,
             rows: Vec::new(),
+            videos: Vec::new(),
             form: None,
+            video_form,
             settings,
             status: String::new(),
             selected_monitor: None,
@@ -241,6 +281,7 @@ impl StreamArchiverApp {
             twitch_flow,
         };
         app.reload_rows();
+        app.reload_videos();
         app
     }
 
@@ -251,6 +292,13 @@ impl StreamArchiverApp {
                 warn!("failed to load monitors: {e:#}");
                 self.status = format!("Error loading channels: {e}");
             }
+        }
+    }
+
+    fn reload_videos(&mut self) {
+        match self.core.store.list_videos() {
+            Ok(v) => self.videos = v,
+            Err(e) => warn!("failed to load videos: {e:#}"),
         }
     }
 
@@ -284,6 +332,7 @@ impl StreamArchiverApp {
         }
         if dirty {
             self.reload_rows();
+            self.reload_videos();
         }
     }
 
@@ -411,6 +460,34 @@ fn fmt_duration(secs: i64) -> String {
     format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
 }
 
+/// Human-readable byte size (B / KB / MB / GB).
+fn fmt_bytes(bytes: i64) -> String {
+    let b = bytes.max(0) as f64;
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    if b >= GB {
+        format!("{:.2} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.0} KB", b / KB)
+    } else {
+        format!("{b:.0} B")
+    }
+}
+
+/// Theme color for a video download status string.
+fn video_status_color(status: &str) -> egui::Color32 {
+    use egui::Color32;
+    match status {
+        "downloading" => Color32::from_rgb(0x4d, 0x9b, 0xff),
+        "completed" => Color32::from_rgb(0x57, 0xc7, 0x57),
+        "failed" => Color32::from_rgb(0xe0, 0x6c, 0x6c),
+        _ => Color32::from_gray(0xa0), // queued / stopped / orphaned
+    }
+}
+
 /// Columns derived from a monitor's latest recording.
 struct RecordingCells {
     /// When *we* started recording.
@@ -516,10 +593,11 @@ impl eframe::App for StreamArchiverApp {
                 ui.horizontal(|ui| {
                     ui.heading("StreamArchiver");
                     ui.separator();
-                    ui.selectable_value(&mut self.view, View::Channels, "Channels");
+                    ui.selectable_value(&mut self.view, View::Streams, "Streams");
+                    ui.selectable_value(&mut self.view, View::Videos, "Videos");
                     ui.selectable_value(&mut self.view, View::Settings, "Settings");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if self.view == View::Channels && ui.button("➕ Add channel").clicked() {
+                        if self.view == View::Streams && ui.button("➕ Add stream").clicked() {
                             self.form = Some(MonitorForm::new_channel(
                                 self.settings.default_output_dir.clone(),
                             ));
@@ -541,7 +619,8 @@ impl eframe::App for StreamArchiverApp {
             });
 
         egui::CentralPanel::default().show_inside(ui, |ui| match self.view {
-            View::Channels => self.channels_view(ui),
+            View::Streams => self.channels_view(ui),
+            View::Videos => self.videos_view(ui),
             View::Settings => self.settings_view(ui),
         });
 
@@ -571,7 +650,7 @@ impl StreamArchiverApp {
         }
 
         if ctx.input_mut(|i| i.consume_shortcut(&ADD)) {
-            self.view = View::Channels;
+            self.view = View::Streams;
             self.form = Some(MonitorForm::new_channel(
                 self.settings.default_output_dir.clone(),
             ));
@@ -585,7 +664,7 @@ impl StreamArchiverApp {
         }
 
         // Row-targeted keys only fire on the channel list when not typing.
-        if self.view == View::Channels && !ctx.egui_wants_keyboard_input() {
+        if self.view == View::Streams && !ctx.egui_wants_keyboard_input() {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Delete)) {
                 if let Some(id) = self.selected_monitor {
                     if let Some(row) = self.rows.iter().find(|r| r.monitor.id == id) {
@@ -646,12 +725,359 @@ impl StreamArchiverApp {
         }
     }
 
+    /// The "Videos" tab: a list of on-demand downloads with an always-visible
+    /// "paste a URL" form pinned to the bottom.
+    fn videos_view(&mut self, ui: &mut egui::Ui) {
+        egui::TopBottomPanel::bottom("video_add_panel")
+            .resizable(false)
+            .show_inside(ui, |ui| {
+                self.video_add_form(ui);
+            });
+        egui::CentralPanel::default().show_inside(ui, |ui| {
+            self.videos_list(ui);
+        });
+    }
+
+    fn videos_list(&mut self, ui: &mut egui::Ui) {
+        // Reflect background progress whenever the list is shown.
+        self.reload_videos();
+
+        if self.videos.is_empty() {
+            ui.add_space(24.0);
+            ui.vertical_centered(|ui| {
+                ui.label("No videos yet.");
+                ui.label("Paste a URL in the box below to download a video or VOD.");
+            });
+            return;
+        }
+
+        let mut to_stop: Option<i64> = None;
+        let mut to_retry: Option<i64> = None;
+        let mut to_delete: Option<i64> = None;
+        let any_active = self.videos.iter().any(|v| v.is_active());
+
+        egui::ScrollArea::both()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                TableBuilder::new(ui)
+                    .striped(true)
+                    .resizable(true)
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .column(Column::auto().at_least(200.0)) // video
+                    .column(Column::auto().at_least(86.0)) // platform
+                    .column(Column::auto().at_least(72.0)) // tool
+                    .column(Column::auto().at_least(90.0)) // status
+                    .column(Column::auto().at_least(72.0)) // size
+                    .column(Column::auto().at_least(80.0)) // added
+                    .column(Column::remainder().at_least(150.0)) // actions
+                    .header(20.0, |mut header| {
+                        for title in [
+                            "Video", "Platform", "Tool", "Status", "Size", "Added", "Actions",
+                        ] {
+                            header.col(|ui| {
+                                ui.strong(title);
+                            });
+                        }
+                    })
+                    .body(|mut body| {
+                        for v in &self.videos {
+                            body.row(24.0, |mut tr| {
+                                tr.col(|ui| {
+                                    let label = if v.title.trim().is_empty() {
+                                        v.url.as_str()
+                                    } else {
+                                        v.title.as_str()
+                                    };
+                                    ui.label(label).on_hover_text(&v.url);
+                                });
+                                tr.col(|ui| {
+                                    platform_badge(ui, v.platform);
+                                    ui.label(v.platform.label());
+                                });
+                                tr.col(|ui| {
+                                    ui.label(v.tool.label());
+                                });
+                                tr.col(|ui| {
+                                    ui.colored_label(video_status_color(&v.status), &v.status);
+                                });
+                                tr.col(|ui| {
+                                    if v.bytes > 0 {
+                                        ui.label(fmt_bytes(v.bytes));
+                                    }
+                                });
+                                tr.col(|ui| {
+                                    ui.label(fmt_date(v.created_at));
+                                });
+                                tr.col(|ui| {
+                                    ui.push_id(v.id, |ui| {
+                                        if v.is_active() {
+                                            if ui
+                                                .small_button("⏹")
+                                                .on_hover_text("Stop download")
+                                                .clicked()
+                                            {
+                                                to_stop = Some(v.id);
+                                            }
+                                        } else if ui
+                                            .small_button("↻")
+                                            .on_hover_text("Retry download")
+                                            .clicked()
+                                        {
+                                            to_retry = Some(v.id);
+                                        }
+                                        let dir_ok = std::path::Path::new(&v.output_dir).is_dir();
+                                        if ui
+                                            .add_enabled(dir_ok, egui::Button::new("📂").small())
+                                            .on_hover_text("Open output folder")
+                                            .clicked()
+                                        {
+                                            crate::platform::open_path(std::path::Path::new(
+                                                &v.output_dir,
+                                            ));
+                                        }
+                                        let file_ok = !v.output_path.is_empty()
+                                            && std::path::Path::new(&v.output_path).is_file();
+                                        if ui
+                                            .add_enabled(file_ok, egui::Button::new("▶").small())
+                                            .on_hover_text("Open file")
+                                            .clicked()
+                                        {
+                                            crate::platform::open_path(std::path::Path::new(
+                                                &v.output_path,
+                                            ));
+                                        }
+                                        if ui.small_button("📋").on_hover_text("Copy URL").clicked()
+                                        {
+                                            ui.ctx().copy_text(v.url.clone());
+                                        }
+                                        if ui
+                                            .small_button("🗑")
+                                            .on_hover_text("Delete from list (keeps the file)")
+                                            .clicked()
+                                        {
+                                            to_delete = Some(v.id);
+                                        }
+                                    });
+                                });
+                            });
+                        }
+                    });
+            });
+
+        // Tick while a download is queued/running so status + size update live.
+        if any_active {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs(1));
+        }
+
+        if let Some(id) = to_stop {
+            self.core.manual(ManualCommand::StopVideo(id));
+            self.status = "Stopping download…".into();
+        }
+        if let Some(id) = to_retry {
+            match self.core.store.reset_video_for_retry(id) {
+                Ok(()) => {
+                    self.core.manual(ManualCommand::StartVideo(id));
+                    self.status = "Re-queued download.".into();
+                }
+                Err(e) => self.status = format!("Error: {e}"),
+            }
+            self.reload_videos();
+        }
+        if let Some(id) = to_delete {
+            if let Err(e) = self.core.store.delete_video(id) {
+                self.status = format!("Error: {e}");
+            }
+            self.reload_videos();
+        }
+    }
+
+    /// The bottom "paste a URL + settings + Download" form on the Videos tab.
+    fn video_add_form(&mut self, ui: &mut egui::Ui) {
+        let platform = Platform::detect(&self.video_form.url);
+        let mut do_download = false;
+
+        {
+            let vf = &mut self.video_form;
+            // Auto-pick the tool from the URL's platform until the user overrides it.
+            if !vf.tool_locked {
+                vf.tool = platform.default_tool();
+            }
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.heading("Download a video / VOD");
+                ui.label(
+                    egui::RichText::new("→ MKV")
+                        .small()
+                        .color(egui::Color32::from_gray(0x90)),
+                );
+            });
+
+            egui::Grid::new("video_form_grid")
+                .num_columns(2)
+                .spacing([12.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("URL");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut vf.url)
+                                .desired_width(360.0)
+                                .hint_text(
+                                    "YouTube video, Twitch VOD, or any streamlink/yt-dlp URL",
+                                ),
+                        );
+                        platform_badge(ui, platform);
+                        ui.label(platform.label());
+                    });
+                    ui.end_row();
+
+                    ui.label("Name");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut vf.title)
+                            .hint_text("optional — used for the filename (default: video)"),
+                    );
+                    ui.end_row();
+
+                    ui.label("Tool");
+                    egui::ComboBox::from_id_salt("video_tool_cb")
+                        .selected_text(vf.tool.label())
+                        .show_ui(ui, |ui| {
+                            for t in Tool::ALL {
+                                if ui.selectable_value(&mut vf.tool, t, t.label()).clicked() {
+                                    vf.tool_locked = true;
+                                }
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label("Quality");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut vf.quality)
+                            .hint_text("best, 1080p, or a yt-dlp -f selector"),
+                    );
+                    ui.end_row();
+
+                    ui.label("Auth");
+                    egui::ComboBox::from_id_salt("video_auth_cb")
+                        .selected_text(vf.auth_kind.label())
+                        .show_ui(ui, |ui| {
+                            for k in AuthKind::ALL {
+                                ui.selectable_value(&mut vf.auth_kind, k, k.label());
+                            }
+                        });
+                    ui.end_row();
+
+                    match vf.auth_kind {
+                        AuthKind::CookiesBrowser => {
+                            ui.label("Browser");
+                            ui.text_edit_singleline(&mut vf.auth_value)
+                                .on_hover_text("e.g. firefox, chrome, edge (blank = global)");
+                            ui.end_row();
+                        }
+                        AuthKind::CookiesFile => {
+                            ui.label("Cookies file");
+                            ui.horizontal(|ui| {
+                                ui.text_edit_singleline(&mut vf.auth_value);
+                                if ui.button("Browse…").clicked() {
+                                    if let Some(p) = browse_file(&vf.auth_value) {
+                                        vf.auth_value = p;
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                        }
+                        AuthKind::Token => {
+                            ui.label("Auth token");
+                            ui.add(egui::TextEdit::singleline(&mut vf.auth_value).password(true))
+                                .on_hover_text("Twitch OAuth token (streamlink)");
+                            ui.end_row();
+                        }
+                        AuthKind::Inherit | AuthKind::Disabled => {}
+                    }
+
+                    ui.label("Output folder");
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut vf.output_dir);
+                        if ui.button("Browse…").clicked() {
+                            if let Some(p) = browse_folder(&vf.output_dir) {
+                                vf.output_dir = p;
+                            }
+                        }
+                    });
+                    ui.end_row();
+
+                    ui.label("Filename template");
+                    ui.text_edit_singleline(&mut vf.filename_template);
+                    ui.end_row();
+
+                    ui.label("Extra args");
+                    ui.text_edit_singleline(&mut vf.extra_args);
+                    ui.end_row();
+                });
+
+            ui.add_space(6.0);
+            let can_download = !vf.url.trim().is_empty();
+            if ui
+                .add_enabled(can_download, egui::Button::new("⬇  Download"))
+                .clicked()
+            {
+                do_download = true;
+            }
+            ui.add_space(6.0);
+        }
+
+        if do_download {
+            self.start_video_download();
+        }
+    }
+
+    /// Insert the form's video as a queued download and kick off the supervisor.
+    fn start_video_download(&mut self) {
+        let url = self.video_form.url.trim().to_string();
+        if url.is_empty() {
+            return;
+        }
+        let video = Video {
+            id: 0,
+            platform: Platform::detect(&url),
+            url,
+            title: self.video_form.title.trim().to_string(),
+            tool: self.video_form.tool,
+            quality: self.video_form.quality.clone(),
+            output_dir: self.video_form.output_dir.clone(),
+            filename_template: self.video_form.filename_template.clone(),
+            auth_kind: self.video_form.auth_kind,
+            auth_value: self.video_form.auth_value.clone(),
+            extra_args: self.video_form.extra_args.clone(),
+            status: "queued".into(),
+            output_path: String::new(),
+            bytes: 0,
+            exit_code: None,
+            created_at: 0,
+            started_at: None,
+            ended_at: None,
+        };
+        match self.core.store.insert_video(&video) {
+            Ok(id) => {
+                self.core.manual(ManualCommand::StartVideo(id));
+                self.status = "Queued video download.".into();
+                // Clear the URL/name for the next one; keep tool/auth/folder settings.
+                self.video_form.url.clear();
+                self.video_form.title.clear();
+                self.video_form.tool_locked = false;
+                self.reload_videos();
+            }
+            Err(e) => self.status = format!("Error: {e}"),
+        }
+    }
+
     fn channels_view(&mut self, ui: &mut egui::Ui) {
         if self.rows.is_empty() {
             ui.add_space(24.0);
             ui.vertical_centered(|ui| {
-                ui.label("No channels yet.");
-                ui.label("Click “Add channel” to start monitoring a livestream.");
+                ui.label("No streams yet.");
+                ui.label("Click “Add stream” to start monitoring a channel for live broadcasts.");
             });
             return;
         }

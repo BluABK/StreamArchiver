@@ -79,4 +79,8 @@ pub enum ManualCommand {
     Start(i64),
     /// Abort the channel's active recording.
     Stop(i64),
+    /// Begin downloading a queued on-demand video (by `video` id).
+    StartVideo(i64),
+    /// Abort an in-flight on-demand video download (by `video` id).
+    StopVideo(i64),
 }

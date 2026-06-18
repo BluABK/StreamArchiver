@@ -82,11 +82,16 @@ fn main() -> Result<()> {
     };
 
     let store = Store::open(&app_paths::db_path()).context("opening data store")?;
-    // Crash recovery: any recording left mid-flight by a previous run is stale.
+    // Crash recovery: any recording/download left mid-flight by a previous run is stale.
     match store.mark_orphaned_recordings(models::now_unix()) {
         Ok(n) if n > 0 => info!("marked {n} orphaned recording(s) from a previous run"),
         Ok(_) => {}
         Err(e) => tracing::warn!("orphan recovery failed: {e:#}"),
+    }
+    match store.mark_orphaned_videos(models::now_unix()) {
+        Ok(n) if n > 0 => info!("marked {n} orphaned video download(s) from a previous run"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("video orphan recovery failed: {e:#}"),
     }
     let core = AppCore::new(Arc::new(store)).context("starting core runtime")?;
     core.start(); // launch the background scheduler + download supervisor
@@ -384,6 +389,7 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
 fn run_headless(secs: u64) -> Result<()> {
     let store = Store::open(&app_paths::db_path()).context("opening data store")?;
     let _ = store.mark_orphaned_recordings(models::now_unix());
+    let _ = store.mark_orphaned_videos(models::now_unix());
     let core = AppCore::new(Arc::new(store)).context("starting core runtime")?;
     core.start();
     info!("headless: running core for {secs}s");

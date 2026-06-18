@@ -13,11 +13,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::models::{
     AuthKind, Channel, Container, DetectionMethod, Monitor, MonitorWithChannel, Platform, Tool,
-    now_unix,
+    Video, now_unix,
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -142,7 +142,35 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 4)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 4);
+        if version < 5 {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE video (
+                    id                INTEGER PRIMARY KEY,
+                    url               TEXT NOT NULL,
+                    title             TEXT NOT NULL DEFAULT '',
+                    platform          TEXT NOT NULL,
+                    tool              TEXT NOT NULL,
+                    quality           TEXT NOT NULL DEFAULT 'best',
+                    output_dir        TEXT NOT NULL,
+                    filename_template TEXT NOT NULL DEFAULT '',
+                    auth_kind         TEXT NOT NULL DEFAULT 'inherit',
+                    auth_value        TEXT NOT NULL DEFAULT '',
+                    extra_args        TEXT NOT NULL DEFAULT '',
+                    status            TEXT NOT NULL DEFAULT 'queued',
+                    output_path       TEXT NOT NULL DEFAULT '',
+                    bytes             INTEGER NOT NULL DEFAULT 0,
+                    exit_code         INTEGER,
+                    log_excerpt       TEXT NOT NULL DEFAULT '',
+                    created_at        INTEGER NOT NULL,
+                    started_at        INTEGER,
+                    ended_at          INTEGER
+                );
+                "#,
+            )?;
+            conn.pragma_update(None, "user_version", 5)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 5);
         Ok(())
     }
 
@@ -430,6 +458,161 @@ impl Store {
         Ok(rows)
     }
 
+    // ----- videos (on-demand downloads) -----
+
+    /// Insert a new video download request (status starts as `queued`).
+    pub fn insert_video(&self, v: &Video) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO video(url, title, platform, tool, quality, output_dir, filename_template,
+                auth_kind, auth_value, extra_args, status, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'queued', ?11)",
+            params![
+                v.url,
+                v.title,
+                v.platform.as_str(),
+                v.tool.as_str(),
+                v.quality,
+                v.output_dir,
+                v.filename_template,
+                v.auth_kind.as_str(),
+                v.auth_value,
+                v.extra_args,
+                now_unix(),
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Mark a video as started (status `downloading` + start time).
+    pub fn set_video_started(&self, id: i64, started_at: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE video SET status='downloading', started_at=?2 WHERE id=?1",
+            params![id, started_at],
+        )?;
+        Ok(())
+    }
+
+    /// Update only a video's status string (e.g. to `stopped`).
+    pub fn set_video_status(&self, id: i64, status: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE video SET status=?2 WHERE id=?1",
+            params![id, status],
+        )?;
+        Ok(())
+    }
+
+    /// Finalize a video download with its outcome.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_video(
+        &self,
+        id: i64,
+        ended_at: i64,
+        bytes: i64,
+        exit_code: Option<i64>,
+        status: &str,
+        output_path: &str,
+        log_excerpt: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE video SET ended_at=?2, bytes=?3, exit_code=?4, status=?5, output_path=?6,
+                log_excerpt=?7 WHERE id=?1",
+            params![
+                id,
+                ended_at,
+                bytes,
+                exit_code,
+                status,
+                output_path,
+                log_excerpt
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Reset a finished video back to `queued` so it can be retried.
+    pub fn reset_video_for_retry(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE video SET status='queued', started_at=NULL, ended_at=NULL, bytes=0,
+                exit_code=NULL, log_excerpt='' WHERE id=?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_video(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM video WHERE id=?1", params![id])?;
+        Ok(())
+    }
+
+    /// Mark videos still flagged `downloading` (crash leftovers) as `orphaned`.
+    pub fn mark_orphaned_videos(&self, ended_at: i64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE video SET status='orphaned', ended_at=?1 WHERE status IN ('downloading','queued')",
+            params![ended_at],
+        )?;
+        Ok(n)
+    }
+
+    pub fn get_video(&self, id: i64) -> Result<Option<Video>> {
+        let conn = self.conn.lock().unwrap();
+        let v = conn
+            .query_row(
+                "SELECT id, url, title, platform, tool, quality, output_dir, filename_template,
+                    auth_kind, auth_value, extra_args, status, output_path, bytes, exit_code,
+                    created_at, started_at, ended_at
+                 FROM video WHERE id=?1",
+                params![id],
+                Self::map_video,
+            )
+            .optional()?;
+        Ok(v)
+    }
+
+    /// All videos, newest first.
+    pub fn list_videos(&self) -> Result<Vec<Video>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, url, title, platform, tool, quality, output_dir, filename_template,
+                auth_kind, auth_value, extra_args, status, output_path, bytes, exit_code,
+                created_at, started_at, ended_at
+             FROM video ORDER BY id DESC",
+        )?;
+        let rows = stmt
+            .query_map([], Self::map_video)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn map_video(r: &rusqlite::Row<'_>) -> rusqlite::Result<Video> {
+        Ok(Video {
+            id: r.get(0)?,
+            url: r.get(1)?,
+            title: r.get(2)?,
+            platform: Platform::parse(&r.get::<_, String>(3)?),
+            tool: Tool::parse(&r.get::<_, String>(4)?),
+            quality: r.get(5)?,
+            output_dir: r.get(6)?,
+            filename_template: r.get(7)?,
+            auth_kind: AuthKind::parse(&r.get::<_, String>(8)?),
+            auth_value: r.get(9)?,
+            extra_args: r.get(10)?,
+            status: r.get(11)?,
+            output_path: r.get(12)?,
+            bytes: r.get(13)?,
+            exit_code: r.get(14)?,
+            created_at: r.get(15)?,
+            started_at: r.get(16)?,
+            ended_at: r.get(17)?,
+        })
+    }
+
     fn map_channel(r: &rusqlite::Row<'_>) -> rusqlite::Result<Channel> {
         Ok(Channel {
             id: r.get(0)?,
@@ -510,6 +693,73 @@ mod tests {
         // deleting the channel cascades to monitors.
         store.delete_channel(c1).unwrap();
         assert_eq!(store.list_monitors_with_channels().unwrap().len(), 0);
+    }
+
+    fn sample_video() -> Video {
+        Video {
+            id: 0,
+            url: "https://youtube.com/watch?v=abc".into(),
+            title: "My VOD".into(),
+            platform: Platform::YouTube,
+            tool: Tool::YtDlp,
+            quality: "best".into(),
+            output_dir: "C:/vids".into(),
+            filename_template: "{name}_{date}".into(),
+            auth_kind: AuthKind::Inherit,
+            auth_value: String::new(),
+            extra_args: String::new(),
+            status: "queued".into(),
+            output_path: String::new(),
+            bytes: 0,
+            exit_code: None,
+            created_at: 0,
+            started_at: None,
+            ended_at: None,
+        }
+    }
+
+    #[test]
+    fn video_crud_roundtrip() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.insert_video(&sample_video()).unwrap();
+
+        let v = store.get_video(id).unwrap().unwrap();
+        assert_eq!(v.status, "queued");
+        assert_eq!(v.tool, Tool::YtDlp);
+
+        store.set_video_started(id, 123).unwrap();
+        assert_eq!(store.get_video(id).unwrap().unwrap().status, "downloading");
+
+        store
+            .finish_video(
+                id,
+                456,
+                1024,
+                Some(0),
+                "completed",
+                "C:/vids/out.mkv",
+                "log",
+            )
+            .unwrap();
+        let v = store.get_video(id).unwrap().unwrap();
+        assert_eq!(v.status, "completed");
+        assert_eq!(v.bytes, 1024);
+        assert_eq!(v.output_path, "C:/vids/out.mkv");
+
+        // Orphan recovery only touches in-flight rows, not completed ones.
+        let id2 = store.insert_video(&sample_video()).unwrap();
+        store.set_video_started(id2, 1).unwrap();
+        let n = store.mark_orphaned_videos(999).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(store.get_video(id2).unwrap().unwrap().status, "orphaned");
+        assert_eq!(store.get_video(id).unwrap().unwrap().status, "completed");
+
+        store.reset_video_for_retry(id2).unwrap();
+        assert_eq!(store.get_video(id2).unwrap().unwrap().status, "queued");
+
+        assert_eq!(store.list_videos().unwrap().len(), 2);
+        store.delete_video(id2).unwrap();
+        assert_eq!(store.list_videos().unwrap().len(), 1);
     }
 
     #[test]

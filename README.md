@@ -36,9 +36,14 @@ cargo build --release
 Right-click the tray icon → **Open** / **Quit**. Quitting gracefully stops any active
 recordings (finalizing the MKV) before exiting.
 
+The window has three tabs: **Streams** (monitor channels for live broadcasts),
+**Videos** (on-demand downloads), and **Settings**.
+
 ## Using it
 
-1. **Add channel** → paste a URL (platform auto-detected). Pick the **tool**, the
+### Streams (live monitoring)
+
+1. **Add stream** → paste a URL (platform auto-detected). Pick the **tool**, the
    **detection method** (platform-filtered), poll interval, quality, **container**
    (MKV default), output folder, and an optional filename template.
 2. **＋Inst** adds another capture *instance* for the same channel — e.g. run both
@@ -46,6 +51,21 @@ recordings (finalizing the MKV) before exiting.
 3. **Settings** → Twitch/YouTube credentials, default output folder, max concurrent
    downloads, and **start at login** (autostart). Folder fields have a **Browse…**
    button.
+
+### Videos (on-demand downloads)
+
+The **Videos** tab downloads a *specific* video or VOD now — a YouTube video, a
+Twitch VOD, or any `streamlink`/`yt-dlp` URL — rather than watching a channel for
+live streams. Paste a URL in the form at the bottom, adjust the settings shown
+alongside it (**tool** — auto-picked from the platform, **quality**, **auth**,
+output folder, filename template, extra args), and click **Download**. Output is
+always **MKV** (yt-dlp remuxes to MKV; streamlink/ffmpeg capture to `.ts` then
+remux). Downloads share the same global concurrency limit as live recordings.
+
+Each row shows status (`queued` → `downloading` → `completed`/`failed`/`stopped`)
+and size, with per-row actions: **Stop**, **Retry**, **Open folder**, **Open
+file**, **Copy URL**, and **Delete** (removes the row; the file is kept). A
+download left in flight by a crash/quit is marked `orphaned` on the next start.
 
 The channel table shows, per monitor: On (enable/disable), Name, Platform (with a
 brand badge), Tool, Detection, poll interval, State, **Went Live** (the platform's

@@ -24,6 +24,8 @@ pub struct AppCore {
     pub rt: Runtime,
     /// monitor_id -> child PID of in-flight recordings.
     pub active: ActiveSet,
+    /// video_id -> child PID of in-flight on-demand video downloads.
+    pub active_videos: ActiveSet,
     /// Set during shutdown so the scheduler/supervisor stop starting new work.
     pub shutdown: Arc<AtomicBool>,
     /// Sends on-demand Start/Stop commands to the supervisor (set in `start`).
@@ -43,6 +45,7 @@ impl AppCore {
             events,
             rt,
             active: Arc::new(Mutex::new(HashMap::new())),
+            active_videos: Arc::new(Mutex::new(HashMap::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             manual_tx: Mutex::new(None),
         }))
@@ -101,6 +104,7 @@ impl AppCore {
             self.store.clone(),
             self.events.clone(),
             self.active.clone(),
+            self.active_videos.clone(),
             self.shutdown.clone(),
             ctx,
             max_concurrent,
@@ -123,16 +127,16 @@ impl AppCore {
         }
     }
 
-    /// Gracefully stop all recordings: signal shutdown, kill the tool process
-    /// trees (so each record task's child exits), then wait for those tasks to
-    /// remux `.ts` -> `.mkv` and finalize before returning.
+    /// Gracefully stop all recordings and on-demand video downloads: signal
+    /// shutdown, kill the tool process trees (so each task's child exits), then
+    /// wait for those tasks to remux `.ts` -> `.mkv` and finalize before returning.
     pub fn stop_all_recordings(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        let initial = self.active.lock().unwrap().len();
+        let initial = self.active.lock().unwrap().len() + self.active_videos.lock().unwrap().len();
         if initial == 0 {
             return;
         }
-        info!("stopping {initial} active recording(s); waiting for finalize...");
+        info!("stopping {initial} active download(s); waiting for finalize...");
         let start = Instant::now();
         loop {
             let pids: Vec<u32> = self
@@ -140,19 +144,23 @@ impl AppCore {
                 .lock()
                 .unwrap()
                 .values()
+                .chain(self.active_videos.lock().unwrap().values())
                 .copied()
                 .filter(|p| *p > 0)
                 .collect();
             for pid in pids {
                 crate::platform::kill_process_tree(pid);
             }
-            if self.active.lock().unwrap().is_empty() {
-                info!("all recordings finalized");
+            if self.active.lock().unwrap().is_empty()
+                && self.active_videos.lock().unwrap().is_empty()
+            {
+                info!("all downloads finalized");
                 break;
             }
             if start.elapsed() > SHUTDOWN_DRAIN_TIMEOUT {
-                let n = self.active.lock().unwrap().len();
-                warn!("timed out waiting for {n} recording(s) to finalize");
+                let n =
+                    self.active.lock().unwrap().len() + self.active_videos.lock().unwrap().len();
+                warn!("timed out waiting for {n} download(s) to finalize");
                 break;
             }
             std::thread::sleep(Duration::from_millis(200));

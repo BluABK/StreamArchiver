@@ -9,7 +9,7 @@
 //! Default container is MKV (never MP4): streamlink records to `.ts` then remuxes
 //! losslessly to `.mkv`; yt-dlp merges straight to `.mkv`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,7 +24,7 @@ use tracing::{info, warn};
 use crate::detectors::{DetectContext, DetectItem, DetectOutcome};
 use crate::events::{AppEvent, EventTx, LiveSignal, ManualCommand};
 use crate::models::{
-    AuthKind, Container, DetectionMethod, MonitorWithChannel, Platform, Tool, now_unix,
+    AuthKind, Container, DetectionMethod, MonitorWithChannel, Platform, Tool, Video, now_unix,
 };
 use crate::platform::ProcessJob;
 use crate::store::Store;
@@ -72,9 +72,25 @@ pub fn resolve_auth(
     global_method: &str,
     global_browser: &str,
 ) -> AuthSource {
-    let val = m.monitor.auth_value.trim();
+    resolve_auth_for(
+        m.monitor.auth_kind,
+        &m.monitor.auth_value,
+        global_method,
+        global_browser,
+    )
+}
+
+/// Resolve an auth source from an `(auth_kind, auth_value)` pair plus the global
+/// default — shared by monitors and on-demand videos.
+pub fn resolve_auth_for(
+    auth_kind: AuthKind,
+    auth_value: &str,
+    global_method: &str,
+    global_browser: &str,
+) -> AuthSource {
+    let val = auth_value.trim();
     let browser = global_browser.trim();
-    match m.monitor.auth_kind {
+    match auth_kind {
         AuthKind::Inherit => match global_method {
             "cookies" if !browser.is_empty() => AuthSource::CookiesBrowser(browser.to_string()),
             _ => AuthSource::None,
@@ -195,11 +211,126 @@ pub fn build_plan(row: &MonitorWithChannel, started_at: i64, auth: &AuthSource) 
     }
 }
 
+/// Build the command + file plan for an on-demand video/VOD download.
+///
+/// Output is always MKV: yt-dlp downloads the full video and remuxes to MKV
+/// directly; streamlink/ffmpeg capture to `.ts` then remux losslessly. Unlike
+/// [`build_plan`], there are no live-stream flags (`--live-from-start`,
+/// `--retry-streams`).
+pub fn build_video_plan(v: &Video, started_at: i64, auth: &AuthSource) -> DownloadPlan {
+    let dir = PathBuf::from(&v.output_dir);
+    let name = if v.title.trim().is_empty() {
+        "video"
+    } else {
+        v.title.trim()
+    };
+    let stem = expand_template(&v.filename_template, name, started_at);
+    let quality = if v.quality.trim().is_empty() {
+        "best".to_string()
+    } else {
+        v.quality.trim().to_string()
+    };
+    let extra = split_args(&v.extra_args);
+    let platform = Platform::detect(&v.url);
+    let final_path = dir.join(format!("{stem}.mkv"));
+
+    match v.tool {
+        Tool::YtDlp => {
+            // yt-dlp downloads the complete video and remuxes to MKV. `%(ext)s`
+            // becomes `mkv` after the remux, so the final path is predictable.
+            let out_tmpl = dir
+                .join(format!("{stem}.%(ext)s"))
+                .to_string_lossy()
+                .into_owned();
+            let mut args = vec![
+                "--no-part".to_string(),
+                "--no-playlist".into(),
+                "--merge-output-format".into(),
+                "mkv".into(),
+                "--remux-video".into(),
+                "mkv".into(),
+                "-o".into(),
+                out_tmpl,
+            ];
+            if quality != "best" {
+                args.push("-f".into());
+                args.push(quality);
+            }
+            match auth {
+                AuthSource::CookiesBrowser(b) => {
+                    args.push("--cookies-from-browser".into());
+                    args.push(b.clone());
+                }
+                AuthSource::CookiesFile(p) => {
+                    args.push("--cookies".into());
+                    args.push(p.clone());
+                }
+                _ => {}
+            }
+            args.extend(extra);
+            args.push(v.url.clone());
+            DownloadPlan {
+                program: "yt-dlp".to_string(),
+                args,
+                // yt-dlp writes the final MKV directly; no separate capture/remux.
+                capture_path: final_path.clone(),
+                final_path,
+                remux_to_mkv: false,
+            }
+        }
+        Tool::Streamlink => {
+            let ts_path = dir.join(format!("{stem}.ts"));
+            let mut args = Vec::new();
+            if platform == Platform::Twitch {
+                args.push("--twitch-supported-codecs=h264,h265,av1".to_string());
+                if let AuthSource::Token(t) = auth {
+                    args.push(format!("--twitch-api-header=Authorization=OAuth {t}"));
+                }
+            }
+            args.extend(extra);
+            args.push("-o".into());
+            args.push(ts_path.to_string_lossy().into_owned());
+            args.push(v.url.clone());
+            args.push(quality);
+            DownloadPlan {
+                program: "streamlink".to_string(),
+                args,
+                capture_path: ts_path,
+                final_path,
+                remux_to_mkv: true,
+            }
+        }
+        Tool::Ffmpeg => {
+            let ts_path = dir.join(format!("{stem}.ts"));
+            let mut args = vec![
+                "-y".to_string(),
+                "-i".into(),
+                v.url.clone(),
+                "-c".into(),
+                "copy".into(),
+            ];
+            args.extend(extra);
+            args.push(ts_path.to_string_lossy().into_owned());
+            DownloadPlan {
+                program: "ffmpeg".to_string(),
+                args,
+                capture_path: ts_path,
+                final_path,
+                remux_to_mkv: true,
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Supervisor {
     store: Arc<Store>,
     events: EventTx,
     active: ActiveSet,
+    /// video_id -> child PID of in-flight on-demand video downloads.
+    active_videos: ActiveSet,
+    /// video_ids whose download was asked to stop (so it finalizes as `stopped`).
+    stopping_videos: Arc<Mutex<HashSet<i64>>>,
     shutdown: Arc<AtomicBool>,
     /// Shared detection context for on-demand (manual Start) liveness checks.
     ctx: Arc<DetectContext>,
@@ -214,10 +345,12 @@ struct BackoffEntry {
 }
 
 impl Supervisor {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<Store>,
         events: EventTx,
         active: ActiveSet,
+        active_videos: ActiveSet,
         shutdown: Arc<AtomicBool>,
         ctx: Arc<DetectContext>,
         max_concurrent: usize,
@@ -226,6 +359,8 @@ impl Supervisor {
             store,
             events,
             active,
+            active_videos,
+            stopping_videos: Arc::new(Mutex::new(HashSet::new())),
             shutdown,
             ctx,
             sem: Arc::new(Semaphore::new(max_concurrent.max(1))),
@@ -253,6 +388,13 @@ impl Supervisor {
                         tokio::spawn(async move { this.manual_start(id).await });
                     }
                     ManualCommand::Stop(id) => self.manual_stop(id),
+                    ManualCommand::StartVideo(id) => {
+                        if !self.shutdown.load(Ordering::SeqCst) {
+                            let this = self.clone();
+                            tokio::spawn(async move { this.start_video(id).await });
+                        }
+                    }
+                    ManualCommand::StopVideo(id) => self.stop_video(id),
                 },
                 else => break,
             }
@@ -343,6 +485,168 @@ impl Supervisor {
             );
             info!(monitor_id, "manual stop");
         }
+    }
+
+    /// Begin an on-demand video download: reserve it and spawn its task.
+    async fn start_video(&self, video_id: i64) {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        {
+            let mut active = self.active_videos.lock().unwrap();
+            if active.contains_key(&video_id) {
+                return; // already downloading/queued
+            }
+            active.insert(video_id, 0); // reserve; real PID set after spawn
+        }
+        let video = match self.store.get_video(video_id) {
+            Ok(Some(v)) => v,
+            _ => {
+                self.active_videos.lock().unwrap().remove(&video_id);
+                return;
+            }
+        };
+        let this = self.clone();
+        tokio::spawn(async move { this.download_video(video).await });
+    }
+
+    /// Abort an in-flight (or queued) on-demand video download.
+    ///
+    /// The stop "tombstone" is recorded only while the download is actually
+    /// active, and under the `active_videos` lock — so it can never linger after
+    /// the task has finalized (which would otherwise silently cancel a later
+    /// retry of the same id) and can never race the finalize into the wrong
+    /// status. `download_video` consumes the tombstone under the same lock.
+    fn stop_video(&self, video_id: i64) {
+        let pid = {
+            let active = self.active_videos.lock().unwrap();
+            let Some(pid) = active.get(&video_id).copied() else {
+                return; // not active: nothing to stop, don't leave a tombstone
+            };
+            self.stopping_videos.lock().unwrap().insert(video_id);
+            pid
+        };
+        if pid > 0 {
+            crate::platform::kill_process_tree(pid);
+            // Already downloading: reflect the stop immediately (download_video
+            // will re-confirm with the final byte count).
+            let _ = self.store.set_video_status(video_id, "stopped");
+        }
+        info!(video_id, pid, "stop video download");
+    }
+
+    /// Atomically decide a video's final status and drop its `active_videos`
+    /// membership: a stop tombstone (set under the same lock by `stop_video`)
+    /// wins over the byte-count classification. Returns the chosen status.
+    fn finalize_video(&self, id: i64, bytes: i64, shutting_down: bool) -> &'static str {
+        let mut active = self.active_videos.lock().unwrap();
+        let stopped = self.stopping_videos.lock().unwrap().remove(&id);
+        active.remove(&id);
+        if stopped {
+            "stopped"
+        } else if shutting_down {
+            // We're quitting and killed the tree; treat any in-flight download as
+            // incomplete regardless of how many bytes landed.
+            "orphaned"
+        } else if bytes > 0 {
+            "completed"
+        } else {
+            "failed"
+        }
+    }
+
+    async fn download_video(&self, video: Video) {
+        let id = video.id;
+        let _permit = self.sem.acquire().await.expect("semaphore");
+
+        // Cancelled (or shutting down) before we got a slot: finalize and bail.
+        if self.stopping_videos.lock().unwrap().contains(&id)
+            || self.shutdown.load(Ordering::SeqCst)
+        {
+            let status = self.finalize_video(id, 0, self.shutdown.load(Ordering::SeqCst));
+            let _ = self
+                .store
+                .finish_video(id, now_unix(), 0, None, status, "", "");
+            return;
+        }
+
+        let started_at = now_unix();
+        let _ = self.store.set_video_started(id, started_at);
+
+        let global_method = self
+            .store
+            .get_setting("download_auth_method")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let global_browser = self
+            .store
+            .get_setting("cookies_browser")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let auth = resolve_auth_for(
+            video.auth_kind,
+            &video.auth_value,
+            &global_method,
+            &global_browser,
+        );
+        let plan = build_video_plan(&video, started_at, &auth);
+        if let Some(parent) = plan.capture_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        let label = if video.title.trim().is_empty() {
+            video.url.clone()
+        } else {
+            video.title.clone()
+        };
+        info!(video = id, program = %plan.program, "downloading video -> {}", plan.final_path.display());
+
+        let outcome = self.run_process(&self.active_videos, id, &plan).await;
+
+        // Remux TS -> MKV (streamlink/ffmpeg); yt-dlp already produced the MKV.
+        let mut final_path = plan.final_path.clone();
+        if plan.remux_to_mkv {
+            if file_len(&plan.capture_path).await > 0 {
+                match remux_ts_to_mkv(&plan.capture_path, &plan.final_path).await {
+                    Ok(()) => {
+                        let _ = tokio::fs::remove_file(&plan.capture_path).await;
+                    }
+                    Err(e) => {
+                        warn!(video = id, "remux failed, keeping .ts: {e:#}");
+                        final_path = plan.capture_path.clone();
+                    }
+                }
+            } else {
+                final_path = plan.capture_path.clone();
+            }
+        } else if file_len(&final_path).await == 0 {
+            // yt-dlp may have produced a different extension than predicted.
+            if let Some(found) = newest_with_stem(&final_path).await {
+                final_path = found;
+            }
+        }
+
+        let bytes = file_len(&final_path).await as i64;
+        // Decide status + drop the active_videos entry atomically so a concurrent
+        // stop can't be lost (and its tombstone can't outlive this task).
+        let status = self.finalize_video(id, bytes, self.shutdown.load(Ordering::SeqCst));
+        let _ = self.store.finish_video(
+            id,
+            now_unix(),
+            bytes,
+            outcome.exit_code,
+            status,
+            &final_path.to_string_lossy(),
+            &outcome.log,
+        );
+        if status == "failed" {
+            let _ = self.events.send(AppEvent::Error {
+                context: "Video".into(),
+                message: format!("{label}: download failed"),
+            });
+        }
+        info!(video = id, bytes, status, "video download finished");
     }
 
     /// One-shot liveness check for a monitor, dispatched by detection method.
@@ -451,7 +755,7 @@ impl Supervisor {
         });
         info!(monitor_id, program = %plan.program, "starting recording -> {}", plan.final_path.display());
 
-        let outcome = self.run_process(monitor_id, &plan).await;
+        let outcome = self.run_process(&self.active, monitor_id, &plan).await;
 
         // Remux TS -> MKV if requested and we captured something.
         let mut final_path = plan.final_path.clone();
@@ -498,7 +802,12 @@ impl Supervisor {
         self.active.lock().unwrap().remove(&monitor_id);
     }
 
-    async fn run_process(&self, monitor_id: i64, plan: &DownloadPlan) -> ProcessOutcome {
+    async fn run_process(
+        &self,
+        active: &ActiveSet,
+        id: i64,
+        plan: &DownloadPlan,
+    ) -> ProcessOutcome {
         let job = match ProcessJob::new() {
             Ok(j) => Some(j),
             Err(e) => {
@@ -529,10 +838,10 @@ impl Supervisor {
                 warn!("job assign failed: {e:#}");
             }
         }
-        // Register the real PID so the scheduler skips this monitor and shutdown
+        // Register the real PID so the scheduler skips this work and shutdown
         // can kill the whole process tree.
         if let Some(pid) = child.id() {
-            self.active.lock().unwrap().insert(monitor_id, pid);
+            active.lock().unwrap().insert(id, pid);
         }
 
         let ring: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -600,6 +909,26 @@ async fn file_len(path: &Path) -> u64 {
         .await
         .map(|m| m.len())
         .unwrap_or(0)
+}
+
+/// Find the actual output when the predicted path is missing: the largest file
+/// in `predicted`'s directory whose name shares its stem (e.g. yt-dlp wrote
+/// `<stem>.webm` instead of the predicted `<stem>.mkv`).
+async fn newest_with_stem(predicted: &Path) -> Option<PathBuf> {
+    let dir = predicted.parent()?;
+    let stem = predicted.file_stem()?.to_string_lossy().into_owned();
+    let mut best: Option<(u64, PathBuf)> = None;
+    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&stem) {
+            let len = entry.metadata().await.map(|m| m.len()).unwrap_or(0);
+            if len > 0 && best.as_ref().map(|(b, _)| len > *b).unwrap_or(true) {
+                best = Some((len, entry.path()));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
 }
 
 /// Minimal whitespace arg splitter (double-quoted segments kept together).
@@ -836,5 +1165,72 @@ mod tests {
         );
         assert!(plan.final_path.to_string_lossy().ends_with(".ts"));
         assert!(!plan.remux_to_mkv);
+    }
+
+    fn video(tool: Tool, url: &str) -> Video {
+        Video {
+            id: 1,
+            url: url.into(),
+            title: "Clip".into(),
+            platform: Platform::detect(url),
+            tool,
+            quality: "best".into(),
+            output_dir: "C:/vids".into(),
+            filename_template: "{name}_{date}".into(),
+            auth_kind: AuthKind::Inherit,
+            auth_value: String::new(),
+            extra_args: String::new(),
+            status: "queued".into(),
+            output_path: String::new(),
+            bytes: 0,
+            exit_code: None,
+            created_at: 0,
+            started_at: None,
+            ended_at: None,
+        }
+    }
+
+    #[test]
+    fn ytdlp_video_outputs_mkv_directly() {
+        let plan = build_video_plan(
+            &video(Tool::YtDlp, "https://youtube.com/watch?v=abc"),
+            1_700_000_000,
+            &AuthSource::None,
+        );
+        assert_eq!(plan.program, "yt-dlp");
+        assert!(plan.final_path.to_string_lossy().ends_with(".mkv"));
+        assert!(!plan.remux_to_mkv); // yt-dlp produces the MKV itself
+        // Not a live capture: no live-stream flags.
+        assert!(!plan.args.iter().any(|a| a == "--live-from-start"));
+        assert!(plan.args.iter().any(|a| a == "--remux-video"));
+    }
+
+    #[test]
+    fn ytdlp_video_quality_and_cookies() {
+        let mut v = video(Tool::YtDlp, "https://youtube.com/watch?v=abc");
+        v.quality = "bv*+ba".into();
+        let plan = build_video_plan(
+            &v,
+            1_700_000_000,
+            &AuthSource::CookiesBrowser("edge".into()),
+        );
+        let joined = plan.args.join(" ");
+        assert!(joined.contains("-f bv*+ba"));
+        assert!(joined.contains("--cookies-from-browser edge"));
+    }
+
+    #[test]
+    fn streamlink_vod_remuxes_to_mkv() {
+        let plan = build_video_plan(
+            &video(Tool::Streamlink, "https://twitch.tv/videos/123"),
+            1_700_000_000,
+            &AuthSource::None,
+        );
+        assert_eq!(plan.program, "streamlink");
+        assert!(plan.capture_path.to_string_lossy().ends_with(".ts"));
+        assert!(plan.final_path.to_string_lossy().ends_with(".mkv"));
+        assert!(plan.remux_to_mkv);
+        // No live-only retry flags for a VOD.
+        assert!(!plan.args.iter().any(|a| a == "--retry-streams"));
     }
 }

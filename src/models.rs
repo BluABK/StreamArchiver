@@ -354,6 +354,41 @@ pub struct MonitorWithChannel {
     pub last_recording_went_live_approx: bool,
 }
 
+/// An on-demand, one-shot video/VOD download (a YouTube video, a Twitch VOD,
+/// etc.) — distinct from a [`Monitor`], which watches a channel for live streams.
+///
+/// `status` is one of: `queued`, `downloading`, `completed`, `failed`,
+/// `stopped`, `orphaned`. Output is always MKV.
+#[derive(Clone, Debug)]
+pub struct Video {
+    pub id: i64,
+    pub url: String,
+    /// User-facing label (falls back to the URL in the UI when empty).
+    pub title: String,
+    pub platform: Platform,
+    pub tool: Tool,
+    pub quality: String,
+    pub output_dir: String,
+    pub filename_template: String,
+    pub auth_kind: AuthKind,
+    pub auth_value: String,
+    pub extra_args: String,
+    pub status: String,
+    pub output_path: String,
+    pub bytes: i64,
+    pub exit_code: Option<i64>,
+    pub created_at: i64,
+    pub started_at: Option<i64>,
+    pub ended_at: Option<i64>,
+}
+
+impl Video {
+    /// True while the download is queued or running (drives the UI live-refresh).
+    pub fn is_active(&self) -> bool {
+        matches!(self.status.as_str(), "queued" | "downloading")
+    }
+}
+
 /// Current unix timestamp in seconds.
 pub fn now_unix() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
