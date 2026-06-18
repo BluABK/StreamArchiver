@@ -434,6 +434,8 @@ pub struct Video {
     pub url: String,
     /// User-facing label (falls back to the URL in the UI when empty).
     pub title: String,
+    /// Detected uploader/channel name (empty unless auto-detected).
+    pub channel: String,
     pub platform: Platform,
     pub tool: Tool,
     pub quality: String,

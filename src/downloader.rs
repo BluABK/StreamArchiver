@@ -119,7 +119,7 @@ pub fn build_plan(row: &MonitorWithChannel, started_at: i64, auth: &AuthSource) 
     let m = &row.monitor;
     let ch = &row.channel;
     let dir = PathBuf::from(&m.output_dir);
-    let stem = expand_template(&m.filename_template, &ch.name, "", started_at);
+    let stem = expand_template(&m.filename_template, &ch.name, "", "", started_at);
     let quality = if m.quality.trim().is_empty() {
         "best".to_string()
     } else {
@@ -221,11 +221,12 @@ pub fn build_video_plan(
     v: &Video,
     started_at: i64,
     title: &str,
+    channel: &str,
     auth: &AuthSource,
 ) -> DownloadPlan {
     let dir = PathBuf::from(&v.output_dir);
     // `{name}` prefers the user's Name field, then the resolved title, then a
-    // generic fallback. `{title}` is the resolved title (may be empty).
+    // generic fallback. `{title}`/`{channel}` are the resolved metadata.
     let name_field = v.title.trim();
     let resolved = title.trim();
     let name = if !name_field.is_empty() {
@@ -235,7 +236,13 @@ pub fn build_video_plan(
     } else {
         "video"
     };
-    let stem = expand_template(&v.filename_template, name, resolved, started_at);
+    let stem = expand_template(
+        &v.filename_template,
+        name,
+        resolved,
+        channel.trim(),
+        started_at,
+    );
     let quality = if v.quality.trim().is_empty() {
         "best".to_string()
     } else {
@@ -602,17 +609,20 @@ impl Supervisor {
             &global_method,
             &global_browser,
         );
-        // Optionally resolve the real stream/video title (for {title}/{name} and
-        // the list display).
-        let title = if video.auto_title {
-            resolve_title(&video, &auth).await
+        // Optionally resolve the real title + channel (for {title}/{channel}/{name}
+        // and the list display).
+        let (title, channel) = if video.auto_title {
+            resolve_meta(&video, &auth).await
         } else {
-            String::new()
+            (String::new(), String::new())
         };
         if !title.is_empty() && video.title.trim().is_empty() {
             let _ = self.store.set_video_title(id, &title);
         }
-        let plan = build_video_plan(&video, started_at, &title, &auth);
+        if !channel.is_empty() {
+            let _ = self.store.set_video_channel(id, &channel);
+        }
+        let plan = build_video_plan(&video, started_at, &title, &channel, &auth);
         if let Some(parent) = plan.capture_path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
@@ -907,17 +917,20 @@ struct ProcessOutcome {
     log: String,
 }
 
-/// Resolve a video/stream's real title via yt-dlp (no download). Works for
-/// YouTube, Twitch VODs, Kick, and many sites; returns an empty string on any
-/// failure (caller falls back to the Name field or "video"). Truncated to keep
-/// filenames sane.
-async fn resolve_title(video: &Video, auth: &AuthSource) -> String {
+/// Resolve a video/stream's real title and channel/uploader via yt-dlp (no
+/// download). Works for YouTube, Twitch VODs, Kick, and many sites; returns
+/// `(title, channel)` with empty strings on any failure (caller falls back).
+/// Each is truncated to keep filenames sane.
+async fn resolve_meta(video: &Video, auth: &AuthSource) -> (String, String) {
+    // Two `--print` templates -> two output lines, in order.
     let mut args: Vec<String> = vec![
         "--no-playlist".into(),
         "--no-warnings".into(),
         "--skip-download".into(),
         "--print".into(),
         "%(title)s".into(),
+        "--print".into(),
+        "%(channel,uploader)s".into(),
     ];
     match auth {
         AuthSource::CookiesBrowser(b) => {
@@ -943,15 +956,21 @@ async fn resolve_title(video: &Video, auth: &AuthSource) -> String {
 
     let out = match cmd.output().await {
         Ok(o) if o.status.success() => o,
-        _ => return String::new(),
+        _ => return (String::new(), String::new()),
     };
     let raw = String::from_utf8_lossy(&out.stdout);
-    let title = raw.lines().next().unwrap_or("").trim();
-    if title.is_empty() || title == "NA" {
-        String::new()
-    } else {
-        title.chars().take(120).collect()
-    }
+    let mut lines = raw.lines();
+    let clean = |s: &str| -> String {
+        let s = s.trim();
+        if s.is_empty() || s == "NA" {
+            String::new()
+        } else {
+            s.chars().take(120).collect()
+        }
+    };
+    let title = clean(lines.next().unwrap_or(""));
+    let channel = clean(lines.next().unwrap_or(""));
+    (title, channel)
 }
 
 /// Probe available formats/qualities for a URL with the given tool, returning
@@ -1083,9 +1102,10 @@ fn split_args(s: &str) -> Vec<String> {
 }
 
 /// Expand a filename template using our own (tool-agnostic) variables so the
-/// output path is known in advance: `{name} {title} {date} {time} {timestamp}`.
-/// `title` is the resolved stream/video title (empty when not auto-detected).
-fn expand_template(template: &str, name: &str, title: &str, secs: i64) -> String {
+/// output path is known in advance: `{name} {title} {channel} {date} {time}
+/// {timestamp}`. `title`/`channel` are resolved metadata (empty when not
+/// auto-detected).
+fn expand_template(template: &str, name: &str, title: &str, channel: &str, secs: i64) -> String {
     let (y, mo, d, h, mi, s) = civil_from_unix_utc(secs);
     let date = format!("{y:04}{mo:02}{d:02}");
     let time = format!("{h:02}{mi:02}{s:02}");
@@ -1097,6 +1117,7 @@ fn expand_template(template: &str, name: &str, title: &str, secs: i64) -> String
     let expanded = tmpl
         .replace("{name}", name)
         .replace("{title}", title)
+        .replace("{channel}", channel)
         .replace("{date}", &date)
         .replace("{time}", &time)
         .replace("{timestamp}", &secs.to_string());
@@ -1197,18 +1218,29 @@ mod tests {
 
     #[test]
     fn template_expands_and_sanitizes() {
-        let name = expand_template("{name}_{date}", "Bad/Name?", "", 1_700_000_000);
+        let name = expand_template("{name}_{date}", "Bad/Name?", "", "", 1_700_000_000);
         assert_eq!(name, "Bad_Name__20231114");
     }
 
     #[test]
-    fn template_expands_title() {
-        let out = expand_template("{title}_{date}", "ignored", "My Stream!", 1_700_000_000);
+    fn template_expands_title_and_channel() {
+        let out = expand_template(
+            "{title}_{date}",
+            "ignored",
+            "My Stream!",
+            "Streamer",
+            1_700_000_000,
+        );
         assert_eq!(out, "My Stream!_20231114");
-        // {name} falls back to the resolved title via build_video_plan, but
-        // expand_template itself keeps name and title distinct.
-        let out2 = expand_template("{name}-{title}", "Nm", "Ttl", 1_700_000_000);
-        assert_eq!(out2, "Nm-Ttl");
+        // name / title / channel stay distinct in expand_template itself.
+        let out2 = expand_template(
+            "{channel}-{name}-{title}",
+            "Nm",
+            "Ttl",
+            "Chan",
+            1_700_000_000,
+        );
+        assert_eq!(out2, "Chan-Nm-Ttl");
     }
 
     #[test]
@@ -1313,6 +1345,7 @@ mod tests {
             id: 1,
             url: url.into(),
             title: "Clip".into(),
+            channel: String::new(),
             platform: Platform::detect(url),
             tool,
             quality: "best".into(),
@@ -1338,6 +1371,7 @@ mod tests {
             &video(Tool::YtDlp, "https://youtube.com/watch?v=abc"),
             1_700_000_000,
             "",
+            "",
             &AuthSource::None,
         );
         assert_eq!(plan.program, "yt-dlp");
@@ -1356,6 +1390,7 @@ mod tests {
             &v,
             1_700_000_000,
             "",
+            "",
             &AuthSource::CookiesBrowser("edge".into()),
         );
         let joined = plan.args.join(" ");
@@ -1368,6 +1403,7 @@ mod tests {
         let plan = build_video_plan(
             &video(Tool::Streamlink, "https://twitch.tv/videos/123"),
             1_700_000_000,
+            "",
             "",
             &AuthSource::None,
         );

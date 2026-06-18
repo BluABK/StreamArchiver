@@ -979,7 +979,8 @@ impl StreamArchiverApp {
                     .resizable(true)
                     .sense(egui::Sense::click())
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                    .column(Column::auto().at_least(200.0)) // video
+                    .column(Column::auto().at_least(180.0)) // video
+                    .column(Column::auto().at_least(110.0)) // channel
                     .column(Column::auto().at_least(86.0)) // platform
                     .column(Column::auto().at_least(72.0)) // tool
                     .column(Column::auto().at_least(90.0)) // status
@@ -989,8 +990,8 @@ impl StreamArchiverApp {
                     .column(Column::remainder().at_least(150.0)) // actions
                     .header(20.0, |mut header| {
                         for title in [
-                            "Video", "Platform", "Tool", "Status", "Size", "Added", "File",
-                            "Actions",
+                            "Video", "Channel", "Platform", "Tool", "Status", "Size", "Added",
+                            "File", "Actions",
                         ] {
                             header.col(|ui| {
                                 ui.strong(title);
@@ -1070,6 +1071,11 @@ impl StreamArchiverApp {
                                         v.title.as_str()
                                     };
                                     ui.label(label).on_hover_text(&v.url);
+                                });
+                                tr.col(|ui| {
+                                    if !v.channel.is_empty() {
+                                        ui.label(&v.channel).on_hover_text(&v.channel);
+                                    }
                                 });
                                 tr.col(|ui| {
                                     platform_badge(ui, v.platform);
@@ -1260,11 +1266,12 @@ impl StreamArchiverApp {
                     ));
                     ui.end_row();
 
-                    ui.label("Auto-detect title");
-                    ui.checkbox(&mut vf.auto_title, "Use the stream's own title")
+                    ui.label("Auto-detect");
+                    ui.checkbox(&mut vf.auto_title, "Detect title + channel")
                         .on_hover_text(
-                            "Looks up the real title via yt-dlp at download time and uses it for \
-                             {title} (and for {name} when Name is left blank).",
+                            "Looks up the real title and channel via yt-dlp at download time: \
+                             fills the Channel column and the {title}/{channel} variables (and \
+                             {name} when Name is left blank).",
                         );
                     ui.end_row();
 
@@ -1345,7 +1352,7 @@ impl StreamArchiverApp {
                     });
                     ui.end_row();
 
-                    let tmpl_hint = "Variables: {name} {title} {date} {time} {timestamp}";
+                    let tmpl_hint = "Variables: {name} {title} {channel} {date} {time} {timestamp}";
                     ui.label("Filename template").on_hover_text(tmpl_hint);
                     ui.text_edit_singleline(&mut vf.filename_template)
                         .on_hover_text(tmpl_hint);
@@ -1407,6 +1414,7 @@ impl StreamArchiverApp {
             platform,
             url,
             title: self.video_form.title.trim().to_string(),
+            channel: String::new(),
             tool: self.video_form.tool,
             quality: self.video_form.quality.clone(),
             output_dir: self.video_form.output_dir.clone(),

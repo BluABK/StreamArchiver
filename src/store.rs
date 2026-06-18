@@ -17,7 +17,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -176,7 +176,11 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 6)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 6);
+        if version < 7 {
+            conn.execute_batch("ALTER TABLE video ADD COLUMN channel TEXT NOT NULL DEFAULT '';")?;
+            conn.pragma_update(None, "user_version", 7)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 7);
         Ok(())
     }
 
@@ -470,12 +474,13 @@ impl Store {
     pub fn insert_video(&self, v: &Video) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO video(url, title, platform, tool, quality, output_dir, filename_template,
-                auth_kind, auth_value, extra_args, auto_title, status, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'queued', ?12)",
+            "INSERT INTO video(url, title, channel, platform, tool, quality, output_dir,
+                filename_template, auth_kind, auth_value, extra_args, auto_title, status, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'queued', ?13)",
             params![
                 v.url,
                 v.title,
+                v.channel,
                 v.platform.as_str(),
                 v.tool.as_str(),
                 v.quality,
@@ -495,6 +500,16 @@ impl Store {
     pub fn set_video_title(&self, id: i64, title: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("UPDATE video SET title=?2 WHERE id=?1", params![id, title])?;
+        Ok(())
+    }
+
+    /// Persist a detected channel/uploader name for a video.
+    pub fn set_video_channel(&self, id: i64, channel: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE video SET channel=?2 WHERE id=?1",
+            params![id, channel],
+        )?;
         Ok(())
     }
 
@@ -580,7 +595,7 @@ impl Store {
             .query_row(
                 "SELECT id, url, title, platform, tool, quality, output_dir, filename_template,
                     auth_kind, auth_value, extra_args, status, output_path, bytes, exit_code,
-                    created_at, started_at, ended_at, auto_title
+                    created_at, started_at, ended_at, auto_title, channel
                  FROM video WHERE id=?1",
                 params![id],
                 Self::map_video,
@@ -595,7 +610,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT id, url, title, platform, tool, quality, output_dir, filename_template,
                 auth_kind, auth_value, extra_args, status, output_path, bytes, exit_code,
-                created_at, started_at, ended_at, auto_title
+                created_at, started_at, ended_at, auto_title, channel
              FROM video ORDER BY id DESC",
         )?;
         let rows = stmt
@@ -609,6 +624,7 @@ impl Store {
             id: r.get(0)?,
             url: r.get(1)?,
             title: r.get(2)?,
+            channel: r.get(19)?,
             platform: Platform::parse(&r.get::<_, String>(3)?),
             tool: Tool::parse(&r.get::<_, String>(4)?),
             quality: r.get(5)?,
@@ -715,6 +731,7 @@ mod tests {
             id: 0,
             url: "https://youtube.com/watch?v=abc".into(),
             title: "My VOD".into(),
+            channel: String::new(),
             platform: Platform::YouTube,
             tool: Tool::YtDlp,
             quality: "best".into(),
@@ -751,6 +768,11 @@ mod tests {
         assert_eq!(
             store.get_video(id).unwrap().unwrap().title,
             "Resolved Title"
+        );
+        store.set_video_channel(id, "Some Channel").unwrap();
+        assert_eq!(
+            store.get_video(id).unwrap().unwrap().channel,
+            "Some Channel"
         );
 
         store.set_video_started(id, 123).unwrap();
