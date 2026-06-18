@@ -757,17 +757,28 @@ impl StreamArchiverApp {
     /// The "Videos" tab: a list of on-demand downloads with an always-visible
     /// "paste a URL" form pinned to the bottom.
     fn videos_view(&mut self, ui: &mut egui::Ui) {
-        egui::TopBottomPanel::bottom("video_add_panel")
+        egui::Panel::bottom("video_add_panel")
             .resizable(true)
+            .default_size(300.0)
             .show_inside(ui, |ui| {
-                // Cap the height so an expanded defaults editor can't crowd out
-                // the list; it scrolls instead.
-                egui::ScrollArea::vertical()
-                    .max_height(340.0)
-                    .show(ui, |ui| {
-                        self.video_defaults_editor(ui);
-                        self.video_add_form(ui);
+                // Per-platform defaults on the right; download form on the left.
+                egui::Panel::right("video_defaults_panel")
+                    .resizable(true)
+                    .default_size(360.0)
+                    .show_inside(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("video_defaults_scroll")
+                            .show(ui, |ui| {
+                                self.video_defaults_editor(ui);
+                            });
                     });
+                egui::CentralPanel::default().show_inside(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("video_form_scroll")
+                        .show(ui, |ui| {
+                            self.video_add_form(ui);
+                        });
+                });
             });
         egui::CentralPanel::default().show_inside(ui, |ui| {
             self.videos_list(ui);
@@ -782,140 +793,135 @@ impl StreamArchiverApp {
         // Borrow the defaults (not `self`) so the nested egui closures don't
         // alias `self`; persist afterwards.
         let defs = &mut self.download_defaults;
-        egui::CollapsingHeader::new("⚙  Per-platform download defaults")
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "New downloads pre-fill from these by platform; override any field per download.",
-                    )
-                    .small()
-                    .color(egui::Color32::from_gray(0x90)),
-                );
-                for platform in Platform::ALL {
-                    egui::CollapsingHeader::new(platform.label())
-                        .id_salt(("dl_def", platform.as_str()))
-                        .show(ui, |ui| {
-                            let d = defs.get_mut(platform);
-                            egui::Grid::new(("dl_def_grid", platform.as_str()))
-                                .num_columns(2)
-                                .spacing([12.0, 6.0])
-                                .show(ui, |ui| {
-                                    ui.label("Tool");
-                                    egui::ComboBox::from_id_salt(("dl_tool", platform.as_str()))
-                                        .selected_text(d.tool.label())
-                                        .show_ui(ui, |ui| {
-                                            for t in Tool::ALL {
-                                                if ui
-                                                    .selectable_value(&mut d.tool, t, t.label())
-                                                    .changed()
-                                                {
-                                                    dirty = true;
-                                                }
-                                            }
-                                        });
-                                    ui.end_row();
 
-                                    ui.label("Quality");
-                                    if ui.text_edit_singleline(&mut d.quality).changed() {
+        ui.add_space(6.0);
+        ui.strong("⚙  Per-platform defaults");
+        ui.label(
+            egui::RichText::new(
+                "Downloads pre-fill from these by platform; override per download.",
+            )
+            .small()
+            .color(egui::Color32::from_gray(0x90)),
+        );
+        ui.add_space(4.0);
+
+        for platform in Platform::ALL {
+            egui::CollapsingHeader::new(platform.label())
+                .id_salt(("dl_def", platform.as_str()))
+                .show(ui, |ui| {
+                    let d = defs.get_mut(platform);
+                    egui::Grid::new(("dl_def_grid", platform.as_str()))
+                        .num_columns(2)
+                        .spacing([12.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Tool");
+                            egui::ComboBox::from_id_salt(("dl_tool", platform.as_str()))
+                                .selected_text(d.tool.label())
+                                .show_ui(ui, |ui| {
+                                    for t in Tool::ALL {
+                                        if ui.selectable_value(&mut d.tool, t, t.label()).changed()
+                                        {
+                                            dirty = true;
+                                        }
+                                    }
+                                });
+                            ui.end_row();
+
+                            ui.label("Quality");
+                            if ui.text_edit_singleline(&mut d.quality).changed() {
+                                dirty = true;
+                            }
+                            ui.end_row();
+
+                            ui.label("Auth");
+                            egui::ComboBox::from_id_salt(("dl_auth", platform.as_str()))
+                                .selected_text(d.auth_kind.label())
+                                .show_ui(ui, |ui| {
+                                    for k in AuthKind::ALL {
+                                        if ui
+                                            .selectable_value(&mut d.auth_kind, k, k.label())
+                                            .changed()
+                                        {
+                                            dirty = true;
+                                        }
+                                    }
+                                });
+                            ui.end_row();
+
+                            match d.auth_kind {
+                                AuthKind::CookiesBrowser => {
+                                    ui.label("Browser");
+                                    if ui
+                                        .text_edit_singleline(&mut d.auth_value)
+                                        .on_hover_text("e.g. firefox, chrome, edge")
+                                        .changed()
+                                    {
                                         dirty = true;
                                     }
                                     ui.end_row();
-
-                                    ui.label("Auth");
-                                    egui::ComboBox::from_id_salt(("dl_auth", platform.as_str()))
-                                        .selected_text(d.auth_kind.label())
-                                        .show_ui(ui, |ui| {
-                                            for k in AuthKind::ALL {
-                                                if ui
-                                                    .selectable_value(&mut d.auth_kind, k, k.label())
-                                                    .changed()
-                                                {
-                                                    dirty = true;
-                                                }
-                                            }
-                                        });
-                                    ui.end_row();
-
-                                    match d.auth_kind {
-                                        AuthKind::CookiesBrowser => {
-                                            ui.label("Browser");
-                                            if ui
-                                                .text_edit_singleline(&mut d.auth_value)
-                                                .on_hover_text("e.g. firefox, chrome, edge")
-                                                .changed()
-                                            {
-                                                dirty = true;
-                                            }
-                                            ui.end_row();
-                                        }
-                                        AuthKind::CookiesFile => {
-                                            ui.label("Cookies file");
-                                            ui.horizontal(|ui| {
-                                                if ui
-                                                    .text_edit_singleline(&mut d.auth_value)
-                                                    .changed()
-                                                {
-                                                    dirty = true;
-                                                }
-                                                if ui.button("Browse…").clicked() {
-                                                    if let Some(p) = browse_file(&d.auth_value) {
-                                                        d.auth_value = p;
-                                                        dirty = true;
-                                                    }
-                                                }
-                                            });
-                                            ui.end_row();
-                                        }
-                                        AuthKind::Token => {
-                                            ui.label("Auth token");
-                                            if ui
-                                                .add(
-                                                    egui::TextEdit::singleline(&mut d.auth_value)
-                                                        .password(true),
-                                                )
-                                                .changed()
-                                            {
-                                                dirty = true;
-                                            }
-                                            ui.end_row();
-                                        }
-                                        AuthKind::Inherit | AuthKind::Disabled => {}
-                                    }
-
-                                    ui.label("Output folder");
+                                }
+                                AuthKind::CookiesFile => {
+                                    ui.label("Cookies file");
                                     ui.horizontal(|ui| {
-                                        if ui.text_edit_singleline(&mut d.output_dir).changed() {
+                                        if ui.text_edit_singleline(&mut d.auth_value).changed() {
                                             dirty = true;
                                         }
                                         if ui.button("Browse…").clicked() {
-                                            if let Some(p) = browse_folder(&d.output_dir) {
-                                                d.output_dir = p;
+                                            if let Some(p) = browse_file(&d.auth_value) {
+                                                d.auth_value = p;
                                                 dirty = true;
                                             }
                                         }
                                     });
                                     ui.end_row();
-
-                                    ui.label("Filename template");
-                                    if ui.text_edit_singleline(&mut d.filename_template).changed() {
+                                }
+                                AuthKind::Token => {
+                                    ui.label("Auth token");
+                                    if ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut d.auth_value)
+                                                .password(true),
+                                        )
+                                        .changed()
+                                    {
                                         dirty = true;
                                     }
                                     ui.end_row();
+                                }
+                                AuthKind::Inherit | AuthKind::Disabled => {}
+                            }
 
-                                    ui.label("Extra args");
-                                    if ui.text_edit_singleline(&mut d.extra_args).changed() {
+                            ui.label("Output folder");
+                            ui.horizontal(|ui| {
+                                if ui.text_edit_singleline(&mut d.output_dir).changed() {
+                                    dirty = true;
+                                }
+                                if ui.button("Browse…").clicked() {
+                                    if let Some(p) = browse_folder(&d.output_dir) {
+                                        d.output_dir = p;
                                         dirty = true;
                                     }
-                                    ui.end_row();
-                                });
+                                }
+                            });
+                            ui.end_row();
+
+                            ui.label("Filename template");
+                            if ui.text_edit_singleline(&mut d.filename_template).changed() {
+                                dirty = true;
+                            }
+                            ui.end_row();
+
+                            ui.label("Extra args");
+                            if ui.text_edit_singleline(&mut d.extra_args).changed() {
+                                dirty = true;
+                            }
+                            ui.end_row();
                         });
-                }
-            });
+                });
+        }
         if dirty {
             self.persist_download_defaults();
         }
-        ui.separator();
     }
 
     fn videos_list(&mut self, ui: &mut egui::Ui) {

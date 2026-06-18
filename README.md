@@ -63,10 +63,10 @@ MKV; streamlink/ffmpeg capture to `.ts` then remux). Downloads share the same
 global concurrency limit as live recordings.
 
 **Per-platform defaults.** The form pre-fills from saved defaults for the pasted
-URL's platform; edit any field to override it for that download. Expand
-**⚙ Per-platform download defaults** (collapsible, on the Videos tab) to set the
+URL's platform; edit any field to override it for that download. The
+**⚙ Per-platform defaults** panel to the right of the download form sets the
 default tool/quality/auth/output/filename/extra args for Twitch, YouTube, Kick,
-and Generic — saved automatically. The form's **Auth** has a **Default
+and Generic (each collapsible) — saved automatically. The form's **Auth** has a **Default
 (per-platform)** option (selected by default, uses the platform default's auth)
 plus the explicit choices; **Inherit (global)** stays available and chains to the
 Settings → *Download authentication* default.
