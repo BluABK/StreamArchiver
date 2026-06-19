@@ -204,10 +204,25 @@ scrape works without any):
 Set a global default in Settings → *Download authentication*, and/or override
 per channel in the add/edit form (a per-channel value always wins):
 - **Browser cookies** → yt-dlp `--cookies-from-browser <browser>` (works for
-  Twitch sub/Turbo and YouTube members).
+  Twitch sub/Turbo and YouTube members). No manual export needed — yt-dlp reads
+  the cookies straight from the browser's profile at download time.
 - **Cookies file** → yt-dlp `--cookies <cookies.txt>`.
 - **Auth token** → streamlink `--twitch-api-header=Authorization=OAuth <token>`
   for Twitch.
+
+> **Browser profiles / sessions.** The browser value accepts yt-dlp's
+> `browser:profile` form, so you can point at a *specific* logged-in profile
+> instead of the browser's default (most-recently-used) one — exactly what you
+> want for a dedicated "YouTube" Firefox profile. Use the **Profile / session**
+> field in Settings → *Download authentication*, or type it inline in any
+> per-platform / per-channel / per-video **Browser** field, e.g.
+> `firefox:dmrf6eed.YouTube`. The profile is the **folder name** under
+> `…\Mozilla\Firefox\Profiles\` (find it at `about:profiles`) or an **absolute
+> path** to that folder. Leaving the profile blank uses the browser default —
+> which is why a separate login can otherwise be missed. (Chromium browsers use
+> a profile *directory* name like `Default` or `Profile 1`.) Tip: the profile DB
+> can be locked while that browser is open; if a read fails, close it (or that
+> profile) and retry.
 
 > Note: streamlink (Twitch) authenticates via the token header; yt-dlp uses
 > cookies. The form offers each tool the form it actually supports.

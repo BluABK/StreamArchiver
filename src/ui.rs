@@ -218,7 +218,10 @@ struct SettingsForm {
     max_concurrent_downloads: String,
     /// Global download-auth default: "none" or "cookies".
     download_auth_method: String,
+    /// Browser to read cookies from (yt-dlp `--cookies-from-browser`).
     cookies_browser: String,
+    /// Optional browser profile/session (the part after `browser:`).
+    cookies_profile: String,
     /// YouTube WebSub VPS relay (yt-websub) — base URL, bearer token, poll secs.
     websub_vps_url: String,
     websub_token: String,
@@ -299,7 +302,8 @@ impl StreamArchiverApp {
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| "none".into()),
-            cookies_browser: setting_or_empty(&core, K_COOKIES_BROWSER),
+            cookies_browser: split_browser_profile(&setting_or_empty(&core, K_COOKIES_BROWSER)).0,
+            cookies_profile: split_browser_profile(&setting_or_empty(&core, K_COOKIES_BROWSER)).1,
             websub_vps_url: setting_or_empty(&core, K_WEBSUB_URL),
             websub_token: setting_or_empty(&core, K_WEBSUB_TOKEN),
             websub_poll_secs: core
@@ -474,6 +478,8 @@ impl StreamArchiverApp {
 
     fn save_settings(&mut self) {
         let s = &self.settings;
+        // Persist the browser + optional profile as one `browser:profile` value.
+        let cookies_value = compose_browser_profile(&s.cookies_browser, &s.cookies_profile);
         let pairs = [
             (K_TWITCH_ID, s.twitch_client_id.trim()),
             (K_TWITCH_SECRET, s.twitch_client_secret.trim()),
@@ -483,7 +489,7 @@ impl StreamArchiverApp {
             (K_DEFAULT_OUT, s.default_output_dir.trim()),
             (K_MAX_CONCURRENT, s.max_concurrent_downloads.trim()),
             (K_DOWNLOAD_AUTH, s.download_auth_method.trim()),
-            (K_COOKIES_BROWSER, s.cookies_browser.trim()),
+            (K_COOKIES_BROWSER, cookies_value.as_str()),
             (K_WEBSUB_URL, s.websub_vps_url.trim()),
             (K_WEBSUB_TOKEN, s.websub_token.trim()),
             (K_WEBSUB_POLL, s.websub_poll_secs.trim()),
@@ -504,6 +510,31 @@ fn setting_or_empty(core: &AppCore, key: &str) -> String {
         .ok()
         .flatten()
         .unwrap_or_default()
+}
+
+/// Split a stored `--cookies-from-browser` value into `(browser, profile)`.
+/// `profile` is everything after the first `:` — a profile/session name or an
+/// absolute path (which may itself contain a `:` drive letter, hence split-once).
+/// yt-dlp parses the same way. Empty profile when there's no `:`.
+fn split_browser_profile(raw: &str) -> (String, String) {
+    match raw.split_once(':') {
+        Some((b, p)) => (b.trim().to_string(), p.trim().to_string()),
+        None => (raw.trim().to_string(), String::new()),
+    }
+}
+
+/// Compose a `--cookies-from-browser` value from a browser + optional profile
+/// (`firefox` or `firefox:<profile>`). Empty browser → empty (no cookies).
+fn compose_browser_profile(browser: &str, profile: &str) -> String {
+    let b = browser.trim();
+    let p = profile.trim();
+    if b.is_empty() {
+        String::new()
+    } else if p.is_empty() {
+        b.to_string()
+    } else {
+        format!("{b}:{p}")
+    }
 }
 
 /// Format a unix timestamp as a local `YYYY-MM-DD` date (empty if unset).
@@ -1127,7 +1158,7 @@ impl StreamArchiverApp {
                                     ui.label("Browser");
                                     if ui
                                         .text_edit_singleline(&mut d.auth_value)
-                                        .on_hover_text("e.g. firefox, chrome, edge")
+                                        .on_hover_text("Browser, or browser:profile — e.g. firefox:dmrf6eed.YouTube (the folder under …/Firefox/Profiles, or an absolute path)")
                                         .changed()
                                     {
                                         dirty = true;
@@ -1606,7 +1637,7 @@ impl StreamArchiverApp {
                         Some(AuthKind::CookiesBrowser) => {
                             ui.label("Browser");
                             ui.text_edit_singleline(&mut vf.auth_value)
-                                .on_hover_text("e.g. firefox, chrome, edge");
+                                .on_hover_text("Browser, or browser:profile — e.g. firefox:dmrf6eed.YouTube (the folder under …/Firefox/Profiles, or an absolute path)");
                             ui.end_row();
                         }
                         Some(AuthKind::CookiesFile) => {
@@ -2360,6 +2391,20 @@ impl StreamArchiverApp {
                                 }
                             });
                         ui.end_row();
+
+                        ui.label("Profile / session");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings.cookies_profile)
+                                .hint_text("optional — e.g. dmrf6eed.YouTube"),
+                        )
+                        .on_hover_text(
+                            "Which browser profile/session to read cookies from. Blank = the \
+                             browser's default (most-recently-used) profile — which is why a \
+                             dedicated login can be missed. For Firefox, use the profile folder \
+                             name (the directory under …/Mozilla/Firefox/Profiles, e.g. \
+                             dmrf6eed.YouTube) or an absolute path to it; find it at about:profiles.",
+                        );
+                        ui.end_row();
                     }
                 });
 
@@ -2504,7 +2549,7 @@ impl StreamArchiverApp {
                             AuthKind::CookiesBrowser => {
                                 ui.label("Browser");
                                 ui.text_edit_singleline(&mut form.auth_value)
-                                    .on_hover_text("e.g. firefox, chrome, edge (blank = global)");
+                                    .on_hover_text("Browser, or browser:profile — e.g. firefox:dmrf6eed.YouTube (blank = global)");
                                 ui.end_row();
                             }
                             AuthKind::CookiesFile => {
@@ -2566,5 +2611,38 @@ impl StreamArchiverApp {
         } else if do_cancel || !open {
             self.form = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compose_browser_profile, split_browser_profile};
+
+    #[test]
+    fn browser_profile_roundtrip() {
+        // No profile.
+        assert_eq!(split_browser_profile("firefox"), ("firefox".into(), String::new()));
+        assert_eq!(compose_browser_profile("firefox", ""), "firefox");
+
+        // Named profile.
+        assert_eq!(
+            split_browser_profile("firefox:dmrf6eed.YouTube"),
+            ("firefox".into(), "dmrf6eed.YouTube".into())
+        );
+        assert_eq!(
+            compose_browser_profile("firefox", "dmrf6eed.YouTube"),
+            "firefox:dmrf6eed.YouTube"
+        );
+
+        // Absolute-path profile: the drive-letter colon stays in the profile
+        // (split on the FIRST colon only, matching yt-dlp).
+        let raw = r"firefox:C:\Users\Blu\AppData\Roaming\Mozilla\Firefox\Profiles\dmrf6eed.YouTube";
+        let (b, p) = split_browser_profile(raw);
+        assert_eq!(b, "firefox");
+        assert_eq!(p, r"C:\Users\Blu\AppData\Roaming\Mozilla\Firefox\Profiles\dmrf6eed.YouTube");
+        assert_eq!(compose_browser_profile(&b, &p), raw);
+
+        // Empty browser -> empty (no cookies), even with a profile.
+        assert_eq!(compose_browser_profile("", "whatever"), "");
     }
 }
