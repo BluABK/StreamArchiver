@@ -30,6 +30,9 @@ const K_DEFAULT_OUT: &str = "default_output_dir";
 const K_MAX_CONCURRENT: &str = "max_concurrent_downloads";
 const K_DOWNLOAD_AUTH: &str = "download_auth_method";
 const K_COOKIES_BROWSER: &str = "cookies_browser";
+const K_WEBSUB_URL: &str = "websub_vps_url";
+const K_WEBSUB_TOKEN: &str = "websub_token";
+const K_WEBSUB_POLL: &str = "websub_poll_secs";
 
 /// Browsers yt-dlp can read cookies from (for the Settings dropdown).
 const COOKIE_BROWSERS: [&str; 8] = [
@@ -216,6 +219,10 @@ struct SettingsForm {
     /// Global download-auth default: "none" or "cookies".
     download_auth_method: String,
     cookies_browser: String,
+    /// YouTube WebSub VPS relay (yt-websub) — base URL, bearer token, poll secs.
+    websub_vps_url: String,
+    websub_token: String,
+    websub_poll_secs: String,
 }
 
 pub struct StreamArchiverApp {
@@ -293,6 +300,14 @@ impl StreamArchiverApp {
                 .flatten()
                 .unwrap_or_else(|| "none".into()),
             cookies_browser: setting_or_empty(&core, K_COOKIES_BROWSER),
+            websub_vps_url: setting_or_empty(&core, K_WEBSUB_URL),
+            websub_token: setting_or_empty(&core, K_WEBSUB_TOKEN),
+            websub_poll_secs: core
+                .store
+                .get_setting(K_WEBSUB_POLL)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "15".into()),
         };
 
         let twitch_flow = Arc::new(Mutex::new(match oauth::connected_login(&core.store) {
@@ -469,6 +484,9 @@ impl StreamArchiverApp {
             (K_MAX_CONCURRENT, s.max_concurrent_downloads.trim()),
             (K_DOWNLOAD_AUTH, s.download_auth_method.trim()),
             (K_COOKIES_BROWSER, s.cookies_browser.trim()),
+            (K_WEBSUB_URL, s.websub_vps_url.trim()),
+            (K_WEBSUB_TOKEN, s.websub_token.trim()),
+            (K_WEBSUB_POLL, s.websub_poll_secs.trim()),
         ];
         for (k, v) in pairs {
             if let Err(e) = self.core.store.set_setting(k, v) {
@@ -2253,6 +2271,36 @@ impl StreamArchiverApp {
                     }
                 }
             }
+
+            ui.add_space(12.0);
+            ui.heading("YouTube WebSub (push via VPS)");
+            ui.label(
+                "Optional. Point at a running yt-websub relay to get near-instant \
+                 go-live triggers for YouTube channels set to the WebSub method.",
+            );
+            egui::Grid::new("websub_grid")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("VPS base URL");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.websub_vps_url)
+                            .desired_width(320.0)
+                            .hint_text("https://hooks.example.com"),
+                    )
+                    .on_hover_text("The yt-websub server's HTTPS base URL (no trailing /api).");
+                    ui.end_row();
+                    ui.label("Bearer token");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.websub_token).password(true),
+                    )
+                    .on_hover_text("YTWEBSUB_BEARER_TOKEN configured on the VPS.");
+                    ui.end_row();
+                    ui.label("Poll interval (s)");
+                    ui.add(egui::TextEdit::singleline(&mut self.settings.websub_poll_secs))
+                        .on_hover_text("How often to pull new events from the VPS (min 5).");
+                    ui.end_row();
+                });
 
             ui.add_space(12.0);
             ui.heading("Defaults");

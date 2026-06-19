@@ -88,7 +88,9 @@ async fn tick(
         // Methods handled by the scheduler today; others are driven elsewhere
         // (CLI self-poll/EventSub in later phases).
         // EventSubHelix is polled here (Helix) *and* pushed by the EventSub task;
-        // whichever sees live first wins (the supervisor dedupes).
+        // whichever sees live first wins (the supervisor dedupes). WebSub is the
+        // same idea for YouTube: scrape-polled here as a fallback, and pushed by
+        // the websub task (which triggers an on-demand liveness check).
         let handled = matches!(
             m.detection_method,
             DetectionMethod::TwitchApi
@@ -97,6 +99,7 @@ async fn tick(
                 | DetectionMethod::GenericProbe
                 | DetectionMethod::YouTubeApi
                 | DetectionMethod::KickApi
+                | DetectionMethod::WebSub
         );
         if !handled {
             continue;
@@ -114,7 +117,7 @@ async fn tick(
                 DetectionMethod::TwitchApi | DetectionMethod::EventSubHelix => {
                     twitch_items.push(item)
                 }
-                DetectionMethod::Scrape => scrape_items.push(item),
+                DetectionMethod::Scrape | DetectionMethod::WebSub => scrape_items.push(item),
                 DetectionMethod::GenericProbe => generic_items.push(item),
                 DetectionMethod::YouTubeApi => youtube_api_items.push(item),
                 DetectionMethod::KickApi => kick_api_items.push(item),

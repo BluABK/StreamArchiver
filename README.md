@@ -134,6 +134,7 @@ in-app for a one-line description of each.
 | **Twitch API (Helix)** | Twitch | Client ID + Secret, or a connected account | one poll interval | Polls `Get Streams`, batched up to 100 channels/call; scales well. **Default for Twitch.** |
 | **Twitch EventSub** | Twitch | Client ID + Secret | ~seconds | Real-time push over a WebSocket (conduit + app token); ignores the poll interval, idles cheaply, reconciles on (re)connect. No public endpoint needed. |
 | **Twitch EventSub + Helix** | Twitch | Client ID + Secret | ~seconds, with a poll backstop | Does both: EventSub push **and** Helix polling. Whichever sees live first starts the recording, so a missed event (network drop, app started after go-live) is still caught. A longer poll interval is fine — it's just a safety net. |
+| **YouTube WebSub (VPS push)** | YouTube | [yt-websub](../yt-websub) relay (URL + token) | ~seconds, with a poll backstop | Push via an external relay on a public VPS: it subscribes to YouTube's WebSub/PubSubHubbub hub and streamarchiver polls it for events. Each notification triggers an **on-demand liveness check** (records only if actually live), with scrape polling as a safety net. A longer poll interval is fine. |
 | **YouTube Data API** | YouTube | API key | one poll interval | `search.list?eventType=live`; reports the real go-live time. **Quota-limited (~100 checks/day)** — use a long interval. |
 | **Kick official API** | Kick | Client ID + Secret | one poll interval | client-credentials app token; more reliable than scraping (no Cloudflare). |
 | **Scrape poll** | YouTube `/live`, Kick, generic | No | one poll interval | **Default for YouTube/Kick**; no credentials, but fragile to site changes. Go-live time is approximate (`~`). |
@@ -156,6 +157,21 @@ rather not reconnect, set a Client Secret and the app token is used.)
 > EventSub**, then `streamarchiver --run-for 120` with `RUST_LOG=info` — it logs
 > `eventsub: connected (conduit …); N channel(s) subscribed` and
 > `stream.online -> monitor N` when a channel goes live.
+
+**YouTube WebSub (push via VPS).** YouTube can *push* go-live notifications over
+WebSub/PubSubHubbub, but the hub needs a public callback URL — which a home machine
+doesn't have. The companion [yt-websub](../yt-websub) server runs on a small public
+VPS: it subscribes to the hub for your channels, durably logs each notification, and
+exposes them over a token-authenticated HTTPS API. streamarchiver (at home) **polls**
+that API. Because a WebSub notification fires for uploads and metadata edits too —
+not just go-lives — each event is treated as a *"check this channel now"* trigger:
+streamarchiver runs its normal liveness check and records **only if the channel is
+actually live** (so it's safe and idempotent), while the scrape poll stays on as a
+backstop. To use it: deploy `yt-websub` (see its README), then in **Settings →
+YouTube WebSub** set the **VPS base URL** + **bearer token**, and set the relevant
+YouTube monitors' **Detection** to **YouTube WebSub (VPS push)**. streamarchiver
+auto-resolves each channel to its `UC…` id, pushes the set to the VPS, and the VPS
+manages the hub subscriptions.
 
 > Tool tip: use **streamlink for Twitch** (reaches 1440p/2K HEVC) and **yt-dlp for
 > YouTube** (`--live-from-start`; streamlink hits YouTube segment 403s). The app

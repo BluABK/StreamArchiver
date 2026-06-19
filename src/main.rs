@@ -15,6 +15,7 @@ mod platform;
 mod scheduler;
 mod store;
 mod ui;
+mod websub;
 
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;

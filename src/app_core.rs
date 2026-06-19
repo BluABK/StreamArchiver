@@ -68,7 +68,7 @@ impl AppCore {
             tokio::sync::mpsc::unbounded_channel::<crate::events::LiveSignal>();
         let (manual_tx, manual_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::events::ManualCommand>();
-        *self.manual_tx.lock().unwrap() = Some(manual_tx);
+        *self.manual_tx.lock().unwrap() = Some(manual_tx.clone());
 
         // One shared detection context (HTTP client + cached Twitch token).
         let ctx = Arc::new(crate::detectors::DetectContext::new(self.store.clone()));
@@ -95,6 +95,15 @@ impl AppCore {
         let es_shutdown = self.shutdown.clone();
         self.rt.spawn(async move {
             crate::eventsub::run(es_store, live_tx, es_shutdown).await;
+        });
+
+        // YouTube WebSub push via the VPS relay -> on-demand liveness checks
+        // (manual Start commands). Idles if unused / not configured.
+        let ws_store = self.store.clone();
+        let ws_shutdown = self.shutdown.clone();
+        let ws_manual_tx = manual_tx.clone();
+        self.rt.spawn(async move {
+            crate::websub::run(ws_store, ws_manual_tx, ws_shutdown).await;
         });
 
         // Supervisor: live signals + manual commands -> recordings.

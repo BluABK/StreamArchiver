@@ -98,6 +98,7 @@ impl Platform {
             ],
             Platform::YouTube => &[
                 DetectionMethod::Scrape,
+                DetectionMethod::WebSub,
                 DetectionMethod::YouTubeApi,
                 DetectionMethod::GenericProbe,
             ],
@@ -182,6 +183,10 @@ pub enum DetectionMethod {
     EventSubHelix,
     /// Kick official API polling (client-credentials app token). Needs creds.
     KickApi,
+    /// YouTube WebSub (PubSubHubbub) push via an external VPS relay: a go-live
+    /// notification triggers an immediate liveness check. Polls (scrape) as a
+    /// fallback. Needs the `yt-websub` server URL + token in Settings.
+    WebSub,
 }
 
 impl DetectionMethod {
@@ -195,6 +200,7 @@ impl DetectionMethod {
             DetectionMethod::EventSub => "eventsub",
             DetectionMethod::EventSubHelix => "eventsub_helix",
             DetectionMethod::KickApi => "kick_api",
+            DetectionMethod::WebSub => "websub",
         }
     }
 
@@ -208,6 +214,7 @@ impl DetectionMethod {
             DetectionMethod::EventSub => "Twitch EventSub push",
             DetectionMethod::EventSubHelix => "Twitch EventSub + Helix",
             DetectionMethod::KickApi => "Kick official API",
+            DetectionMethod::WebSub => "YouTube WebSub (VPS push)",
         }
     }
 
@@ -222,6 +229,7 @@ impl DetectionMethod {
             DetectionMethod::EventSub => "EventSub",
             DetectionMethod::EventSubHelix => "ES+Helix",
             DetectionMethod::KickApi => "Kick API",
+            DetectionMethod::WebSub => "WebSub",
         }
     }
 
@@ -234,6 +242,7 @@ impl DetectionMethod {
             "eventsub" => DetectionMethod::EventSub,
             "eventsub_helix" => DetectionMethod::EventSubHelix,
             "kick_api" => DetectionMethod::KickApi,
+            "websub" => DetectionMethod::WebSub,
             _ => DetectionMethod::GenericProbe,
         }
     }
@@ -268,6 +277,12 @@ impl DetectionMethod {
             DetectionMethod::KickApi => {
                 "Kick official API via a client-credentials app token — more reliable than \
                  scraping. Needs Kick Client ID + Secret."
+            }
+            DetectionMethod::WebSub => {
+                "YouTube push via an external yt-websub VPS relay: a go-live notification \
+                 triggers an immediate liveness check (records only if actually live), with \
+                 scrape polling as a safety-net fallback. Set the VPS URL + token in Settings; \
+                 a longer poll interval is fine."
             }
             DetectionMethod::GenericProbe => {
                 "Probes the URL with streamlink (--stream-url) each interval. No credentials; works \
