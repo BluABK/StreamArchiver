@@ -1043,7 +1043,25 @@ impl StreamArchiverApp {
 
         if do_delete {
             match self.core.store.delete_monitor(id) {
-                Ok(()) => self.status = "Deleted.".into(),
+                Ok(()) => {
+                    self.status = "Deleted.".into();
+                    // If that was the channel's last capture instance, drop the
+                    // now-orphaned channel row too (the row snapshot still has it).
+                    if let Some(cid) = self
+                        .rows
+                        .iter()
+                        .find(|r| r.monitor.id == id)
+                        .map(|r| r.channel.id)
+                    {
+                        let last = !self
+                            .rows
+                            .iter()
+                            .any(|r| r.channel.id == cid && r.monitor.id != id);
+                        if last {
+                            let _ = self.core.store.delete_channel(cid);
+                        }
+                    }
+                }
                 Err(e) => self.status = format!("Error: {e}"),
             }
             if self.selected_monitor == Some(id) {

@@ -8,6 +8,12 @@
 use tokio::sync::broadcast;
 
 /// State-change notifications emitted by the core for the UI to render.
+///
+/// The UI reloads its state wholesale on any event (it doesn't diff), and
+/// `notifications` only reads `channel`/`status`. The remaining payload fields
+/// (ids, state) are part of the event contract and Debug output rather than
+/// consumed today — hence the allow.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum AppEvent {
     /// A monitor's live/recording state changed (e.g. "idle" -> "live").
@@ -19,10 +25,6 @@ pub enum AppEvent {
         monitor_id: i64,
         recording_id: i64,
         channel: String,
-    },
-    Progress {
-        recording_id: i64,
-        bytes: u64,
     },
     RecordingFinished {
         recording_id: i64,

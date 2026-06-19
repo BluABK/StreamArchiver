@@ -376,10 +376,6 @@ impl Container {
         }
     }
 
-    pub fn ext(self) -> &'static str {
-        self.as_str()
-    }
-
     pub fn parse(s: &str) -> Container {
         match s {
             "ts" => Container::Ts,
@@ -465,9 +461,14 @@ pub struct Video {
     pub status: String,
     pub output_path: String,
     pub bytes: i64,
-    pub exit_code: Option<i64>,
     pub created_at: i64,
+    // Persisted run metadata, round-tripped through the store but not yet shown
+    // in the UI (kept so the data is available without a schema/struct change).
+    #[allow(dead_code)]
+    pub exit_code: Option<i64>,
+    #[allow(dead_code)]
     pub started_at: Option<i64>,
+    #[allow(dead_code)]
     pub ended_at: Option<i64>,
 }
 
