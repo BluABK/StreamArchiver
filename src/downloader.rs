@@ -51,6 +51,11 @@ const RING_MAX_LINES: usize = 80;
 /// A recording that fails faster than this is treated as a transient failure
 /// and subject to backoff.
 const SHORT_RUN_SECS: i64 = 15;
+/// How often the from-start catch-up watcher probes the growing capture.
+const CATCHUP_PROBE_INTERVAL_SECS: u64 = 20;
+/// Treat a from-start capture as caught up once its media is within this many
+/// seconds of the live edge (absorbs fragment lag + approximate go-live times).
+const CATCHUP_TOLERANCE_SECS: i64 = 45;
 
 /// The plan for one recording: the command to run plus the files involved.
 #[derive(Debug, Clone)]
@@ -823,9 +828,38 @@ impl Supervisor {
         });
         info!(monitor_id, program = %plan.program, "starting recording -> {}", plan.final_path.display());
 
+        // When capturing from the start of the broadcast (live-from-start /
+        // hls-live-restart), the early footage isn't lost — it's pulled from the
+        // DVR. Watch the growing capture and zero out "lost time" once it catches
+        // up to the live edge; finalize then recomputes the exact residual (in
+        // case the stream ends before catch-up completes).
+        let from_start = row.monitor.capture_from_start
+            && matches!(row.monitor.tool, Tool::Streamlink | Tool::YtDlp);
+        let resolve_lost = from_start && went_live_at.is_some();
+        let watcher_done = Arc::new(AtomicBool::new(false));
+        let watcher = resolve_lost.then(|| {
+            tokio::spawn(catch_up_watcher(
+                self.store.clone(),
+                rec_id,
+                plan.capture_path.clone(),
+                went_live_at.unwrap_or(0),
+                watcher_done.clone(),
+            ))
+        });
+
         let outcome = self
             .run_process(&self.active, monitor_id, &plan, None, None)
             .await;
+
+        // Stop the catch-up watcher before we touch the capture file (so it can't
+        // race finalize's authoritative lost-time write).
+        watcher_done.store(true, Ordering::SeqCst);
+        if let Some(w) = watcher {
+            let _ = w.await;
+        }
+        // Broadcast end ~= when the tool exited; snapshot it before remux so the
+        // span (and thus lost-time) isn't inflated by remux duration.
+        let ended = now_unix();
 
         // Remux TS -> MKV if requested and we captured something.
         let mut final_path = plan.final_path.clone();
@@ -846,6 +880,24 @@ impl Supervisor {
         }
 
         let bytes = file_len(&final_path).await as i64;
+
+        // Conclude "no footage missed" only when the capture actually spans the
+        // whole broadcast (reached the live edge with the head intact). If it
+        // ended before catching up (stopped/crashed/stream ended early), the gap
+        // is the not-yet-downloaded *tail*, not missed *beginning* — so don't
+        // record it as Lost time; leave it unset and let the UI fall back to the
+        // provisional `started - went_live` estimate.
+        if resolve_lost {
+            if let (Some(wl), Some(captured)) =
+                (went_live_at, media_duration_secs(&final_path).await)
+            {
+                let span = (ended - wl).max(0);
+                if captured + CATCHUP_TOLERANCE_SECS >= span {
+                    let _ = self.store.set_recording_lost_secs(rec_id, 0);
+                }
+            }
+        }
+
         let duration = now_unix() - started_at;
         let ok = bytes > 0;
         let status = if ok { "completed" } else { "failed" };
@@ -1164,6 +1216,67 @@ async fn file_len(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// Media duration of `path` in whole seconds via `ffprobe`, or `None` if it
+/// can't be determined (file missing/unreadable, ffprobe absent, or a container
+/// — e.g. a still-growing `.ts` — that doesn't report a duration).
+async fn media_duration_secs(path: &Path) -> Option<i64> {
+    let mut cmd = Command::new("ffprobe");
+    cmd.args(["-v", "error", "-hide_banner", "-show_entries", "format=duration",
+              "-of", "default=noprint_wrappers=1:nokey=1"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let out = tokio::time::timeout(Duration::from_secs(20), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let secs: f64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    if secs.is_finite() && secs >= 0.0 {
+        Some(secs as i64)
+    } else {
+        None
+    }
+}
+
+/// Watch a from-start recording's growing capture and zero its "lost time" once
+/// the captured media catches up to the live edge. Exits early when `done` is set
+/// (recording ended) so finalize can compute the exact residual without a race.
+async fn catch_up_watcher(
+    store: Arc<Store>,
+    rec_id: i64,
+    capture_path: PathBuf,
+    went_live: i64,
+    done: Arc<AtomicBool>,
+) {
+    loop {
+        // Interruptible wait between probes (checks `done` every 250ms).
+        for _ in 0..(CATCHUP_PROBE_INTERVAL_SECS * 4) {
+            if done.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        if done.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Some(captured) = media_duration_secs(&capture_path).await {
+            let elapsed = now_unix() - went_live;
+            if captured + CATCHUP_TOLERANCE_SECS >= elapsed {
+                let _ = store.set_recording_lost_secs(rec_id, 0);
+                info!(rec_id, "from-start capture caught up with live (lost time = 0)");
+                return;
+            }
+        }
+    }
+}
+
 /// Find the actual output when the predicted path is missing: the largest file
 /// in `predicted`'s directory whose name shares its stem (e.g. yt-dlp wrote
 /// `<stem>.webm` instead of the predicted `<stem>.mkv`).
@@ -1309,6 +1422,7 @@ mod tests {
             last_recording_status: None,
             last_recording_went_live: None,
             last_recording_went_live_approx: false,
+            last_recording_lost_secs: None,
         }
     }
 

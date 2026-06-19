@@ -328,6 +328,7 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
         last_recording_status: None,
         last_recording_went_live: None,
         last_recording_went_live_approx: false,
+        last_recording_lost_secs: None,
     };
     let plan = downloader::build_plan(&row, models::now_unix(), &downloader::AuthSource::None);
     println!("plan: {} {:?}", plan.program, plan.args);

@@ -432,6 +432,11 @@ pub struct MonitorWithChannel {
     /// Platform-reported (or approximated) go-live time of the latest recording.
     pub last_recording_went_live: Option<i64>,
     pub last_recording_went_live_approx: bool,
+    /// Resolved "missed beginning" for the latest recording, in seconds. Set to
+    /// `0` once a from-start capture has covered the whole broadcast (caught up to
+    /// the live edge). `None` until/unless confirmed — the UI then falls back to
+    /// the provisional `started - went_live` estimate.
+    pub last_recording_lost_secs: Option<i64>,
 }
 
 /// An on-demand, one-shot video/VOD download (a YouTube video, a Twitch VOD,

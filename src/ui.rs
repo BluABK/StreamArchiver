@@ -786,9 +786,12 @@ fn stream_cells(row: &MonitorWithChannel, now: i64) -> Vec<Cell> {
     };
     let went_live_ts = row.last_recording_went_live.unwrap_or(0);
     let started_ts = started.unwrap_or(0);
-    let lost = match (started, row.last_recording_went_live) {
-        (Some(s), Some(w)) => (s - w).max(0),
-        _ => 0,
+    let lost = match row.last_recording_lost_secs {
+        Some(s) => s.max(0),
+        None => match (started, row.last_recording_went_live) {
+            (Some(s), Some(w)) => (s - w).max(0),
+            _ => 0,
+        },
     };
     vec![
         Cell::num(
@@ -826,7 +829,8 @@ struct RecordingCells {
     duration: String,
     /// When the stream went live on the platform (`~`-prefixed if approximate).
     went_live: String,
-    /// How much of the stream we missed = started_on - went_live.
+    /// How much of the beginning we missed: the resolved lost time when known
+    /// (0 once a from-start capture caught up), else provisional started - went_live.
     lost: String,
 }
 
@@ -849,9 +853,14 @@ fn recording_cells(row: &MonitorWithChannel, now: i64) -> RecordingCells {
         }
         None => String::new(),
     };
-    let lost = match (started, row.last_recording_went_live) {
-        (Some(s), Some(w)) => fmt_duration((s - w).max(0)),
-        _ => String::new(),
+    // Prefer the resolved lost time (0 once a from-start capture caught up, or
+    // the exact residual) when known; else fall back to started - went_live.
+    let lost = match row.last_recording_lost_secs {
+        Some(s) => fmt_duration(s.max(0)),
+        None => match (started, row.last_recording_went_live) {
+            (Some(s), Some(w)) => fmt_duration((s - w).max(0)),
+            _ => String::new(),
+        },
     };
     RecordingCells {
         started_on: started.map(fmt_datetime_short).unwrap_or_default(),
@@ -2067,7 +2076,15 @@ impl StreamArchiverApp {
                                     ui.label(&rec.started_on);
                                 });
                                 tr.col(|ui| {
-                                    ui.label(&rec.lost);
+                                    let resp = ui.label(&rec.lost);
+                                    if m.capture_from_start {
+                                        resp.on_hover_text(
+                                            "How much of the beginning we missed. Capturing from \
+                                             start, so this drops to 0 once the capture catches up \
+                                             to the live edge; until then it's an estimate (the gap \
+                                             before recording began).",
+                                        );
+                                    }
                                 });
                                 tr.col(|ui| {
                                     ui.label(&rec.duration);

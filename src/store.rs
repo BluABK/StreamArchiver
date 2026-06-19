@@ -17,7 +17,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -180,7 +180,13 @@ impl Store {
             conn.execute_batch("ALTER TABLE video ADD COLUMN channel TEXT NOT NULL DEFAULT '';")?;
             conn.pragma_update(None, "user_version", 7)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 7);
+        if version < 8 {
+            // Resolved "missed beginning" for a recording (NULL until confirmed);
+            // 0 once a from-start capture has caught up to live (full coverage).
+            conn.execute_batch("ALTER TABLE recording ADD COLUMN lost_secs INTEGER;")?;
+            conn.pragma_update(None, "user_version", 8)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 8);
         Ok(())
     }
 
@@ -373,6 +379,17 @@ impl Store {
         Ok(())
     }
 
+    /// Set the resolved "missed footage" (seconds) for a recording. Used by the
+    /// from-start catch-up watcher (0 on catch-up) and finalize (the residual).
+    pub fn set_recording_lost_secs(&self, id: i64, lost_secs: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE recording SET lost_secs=?2 WHERE id=?1",
+            params![id, lost_secs],
+        )?;
+        Ok(())
+    }
+
     /// Mark any recordings still flagged 'recording' (i.e. left over from a
     /// crash) as 'orphaned'. Returns the number updated. Called on startup.
     pub fn mark_orphaned_recordings(&self, ended_at: i64) -> Result<usize> {
@@ -394,7 +411,7 @@ impl Store {
                 m.quality, m.output_dir, m.filename_template, m.container, m.capture_from_start,
                 m.auth_kind, m.auth_value, m.extra_args, m.max_concurrent, m.last_checked_at,
                 m.last_state,
-                r.started_at, r.ended_at, r.status, r.went_live_at, r.went_live_approx
+                r.started_at, r.ended_at, r.status, r.went_live_at, r.went_live_approx, r.lost_secs
              FROM monitor m
              JOIN channel c ON c.id = m.channel_id
              LEFT JOIN recording r
@@ -437,6 +454,7 @@ impl Store {
                     last_recording_status: r.get(24)?,
                     last_recording_went_live: r.get(25)?,
                     last_recording_went_live_approx: r.get::<_, Option<i64>>(26)?.unwrap_or(0) != 0,
+                    last_recording_lost_secs: r.get(27)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

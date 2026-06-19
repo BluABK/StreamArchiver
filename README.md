@@ -98,9 +98,21 @@ the **Videos** and **Streams** tables alike.
 The channel table shows, per monitor: On (enable/disable), Name, Platform (with a
 brand badge), Tool, Detection, poll interval, State, **Went Live** (the platform's
 go-live time — `~`-prefixed when only our first-detected time is known, e.g. for
-scrape), **Started On** (when we began recording), **Lost time** (Started On −
-Went Live, i.e. how much of the stream we missed), **Duration** (live, `HH:MM:SS`),
-and **Added** (when the channel was added).
+scrape), **Started On** (when we began recording), **Lost time** (how much of the
+stream we missed), **Duration** (live, `HH:MM:SS`), and **Added** (when the channel
+was added).
+
+**Lost time & capture-from-start.** Normally Lost time is `Started On − Went Live`
+— the gap before we began. But with **Capture from start** enabled (yt-dlp
+`--live-from-start` / streamlink `--hls-live-restart`) the early footage isn't
+actually lost; it's pulled from the platform's DVR. So for those recordings the
+app watches the capture and **drops Lost time to 0 once it catches up to the live
+edge** (confirmed again at the end by checking the captured length covers the
+whole broadcast). If a from-start capture *doesn't* reach the live edge — it's
+stopped, crashes, or the stream ends first — the not-yet-downloaded part is the
+recent *tail*, not the beginning, so we don't claim a "lost" figure: the column
+just shows the provisional `Started − Went Live` estimate until catch-up is
+confirmed.
 
 ### Row actions & shortcuts
 
