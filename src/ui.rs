@@ -1266,12 +1266,33 @@ impl eframe::App for StreamArchiverApp {
             .show_inside(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading("StreamArchiver");
+                    let built = env!("BUILD_UNIX")
+                        .parse::<i64>()
+                        .ok()
+                        .and_then(|s| chrono::DateTime::from_timestamp(s, 0))
+                        .map(|dt| {
+                            dt.with_timezone(&chrono::Local)
+                                .format("%Y-%m-%d %H:%M")
+                                .to_string()
+                        })
+                        .unwrap_or_default();
                     ui.label(
-                        egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
-                            .small()
-                            .color(egui::Color32::from_gray(0x90)),
+                        egui::RichText::new(concat!(
+                            "v",
+                            env!("CARGO_PKG_VERSION"),
+                            " · ",
+                            env!("GIT_HASH")
+                        ))
+                        .small()
+                        .color(egui::Color32::from_gray(0x90)),
                     )
-                    .on_hover_text(concat!("StreamArchiver v", env!("CARGO_PKG_VERSION")));
+                    .on_hover_text(format!(
+                        "StreamArchiver v{} · build {}\ncommit {}\ncompiled {}",
+                        env!("CARGO_PKG_VERSION"),
+                        env!("BUILD_NUMBER"),
+                        env!("GIT_HASH"),
+                        built,
+                    ));
                     ui.separator();
                     ui.selectable_value(&mut self.view, View::Streams, "Streams");
                     ui.selectable_value(&mut self.view, View::Videos, "Videos");
