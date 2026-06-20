@@ -16,8 +16,8 @@ use tray_icon::TrayIcon;
 use crate::app_core::AppCore;
 use crate::events::{ManualCommand, UiCommand};
 use crate::models::{
-    AuthKind, Channel, Container, DetectionMethod, DownloadDefaults, Monitor, MonitorWithChannel,
-    Platform, Recording, StreamGroup, Tool, Video, group_recordings,
+    AdBreak, AuthKind, Channel, Container, DetectionMethod, DownloadDefaults, Monitor,
+    MonitorWithChannel, Platform, Recording, StreamGroup, Tool, Video, group_recordings,
 };
 use crate::oauth::{self, AuthFlow};
 use crate::platform::AutoStart;
@@ -274,6 +274,8 @@ pub struct StreamArchiverApp {
     expanded_instances: HashSet<i64>,
     expanded_streams: HashSet<String>,
     rec_cache: HashMap<i64, Vec<Recording>>,
+    /// Recording id whose ad-break cut list is shown in a popup (None = closed).
+    ad_popup: Option<i64>,
     /// Sort + per-column filters for the Videos table.
     videos_sort: SortState,
     videos_filters: Vec<String>,
@@ -374,6 +376,7 @@ impl StreamArchiverApp {
             expanded_instances: HashSet::new(),
             expanded_streams: HashSet::new(),
             rec_cache: HashMap::new(),
+            ad_popup: None,
             videos_sort: SortState::default(),
             videos_filters: vec![String::new(); VIDEO_COLS],
             twitch_flow,
@@ -617,6 +620,52 @@ fn fmt_duration(secs: i64) -> String {
     format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
 }
 
+/// Ad-break count for a cell (blank when there are none, so empty rows stay clean).
+fn fmt_ad_count(n: i64) -> String {
+    if n > 0 { n.to_string() } else { String::new() }
+}
+
+/// Total ad time for a cell (blank when zero).
+fn fmt_ad_time(secs: i64) -> String {
+    if secs > 0 { fmt_duration(secs) } else { String::new() }
+}
+
+/// Human-readable lines describing where ad breaks cause hard cuts in the
+/// finished file. `at_secs` is already the cut's position in the captured file
+/// (ad segments are filtered out), so it's shown directly as a seek timestamp.
+/// `breaks` must be ordered by offset.
+fn ad_cut_lines(breaks: &[AdBreak]) -> Vec<String> {
+    breaks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            format!(
+                "#{}  cut at {}  ({}s ad)",
+                i + 1,
+                fmt_duration(b.at_secs.max(0)),
+                b.duration_secs
+            )
+        })
+        .collect()
+}
+
+/// Multi-line tooltip body for an ad cell: a heading plus the per-break cut list
+/// (or a fallback when the details aren't loaded yet).
+fn ad_tooltip(count: i64, secs: i64, breaks: Option<&Vec<AdBreak>>) -> String {
+    let mut s = format!(
+        "{count} ad break(s), {} total — each is a hard cut in the file.",
+        fmt_duration(secs)
+    );
+    match breaks {
+        Some(b) if !b.is_empty() => {
+            s.push('\n');
+            s.push_str(&ad_cut_lines(b).join("\n"));
+        }
+        _ => {}
+    }
+    s
+}
+
 /// Parse the monitor id out of a [`StreamGroup`] key (`s<mid>:…` / `t<mid>:…`).
 fn stream_key_monitor(key: &str) -> Option<i64> {
     let rest = key.strip_prefix('s').or_else(|| key.strip_prefix('t'))?;
@@ -682,7 +731,7 @@ fn fmt_speed(bytes_per_sec: f64) -> String {
 /// Sortable/filterable Videos columns (Video..File; excludes Actions).
 const VIDEO_COLS: usize = 9;
 /// Sortable/filterable Streams columns (On..Added; excludes Actions).
-const STREAM_COLS: usize = 13;
+const STREAM_COLS: usize = 15;
 
 /// Which column a table is sorted by and in what direction. `col == None` keeps
 /// the natural (database) order.
@@ -1002,6 +1051,14 @@ fn channel_cells(channel: &Channel, monitors: &[&MonitorWithChannel], now: i64) 
         ),
         Cell::num(0.0, rec.lost.clone()),
         Cell::num(0.0, rec.duration.clone()),
+        Cell::num(
+            primary.last_recording_ad_count as f64,
+            fmt_ad_count(primary.last_recording_ad_count),
+        ),
+        Cell::num(
+            primary.last_recording_ad_secs as f64,
+            fmt_ad_time(primary.last_recording_ad_secs),
+        ),
         Cell::num(channel.created_at as f64, fmt_date(channel.created_at)),
     ]
 }
@@ -1147,6 +1204,20 @@ fn render_instance_row(
     });
     tr.col(|ui| {
         ui.label(&rec.duration);
+    });
+    tr.col(|ui| {
+        if row.last_recording_ad_count > 0 {
+            ui.label(fmt_ad_count(row.last_recording_ad_count)).on_hover_text(
+                ad_tooltip(row.last_recording_ad_count, row.last_recording_ad_secs, None),
+            );
+        }
+    });
+    tr.col(|ui| {
+        if row.last_recording_ad_secs > 0 {
+            ui.label(fmt_ad_time(row.last_recording_ad_secs)).on_hover_text(
+                ad_tooltip(row.last_recording_ad_count, row.last_recording_ad_secs, None),
+            );
+        }
     });
     tr.col(|ui| {
         ui.label(fmt_date(row.channel.created_at));
@@ -1338,6 +1409,7 @@ impl eframe::App for StreamArchiverApp {
         self.confirm_delete_window(ui.ctx());
         self.confirm_delete_channel_window(ui.ctx());
         self.format_probe_window(ui.ctx());
+        self.ad_popup_window(ui.ctx());
     }
 }
 
@@ -2352,6 +2424,54 @@ impl StreamArchiverApp {
         }
     }
 
+    /// Window listing where ad breaks cause hard cuts in a take's finished file.
+    /// Opened by double-clicking an Ads / Ad time cell.
+    fn ad_popup_window(&mut self, ctx: &egui::Context) {
+        let Some(rid) = self.ad_popup else {
+            return;
+        };
+        let breaks = self
+            .core
+            .store
+            .ad_breaks_for_recording(rid)
+            .unwrap_or_default();
+        let total: i64 = breaks.iter().map(|b| b.duration_secs).sum();
+        let mut open = true;
+        egui::Window::new("Ad breaks — cut points")
+            .collapsible(false)
+            .resizable(true)
+            .default_size([360.0, 240.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                if breaks.is_empty() {
+                    ui.label("No ad breaks recorded for this take.");
+                    return;
+                }
+                ui.label(format!(
+                    "{} ad break(s), {} total. Each is a hard cut in the recorded file \
+                     (streamlink filters ad segments out).",
+                    breaks.len(),
+                    fmt_duration(total),
+                ));
+                ui.add_space(6.0);
+                let lines = ad_cut_lines(&breaks);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for line in &lines {
+                            ui.label(egui::RichText::new(line).monospace());
+                        }
+                    });
+                ui.add_space(6.0);
+                if ui.button("📋  Copy").clicked() {
+                    ui.ctx().copy_text(lines.join("\n"));
+                }
+            });
+        if !open {
+            self.ad_popup = None;
+        }
+    }
+
     fn channels_view(&mut self, ui: &mut egui::Ui) {
         if self.channels.is_empty() {
             ui.add_space(24.0);
@@ -2437,6 +2557,26 @@ impl StreamArchiverApp {
             })
             .collect();
 
+        // Per-recording ad-break detail (offsets) for the cut-list tooltips on
+        // expanded history rows. Only fetched for takes that actually had ads, so
+        // it stays bounded by what's currently expanded.
+        let mut ad_breaks: HashMap<i64, Vec<AdBreak>> = HashMap::new();
+        for &mid in &expanded_monitors {
+            if let Some(recs) = self.rec_cache.get(&mid) {
+                for r in recs.iter().filter(|r| r.ad_count > 0) {
+                    let v = self
+                        .core
+                        .store
+                        .ad_breaks_for_recording(r.id)
+                        .unwrap_or_default();
+                    ad_breaks.insert(r.id, v);
+                }
+            }
+        }
+        // Collected in the table closure (which borrows `self` immutably), applied
+        // afterwards: a double-click on an ad cell opens that take's cut-list popup.
+        let mut open_ad_popup: Option<i64> = None;
+
         // Snapshot expansion state for read-only use inside the table closure.
         let exp_channels = self.expanded_channels.clone();
         let exp_instances = self.expanded_instances.clone();
@@ -2486,6 +2626,8 @@ impl StreamArchiverApp {
                     .column(Column::auto().at_least(104.0)) // started on
                     .column(Column::auto().at_least(58.0)) // lost time
                     .column(Column::auto().at_least(58.0)) // duration
+                    .column(Column::auto().at_least(44.0)) // ads
+                    .column(Column::auto().at_least(58.0)) // ad time
                     .column(Column::auto().at_least(80.0)) // added
                     .column(Column::remainder().at_least(140.0)) // actions
                     .header(46.0, |mut header| {
@@ -2502,6 +2644,8 @@ impl StreamArchiverApp {
                             "Started On",
                             "Lost time",
                             "Duration",
+                            "Ads",
+                            "Ad time",
                             "Added",
                         ];
                         for (i, t) in titles.into_iter().enumerate() {
@@ -2575,11 +2719,14 @@ impl StreamArchiverApp {
                                     .max()
                                     .unwrap_or(0);
                                 // Latest activity across instances drives the time columns.
-                                let rec = mons
+                                let primary = mons
                                     .iter()
                                     .copied()
-                                    .max_by_key(|m| m.last_recording_started.unwrap_or(0))
-                                    .map(|m| recording_cells(m, now));
+                                    .max_by_key(|m| m.last_recording_started.unwrap_or(0));
+                                let rec = primary.map(|m| recording_cells(m, now));
+                                let ads = primary.map(|m| {
+                                    (m.last_recording_ad_count, m.last_recording_ad_secs)
+                                });
                                 body.row(24.0, |mut tr| {
                                     tr.set_selected(any_rec);
                                     let mut disc = false;
@@ -2646,6 +2793,22 @@ impl StreamArchiverApp {
                                     tr.col(|ui| {
                                         if let Some(r) = &rec {
                                             ui.label(&r.duration);
+                                        }
+                                    });
+                                    tr.col(|ui| {
+                                        if let Some((c, s)) = ads {
+                                            if c > 0 {
+                                                ui.label(fmt_ad_count(c))
+                                                    .on_hover_text(ad_tooltip(c, s, None));
+                                            }
+                                        }
+                                    });
+                                    tr.col(|ui| {
+                                        if let Some((c, s)) = ads {
+                                            if s > 0 {
+                                                ui.label(fmt_ad_time(s))
+                                                    .on_hover_text(ad_tooltip(c, s, None));
+                                            }
                                         }
                                     });
                                     tr.col(|ui| {
@@ -2738,6 +2901,13 @@ impl StreamArchiverApp {
                                             .parent()
                                             .map(|p| p.to_path_buf())
                                     });
+                                let ad_count = g.ad_count();
+                                let ad_secs = g.ad_secs();
+                                // A single-take stream carries the cut detail on its
+                                // one take; multi-take streams show per-take cuts when
+                                // expanded.
+                                let ad_rec =
+                                    if g.takes.len() == 1 { Some(g.takes[0].id) } else { None };
                                 body.row(24.0, |mut tr| {
                                     let mut disc = false;
                                     tr.col(|_ui| {});
@@ -2778,6 +2948,34 @@ impl StreamArchiverApp {
                                                 fmt_duration(span),
                                             ),
                                         );
+                                    });
+                                    tr.col(|ui| {
+                                        if ad_count > 0 {
+                                            let det = ad_rec.and_then(|id| ad_breaks.get(&id));
+                                            let resp = ui
+                                                .add(
+                                                    egui::Label::new(fmt_ad_count(ad_count))
+                                                        .sense(egui::Sense::click()),
+                                                )
+                                                .on_hover_text(ad_tooltip(ad_count, ad_secs, det));
+                                            if ad_rec.is_some() && resp.double_clicked() {
+                                                open_ad_popup = ad_rec;
+                                            }
+                                        }
+                                    });
+                                    tr.col(|ui| {
+                                        if ad_secs > 0 {
+                                            let det = ad_rec.and_then(|id| ad_breaks.get(&id));
+                                            let resp = ui
+                                                .add(
+                                                    egui::Label::new(fmt_ad_time(ad_secs))
+                                                        .sense(egui::Sense::click()),
+                                                )
+                                                .on_hover_text(ad_tooltip(ad_count, ad_secs, det));
+                                            if ad_rec.is_some() && resp.double_clicked() {
+                                                open_ad_popup = ad_rec;
+                                            }
+                                        }
                                     });
                                     tr.col(|_ui| {});
                                     tr.col(|ui| {
@@ -2833,6 +3031,38 @@ impl StreamArchiverApp {
                                         let d = ui.label(fmt_duration(t.duration_secs(now)));
                                         if t.bytes > 0 {
                                             d.on_hover_text(fmt_bytes(t.bytes));
+                                        }
+                                    });
+                                    tr.col(|ui| {
+                                        if t.ad_count > 0 {
+                                            let det = ad_breaks.get(&t.id);
+                                            let resp = ui
+                                                .add(
+                                                    egui::Label::new(fmt_ad_count(t.ad_count))
+                                                        .sense(egui::Sense::click()),
+                                                )
+                                                .on_hover_text(ad_tooltip(
+                                                    t.ad_count, t.ad_secs, det,
+                                                ));
+                                            if resp.double_clicked() {
+                                                open_ad_popup = Some(t.id);
+                                            }
+                                        }
+                                    });
+                                    tr.col(|ui| {
+                                        if t.ad_secs > 0 {
+                                            let det = ad_breaks.get(&t.id);
+                                            let resp = ui
+                                                .add(
+                                                    egui::Label::new(fmt_ad_time(t.ad_secs))
+                                                        .sense(egui::Sense::click()),
+                                                )
+                                                .on_hover_text(ad_tooltip(
+                                                    t.ad_count, t.ad_secs, det,
+                                                ));
+                                            if resp.double_clicked() {
+                                                open_ad_popup = Some(t.id);
+                                            }
                                         }
                                     });
                                     tr.col(|_ui| {});
@@ -2892,6 +3122,9 @@ impl StreamArchiverApp {
             });
         self.streams_sort = sort;
         self.streams_filters = filters;
+        if let Some(rid) = open_ad_popup {
+            self.ad_popup = Some(rid);
+        }
 
         // Tick the live Duration column ~1/sec while anything is recording.
         if any_active {
@@ -2975,6 +3208,10 @@ impl StreamArchiverApp {
         if let Some(rid) = delete_recording {
             if let Err(e) = self.core.store.delete_recording(rid) {
                 self.status = format!("Error: {e}");
+            }
+            // The take (and its cascaded ad breaks) is gone; close a popup for it.
+            if self.ad_popup == Some(rid) {
+                self.ad_popup = None;
             }
             self.reload_rows();
         }

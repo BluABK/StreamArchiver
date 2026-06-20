@@ -452,9 +452,32 @@ pub struct MonitorWithChannel {
     /// the live edge). `None` until/unless confirmed — the UI then falls back to
     /// the provisional `started - went_live` estimate.
     pub last_recording_lost_secs: Option<i64>,
+    /// Ad breaks detected during the latest recording take (count + total
+    /// seconds). Each break is a hard cut in the finished file; see [`AdBreak`].
+    pub last_recording_ad_count: i64,
+    pub last_recording_ad_secs: i64,
     /// Total recording takes for this monitor (drives the history-tree disclosure
     /// without loading the full history until a row is expanded).
     pub recording_count: i64,
+}
+
+/// One advertisement break detected during a recording take.
+///
+/// Streamlink *filters out* Twitch ad segments, so a break becomes a hard cut in
+/// the captured file rather than recorded ad footage. `at_secs` is the
+/// (approximate) position of that hard cut in the finished file — i.e. the
+/// content captured up to the break — so it can be used directly as a seek
+/// timestamp. `duration_secs` is the ad-pod length the tool reported.
+#[derive(Clone, Debug)]
+pub struct AdBreak {
+    // Round-tripped from the DB row but not read in the UI yet (the cut list uses
+    // only the offset + duration); kept so the data is available without a change.
+    #[allow(dead_code)]
+    pub id: i64,
+    #[allow(dead_code)]
+    pub recording_id: i64,
+    pub at_secs: i64,
+    pub duration_secs: i64,
 }
 
 /// An on-demand, one-shot video/VOD download (a YouTube video, a Twitch VOD,
@@ -600,6 +623,10 @@ pub struct Recording {
     pub lost_secs: Option<i64>,
     /// Platform stream/video id when detection knew it; `None` for id-less methods.
     pub stream_id: Option<String>,
+    /// Ad breaks detected during this take (count + total seconds). Each break is
+    /// a hard cut in the finished file; the per-break offsets live in `ad_break`.
+    pub ad_count: i64,
+    pub ad_secs: i64,
 }
 
 impl Recording {
@@ -650,6 +677,14 @@ impl StreamGroup {
     /// known (a from-start take that caught up makes it 0).
     pub fn lost_secs(&self) -> Option<i64> {
         self.takes.iter().find_map(|t| t.lost_secs)
+    }
+    /// Ad breaks across all takes of this stream.
+    pub fn ad_count(&self) -> i64 {
+        self.takes.iter().map(|t| t.ad_count).sum()
+    }
+    /// Total advertisement time (seconds) skipped across all takes.
+    pub fn ad_secs(&self) -> i64 {
+        self.takes.iter().map(|t| t.ad_secs).sum()
     }
     /// Rolled-up status for the stream row.
     pub fn status(&self) -> &'static str {
@@ -753,6 +788,8 @@ mod tests {
             went_live_approx: true,
             lost_secs: None,
             stream_id: stream_id.map(str::to_string),
+            ad_count: 0,
+            ad_secs: 0,
         }
     }
 

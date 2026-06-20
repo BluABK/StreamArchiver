@@ -57,6 +57,24 @@ const CATCHUP_PROBE_INTERVAL_SECS: u64 = 20;
 /// seconds of the live edge (absorbs fragment lag + approximate go-live times).
 const CATCHUP_TOLERANCE_SECS: i64 = 45;
 
+/// Wiring for recording advertisement breaks parsed from a live capture's log.
+///
+/// Only Twitch+streamlink recordings pass this: streamlink filters Twitch ad
+/// segments out of the capture (each break becomes a hard cut) and logs each one
+/// as `Detected advertisement break of N second(s)`. yt-dlp/ffmpeg have no
+/// equivalent, and on-demand video downloads never set it.
+struct AdSink {
+    store: Arc<Store>,
+    events: EventTx,
+    monitor_id: i64,
+    recording_id: i64,
+    /// Take start (unix secs); used for the wall-clock fallback offset.
+    started_at: i64,
+    /// The growing capture file; its media duration is the true cut position
+    /// (ad segments are filtered out, so captured content == the finished file).
+    capture_path: PathBuf,
+}
+
 /// The plan for one recording: the command to run plus the files involved.
 #[derive(Debug, Clone)]
 pub struct DownloadPlan {
@@ -673,6 +691,7 @@ impl Supervisor {
                 &plan,
                 Some(self.video_progress.clone()),
                 Some(self.video_speed.clone()),
+                None, // on-demand downloads don't track ad breaks
             )
             .await;
 
@@ -858,8 +877,21 @@ impl Supervisor {
             ))
         });
 
+        // Twitch+streamlink filters ads into hard cuts and logs each break; record
+        // them so the UI can show ad count/time and the cut timestamps.
+        let ad_sink = (row.monitor.tool == Tool::Streamlink
+            && row.monitor.platform() == Platform::Twitch)
+            .then(|| AdSink {
+                store: self.store.clone(),
+                events: self.events.clone(),
+                monitor_id,
+                recording_id: rec_id,
+                started_at,
+                capture_path: plan.capture_path.clone(),
+            });
+
         let outcome = self
-            .run_process(&self.active, monitor_id, &plan, None, None)
+            .run_process(&self.active, monitor_id, &plan, None, None, ad_sink)
             .await;
 
         // Stop the catch-up watcher before we touch the capture file (so it can't
@@ -942,6 +974,7 @@ impl Supervisor {
         plan: &DownloadPlan,
         progress: Option<VideoProgress>,
         speed: Option<VideoSpeed>,
+        ads: Option<AdSink>,
     ) -> ProcessOutcome {
         let job = match ProcessJob::new() {
             Ok(j) => Some(j),
@@ -1011,6 +1044,10 @@ impl Supervisor {
             let spd = speed.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
+                // Ad time skipped so far in this take, for the wall-clock fallback
+                // offset (each filtered break removes wall-clock that isn't in the
+                // file).
+                let mut prior_ad_secs: i64 = 0;
                 while let Ok(Some(line)) = lines.next_line().await {
                     // Some tools emit progress on stderr; catch it there too.
                     if prog.is_some() || spd.is_some() {
@@ -1020,6 +1057,43 @@ impl Supervisor {
                         }
                         if let (Some(s), Some(m)) = (s, spd.as_ref()) {
                             m.lock().unwrap().insert(id, s);
+                        }
+                    }
+                    // Record streamlink ad breaks (Twitch). Streamlink de-dups
+                    // breaks itself, so each matching line is one distinct break.
+                    if let Some(sink) = ads.as_ref() {
+                        if let Some(dur) = parse_ad_break_secs(&line) {
+                            // The cut lands at the content captured so far. Ad
+                            // segments are filtered out, so the capture's media
+                            // duration is exactly that position — correct for both
+                            // live-edge and capture-from-start/DVR (where wall clock
+                            // since start doesn't track the file timeline). Fall
+                            // back to wall clock minus the ad time already skipped
+                            // (correct at the live edge) if ffprobe can't read the
+                            // still-growing file yet.
+                            let at = match media_duration_secs(&sink.capture_path).await {
+                                Some(d) => d,
+                                None => (now_unix() - sink.started_at - prior_ad_secs).max(0),
+                            };
+                            prior_ad_secs += dur;
+                            match sink.store.insert_ad_break(sink.recording_id, at, dur) {
+                                Ok(_) => {
+                                    info!(
+                                        monitor_id = sink.monitor_id,
+                                        rec_id = sink.recording_id,
+                                        at,
+                                        secs = dur,
+                                        "ad break detected"
+                                    );
+                                    // Wake the UI so an expanded history tree
+                                    // refreshes its Ads / Ad time columns.
+                                    let _ = sink.events.send(AppEvent::MonitorState {
+                                        monitor_id: sink.monitor_id,
+                                        state: "recording".into(),
+                                    });
+                                }
+                                Err(e) => warn!("insert ad_break failed: {e:#}"),
+                            }
                         }
                     }
                     tracing::trace!(target: "streamarchiver::recproc", "[{program}] {line}");
@@ -1083,6 +1157,17 @@ fn parse_progress_fields(line: &str) -> (Option<f32>, Option<f64>) {
 #[cfg(test)]
 fn parse_progress(line: &str) -> Option<f32> {
     parse_progress_fields(line).0
+}
+
+/// Parse streamlink's Twitch `Detected advertisement break of N second(s)` log
+/// line into the break duration in seconds. Returns `None` for any other line.
+/// Tolerant of streamlink's `[plugins.twitch][info]` line prefix.
+fn parse_ad_break_secs(line: &str) -> Option<i64> {
+    const MARKER: &str = "advertisement break of ";
+    let idx = line.find(MARKER)?;
+    let rest = &line[idx + MARKER.len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse::<i64>().ok()
 }
 
 /// Resolve a video/stream's real title and channel/uploader via yt-dlp (no
@@ -1452,6 +1537,8 @@ mod tests {
             last_recording_went_live: None,
             last_recording_went_live_approx: false,
             last_recording_lost_secs: None,
+            last_recording_ad_count: 0,
+            last_recording_ad_secs: 0,
             recording_count: 0,
         }
     }
@@ -1498,6 +1585,28 @@ mod tests {
         assert_eq!(parse_progress_fields("DLPCT= 50.0%"), (Some(0.5), None));
         // Non-marker lines yield nothing.
         assert_eq!(parse_progress_fields("some other log line"), (None, None));
+    }
+
+    #[test]
+    fn parses_streamlink_ad_break() {
+        assert_eq!(
+            parse_ad_break_secs(
+                "[plugins.twitch][info] Detected advertisement break of 30 seconds"
+            ),
+            Some(30)
+        );
+        // Singular form ("1 second") and no log prefix.
+        assert_eq!(
+            parse_ad_break_secs("Detected advertisement break of 1 second"),
+            Some(1)
+        );
+        // Other streamlink ad lines and unrelated lines don't match.
+        assert_eq!(parse_ad_break_secs("Will skip ad segments"), None);
+        assert_eq!(
+            parse_ad_break_secs("Waiting for pre-roll ads to finish, be patient"),
+            None
+        );
+        assert_eq!(parse_ad_break_secs("some other log line"), None);
     }
 
     #[test]

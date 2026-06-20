@@ -12,12 +12,12 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::models::{
-    AuthKind, Channel, Container, DetectionMethod, Monitor, MonitorWithChannel, Platform, Tool,
-    Video, now_unix,
+    AdBreak, AuthKind, Channel, Container, DetectionMethod, Monitor, MonitorWithChannel, Platform,
+    Tool, Video, now_unix,
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -205,7 +205,25 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 10)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 10);
+        if version < 11 {
+            // Advertisement breaks detected during a recording (streamlink filters
+            // Twitch ads out -> each break is a hard cut in the finished file).
+            // `at_secs` is the offset from the take's start; `duration_secs` is the
+            // reported ad-pod length. Cascades when the recording row is removed.
+            conn.execute_batch(
+                r#"
+                CREATE TABLE ad_break (
+                    id            INTEGER PRIMARY KEY,
+                    recording_id  INTEGER NOT NULL REFERENCES recording(id) ON DELETE CASCADE,
+                    at_secs       INTEGER NOT NULL,
+                    duration_secs INTEGER NOT NULL
+                );
+                CREATE INDEX idx_ad_break_recording ON ad_break(recording_id);
+                "#,
+            )?;
+            conn.pragma_update(None, "user_version", 11)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 11);
         Ok(())
     }
 
@@ -464,6 +482,43 @@ impl Store {
         Ok(())
     }
 
+    /// Record an advertisement break detected during a recording take. `at_secs`
+    /// is the offset from the take's start; `duration_secs` the reported ad length.
+    pub fn insert_ad_break(
+        &self,
+        recording_id: i64,
+        at_secs: i64,
+        duration_secs: i64,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO ad_break(recording_id, at_secs, duration_secs) VALUES(?1, ?2, ?3)",
+            params![recording_id, at_secs, duration_secs],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// All ad breaks for a recording take, ordered by offset (for the cut-list
+    /// tooltip/popup).
+    pub fn ad_breaks_for_recording(&self, recording_id: i64) -> Result<Vec<AdBreak>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, recording_id, at_secs, duration_secs FROM ad_break
+             WHERE recording_id = ?1 ORDER BY at_secs, id",
+        )?;
+        let rows = stmt
+            .query_map(params![recording_id], |r| {
+                Ok(AdBreak {
+                    id: r.get(0)?,
+                    recording_id: r.get(1)?,
+                    at_secs: r.get(2)?,
+                    duration_secs: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Mark any recordings still flagged 'recording' (i.e. left over from a
     /// crash) as 'orphaned'. Returns the number updated. Called on startup.
     pub fn mark_orphaned_recordings(&self, ended_at: i64) -> Result<usize> {
@@ -487,7 +542,9 @@ impl Store {
                 m.last_state,
                 r.started_at, r.ended_at, r.status, r.went_live_at, r.went_live_approx, r.lost_secs,
                 (SELECT COUNT(*) FROM recording rc WHERE rc.monitor_id = m.id),
-                m.url
+                m.url,
+                (SELECT COUNT(*) FROM ad_break ab WHERE ab.recording_id = r.id),
+                COALESCE((SELECT SUM(ab.duration_secs) FROM ad_break ab WHERE ab.recording_id = r.id), 0)
              FROM monitor m
              JOIN channel c ON c.id = m.channel_id
              LEFT JOIN recording r
@@ -532,6 +589,8 @@ impl Store {
                     last_recording_went_live: r.get(25)?,
                     last_recording_went_live_approx: r.get::<_, Option<i64>>(26)?.unwrap_or(0) != 0,
                     last_recording_lost_secs: r.get(27)?,
+                    last_recording_ad_count: r.get(30)?,
+                    last_recording_ad_secs: r.get(31)?,
                     recording_count: r.get(28)?,
                 })
             })?
@@ -544,7 +603,9 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, monitor_id, started_at, ended_at, status, bytes, exit_code,
-                    COALESCE(output_path, ''), went_live_at, went_live_approx, lost_secs, stream_id
+                    COALESCE(output_path, ''), went_live_at, went_live_approx, lost_secs, stream_id,
+                    (SELECT COUNT(*) FROM ad_break ab WHERE ab.recording_id = recording.id),
+                    COALESCE((SELECT SUM(ab.duration_secs) FROM ad_break ab WHERE ab.recording_id = recording.id), 0)
              FROM recording WHERE monitor_id = ?1 ORDER BY started_at, id",
         )?;
         let rows = stmt
@@ -562,6 +623,8 @@ impl Store {
                     went_live_approx: r.get::<_, Option<i64>>(9)?.unwrap_or(0) != 0,
                     lost_secs: r.get(10)?,
                     stream_id: r.get(11)?,
+                    ad_count: r.get(12)?,
+                    ad_secs: r.get(13)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -934,6 +997,45 @@ mod tests {
         assert_eq!(store.list_videos().unwrap().len(), 2);
         store.delete_video(id2).unwrap();
         assert_eq!(store.list_videos().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ad_break_roundtrip_and_rollups() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        let rid = store
+            .insert_recording(mid, 1_000, "C:/rec/out.mkv", Some(1_000), false, Some("s1"))
+            .unwrap();
+
+        // Insert out of order; the query must return them ordered by offset.
+        store.insert_ad_break(rid, 600, 30).unwrap();
+        store.insert_ad_break(rid, 120, 15).unwrap();
+
+        let breaks = store.ad_breaks_for_recording(rid).unwrap();
+        assert_eq!(breaks.len(), 2);
+        assert_eq!(breaks[0].at_secs, 120);
+        assert_eq!(breaks[0].duration_secs, 15);
+        assert_eq!(breaks[1].at_secs, 600);
+
+        // recordings_for_monitor rolls up count + total seconds for the take.
+        let recs = store.recordings_for_monitor(mid).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].ad_count, 2);
+        assert_eq!(recs[0].ad_secs, 45);
+
+        // The latest-recording join exposes the same rollup on the monitor row.
+        let row = store.get_monitor_with_channel(mid).unwrap().unwrap();
+        assert_eq!(row.last_recording_ad_count, 2);
+        assert_eq!(row.last_recording_ad_secs, 45);
+
+        // Deleting the recording cascades to its ad breaks.
+        store.finish_recording(rid, 2_000, 1, Some(0), "completed", "C:/rec/out.mkv", "").unwrap();
+        store.delete_recording(rid).unwrap();
+        assert!(store.ad_breaks_for_recording(rid).unwrap().is_empty());
     }
 
     #[test]
