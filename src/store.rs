@@ -726,7 +726,7 @@ impl Store {
                 COALESCE((SELECT SUM(ab.duration_secs) FROM ad_break ab WHERE ab.recording_id = r.id), 0),
                 m.ad_free, m.ad_free_sub, m.audio_tracks, m.subtitle_tracks,
                 (SELECT COUNT(*) FROM stream_meta_change smc WHERE smc.recording_id = r.id),
-                m.chat_log
+                m.chat_log, COALESCE(r.log_excerpt, '')
              FROM monitor m
              JOIN channel c ON c.id = m.channel_id
              LEFT JOIN recording r
@@ -778,6 +778,7 @@ impl Store {
                     last_recording_ad_count: r.get(30)?,
                     last_recording_ad_secs: r.get(31)?,
                     last_recording_meta_changes: r.get(36)?,
+                    last_recording_log: r.get(38)?,
                     ad_free_sub: r.get::<_, Option<i64>>(33)?.map(|v| v != 0),
                     recording_count: r.get(28)?,
                 })
@@ -794,7 +795,8 @@ impl Store {
                     COALESCE(output_path, ''), went_live_at, went_live_approx, lost_secs, stream_id,
                     (SELECT COUNT(*) FROM ad_break ab WHERE ab.recording_id = recording.id),
                     COALESCE((SELECT SUM(ab.duration_secs) FROM ad_break ab WHERE ab.recording_id = recording.id), 0),
-                    (SELECT COUNT(*) FROM stream_meta_change smc WHERE smc.recording_id = recording.id)
+                    (SELECT COUNT(*) FROM stream_meta_change smc WHERE smc.recording_id = recording.id),
+                    COALESCE(log_excerpt, '')
              FROM recording WHERE monitor_id = ?1 ORDER BY started_at, id",
         )?;
         let rows = stmt
@@ -815,6 +817,7 @@ impl Store {
                     ad_count: r.get(12)?,
                     ad_secs: r.get(13)?,
                     meta_change_count: r.get(14)?,
+                    log_excerpt: r.get(15)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

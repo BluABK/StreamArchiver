@@ -567,6 +567,9 @@ pub struct MonitorWithChannel {
     /// Title + game/category changes logged during the latest recording take (see
     /// [`StreamMetaChange`]). Drives the Changes column / popup.
     pub last_recording_meta_changes: i64,
+    /// Captured stderr tail of the latest recording (the `log_excerpt`), used to
+    /// show *why* it failed on hover. Empty when there's no recording yet.
+    pub last_recording_log: String,
     /// Cached auto Twitch-sub ad-free status: `None` unknown/not checked,
     /// `Some(false)` checked & not subscribed, `Some(true)` subscribed. Combined
     /// with `monitor.ad_free` (the manual flag) for the Ad-free column. (The
@@ -768,6 +771,8 @@ pub struct Recording {
     /// Title + game/category changes logged during this take; per-change rows live
     /// in `stream_meta_change`.
     pub meta_change_count: i64,
+    /// Captured stderr tail (`log_excerpt`) — the failure reason for a failed take.
+    pub log_excerpt: String,
 }
 
 impl Recording {
@@ -936,6 +941,7 @@ mod tests {
             ad_count: 0,
             ad_secs: 0,
             meta_change_count: 0,
+            log_excerpt: String::new(),
         }
     }
 
