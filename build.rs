@@ -14,7 +14,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
     let hash = git(&["rev-parse", "--short=9", "HEAD"]).unwrap_or_else(|| "nogit".to_string());
-    let dirty = match git(&["status", "--porcelain"]) {
+    // Dirty = uncommitted changes to *tracked* files; ignore untracked files
+    // (editor configs, build output, etc.) which don't change the built code.
+    let dirty = match git(&["status", "--porcelain", "--untracked-files=no"]) {
         Some(s) if !s.trim().is_empty() => "-dirty",
         _ => "",
     };
