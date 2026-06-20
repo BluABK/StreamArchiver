@@ -280,6 +280,9 @@ pub struct StreamArchiverApp {
     expanded_instances: HashSet<i64>,
     expanded_streams: HashSet<String>,
     rec_cache: HashMap<i64, Vec<Recording>>,
+    /// Lazy per-recording ad-break detail (cut list), keyed by recording id;
+    /// cleared on reload. Avoids a per-frame DB query for tooltips/the popup.
+    ad_break_cache: HashMap<i64, Vec<AdBreak>>,
     /// Recording id whose ad-break cut list is shown in a popup (None = closed).
     ad_popup: Option<i64>,
     /// Sort + per-column filters for the Videos table.
@@ -382,6 +385,7 @@ impl StreamArchiverApp {
             expanded_instances: HashSet::new(),
             expanded_streams: HashSet::new(),
             rec_cache: HashMap::new(),
+            ad_break_cache: HashMap::new(),
             ad_popup: None,
             videos_sort: SortState::default(),
             videos_filters: vec![String::new(); VIDEO_COLS],
@@ -407,6 +411,7 @@ impl StreamArchiverApp {
         }
         // History may have changed; re-fetch lazily on next expand.
         self.rec_cache.clear();
+        self.ad_break_cache.clear();
         // Drop expansion state for channels/monitors that no longer exist (avoids
         // an unbounded leak and "sticky" expansion if a row id is later reused).
         let live_channels: HashSet<i64> = self.channels.iter().map(|c| c.id).collect();
@@ -2486,11 +2491,17 @@ impl StreamArchiverApp {
         let Some(rid) = self.ad_popup else {
             return;
         };
-        let breaks = self
-            .core
-            .store
-            .ad_breaks_for_recording(rid)
-            .unwrap_or_default();
+        // Reuse the cached cut list (cleared on reload) rather than re-querying
+        // every frame the popup is open.
+        if !self.ad_break_cache.contains_key(&rid) {
+            let v = self
+                .core
+                .store
+                .ad_breaks_for_recording(rid)
+                .unwrap_or_default();
+            self.ad_break_cache.insert(rid, v);
+        }
+        let breaks = self.ad_break_cache.get(&rid).cloned().unwrap_or_default();
         let total: i64 = breaks.iter().map(|b| b.duration_secs).sum();
         let mut open = true;
         egui::Window::new("Ad breaks — cut points")
@@ -2614,21 +2625,27 @@ impl StreamArchiverApp {
             .collect();
 
         // Per-recording ad-break detail (offsets) for the cut-list tooltips on
-        // expanded history rows. Only fetched for takes that actually had ads, so
-        // it stays bounded by what's currently expanded.
-        let mut ad_breaks: HashMap<i64, Vec<AdBreak>> = HashMap::new();
+        // expanded history rows. Cached (cleared on reload) so we issue the SELECT
+        // once per take with ads, not every frame; bounded by what's expanded.
         for &mid in &expanded_monitors {
-            if let Some(recs) = self.rec_cache.get(&mid) {
-                for r in recs.iter().filter(|r| r.ad_count > 0) {
-                    let v = self
-                        .core
-                        .store
-                        .ad_breaks_for_recording(r.id)
-                        .unwrap_or_default();
-                    ad_breaks.insert(r.id, v);
-                }
+            let need: Vec<i64> = match self.rec_cache.get(&mid) {
+                Some(recs) => recs
+                    .iter()
+                    .filter(|r| r.ad_count > 0 && !self.ad_break_cache.contains_key(&r.id))
+                    .map(|r| r.id)
+                    .collect(),
+                None => Vec::new(),
+            };
+            for rid in need {
+                let v = self
+                    .core
+                    .store
+                    .ad_breaks_for_recording(rid)
+                    .unwrap_or_default();
+                self.ad_break_cache.insert(rid, v);
             }
         }
+        let ad_breaks = &self.ad_break_cache;
         // Collected in the table closure (which borrows `self` immutably), applied
         // afterwards: a double-click on an ad cell opens that take's cut-list popup.
         let mut open_ad_popup: Option<i64> = None;

@@ -23,6 +23,16 @@ pub struct Store {
     conn: Mutex<Connection>,
 }
 
+/// Minimal monitor fields the ad-free (Twitch sub) refresher needs.
+pub struct AdFreeRow {
+    pub id: i64,
+    pub url: String,
+    pub ad_free: bool,
+    pub ad_free_sub: Option<bool>,
+    pub ad_free_sub_at: Option<i64>,
+    pub last_state: String,
+}
+
 /// Row summary for the `--recordings` diagnostic.
 pub struct RecInfo {
     pub id: i64,
@@ -457,6 +467,30 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// Minimal Twitch-monitor rows for the ad-free refresher — just the fields it
+    /// needs, avoiding the heavy channel/recording/ad-break join of
+    /// [`Self::list_monitors_with_channels`] on its frequent poll tick.
+    pub fn twitch_monitors_for_ad_free(&self) -> Result<Vec<AdFreeRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, url, ad_free, ad_free_sub, ad_free_sub_at, last_state
+             FROM monitor WHERE url LIKE '%twitch.tv%'",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(AdFreeRow {
+                    id: r.get(0)?,
+                    url: r.get(1)?,
+                    ad_free: r.get::<_, i64>(2)? != 0,
+                    ad_free_sub: r.get::<_, Option<i64>>(3)?.map(|v| v != 0),
+                    ad_free_sub_at: r.get(4)?,
+                    last_state: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Clear all cached auto Twitch-sub ad-free results (e.g. on disconnect).
     pub fn clear_ad_free_sub(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -600,7 +634,7 @@ impl Store {
                 m.url,
                 (SELECT COUNT(*) FROM ad_break ab WHERE ab.recording_id = r.id),
                 COALESCE((SELECT SUM(ab.duration_secs) FROM ad_break ab WHERE ab.recording_id = r.id), 0),
-                m.ad_free, m.ad_free_sub, m.ad_free_sub_at
+                m.ad_free, m.ad_free_sub
              FROM monitor m
              JOIN channel c ON c.id = m.channel_id
              LEFT JOIN recording r
@@ -649,7 +683,6 @@ impl Store {
                     last_recording_ad_count: r.get(30)?,
                     last_recording_ad_secs: r.get(31)?,
                     ad_free_sub: r.get::<_, Option<i64>>(33)?.map(|v| v != 0),
-                    ad_free_sub_at: r.get(34)?,
                     recording_count: r.get(28)?,
                 })
             })?

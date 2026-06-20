@@ -1604,7 +1604,6 @@ mod tests {
             last_recording_ad_count: 0,
             last_recording_ad_secs: 0,
             ad_free_sub: None,
-            ad_free_sub_at: None,
             recording_count: 0,
         }
     }

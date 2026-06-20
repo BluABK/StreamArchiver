@@ -462,10 +462,9 @@ pub struct MonitorWithChannel {
     pub last_recording_ad_secs: i64,
     /// Cached auto Twitch-sub ad-free status: `None` unknown/not checked,
     /// `Some(false)` checked & not subscribed, `Some(true)` subscribed. Combined
-    /// with `monitor.ad_free` (the manual flag) for the Ad-free column.
+    /// with `monitor.ad_free` (the manual flag) for the Ad-free column. (The
+    /// refresher tracks the last-checked time via a separate lightweight query.)
     pub ad_free_sub: Option<bool>,
-    /// When `ad_free_sub` was last refreshed (unix secs), for staleness.
-    pub ad_free_sub_at: Option<i64>,
     /// Total recording takes for this monitor (drives the history-tree disclosure
     /// without loading the full history until a row is expanded).
     pub recording_count: i64,

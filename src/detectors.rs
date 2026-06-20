@@ -767,7 +767,7 @@ async fn refresh_ad_free_once(
     shutdown: &Arc<AtomicBool>,
     stale_after: i64,
 ) {
-    let rows = match ctx.store.list_monitors_with_channels() {
+    let rows = match ctx.store.twitch_monitors_for_ad_free() {
         Ok(r) => r,
         Err(_) => return,
     };
@@ -778,12 +778,9 @@ async fn refresh_ad_free_once(
         if shutdown.load(Ordering::SeqCst) {
             return;
         }
-        if row.monitor.platform() != Platform::Twitch {
-            continue;
-        }
         // The manual flag already wins in the UI, so the auto result would never be
         // shown — don't spend a Helix call on it.
-        if row.monitor.ad_free {
+        if row.ad_free {
             continue;
         }
         if let Some(at) = row.ad_free_sub_at {
@@ -791,7 +788,7 @@ async fn refresh_ad_free_once(
                 continue; // checked recently
             }
         }
-        let Some(login) = twitch_login(&row.monitor.url) else {
+        let Some(login) = twitch_login(&row.url) else {
             continue;
         };
         let result = match by_login.get(&login) {
@@ -809,19 +806,19 @@ async fn refresh_ad_free_once(
             let wrote = ctx
                 .store
                 .set_monitor_ad_free_sub_if_connected(
-                    row.monitor.id,
+                    row.id,
                     Some(sub),
                     now,
                     crate::oauth::K_USER_ID,
                 )
                 .unwrap_or(false);
             if wrote {
-                info!(monitor_id = row.monitor.id, subscribed = sub, "ad-free sub status refreshed");
+                info!(monitor_id = row.id, subscribed = sub, "ad-free sub status refreshed");
                 // Reload the UI only when the displayed status actually changed.
                 if result != row.ad_free_sub {
                     let _ = events.send(AppEvent::MonitorState {
-                        monitor_id: row.monitor.id,
-                        state: row.monitor.last_state.clone(),
+                        monitor_id: row.id,
+                        state: row.last_state.clone(),
                     });
                 }
             }
