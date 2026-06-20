@@ -163,11 +163,25 @@ pub fn resolve_auth_for(
 /// All tools capture to a progressively-flushed `.ts` (so an abrupt
 /// kill/crash leaves usable data) and remux losslessly to `.mkv` on clean
 /// stop. If the user picked the TS container, the `.ts` is kept as-is.
-pub fn build_plan(row: &MonitorWithChannel, started_at: i64, auth: &AuthSource) -> DownloadPlan {
+pub fn build_plan(
+    row: &MonitorWithChannel,
+    started_at: i64,
+    auth: &AuthSource,
+    stream_id: Option<&str>,
+) -> DownloadPlan {
     let m = &row.monitor;
     let ch = &row.channel;
     let dir = PathBuf::from(&m.output_dir);
-    let stem = expand_template(&m.filename_template, &ch.name, "", "", started_at);
+    // `{video_id}` is the platform stream/video id when detection knew it (Twitch
+    // Helix/EventSub, YouTube Data API, Kick API); empty for id-less methods.
+    let stem = expand_template(
+        &m.filename_template,
+        &ch.name,
+        "",
+        "",
+        stream_id.unwrap_or(""),
+        started_at,
+    );
     let quality = if m.quality.trim().is_empty() {
         "best".to_string()
     } else {
@@ -270,11 +284,12 @@ pub fn build_video_plan(
     started_at: i64,
     title: &str,
     channel: &str,
+    video_id: &str,
     auth: &AuthSource,
 ) -> DownloadPlan {
     let dir = PathBuf::from(&v.output_dir);
     // `{name}` prefers the user's Name field, then the resolved title, then a
-    // generic fallback. `{title}`/`{channel}` are the resolved metadata.
+    // generic fallback. `{title}`/`{channel}`/`{video_id}` are resolved metadata.
     let name_field = v.title.trim();
     let resolved = title.trim();
     let name = if !name_field.is_empty() {
@@ -289,6 +304,7 @@ pub fn build_video_plan(
         name,
         resolved,
         channel.trim(),
+        video_id.trim(),
         started_at,
     );
     let quality = if v.quality.trim().is_empty() {
@@ -677,12 +693,12 @@ impl Supervisor {
             &global_method,
             &global_browser,
         );
-        // Optionally resolve the real title + channel (for {title}/{channel}/{name}
-        // and the list display).
-        let (title, channel) = if video.auto_title {
+        // Optionally resolve the real title + channel + id (for
+        // {title}/{channel}/{video_id}/{name} and the list display).
+        let (title, channel, video_id) = if video.auto_title {
             resolve_meta(&video, &auth).await
         } else {
-            (String::new(), String::new())
+            (String::new(), String::new(), String::new())
         };
         if !title.is_empty() && video.title.trim().is_empty() {
             let _ = self.store.set_video_title(id, &title);
@@ -690,7 +706,7 @@ impl Supervisor {
         if !channel.is_empty() {
             let _ = self.store.set_video_channel(id, &channel);
         }
-        let plan = build_video_plan(&video, started_at, &title, &channel, &auth);
+        let plan = build_video_plan(&video, started_at, &title, &channel, &video_id, &auth);
         if let Some(parent) = plan.capture_path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
@@ -845,7 +861,7 @@ impl Supervisor {
             .flatten()
             .unwrap_or_default();
         let auth = resolve_auth(&row, &global_method, &global_browser);
-        let plan = build_plan(&row, started_at, &auth);
+        let plan = build_plan(&row, started_at, &auth, stream_id.as_deref());
         if let Some(parent) = plan.capture_path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
@@ -1251,12 +1267,12 @@ fn parse_ad_break_secs(line: &str) -> Option<i64> {
     digits.parse::<i64>().ok()
 }
 
-/// Resolve a video/stream's real title and channel/uploader via yt-dlp (no
+/// Resolve a video/stream's real title, channel/uploader, and id via yt-dlp (no
 /// download). Works for YouTube, Twitch VODs, Kick, and many sites; returns
-/// `(title, channel)` with empty strings on any failure (caller falls back).
+/// `(title, channel, id)` with empty strings on any failure (caller falls back).
 /// Each is truncated to keep filenames sane.
-async fn resolve_meta(video: &Video, auth: &AuthSource) -> (String, String) {
-    // Two `--print` templates -> two output lines, in order.
+async fn resolve_meta(video: &Video, auth: &AuthSource) -> (String, String, String) {
+    // Three `--print` templates -> three output lines, in order.
     let mut args: Vec<String> = vec![
         "--no-playlist".into(),
         "--no-warnings".into(),
@@ -1265,6 +1281,8 @@ async fn resolve_meta(video: &Video, auth: &AuthSource) -> (String, String) {
         "%(title)s".into(),
         "--print".into(),
         "%(channel,uploader)s".into(),
+        "--print".into(),
+        "%(id)s".into(),
     ];
     match auth {
         AuthSource::CookiesBrowser(b) => {
@@ -1290,7 +1308,7 @@ async fn resolve_meta(video: &Video, auth: &AuthSource) -> (String, String) {
 
     let out = match cmd.output().await {
         Ok(o) if o.status.success() => o,
-        _ => return (String::new(), String::new()),
+        _ => return (String::new(), String::new(), String::new()),
     };
     let raw = String::from_utf8_lossy(&out.stdout);
     let mut lines = raw.lines();
@@ -1304,7 +1322,8 @@ async fn resolve_meta(video: &Video, auth: &AuthSource) -> (String, String) {
     };
     let title = clean(lines.next().unwrap_or(""));
     let channel = clean(lines.next().unwrap_or(""));
-    (title, channel)
+    let id = clean(lines.next().unwrap_or(""));
+    (title, channel, id)
 }
 
 /// Probe available formats/qualities for a URL with the given tool, returning
@@ -1506,10 +1525,18 @@ fn split_args(s: &str) -> Vec<String> {
 }
 
 /// Expand a filename template using our own (tool-agnostic) variables so the
-/// output path is known in advance: `{name} {title} {channel} {date} {time}
-/// {timestamp}`. `title`/`channel` are resolved metadata (empty when not
-/// auto-detected).
-fn expand_template(template: &str, name: &str, title: &str, channel: &str, secs: i64) -> String {
+/// output path is known in advance: `{name} {title} {channel} {video_id} {date}
+/// {time} {timestamp}`. `title`/`channel`/`video_id` are resolved metadata (empty
+/// when not known: e.g. live recordings have no title, id-less detection methods
+/// have no video_id).
+fn expand_template(
+    template: &str,
+    name: &str,
+    title: &str,
+    channel: &str,
+    video_id: &str,
+    secs: i64,
+) -> String {
     let (y, mo, d, h, mi, s) = civil_from_unix_utc(secs);
     let date = format!("{y:04}{mo:02}{d:02}");
     let time = format!("{h:02}{mi:02}{s:02}");
@@ -1522,6 +1549,7 @@ fn expand_template(template: &str, name: &str, title: &str, channel: &str, secs:
         .replace("{name}", name)
         .replace("{title}", title)
         .replace("{channel}", channel)
+        .replace("{video_id}", video_id)
         .replace("{date}", &date)
         .replace("{time}", &time)
         .replace("{timestamp}", &secs.to_string());
@@ -1637,8 +1665,24 @@ mod tests {
 
     #[test]
     fn template_expands_and_sanitizes() {
-        let name = expand_template("{name}_{date}", "Bad/Name?", "", "", 1_700_000_000);
+        let name = expand_template("{name}_{date}", "Bad/Name?", "", "", "", 1_700_000_000);
         assert_eq!(name, "Bad_Name__20231114");
+    }
+
+    #[test]
+    fn template_expands_video_id() {
+        let out = expand_template(
+            "{name}_{video_id}",
+            "Stream",
+            "",
+            "",
+            "abc123",
+            1_700_000_000,
+        );
+        assert_eq!(out, "Stream_abc123");
+        // Empty id (id-less detection) leaves the slot blank.
+        let out = expand_template("{name}-{video_id}", "Stream", "", "", "", 1_700_000_000);
+        assert_eq!(out, "Stream-");
     }
 
     #[test]
@@ -1699,6 +1743,7 @@ mod tests {
             "ignored",
             "My Stream!",
             "Streamer",
+            "",
             1_700_000_000,
         );
         assert_eq!(out, "My Stream!_20231114");
@@ -1708,6 +1753,7 @@ mod tests {
             "Nm",
             "Ttl",
             "Chan",
+            "",
             1_700_000_000,
         );
         assert_eq!(out2, "Chan-Nm-Ttl");
@@ -1719,6 +1765,7 @@ mod tests {
             &row(Tool::Streamlink, Container::Mkv, Platform::Twitch),
             1_700_000_000,
             &AuthSource::None,
+            None,
         );
         assert_eq!(plan.program, "streamlink");
         assert!(plan.capture_path.to_string_lossy().ends_with(".ts"));
@@ -1738,6 +1785,7 @@ mod tests {
             &row(Tool::YtDlp, Container::Mkv, Platform::YouTube),
             1_700_000_000,
             &AuthSource::None,
+            None,
         );
         assert_eq!(plan.program, "yt-dlp");
         assert!(plan.capture_path.to_string_lossy().ends_with(".ts"));
@@ -1753,6 +1801,7 @@ mod tests {
             &row(Tool::Streamlink, Container::Mkv, Platform::Twitch),
             1_700_000_000,
             &AuthSource::Token("abc123".into()),
+            None,
         );
         assert!(
             plan.args
@@ -1767,6 +1816,7 @@ mod tests {
             &row(Tool::YtDlp, Container::Mkv, Platform::YouTube),
             1_700_000_000,
             &AuthSource::CookiesBrowser("firefox".into()),
+            None,
         );
         let joined = browser.args.join(" ");
         assert!(joined.contains("--cookies-from-browser firefox"));
@@ -1775,6 +1825,7 @@ mod tests {
             &row(Tool::YtDlp, Container::Mkv, Platform::YouTube),
             1_700_000_000,
             &AuthSource::CookiesFile("C:/c.txt".into()),
+            None,
         );
         assert!(file.args.join(" ").contains("--cookies C:/c.txt"));
     }
@@ -1805,6 +1856,7 @@ mod tests {
             &row(Tool::Streamlink, Container::Ts, Platform::Twitch),
             1_700_000_000,
             &AuthSource::None,
+            None,
         );
         assert!(plan.final_path.to_string_lossy().ends_with(".ts"));
         assert!(!plan.remux_to_mkv);
@@ -1842,6 +1894,7 @@ mod tests {
             1_700_000_000,
             "",
             "",
+            "",
             &AuthSource::None,
         );
         assert_eq!(plan.program, "yt-dlp");
@@ -1861,6 +1914,7 @@ mod tests {
             1_700_000_000,
             "",
             "",
+            "",
             &AuthSource::CookiesBrowser("edge".into()),
         );
         let joined = plan.args.join(" ");
@@ -1873,6 +1927,7 @@ mod tests {
         let plan = build_video_plan(
             &video(Tool::Streamlink, "https://twitch.tv/videos/123"),
             1_700_000_000,
+            "",
             "",
             "",
             &AuthSource::None,

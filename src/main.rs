@@ -350,7 +350,7 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
         ad_free_sub: None,
         recording_count: 0,
     };
-    let plan = downloader::build_plan(&row, models::now_unix(), &downloader::AuthSource::None);
+    let plan = downloader::build_plan(&row, models::now_unix(), &downloader::AuthSource::None, None);
     println!("plan: {} {:?}", plan.program, plan.args);
 
     let rt = tokio::runtime::Runtime::new()?;

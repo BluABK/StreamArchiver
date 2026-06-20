@@ -252,6 +252,7 @@ yt-dlp's output templates):
 | `{name}` | **Streams:** the channel (container) name. **Videos:** the **Name** field if set, else the auto-detected title, else `video`. |
 | `{title}` | The stream/video title. **Videos only**, and only when **Auto-detect** is on (live recordings don't resolve a title, so it's empty there). |
 | `{channel}` | The uploader/channel name. **Videos only**, when **Auto-detect** is on; empty otherwise. |
+| `{video_id}` | The platform **stream/video id**. **Streams:** set when detection knows it (Twitch Helix/EventSub, YouTube Data API, Kick API); empty for id-less methods (scrape / generic probe). **Videos:** set when **Auto-detect** is on. |
 | `{date}` | Capture-start date, **UTC**, `YYYYMMDD` (e.g. `20260620`). |
 | `{time}` | Capture-start time, **UTC**, `HHMMSS` (e.g. `183001`). |
 | `{timestamp}` | Capture start as a **Unix timestamp** (whole seconds). |
@@ -268,8 +269,8 @@ Notes:
 - If a template expands to nothing usable, it falls back to `{name}_{date}_{time}`.
 
 Examples: `{name}_{date}_{time}` → `Layna_20260620_183001.mkv`; for a Videos
-download with **Auto-detect** on, `{channel} - {title} [{timestamp}]` →
-`SomeChannel - Cool Stream [1718908201].mkv`.
+download with **Auto-detect** on, `{channel} - {title} [{video_id}]` →
+`SomeChannel - Cool Stream [dQw4w9WgXcQ].mkv`.
 
 ### Authentication
 
