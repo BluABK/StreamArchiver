@@ -418,6 +418,10 @@ pub struct Monitor {
     /// Capture from the start of the broadcast (yt-dlp `--live-from-start`,
     /// streamlink `--hls-live-restart`) vs. from the live edge. Default true.
     pub capture_from_start: bool,
+    /// Manually marked ad-free for our account (YouTube membership/Premium,
+    /// Twitch Turbo/sub) — captures won't have ad-break hard cuts. Auto Twitch-sub
+    /// detection can also set the displayed status; see `MonitorWithChannel`.
+    pub ad_free: bool,
     /// Per-channel auth override for the downloader (Inherit = use global).
     pub auth_kind: AuthKind,
     /// Value for `auth_kind`: browser name, cookies.txt path, or token.

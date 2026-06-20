@@ -1524,6 +1524,7 @@ mod tests {
                 filename_template: "{name}_{date}_{time}".into(),
                 container,
                 capture_from_start: true,
+                ad_free: false,
                 auth_kind: AuthKind::Inherit,
                 auth_value: String::new(),
                 extra_args: String::new(),

@@ -86,6 +86,9 @@ struct MonitorForm {
     filename_template: String,
     container: Container,
     capture_from_start: bool,
+    /// Manually mark this instance ad-free (member/sub/Turbo) — drives the Ad-free
+    /// column when auto detection isn't available.
+    ad_free: bool,
     enabled: bool,
     auth_kind: AuthKind,
     auth_value: String,
@@ -111,6 +114,7 @@ impl MonitorForm {
             filename_template: "{name}_{date}_{time}".into(),
             container: Container::Mkv,
             capture_from_start: true,
+            ad_free: false,
             enabled: true,
             auth_kind: AuthKind::Inherit,
             auth_value: String::new(),
@@ -134,6 +138,7 @@ impl MonitorForm {
             filename_template: m.filename_template.clone(),
             container: m.container,
             capture_from_start: m.capture_from_start,
+            ad_free: m.ad_free,
             enabled: m.enabled,
             auth_kind: m.auth_kind,
             auth_value: m.auth_value.clone(),
@@ -159,6 +164,7 @@ impl MonitorForm {
             filename_template: "{name}_{date}_{time}".into(),
             container: Container::Mkv,
             capture_from_start: true,
+            ad_free: false,
             enabled: true,
             auth_kind: AuthKind::Inherit,
             auth_value: String::new(),
@@ -503,6 +509,7 @@ impl StreamArchiverApp {
             filename_template: form.filename_template.clone(),
             container: form.container,
             capture_from_start: form.capture_from_start,
+            ad_free: form.ad_free,
             auth_kind: form.auth_kind,
             auth_value: form.auth_value.clone(),
             extra_args: form.extra_args.clone(),
@@ -630,6 +637,41 @@ fn fmt_ad_time(secs: i64) -> String {
     if secs > 0 { fmt_duration(secs) } else { String::new() }
 }
 
+/// Resolve an instance's ad-free status into a (label, tooltip) for display.
+/// Manual flag wins; otherwise the auto Twitch-sub result (`Some(true)` = sub'd,
+/// `Some(false)` = checked & not sub'd, `None` = unknown/not checked). Returns
+/// `None` when there's nothing to show.
+fn ad_free_status(manual: bool, sub: Option<bool>) -> Option<(&'static str, &'static str)> {
+    if manual {
+        Some((
+            "Yes",
+            "Marked ad-free for your account (member/sub/Turbo) — captures won't have \
+             ad-break hard cuts.",
+        ))
+    } else {
+        match sub {
+            Some(true) => Some((
+                "Yes (sub)",
+                "Your connected Twitch account is subscribed to this channel — \
+                 subscriber captures have no ad breaks.",
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// Channel-row ad-free summary (label + numeric sort key) from how many of the
+/// channel's instances are ad-free.
+fn ad_free_summary(ad_free_count: usize, total: usize) -> (&'static str, f64) {
+    if total == 0 || ad_free_count == 0 {
+        ("", 0.0)
+    } else if ad_free_count == total {
+        ("Yes", 2.0)
+    } else {
+        ("some", 1.0)
+    }
+}
+
 /// Human-readable lines describing where ad breaks cause hard cuts in the
 /// finished file. `at_secs` is already the cut's position in the captured file
 /// (ad segments are filtered out), so it's shown directly as a seek timestamp.
@@ -731,7 +773,7 @@ fn fmt_speed(bytes_per_sec: f64) -> String {
 /// Sortable/filterable Videos columns (Video..File; excludes Actions).
 const VIDEO_COLS: usize = 9;
 /// Sortable/filterable Streams columns (On..Added; excludes Actions).
-const STREAM_COLS: usize = 15;
+const STREAM_COLS: usize = 16;
 
 /// Which column a table is sorted by and in what direction. `col == None` keeps
 /// the natural (database) order.
@@ -1059,6 +1101,14 @@ fn channel_cells(channel: &Channel, monitors: &[&MonitorWithChannel], now: i64) 
             primary.last_recording_ad_secs as f64,
             fmt_ad_time(primary.last_recording_ad_secs),
         ),
+        {
+            let n = monitors
+                .iter()
+                .filter(|m| ad_free_status(m.monitor.ad_free, None).is_some())
+                .count();
+            let (label, key) = ad_free_summary(n, monitors.len());
+            Cell::num(key, label)
+        },
         Cell::num(channel.created_at as f64, fmt_date(channel.created_at)),
     ]
 }
@@ -1217,6 +1267,12 @@ fn render_instance_row(
             ui.label(fmt_ad_time(row.last_recording_ad_secs)).on_hover_text(
                 ad_tooltip(row.last_recording_ad_count, row.last_recording_ad_secs, None),
             );
+        }
+    });
+    tr.col(|ui| {
+        if let Some((label, hover)) = ad_free_status(m.ad_free, None) {
+            ui.colored_label(egui::Color32::from_rgb(0x57, 0xc7, 0x57), label)
+                .on_hover_text(hover);
         }
     });
     tr.col(|ui| {
@@ -2628,6 +2684,7 @@ impl StreamArchiverApp {
                     .column(Column::auto().at_least(58.0)) // duration
                     .column(Column::auto().at_least(44.0)) // ads
                     .column(Column::auto().at_least(58.0)) // ad time
+                    .column(Column::auto().at_least(64.0)) // ad-free
                     .column(Column::auto().at_least(80.0)) // added
                     .column(Column::remainder().at_least(140.0)) // actions
                     .header(46.0, |mut header| {
@@ -2646,6 +2703,7 @@ impl StreamArchiverApp {
                             "Duration",
                             "Ads",
                             "Ad time",
+                            "Ad-free",
                             "Added",
                         ];
                         for (i, t) in titles.into_iter().enumerate() {
@@ -2727,6 +2785,13 @@ impl StreamArchiverApp {
                                 let ads = primary.map(|m| {
                                     (m.last_recording_ad_count, m.last_recording_ad_secs)
                                 });
+                                let n_adfree = mons
+                                    .iter()
+                                    .filter(|m| {
+                                        ad_free_status(m.monitor.ad_free, None).is_some()
+                                    })
+                                    .count();
+                                let ad_free = ad_free_summary(n_adfree, ninst);
                                 body.row(24.0, |mut tr| {
                                     tr.set_selected(any_rec);
                                     let mut disc = false;
@@ -2809,6 +2874,14 @@ impl StreamArchiverApp {
                                                 ui.label(fmt_ad_time(s))
                                                     .on_hover_text(ad_tooltip(c, s, None));
                                             }
+                                        }
+                                    });
+                                    tr.col(|ui| {
+                                        if !ad_free.0.is_empty() {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(0x57, 0xc7, 0x57),
+                                                ad_free.0,
+                                            );
                                         }
                                     });
                                     tr.col(|ui| {
@@ -2977,7 +3050,8 @@ impl StreamArchiverApp {
                                             }
                                         }
                                     });
-                                    tr.col(|_ui| {});
+                                    tr.col(|_ui| {}); // ad-free (n/a per stream)
+                                    tr.col(|_ui| {}); // added
                                     tr.col(|ui| {
                                         let ok = dir.as_ref().map(|d| d.is_dir()).unwrap_or(false);
                                         if ui
@@ -3065,7 +3139,8 @@ impl StreamArchiverApp {
                                             }
                                         }
                                     });
-                                    tr.col(|_ui| {});
+                                    tr.col(|_ui| {}); // ad-free (n/a per take)
+                                    tr.col(|_ui| {}); // added
                                     tr.col(|ui| {
                                         ui.push_id(t.id, |ui| {
                                             let file_ok = !t.output_path.is_empty()
@@ -3594,6 +3669,15 @@ impl StreamArchiverApp {
                         ui.label("Capture from start");
                         ui.checkbox(&mut form.capture_from_start, "").on_hover_text(
                             "yt-dlp --live-from-start / streamlink --hls-live-restart",
+                        );
+                        ui.end_row();
+
+                        ui.label("Ad-free");
+                        ui.checkbox(&mut form.ad_free, "").on_hover_text(
+                            "Mark this instance ad-free for your account (YouTube \
+                             membership/Premium, Twitch Turbo/sub) so captures won't have \
+                             ad-break hard cuts. For Twitch with a connected account, sub \
+                             status is also detected automatically.",
                         );
                         ui.end_row();
 

@@ -17,7 +17,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -223,7 +223,16 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 11)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 11);
+        if version < 12 {
+            // Manually-marked ad-free instance (YouTube membership/Premium, Twitch
+            // Turbo/sub): captures won't have ad-break hard cuts. Auto Twitch-sub
+            // detection layers on top of this (a later migration).
+            conn.execute_batch(
+                "ALTER TABLE monitor ADD COLUMN ad_free INTEGER NOT NULL DEFAULT 0;",
+            )?;
+            conn.pragma_update(None, "user_version", 12)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 12);
         Ok(())
     }
 
@@ -336,8 +345,8 @@ impl Store {
         conn.execute(
             "INSERT INTO monitor(channel_id, url, enabled, tool, detection_method, poll_interval_secs,
                 quality, output_dir, filename_template, container, capture_from_start, auth_kind,
-                auth_value, extra_args, max_concurrent, last_state)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                auth_value, extra_args, max_concurrent, last_state, ad_free)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 m.channel_id,
                 m.url,
@@ -355,6 +364,7 @@ impl Store {
                 m.extra_args,
                 m.max_concurrent,
                 m.last_state,
+                m.ad_free as i64,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -365,7 +375,7 @@ impl Store {
         conn.execute(
             "UPDATE monitor SET url=?2, enabled=?3, tool=?4, detection_method=?5, poll_interval_secs=?6,
                 quality=?7, output_dir=?8, filename_template=?9, container=?10, capture_from_start=?11,
-                auth_kind=?12, auth_value=?13, extra_args=?14, max_concurrent=?15 WHERE id=?1",
+                auth_kind=?12, auth_value=?13, extra_args=?14, max_concurrent=?15, ad_free=?16 WHERE id=?1",
             params![
                 m.id,
                 m.url,
@@ -382,6 +392,7 @@ impl Store {
                 m.auth_value,
                 m.extra_args,
                 m.max_concurrent,
+                m.ad_free as i64,
             ],
         )?;
         Ok(())
@@ -544,7 +555,8 @@ impl Store {
                 (SELECT COUNT(*) FROM recording rc WHERE rc.monitor_id = m.id),
                 m.url,
                 (SELECT COUNT(*) FROM ad_break ab WHERE ab.recording_id = r.id),
-                COALESCE((SELECT SUM(ab.duration_secs) FROM ad_break ab WHERE ab.recording_id = r.id), 0)
+                COALESCE((SELECT SUM(ab.duration_secs) FROM ad_break ab WHERE ab.recording_id = r.id), 0),
+                m.ad_free
              FROM monitor m
              JOIN channel c ON c.id = m.channel_id
              LEFT JOIN recording r
@@ -573,6 +585,7 @@ impl Store {
                     filename_template: r.get(13)?,
                     container: Container::parse(&r.get::<_, String>(14)?),
                     capture_from_start: r.get::<_, i64>(15)? != 0,
+                    ad_free: r.get::<_, i64>(32)? != 0,
                     auth_kind: AuthKind::parse(&r.get::<_, String>(16)?),
                     auth_value: r.get(17)?,
                     extra_args: r.get(18)?,
@@ -861,6 +874,7 @@ mod tests {
             filename_template: "{name}_{date}_{time}".into(),
             container: Container::Mkv,
             capture_from_start: true,
+            ad_free: false,
             auth_kind: AuthKind::Inherit,
             auth_value: String::new(),
             extra_args: String::new(),
@@ -997,6 +1011,24 @@ mod tests {
         assert_eq!(store.list_videos().unwrap().len(), 2);
         store.delete_video(id2).unwrap();
         assert_eq!(store.list_videos().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ad_free_flag_roundtrips() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        m.ad_free = true;
+        let mid = store.insert_monitor(&m).unwrap();
+        let row = store.get_monitor_with_channel(mid).unwrap().unwrap();
+        assert!(row.monitor.ad_free);
+
+        // update_monitor persists a cleared flag too.
+        let mut m2 = row.monitor.clone();
+        m2.ad_free = false;
+        store.update_monitor(&m2).unwrap();
+        assert!(!store.get_monitor_with_channel(mid).unwrap().unwrap().monitor.ad_free);
     }
 
     #[test]
