@@ -1266,32 +1266,31 @@ impl eframe::App for StreamArchiverApp {
             .show_inside(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading("StreamArchiver");
-                    let built = env!("BUILD_UNIX")
+                    let built_dt = env!("BUILD_UNIX")
                         .parse::<i64>()
                         .ok()
                         .and_then(|s| chrono::DateTime::from_timestamp(s, 0))
-                        .map(|dt| {
-                            dt.with_timezone(&chrono::Local)
-                                .format("%Y-%m-%d %H:%M")
-                                .to_string()
-                        })
+                        .map(|dt| dt.with_timezone(&chrono::Local));
+                    let built_short = built_dt
+                        .map(|dt| dt.format("%m-%d %H:%M").to_string())
+                        .unwrap_or_default();
+                    let built_full = built_dt
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
                         .unwrap_or_default();
                     ui.label(
-                        egui::RichText::new(concat!(
-                            "v",
+                        egui::RichText::new(format!(
+                            "v{} · {} · built {built_short}",
                             env!("CARGO_PKG_VERSION"),
-                            " · ",
-                            env!("GIT_HASH")
+                            env!("GIT_HASH"),
                         ))
                         .small()
                         .color(egui::Color32::from_gray(0x90)),
                     )
                     .on_hover_text(format!(
-                        "StreamArchiver v{} · build {}\ncommit {}\ncompiled {}",
+                        "StreamArchiver v{} · build {}\ncommit {}\ncompiled {built_full}",
                         env!("CARGO_PKG_VERSION"),
                         env!("BUILD_NUMBER"),
                         env!("GIT_HASH"),
-                        built,
                     ));
                     ui.separator();
                     ui.selectable_value(&mut self.view, View::Streams, "Streams");
