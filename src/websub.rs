@@ -33,6 +33,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, info, warn};
 
+use crate::app_core::sleep_cancellable;
 use crate::events::ManualCommand;
 use crate::models::{DetectionMethod, Platform};
 use crate::store::Store;
@@ -428,16 +429,6 @@ fn find_uc(html: &str) -> Option<String> {
         }
     }
     None
-}
-
-async fn sleep_cancellable(dur: Duration, shutdown: &Arc<AtomicBool>) {
-    let steps = (dur.as_millis() / 200).max(1);
-    for _ in 0..steps {
-        if shutdown.load(Ordering::SeqCst) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
 }
 
 #[cfg(test)]

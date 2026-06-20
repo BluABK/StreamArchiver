@@ -632,6 +632,10 @@ fn fmt_duration(secs: i64) -> String {
     format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
 }
 
+/// Success/affirmative green, shared across the table (recording "completed",
+/// video "completed", ad-free "Yes").
+const SUCCESS_GREEN: egui::Color32 = egui::Color32::from_rgb(0x57, 0xc7, 0x57);
+
 /// Ad-break count for a cell (blank when there are none, so empty rows stay clean).
 fn fmt_ad_count(n: i64) -> String {
     if n > 0 { n.to_string() } else { String::new() }
@@ -703,14 +707,42 @@ fn ad_tooltip(count: i64, secs: i64, breaks: Option<&Vec<AdBreak>>) -> String {
         "{count} ad break(s), {} total — each is a hard cut in the file.",
         fmt_duration(secs)
     );
-    match breaks {
-        Some(b) if !b.is_empty() => {
-            s.push('\n');
-            s.push_str(&ad_cut_lines(b).join("\n"));
-        }
-        _ => {}
+    if let Some(b) = breaks.filter(|b| !b.is_empty()) {
+        s.push('\n');
+        s.push_str(&ad_cut_lines(b).join("\n"));
     }
     s
+}
+
+/// Render one Ads / Ad-time table cell. Blank `text` renders nothing. The hover
+/// tooltip (the cut list) is built lazily, only when hovered. When `clickable_rec`
+/// is set the cell senses a double-click and returns that recording id (to open
+/// its cut-list popup); `detail` is the per-break list when loaded.
+fn ad_cell(
+    ui: &mut egui::Ui,
+    text: String,
+    count: i64,
+    secs: i64,
+    detail: Option<&Vec<AdBreak>>,
+    clickable_rec: Option<i64>,
+) -> Option<i64> {
+    if text.is_empty() {
+        return None;
+    }
+    let label = if clickable_rec.is_some() {
+        egui::Label::new(text).sense(egui::Sense::click())
+    } else {
+        egui::Label::new(text)
+    };
+    let resp = ui
+        .add(label)
+        .on_hover_ui(|ui| {
+            ui.label(ad_tooltip(count, secs, detail));
+        });
+    match clickable_rec {
+        Some(rec) if resp.double_clicked() => Some(rec),
+        _ => None,
+    }
 }
 
 /// Parse the monitor id out of a [`StreamGroup`] key (`s<mid>:…` / `t<mid>:…`).
@@ -752,7 +784,7 @@ fn video_status_color(status: &str) -> egui::Color32 {
     use egui::Color32;
     match status {
         "downloading" => Color32::from_rgb(0x4d, 0x9b, 0xff),
-        "completed" => Color32::from_rgb(0x57, 0xc7, 0x57),
+        "completed" => SUCCESS_GREEN,
         "failed" => Color32::from_rgb(0xe0, 0x6c, 0x6c),
         _ => Color32::from_gray(0xa0), // queued / stopped / orphaned
     }
@@ -984,7 +1016,7 @@ fn rec_status_color(status: &str) -> egui::Color32 {
     use egui::Color32;
     match status {
         "recording" => Color32::from_rgb(0x4d, 0x9b, 0xff),
-        "completed" => Color32::from_rgb(0x57, 0xc7, 0x57),
+        "completed" => SUCCESS_GREEN,
         "failed" => Color32::from_rgb(0xe0, 0x6c, 0x6c),
         _ => Color32::from_gray(0xa0), // stopped / orphaned
     }
@@ -1038,6 +1070,24 @@ fn channel_platform(monitors: &[&MonitorWithChannel]) -> Option<Platform> {
     if it.all(|p| p == first) { Some(first) } else { None }
 }
 
+/// The channel's most-recent-activity instance, which drives the container row's
+/// time + ad columns. `None` only for an empty container. Shared by the
+/// sort/filter model and the row render so they can't drift.
+fn channel_primary<'a>(monitors: &[&'a MonitorWithChannel]) -> Option<&'a MonitorWithChannel> {
+    monitors
+        .iter()
+        .copied()
+        .max_by_key(|m| m.last_recording_started.unwrap_or(0))
+}
+
+/// How many of the channel's instances are ad-free (manual flag or detected sub).
+fn channel_ad_free_count(monitors: &[&MonitorWithChannel]) -> usize {
+    monitors
+        .iter()
+        .filter(|m| ad_free_status(m.monitor.ad_free, m.ad_free_sub).is_some())
+        .count()
+}
+
 /// Sort/filter cells for a channel container's top-level row (matches the table
 /// columns). `channel` is the container; `monitors` are its instances (possibly
 /// none, for an empty container).
@@ -1055,11 +1105,7 @@ fn channel_cells(channel: &Channel, monitors: &[&MonitorWithChannel], now: i64) 
         .iter()
         .any(|m| m.last_recording_status.as_deref() == Some("recording"));
     // The most recent recording across instances drives the time columns.
-    let primary = monitors
-        .iter()
-        .copied()
-        .max_by_key(|m| m.last_recording_started.unwrap_or(0))
-        .unwrap_or(monitors[0]);
+    let primary = channel_primary(monitors).unwrap_or(monitors[0]);
     let rec = recording_cells(primary, now);
     let ninst = monitors.len();
     let tool = if ninst == 1 {
@@ -1107,11 +1153,8 @@ fn channel_cells(channel: &Channel, monitors: &[&MonitorWithChannel], now: i64) 
             fmt_ad_time(primary.last_recording_ad_secs),
         ),
         {
-            let n = monitors
-                .iter()
-                .filter(|m| ad_free_status(m.monitor.ad_free, m.ad_free_sub).is_some())
-                .count();
-            let (label, key) = ad_free_summary(n, monitors.len());
+            let (label, key) =
+                ad_free_summary(channel_ad_free_count(monitors), monitors.len());
             Cell::num(key, label)
         },
         Cell::num(channel.created_at as f64, fmt_date(channel.created_at)),
@@ -1260,24 +1303,16 @@ fn render_instance_row(
     tr.col(|ui| {
         ui.label(&rec.duration);
     });
+    let (ad_c, ad_s) = (row.last_recording_ad_count, row.last_recording_ad_secs);
     tr.col(|ui| {
-        if row.last_recording_ad_count > 0 {
-            ui.label(fmt_ad_count(row.last_recording_ad_count)).on_hover_text(
-                ad_tooltip(row.last_recording_ad_count, row.last_recording_ad_secs, None),
-            );
-        }
+        ad_cell(ui, fmt_ad_count(ad_c), ad_c, ad_s, None, None);
     });
     tr.col(|ui| {
-        if row.last_recording_ad_secs > 0 {
-            ui.label(fmt_ad_time(row.last_recording_ad_secs)).on_hover_text(
-                ad_tooltip(row.last_recording_ad_count, row.last_recording_ad_secs, None),
-            );
-        }
+        ad_cell(ui, fmt_ad_time(ad_s), ad_c, ad_s, None, None);
     });
     tr.col(|ui| {
         if let Some((label, hover)) = ad_free_status(m.ad_free, row.ad_free_sub) {
-            ui.colored_label(egui::Color32::from_rgb(0x57, 0xc7, 0x57), label)
-                .on_hover_text(hover);
+            ui.colored_label(SUCCESS_GREEN, label).on_hover_text(hover);
         }
     });
     tr.col(|ui| {
@@ -2794,21 +2829,13 @@ impl StreamArchiverApp {
                                     .max()
                                     .unwrap_or(0);
                                 // Latest activity across instances drives the time columns.
-                                let primary = mons
-                                    .iter()
-                                    .copied()
-                                    .max_by_key(|m| m.last_recording_started.unwrap_or(0));
+                                let primary = channel_primary(&mons);
                                 let rec = primary.map(|m| recording_cells(m, now));
                                 let ads = primary.map(|m| {
                                     (m.last_recording_ad_count, m.last_recording_ad_secs)
                                 });
-                                let n_adfree = mons
-                                    .iter()
-                                    .filter(|m| {
-                                        ad_free_status(m.monitor.ad_free, m.ad_free_sub).is_some()
-                                    })
-                                    .count();
-                                let ad_free = ad_free_summary(n_adfree, ninst);
+                                let ad_free =
+                                    ad_free_summary(channel_ad_free_count(&mons), ninst);
                                 body.row(24.0, |mut tr| {
                                     tr.set_selected(any_rec);
                                     let mut disc = false;
@@ -2879,26 +2906,17 @@ impl StreamArchiverApp {
                                     });
                                     tr.col(|ui| {
                                         if let Some((c, s)) = ads {
-                                            if c > 0 {
-                                                ui.label(fmt_ad_count(c))
-                                                    .on_hover_text(ad_tooltip(c, s, None));
-                                            }
+                                            ad_cell(ui, fmt_ad_count(c), c, s, None, None);
                                         }
                                     });
                                     tr.col(|ui| {
                                         if let Some((c, s)) = ads {
-                                            if s > 0 {
-                                                ui.label(fmt_ad_time(s))
-                                                    .on_hover_text(ad_tooltip(c, s, None));
-                                            }
+                                            ad_cell(ui, fmt_ad_time(s), c, s, None, None);
                                         }
                                     });
                                     tr.col(|ui| {
                                         if !ad_free.0.is_empty() {
-                                            ui.colored_label(
-                                                egui::Color32::from_rgb(0x57, 0xc7, 0x57),
-                                                ad_free.0,
-                                            );
+                                            ui.colored_label(SUCCESS_GREEN, ad_free.0);
                                         }
                                     });
                                     tr.col(|ui| {
@@ -3040,31 +3058,19 @@ impl StreamArchiverApp {
                                         );
                                     });
                                     tr.col(|ui| {
-                                        if ad_count > 0 {
-                                            let det = ad_rec.and_then(|id| ad_breaks.get(&id));
-                                            let resp = ui
-                                                .add(
-                                                    egui::Label::new(fmt_ad_count(ad_count))
-                                                        .sense(egui::Sense::click()),
-                                                )
-                                                .on_hover_text(ad_tooltip(ad_count, ad_secs, det));
-                                            if ad_rec.is_some() && resp.double_clicked() {
-                                                open_ad_popup = ad_rec;
-                                            }
+                                        let det = ad_rec.and_then(|id| ad_breaks.get(&id));
+                                        if let Some(r) = ad_cell(
+                                            ui, fmt_ad_count(ad_count), ad_count, ad_secs, det, ad_rec,
+                                        ) {
+                                            open_ad_popup = Some(r);
                                         }
                                     });
                                     tr.col(|ui| {
-                                        if ad_secs > 0 {
-                                            let det = ad_rec.and_then(|id| ad_breaks.get(&id));
-                                            let resp = ui
-                                                .add(
-                                                    egui::Label::new(fmt_ad_time(ad_secs))
-                                                        .sense(egui::Sense::click()),
-                                                )
-                                                .on_hover_text(ad_tooltip(ad_count, ad_secs, det));
-                                            if ad_rec.is_some() && resp.double_clicked() {
-                                                open_ad_popup = ad_rec;
-                                            }
+                                        let det = ad_rec.and_then(|id| ad_breaks.get(&id));
+                                        if let Some(r) = ad_cell(
+                                            ui, fmt_ad_time(ad_secs), ad_count, ad_secs, det, ad_rec,
+                                        ) {
+                                            open_ad_popup = Some(r);
                                         }
                                     });
                                     tr.col(|_ui| {}); // ad-free (n/a per stream)
@@ -3125,35 +3131,21 @@ impl StreamArchiverApp {
                                         }
                                     });
                                     tr.col(|ui| {
-                                        if t.ad_count > 0 {
-                                            let det = ad_breaks.get(&t.id);
-                                            let resp = ui
-                                                .add(
-                                                    egui::Label::new(fmt_ad_count(t.ad_count))
-                                                        .sense(egui::Sense::click()),
-                                                )
-                                                .on_hover_text(ad_tooltip(
-                                                    t.ad_count, t.ad_secs, det,
-                                                ));
-                                            if resp.double_clicked() {
-                                                open_ad_popup = Some(t.id);
-                                            }
+                                        let det = ad_breaks.get(&t.id);
+                                        if let Some(r) = ad_cell(
+                                            ui, fmt_ad_count(t.ad_count), t.ad_count, t.ad_secs,
+                                            det, Some(t.id),
+                                        ) {
+                                            open_ad_popup = Some(r);
                                         }
                                     });
                                     tr.col(|ui| {
-                                        if t.ad_secs > 0 {
-                                            let det = ad_breaks.get(&t.id);
-                                            let resp = ui
-                                                .add(
-                                                    egui::Label::new(fmt_ad_time(t.ad_secs))
-                                                        .sense(egui::Sense::click()),
-                                                )
-                                                .on_hover_text(ad_tooltip(
-                                                    t.ad_count, t.ad_secs, det,
-                                                ));
-                                            if resp.double_clicked() {
-                                                open_ad_popup = Some(t.id);
-                                            }
+                                        let det = ad_breaks.get(&t.id);
+                                        if let Some(r) = ad_cell(
+                                            ui, fmt_ad_time(t.ad_secs), t.ad_count, t.ad_secs,
+                                            det, Some(t.id),
+                                        ) {
+                                            open_ad_popup = Some(r);
                                         }
                                     });
                                     tr.col(|_ui| {}); // ad-free (n/a per take)

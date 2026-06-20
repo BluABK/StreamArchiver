@@ -17,6 +17,19 @@ use crate::store::Store;
 /// How long to wait for in-flight recordings to remux/finalize on shutdown.
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Sleep `dur`, returning early (within ~200ms) once `shutdown` is set. Shared by
+/// the background loops (scheduler-adjacent tasks, eventsub, websub, ad-free
+/// refresher) so they all stop promptly on quit.
+pub async fn sleep_cancellable(dur: Duration, shutdown: &Arc<AtomicBool>) {
+    let steps = (dur.as_millis() / 200).max(1);
+    for _ in 0..steps {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 pub struct AppCore {
     pub store: Arc<Store>,
     pub events: EventTx,

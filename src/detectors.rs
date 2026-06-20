@@ -23,6 +23,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
+use crate::app_core::sleep_cancellable;
 use crate::events::{AppEvent, EventTx};
 use crate::models::{Platform, now_unix};
 use crate::store::Store;
@@ -741,7 +742,7 @@ pub async fn refresh_ad_free(ctx: Arc<DetectContext>, events: EventTx, shutdown:
     const TICK_SECS: u64 = 60;
     const STALE_AFTER_SECS: i64 = 6 * 3600;
 
-    interruptible_sleep(&shutdown, INITIAL_DELAY_SECS).await;
+    sleep_cancellable(Duration::from_secs(INITIAL_DELAY_SECS), &shutdown).await;
     loop {
         if shutdown.load(Ordering::SeqCst) {
             return;
@@ -753,7 +754,7 @@ pub async fn refresh_ad_free(ctx: Arc<DetectContext>, events: EventTx, shutdown:
         if crate::oauth::connected_user_id(ctx.store.as_ref()).is_some() {
             refresh_ad_free_once(&ctx, &events, &shutdown, STALE_AFTER_SECS).await;
         }
-        interruptible_sleep(&shutdown, TICK_SECS).await;
+        sleep_cancellable(Duration::from_secs(TICK_SECS), &shutdown).await;
     }
 }
 
@@ -823,19 +824,6 @@ async fn refresh_ad_free_once(
                 }
             }
         }
-    }
-}
-
-/// Sleep `secs`, waking within ~5s if `shutdown` is set.
-async fn interruptible_sleep(shutdown: &Arc<AtomicBool>, secs: u64) {
-    let mut remaining = secs;
-    while remaining > 0 {
-        if shutdown.load(Ordering::SeqCst) {
-            return;
-        }
-        let chunk = remaining.min(5);
-        tokio::time::sleep(Duration::from_secs(chunk)).await;
-        remaining -= chunk;
     }
 }
 
