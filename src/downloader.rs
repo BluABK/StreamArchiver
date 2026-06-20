@@ -229,8 +229,9 @@ pub fn build_plan(
     // `{video_id}` (platform id when known), `{take}` (attempt number), and the
     // media vars (filled only when `media` is provided, i.e. pre-probe). Then
     // avoid clobbering an existing finished file of the same name.
+    // `{games}` isn't known until the stream ends; it's filled at the post-rename.
     let stem = monitor_stem(
-        m, &ch.name, started_at, stream_id, row.recording_count, &quality, media,
+        m, &ch.name, started_at, stream_id, row.recording_count, &quality, media, "",
     );
     let extra = split_args(&m.extra_args);
     let final_ext = match m.container {
@@ -1095,11 +1096,28 @@ impl Supervisor {
             }
         }
 
-        // Post-capture: probe the finished file for actual media info and rename to
-        // the template (the accurate path for the post-rename modes).
-        if want_media && media_mode.post() && file_len(&final_path).await > 0 {
-            if let Some(mi) = probe_media(&final_path.to_string_lossy()).await {
+        // Post-capture: fill in the filename bits that are only known now and
+        // rename. `{resolution}/{fps}/…` come from probing the finished file (the
+        // post-rename media modes); `{games}` is the list of categories played,
+        // and triggers a rename even when media probing is off.
+        let want_games = template_wants_games(&row.monitor.filename_template);
+        let do_post_media = want_media && media_mode.post() && file_len(&final_path).await > 0;
+        if do_post_media || want_games {
+            let mi = if do_post_media {
+                probe_media(&final_path.to_string_lossy()).await
+            } else {
+                None
+            };
+            let games = if want_games {
+                games_for_recording(&self.store, rec_id)
+            } else {
+                String::new()
+            };
+            // Only rename when we actually resolved something to substitute in.
+            if mi.is_some() || !games.is_empty() {
                 let quality = resolved_quality(&row.monitor.quality);
+                // Prefer the post-probe; fall back to the pre-probe so a {games}
+                // rename in pre-probe mode doesn't drop already-resolved media vars.
                 let stem = monitor_stem(
                     &row.monitor,
                     &row.channel.name,
@@ -1107,7 +1125,8 @@ impl Supervisor {
                     stream_id.as_deref(),
                     row.recording_count,
                     &quality,
-                    Some(&mi),
+                    mi.as_ref().or(pre_media.as_ref()),
+                    &games,
                 );
                 final_path = rename_for_media(final_path, &stem).await;
             }
@@ -1620,6 +1639,48 @@ fn template_wants_media(template: &str) -> bool {
         .any(|k| template.contains(k))
 }
 
+/// True if `template` uses `{games}` (only known after the stream ends, so it
+/// triggers a post-capture rename even when media probing is off).
+fn template_wants_games(template: &str) -> bool {
+    template.contains("{games}")
+}
+
+/// Max length of the expanded `{games}` value, to keep paths sane.
+const GAMES_MAX_LEN: usize = 100;
+
+/// Build the `{games}` value from the categories played: distinct names in order
+/// of first appearance (case-insensitive dedup), joined with `, ` and capped to
+/// [`GAMES_MAX_LEN`] characters. Illegal filename characters are handled later by
+/// `sanitize_filename` in `expand_template`.
+fn format_games(categories: &[String]) -> String {
+    let mut seen: Vec<&str> = Vec::new();
+    for c in categories {
+        let c = c.trim();
+        if !c.is_empty() && !seen.iter().any(|s| s.eq_ignore_ascii_case(c)) {
+            seen.push(c);
+        }
+    }
+    let joined = seen.join(", ");
+    if joined.chars().count() <= GAMES_MAX_LEN {
+        joined
+    } else {
+        joined.chars().take(GAMES_MAX_LEN).collect()
+    }
+}
+
+/// The `{games}` value for a finished recording: every distinct category logged
+/// to `stream_meta_change` for it (empty when none / non-Twitch).
+fn games_for_recording(store: &Store, rec_id: i64) -> String {
+    let cats: Vec<String> = store
+        .meta_changes_for_recording(rec_id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| c.kind == "category")
+        .map(|c| c.new_value)
+        .collect();
+    format_games(&cats)
+}
+
 /// Round an ffprobe `r_frame_rate` ("60/1", "30000/1001") to a whole-number fps
 /// string; empty on parse failure.
 fn fmt_fps(rate: &str) -> String {
@@ -1870,6 +1931,7 @@ fn media_info_mode(store: &Store) -> MediaInfoMode {
 
 /// Build a monitor recording's filename stem (no extension, no collision suffix).
 /// Shared by [`build_plan`] and the post-capture rename so they agree.
+#[allow(clippy::too_many_arguments)]
 fn monitor_stem(
     m: &Monitor,
     ch_name: &str,
@@ -1878,6 +1940,7 @@ fn monitor_stem(
     recording_count: i64,
     quality: &str,
     media: Option<&MediaInfo>,
+    games: &str,
 ) -> String {
     let take = (recording_count + 1).to_string();
     let mi = media.cloned().unwrap_or_default();
@@ -1888,6 +1951,7 @@ fn monitor_stem(
             video_id: stream_id.unwrap_or(""),
             quality,
             take: &take,
+            games,
             resolution: &mi.resolution,
             height: &mi.height,
             width: &mi.width,
@@ -2122,14 +2186,18 @@ pub struct TemplateVars<'a> {
     pub vcodec: &'a str,
     /// Attempt number (per-monitor take count); empty for on-demand videos.
     pub take: &'a str,
+    /// Distinct game/category names played during the recording, joined + length-
+    /// capped. Only known after the stream ends, so it's filled at the post-rename
+    /// (empty for the initial capture name and for on-demand videos).
+    pub games: &'a str,
     /// Capture-start time (unix secs) for `{date}`/`{time}`/`{timestamp}`.
     pub secs: i64,
 }
 
 /// Expand a filename template using our own (tool-agnostic) variables so the
 /// output path is known in advance: `{name} {title} {channel} {video_id}
-/// {quality} {resolution} {height} {width} {fps} {vcodec} {take} {date} {time}
-/// {timestamp}`.
+/// {quality} {resolution} {height} {width} {fps} {vcodec} {take} {games} {date}
+/// {time} {timestamp}`.
 fn expand_template(template: &str, v: &TemplateVars) -> String {
     let (y, mo, d, h, mi, s) = civil_from_unix_utc(v.secs);
     let date = format!("{y:04}{mo:02}{d:02}");
@@ -2151,6 +2219,7 @@ fn expand_template(template: &str, v: &TemplateVars) -> String {
         .replace("{fps}", v.fps)
         .replace("{vcodec}", v.vcodec)
         .replace("{take}", v.take)
+        .replace("{games}", v.games)
         .replace("{date}", &date)
         .replace("{time}", &time)
         .replace("{timestamp}", &v.secs.to_string());
@@ -2352,6 +2421,39 @@ mod tests {
         assert!(template_wants_media("{vcodec}-{height}"));
         assert!(!template_wants_media("{name}_{date}_{quality}"));
         assert!(!template_wants_media("{name}_{video_id}"));
+    }
+
+    #[test]
+    fn template_expands_games() {
+        let out = expand_template(
+            "{name}_{games}",
+            &TemplateVars {
+                name: "Layna",
+                games: "Just Chatting, Valorant",
+                secs: 1_700_000_000,
+                ..Default::default()
+            },
+        );
+        assert_eq!(out, "Layna_Just Chatting, Valorant");
+        assert!(template_wants_games("{name}_{games}"));
+        assert!(!template_wants_games("{name}_{date}"));
+    }
+
+    #[test]
+    fn format_games_dedups_orders_and_truncates() {
+        // Case-insensitive dedup, blanks skipped, order of first appearance kept.
+        let cats = vec![
+            "Just Chatting".to_string(),
+            "Valorant".to_string(),
+            "just chatting".to_string(),
+            String::new(),
+            " Valorant ".to_string(),
+        ];
+        assert_eq!(format_games(&cats), "Just Chatting, Valorant");
+        // Capped to GAMES_MAX_LEN characters.
+        let many: Vec<String> = (0..50).map(|i| format!("Game{i}")).collect();
+        assert!(format_games(&many).chars().count() <= GAMES_MAX_LEN);
+        assert_eq!(format_games(&[]), "");
     }
 
     #[test]

@@ -325,6 +325,7 @@ yt-dlp's output templates):
 | `{fps}` | Actual frame rate, rounded to a whole number (e.g. `60`, `30`). Same probing requirement. |
 | `{vcodec}` | Actual video codec (e.g. `h264`, `hevc`, `av1`). Same probing requirement. |
 | `{take}` | **Streams:** this monitor's attempt number (1, 2, 3, …) — a built-in way to keep names unique when you omit `{date}`/`{time}`. Empty for Videos. |
+| `{games}` | **Streams (Twitch):** the distinct game/category names played during the recording, in order of first appearance, joined with `, ` and length-capped. Only known once the stream ends, so it's filled by a **post-capture rename** (see below). Empty for non-Twitch / Videos / when no category was set. |
 | `{date}` | Capture-start date, **UTC**, `YYYYMMDD` (e.g. `20260620`). |
 | `{time}` | Capture-start time, **UTC**, `HHMMSS` (e.g. `183001`). |
 | `{timestamp}` | Capture start as a **Unix timestamp** (whole seconds). |
@@ -364,6 +365,11 @@ variables:
 
 Probing uses the capture tool to resolve the stream and `ffprobe` to read it
 (post-rename `ffprobe`s the finished file). Applies to both Streams and Videos.
+
+`{games}` works the same way but is independent of this setting: because the
+categories played are only known once the stream ends, a template using `{games}`
+always gets a post-capture rename (and any subtitle/chat sidecars are moved along
+with the file).
 
 Examples: `{name}_{date}_{time}` → `Layna_20260620_183001.mkv`; for a Videos
 download with **Auto-detect** on, `{channel} - {title} [{video_id}]` →
