@@ -107,7 +107,7 @@ fn main() -> Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title(concat!(
                 "StreamArchiver v",
-                env!("CARGO_PKG_VERSION"),
+                env!("APP_VERSION"),
                 " (",
                 env!("GIT_HASH"),
                 ")"
@@ -161,7 +161,7 @@ fn build_tray(ctx: egui::Context) -> Result<(TrayIcon, Receiver<UiCommand>)> {
         .with_menu(Box::new(menu))
         .with_tooltip(concat!(
             "StreamArchiver v",
-            env!("CARGO_PKG_VERSION"),
+            env!("APP_VERSION"),
             " (",
             env!("GIT_HASH"),
             ")"

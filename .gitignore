@@ -1,2 +1,4 @@
 /target
 .claude
+# Local, per-machine build counter (the patch z of the displayed version).
+/.build-counter

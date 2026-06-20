@@ -1582,7 +1582,7 @@ impl eframe::App for StreamArchiverApp {
                     ui.label(
                         egui::RichText::new(format!(
                             "v{} · {} · built {built_short}",
-                            env!("CARGO_PKG_VERSION"),
+                            env!("APP_VERSION"),
                             env!("GIT_HASH"),
                         ))
                         .small()
@@ -1590,7 +1590,7 @@ impl eframe::App for StreamArchiverApp {
                     )
                     .on_hover_text(format!(
                         "StreamArchiver v{} · build {}\ncommit {}\ncompiled {built_full}",
-                        env!("CARGO_PKG_VERSION"),
+                        env!("APP_VERSION"),
                         env!("BUILD_NUMBER"),
                         env!("GIT_HASH"),
                     ));
