@@ -104,7 +104,7 @@ fn main() -> Result<()> {
     let (rgba, w, h) = platform::app_icon_rgba();
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("StreamArchiver")
+            .with_title(concat!("StreamArchiver v", env!("CARGO_PKG_VERSION")))
             .with_inner_size([960.0, 600.0])
             .with_min_inner_size([680.0, 420.0])
             .with_visible(!start_hidden)
@@ -152,7 +152,7 @@ fn build_tray(ctx: egui::Context) -> Result<(TrayIcon, Receiver<UiCommand>)> {
 
     let tray = tray_icon::TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("StreamArchiver")
+        .with_tooltip(concat!("StreamArchiver v", env!("CARGO_PKG_VERSION")))
         .with_icon(platform::tray_icon_image()?)
         .build()?;
 

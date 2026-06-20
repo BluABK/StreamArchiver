@@ -1266,6 +1266,12 @@ impl eframe::App for StreamArchiverApp {
             .show_inside(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading("StreamArchiver");
+                    ui.label(
+                        egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                            .small()
+                            .color(egui::Color32::from_gray(0x90)),
+                    )
+                    .on_hover_text(concat!("StreamArchiver v", env!("CARGO_PKG_VERSION")));
                     ui.separator();
                     ui.selectable_value(&mut self.view, View::Streams, "Streams");
                     ui.selectable_value(&mut self.view, View::Videos, "Videos");
