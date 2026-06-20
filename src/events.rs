@@ -46,13 +46,15 @@ pub fn bus() -> (EventTx, EventRx) {
 }
 
 /// A "monitor is live" signal from a detector to the download supervisor.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct LiveSignal {
     pub monitor_id: i64,
     /// Platform-reported go-live time (unix seconds), if known.
     pub went_live_at: Option<i64>,
     /// True when `went_live_at` is our first-detected time, not platform-reported.
     pub approximate: bool,
+    /// Platform stream/video id, if known (groups recording takes of one stream).
+    pub stream_id: Option<String>,
 }
 
 impl LiveSignal {
@@ -61,7 +63,14 @@ impl LiveSignal {
             monitor_id,
             went_live_at,
             approximate,
+            stream_id: None,
         }
+    }
+
+    /// Attach a platform stream id (builder-style).
+    pub fn with_stream_id(mut self, stream_id: Option<String>) -> LiveSignal {
+        self.stream_id = stream_id;
+        self
     }
 }
 

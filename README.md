@@ -95,12 +95,33 @@ a ▲/▼ shows the active column); type in the box under a header to filter tha
 column (case-insensitive substring). Filters combine across columns. This works on
 the **Videos** and **Streams** tables alike.
 
-The channel table shows, per monitor: On (enable/disable), Name, Platform (with a
+The channel table shows, per channel: On (enable/disable), Name, Platform (with a
 brand badge), Tool, Detection, poll interval, State, **Went Live** (the platform's
 go-live time — `~`-prefixed when only our first-detected time is known, e.g. for
 scrape), **Started On** (when we began recording), **Lost time** (how much of the
 stream we missed), **Duration** (live, `HH:MM:SS`), and **Added** (when the channel
 was added).
+
+**Recording history (collapsible).** Each channel row is a tree you can expand
+(the ▶ triangle) to see its **past streams**, and each stream that took more than
+one attempt expands again to its individual **takes**:
+
+```
+▼ Layna            twitch  streamlink  recording
+   ▼ 🎬 2026-06-20 18:00   recording   · 2 takes
+        Take 1   18:00–18:12   failed       (crashed)
+        Take 2   18:13–…       recording
+   ▶ 🎬 2026-06-19 21:30   completed
+```
+
+A channel with **multiple capture instances** (e.g. streamlink *and* yt-dlp on the
+same channel) instead expands to one row per instance, and each instance expands
+to its own streams → takes. The app groups attempts into one stream by the
+platform's **stream/video id** when detection knows it (Twitch Helix/EventSub,
+YouTube Data API, Kick API); for id-less methods (scrape/probe) it groups attempts
+that share a go-live time or that abut in time (a crash + retry, or a manual
+stop+restart, becomes one stream with several takes). A take row offers **Open
+file / Open folder / Copy file path / Remove from list** (the file is kept).
 
 **Lost time & capture-from-start.** Normally Lost time is `Started On − Went Live`
 — the gap before we began. But with **Capture from start** enabled (yt-dlp

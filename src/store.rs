@@ -17,7 +17,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -186,7 +186,14 @@ impl Store {
             conn.execute_batch("ALTER TABLE recording ADD COLUMN lost_secs INTEGER;")?;
             conn.pragma_update(None, "user_version", 8)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 8);
+        if version < 9 {
+            // Platform stream/video id (Twitch stream id, YouTube video id, Kick
+            // livestream id) when detection knows it — used to group recording
+            // takes of the same broadcast. NULL for id-less methods (scrape etc.).
+            conn.execute_batch("ALTER TABLE recording ADD COLUMN stream_id TEXT;")?;
+            conn.pragma_update(None, "user_version", 9)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 9);
         Ok(())
     }
 
@@ -350,12 +357,13 @@ impl Store {
         output_path: &str,
         went_live_at: Option<i64>,
         went_live_approx: bool,
+        stream_id: Option<&str>,
     ) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO recording(monitor_id, started_at, output_path, status, went_live_at, went_live_approx)
-             VALUES(?1, ?2, ?3, 'recording', ?4, ?5)",
-            params![monitor_id, started_at, output_path, went_live_at, went_live_approx as i64],
+            "INSERT INTO recording(monitor_id, started_at, output_path, status, went_live_at, went_live_approx, stream_id)
+             VALUES(?1, ?2, ?3, 'recording', ?4, ?5, ?6)",
+            params![monitor_id, started_at, output_path, went_live_at, went_live_approx as i64, stream_id],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -377,6 +385,18 @@ impl Store {
             params![id, ended_at, bytes, exit_code, status, output_path, log_excerpt],
         )?;
         Ok(())
+    }
+
+    /// Remove a recording (take) row from the history. The captured file on disk
+    /// is left untouched. Refuses an in-progress ('recording') take so we never
+    /// orphan a running capture from its history row; returns the rows removed.
+    pub fn delete_recording(&self, id: i64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM recording WHERE id = ?1 AND status <> 'recording'",
+            params![id],
+        )?;
+        Ok(n)
     }
 
     /// Set the resolved "missed footage" (seconds) for a recording. Used by the
@@ -411,12 +431,13 @@ impl Store {
                 m.quality, m.output_dir, m.filename_template, m.container, m.capture_from_start,
                 m.auth_kind, m.auth_value, m.extra_args, m.max_concurrent, m.last_checked_at,
                 m.last_state,
-                r.started_at, r.ended_at, r.status, r.went_live_at, r.went_live_approx, r.lost_secs
+                r.started_at, r.ended_at, r.status, r.went_live_at, r.went_live_approx, r.lost_secs,
+                (SELECT COUNT(*) FROM recording rc WHERE rc.monitor_id = m.id)
              FROM monitor m
              JOIN channel c ON c.id = m.channel_id
              LEFT JOIN recording r
                 ON r.id = (SELECT id FROM recording r2 WHERE r2.monitor_id = m.id ORDER BY r2.id DESC LIMIT 1)
-             ORDER BY c.name COLLATE NOCASE, m.id",
+             ORDER BY c.name COLLATE NOCASE, c.id, m.id",
         )?;
         let rows = stmt
             .query_map([], |r| {
@@ -455,6 +476,36 @@ impl Store {
                     last_recording_went_live: r.get(25)?,
                     last_recording_went_live_approx: r.get::<_, Option<i64>>(26)?.unwrap_or(0) != 0,
                     last_recording_lost_secs: r.get(27)?,
+                    recording_count: r.get(28)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// All recording takes for a monitor (oldest first), for the history tree.
+    pub fn recordings_for_monitor(&self, monitor_id: i64) -> Result<Vec<crate::models::Recording>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, monitor_id, started_at, ended_at, status, bytes, exit_code,
+                    COALESCE(output_path, ''), went_live_at, went_live_approx, lost_secs, stream_id
+             FROM recording WHERE monitor_id = ?1 ORDER BY started_at, id",
+        )?;
+        let rows = stmt
+            .query_map(params![monitor_id], |r| {
+                Ok(crate::models::Recording {
+                    id: r.get(0)?,
+                    monitor_id: r.get(1)?,
+                    started_at: r.get(2)?,
+                    ended_at: r.get(3)?,
+                    status: r.get(4)?,
+                    bytes: r.get(5)?,
+                    exit_code: r.get(6)?,
+                    output_path: r.get(7)?,
+                    went_live_at: r.get(8)?,
+                    went_live_approx: r.get::<_, Option<i64>>(9)?.unwrap_or(0) != 0,
+                    lost_secs: r.get(10)?,
+                    stream_id: r.get(11)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

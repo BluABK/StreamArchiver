@@ -437,6 +437,9 @@ pub struct MonitorWithChannel {
     /// the live edge). `None` until/unless confirmed — the UI then falls back to
     /// the provisional `started - went_live` estimate.
     pub last_recording_lost_secs: Option<i64>,
+    /// Total recording takes for this monitor (drives the history-tree disclosure
+    /// without loading the full history until a row is expanded).
+    pub recording_count: i64,
 }
 
 /// An on-demand, one-shot video/VOD download (a YouTube video, a Twitch VOD,
@@ -562,4 +565,228 @@ pub fn now_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// One recording attempt ("take") of a stream — a single capture-process run.
+/// Multiple takes (crash / network drop / manual stop+start) can belong to one
+/// broadcast; see [`group_recordings`].
+#[derive(Clone, Debug)]
+pub struct Recording {
+    pub id: i64,
+    pub monitor_id: i64,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub status: String,
+    pub bytes: i64,
+    pub exit_code: Option<i64>,
+    pub output_path: String,
+    pub went_live_at: Option<i64>,
+    pub went_live_approx: bool,
+    pub lost_secs: Option<i64>,
+    /// Platform stream/video id when detection knew it; `None` for id-less methods.
+    pub stream_id: Option<String>,
+}
+
+impl Recording {
+    pub fn is_active(&self) -> bool {
+        self.status == "recording"
+    }
+    /// End time for duration math (`now` while the take is still in progress).
+    pub fn duration_secs(&self, now: i64) -> i64 {
+        (self.ended_at.unwrap_or(now) - self.started_at).max(0)
+    }
+}
+
+/// A set of recording takes that belong to the same broadcast.
+#[derive(Clone, Debug)]
+pub struct StreamGroup {
+    /// Stable key for display + UI expansion state.
+    pub key: String,
+    pub stream_id: Option<String>,
+    pub went_live_at: Option<i64>,
+    pub went_live_approx: bool,
+    /// Takes, oldest first.
+    pub takes: Vec<Recording>,
+}
+
+impl StreamGroup {
+    pub fn is_active(&self) -> bool {
+        self.takes.iter().any(Recording::is_active)
+    }
+    /// Earliest take start (takes are stored oldest-first).
+    pub fn started_at(&self) -> i64 {
+        self.takes.first().map(|t| t.started_at).unwrap_or(0)
+    }
+    /// Latest take end, or `None` while any take is still in progress.
+    pub fn ended_at(&self) -> Option<i64> {
+        if self.is_active() {
+            return None;
+        }
+        self.takes.iter().filter_map(|t| t.ended_at).max()
+    }
+    pub fn total_bytes(&self) -> i64 {
+        self.takes.iter().map(|t| t.bytes).sum()
+    }
+    /// Total captured time summed across takes.
+    pub fn captured_secs(&self, now: i64) -> i64 {
+        self.takes.iter().map(|t| t.duration_secs(now)).sum()
+    }
+    /// Resolved "missed beginning" for the stream: the first take's value when
+    /// known (a from-start take that caught up makes it 0).
+    pub fn lost_secs(&self) -> Option<i64> {
+        self.takes.iter().find_map(|t| t.lost_secs)
+    }
+    /// Rolled-up status for the stream row.
+    pub fn status(&self) -> &'static str {
+        if self.is_active() {
+            "recording"
+        } else if self.takes.iter().any(|t| t.status == "completed") {
+            "completed"
+        } else if self.takes.iter().all(|t| t.status == "orphaned") {
+            "orphaned"
+        } else {
+            "failed"
+        }
+    }
+}
+
+/// Gap (seconds) within which two id-less takes are treated as the same
+/// interrupted broadcast (crash / retry / manual stop+restart).
+pub const STREAM_CONTINUITY_GAP_SECS: i64 = 600;
+
+/// True if take `r` continues the same broadcast as group `g`.
+fn same_stream(g: &StreamGroup, r: &Recording) -> bool {
+    match (&g.stream_id, &r.stream_id) {
+        // A platform id is authoritative.
+        (Some(a), Some(b)) => a == b,
+        // Never merge an id-bearing stream with an id-less take (or vice-versa).
+        (Some(_), None) | (None, Some(_)) => false,
+        (None, None) => {
+            // Same platform-reported (non-approx) go-live => same broadcast.
+            if let (Some(a), Some(b)) = (g.went_live_at, r.went_live_at) {
+                if !g.went_live_approx && !r.went_live_approx && a == b {
+                    return true;
+                }
+            }
+            // Otherwise: a new take that abuts the previous one in time is a
+            // continuation; a still-active previous take is too.
+            match g.takes.last().and_then(|t| t.ended_at) {
+                Some(prev_end) => r.started_at - prev_end <= STREAM_CONTINUITY_GAP_SECS,
+                None => true,
+            }
+        }
+    }
+}
+
+fn stream_key(r: &Recording) -> String {
+    match &r.stream_id {
+        Some(id) => format!("s{}:{}", r.monitor_id, id),
+        None => format!("t{}:{}", r.monitor_id, r.started_at),
+    }
+}
+
+/// Group recording takes into streams. Returns newest stream first; takes within
+/// a stream are oldest-first. Takes group by shared platform stream id; id-less
+/// takes group by a shared platform go-live time or by abutting in time.
+///
+/// Caller should pass recordings for a single monitor (grouping is time-linear).
+pub fn group_recordings(recordings: &[Recording]) -> Vec<StreamGroup> {
+    let mut recs: Vec<&Recording> = recordings.iter().collect();
+    recs.sort_by_key(|r| (r.started_at, r.id));
+
+    let mut groups: Vec<StreamGroup> = Vec::new();
+    for r in recs {
+        if groups.last().is_some_and(|g| same_stream(g, r)) {
+            let g = groups.last_mut().unwrap();
+            if g.stream_id.is_none() {
+                g.stream_id = r.stream_id.clone();
+            }
+            if g.went_live_at.is_none() && r.went_live_at.is_some() {
+                g.went_live_at = r.went_live_at;
+                g.went_live_approx = r.went_live_approx;
+            }
+            g.takes.push(r.clone());
+        } else {
+            groups.push(StreamGroup {
+                key: stream_key(r),
+                stream_id: r.stream_id.clone(),
+                went_live_at: r.went_live_at,
+                went_live_approx: r.went_live_approx,
+                takes: vec![r.clone()],
+            });
+        }
+    }
+    groups.reverse(); // newest stream first
+    groups
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(id: i64, started: i64, ended: Option<i64>, stream_id: Option<&str>) -> Recording {
+        Recording {
+            id,
+            monitor_id: 1,
+            started_at: started,
+            ended_at: ended,
+            status: if ended.is_some() { "completed".into() } else { "recording".into() },
+            bytes: 1,
+            exit_code: None,
+            output_path: String::new(),
+            went_live_at: None,
+            went_live_approx: true,
+            lost_secs: None,
+            stream_id: stream_id.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn groups_takes_by_platform_id() {
+        // Two takes of stream "A", one of stream "B".
+        let recs = vec![
+            rec(1, 1000, Some(1100), Some("A")),
+            rec(2, 1110, Some(2000), Some("A")),
+            rec(3, 5000, Some(6000), Some("B")),
+        ];
+        let groups = group_recordings(&recs);
+        assert_eq!(groups.len(), 2);
+        // Newest first.
+        assert_eq!(groups[0].stream_id.as_deref(), Some("B"));
+        assert_eq!(groups[0].takes.len(), 1);
+        assert_eq!(groups[1].stream_id.as_deref(), Some("A"));
+        assert_eq!(groups[1].takes.len(), 2);
+    }
+
+    #[test]
+    fn idless_takes_group_by_continuity_then_split_on_gap() {
+        // 1 & 2 abut (crash+retry); 3 is hours later -> new stream.
+        let recs = vec![
+            rec(1, 1000, Some(1100), None),
+            rec(2, 1150, Some(2000), None), // 50s gap -> same
+            rec(3, 2000 + STREAM_CONTINUITY_GAP_SECS + 60, Some(9999), None), // beyond gap -> new
+        ];
+        let groups = group_recordings(&recs);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[1].takes.len(), 2); // oldest group = the two abutting takes
+        assert_eq!(groups[0].takes.len(), 1);
+    }
+
+    #[test]
+    fn idless_does_not_merge_into_id_stream() {
+        let recs = vec![
+            rec(1, 1000, Some(1100), Some("A")),
+            rec(2, 1150, Some(2000), None), // abuts in time but has no id -> separate
+        ];
+        let groups = group_recordings(&recs);
+        assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn active_take_makes_stream_active_and_open_ended() {
+        let recs = vec![rec(1, 1000, None, Some("A"))];
+        let groups = group_recordings(&recs);
+        assert!(groups[0].is_active());
+        assert_eq!(groups[0].ended_at(), None);
+    }
 }

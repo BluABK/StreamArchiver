@@ -166,11 +166,15 @@ fn handle_message(
             if v["payload"]["subscription"]["type"].as_str() == Some("stream.online") {
                 let event = &v["payload"]["event"];
                 let went_live = event["started_at"].as_str().and_then(parse_ts);
+                let stream_id = event["id"].as_str().map(str::to_string);
                 if let Some(uid) = event["broadcaster_user_id"].as_str() {
                     if let Some(mons) = uid_to_monitors.get(uid) {
                         for &mid in mons {
                             info!("eventsub: stream.online -> monitor {mid}");
-                            let _ = live_tx.send(LiveSignal::new(mid, went_live, false));
+                            let _ = live_tx.send(
+                                LiveSignal::new(mid, went_live, false)
+                                    .with_stream_id(stream_id.clone()),
+                            );
                         }
                     }
                 }
@@ -441,11 +445,14 @@ async fn reconcile(
                     for s in arr {
                         if s["type"].as_str() == Some("live") {
                             let went_live = s["started_at"].as_str().and_then(parse_ts);
+                            let stream_id = s["id"].as_str().map(str::to_string);
                             if let Some(login) = s["user_login"].as_str() {
                                 if let Some(mons) = login_to_monitors.get(&login.to_lowercase()) {
                                     for &mid in mons {
-                                        let _ =
-                                            live_tx.send(LiveSignal::new(mid, went_live, false));
+                                        let _ = live_tx.send(
+                                            LiveSignal::new(mid, went_live, false)
+                                                .with_stream_id(stream_id.clone()),
+                                        );
                                     }
                                 }
                             }

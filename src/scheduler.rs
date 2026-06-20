@@ -178,7 +178,8 @@ async fn tick(
             let signal = match o.went_live_at {
                 Some(t) => LiveSignal::new(o.monitor_id, Some(t), false),
                 None => LiveSignal::new(o.monitor_id, Some(checked_at), true),
-            };
+            }
+            .with_stream_id(o.stream_id.clone());
             let _ = live_tx.send(signal);
         }
     }

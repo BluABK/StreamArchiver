@@ -4,6 +4,7 @@
 //! `Context::request_repaint`. Closing the window hides it to the tray; the
 //! tray "Quit" item triggers a real close.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
@@ -16,7 +17,7 @@ use crate::app_core::AppCore;
 use crate::events::{ManualCommand, UiCommand};
 use crate::models::{
     AuthKind, Channel, Container, DetectionMethod, DownloadDefaults, Monitor, MonitorWithChannel,
-    Platform, Tool, Video,
+    Platform, Recording, StreamGroup, Tool, Video, group_recordings,
 };
 use crate::oauth::{self, AuthFlow};
 use crate::platform::AutoStart;
@@ -44,17 +45,6 @@ enum View {
     Streams,
     Videos,
     Settings,
-}
-
-/// A self-mutating action picked from a row's right-click context menu. (URL /
-/// folder / clipboard actions are handled inline in the menu and aren't here.)
-enum MenuChoice {
-    Start,
-    Stop,
-    Edit,
-    AddInstance,
-    Toggle,
-    Delete,
 }
 
 /// State of the on-demand "List formats" probe (Videos tab), shown in a window.
@@ -255,6 +245,12 @@ pub struct StreamArchiverApp {
     /// Sort + per-column filters for the Streams table.
     streams_sort: SortState,
     streams_filters: Vec<String>,
+    /// Expansion state for the Streams history tree (channel id / monitor id /
+    /// stream key), and a lazy cache of recordings per expanded monitor.
+    expanded_channels: HashSet<i64>,
+    expanded_instances: HashSet<i64>,
+    expanded_streams: HashSet<String>,
+    rec_cache: HashMap<i64, Vec<Recording>>,
     /// Sort + per-column filters for the Videos table.
     videos_sort: SortState,
     videos_filters: Vec<String>,
@@ -348,6 +344,10 @@ impl StreamArchiverApp {
             confirm_delete: None,
             streams_sort: SortState::default(),
             streams_filters: vec![String::new(); STREAM_COLS],
+            expanded_channels: HashSet::new(),
+            expanded_instances: HashSet::new(),
+            expanded_streams: HashSet::new(),
+            rec_cache: HashMap::new(),
             videos_sort: SortState::default(),
             videos_filters: vec![String::new(); VIDEO_COLS],
             twitch_flow,
@@ -365,6 +365,17 @@ impl StreamArchiverApp {
                 self.status = format!("Error loading channels: {e}");
             }
         }
+        // History may have changed; re-fetch lazily on next expand.
+        self.rec_cache.clear();
+        // Drop expansion state for channels/monitors that no longer exist (avoids
+        // an unbounded leak and "sticky" expansion if a row id is later reused).
+        let live_channels: HashSet<i64> = self.rows.iter().map(|r| r.channel.id).collect();
+        let live_monitors: HashSet<i64> = self.rows.iter().map(|r| r.monitor.id).collect();
+        self.expanded_channels.retain(|id| live_channels.contains(id));
+        self.expanded_instances.retain(|id| live_monitors.contains(id));
+        // Stream keys are "s<mid>:…" / "t<mid>:…"; keep only live monitors'.
+        self.expanded_streams
+            .retain(|k| stream_key_monitor(k).is_some_and(|mid| live_monitors.contains(&mid)));
     }
 
     fn reload_videos(&mut self) {
@@ -569,6 +580,23 @@ fn fmt_datetime_short(secs: i64) -> String {
 fn fmt_duration(secs: i64) -> String {
     let s = secs.max(0);
     format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+}
+
+/// Parse the monitor id out of a [`StreamGroup`] key (`s<mid>:…` / `t<mid>:…`).
+fn stream_key_monitor(key: &str) -> Option<i64> {
+    let rest = key.strip_prefix('s').or_else(|| key.strip_prefix('t'))?;
+    rest.split(':').next()?.parse().ok()
+}
+
+/// Format a go-live time (`~`-prefixed when only our approximate time is known).
+fn fmt_went_live(at: Option<i64>, approx: bool) -> String {
+    match at {
+        Some(w) => {
+            let s = fmt_datetime_short(w);
+            if approx { format!("~{s}") } else { s }
+        }
+        None => String::new(),
+    }
 }
 
 /// Human-readable byte size (B / KB / MB / GB).
@@ -868,6 +896,282 @@ fn recording_cells(row: &MonitorWithChannel, now: i64) -> RecordingCells {
         went_live,
         lost,
     }
+}
+
+/// Theme color for a recording / stream status string.
+fn rec_status_color(status: &str) -> egui::Color32 {
+    use egui::Color32;
+    match status {
+        "recording" => Color32::from_rgb(0x4d, 0x9b, 0xff),
+        "completed" => Color32::from_rgb(0x57, 0xc7, 0x57),
+        "failed" => Color32::from_rgb(0xe0, 0x6c, 0x6c),
+        _ => Color32::from_gray(0xa0), // stopped / orphaned
+    }
+}
+
+/// Render the Streams-tree Name cell: indent by `depth`, a clickable ▶/▼ when
+/// `has_children`, then `label`. Returns true if the disclosure was clicked.
+fn tree_name(
+    ui: &mut egui::Ui,
+    depth: usize,
+    has_children: bool,
+    expanded: bool,
+    label: impl Into<egui::WidgetText>,
+) -> bool {
+    let mut clicked = false;
+    ui.add_space(depth as f32 * 16.0);
+    if has_children {
+        let tri = if expanded { "▼" } else { "▶" };
+        if ui
+            .add(egui::Button::new(tri).small().frame(false))
+            .on_hover_text("Expand / collapse")
+            .clicked()
+        {
+            clicked = true;
+        }
+    } else {
+        ui.add_space(16.0); // align with rows that have a triangle
+    }
+    ui.label(label);
+    clicked
+}
+
+/// Sort/filter cells for a channel's top-level row: a single-instance channel
+/// uses the monitor's own cells; a multi-instance channel aggregates.
+fn channel_cells(monitors: &[&MonitorWithChannel], now: i64) -> Vec<Cell> {
+    if monitors.len() == 1 {
+        return stream_cells(monitors[0], now);
+    }
+    let first = monitors[0];
+    let ch = &first.channel;
+    let any_enabled = monitors.iter().any(|m| m.monitor.enabled);
+    let any_recording = monitors
+        .iter()
+        .any(|m| m.last_recording_status.as_deref() == Some("recording"));
+    // The most recent recording across instances drives the time columns.
+    let primary = monitors
+        .iter()
+        .copied()
+        .max_by_key(|m| m.last_recording_started.unwrap_or(0))
+        .unwrap_or(first);
+    let rec = recording_cells(primary, now);
+    let state = if any_recording {
+        "recording".to_string()
+    } else {
+        format!("{} instances", monitors.len())
+    };
+    vec![
+        Cell::num(
+            if any_enabled { 1.0 } else { 0.0 },
+            if any_enabled { "on" } else { "off" },
+        ),
+        Cell::text(ch.name.clone()),
+        Cell::text(ch.platform.label()),
+        Cell::text("(multiple)"),
+        Cell::text("(multiple)"),
+        Cell::num(0.0, String::new()),
+        Cell::text(state),
+        Cell::num(
+            primary.last_recording_went_live.unwrap_or(0) as f64,
+            rec.went_live.clone(),
+        ),
+        Cell::num(
+            primary.last_recording_started.unwrap_or(0) as f64,
+            rec.started_on.clone(),
+        ),
+        Cell::num(0.0, rec.lost.clone()),
+        Cell::num(0.0, rec.duration.clone()),
+        Cell::num(ch.created_at as f64, fmt_date(ch.created_at)),
+    ]
+}
+
+/// Self-mutating actions collected while rendering a capture-instance row.
+#[derive(Default)]
+struct RowActions {
+    start: Option<i64>,                 // monitor id
+    stop: Option<i64>,                  // monitor id
+    edit: Option<i64>,                  // monitor id
+    add_instance: Option<i64>,          // channel id
+    delete: Option<(i64, String)>,      // (monitor id, channel name)
+    toggle_enabled: Option<(i64, bool)>,
+    select: Option<i64>,                // monitor id
+}
+
+/// Render one capture-instance (monitor) row across all columns, with the Name
+/// column carrying the tree disclosure. Returns true if the disclosure (the
+/// row's stream history) was toggled. Self-mutating picks land in `a`.
+#[allow(clippy::too_many_arguments)]
+fn render_instance_row(
+    tr: &mut egui_extras::TableRow<'_, '_>,
+    row: &MonitorWithChannel,
+    now: i64,
+    recording: bool,
+    is_selected: bool,
+    depth: usize,
+    has_history: bool,
+    expanded: bool,
+    a: &mut RowActions,
+) -> bool {
+    let m = &row.monitor;
+    let rec = recording_cells(row, now);
+    tr.set_selected(recording || is_selected);
+
+    // Right-click context menu (shared with the inline action buttons).
+    let add_menu = |ui: &mut egui::Ui, a: &mut RowActions| {
+        ui.set_min_width(180.0);
+        if recording {
+            if ui.button("⏹  Stop recording").clicked() {
+                a.stop = Some(m.id);
+                ui.close();
+            }
+        } else if ui.button("▶  Start recording").clicked() {
+            a.start = Some(m.id);
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("🔗  Open channel URL").clicked() {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(row.channel.url.clone()));
+            ui.close();
+        }
+        let folder_exists = std::path::Path::new(&m.output_dir).is_dir();
+        if ui
+            .add_enabled(folder_exists, egui::Button::new("📂  Open output folder"))
+            .clicked()
+        {
+            crate::platform::open_path(std::path::Path::new(&m.output_dir));
+            ui.close();
+        }
+        if ui.button("📋  Copy URL").clicked() {
+            ui.ctx().copy_text(row.channel.url.clone());
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("✏  Edit…").clicked() {
+            a.edit = Some(m.id);
+            ui.close();
+        }
+        if ui.button("➕  Add tool instance").clicked() {
+            a.add_instance = Some(row.channel.id);
+            ui.close();
+        }
+        let toggle_label = if m.enabled { "⏸  Disable" } else { "✔  Enable" };
+        if ui.button(toggle_label).clicked() {
+            a.toggle_enabled = Some((m.id, !m.enabled));
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("🗑  Delete").clicked() {
+            a.delete = Some((m.id, row.channel.name.clone()));
+            ui.close();
+        }
+    };
+
+    let mut disclosure_clicked = false;
+    tr.col(|ui| {
+        let mut on = m.enabled;
+        let cb = ui.checkbox(&mut on, "");
+        if cb.changed() {
+            a.toggle_enabled = Some((m.id, on));
+        }
+        cb.context_menu(|ui| add_menu(ui, a));
+    });
+    tr.col(|ui| {
+        disclosure_clicked = tree_name(
+            ui,
+            depth,
+            has_history,
+            expanded,
+            egui::RichText::new(&row.channel.name),
+        );
+        ui.response().on_hover_text(&row.channel.url);
+    });
+    tr.col(|ui| {
+        platform_badge(ui, row.channel.platform);
+        ui.label(row.channel.platform.label());
+    });
+    tr.col(|ui| {
+        ui.label(m.tool.label()).on_hover_text(m.tool.tooltip());
+    });
+    tr.col(|ui| {
+        ui.label(m.detection_method.short_label()).on_hover_text(format!(
+            "{}\n\n{}",
+            m.detection_method.label(),
+            m.detection_method.tooltip()
+        ));
+    });
+    tr.col(|ui| {
+        ui.label(format!("{}s", m.poll_interval_secs));
+    });
+    tr.col(|ui| {
+        ui.label(&m.last_state);
+    });
+    tr.col(|ui| {
+        ui.label(&rec.went_live);
+    });
+    tr.col(|ui| {
+        ui.label(&rec.started_on);
+    });
+    tr.col(|ui| {
+        let resp = ui.label(&rec.lost);
+        if m.capture_from_start {
+            resp.on_hover_text(
+                "How much of the beginning we missed. Capturing from start, so this drops \
+                 to 0 once the capture catches up to the live edge; until then it's an \
+                 estimate (the gap before recording began).",
+            );
+        }
+    });
+    tr.col(|ui| {
+        ui.label(&rec.duration);
+    });
+    tr.col(|ui| {
+        ui.label(fmt_date(row.channel.created_at));
+    });
+    tr.col(|ui| {
+        ui.push_id(m.id, |ui| {
+            let mut btns: Vec<egui::Response> = Vec::with_capacity(4);
+            if recording {
+                let b = ui.small_button("⏹").on_hover_text("Stop / abort recording");
+                if b.clicked() {
+                    a.stop = Some(m.id);
+                }
+                btns.push(b);
+            } else {
+                let b = ui
+                    .small_button("▶")
+                    .on_hover_text("Start recording now (checks if live)");
+                if b.clicked() {
+                    a.start = Some(m.id);
+                }
+                btns.push(b);
+            }
+            let b = ui.small_button("✏").on_hover_text("Edit");
+            if b.clicked() {
+                a.edit = Some(m.id);
+            }
+            btns.push(b);
+            let b = ui.small_button("➕").on_hover_text("Add another tool instance");
+            if b.clicked() {
+                a.add_instance = Some(row.channel.id);
+            }
+            btns.push(b);
+            let b = ui.small_button("🗑").on_hover_text("Delete this instance");
+            if b.clicked() {
+                a.delete = Some((m.id, row.channel.name.clone()));
+            }
+            btns.push(b);
+            for b in &btns {
+                b.context_menu(|ui| add_menu(ui, a));
+            }
+        });
+    });
+
+    let row_resp = tr.response();
+    if row_resp.clicked() || row_resp.secondary_clicked() {
+        a.select = Some(m.id);
+    }
+    row_resp.context_menu(|ui| add_menu(ui, a));
+    disclosure_clicked
 }
 
 /// Draw a small colored brand badge for the platform.
@@ -1875,14 +2179,15 @@ impl StreamArchiverApp {
             return;
         }
 
-        // Deferred actions to avoid borrowing self mutably inside the table closure.
-        let mut to_edit: Option<usize> = None;
-        let mut to_add_instance: Option<usize> = None;
-        let mut to_delete: Option<(i64, String)> = None;
-        let mut toggle: Option<(i64, bool)> = None;
-        let mut to_start: Option<i64> = None;
-        let mut to_stop: Option<i64> = None;
-        let mut to_select: Option<i64> = None;
+        // Self-mutating actions, collected during rendering and applied after the
+        // table closure (which only borrows `self` immutably).
+        let mut acts = RowActions::default();
+        let mut toggle_channel: Option<i64> = None;
+        let mut toggle_instance: Option<i64> = None;
+        let mut toggle_stream: Option<String> = None;
+        let mut open_path: Option<std::path::PathBuf> = None;
+        let mut copy_text: Option<String> = None;
+        let mut delete_recording: Option<i64> = None;
 
         let selected_monitor = self.selected_monitor;
         let now = crate::models::now_unix();
@@ -1891,9 +2196,73 @@ impl StreamArchiverApp {
             .iter()
             .any(|r| r.last_recording_status.as_deref() == Some("recording"));
 
-        // Build the sort/filter model and take the persisted sort/filter state
-        // into locals (written back after the table is drawn).
-        let model: Vec<Vec<Cell>> = self.rows.iter().map(|r| stream_cells(r, now)).collect();
+        // Group monitor rows into channels (rows are ordered by channel name then
+        // monitor id, so a channel's instances are contiguous).
+        struct ChanEntry {
+            channel: Channel,
+            rows: Vec<usize>,
+        }
+        let mut chan_entries: Vec<ChanEntry> = Vec::new();
+        for (i, row) in self.rows.iter().enumerate() {
+            match chan_entries.last_mut() {
+                Some(e) if e.channel.id == row.channel.id => e.rows.push(i),
+                _ => chan_entries.push(ChanEntry {
+                    channel: row.channel.clone(),
+                    rows: vec![i],
+                }),
+            }
+        }
+
+        // Lazily load + cache recordings for currently-expanded monitors, then
+        // group each monitor's takes into streams.
+        let mut expanded_monitors: Vec<i64> = Vec::new();
+        for e in &chan_entries {
+            if !self.expanded_channels.contains(&e.channel.id) {
+                continue;
+            }
+            if e.rows.len() == 1 {
+                expanded_monitors.push(self.rows[e.rows[0]].monitor.id);
+            } else {
+                for &ri in &e.rows {
+                    let mid = self.rows[ri].monitor.id;
+                    if self.expanded_instances.contains(&mid) {
+                        expanded_monitors.push(mid);
+                    }
+                }
+            }
+        }
+        for &mid in &expanded_monitors {
+            if !self.rec_cache.contains_key(&mid) {
+                let recs = self
+                    .core
+                    .store
+                    .recordings_for_monitor(mid)
+                    .unwrap_or_default();
+                self.rec_cache.insert(mid, recs);
+            }
+        }
+        let groups: HashMap<i64, Vec<StreamGroup>> = expanded_monitors
+            .iter()
+            .map(|&mid| {
+                let recs = self.rec_cache.get(&mid).map(Vec::as_slice).unwrap_or(&[]);
+                (mid, group_recordings(recs))
+            })
+            .collect();
+
+        // Snapshot expansion state for read-only use inside the table closure.
+        let exp_channels = self.expanded_channels.clone();
+        let exp_instances = self.expanded_instances.clone();
+        let exp_streams = self.expanded_streams.clone();
+
+        // Channel-level sort/filter model (one entry per top-level channel row).
+        let model: Vec<Vec<Cell>> = chan_entries
+            .iter()
+            .map(|e| {
+                let mons: Vec<&MonitorWithChannel> =
+                    e.rows.iter().map(|&i| &self.rows[i]).collect();
+                channel_cells(&mons, now)
+            })
+            .collect();
         let mut sort = self.streams_sort;
         let mut filters = self.streams_filters.clone();
         if filters.len() != STREAM_COLS {
@@ -1955,213 +2324,345 @@ impl StreamArchiverApp {
                         });
                     });
                 table.body(|mut body| {
-                        let order = ordered_rows(&model, &sort, &filters);
-                        for &i in &order {
-                            let row = &self.rows[i];
-                            let m = &row.monitor;
-                            let rec = recording_cells(row, now);
-                            let recording = self.core.active.lock().unwrap().contains_key(&m.id);
-                            let is_selected = selected_monitor == Some(m.id);
-                            body.row(24.0, |mut tr| {
-                                // Tint active (recording) rows and the user-selected
-                                // row with the theme accent (blue).
-                                tr.set_selected(recording || is_selected);
+                    let order = ordered_rows(&model, &sort, &filters);
 
-                                // Reusable context-menu body (a `Fn`), attached below
-                                // to both the row and each inline action button so a
-                                // right-click anywhere on the row opens it. Self-mutating
-                                // picks go through `menu_choice`; URL/folder/clipboard
-                                // actions are handled inline (they only need `ctx`).
-                                let mut menu_choice: Option<MenuChoice> = None;
-                                let add_menu =
-                                    |ui: &mut egui::Ui, choice: &mut Option<MenuChoice>| {
-                                        ui.set_min_width(180.0);
-                                        if recording {
-                                            if ui.button("⏹  Stop recording").clicked() {
-                                                *choice = Some(MenuChoice::Stop);
-                                                ui.close();
+                    // Flatten the channel -> (instance) -> stream -> take tree into
+                    // the rows currently visible (respecting expansion state).
+                    #[derive(Clone, Copy)]
+                    enum Vis {
+                        Channel(usize),
+                        Instance { row: usize, depth: usize },
+                        Stream { mid: i64, gi: usize, depth: usize },
+                        Take { mid: i64, gi: usize, ti: usize, depth: usize },
+                    }
+                    let mut vis: Vec<Vis> = Vec::new();
+                    for &ci in &order {
+                        let e = &chan_entries[ci];
+                        vis.push(Vis::Channel(ci));
+                        if !exp_channels.contains(&e.channel.id) {
+                            continue;
+                        }
+                        if e.rows.len() == 1 {
+                            let mid = self.rows[e.rows[0]].monitor.id;
+                            if let Some(grps) = groups.get(&mid) {
+                                for (gi, g) in grps.iter().enumerate() {
+                                    vis.push(Vis::Stream { mid, gi, depth: 1 });
+                                    if g.takes.len() > 1 && exp_streams.contains(&g.key) {
+                                        for ti in 0..g.takes.len() {
+                                            vis.push(Vis::Take { mid, gi, ti, depth: 2 });
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            for &ri in &e.rows {
+                                let mid = self.rows[ri].monitor.id;
+                                vis.push(Vis::Instance { row: ri, depth: 1 });
+                                if exp_instances.contains(&mid) {
+                                    if let Some(grps) = groups.get(&mid) {
+                                        for (gi, g) in grps.iter().enumerate() {
+                                            vis.push(Vis::Stream { mid, gi, depth: 2 });
+                                            if g.takes.len() > 1 && exp_streams.contains(&g.key) {
+                                                for ti in 0..g.takes.len() {
+                                                    vis.push(Vis::Take { mid, gi, ti, depth: 3 });
+                                                }
                                             }
-                                        } else if ui.button("▶  Start recording").clicked() {
-                                            *choice = Some(MenuChoice::Start);
-                                            ui.close();
                                         }
-                                        ui.separator();
-                                        if ui.button("🔗  Open channel URL").clicked() {
-                                            ui.ctx().open_url(egui::OpenUrl::new_tab(
-                                                row.channel.url.clone(),
-                                            ));
-                                            ui.close();
-                                        }
-                                        let folder_exists =
-                                            std::path::Path::new(&m.output_dir).is_dir();
-                                        if ui
-                                            .add_enabled(
-                                                folder_exists,
-                                                egui::Button::new("📂  Open output folder"),
-                                            )
-                                            .clicked()
-                                        {
-                                            crate::platform::open_path(std::path::Path::new(
-                                                &m.output_dir,
-                                            ));
-                                            ui.close();
-                                        }
-                                        if ui.button("📋  Copy URL").clicked() {
-                                            ui.ctx().copy_text(row.channel.url.clone());
-                                            ui.close();
-                                        }
-                                        ui.separator();
-                                        if ui.button("✏  Edit…").clicked() {
-                                            *choice = Some(MenuChoice::Edit);
-                                            ui.close();
-                                        }
-                                        if ui.button("➕  Add tool instance").clicked() {
-                                            *choice = Some(MenuChoice::AddInstance);
-                                            ui.close();
-                                        }
-                                        let toggle_label = if m.enabled {
-                                            "⏸  Disable"
-                                        } else {
-                                            "✔  Enable"
-                                        };
-                                        if ui.button(toggle_label).clicked() {
-                                            *choice = Some(MenuChoice::Toggle);
-                                            ui.close();
-                                        }
-                                        ui.separator();
-                                        if ui.button("🗑  Delete").clicked() {
-                                            *choice = Some(MenuChoice::Delete);
-                                            ui.close();
-                                        }
-                                    };
+                                    }
+                                }
+                            }
+                        }
+                    }
 
-                                tr.col(|ui| {
-                                    let mut on = m.enabled;
-                                    let cb = ui.checkbox(&mut on, "");
-                                    if cb.changed() {
-                                        toggle = Some((m.id, on));
-                                    }
-                                    // The checkbox senses clicks too, so give it the menu.
-                                    cb.context_menu(|ui| add_menu(ui, &mut menu_choice));
-                                });
-                                tr.col(|ui| {
-                                    ui.label(&row.channel.name).on_hover_text(&row.channel.url);
-                                });
-                                tr.col(|ui| {
-                                    platform_badge(ui, row.channel.platform);
-                                    ui.label(row.channel.platform.label());
-                                });
-                                tr.col(|ui| {
-                                    ui.label(m.tool.label()).on_hover_text(m.tool.tooltip());
-                                });
-                                tr.col(|ui| {
-                                    ui.label(m.detection_method.short_label()).on_hover_text(
-                                        format!(
-                                            "{}\n\n{}",
-                                            m.detection_method.label(),
-                                            m.detection_method.tooltip()
-                                        ),
-                                    );
-                                });
-                                tr.col(|ui| {
-                                    ui.label(format!("{}s", m.poll_interval_secs));
-                                });
-                                tr.col(|ui| {
-                                    ui.label(&m.last_state);
-                                });
-                                tr.col(|ui| {
-                                    ui.label(&rec.went_live);
-                                });
-                                tr.col(|ui| {
-                                    ui.label(&rec.started_on);
-                                });
-                                tr.col(|ui| {
-                                    let resp = ui.label(&rec.lost);
-                                    if m.capture_from_start {
-                                        resp.on_hover_text(
-                                            "How much of the beginning we missed. Capturing from \
-                                             start, so this drops to 0 once the capture catches up \
-                                             to the live edge; until then it's an estimate (the gap \
-                                             before recording began).",
-                                        );
-                                    }
-                                });
-                                tr.col(|ui| {
-                                    ui.label(&rec.duration);
-                                });
-                                tr.col(|ui| {
-                                    ui.label(fmt_date(row.channel.created_at));
-                                });
-                                tr.col(|ui| {
-                                    ui.push_id(m.id, |ui| {
-                                        let mut btns: Vec<egui::Response> = Vec::with_capacity(4);
-                                        if recording {
-                                            let b = ui
-                                                .small_button("⏹")
-                                                .on_hover_text("Stop / abort recording");
-                                            if b.clicked() {
-                                                to_stop = Some(m.id);
-                                            }
-                                            btns.push(b);
-                                        } else {
-                                            let b = ui.small_button("▶").on_hover_text(
-                                                "Start recording now (checks if live)",
-                                            );
-                                            if b.clicked() {
-                                                to_start = Some(m.id);
-                                            }
-                                            btns.push(b);
-                                        }
-                                        let b = ui.small_button("✏").on_hover_text("Edit");
-                                        if b.clicked() {
-                                            to_edit = Some(i);
-                                        }
-                                        btns.push(b);
-                                        let b = ui
-                                            .small_button("➕")
-                                            .on_hover_text("Add another tool instance");
-                                        if b.clicked() {
-                                            to_add_instance = Some(i);
-                                        }
-                                        btns.push(b);
-                                        let b = ui
-                                            .small_button("🗑")
-                                            .on_hover_text("Delete this instance");
-                                        if b.clicked() {
-                                            to_delete = Some((m.id, row.channel.name.clone()));
-                                        }
-                                        btns.push(b);
-                                        // Buttons sense clicks and would otherwise swallow
-                                        // the right-click, so give each the row menu too.
-                                        for b in &btns {
-                                            b.context_menu(|ui| add_menu(ui, &mut menu_choice));
+                    for v in &vis {
+                        match *v {
+                            Vis::Channel(ci) => {
+                                let e = &chan_entries[ci];
+                                if e.rows.len() == 1 {
+                                    let row = &self.rows[e.rows[0]];
+                                    let recording = self
+                                        .core
+                                        .active
+                                        .lock()
+                                        .unwrap()
+                                        .contains_key(&row.monitor.id);
+                                    let is_selected = selected_monitor == Some(row.monitor.id);
+                                    let has_hist = row.recording_count > 0;
+                                    let expanded = exp_channels.contains(&e.channel.id);
+                                    body.row(24.0, |mut tr| {
+                                        if render_instance_row(
+                                            &mut tr, row, now, recording, is_selected, 0, has_hist,
+                                            expanded, &mut acts,
+                                        ) {
+                                            toggle_channel = Some(e.channel.id);
                                         }
                                     });
-                                });
-
-                                // Left-click selects the row; right-click anywhere on it
-                                // (cells or buttons) opens the context menu, which also
-                                // selects it. `response()` is the union of all cells.
-                                let row_resp = tr.response();
-                                if row_resp.clicked() || row_resp.secondary_clicked() {
-                                    to_select = Some(m.id);
+                                } else {
+                                    let ch = &e.channel;
+                                    let any_rec = e.rows.iter().any(|&ri| {
+                                        self.core
+                                            .active
+                                            .lock()
+                                            .unwrap()
+                                            .contains_key(&self.rows[ri].monitor.id)
+                                    });
+                                    let expanded = exp_channels.contains(&ch.id);
+                                    let ninst = e.rows.len();
+                                    body.row(24.0, |mut tr| {
+                                        tr.set_selected(any_rec);
+                                        let mut disc = false;
+                                        tr.col(|_ui| {});
+                                        tr.col(|ui| {
+                                            disc = tree_name(
+                                                ui, 0, true, expanded,
+                                                egui::RichText::new(&ch.name).strong(),
+                                            );
+                                        });
+                                        tr.col(|ui| {
+                                            platform_badge(ui, ch.platform);
+                                            ui.label(ch.platform.label());
+                                        });
+                                        tr.col(|ui| {
+                                            ui.weak(format!("{ninst} instances"));
+                                        });
+                                        tr.col(|_ui| {});
+                                        tr.col(|_ui| {});
+                                        tr.col(|ui| {
+                                            if any_rec {
+                                                ui.colored_label(
+                                                    rec_status_color("recording"),
+                                                    "recording",
+                                                );
+                                            }
+                                        });
+                                        tr.col(|_ui| {});
+                                        tr.col(|_ui| {});
+                                        tr.col(|_ui| {});
+                                        tr.col(|_ui| {});
+                                        tr.col(|ui| {
+                                            ui.label(fmt_date(ch.created_at));
+                                        });
+                                        tr.col(|ui| {
+                                            if ui
+                                                .small_button("➕")
+                                                .on_hover_text("Add tool instance")
+                                                .clicked()
+                                            {
+                                                acts.add_instance = Some(ch.id);
+                                            }
+                                        });
+                                        tr.response().context_menu(|ui| {
+                                            ui.set_min_width(160.0);
+                                            if ui.button("🔗  Open channel URL").clicked() {
+                                                ui.ctx()
+                                                    .open_url(egui::OpenUrl::new_tab(ch.url.clone()));
+                                                ui.close();
+                                            }
+                                            if ui.button("📋  Copy URL").clicked() {
+                                                ui.ctx().copy_text(ch.url.clone());
+                                                ui.close();
+                                            }
+                                            if ui.button("➕  Add tool instance").clicked() {
+                                                acts.add_instance = Some(ch.id);
+                                                ui.close();
+                                            }
+                                        });
+                                        if disc {
+                                            toggle_channel = Some(ch.id);
+                                        }
+                                    });
                                 }
-                                row_resp.context_menu(|ui| add_menu(ui, &mut menu_choice));
-
-                                match menu_choice {
-                                    Some(MenuChoice::Start) => to_start = Some(m.id),
-                                    Some(MenuChoice::Stop) => to_stop = Some(m.id),
-                                    Some(MenuChoice::Edit) => to_edit = Some(i),
-                                    Some(MenuChoice::AddInstance) => to_add_instance = Some(i),
-                                    Some(MenuChoice::Toggle) => toggle = Some((m.id, !m.enabled)),
-                                    Some(MenuChoice::Delete) => {
-                                        to_delete = Some((m.id, row.channel.name.clone()))
+                            }
+                            Vis::Instance { row: ri, depth } => {
+                                let row = &self.rows[ri];
+                                let recording = self
+                                    .core
+                                    .active
+                                    .lock()
+                                    .unwrap()
+                                    .contains_key(&row.monitor.id);
+                                let is_selected = selected_monitor == Some(row.monitor.id);
+                                let has_hist = row.recording_count > 0;
+                                let expanded = exp_instances.contains(&row.monitor.id);
+                                let mid = row.monitor.id;
+                                body.row(24.0, |mut tr| {
+                                    if render_instance_row(
+                                        &mut tr, row, now, recording, is_selected, depth, has_hist,
+                                        expanded, &mut acts,
+                                    ) {
+                                        toggle_instance = Some(mid);
                                     }
-                                    None => {}
-                                }
-                            });
+                                });
+                            }
+                            Vis::Stream { mid, gi, depth } => {
+                                let g = &groups[&mid][gi];
+                                let has_takes = g.takes.len() > 1;
+                                let expanded = exp_streams.contains(&g.key);
+                                let when = fmt_went_live(g.went_live_at, g.went_live_approx);
+                                let label = if when.is_empty() {
+                                    format!("🎬 {}", fmt_datetime_short(g.started_at()))
+                                } else {
+                                    format!("🎬 {when}")
+                                };
+                                let span = (g.ended_at().unwrap_or(now) - g.started_at()).max(0);
+                                let dir = g
+                                    .takes
+                                    .iter()
+                                    .find(|t| !t.output_path.is_empty())
+                                    .and_then(|t| {
+                                        std::path::Path::new(&t.output_path)
+                                            .parent()
+                                            .map(|p| p.to_path_buf())
+                                    });
+                                body.row(24.0, |mut tr| {
+                                    let mut disc = false;
+                                    tr.col(|_ui| {});
+                                    tr.col(|ui| {
+                                        disc = tree_name(
+                                            ui, depth, has_takes, expanded,
+                                            egui::RichText::new(label.clone()),
+                                        );
+                                        if has_takes {
+                                            ui.weak(format!("· {} takes", g.takes.len()));
+                                        }
+                                    });
+                                    tr.col(|_ui| {});
+                                    tr.col(|_ui| {});
+                                    tr.col(|_ui| {});
+                                    tr.col(|_ui| {});
+                                    tr.col(|ui| {
+                                        ui.colored_label(rec_status_color(g.status()), g.status());
+                                    });
+                                    tr.col(|ui| {
+                                        ui.label(fmt_went_live(g.went_live_at, g.went_live_approx));
+                                    });
+                                    tr.col(|ui| {
+                                        ui.label(fmt_datetime_short(g.started_at()));
+                                    });
+                                    tr.col(|ui| {
+                                        if let Some(l) = g.lost_secs() {
+                                            ui.label(fmt_duration(l));
+                                        }
+                                    });
+                                    tr.col(|ui| {
+                                        ui.label(fmt_duration(g.captured_secs(now))).on_hover_text(
+                                            format!(
+                                                "{} captured across {} take(s) · span {}",
+                                                fmt_bytes(g.total_bytes()),
+                                                g.takes.len(),
+                                                fmt_duration(span),
+                                            ),
+                                        );
+                                    });
+                                    tr.col(|_ui| {});
+                                    tr.col(|ui| {
+                                        let ok = dir.as_ref().map(|d| d.is_dir()).unwrap_or(false);
+                                        if ui
+                                            .add_enabled(ok, egui::Button::new("📂").small())
+                                            .on_hover_text("Open folder")
+                                            .clicked()
+                                        {
+                                            open_path = dir.clone();
+                                        }
+                                    });
+                                    if disc {
+                                        toggle_stream = Some(g.key.clone());
+                                    }
+                                });
+                            }
+                            Vis::Take { mid, gi, ti, depth } => {
+                                let t = &groups[&mid][gi].takes[ti];
+                                let dir = std::path::Path::new(&t.output_path)
+                                    .parent()
+                                    .map(|p| p.to_path_buf());
+                                body.row(24.0, |mut tr| {
+                                    tr.col(|_ui| {});
+                                    tr.col(|ui| {
+                                        tree_name(
+                                            ui, depth, false, false,
+                                            egui::RichText::new(format!("Take {}", ti + 1)).weak(),
+                                        );
+                                    });
+                                    tr.col(|_ui| {});
+                                    tr.col(|_ui| {});
+                                    tr.col(|_ui| {});
+                                    tr.col(|_ui| {});
+                                    tr.col(|ui| {
+                                        let resp =
+                                            ui.colored_label(rec_status_color(&t.status), &t.status);
+                                        if let Some(code) = t.exit_code {
+                                            resp.on_hover_text(format!("exit code {code}"));
+                                        }
+                                    });
+                                    tr.col(|_ui| {});
+                                    tr.col(|ui| {
+                                        ui.label(fmt_datetime_short(t.started_at));
+                                    });
+                                    tr.col(|ui| {
+                                        if let Some(l) = t.lost_secs {
+                                            ui.label(fmt_duration(l));
+                                        }
+                                    });
+                                    tr.col(|ui| {
+                                        let d = ui.label(fmt_duration(t.duration_secs(now)));
+                                        if t.bytes > 0 {
+                                            d.on_hover_text(fmt_bytes(t.bytes));
+                                        }
+                                    });
+                                    tr.col(|_ui| {});
+                                    tr.col(|ui| {
+                                        ui.push_id(t.id, |ui| {
+                                            let file_ok = !t.output_path.is_empty()
+                                                && std::path::Path::new(&t.output_path).is_file();
+                                            if ui
+                                                .add_enabled(file_ok, egui::Button::new("▶").small())
+                                                .on_hover_text("Open file")
+                                                .clicked()
+                                            {
+                                                open_path =
+                                                    Some(std::path::PathBuf::from(&t.output_path));
+                                            }
+                                            let dir_ok =
+                                                dir.as_ref().map(|d| d.is_dir()).unwrap_or(false);
+                                            if ui
+                                                .add_enabled(dir_ok, egui::Button::new("📂").small())
+                                                .on_hover_text("Open folder")
+                                                .clicked()
+                                            {
+                                                open_path = dir.clone();
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    !t.output_path.is_empty(),
+                                                    egui::Button::new("📋").small(),
+                                                )
+                                                .on_hover_text("Copy file path")
+                                                .clicked()
+                                            {
+                                                copy_text = Some(t.output_path.clone());
+                                            }
+                                            let del_hint = if t.is_active() {
+                                                "Stop the recording before removing this take"
+                                            } else {
+                                                "Remove this take from the list (keeps the file)"
+                                            };
+                                            if ui
+                                                .add_enabled(
+                                                    !t.is_active(),
+                                                    egui::Button::new("🗑").small(),
+                                                )
+                                                .on_hover_text(del_hint)
+                                                .clicked()
+                                            {
+                                                delete_recording = Some(t.id);
+                                            }
+                                        });
+                                    });
+                                });
+                            }
                         }
-                    });
+                    }
+                });
             });
         self.streams_sort = sort;
         self.streams_filters = filters;
@@ -2172,34 +2673,65 @@ impl StreamArchiverApp {
                 .request_repaint_after(std::time::Duration::from_secs(1));
         }
 
-        if let Some(i) = to_edit {
-            self.form = Some(MonitorForm::from_existing(&self.rows[i]));
+        if let Some(id) = toggle_channel {
+            if !self.expanded_channels.remove(&id) {
+                self.expanded_channels.insert(id);
+            }
         }
-        if let Some(i) = to_add_instance {
-            self.form = Some(MonitorForm::add_instance(
-                &self.rows[i].channel,
-                self.settings.default_output_dir.clone(),
-            ));
+        if let Some(id) = toggle_instance {
+            if !self.expanded_instances.remove(&id) {
+                self.expanded_instances.insert(id);
+            }
         }
-        if let Some(id) = to_select {
+        if let Some(k) = toggle_stream {
+            if !self.expanded_streams.remove(&k) {
+                self.expanded_streams.insert(k);
+            }
+        }
+        if let Some(mid) = acts.edit {
+            if let Some(r) = self.rows.iter().find(|r| r.monitor.id == mid) {
+                self.form = Some(MonitorForm::from_existing(r));
+            }
+        }
+        if let Some(cid) = acts.add_instance {
+            if let Some(r) = self.rows.iter().find(|r| r.channel.id == cid) {
+                self.form = Some(MonitorForm::add_instance(
+                    &r.channel,
+                    self.settings.default_output_dir.clone(),
+                ));
+            }
+        }
+        if let Some(id) = acts.select {
             self.selected_monitor = Some(id);
         }
-        if let Some((id, on)) = toggle {
+        if let Some((id, on)) = acts.toggle_enabled {
             if let Err(e) = self.core.store.set_monitor_enabled(id, on) {
                 self.status = format!("Error: {e}");
             }
             self.reload_rows();
         }
-        if let Some((id, name)) = to_delete {
+        if let Some((id, name)) = acts.delete {
             self.confirm_delete = Some((id, name));
         }
-        if let Some(id) = to_start {
+        if let Some(id) = acts.start {
             self.core.manual(ManualCommand::Start(id));
             self.status = "Checking channel… will record if live.".into();
         }
-        if let Some(id) = to_stop {
+        if let Some(id) = acts.stop {
             self.core.manual(ManualCommand::Stop(id));
             self.status = "Stopping recording…".into();
+        }
+        if let Some(p) = open_path {
+            crate::platform::open_path(&p);
+        }
+        if let Some(t) = copy_text {
+            ui.ctx().copy_text(t);
+        }
+        if let Some(rid) = delete_recording {
+            if let Err(e) = self.core.store.delete_recording(rid) {
+                self.status = format!("Error: {e}");
+            }
+            self.reload_rows();
         }
     }
 

@@ -48,6 +48,9 @@ pub struct DetectOutcome {
     /// Platform-reported go-live time (unix seconds), when the source provides it
     /// (Twitch Helix). `None` means callers should approximate it.
     pub went_live_at: Option<i64>,
+    /// Platform stream/video id, when the source provides it (groups recording
+    /// takes of one broadcast). `None` for id-less methods (scrape/probe).
+    pub stream_id: Option<String>,
 }
 
 impl DetectOutcome {
@@ -58,6 +61,7 @@ impl DetectOutcome {
             detail: detail.into(),
             error: false,
             went_live_at: None,
+            stream_id: None,
         }
     }
     fn live_at(
@@ -70,6 +74,11 @@ impl DetectOutcome {
             ..DetectOutcome::live(monitor_id, detail)
         }
     }
+    /// Attach a platform stream id (builder-style).
+    fn with_stream_id(mut self, stream_id: Option<String>) -> DetectOutcome {
+        self.stream_id = stream_id;
+        self
+    }
     fn offline(monitor_id: i64) -> DetectOutcome {
         DetectOutcome {
             monitor_id,
@@ -77,6 +86,7 @@ impl DetectOutcome {
             detail: String::new(),
             error: false,
             went_live_at: None,
+            stream_id: None,
         }
     }
     fn err(monitor_id: i64, detail: impl Into<String>) -> DetectOutcome {
@@ -86,6 +96,7 @@ impl DetectOutcome {
             detail: detail.into(),
             error: true,
             went_live_at: None,
+            stream_id: None,
         }
     }
 }
@@ -236,6 +247,7 @@ impl DetectContext {
 
         #[derive(Deserialize)]
         struct Stream {
+            id: String,
             user_login: String,
             #[serde(rename = "type")]
             kind: String,
@@ -264,8 +276,9 @@ impl DetectContext {
 
                 match resp {
                     Ok(r) if r.status().is_success() => {
-                        // login -> go-live time (unix), for currently-live channels.
-                        let live: HashMap<String, Option<i64>> = match r.json::<StreamsResp>().await
+                        // login -> (go-live time, stream id) for currently-live channels.
+                        let live: HashMap<String, (Option<i64>, Option<String>)> =
+                            match r.json::<StreamsResp>().await
                         {
                             Ok(sr) => sr
                                 .data
@@ -273,7 +286,7 @@ impl DetectContext {
                                 .filter(|s| s.kind == "live")
                                 .map(|s| {
                                     let when = s.started_at.as_deref().and_then(parse_rfc3339);
-                                    (s.user_login.to_lowercase(), when)
+                                    (s.user_login.to_lowercase(), (when, Some(s.id)))
                                 })
                                 .collect(),
                             Err(e) => {
@@ -292,7 +305,8 @@ impl DetectContext {
                             let key = l.to_lowercase();
                             for mid in &login_to_mons[l] {
                                 outcomes.push(match live.get(&key) {
-                                    Some(went) => DetectOutcome::live_at(*mid, "live", *went),
+                                    Some((went, id)) => DetectOutcome::live_at(*mid, "live", *went)
+                                        .with_stream_id(id.clone()),
                                     None => DetectOutcome::offline(*mid),
                                 });
                             }
@@ -386,6 +400,7 @@ impl DetectContext {
                     Some(vid) => {
                         let went = self.youtube_actual_start(vid, &key).await;
                         DetectOutcome::live_at(item.monitor_id, "live", went)
+                            .with_stream_id(Some(vid.to_string()))
                     }
                     None => DetectOutcome::offline(item.monitor_id),
                 }
@@ -520,7 +535,12 @@ impl DetectContext {
                     .or_else(|| stream["created_at"].as_str())
                     .and_then(parse_rfc3339);
                 if live {
-                    DetectOutcome::live_at(item.monitor_id, "live", went)
+                    // The livestream id (when present) identifies the broadcast.
+                    let id = stream["id"]
+                        .as_i64()
+                        .map(|n| n.to_string())
+                        .or_else(|| stream["id"].as_str().map(str::to_string));
+                    DetectOutcome::live_at(item.monitor_id, "live", went).with_stream_id(id)
                 } else {
                     DetectOutcome::offline(item.monitor_id)
                 }

@@ -426,7 +426,7 @@ impl Supervisor {
                     if self.shutdown.load(Ordering::SeqCst) {
                         continue; // draining: don't start new recordings
                     }
-                    self.try_begin(signal.monitor_id, signal.went_live_at, signal.approximate, false);
+                    self.try_begin(signal.monitor_id, signal.went_live_at, signal.approximate, signal.stream_id, false);
                 }
                 Some(cmd) = manual_rx.recv() => match cmd {
                     ManualCommand::Start(id) => {
@@ -454,6 +454,7 @@ impl Supervisor {
         monitor_id: i64,
         went_live_at: Option<i64>,
         approximate: bool,
+        stream_id: Option<String>,
         bypass_backoff: bool,
     ) -> bool {
         {
@@ -479,7 +480,7 @@ impl Supervisor {
         };
         let this = self.clone();
         tokio::spawn(async move {
-            this.record(row, went_live_at, approximate).await;
+            this.record(row, went_live_at, approximate, stream_id).await;
         });
         true
     }
@@ -500,7 +501,7 @@ impl Supervisor {
                 Some(t) => (Some(t), false),
                 None => (Some(now_unix()), true),
             };
-            self.try_begin(monitor_id, went, approx, true);
+            self.try_begin(monitor_id, went, approx, outcome.stream_id, true);
         } else {
             let message = if outcome.error && !outcome.detail.is_empty() {
                 format!("{name}: {}", outcome.detail)
@@ -743,6 +744,7 @@ impl Supervisor {
                     detail: "no result".into(),
                     error: true,
                     went_live_at: None,
+                    stream_id: None,
                 }),
             DetectionMethod::GenericProbe => self.ctx.detect_generic(&item).await,
             DetectionMethod::YouTubeApi => self.ctx.detect_youtube_api(&item).await,
@@ -781,7 +783,13 @@ impl Supervisor {
         }
     }
 
-    async fn record(&self, row: MonitorWithChannel, went_live_at: Option<i64>, approximate: bool) {
+    async fn record(
+        &self,
+        row: MonitorWithChannel,
+        went_live_at: Option<i64>,
+        approximate: bool,
+        stream_id: Option<String>,
+    ) {
         let monitor_id = row.monitor.id;
         let _permit = self.sem.acquire().await.expect("semaphore");
 
@@ -812,6 +820,7 @@ impl Supervisor {
                 &plan.final_path.to_string_lossy(),
                 went_live_at,
                 approximate,
+                stream_id.as_deref(),
             )
             .unwrap_or(0);
         let _ = self
@@ -840,6 +849,8 @@ impl Supervisor {
         let watcher = resolve_lost.then(|| {
             tokio::spawn(catch_up_watcher(
                 self.store.clone(),
+                self.events.clone(),
+                monitor_id,
                 rec_id,
                 plan.capture_path.clone(),
                 went_live_at.unwrap_or(0),
@@ -1248,8 +1259,11 @@ async fn media_duration_secs(path: &Path) -> Option<i64> {
 /// Watch a from-start recording's growing capture and zero its "lost time" once
 /// the captured media catches up to the live edge. Exits early when `done` is set
 /// (recording ended) so finalize can compute the exact residual without a race.
+#[allow(clippy::too_many_arguments)]
 async fn catch_up_watcher(
     store: Arc<Store>,
+    events: EventTx,
+    monitor_id: i64,
     rec_id: i64,
     capture_path: PathBuf,
     went_live: i64,
@@ -1271,6 +1285,12 @@ async fn catch_up_watcher(
             if captured + CATCHUP_TOLERANCE_SECS >= elapsed {
                 let _ = store.set_recording_lost_secs(rec_id, 0);
                 info!(rec_id, "from-start capture caught up with live (lost time = 0)");
+                // Wake the UI so an already-expanded history tree refreshes the
+                // Lost-time column from the new value.
+                let _ = events.send(AppEvent::MonitorState {
+                    monitor_id,
+                    state: "recording".into(),
+                });
                 return;
             }
         }
@@ -1423,6 +1443,7 @@ mod tests {
             last_recording_went_live: None,
             last_recording_went_live_approx: false,
             last_recording_lost_secs: None,
+            recording_count: 0,
         }
     }
 
