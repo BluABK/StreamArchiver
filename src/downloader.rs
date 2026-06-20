@@ -47,6 +47,11 @@ pub type VideoProgress = Arc<Mutex<HashMap<i64, f32>>>;
 /// when the download finishes.
 pub type VideoSpeed = Arc<Mutex<HashMap<i64, f64>>>;
 
+/// monitor_id -> unix time the current ad break ends, while one is playing
+/// (Twitch+streamlink). Lets the UI tint a row "ad running"; entries expire
+/// naturally (now >= value) and are removed when the recording ends.
+pub type AdActive = Arc<Mutex<HashMap<i64, i64>>>;
+
 const RING_MAX_LINES: usize = 80;
 /// A recording that fails faster than this is treated as a transient failure
 /// and subject to backoff.
@@ -81,6 +86,8 @@ struct AdSink {
     /// The growing capture file; its media duration is the true cut position
     /// (ad segments are filtered out, so captured content == the finished file).
     capture_path: PathBuf,
+    /// Shared map the UI reads to tint a row while an ad is playing.
+    ad_active: AdActive,
 }
 
 /// The plan for one recording: the command to run plus the files involved.
@@ -402,6 +409,8 @@ pub struct Supervisor {
     shutdown: Arc<AtomicBool>,
     /// Shared detection context for on-demand (manual Start) liveness checks.
     ctx: Arc<DetectContext>,
+    /// monitor_id -> unix time the current ad break ends (for the UI row tint).
+    ad_active: AdActive,
     sem: Arc<Semaphore>,
     backoff: Arc<Mutex<HashMap<i64, BackoffEntry>>>,
 }
@@ -423,6 +432,7 @@ impl Supervisor {
         video_speed: VideoSpeed,
         shutdown: Arc<AtomicBool>,
         ctx: Arc<DetectContext>,
+        ad_active: AdActive,
         max_concurrent: usize,
     ) -> Supervisor {
         Supervisor {
@@ -435,6 +445,7 @@ impl Supervisor {
             stopping_videos: Arc::new(Mutex::new(HashSet::new())),
             shutdown,
             ctx,
+            ad_active,
             sem: Arc::new(Semaphore::new(max_concurrent.max(1))),
             backoff: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -901,6 +912,7 @@ impl Supervisor {
                 went_live_at,
                 from_start,
                 capture_path: plan.capture_path.clone(),
+                ad_active: self.ad_active.clone(),
             });
 
         let outcome = self
@@ -978,6 +990,7 @@ impl Supervisor {
 
         self.note_result(monitor_id, duration, ok);
         self.active.lock().unwrap().remove(&monitor_id);
+        self.ad_active.lock().unwrap().remove(&monitor_id);
     }
 
     async fn run_process(
@@ -1138,6 +1151,11 @@ impl Supervisor {
                     let at = at.max(last_at);
                     last_at = at;
                     prior_ad_secs += dur;
+                    // Mark the ad window so the UI can tint the row while it plays.
+                    sink.ad_active
+                        .lock()
+                        .unwrap()
+                        .insert(sink.monitor_id, detected_at + dur);
                     match sink.store.insert_ad_break(sink.recording_id, at, dur) {
                         Ok(_) => {
                             info!(

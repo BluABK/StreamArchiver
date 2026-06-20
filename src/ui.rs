@@ -636,6 +636,41 @@ fn fmt_duration(secs: i64) -> String {
 /// video "completed", ad-free "Yes").
 const SUCCESS_GREEN: egui::Color32 = egui::Color32::from_rgb(0x57, 0xc7, 0x57);
 
+/// Streams-row background tint while an ad is playing (amber) / after an error
+/// (red). Recording + keyboard-selected rows reuse the theme's selection accent.
+const HL_AD: egui::Color32 = egui::Color32::from_rgb(0x7a, 0x5a, 0x12);
+const HL_ERROR: egui::Color32 = egui::Color32::from_rgb(0x6e, 0x2f, 0x2f);
+
+/// Background tint for a Streams row, by state (highest priority first): an ad is
+/// playing > recording > last poll/recording errored > keyboard-selected.
+/// `accent` is the theme's selection color (so recording/selected keep the
+/// existing look). `None` = no tint.
+fn row_tint(
+    recording: bool,
+    ad_running: bool,
+    errored: bool,
+    selected: bool,
+    accent: egui::Color32,
+) -> Option<egui::Color32> {
+    if recording && ad_running {
+        Some(HL_AD)
+    } else if recording {
+        Some(accent)
+    } else if errored {
+        Some(HL_ERROR)
+    } else if selected {
+        Some(accent)
+    } else {
+        None
+    }
+}
+
+/// Whether a monitor's last poll or recording ended in an error/failure.
+fn monitor_errored(m: &MonitorWithChannel) -> bool {
+    matches!(m.monitor.last_state.as_str(), "error" | "failed")
+        || m.last_recording_status.as_deref() == Some("failed")
+}
+
 /// Ad-break count for a cell (blank when there are none, so empty rows stay clean).
 fn fmt_ad_count(n: i64) -> String {
     if n > 0 { n.to_string() } else { String::new() }
@@ -1182,7 +1217,7 @@ fn render_instance_row(
     row: &MonitorWithChannel,
     now: i64,
     recording: bool,
-    is_selected: bool,
+    highlight: bool,
     depth: usize,
     has_history: bool,
     expanded: bool,
@@ -1190,7 +1225,8 @@ fn render_instance_row(
 ) -> bool {
     let m = &row.monitor;
     let rec = recording_cells(row, now);
-    tr.set_selected(recording || is_selected);
+    // The caller set the row's tint color (recording/ad/error/selected); paint it.
+    tr.set_selected(highlight);
 
     // Right-click context menu (shared with the inline action buttons).
     let add_menu = |ui: &mut egui::Ui, a: &mut RowActions| {
@@ -2689,6 +2725,9 @@ impl StreamArchiverApp {
         let exp_channels = self.expanded_channels.clone();
         let exp_instances = self.expanded_instances.clone();
         let exp_streams = self.expanded_streams.clone();
+        // Snapshot which monitors currently have an ad playing (for the row tint).
+        let ad_active = self.core.ad_active.lock().unwrap().clone();
+        let ad_running = |mid: i64| ad_active.get(&mid).is_some_and(|&end| now < end);
 
         // Channel-level sort/filter model (one entry per top-level channel row).
         let model: Vec<Vec<Cell>> = chan_entries
@@ -2715,6 +2754,9 @@ impl StreamArchiverApp {
                 // breaking the row context menu. Turn it off for the table so the
                 // row's click sense wins (the menu offers "Copy URL" instead).
                 ui.style_mut().interaction.selectable_labels = false;
+                // Theme accent used for recording/selected rows; ad/error states
+                // override the per-row selection color before each row.
+                let sel_color = ui.visuals().selection.bg_fill;
                 let table = TableBuilder::new(ui)
                     .striped(true)
                     .resizable(true)
@@ -2836,8 +2878,16 @@ impl StreamArchiverApp {
                                 });
                                 let ad_free =
                                     ad_free_summary(channel_ad_free_count(&mons), ninst);
+                                // Tint the container row by the rolled-up state of
+                                // its instances (ad playing / recording / errored).
+                                let any_ad = mons.iter().any(|m| ad_running(m.monitor.id));
+                                let any_err = mons.iter().copied().any(monitor_errored);
+                                let tint = row_tint(any_rec, any_ad, any_err, false, sel_color);
+                                if let Some(c) = tint {
+                                    body.ui_mut().visuals_mut().selection.bg_fill = c;
+                                }
                                 body.row(24.0, |mut tr| {
-                                    tr.set_selected(any_rec);
+                                    tr.set_selected(tint.is_some());
                                     let mut disc = false;
                                     tr.col(|ui| {
                                         let mut on = all_enabled;
@@ -2980,10 +3030,22 @@ impl StreamArchiverApp {
                                 let has_hist = row.recording_count > 0;
                                 let expanded = exp_instances.contains(&row.monitor.id);
                                 let mid = row.monitor.id;
+                                // Tint by state: ad playing / recording / errored /
+                                // keyboard-selected.
+                                let tint = row_tint(
+                                    recording,
+                                    ad_running(mid),
+                                    monitor_errored(row),
+                                    is_selected,
+                                    sel_color,
+                                );
+                                if let Some(c) = tint {
+                                    body.ui_mut().visuals_mut().selection.bg_fill = c;
+                                }
                                 body.row(24.0, |mut tr| {
                                     if render_instance_row(
-                                        &mut tr, row, now, recording, is_selected, depth, has_hist,
-                                        expanded, &mut acts,
+                                        &mut tr, row, now, recording, tint.is_some(), depth,
+                                        has_hist, expanded, &mut acts,
                                     ) {
                                         toggle_instance = Some(mid);
                                     }
