@@ -253,6 +253,8 @@ yt-dlp's output templates):
 | `{title}` | The stream/video title. **Videos only**, and only when **Auto-detect** is on (live recordings don't resolve a title, so it's empty there). |
 | `{channel}` | The uploader/channel name. **Videos only**, when **Auto-detect** is on; empty otherwise. |
 | `{video_id}` | The platform **stream/video id**. **Streams:** set when detection knows it (Twitch Helix/EventSub, YouTube Data API, Kick API); empty for id-less methods (scrape / generic probe). **Videos:** set when **Auto-detect** is on. |
+| `{quality}` | The **configured quality selector** (e.g. `1080p60`, `best`, `bv*+ba`) — what you asked for, not necessarily the actual resolution (see `{resolution}` below). |
+| `{take}` | **Streams:** this monitor's attempt number (1, 2, 3, …) — a built-in way to keep names unique when you omit `{date}`/`{time}`. Empty for Videos. |
 | `{date}` | Capture-start date, **UTC**, `YYYYMMDD` (e.g. `20260620`). |
 | `{time}` | Capture-start time, **UTC**, `HHMMSS` (e.g. `183001`). |
 | `{timestamp}` | Capture start as a **Unix timestamp** (whole seconds). |
@@ -267,6 +269,11 @@ Notes:
 - Unknown `{…}` tokens are left as literal text; only the variables above are
   substituted.
 - If a template expands to nothing usable, it falls back to `{name}_{date}_{time}`.
+- **Collisions are handled automatically:** if the target file already exists, the
+  app appends ` (2)`, ` (3)`, … (file-manager style) rather than overwriting — so
+  even a template with no unique part (e.g. just `{name}`) never clobbers an
+  earlier recording. Use `{take}` (or `{date}`/`{time}`/`{video_id}`) if you'd
+  rather the difference be part of the name itself.
 
 Examples: `{name}_{date}_{time}` → `Layna_20260620_183001.mkv`; for a Videos
 download with **Auto-detect** on, `{channel} - {title} [{video_id}]` →

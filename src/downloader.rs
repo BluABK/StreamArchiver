@@ -172,22 +172,35 @@ pub fn build_plan(
     let m = &row.monitor;
     let ch = &row.channel;
     let dir = PathBuf::from(&m.output_dir);
-    // `{video_id}` is the platform stream/video id when detection knew it (Twitch
-    // Helix/EventSub, YouTube Data API, Kick API); empty for id-less methods.
-    let stem = expand_template(
-        &m.filename_template,
-        &ch.name,
-        "",
-        "",
-        stream_id.unwrap_or(""),
-        started_at,
-    );
     let quality = if m.quality.trim().is_empty() {
         "best".to_string()
     } else {
         m.quality.clone()
     };
+    // `{video_id}` is the platform stream/video id when detection knew it (Twitch
+    // Helix/EventSub, YouTube Data API, Kick API); empty for id-less methods.
+    // `{take}` is this monitor's attempt number. Media vars (resolution/fps/…) are
+    // filled later when probing is enabled.
+    let take = (row.recording_count + 1).to_string();
+    let stem = expand_template(
+        &m.filename_template,
+        &TemplateVars {
+            name: &ch.name,
+            video_id: stream_id.unwrap_or(""),
+            quality: &quality,
+            take: &take,
+            secs: started_at,
+            ..Default::default()
+        },
+    );
     let extra = split_args(&m.extra_args);
+
+    // Don't clobber an existing finished file of the same name.
+    let final_ext = match m.container {
+        Container::Mkv => "mkv",
+        Container::Ts => "ts",
+    };
+    let stem = unique_stem(&dir, &stem, final_ext);
 
     let ts_path = dir.join(format!("{stem}.ts"));
     let ts_str = ts_path.to_string_lossy().into_owned();
@@ -299,21 +312,27 @@ pub fn build_video_plan(
     } else {
         "video"
     };
-    let stem = expand_template(
-        &v.filename_template,
-        name,
-        resolved,
-        channel.trim(),
-        video_id.trim(),
-        started_at,
-    );
     let quality = if v.quality.trim().is_empty() {
         "best".to_string()
     } else {
         v.quality.trim().to_string()
     };
+    let stem = expand_template(
+        &v.filename_template,
+        &TemplateVars {
+            name,
+            title: resolved,
+            channel: channel.trim(),
+            video_id: video_id.trim(),
+            quality: &quality,
+            secs: started_at,
+            ..Default::default()
+        },
+    );
     let extra = split_args(&v.extra_args);
     let platform = Platform::detect(&v.url);
+    // Don't clobber an existing finished file (all video tools end at .mkv).
+    let stem = unique_stem(&dir, &stem, "mkv");
     let final_path = dir.join(format!("{stem}.mkv"));
 
     match v.tool {
@@ -1524,20 +1543,35 @@ fn split_args(s: &str) -> Vec<String> {
     out
 }
 
+/// Inputs to [`expand_template`]. Each field maps to a `{…}` variable; empty
+/// fields render empty. `title`/`channel`/`video_id` are resolved metadata (empty
+/// for live recordings or id-less methods); `resolution`/`height`/`width`/`fps`/
+/// `vcodec` are actual media info (filled only when probing is enabled).
+#[derive(Default)]
+pub struct TemplateVars<'a> {
+    pub name: &'a str,
+    pub title: &'a str,
+    pub channel: &'a str,
+    pub video_id: &'a str,
+    /// Configured quality selector (e.g. `1080p60`, `best`).
+    pub quality: &'a str,
+    pub resolution: &'a str,
+    pub height: &'a str,
+    pub width: &'a str,
+    pub fps: &'a str,
+    pub vcodec: &'a str,
+    /// Attempt number (per-monitor take count); empty for on-demand videos.
+    pub take: &'a str,
+    /// Capture-start time (unix secs) for `{date}`/`{time}`/`{timestamp}`.
+    pub secs: i64,
+}
+
 /// Expand a filename template using our own (tool-agnostic) variables so the
-/// output path is known in advance: `{name} {title} {channel} {video_id} {date}
-/// {time} {timestamp}`. `title`/`channel`/`video_id` are resolved metadata (empty
-/// when not known: e.g. live recordings have no title, id-less detection methods
-/// have no video_id).
-fn expand_template(
-    template: &str,
-    name: &str,
-    title: &str,
-    channel: &str,
-    video_id: &str,
-    secs: i64,
-) -> String {
-    let (y, mo, d, h, mi, s) = civil_from_unix_utc(secs);
+/// output path is known in advance: `{name} {title} {channel} {video_id}
+/// {quality} {resolution} {height} {width} {fps} {vcodec} {take} {date} {time}
+/// {timestamp}`.
+fn expand_template(template: &str, v: &TemplateVars) -> String {
+    let (y, mo, d, h, mi, s) = civil_from_unix_utc(v.secs);
     let date = format!("{y:04}{mo:02}{d:02}");
     let time = format!("{h:02}{mi:02}{s:02}");
     let tmpl = if template.trim().is_empty() {
@@ -1546,19 +1580,44 @@ fn expand_template(
         template
     };
     let expanded = tmpl
-        .replace("{name}", name)
-        .replace("{title}", title)
-        .replace("{channel}", channel)
-        .replace("{video_id}", video_id)
+        .replace("{name}", v.name)
+        .replace("{title}", v.title)
+        .replace("{channel}", v.channel)
+        .replace("{video_id}", v.video_id)
+        .replace("{quality}", v.quality)
+        .replace("{resolution}", v.resolution)
+        .replace("{height}", v.height)
+        .replace("{width}", v.width)
+        .replace("{fps}", v.fps)
+        .replace("{vcodec}", v.vcodec)
+        .replace("{take}", v.take)
         .replace("{date}", &date)
         .replace("{time}", &time)
-        .replace("{timestamp}", &secs.to_string());
+        .replace("{timestamp}", &v.secs.to_string());
     let cleaned = sanitize_filename(&expanded);
     if cleaned.is_empty() {
-        format!("{}_{date}_{time}", sanitize_filename(name))
+        format!("{}_{date}_{time}", sanitize_filename(v.name))
     } else {
         cleaned
     }
+}
+
+/// A stem (filename without extension) that doesn't collide with an existing
+/// `<stem>.<ext>` in `dir`: returns `stem`, else `stem (2)`, `stem (3)`, … —
+/// matching the file-manager convention. A missing `dir` can't collide.
+fn unique_stem(dir: &Path, stem: &str, ext: &str) -> String {
+    let taken = |s: &str| dir.join(format!("{s}.{ext}")).exists();
+    if !taken(stem) {
+        return stem.to_string();
+    }
+    for n in 2..10_000 {
+        let cand = format!("{stem} ({n})");
+        if !taken(&cand) {
+            return cand;
+        }
+    }
+    // Pathological fallback (10k same-named files): stamp it so we never clobber.
+    format!("{stem} ({})", now_unix())
 }
 
 fn sanitize_filename(s: &str) -> String {
@@ -1655,6 +1714,26 @@ mod tests {
     }
 
     #[test]
+    fn unique_stem_avoids_existing_files() {
+        let dir = std::env::temp_dir()
+            .join(format!("sa_unique_{}_{}", std::process::id(), now_unix()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Nothing there yet -> stem unchanged.
+        assert_eq!(unique_stem(&dir, "Layna", "mkv"), "Layna");
+        std::fs::write(dir.join("Layna.mkv"), b"x").unwrap();
+        assert_eq!(unique_stem(&dir, "Layna", "mkv"), "Layna (2)");
+        std::fs::write(dir.join("Layna (2).mkv"), b"x").unwrap();
+        assert_eq!(unique_stem(&dir, "Layna", "mkv"), "Layna (3)");
+        // A different extension doesn't collide.
+        assert_eq!(unique_stem(&dir, "Layna", "ts"), "Layna");
+        // A missing directory can't collide.
+        assert_eq!(unique_stem(&dir.join("nope"), "Layna", "mkv"), "Layna");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn civil_date_known_value() {
         // 1700000000 = 2023-11-14 22:13:20 UTC
         assert_eq!(
@@ -1665,23 +1744,40 @@ mod tests {
 
     #[test]
     fn template_expands_and_sanitizes() {
-        let name = expand_template("{name}_{date}", "Bad/Name?", "", "", "", 1_700_000_000);
+        let name = expand_template(
+            "{name}_{date}",
+            &TemplateVars {
+                name: "Bad/Name?",
+                secs: 1_700_000_000,
+                ..Default::default()
+            },
+        );
         assert_eq!(name, "Bad_Name__20231114");
     }
 
     #[test]
-    fn template_expands_video_id() {
+    fn template_expands_video_id_quality_take() {
         let out = expand_template(
-            "{name}_{video_id}",
-            "Stream",
-            "",
-            "",
-            "abc123",
-            1_700_000_000,
+            "{name}_{video_id}_{quality}_take{take}",
+            &TemplateVars {
+                name: "Stream",
+                video_id: "abc123",
+                quality: "1080p60",
+                take: "3",
+                secs: 1_700_000_000,
+                ..Default::default()
+            },
         );
-        assert_eq!(out, "Stream_abc123");
+        assert_eq!(out, "Stream_abc123_1080p60_take3");
         // Empty id (id-less detection) leaves the slot blank.
-        let out = expand_template("{name}-{video_id}", "Stream", "", "", "", 1_700_000_000);
+        let out = expand_template(
+            "{name}-{video_id}",
+            &TemplateVars {
+                name: "Stream",
+                secs: 1_700_000_000,
+                ..Default::default()
+            },
+        );
         assert_eq!(out, "Stream-");
     }
 
@@ -1740,21 +1836,25 @@ mod tests {
     fn template_expands_title_and_channel() {
         let out = expand_template(
             "{title}_{date}",
-            "ignored",
-            "My Stream!",
-            "Streamer",
-            "",
-            1_700_000_000,
+            &TemplateVars {
+                name: "ignored",
+                title: "My Stream!",
+                channel: "Streamer",
+                secs: 1_700_000_000,
+                ..Default::default()
+            },
         );
         assert_eq!(out, "My Stream!_20231114");
         // name / title / channel stay distinct in expand_template itself.
         let out2 = expand_template(
             "{channel}-{name}-{title}",
-            "Nm",
-            "Ttl",
-            "Chan",
-            "",
-            1_700_000_000,
+            &TemplateVars {
+                name: "Nm",
+                title: "Ttl",
+                channel: "Chan",
+                secs: 1_700_000_000,
+                ..Default::default()
+            },
         );
         assert_eq!(out2, "Chan-Nm-Ttl");
     }
