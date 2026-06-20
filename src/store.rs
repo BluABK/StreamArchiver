@@ -17,7 +17,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -252,7 +252,18 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 13)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 13);
+        if version < 14 {
+            // Per-instance audio/subtitle track selection (max-archival). Empty
+            // preserves the current single-track / no-subtitles behavior, so
+            // existing monitors are unchanged until edited; the Add form defaults
+            // new monitors to "all".
+            conn.execute_batch(
+                "ALTER TABLE monitor ADD COLUMN audio_tracks TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE monitor ADD COLUMN subtitle_tracks TEXT NOT NULL DEFAULT '';",
+            )?;
+            conn.pragma_update(None, "user_version", 14)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 14);
         Ok(())
     }
 
@@ -365,8 +376,8 @@ impl Store {
         conn.execute(
             "INSERT INTO monitor(channel_id, url, enabled, tool, detection_method, poll_interval_secs,
                 quality, output_dir, filename_template, container, capture_from_start, auth_kind,
-                auth_value, extra_args, max_concurrent, last_state, ad_free)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                auth_value, extra_args, max_concurrent, last_state, ad_free, audio_tracks, subtitle_tracks)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 m.channel_id,
                 m.url,
@@ -385,6 +396,8 @@ impl Store {
                 m.max_concurrent,
                 m.last_state,
                 m.ad_free as i64,
+                m.audio_tracks,
+                m.subtitle_tracks,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -395,7 +408,8 @@ impl Store {
         conn.execute(
             "UPDATE monitor SET url=?2, enabled=?3, tool=?4, detection_method=?5, poll_interval_secs=?6,
                 quality=?7, output_dir=?8, filename_template=?9, container=?10, capture_from_start=?11,
-                auth_kind=?12, auth_value=?13, extra_args=?14, max_concurrent=?15, ad_free=?16 WHERE id=?1",
+                auth_kind=?12, auth_value=?13, extra_args=?14, max_concurrent=?15, ad_free=?16,
+                audio_tracks=?17, subtitle_tracks=?18 WHERE id=?1",
             params![
                 m.id,
                 m.url,
@@ -413,6 +427,8 @@ impl Store {
                 m.extra_args,
                 m.max_concurrent,
                 m.ad_free as i64,
+                m.audio_tracks,
+                m.subtitle_tracks,
             ],
         )?;
         Ok(())
@@ -634,7 +650,7 @@ impl Store {
                 m.url,
                 (SELECT COUNT(*) FROM ad_break ab WHERE ab.recording_id = r.id),
                 COALESCE((SELECT SUM(ab.duration_secs) FROM ad_break ab WHERE ab.recording_id = r.id), 0),
-                m.ad_free, m.ad_free_sub
+                m.ad_free, m.ad_free_sub, m.audio_tracks, m.subtitle_tracks
              FROM monitor m
              JOIN channel c ON c.id = m.channel_id
              LEFT JOIN recording r
@@ -666,6 +682,8 @@ impl Store {
                     ad_free: r.get::<_, i64>(32)? != 0,
                     auth_kind: AuthKind::parse(&r.get::<_, String>(16)?),
                     auth_value: r.get(17)?,
+                    audio_tracks: r.get(34)?,
+                    subtitle_tracks: r.get(35)?,
                     extra_args: r.get(18)?,
                     max_concurrent: r.get(19)?,
                     last_checked_at: r.get(20)?,
@@ -956,6 +974,8 @@ mod tests {
             ad_free: false,
             auth_kind: AuthKind::Inherit,
             auth_value: String::new(),
+            audio_tracks: String::new(),
+            subtitle_tracks: String::new(),
             extra_args: String::new(),
             max_concurrent: 1,
             last_checked_at: None,

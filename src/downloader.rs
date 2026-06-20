@@ -164,6 +164,46 @@ pub fn resolve_auth_for(
 /// All tools capture to a progressively-flushed `.ts` (so an abrupt
 /// kill/crash leaves usable data) and remux losslessly to `.mkv` on clean
 /// stop. If the user picked the TS container, the `.ts` is kept as-is.
+/// Append audio/subtitle track-selection flags appropriate to `tool`.
+///
+/// `audio`/`subs` are the per-monitor selectors: empty = the tool's default, a
+/// case-insensitive `all` (or `*`) = every track, otherwise a comma-separated
+/// pass-through list. Audio selection is a streamlink feature
+/// (`--hls-audio-select`); subtitle capture is a yt-dlp feature (`--sub-langs`,
+/// written as sidecar files next to the recording). Each tool ignores the
+/// selector it can't honor — streamlink can't mux subtitles, and ffmpeg has no
+/// per-track selector (its capture maps all video+audio tracks regardless of the
+/// value; see the `Tool::Ffmpeg` arm of `build_plan`). Pushed before the user's
+/// `extra_args` so a power user can still override. Selector values use the
+/// `--flag=value` form so a value can never be mis-parsed as a separate option.
+fn push_track_args(args: &mut Vec<String>, tool: Tool, audio: &str, subs: &str) {
+    let audio = audio.trim();
+    let subs = subs.trim();
+    let is_all = |s: &str| s.eq_ignore_ascii_case("all") || s == "*";
+    match tool {
+        Tool::Streamlink => {
+            if !audio.is_empty() {
+                let sel = if is_all(audio) { "*" } else { audio };
+                args.push(format!("--hls-audio-select={sel}"));
+            }
+        }
+        Tool::YtDlp => {
+            if !subs.is_empty() {
+                // `all` and `*` both mean every subtitle; otherwise pass the
+                // comma-separated language list through. Sidecar `.vtt` files are
+                // written next to the capture (best-effort for live) — a lossless,
+                // replayable archive. They are NOT embedded into the container;
+                // the media-rename step moves them so they stay matched to the
+                // final file (see `rename_subtitle_sidecars`).
+                let langs = if is_all(subs) { "all" } else { subs };
+                args.push(format!("--sub-langs={langs}"));
+                args.push("--write-subs".into());
+            }
+        }
+        Tool::Ffmpeg => {}
+    }
+}
+
 pub fn build_plan(
     row: &MonitorWithChannel,
     started_at: i64,
@@ -214,6 +254,7 @@ pub fn build_plan(
             args.push("3".into());
             args.push("--retry-max".into());
             args.push("5".into());
+            push_track_args(&mut args, Tool::Streamlink, &m.audio_tracks, &m.subtitle_tracks);
             args.extend(extra);
             args.push("-o".into());
             args.push(ts_str);
@@ -245,6 +286,7 @@ pub fn build_plan(
                 }
                 _ => {}
             }
+            push_track_args(&mut args, Tool::YtDlp, &m.audio_tracks, &m.subtitle_tracks);
             args.extend(extra);
             args.push(m.url.clone());
             ("yt-dlp".to_string(), args)
@@ -254,6 +296,13 @@ pub fn build_plan(
                 "-y".to_string(),
                 "-i".into(),
                 m.url.clone(),
+                // Keep all video + audio tracks (ffmpeg's default copies only one
+                // per type). TS can't reliably hold text subtitles, so subs are
+                // left to the MKV remux.
+                "-map".into(),
+                "0:v?".into(),
+                "-map".into(),
+                "0:a?".into(),
                 "-c".into(),
                 "copy".into(),
             ];
@@ -373,6 +422,12 @@ pub fn build_video_plan(
                 "-y".to_string(),
                 "-i".into(),
                 v.url.clone(),
+                // Keep all video + audio tracks (ffmpeg's default copies only one
+                // per type); the MKV remux below preserves them.
+                "-map".into(),
+                "0:v?".into(),
+                "-map".into(),
+                "0:a?".into(),
                 "-c".into(),
                 "copy".into(),
             ];
@@ -1423,6 +1478,17 @@ pub async fn remux_ts_to_mkv(src: &Path, dst: &Path) -> anyhow::Result<()> {
     cmd.arg("-y")
         .arg("-i")
         .arg(src)
+        // Keep EVERY video/audio/subtitle stream, not just ffmpeg's default
+        // one-per-type — otherwise the extra audio tracks captured via
+        // `--hls-audio-select=*` would be dropped here. Map by type (each `?`
+        // optional) rather than `-map 0` so TS data streams (e.g. timed-ID3),
+        // which MKV can't hold, don't fail the remux.
+        .arg("-map")
+        .arg("0:v?")
+        .arg("-map")
+        .arg("0:a?")
+        .arg("-map")
+        .arg("0:s?")
         .arg("-c")
         .arg("copy")
         .arg(dst)
@@ -1652,11 +1718,62 @@ async fn rename_for_media(final_path: PathBuf, new_stem: &str) -> PathBuf {
     if new_path == final_path {
         return final_path; // already correctly named (e.g. no media, or "Both")
     }
+    let old_stem = final_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned());
     match tokio::fs::rename(&final_path, &new_path).await {
-        Ok(()) => new_path,
+        Ok(()) => {
+            // Move any subtitle sidecars (yt-dlp `--write-subs` writes
+            // `{stem}.<lang>.vtt`) so they stay matched to the renamed video.
+            if let Some(old) = old_stem {
+                rename_subtitle_sidecars(&dir, &old, &unique).await;
+            }
+            new_path
+        }
         Err(e) => {
             warn!("media rename failed, keeping {}: {e:#}", final_path.display());
             final_path
+        }
+    }
+}
+
+/// Subtitle-sidecar extensions, for companion-file moves when the video is
+/// renamed (so external subs stay associated with their recording).
+const SUBTITLE_EXTS: [&str; 6] = ["vtt", "srt", "ass", "ssa", "sub", "lrc"];
+
+/// When the main recording file is renamed, move its subtitle sidecars
+/// (`{old_stem}.<lang>.<ext>`, e.g. `cap.en.vtt` written by yt-dlp `--write-subs`)
+/// to follow `new_stem`, so they don't become orphaned next to a renamed video.
+/// Best-effort: per-file failures are logged, not fatal; existing targets are
+/// never clobbered.
+async fn rename_subtitle_sidecars(dir: &Path, old_stem: &str, new_stem: &str) {
+    if old_stem == new_stem || old_stem.is_empty() {
+        return;
+    }
+    let prefix = format!("{old_stem}.");
+    let mut rd = match tokio::fs::read_dir(dir).await {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let is_sub = Path::new(&name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| SUBTITLE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+            .unwrap_or(false);
+        if !is_sub {
+            continue;
+        }
+        let to = dir.join(format!("{new_stem}.{rest}"));
+        if to.exists() {
+            continue; // don't clobber an unrelated existing file
+        }
+        if let Err(e) = tokio::fs::rename(entry.path(), &to).await {
+            warn!("subtitle sidecar rename failed for {}: {e:#}", name);
         }
     }
 }
@@ -1998,6 +2115,8 @@ mod tests {
                 ad_free: false,
                 auth_kind: AuthKind::Inherit,
                 auth_value: String::new(),
+                audio_tracks: String::new(),
+                subtitle_tracks: String::new(),
                 extra_args: String::new(),
                 max_concurrent: 1,
                 last_checked_at: None,
@@ -2038,6 +2157,32 @@ mod tests {
         assert_eq!(unique_stem(&dir, "Layna", "mkv", Some(&own)), "Layna (2)");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn subtitle_sidecars_follow_rename() {
+        let dir = std::env::temp_dir()
+            .join(format!("sa_subs_{}_{}", std::process::id(), now_unix()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let old = "cap_20260620";
+        let new = "Show_1080p";
+        // The video has already been renamed; its subtitle sidecars have not.
+        tokio::fs::write(dir.join(format!("{new}.mkv")), b"v").await.unwrap();
+        tokio::fs::write(dir.join(format!("{old}.en.vtt")), b"s").await.unwrap();
+        tokio::fs::write(dir.join(format!("{old}.de.vtt")), b"s").await.unwrap();
+        // A same-stem non-subtitle companion must be left alone.
+        tokio::fs::write(dir.join(format!("{old}.notes.txt")), b"x").await.unwrap();
+
+        rename_subtitle_sidecars(&dir, old, new).await;
+
+        assert!(dir.join(format!("{new}.en.vtt")).exists());
+        assert!(dir.join(format!("{new}.de.vtt")).exists());
+        assert!(!dir.join(format!("{old}.en.vtt")).exists());
+        assert!(dir.join(format!("{old}.notes.txt")).exists());
+        assert!(!dir.join(format!("{new}.notes.txt")).exists());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[test]
@@ -2259,6 +2404,60 @@ mod tests {
             None,
         );
         assert!(file.args.join(" ").contains("--cookies C:/c.txt"));
+    }
+
+    #[test]
+    fn audio_subtitle_track_selection() {
+        // streamlink: "all"/"*" -> --hls-audio-select=*; a list passes through.
+        let mut r = row(Tool::Streamlink, Container::Mkv, Platform::Twitch);
+        r.monitor.audio_tracks = "all".into();
+        r.monitor.subtitle_tracks = "all".into(); // ignored by streamlink
+        let plan = build_plan(&r, 1_700_000_000, &AuthSource::None, None, None);
+        assert!(plan.args.iter().any(|a| a == "--hls-audio-select=*"));
+        assert!(!plan.args.iter().any(|a| a == "--sub-langs"));
+
+        let mut r2 = row(Tool::Streamlink, Container::Mkv, Platform::Twitch);
+        r2.monitor.audio_tracks = "en,de".into();
+        let plan2 = build_plan(&r2, 1_700_000_000, &AuthSource::None, None, None);
+        assert!(plan2.args.iter().any(|a| a == "--hls-audio-select=en,de"));
+
+        // yt-dlp: "all" subs -> --sub-langs=all --write-subs; audio ignored. The
+        // `--flag=value` form keeps a value from being mis-parsed as an option.
+        let mut y = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
+        y.monitor.subtitle_tracks = "all".into();
+        y.monitor.audio_tracks = "all".into(); // ignored by yt-dlp
+        let yplan = build_plan(&y, 1_700_000_000, &AuthSource::None, None, None);
+        assert!(yplan.args.iter().any(|a| a == "--sub-langs=all"));
+        assert!(yplan.args.iter().any(|a| a == "--write-subs"));
+        assert!(!yplan.args.iter().any(|a| a == "--hls-audio-select=*"));
+
+        // "*" is normalized to "all" for subtitles too (matches the audio path),
+        // so it never reaches yt-dlp as the invalid regex `--sub-langs *`.
+        let mut y2 = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
+        y2.monitor.subtitle_tracks = "*".into();
+        let yplan2 = build_plan(&y2, 1_700_000_000, &AuthSource::None, None, None);
+        assert!(yplan2.args.iter().any(|a| a == "--sub-langs=all"));
+
+        // A language list passes through verbatim (joined form).
+        let mut y3 = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
+        y3.monitor.subtitle_tracks = "en,de".into();
+        let yplan3 = build_plan(&y3, 1_700_000_000, &AuthSource::None, None, None);
+        assert!(yplan3.args.iter().any(|a| a == "--sub-langs=en,de"));
+
+        // Empty (existing-monitor default) adds no track flags at all.
+        let plain = build_plan(
+            &row(Tool::Streamlink, Container::Mkv, Platform::Twitch),
+            1_700_000_000,
+            &AuthSource::None,
+            None,
+            None,
+        );
+        assert!(
+            !plain
+                .args
+                .iter()
+                .any(|a| a.starts_with("--hls-audio-select"))
+        );
     }
 
     #[test]

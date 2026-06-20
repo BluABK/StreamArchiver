@@ -515,6 +515,16 @@ pub struct Monitor {
     pub auth_kind: AuthKind,
     /// Value for `auth_kind`: browser name, cookies.txt path, or token.
     pub auth_value: String,
+    /// Audio tracks to capture. Empty = the tool's default (one track); `all`/`*`
+    /// = every audio track; otherwise a comma-separated pass-through list of
+    /// language codes/names. Honored by streamlink (`--hls-audio-select`); the
+    /// ffmpeg tool keeps all video+audio tracks via its capture mapping
+    /// (subset selection not supported), and yt-dlp ignores it.
+    pub audio_tracks: String,
+    /// Subtitle tracks to capture. Empty = none; `all` = every subtitle;
+    /// otherwise a comma-separated pass-through list of language codes. Honored by
+    /// yt-dlp (`--sub-langs` + write sidecars); streamlink can't mux subtitles.
+    pub subtitle_tracks: String,
     pub extra_args: String,
     pub max_concurrent: i64,
     pub last_checked_at: Option<i64>,

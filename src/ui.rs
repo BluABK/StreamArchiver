@@ -93,6 +93,12 @@ struct MonitorForm {
     enabled: bool,
     auth_kind: AuthKind,
     auth_value: String,
+    /// Audio tracks to capture (streamlink `--hls-audio-select`): empty = default,
+    /// `all`/`*` = every track, or a comma-separated list.
+    audio_tracks: String,
+    /// Subtitle tracks to capture (yt-dlp `--sub-langs`): empty = none, `all` =
+    /// every subtitle, or a comma-separated list of language codes.
+    subtitle_tracks: String,
     extra_args: String,
     /// Platform the tool/detection defaults were last set for; a URL change to a
     /// different platform re-applies that platform's defaults.
@@ -119,6 +125,9 @@ impl MonitorForm {
             enabled: true,
             auth_kind: AuthKind::Inherit,
             auth_value: String::new(),
+            // New monitors default to max-archival: every audio + subtitle track.
+            audio_tracks: "all".into(),
+            subtitle_tracks: "all".into(),
             extra_args: String::new(),
             last_platform: None,
         }
@@ -143,6 +152,8 @@ impl MonitorForm {
             enabled: m.enabled,
             auth_kind: m.auth_kind,
             auth_value: m.auth_value.clone(),
+            audio_tracks: m.audio_tracks.clone(),
+            subtitle_tracks: m.subtitle_tracks.clone(),
             extra_args: m.extra_args.clone(),
             // Don't override the saved tool/detection just because the form opened.
             last_platform: Some(m.platform()),
@@ -169,6 +180,9 @@ impl MonitorForm {
             enabled: true,
             auth_kind: AuthKind::Inherit,
             auth_value: String::new(),
+            // New monitors default to max-archival: every audio + subtitle track.
+            audio_tracks: "all".into(),
+            subtitle_tracks: "all".into(),
             extra_args: String::new(),
             last_platform: None,
         }
@@ -521,6 +535,8 @@ impl StreamArchiverApp {
             ad_free: form.ad_free,
             auth_kind: form.auth_kind,
             auth_value: form.auth_value.clone(),
+            audio_tracks: form.audio_tracks.trim().to_string(),
+            subtitle_tracks: form.subtitle_tracks.trim().to_string(),
             extra_args: form.extra_args.clone(),
             max_concurrent: 1,
             last_checked_at: None,
@@ -3778,6 +3794,25 @@ impl StreamArchiverApp {
                                     ui.selectable_value(&mut form.container, c, c.label());
                                 }
                             });
+                        ui.end_row();
+
+                        ui.label("Audio tracks");
+                        ui.text_edit_singleline(&mut form.audio_tracks).on_hover_text(
+                            "Audio tracks to capture (streamlink --hls-audio-select). \
+                             Empty = the tool's default single track; 'all' (or '*') = \
+                             every track; or a comma-separated list of language \
+                             codes/names. streamlink-only; ffmpeg copy keeps all tracks.",
+                        );
+                        ui.end_row();
+
+                        ui.label("Subtitle tracks");
+                        ui.text_edit_singleline(&mut form.subtitle_tracks).on_hover_text(
+                            "Subtitle tracks to capture (yt-dlp --sub-langs, written as \
+                             sidecar files next to the recording). Empty = none; 'all' \
+                             (or '*') = every subtitle; or a comma-separated list of \
+                             language codes. yt-dlp-only; streamlink can't mux subtitles. \
+                             Best-effort for live streams.",
+                        );
                         ui.end_row();
 
                         ui.label("Capture from start");

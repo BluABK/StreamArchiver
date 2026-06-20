@@ -236,6 +236,34 @@ usable data) and are remuxed losslessly to **`.mkv`** on clean stop. MKV is the
 default; pick TS per channel if you prefer. **MP4 is never produced** (poor for
 interrupted writes).
 
+### Audio & subtitle tracks
+
+To archive as much of a stream as possible, each instance has **Audio tracks** and
+**Subtitle tracks** fields (on the Streams add/edit form):
+
+- **Audio tracks** — which audio tracks to capture, via streamlink's
+  `--hls-audio-select`. Empty = the tool's default (one track); **`all`** (or
+  `*`) = every audio track; or a comma-separated list of language codes/names
+  (e.g. `en,de`). Honored by **streamlink**; the **ffmpeg** tool keeps all
+  video+audio tracks via its capture mapping (it can't select a *subset*), and
+  **yt-dlp** ignores it (it captures its default audio).
+- **Subtitle tracks** — which subtitles to capture, via yt-dlp's `--sub-langs`,
+  written as **sidecar files** next to the recording (e.g. `clip.en.vtt`) — a
+  lossless, replayable archive, **not** embedded into the container. Empty =
+  none; **`all`** (or `*`) = every subtitle; or a comma-separated list of
+  language codes. Honored by **yt-dlp** only — **streamlink can't mux
+  subtitles**. Best-effort for live streams (live subtitle availability varies by
+  platform).
+
+The **MKV remux** on clean stop preserves *all* captured video/audio/subtitle
+tracks (not just one per type), and subtitle sidecars are moved along if the file
+is later renamed (see *Filename media info*), so the tracks you select are the
+tracks you keep.
+
+**New** instances default both to **`all`** (maximum archival). **Existing**
+instances keep their previous behavior (empty) until you edit them. Power-user
+**Extra args** are appended after these, so they can still override.
+
 ### Filename templates
 
 The **filename template** sets the output file's *name*. The separate **Output

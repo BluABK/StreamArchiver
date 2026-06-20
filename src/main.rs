@@ -268,6 +268,8 @@ fn run_add(args: &[String], pos: usize) -> Result<()> {
         ad_free: false,
         auth_kind: models::AuthKind::Inherit,
         auth_value: String::new(),
+        audio_tracks: "all".into(),
+        subtitle_tracks: "all".into(),
         extra_args: String::new(),
         max_concurrent: 1,
         last_checked_at: None,
@@ -334,6 +336,8 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
             ad_free: false,
             auth_kind: models::AuthKind::Inherit,
             auth_value: String::new(),
+            audio_tracks: String::new(),
+            subtitle_tracks: String::new(),
             extra_args: String::new(),
             max_concurrent: 1,
             last_checked_at: None,
@@ -350,7 +354,8 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
         ad_free_sub: None,
         recording_count: 0,
     };
-    let plan = downloader::build_plan(&row, models::now_unix(), &downloader::AuthSource::None, None);
+    let plan =
+        downloader::build_plan(&row, models::now_unix(), &downloader::AuthSource::None, None, None);
     println!("plan: {} {:?}", plan.program, plan.args);
 
     let rt = tokio::runtime::Runtime::new()?;
