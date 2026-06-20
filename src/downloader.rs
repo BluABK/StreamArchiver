@@ -2346,6 +2346,8 @@ mod tests {
             last_recording_ad_count: 0,
             last_recording_ad_secs: 0,
             last_recording_meta_changes: 0,
+            last_recording_title: String::new(),
+            last_recording_category: String::new(),
             last_recording_log: String::new(),
             ad_free_sub: None,
             recording_count: 0,

@@ -882,6 +882,18 @@ fn meta_cell(
     }
 }
 
+/// Render a current-Title / current-Game cell: blank when empty, otherwise a
+/// label truncated to the (width-capped) column. egui shows the full text on
+/// hover automatically when the label is elided (`show_tooltip_when_elided`
+/// defaults to true), so we add no explicit tooltip — a second one would just
+/// stack a duplicate.
+fn meta_value_cell(ui: &mut egui::Ui, value: &str) {
+    if value.is_empty() {
+        return;
+    }
+    ui.add(egui::Label::new(value).truncate());
+}
+
 /// Parse the monitor id out of a [`StreamGroup`] key (`s<mid>:…` / `t<mid>:…`).
 fn stream_key_monitor(key: &str) -> Option<i64> {
     let rest = key.strip_prefix('s').or_else(|| key.strip_prefix('t'))?;
@@ -956,31 +968,38 @@ struct StreamCol {
     title: &'static str,
     tooltip: &'static str,
     min_width: f32,
+    /// Starting (and clipped) width for content-capped columns whose value can be
+    /// long (the current Title / Game); the cell truncates to it and shows the
+    /// full text on hover. `0.0` = auto-size to content (the default).
+    initial: f32,
     sortable: bool,
 }
 
 /// The Streams columns in display order: Actions and the platform-icon column sit
-/// just left of Name. Widths are floors — `Column::auto` shrinks tight columns to
-/// their content.
-const STREAM_COLUMNS: [StreamCol; 18] = [
-    StreamCol { title: "On", tooltip: "Enable/disable monitoring. A channel's checkbox toggles all its instances at once.", min_width: 26.0, sortable: true },
-    StreamCol { title: "Actions", tooltip: "Per-row actions: start/stop recording, edit, add instance, open folder, delete.", min_width: 126.0, sortable: false },
-    StreamCol { title: "Plat", tooltip: "Source platform (icon): Twitch, YouTube, Kick, or a generic URL. A channel shows every platform among its instances.", min_width: 52.0, sortable: true },
-    StreamCol { title: "Name", tooltip: "Channel (container) name. Expand it to see its instances and recording history.", min_width: 130.0, sortable: true },
-    StreamCol { title: "Tool", tooltip: "Capture tool: streamlink, yt-dlp, or ffmpeg.", min_width: 60.0, sortable: true },
-    StreamCol { title: "Detection", tooltip: "How a live stream is detected (API poll, page scrape, Twitch EventSub, or a generic probe).", min_width: 70.0, sortable: true },
-    StreamCol { title: "Every", tooltip: "Poll interval — how often this instance is checked for a live stream.", min_width: 44.0, sortable: true },
-    StreamCol { title: "Last poll", tooltip: "When this instance was last checked.", min_width: 92.0, sortable: true },
-    StreamCol { title: "State", tooltip: "Current state (idle / live / recording / failed). Hover a failed row to see why it failed.", min_width: 66.0, sortable: true },
-    StreamCol { title: "Went Live", tooltip: "When the stream went live on the platform (a \"~\" prefix means it's our approximate time).", min_width: 96.0, sortable: true },
-    StreamCol { title: "Started On", tooltip: "When recording started.", min_width: 92.0, sortable: true },
-    StreamCol { title: "Lost time", tooltip: "How much of the start was missed. Drops to 0 once a from-start capture catches up to the live edge.", min_width: 52.0, sortable: true },
-    StreamCol { title: "Duration", tooltip: "How long we've recorded (ticks while live).", min_width: 56.0, sortable: true },
-    StreamCol { title: "Ads", tooltip: "Ad breaks detected (Twitch + streamlink); each is a hard cut. Hover or double-click for the list.", min_width: 38.0, sortable: true },
-    StreamCol { title: "Ad time", tooltip: "Total advertisement time skipped.", min_width: 52.0, sortable: true },
-    StreamCol { title: "Ad-free", tooltip: "Marked or auto-detected ad-free (sub / Turbo / Premium) — captures have no ad-break cuts.", min_width: 54.0, sortable: true },
-    StreamCol { title: "Changes", tooltip: "Title / game-category changes logged during the recording. Hover or double-click for the log.", min_width: 56.0, sortable: true },
-    StreamCol { title: "Added", tooltip: "When the channel was added.", min_width: 84.0, sortable: true },
+/// just left of Name; the current Game/Title sit just right of State. Widths are
+/// floors — `Column::auto` shrinks tight columns to their content — except the
+/// `initial`-width columns, which start narrow and truncate (full value on hover).
+const STREAM_COLUMNS: [StreamCol; 20] = [
+    StreamCol { title: "On", tooltip: "Enable/disable monitoring. A channel's checkbox toggles all its instances at once.", min_width: 26.0, initial: 0.0, sortable: true },
+    StreamCol { title: "Actions", tooltip: "Per-row actions: start/stop recording, edit, add instance, open folder, delete.", min_width: 126.0, initial: 0.0, sortable: false },
+    StreamCol { title: "Plat", tooltip: "Source platform (icon): Twitch, YouTube, Kick, or a generic URL. A channel shows every platform among its instances.", min_width: 52.0, initial: 0.0, sortable: true },
+    StreamCol { title: "Name", tooltip: "Channel (container) name. Expand it to see its instances and recording history.", min_width: 130.0, initial: 0.0, sortable: true },
+    StreamCol { title: "Tool", tooltip: "Capture tool: streamlink, yt-dlp, or ffmpeg.", min_width: 60.0, initial: 0.0, sortable: true },
+    StreamCol { title: "Detection", tooltip: "How a live stream is detected (API poll, page scrape, Twitch EventSub, or a generic probe).", min_width: 70.0, initial: 0.0, sortable: true },
+    StreamCol { title: "Every", tooltip: "Poll interval — how often this instance is checked for a live stream.", min_width: 44.0, initial: 0.0, sortable: true },
+    StreamCol { title: "Last poll", tooltip: "When this instance was last checked.", min_width: 92.0, initial: 0.0, sortable: true },
+    StreamCol { title: "State", tooltip: "Current state (idle / live / recording / failed). Hover a failed row to see why it failed.", min_width: 66.0, initial: 0.0, sortable: true },
+    StreamCol { title: "Game", tooltip: "Current game / category of the most recent recording (Twitch only; blank elsewhere). Truncated — hover for the full name.", min_width: 60.0, initial: 96.0, sortable: true },
+    StreamCol { title: "Title", tooltip: "Current stream title of the most recent recording (Twitch only; blank elsewhere). Truncated — hover for the full title. Its full change history is in the Changes column.", min_width: 80.0, initial: 170.0, sortable: true },
+    StreamCol { title: "Went Live", tooltip: "When the stream went live on the platform (a \"~\" prefix means it's our approximate time).", min_width: 96.0, initial: 0.0, sortable: true },
+    StreamCol { title: "Started On", tooltip: "When recording started.", min_width: 92.0, initial: 0.0, sortable: true },
+    StreamCol { title: "Lost time", tooltip: "How much of the start was missed. Drops to 0 once a from-start capture catches up to the live edge.", min_width: 52.0, initial: 0.0, sortable: true },
+    StreamCol { title: "Duration", tooltip: "How long we've recorded (ticks while live).", min_width: 56.0, initial: 0.0, sortable: true },
+    StreamCol { title: "Ads", tooltip: "Ad breaks detected (Twitch + streamlink); each is a hard cut. Hover or double-click for the list.", min_width: 38.0, initial: 0.0, sortable: true },
+    StreamCol { title: "Ad time", tooltip: "Total advertisement time skipped.", min_width: 52.0, initial: 0.0, sortable: true },
+    StreamCol { title: "Ad-free", tooltip: "Marked or auto-detected ad-free (sub / Turbo / Premium) — captures have no ad-break cuts.", min_width: 54.0, initial: 0.0, sortable: true },
+    StreamCol { title: "Changes", tooltip: "Title / game-category changes logged during the recording. Hover or double-click for the log.", min_width: 56.0, initial: 0.0, sortable: true },
+    StreamCol { title: "Added", tooltip: "When the channel was added.", min_width: 84.0, initial: 0.0, sortable: true },
 ];
 
 /// Total Streams columns (includes the non-sortable Actions slot).
@@ -1300,8 +1319,8 @@ fn channel_cells(channel: &Channel, monitors: &[&MonitorWithChannel], now: i64) 
         .max()
         .unwrap_or(0);
     // In STREAM_COLUMNS order: On, Actions(empty), Plat, Name, Tool, Detection,
-    // Every, Last poll, State, Went Live, Started On, Lost, Duration, Ads, Ad time,
-    // Ad-free, Changes, Added.
+    // Every, Last poll, State, Game, Title, Went Live, Started On, Lost, Duration,
+    // Ads, Ad time, Ad-free, Changes, Added.
     vec![
         Cell::num(
             if all_enabled { 1.0 } else { 0.0 },
@@ -1319,6 +1338,8 @@ fn channel_cells(channel: &Channel, monitors: &[&MonitorWithChannel], now: i64) 
         Cell::text(String::new()), // every
         Cell::num(last as f64, fmt_datetime_short(last)),
         Cell::text(if any_recording { "recording".to_string() } else { String::new() }),
+        Cell::text(primary.last_recording_category.clone()),
+        Cell::text(primary.last_recording_title.clone()),
         Cell::num(
             primary.last_recording_went_live.unwrap_or(0) as f64,
             rec.went_live.clone(),
@@ -1435,8 +1456,8 @@ fn render_instance_row(
 
     let mut disclosure_clicked = false;
     // Column order: On · Actions · Platform · Name · Tool · Detection · Every ·
-    // Last poll · State · Went Live · Started On · Lost · Duration · Ads · Ad time
-    // · Ad-free · Changes · Added.
+    // Last poll · State · Game · Title · Went Live · Started On · Lost · Duration ·
+    // Ads · Ad time · Ad-free · Changes · Added.
     tr.col(|ui| {
         let mut on = m.enabled;
         let cb = ui.checkbox(&mut on, "");
@@ -1517,6 +1538,12 @@ fn render_instance_row(
         if m.last_state == "failed" || row.last_recording_status.as_deref() == Some("failed") {
             resp.on_hover_text(fail_hover(&row.last_recording_log));
         }
+    });
+    tr.col(|ui| {
+        meta_value_cell(ui, &row.last_recording_category);
+    });
+    tr.col(|ui| {
+        meta_value_cell(ui, &row.last_recording_title);
     });
     tr.col(|ui| {
         ui.label(&rec.went_live);
@@ -3092,7 +3119,14 @@ impl StreamArchiverApp {
                 // One column per descriptor — count is guaranteed to match the
                 // header and the per-row cells (all driven by STREAM_COLUMNS).
                 for c in &STREAM_COLUMNS {
-                    tb = tb.column(Column::auto().at_least(c.min_width));
+                    let col = if c.initial > 0.0 {
+                        // Content-capped column (Title / Game): start narrow and
+                        // clip — the cell truncates and shows the full text on hover.
+                        Column::initial(c.initial).at_least(c.min_width).clip(true)
+                    } else {
+                        Column::auto().at_least(c.min_width)
+                    };
+                    tb = tb.column(col);
                 }
                 let table = tb.header(46.0, |mut header| {
                     for (i, c) in STREAM_COLUMNS.iter().enumerate() {
@@ -3176,6 +3210,12 @@ impl StreamArchiverApp {
                                 });
                                 let meta_changes =
                                     primary.map(|m| m.last_recording_meta_changes);
+                                let cur_category = primary
+                                    .map(|m| m.last_recording_category.clone())
+                                    .unwrap_or_default();
+                                let cur_title = primary
+                                    .map(|m| m.last_recording_title.clone())
+                                    .unwrap_or_default();
                                 let ad_free =
                                     ad_free_summary(channel_ad_free_count(&mons), ninst);
                                 // Tint the container row by the rolled-up state of
@@ -3256,6 +3296,12 @@ impl StreamArchiverApp {
                                                     .on_hover_text(fail_hover(&p.last_recording_log));
                                             }
                                         }
+                                    });
+                                    tr.col(|ui| {
+                                        meta_value_cell(ui, &cur_category);
+                                    });
+                                    tr.col(|ui| {
+                                        meta_value_cell(ui, &cur_title);
                                     });
                                     tr.col(|ui| {
                                         if let Some(r) = &rec {
@@ -3426,6 +3472,12 @@ impl StreamArchiverApp {
                                         }
                                     });
                                     tr.col(|ui| {
+                                        meta_value_cell(ui, g.category());
+                                    });
+                                    tr.col(|ui| {
+                                        meta_value_cell(ui, g.title());
+                                    });
+                                    tr.col(|ui| {
                                         ui.label(fmt_went_live(g.went_live_at, g.went_live_approx));
                                     });
                                     tr.col(|ui| {
@@ -3553,6 +3605,12 @@ impl StreamArchiverApp {
                                         } else if let Some(code) = t.exit_code {
                                             resp.on_hover_text(format!("exit code {code}"));
                                         }
+                                    });
+                                    tr.col(|ui| {
+                                        meta_value_cell(ui, &t.category);
+                                    });
+                                    tr.col(|ui| {
+                                        meta_value_cell(ui, &t.title);
                                     });
                                     tr.col(|_ui| {}); // went live
                                     tr.col(|ui| {

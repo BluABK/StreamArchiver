@@ -567,6 +567,14 @@ pub struct MonitorWithChannel {
     /// Title + game/category changes logged during the latest recording take (see
     /// [`StreamMetaChange`]). Drives the Changes column / popup.
     pub last_recording_meta_changes: i64,
+    /// Current (latest-logged) stream title of the latest recording take — the
+    /// most recent `title` [`StreamMetaChange`]. Empty when none was logged (only
+    /// Twitch metadata is polled). Drives the Title column.
+    pub last_recording_title: String,
+    /// Current (latest-logged) game/category of the latest recording take — the
+    /// most recent `category` [`StreamMetaChange`]. Empty when none. Drives the
+    /// Game column.
+    pub last_recording_category: String,
     /// Captured stderr tail of the latest recording (the `log_excerpt`), used to
     /// show *why* it failed on hover. Empty when there's no recording yet.
     pub last_recording_log: String,
@@ -771,6 +779,10 @@ pub struct Recording {
     /// Title + game/category changes logged during this take; per-change rows live
     /// in `stream_meta_change`.
     pub meta_change_count: i64,
+    /// Current (latest-logged) title/game for this take — the most recent `title`
+    /// / `category` [`StreamMetaChange`]. Empty when none was logged.
+    pub title: String,
+    pub category: String,
     /// Captured stderr tail (`log_excerpt`) — the failure reason for a failed take.
     pub log_excerpt: String,
 }
@@ -835,6 +847,18 @@ impl StreamGroup {
     /// Title/category changes logged across all takes of this stream.
     pub fn meta_change_count(&self) -> i64 {
         self.takes.iter().map(|t| t.meta_change_count).sum()
+    }
+    /// Current title for the stream: the newest take's logged title (takes are
+    /// oldest-first, so the last one), or empty if none. Deliberately does NOT
+    /// fall back to an older take when the newest is empty — that would show a
+    /// stale value and disagree with the instance/channel rows, which read only
+    /// the latest take. An emptied/cleared current title should read as empty.
+    pub fn title(&self) -> &str {
+        self.takes.last().map(|t| t.title.as_str()).unwrap_or("")
+    }
+    /// Current game/category for the stream (see [`StreamGroup::title`]).
+    pub fn category(&self) -> &str {
+        self.takes.last().map(|t| t.category.as_str()).unwrap_or("")
     }
     /// Rolled-up status for the stream row.
     pub fn status(&self) -> &'static str {
@@ -941,6 +965,8 @@ mod tests {
             ad_count: 0,
             ad_secs: 0,
             meta_change_count: 0,
+            title: String::new(),
+            category: String::new(),
             log_excerpt: String::new(),
         }
     }
