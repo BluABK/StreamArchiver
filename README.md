@@ -264,6 +264,25 @@ tracks you keep.
 instances keep their previous behavior (empty) until you edit them. Power-user
 **Extra args** are appended after these, so they can still override.
 
+### Title & category change log
+
+While a Twitch stream records, StreamArchiver polls Helix and logs every **title**
+and **game/category** change for that take — so the archive captures *what* the
+broadcast was, not just the footage. (The normal scheduler pauses polling during a
+recording, so this runs as a dedicated per-recording poller.)
+
+- A **Changes** column shows the number of changes for the latest take. **Hover**
+  a stream/take row's count to see the list inline, or **double-click** it to open
+  a scrollable, copyable log window. Each entry shows the offset from the take's
+  start, the kind, and the value (the first entry per kind is what it *started*
+  with; later entries show `old → new`).
+- **Twitch only**, and it needs Twitch credentials configured (Settings) — it uses
+  the same app/user token as live detection. Other platforms don't log changes.
+- Polling is coarse (about once a minute) since changes are infrequent, so the API
+  cost is negligible (one call per active Twitch recording).
+
+A later option will let you fold the categories played into the filename.
+
 ### Filename templates
 
 The **filename template** sets the output file's *name*. The separate **Output

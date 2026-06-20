@@ -559,6 +559,9 @@ pub struct MonitorWithChannel {
     /// seconds). Each break is a hard cut in the finished file; see [`AdBreak`].
     pub last_recording_ad_count: i64,
     pub last_recording_ad_secs: i64,
+    /// Title + game/category changes logged during the latest recording take (see
+    /// [`StreamMetaChange`]). Drives the Changes column / popup.
+    pub last_recording_meta_changes: i64,
     /// Cached auto Twitch-sub ad-free status: `None` unknown/not checked,
     /// `Some(false)` checked & not subscribed, `Some(true)` subscribed. Combined
     /// with `monitor.ad_free` (the manual flag) for the Ad-free column. (The
@@ -586,6 +589,25 @@ pub struct AdBreak {
     pub recording_id: i64,
     pub at_secs: i64,
     pub duration_secs: i64,
+}
+
+/// One title or game/category change observed during a recording take.
+///
+/// `at_secs` is the offset from the take's start (wall clock) when the change was
+/// detected. `kind` is `"title"` or `"category"`. The first entry for each kind
+/// is the *initial* value (its `old_value` is empty); later entries record a
+/// transition (`old_value` -> `new_value`). Cascades when the recording is
+/// removed.
+#[derive(Clone, Debug)]
+pub struct StreamMetaChange {
+    #[allow(dead_code)]
+    pub id: i64,
+    #[allow(dead_code)]
+    pub recording_id: i64,
+    pub at_secs: i64,
+    pub kind: String,
+    pub old_value: String,
+    pub new_value: String,
 }
 
 /// An on-demand, one-shot video/VOD download (a YouTube video, a Twitch VOD,
@@ -738,6 +760,9 @@ pub struct Recording {
     /// a hard cut in the finished file; the per-break offsets live in `ad_break`.
     pub ad_count: i64,
     pub ad_secs: i64,
+    /// Title + game/category changes logged during this take; per-change rows live
+    /// in `stream_meta_change`.
+    pub meta_change_count: i64,
 }
 
 impl Recording {
@@ -796,6 +821,10 @@ impl StreamGroup {
     /// Total advertisement time (seconds) skipped across all takes.
     pub fn ad_secs(&self) -> i64 {
         self.takes.iter().map(|t| t.ad_secs).sum()
+    }
+    /// Title/category changes logged across all takes of this stream.
+    pub fn meta_change_count(&self) -> i64 {
+        self.takes.iter().map(|t| t.meta_change_count).sum()
     }
     /// Rolled-up status for the stream row.
     pub fn status(&self) -> &'static str {
@@ -901,6 +930,7 @@ mod tests {
             stream_id: stream_id.map(str::to_string),
             ad_count: 0,
             ad_secs: 0,
+            meta_change_count: 0,
         }
     }
 

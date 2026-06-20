@@ -13,11 +13,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::models::{
     AdBreak, AuthKind, Channel, Container, DetectionMethod, Monitor, MonitorWithChannel, Platform,
-    Tool, Video, now_unix,
+    StreamMetaChange, Tool, Video, now_unix,
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -263,7 +263,29 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 14)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 14);
+        if version < 15 {
+            // Title / game-category changes observed during a recording. Twitch
+            // Helix has the metadata, but the scheduler pauses polling while a
+            // monitor records, so the supervisor polls it and logs changes here.
+            // `at_secs` is the offset from the take start; the first row per
+            // `kind` ('title'/'category') is the initial value (empty old_value).
+            // Cascades when the recording row is removed.
+            conn.execute_batch(
+                r#"
+                CREATE TABLE stream_meta_change (
+                    id            INTEGER PRIMARY KEY,
+                    recording_id  INTEGER NOT NULL REFERENCES recording(id) ON DELETE CASCADE,
+                    at_secs       INTEGER NOT NULL,
+                    kind          TEXT NOT NULL,
+                    old_value     TEXT NOT NULL DEFAULT '',
+                    new_value     TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX idx_meta_change_recording ON stream_meta_change(recording_id);
+                "#,
+            )?;
+            conn.pragma_update(None, "user_version", 15)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 15);
         Ok(())
     }
 
@@ -624,6 +646,46 @@ impl Store {
         Ok(rows)
     }
 
+    /// Record a title or game/category change observed during a recording take.
+    pub fn insert_meta_change(
+        &self,
+        recording_id: i64,
+        at_secs: i64,
+        kind: &str,
+        old_value: &str,
+        new_value: &str,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO stream_meta_change(recording_id, at_secs, kind, old_value, new_value)
+             VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![recording_id, at_secs, kind, old_value, new_value],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// All metadata changes for a recording take, in chronological order.
+    pub fn meta_changes_for_recording(&self, recording_id: i64) -> Result<Vec<StreamMetaChange>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, recording_id, at_secs, kind, old_value, new_value FROM stream_meta_change
+             WHERE recording_id = ?1 ORDER BY at_secs, id",
+        )?;
+        let rows = stmt
+            .query_map(params![recording_id], |r| {
+                Ok(StreamMetaChange {
+                    id: r.get(0)?,
+                    recording_id: r.get(1)?,
+                    at_secs: r.get(2)?,
+                    kind: r.get(3)?,
+                    old_value: r.get(4)?,
+                    new_value: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Mark any recordings still flagged 'recording' (i.e. left over from a
     /// crash) as 'orphaned'. Returns the number updated. Called on startup.
     pub fn mark_orphaned_recordings(&self, ended_at: i64) -> Result<usize> {
@@ -650,7 +712,8 @@ impl Store {
                 m.url,
                 (SELECT COUNT(*) FROM ad_break ab WHERE ab.recording_id = r.id),
                 COALESCE((SELECT SUM(ab.duration_secs) FROM ad_break ab WHERE ab.recording_id = r.id), 0),
-                m.ad_free, m.ad_free_sub, m.audio_tracks, m.subtitle_tracks
+                m.ad_free, m.ad_free_sub, m.audio_tracks, m.subtitle_tracks,
+                (SELECT COUNT(*) FROM stream_meta_change smc WHERE smc.recording_id = r.id)
              FROM monitor m
              JOIN channel c ON c.id = m.channel_id
              LEFT JOIN recording r
@@ -700,6 +763,7 @@ impl Store {
                     last_recording_lost_secs: r.get(27)?,
                     last_recording_ad_count: r.get(30)?,
                     last_recording_ad_secs: r.get(31)?,
+                    last_recording_meta_changes: r.get(36)?,
                     ad_free_sub: r.get::<_, Option<i64>>(33)?.map(|v| v != 0),
                     recording_count: r.get(28)?,
                 })
@@ -715,7 +779,8 @@ impl Store {
             "SELECT id, monitor_id, started_at, ended_at, status, bytes, exit_code,
                     COALESCE(output_path, ''), went_live_at, went_live_approx, lost_secs, stream_id,
                     (SELECT COUNT(*) FROM ad_break ab WHERE ab.recording_id = recording.id),
-                    COALESCE((SELECT SUM(ab.duration_secs) FROM ad_break ab WHERE ab.recording_id = recording.id), 0)
+                    COALESCE((SELECT SUM(ab.duration_secs) FROM ad_break ab WHERE ab.recording_id = recording.id), 0),
+                    (SELECT COUNT(*) FROM stream_meta_change smc WHERE smc.recording_id = recording.id)
              FROM recording WHERE monitor_id = ?1 ORDER BY started_at, id",
         )?;
         let rows = stmt
@@ -735,6 +800,7 @@ impl Store {
                     stream_id: r.get(11)?,
                     ad_count: r.get(12)?,
                     ad_secs: r.get(13)?,
+                    meta_change_count: r.get(14)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1209,6 +1275,40 @@ mod tests {
         store.finish_recording(rid, 2_000, 1, Some(0), "completed", "C:/rec/out.mkv", "").unwrap();
         store.delete_recording(rid).unwrap();
         assert!(store.ad_breaks_for_recording(rid).unwrap().is_empty());
+    }
+
+    #[test]
+    fn meta_change_roundtrip_and_rollups() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+        let rid = store
+            .insert_recording(mid, 1_000, "C:/rec/out.mkv", Some(1_000), false, Some("s1"))
+            .unwrap();
+
+        // Insert out of order; the query returns them ordered by offset.
+        store.insert_meta_change(rid, 300, "category", "Just Chatting", "Valorant").unwrap();
+        store.insert_meta_change(rid, 0, "title", "", "starting soon").unwrap();
+        store.insert_meta_change(rid, 0, "category", "", "Just Chatting").unwrap();
+
+        let changes = store.meta_changes_for_recording(rid).unwrap();
+        assert_eq!(changes.len(), 3);
+        assert_eq!(changes[0].at_secs, 0);
+        assert_eq!(changes[2].kind, "category");
+        assert_eq!(changes[2].new_value, "Valorant");
+
+        // Count rolls up on both the take and the latest-recording monitor row.
+        let recs = store.recordings_for_monitor(mid).unwrap();
+        assert_eq!(recs[0].meta_change_count, 3);
+        let row = store.get_monitor_with_channel(mid).unwrap().unwrap();
+        assert_eq!(row.last_recording_meta_changes, 3);
+
+        // Deleting the recording cascades to its metadata changes.
+        store.finish_recording(rid, 2_000, 1, Some(0), "completed", "C:/rec/out.mkv", "").unwrap();
+        store.delete_recording(rid).unwrap();
+        assert!(store.meta_changes_for_recording(rid).unwrap().is_empty());
     }
 
     #[test]

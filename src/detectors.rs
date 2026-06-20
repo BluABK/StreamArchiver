@@ -126,6 +126,14 @@ struct TwitchToken {
 }
 
 /// Shared detection state: one HTTP client + cached app tokens.
+/// A live Twitch stream's mutable metadata, polled during a recording to log
+/// title and game/category changes.
+#[derive(Clone, Debug, Default)]
+pub struct StreamMeta {
+    pub title: String,
+    pub game: String,
+}
+
 pub struct DetectContext {
     http: Client,
     pub store: Arc<Store>,
@@ -432,6 +440,77 @@ impl DetectContext {
             }
         }
         outcomes
+    }
+
+    /// Title + game/category of a currently-live Twitch channel, for the
+    /// in-recording metadata change log (the scheduler pauses polling while a
+    /// monitor records, so the [`Supervisor`](crate::downloader::Supervisor)
+    /// polls this directly). `None` when offline, on error, or when Twitch
+    /// credentials aren't configured. Mirrors `detect_twitch`'s token handling:
+    /// a connected user token if present, else the app token, with a one-shot
+    /// app-token fallback on a 401.
+    pub async fn twitch_stream_meta(&self, url: &str) -> Option<StreamMeta> {
+        let login = twitch_login(url)?;
+        let client_id = self
+            .store
+            .get_setting("twitch_client_id")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if client_id.is_empty() {
+            return None;
+        }
+        let user_token = {
+            let _guard = self.twitch_refresh.lock().await;
+            crate::oauth::valid_user_token(&self.http, self.store.as_ref()).await
+        };
+        let mut using_user_token = user_token.is_some();
+        let mut token = match user_token {
+            Some(t) => t,
+            None => self.twitch_app_token().await.ok()?,
+        };
+
+        #[derive(Deserialize)]
+        struct Stream {
+            #[serde(rename = "type")]
+            kind: String,
+            #[serde(default)]
+            title: String,
+            #[serde(default)]
+            game_name: String,
+        }
+        #[derive(Deserialize)]
+        struct Resp {
+            data: Vec<Stream>,
+        }
+
+        loop {
+            let resp = self
+                .http
+                .get("https://api.twitch.tv/helix/streams")
+                .header("Client-Id", &client_id)
+                .bearer_auth(&token)
+                .query(&[("user_login", login.as_str())])
+                .send()
+                .await
+                .ok()?;
+            match resp.status() {
+                s if s.is_success() => {
+                    let sr: Resp = resp.json().await.ok()?;
+                    let s = sr.data.into_iter().find(|s| s.kind == "live")?;
+                    return Some(StreamMeta {
+                        title: s.title,
+                        game: s.game_name,
+                    });
+                }
+                reqwest::StatusCode::UNAUTHORIZED if using_user_token => {
+                    token = self.twitch_app_token().await.ok()?;
+                    using_user_token = false;
+                    continue;
+                }
+                _ => return None,
+            }
+        }
     }
 
     // ----- YouTube Data API (API key) -----

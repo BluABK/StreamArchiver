@@ -17,8 +17,8 @@ use crate::app_core::AppCore;
 use crate::events::{ManualCommand, UiCommand};
 use crate::models::{
     AdBreak, AuthKind, Channel, Container, DetectionMethod, DownloadDefaults, K_FILENAME_MEDIA,
-    MediaInfoMode, Monitor, MonitorWithChannel, Platform, Recording, StreamGroup, Tool, Video,
-    group_recordings,
+    MediaInfoMode, Monitor, MonitorWithChannel, Platform, Recording, StreamGroup, StreamMetaChange,
+    Tool, Video, group_recordings,
 };
 use crate::oauth::{self, AuthFlow};
 use crate::platform::AutoStart;
@@ -302,6 +302,11 @@ pub struct StreamArchiverApp {
     ad_break_cache: HashMap<i64, Vec<AdBreak>>,
     /// Recording id whose ad-break cut list is shown in a popup (None = closed).
     ad_popup: Option<i64>,
+    /// Lazy per-recording title/category change log, keyed by recording id;
+    /// cleared on reload. Same caching role as `ad_break_cache`.
+    meta_change_cache: HashMap<i64, Vec<StreamMetaChange>>,
+    /// Recording id whose metadata-change log is shown in a popup (None = closed).
+    meta_popup: Option<i64>,
     /// Sort + per-column filters for the Videos table.
     videos_sort: SortState,
     videos_filters: Vec<String>,
@@ -405,6 +410,8 @@ impl StreamArchiverApp {
             rec_cache: HashMap::new(),
             ad_break_cache: HashMap::new(),
             ad_popup: None,
+            meta_change_cache: HashMap::new(),
+            meta_popup: None,
             videos_sort: SortState::default(),
             videos_filters: vec![String::new(); VIDEO_COLS],
             twitch_flow,
@@ -430,6 +437,7 @@ impl StreamArchiverApp {
         // History may have changed; re-fetch lazily on next expand.
         self.rec_cache.clear();
         self.ad_break_cache.clear();
+        self.meta_change_cache.clear();
         // Drop expansion state for channels/monitors that no longer exist (avoids
         // an unbounded leak and "sticky" expansion if a row id is later reused).
         let live_channels: HashSet<i64> = self.channels.iter().map(|c| c.id).collect();
@@ -801,6 +809,68 @@ fn ad_cell(
     }
 }
 
+/// Count string for a Changes cell ("" when zero, so empty cells render nothing).
+fn fmt_meta_count(n: i64) -> String {
+    if n > 0 { n.to_string() } else { String::new() }
+}
+
+/// One human-readable line per metadata change (offset + kind + value/transition).
+fn meta_change_lines(changes: &[StreamMetaChange]) -> Vec<String> {
+    changes
+        .iter()
+        .map(|c| {
+            let at = fmt_duration(c.at_secs.max(0));
+            let kind = if c.kind == "category" { "Category" } else { "Title" };
+            if c.old_value.is_empty() {
+                // First entry per kind: the value the recording started with.
+                format!("{at}  {kind}: {}", c.new_value)
+            } else {
+                format!("{at}  {kind}: {} → {}", c.old_value, c.new_value)
+            }
+        })
+        .collect()
+}
+
+/// Multi-line tooltip body for a Changes cell: a heading plus the change list
+/// (or just the heading when the detail isn't loaded for this row).
+fn meta_tooltip(count: i64, changes: Option<&Vec<StreamMetaChange>>) -> String {
+    let mut s = format!("{count} title/category change(s) during this recording.");
+    if let Some(c) = changes.filter(|c| !c.is_empty()) {
+        s.push('\n');
+        s.push_str(&meta_change_lines(c).join("\n"));
+    }
+    s
+}
+
+/// Render one Changes table cell, mirroring [`ad_cell`]: blank when the count is
+/// zero, a lazily-built hover list, and (when `clickable_rec` is set) a
+/// double-click that returns the recording id to open its change-log popup.
+fn meta_cell(
+    ui: &mut egui::Ui,
+    count: i64,
+    detail: Option<&Vec<StreamMetaChange>>,
+    clickable_rec: Option<i64>,
+) -> Option<i64> {
+    let text = fmt_meta_count(count);
+    if text.is_empty() {
+        return None;
+    }
+    let label = if clickable_rec.is_some() {
+        egui::Label::new(text).sense(egui::Sense::click())
+    } else {
+        egui::Label::new(text)
+    };
+    let resp = ui
+        .add(label)
+        .on_hover_ui(|ui| {
+            ui.label(meta_tooltip(count, detail));
+        });
+    match clickable_rec {
+        Some(rec) if resp.double_clicked() => Some(rec),
+        _ => None,
+    }
+}
+
 /// Parse the monitor id out of a [`StreamGroup`] key (`s<mid>:…` / `t<mid>:…`).
 fn stream_key_monitor(key: &str) -> Option<i64> {
     let rest = key.strip_prefix('s').or_else(|| key.strip_prefix('t'))?;
@@ -866,7 +936,7 @@ fn fmt_speed(bytes_per_sec: f64) -> String {
 /// Sortable/filterable Videos columns (Video..File; excludes Actions).
 const VIDEO_COLS: usize = 9;
 /// Sortable/filterable Streams columns (On..Added; excludes Actions).
-const STREAM_COLS: usize = 16;
+const STREAM_COLS: usize = 17;
 
 /// Which column a table is sorted by and in what direction. `col == None` keeps
 /// the natural (database) order.
@@ -1213,6 +1283,10 @@ fn channel_cells(channel: &Channel, monitors: &[&MonitorWithChannel], now: i64) 
                 ad_free_summary(channel_ad_free_count(monitors), monitors.len());
             Cell::num(key, label)
         },
+        Cell::num(
+            primary.last_recording_meta_changes as f64,
+            fmt_meta_count(primary.last_recording_meta_changes),
+        ),
         Cell::num(channel.created_at as f64, fmt_date(channel.created_at)),
     ]
 }
@@ -1371,6 +1445,9 @@ fn render_instance_row(
         if let Some((label, hover)) = ad_free_status(m.ad_free, row.ad_free_sub) {
             ui.colored_label(SUCCESS_GREEN, label).on_hover_text(hover);
         }
+    });
+    tr.col(|ui| {
+        meta_cell(ui, row.last_recording_meta_changes, None, None);
     });
     tr.col(|ui| {
         ui.label(fmt_date(row.channel.created_at));
@@ -1563,6 +1640,7 @@ impl eframe::App for StreamArchiverApp {
         self.confirm_delete_channel_window(ui.ctx());
         self.format_probe_window(ui.ctx());
         self.ad_popup_window(ui.ctx());
+        self.meta_popup_window(ui.ctx());
     }
 }
 
@@ -2631,6 +2709,54 @@ impl StreamArchiverApp {
         }
     }
 
+    fn meta_popup_window(&mut self, ctx: &egui::Context) {
+        let Some(rid) = self.meta_popup else {
+            return;
+        };
+        if !self.meta_change_cache.contains_key(&rid) {
+            let v = self
+                .core
+                .store
+                .meta_changes_for_recording(rid)
+                .unwrap_or_default();
+            self.meta_change_cache.insert(rid, v);
+        }
+        let changes = self.meta_change_cache.get(&rid).cloned().unwrap_or_default();
+        let mut open = true;
+        egui::Window::new("Title & category changes")
+            .collapsible(false)
+            .resizable(true)
+            .default_size([420.0, 260.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                if changes.is_empty() {
+                    ui.label("No title or category changes recorded for this take.");
+                    return;
+                }
+                ui.label(format!(
+                    "{} change(s) during this recording (offset from the take's start; \
+                     the first entry per kind is the value it started with).",
+                    changes.len(),
+                ));
+                ui.add_space(6.0);
+                let lines = meta_change_lines(&changes);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for line in &lines {
+                            ui.label(egui::RichText::new(line).monospace());
+                        }
+                    });
+                ui.add_space(6.0);
+                if ui.button("📋  Copy").clicked() {
+                    ui.ctx().copy_text(lines.join("\n"));
+                }
+            });
+        if !open {
+            self.meta_popup = None;
+        }
+    }
+
     fn channels_view(&mut self, ui: &mut egui::Ui) {
         if self.channels.is_empty() {
             ui.add_space(24.0);
@@ -2738,9 +2864,32 @@ impl StreamArchiverApp {
             }
         }
         let ad_breaks = &self.ad_break_cache;
+        // Same lazy caching for per-recording title/category change logs.
+        for &mid in &expanded_monitors {
+            let need: Vec<i64> = match self.rec_cache.get(&mid) {
+                Some(recs) => recs
+                    .iter()
+                    .filter(|r| {
+                        r.meta_change_count > 0 && !self.meta_change_cache.contains_key(&r.id)
+                    })
+                    .map(|r| r.id)
+                    .collect(),
+                None => Vec::new(),
+            };
+            for rid in need {
+                let v = self
+                    .core
+                    .store
+                    .meta_changes_for_recording(rid)
+                    .unwrap_or_default();
+                self.meta_change_cache.insert(rid, v);
+            }
+        }
+        let meta_logs = &self.meta_change_cache;
         // Collected in the table closure (which borrows `self` immutably), applied
-        // afterwards: a double-click on an ad cell opens that take's cut-list popup.
+        // afterwards: a double-click on an ad / changes cell opens that take's popup.
         let mut open_ad_popup: Option<i64> = None;
+        let mut open_meta_popup: Option<i64> = None;
 
         // Snapshot expansion state for read-only use inside the table closure.
         let exp_channels = self.expanded_channels.clone();
@@ -2800,6 +2949,7 @@ impl StreamArchiverApp {
                     .column(Column::auto().at_least(44.0)) // ads
                     .column(Column::auto().at_least(58.0)) // ad time
                     .column(Column::auto().at_least(64.0)) // ad-free
+                    .column(Column::auto().at_least(64.0)) // changes
                     .column(Column::auto().at_least(80.0)) // added
                     .column(Column::remainder().at_least(140.0)) // actions
                     .header(46.0, |mut header| {
@@ -2819,8 +2969,14 @@ impl StreamArchiverApp {
                             "Ads",
                             "Ad time",
                             "Ad-free",
+                            "Changes",
                             "Added",
                         ];
+                        // Invariant: one sortable title per STREAM_COLS, and the
+                        // `.column(...)` chain above declares STREAM_COLS + 1 (the
+                        // trailing Actions column). Keep all three in lockstep when
+                        // adding a column, or egui_extras panics on the extra cell.
+                        debug_assert_eq!(titles.len(), STREAM_COLS);
                         for (i, t) in titles.into_iter().enumerate() {
                             header.col(|ui| {
                                 sort_filter_header(ui, i, t, true, &mut sort, &mut filters[i]);
@@ -2897,6 +3053,8 @@ impl StreamArchiverApp {
                                 let ads = primary.map(|m| {
                                     (m.last_recording_ad_count, m.last_recording_ad_secs)
                                 });
+                                let meta_changes =
+                                    primary.map(|m| m.last_recording_meta_changes);
                                 let ad_free =
                                     ad_free_summary(channel_ad_free_count(&mons), ninst);
                                 // Tint the container row by the rolled-up state of
@@ -2988,6 +3146,11 @@ impl StreamArchiverApp {
                                     tr.col(|ui| {
                                         if !ad_free.0.is_empty() {
                                             ui.colored_label(SUCCESS_GREEN, ad_free.0);
+                                        }
+                                    });
+                                    tr.col(|ui| {
+                                        if let Some(c) = meta_changes {
+                                            meta_cell(ui, c, None, None);
                                         }
                                     });
                                     tr.col(|ui| {
@@ -3099,6 +3262,11 @@ impl StreamArchiverApp {
                                 // expanded.
                                 let ad_rec =
                                     if g.takes.len() == 1 { Some(g.takes[0].id) } else { None };
+                                let meta_count = g.meta_change_count();
+                                // Same rule as ads: a single-take stream carries its
+                                // detail directly; multi-take shows per-take on expand.
+                                let meta_rec =
+                                    if g.takes.len() == 1 { Some(g.takes[0].id) } else { None };
                                 body.row(24.0, |mut tr| {
                                     let mut disc = false;
                                     tr.col(|_ui| {});
@@ -3157,6 +3325,12 @@ impl StreamArchiverApp {
                                         }
                                     });
                                     tr.col(|_ui| {}); // ad-free (n/a per stream)
+                                    tr.col(|ui| {
+                                        let det = meta_rec.and_then(|id| meta_logs.get(&id));
+                                        if let Some(r) = meta_cell(ui, meta_count, det, meta_rec) {
+                                            open_meta_popup = Some(r);
+                                        }
+                                    });
                                     tr.col(|_ui| {}); // added
                                     tr.col(|ui| {
                                         let ok = dir.as_ref().map(|d| d.is_dir()).unwrap_or(false);
@@ -3232,6 +3406,14 @@ impl StreamArchiverApp {
                                         }
                                     });
                                     tr.col(|_ui| {}); // ad-free (n/a per take)
+                                    tr.col(|ui| {
+                                        let det = meta_logs.get(&t.id);
+                                        if let Some(r) =
+                                            meta_cell(ui, t.meta_change_count, det, Some(t.id))
+                                        {
+                                            open_meta_popup = Some(r);
+                                        }
+                                    });
                                     tr.col(|_ui| {}); // added
                                     tr.col(|ui| {
                                         ui.push_id(t.id, |ui| {
@@ -3291,6 +3473,9 @@ impl StreamArchiverApp {
         self.streams_filters = filters;
         if let Some(rid) = open_ad_popup {
             self.ad_popup = Some(rid);
+        }
+        if let Some(rid) = open_meta_popup {
+            self.meta_popup = Some(rid);
         }
 
         // Tick the live Duration column ~1/sec while anything is recording.
@@ -3376,9 +3561,13 @@ impl StreamArchiverApp {
             if let Err(e) = self.core.store.delete_recording(rid) {
                 self.status = format!("Error: {e}");
             }
-            // The take (and its cascaded ad breaks) is gone; close a popup for it.
+            // The take (and its cascaded ad breaks / meta changes) is gone; close
+            // any popup for it.
             if self.ad_popup == Some(rid) {
                 self.ad_popup = None;
+            }
+            if self.meta_popup == Some(rid) {
+                self.meta_popup = None;
             }
             self.reload_rows();
         }

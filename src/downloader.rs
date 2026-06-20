@@ -1003,6 +1003,24 @@ impl Supervisor {
                 ad_active: self.ad_active.clone(),
             });
 
+        // Log Twitch title / game-category changes during the take (Helix has the
+        // metadata; the scheduler pauses normal polling while recording). Twitch
+        // only; no-ops gracefully if credentials are unset.
+        let meta_done = Arc::new(AtomicBool::new(false));
+        let meta_task = (rec_id != 0 && row.monitor.platform() == Platform::Twitch).then(|| {
+            tokio::spawn(meta_watcher(
+                self.ctx.clone(),
+                self.store.clone(),
+                self.events.clone(),
+                monitor_id,
+                rec_id,
+                started_at,
+                row.monitor.url.clone(),
+                meta_done.clone(),
+                self.shutdown.clone(),
+            ))
+        });
+
         let outcome = self
             .run_process(&self.active, monitor_id, &plan, None, None, ad_sink)
             .await;
@@ -1012,6 +1030,12 @@ impl Supervisor {
         watcher_done.store(true, Ordering::SeqCst);
         if let Some(w) = watcher {
             let _ = w.await;
+        }
+        // Stop the metadata watcher too (it only writes its own table, but join it
+        // so a final in-flight poll can't insert after the recording is finalized).
+        meta_done.store(true, Ordering::SeqCst);
+        if let Some(t) = meta_task {
+            let _ = t.await;
         }
         // Broadcast end ~= when the tool exited; snapshot it before remux so the
         // span (and thus lost-time) isn't inflated by remux duration.
@@ -1916,6 +1940,81 @@ async fn catch_up_watcher(
     }
 }
 
+/// How often to poll Twitch Helix for title/category changes during a recording.
+/// Changes are infrequent and not time-critical for an archive log, so a coarse
+/// interval keeps the API cost negligible (one call per active Twitch recording).
+const META_POLL_INTERVAL_SECS: i64 = 60;
+
+/// Poll a live Twitch channel's title + game/category for the duration of a
+/// recording, logging each change to `stream_meta_change`. The first observed
+/// value of each field is logged as the baseline (empty `old_value`); later
+/// transitions record `old -> new` (including a change to empty, e.g. a cleared
+/// category). Stops when `done` (recording ended) or `shutdown` is set. No-ops
+/// gracefully when Twitch credentials are unset (`twitch_stream_meta` -> `None`).
+#[allow(clippy::too_many_arguments)]
+async fn meta_watcher(
+    ctx: Arc<DetectContext>,
+    store: Arc<Store>,
+    events: EventTx,
+    monitor_id: i64,
+    rec_id: i64,
+    started_at: i64,
+    url: String,
+    done: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let mut last_title: Option<String> = None;
+    let mut last_game: Option<String> = None;
+    loop {
+        if done.load(Ordering::SeqCst) || shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Some(meta) = ctx.twitch_stream_meta(&url).await {
+            let at = (now_unix() - started_at).max(0);
+            let mut changed = false;
+            // Title: log the initial non-empty value, then every transition.
+            if last_title.as_deref() != Some(meta.title.as_str()) {
+                let baseline = last_title.is_none();
+                let old = last_title.take().unwrap_or_default();
+                last_title = Some(meta.title.clone());
+                if !(baseline && meta.title.is_empty()) {
+                    match store.insert_meta_change(rec_id, at, "title", &old, &meta.title) {
+                        Ok(_) => changed = true,
+                        Err(e) => warn!("insert title change failed: {e:#}"),
+                    }
+                }
+            }
+            // Category/game: same rule.
+            if last_game.as_deref() != Some(meta.game.as_str()) {
+                let baseline = last_game.is_none();
+                let old = last_game.take().unwrap_or_default();
+                last_game = Some(meta.game.clone());
+                if !(baseline && meta.game.is_empty()) {
+                    match store.insert_meta_change(rec_id, at, "category", &old, &meta.game) {
+                        Ok(_) => changed = true,
+                        Err(e) => warn!("insert category change failed: {e:#}"),
+                    }
+                }
+            }
+            if changed {
+                // Wake the UI so the Changes column / popup refreshes live.
+                let _ = events.send(AppEvent::MonitorState {
+                    monitor_id,
+                    state: "recording".into(),
+                });
+            }
+        }
+
+        // Interruptible wait until the next poll (checks the flags every 250ms).
+        for _ in 0..(META_POLL_INTERVAL_SECS * 4) {
+            if done.load(Ordering::SeqCst) || shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+}
+
 /// Find the actual output when the predicted path is missing: the largest file
 /// in `predicted`'s directory whose name shares its stem (e.g. yt-dlp wrote
 /// `<stem>.webm` instead of the predicted `<stem>.mkv`).
@@ -2130,6 +2229,7 @@ mod tests {
             last_recording_lost_secs: None,
             last_recording_ad_count: 0,
             last_recording_ad_secs: 0,
+            last_recording_meta_changes: 0,
             ad_free_sub: None,
             recording_count: 0,
         }
