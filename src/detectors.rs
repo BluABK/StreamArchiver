@@ -23,6 +23,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
+use crate::events::{AppEvent, EventTx};
 use crate::models::{Platform, now_unix};
 use crate::store::Store;
 
@@ -729,10 +730,11 @@ impl DetectContext {
 /// Background task: while a Twitch account is connected, periodically refresh the
 /// auto Twitch-sub ad-free status for Twitch monitors. Cheap and idle-friendly:
 /// at most one Helix lookup per unique broadcaster, no more than every few hours,
-/// and nothing at all when no account is connected.
-pub async fn refresh_ad_free(ctx: Arc<DetectContext>, shutdown: Arc<AtomicBool>) {
-    const INITIAL_DELAY_SECS: u64 = 30;
-    const PERIOD_SECS: u64 = 6 * 3600;
+/// and nothing at all when no account is connected. A short poll tick means a
+/// just-connected account is picked up within ~`TICK_SECS`, not a refresh period.
+pub async fn refresh_ad_free(ctx: Arc<DetectContext>, events: EventTx, shutdown: Arc<AtomicBool>) {
+    const INITIAL_DELAY_SECS: u64 = 20;
+    const TICK_SECS: u64 = 60;
     const STALE_AFTER_SECS: i64 = 6 * 3600;
 
     interruptible_sleep(&shutdown, INITIAL_DELAY_SECS).await;
@@ -742,18 +744,20 @@ pub async fn refresh_ad_free(ctx: Arc<DetectContext>, shutdown: Arc<AtomicBool>)
         }
         // Need a stored account id (set on connect with the subscriptions scope) to
         // resolve subs at all; legacy connections without it do no work until a
-        // reconnect.
+        // reconnect. The pass itself only spends a Helix call on stale/unchecked
+        // monitors, so an idle tick is just one local DB query.
         if crate::oauth::connected_user_id(ctx.store.as_ref()).is_some() {
-            refresh_ad_free_once(&ctx, STALE_AFTER_SECS).await;
+            refresh_ad_free_once(&ctx, &events, STALE_AFTER_SECS).await;
         }
-        interruptible_sleep(&shutdown, PERIOD_SECS).await;
+        interruptible_sleep(&shutdown, TICK_SECS).await;
     }
 }
 
 /// One refresh pass: check each Twitch monitor whose cached status is stale,
 /// de-duplicating per broadcaster login. Only conclusive results are persisted;
-/// an undeterminable result (e.g. scope not yet granted) is left to retry.
-async fn refresh_ad_free_once(ctx: &Arc<DetectContext>, stale_after: i64) {
+/// an undeterminable result (e.g. scope not yet granted) is left to retry. Emits
+/// a bus event when a status actually changes so the UI reloads the column.
+async fn refresh_ad_free_once(ctx: &Arc<DetectContext>, events: &EventTx, stale_after: i64) {
     let rows = match ctx.store.list_monitors_with_channels() {
         Ok(r) => r,
         Err(_) => return,
@@ -791,6 +795,13 @@ async fn refresh_ad_free_once(ctx: &Arc<DetectContext>, stale_after: i64) {
         if result.is_some() && crate::oauth::connected_user_id(ctx.store.as_ref()).is_some() {
             let _ = ctx.store.set_monitor_ad_free_sub(row.monitor.id, result, now);
             info!(monitor_id = row.monitor.id, subscribed = ?result, "ad-free sub status refreshed");
+            // Reload the UI only when the displayed status actually changed.
+            if result != row.ad_free_sub {
+                let _ = events.send(AppEvent::MonitorState {
+                    monitor_id: row.monitor.id,
+                    state: row.monitor.last_state.clone(),
+                });
+            }
         }
     }
 }

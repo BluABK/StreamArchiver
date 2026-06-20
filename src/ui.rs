@@ -3409,6 +3409,9 @@ impl StreamArchiverApp {
                         if ui.button("Disconnect").clicked() {
                             let _ = oauth::disconnect(&self.core.store);
                             *self.twitch_flow.lock().unwrap() = AuthFlow::Idle;
+                            // disconnect() clears the cached ad-free (sub) results;
+                            // reload so the Streams column drops the stale badges now.
+                            self.reload_rows();
                         }
                     });
                     ui.small(

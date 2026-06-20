@@ -1036,18 +1036,29 @@ impl Supervisor {
             });
         }
 
+        // Ad breaks are handled off the stderr-drain path: the drain loop just
+        // forwards `(detected_at, duration)` over this channel, and a dedicated
+        // task does the (potentially slow) ffprobe + DB insert. This keeps stderr
+        // consumption from stalling — a blocked drain can backpressure the capture
+        // process's own stderr writes.
+        let (ad_tx, ad_rx) = if ads.is_some() {
+            let (tx, rx) = mpsc::unbounded_channel::<(i64, i64)>();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
         let ring: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
-        if let Some(stderr) = child.stderr.take() {
+        let stderr_task = if let Some(stderr) = child.stderr.take() {
             let ring = ring.clone();
             let program = plan.program.clone();
             let prog = progress.clone();
             let spd = speed.clone();
-            tokio::spawn(async move {
+            // Move the sole ad-break sender in; the channel closes when the drain
+            // loop ends (EOF on child exit), ending the processor task.
+            let ad_tx = ad_tx;
+            Some(tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
-                // Ad time skipped so far in this take, for the wall-clock fallback
-                // offset (each filtered break removes wall-clock that isn't in the
-                // file).
-                let mut prior_ad_secs: i64 = 0;
                 while let Ok(Some(line)) = lines.next_line().await {
                     // Some tools emit progress on stderr; catch it there too.
                     if prog.is_some() || spd.is_some() {
@@ -1059,41 +1070,11 @@ impl Supervisor {
                             m.lock().unwrap().insert(id, s);
                         }
                     }
-                    // Record streamlink ad breaks (Twitch). Streamlink de-dups
-                    // breaks itself, so each matching line is one distinct break.
-                    if let Some(sink) = ads.as_ref() {
+                    // Forward streamlink ad breaks without blocking the drain
+                    // (streamlink de-dups, so each matching line is one break).
+                    if let Some(tx) = &ad_tx {
                         if let Some(dur) = parse_ad_break_secs(&line) {
-                            // The cut lands at the content captured so far. Ad
-                            // segments are filtered out, so the capture's media
-                            // duration is exactly that position — correct for both
-                            // live-edge and capture-from-start/DVR (where wall clock
-                            // since start doesn't track the file timeline). Fall
-                            // back to wall clock minus the ad time already skipped
-                            // (correct at the live edge) if ffprobe can't read the
-                            // still-growing file yet.
-                            let at = match media_duration_secs(&sink.capture_path).await {
-                                Some(d) => d,
-                                None => (now_unix() - sink.started_at - prior_ad_secs).max(0),
-                            };
-                            prior_ad_secs += dur;
-                            match sink.store.insert_ad_break(sink.recording_id, at, dur) {
-                                Ok(_) => {
-                                    info!(
-                                        monitor_id = sink.monitor_id,
-                                        rec_id = sink.recording_id,
-                                        at,
-                                        secs = dur,
-                                        "ad break detected"
-                                    );
-                                    // Wake the UI so an expanded history tree
-                                    // refreshes its Ads / Ad time columns.
-                                    let _ = sink.events.send(AppEvent::MonitorState {
-                                        monitor_id: sink.monitor_id,
-                                        state: "recording".into(),
-                                    });
-                                }
-                                Err(e) => warn!("insert ad_break failed: {e:#}"),
-                            }
+                            let _ = tx.send((now_unix(), dur));
                         }
                     }
                     tracing::trace!(target: "streamarchiver::recproc", "[{program}] {line}");
@@ -1103,10 +1084,58 @@ impl Supervisor {
                     }
                     r.push_back(line);
                 }
-            });
-        }
+            }))
+        } else {
+            drop(ad_tx); // no stderr piped: close the channel so the processor ends
+            None
+        };
+
+        // Ad-break processor: for each break, the cut lands at the content captured
+        // so far. Ad segments are filtered out, so the capture's media duration is
+        // that position — correct for both live-edge and capture-from-start/DVR.
+        // Falls back to wall clock minus already-skipped ad time if ffprobe can't
+        // read the still-growing file yet.
+        let ad_task = match (ads, ad_rx) {
+            (Some(sink), Some(mut rx)) => Some(tokio::spawn(async move {
+                let mut prior_ad_secs: i64 = 0;
+                while let Some((detected_at, dur)) = rx.recv().await {
+                    let at = match media_duration_secs(&sink.capture_path).await {
+                        Some(d) => d,
+                        None => (detected_at - sink.started_at - prior_ad_secs).max(0),
+                    };
+                    prior_ad_secs += dur;
+                    match sink.store.insert_ad_break(sink.recording_id, at, dur) {
+                        Ok(_) => {
+                            info!(
+                                monitor_id = sink.monitor_id,
+                                rec_id = sink.recording_id,
+                                at,
+                                secs = dur,
+                                "ad break detected"
+                            );
+                            // Wake the UI so an expanded history tree refreshes its
+                            // Ads / Ad time columns.
+                            let _ = sink.events.send(AppEvent::MonitorState {
+                                monitor_id: sink.monitor_id,
+                                state: "recording".into(),
+                            });
+                        }
+                        Err(e) => warn!("insert ad_break failed: {e:#}"),
+                    }
+                }
+            })),
+            _ => None,
+        };
 
         let status = child.wait().await;
+        // Drain both reader tasks fully before returning, so every log line and ad
+        // break is recorded before the caller remuxes/removes the capture file.
+        if let Some(t) = stderr_task {
+            let _ = t.await;
+        }
+        if let Some(t) = ad_task {
+            let _ = t.await;
+        }
         // Closing the job here terminates any stragglers (e.g. yt-dlp's ffmpeg).
         if let Some(j) = &job {
             j.kill();

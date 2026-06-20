@@ -107,11 +107,13 @@ impl AppCore {
         });
 
         // Periodic ad-free (Twitch sub) status refresher. Idles when no Twitch
-        // account is connected; otherwise refreshes stale entries every few hours.
+        // account is connected; otherwise refreshes stale entries every few hours
+        // and emits a bus event (so the UI reloads) when a status changes.
         let af_ctx = ctx.clone();
+        let af_events = self.events.clone();
         let af_shutdown = self.shutdown.clone();
         self.rt.spawn(async move {
-            crate::detectors::refresh_ad_free(af_ctx, af_shutdown).await;
+            crate::detectors::refresh_ad_free(af_ctx, af_events, af_shutdown).await;
         });
 
         // Supervisor: live signals + manual commands -> recordings.
