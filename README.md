@@ -253,7 +253,11 @@ yt-dlp's output templates):
 | `{title}` | The stream/video title. **Videos only**, and only when **Auto-detect** is on (live recordings don't resolve a title, so it's empty there). |
 | `{channel}` | The uploader/channel name. **Videos only**, when **Auto-detect** is on; empty otherwise. |
 | `{video_id}` | The platform **stream/video id**. **Streams:** set when detection knows it (Twitch Helix/EventSub, YouTube Data API, Kick API); empty for id-less methods (scrape / generic probe). **Videos:** set when **Auto-detect** is on. |
-| `{quality}` | The **configured quality selector** (e.g. `1080p60`, `best`, `bv*+ba`) — what you asked for, not necessarily the actual resolution (see `{resolution}` below). |
+| `{quality}` | The **configured quality selector** (e.g. `1080p60`, `best`, `bv*+ba`) — what you asked for, not necessarily the actual resolution (see `{resolution}`). |
+| `{resolution}` | **Actual** capture resolution `WxH` (e.g. `1920x1080`). Requires media probing — see *Filename media info* below; empty when off/unavailable. |
+| `{width}` / `{height}` | Actual width / height in pixels (e.g. `1920` / `1080`). Same probing requirement. |
+| `{fps}` | Actual frame rate, rounded to a whole number (e.g. `60`, `30`). Same probing requirement. |
+| `{vcodec}` | Actual video codec (e.g. `h264`, `hevc`, `av1`). Same probing requirement. |
 | `{take}` | **Streams:** this monitor's attempt number (1, 2, 3, …) — a built-in way to keep names unique when you omit `{date}`/`{time}`. Empty for Videos. |
 | `{date}` | Capture-start date, **UTC**, `YYYYMMDD` (e.g. `20260620`). |
 | `{time}` | Capture-start time, **UTC**, `HHMMSS` (e.g. `183001`). |
@@ -274,6 +278,26 @@ Notes:
   even a template with no unique part (e.g. just `{name}`) never clobbers an
   earlier recording. Use `{take}` (or `{date}`/`{time}`/`{video_id}`) if you'd
   rather the difference be part of the name itself.
+
+#### Filename media info ({resolution}/{fps}/…)
+
+Actual resolution/fps/codec aren't known when the filename is first chosen (it's
+picked before recording starts), so **Settings → Defaults → Filename media info**
+selects how they're obtained — only relevant when your template uses one of those
+variables:
+
+- **Off** (default) — don't probe; those variables stay empty.
+- **Pre-probe (before recording)** — probe the stream first so the name is final
+  from the start. Adds a little latency and is best-effort: the probed format can
+  differ from what actually gets recorded (or shift mid-stream). Use a
+  post-rename mode for guaranteed-accurate values.
+- **Post-capture rename** — record first, then probe the finished file and rename
+  it. Most accurate; the final name only appears once the capture completes.
+- **Pre-probe + rename** — pre-probe for an initial name, then correct it after
+  capture if the actual media differs.
+
+Probing uses the capture tool to resolve the stream and `ffprobe` to read it
+(post-rename `ffprobe`s the finished file). Applies to both Streams and Videos.
 
 Examples: `{name}_{date}_{time}` → `Layna_20260620_183001.mkv`; for a Videos
 download with **Auto-detect** on, `{channel} - {title} [{video_id}]` →

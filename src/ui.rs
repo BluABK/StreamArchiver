@@ -16,8 +16,9 @@ use tray_icon::TrayIcon;
 use crate::app_core::AppCore;
 use crate::events::{ManualCommand, UiCommand};
 use crate::models::{
-    AdBreak, AuthKind, Channel, Container, DetectionMethod, DownloadDefaults, Monitor,
-    MonitorWithChannel, Platform, Recording, StreamGroup, Tool, Video, group_recordings,
+    AdBreak, AuthKind, Channel, Container, DetectionMethod, DownloadDefaults, K_FILENAME_MEDIA,
+    MediaInfoMode, Monitor, MonitorWithChannel, Platform, Recording, StreamGroup, Tool, Video,
+    group_recordings,
 };
 use crate::oauth::{self, AuthFlow};
 use crate::platform::AutoStart;
@@ -239,6 +240,8 @@ struct SettingsForm {
     websub_vps_url: String,
     websub_token: String,
     websub_poll_secs: String,
+    /// When to probe captures for the {resolution}/{fps}/… filename variables.
+    filename_media_info: MediaInfoMode,
 }
 
 pub struct StreamArchiverApp {
@@ -342,6 +345,7 @@ impl StreamArchiverApp {
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| "15".into()),
+            filename_media_info: MediaInfoMode::parse(&setting_or_empty(&core, K_FILENAME_MEDIA)),
         };
 
         let twitch_flow = Arc::new(Mutex::new(match oauth::connected_login(&core.store) {
@@ -554,6 +558,7 @@ impl StreamArchiverApp {
             (K_WEBSUB_URL, s.websub_vps_url.trim()),
             (K_WEBSUB_TOKEN, s.websub_token.trim()),
             (K_WEBSUB_POLL, s.websub_poll_secs.trim()),
+            (K_FILENAME_MEDIA, s.filename_media_info.as_str()),
         ];
         for (k, v) in pairs {
             if let Err(e) = self.core.store.set_setting(k, v) {
@@ -3568,6 +3573,22 @@ impl StreamArchiverApp {
                     ui.end_row();
                     ui.label("Max concurrent downloads");
                     ui.text_edit_singleline(&mut self.settings.max_concurrent_downloads);
+                    ui.end_row();
+                    ui.label("Filename media info")
+                        .on_hover_text(
+                            "How the {resolution}/{height}/{width}/{fps}/{vcodec} filename \
+                             variables get their values. Only applies when the filename \
+                             template uses one of them.",
+                        );
+                    let mode = &mut self.settings.filename_media_info;
+                    egui::ComboBox::from_id_salt("media_info_cb")
+                        .selected_text(mode.label())
+                        .show_ui(ui, |ui| {
+                            for m in MediaInfoMode::ALL {
+                                ui.selectable_value(mode, m, m.label())
+                                    .on_hover_text(m.tooltip());
+                            }
+                        });
                     ui.end_row();
                 });
 

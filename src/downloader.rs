@@ -24,7 +24,8 @@ use tracing::{info, warn};
 use crate::detectors::{DetectContext, DetectItem, DetectOutcome};
 use crate::events::{AppEvent, EventTx, LiveSignal, ManualCommand};
 use crate::models::{
-    AuthKind, Container, DetectionMethod, MonitorWithChannel, Platform, Tool, Video, now_unix,
+    AuthKind, Container, DetectionMethod, K_FILENAME_MEDIA, MediaInfoMode, Monitor,
+    MonitorWithChannel, Platform, Tool, Video, now_unix,
 };
 use crate::platform::ProcessJob;
 use crate::store::Store;
@@ -168,39 +169,24 @@ pub fn build_plan(
     started_at: i64,
     auth: &AuthSource,
     stream_id: Option<&str>,
+    media: Option<&MediaInfo>,
 ) -> DownloadPlan {
     let m = &row.monitor;
     let ch = &row.channel;
     let dir = PathBuf::from(&m.output_dir);
-    let quality = if m.quality.trim().is_empty() {
-        "best".to_string()
-    } else {
-        m.quality.clone()
-    };
-    // `{video_id}` is the platform stream/video id when detection knew it (Twitch
-    // Helix/EventSub, YouTube Data API, Kick API); empty for id-less methods.
-    // `{take}` is this monitor's attempt number. Media vars (resolution/fps/…) are
-    // filled later when probing is enabled.
-    let take = (row.recording_count + 1).to_string();
-    let stem = expand_template(
-        &m.filename_template,
-        &TemplateVars {
-            name: &ch.name,
-            video_id: stream_id.unwrap_or(""),
-            quality: &quality,
-            take: &take,
-            secs: started_at,
-            ..Default::default()
-        },
+    let quality = resolved_quality(&m.quality);
+    // `{video_id}` (platform id when known), `{take}` (attempt number), and the
+    // media vars (filled only when `media` is provided, i.e. pre-probe). Then
+    // avoid clobbering an existing finished file of the same name.
+    let stem = monitor_stem(
+        m, &ch.name, started_at, stream_id, row.recording_count, &quality, media,
     );
     let extra = split_args(&m.extra_args);
-
-    // Don't clobber an existing finished file of the same name.
     let final_ext = match m.container {
         Container::Mkv => "mkv",
         Container::Ts => "ts",
     };
-    let stem = unique_stem(&dir, &stem, final_ext);
+    let stem = unique_stem(&dir, &stem, final_ext, None);
 
     let ts_path = dir.join(format!("{stem}.ts"));
     let ts_str = ts_path.to_string_lossy().into_owned();
@@ -299,40 +285,15 @@ pub fn build_video_plan(
     channel: &str,
     video_id: &str,
     auth: &AuthSource,
+    media: Option<&MediaInfo>,
 ) -> DownloadPlan {
     let dir = PathBuf::from(&v.output_dir);
-    // `{name}` prefers the user's Name field, then the resolved title, then a
-    // generic fallback. `{title}`/`{channel}`/`{video_id}` are resolved metadata.
-    let name_field = v.title.trim();
-    let resolved = title.trim();
-    let name = if !name_field.is_empty() {
-        name_field
-    } else if !resolved.is_empty() {
-        resolved
-    } else {
-        "video"
-    };
-    let quality = if v.quality.trim().is_empty() {
-        "best".to_string()
-    } else {
-        v.quality.trim().to_string()
-    };
-    let stem = expand_template(
-        &v.filename_template,
-        &TemplateVars {
-            name,
-            title: resolved,
-            channel: channel.trim(),
-            video_id: video_id.trim(),
-            quality: &quality,
-            secs: started_at,
-            ..Default::default()
-        },
-    );
+    let quality = resolved_quality(&v.quality);
+    let stem = video_stem(v, started_at, title, channel, video_id, &quality, media);
     let extra = split_args(&v.extra_args);
     let platform = Platform::detect(&v.url);
     // Don't clobber an existing finished file (all video tools end at .mkv).
-    let stem = unique_stem(&dir, &stem, "mkv");
+    let stem = unique_stem(&dir, &stem, "mkv", None);
     let final_path = dir.join(format!("{stem}.mkv"));
 
     match v.tool {
@@ -725,7 +686,17 @@ impl Supervisor {
         if !channel.is_empty() {
             let _ = self.store.set_video_channel(id, &channel);
         }
-        let plan = build_video_plan(&video, started_at, &title, &channel, &video_id, &auth);
+        // Filename media-info ({resolution}/{fps}/…): pre-probe before download if
+        // configured; the finished file is probed/renamed below for post modes.
+        let media_mode = media_info_mode(&self.store);
+        let want_media = template_wants_media(&video.filename_template);
+        let pre_media = if want_media && media_mode.pre() {
+            preprobe_media(video.tool, &video.url, &video.quality, &auth).await
+        } else {
+            None
+        };
+        let plan =
+            build_video_plan(&video, started_at, &title, &channel, &video_id, &auth, pre_media.as_ref());
         if let Some(parent) = plan.capture_path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
@@ -769,6 +740,16 @@ impl Supervisor {
             // yt-dlp may have produced a different extension than predicted.
             if let Some(found) = newest_with_stem(&final_path).await {
                 final_path = found;
+            }
+        }
+
+        // Post-capture: probe the finished file for actual media info and rename.
+        if want_media && media_mode.post() && file_len(&final_path).await > 0 {
+            if let Some(mi) = probe_media(&final_path.to_string_lossy()).await {
+                let quality = resolved_quality(&video.quality);
+                let stem =
+                    video_stem(&video, started_at, &title, &channel, &video_id, &quality, Some(&mi));
+                final_path = rename_for_media(final_path, &stem).await;
             }
         }
 
@@ -864,9 +845,6 @@ impl Supervisor {
         stream_id: Option<String>,
     ) {
         let monitor_id = row.monitor.id;
-        let _permit = self.sem.acquire().await.expect("semaphore");
-
-        let started_at = now_unix();
         let global_method = self
             .store
             .get_setting("download_auth_method")
@@ -880,7 +858,27 @@ impl Supervisor {
             .flatten()
             .unwrap_or_default();
         let auth = resolve_auth(&row, &global_method, &global_browser);
-        let plan = build_plan(&row, started_at, &auth, stream_id.as_deref());
+        // Filename media-info ({resolution}/{fps}/…): pre-probe the stream if the
+        // template uses it and the mode asks for it. Do this BEFORE taking the
+        // concurrency permit (so a slow probe can't block other recordings) and
+        // BEFORE the start timestamp (so it reflects when capture actually begins).
+        // The finished file is probed again (and renamed) below for post modes.
+        let media_mode = media_info_mode(&self.store);
+        let want_media = template_wants_media(&row.monitor.filename_template);
+        let pre_media = if want_media && media_mode.pre() {
+            preprobe_media(row.monitor.tool, &row.monitor.url, &row.monitor.quality, &auth).await
+        } else {
+            None
+        };
+
+        let _permit = self.sem.acquire().await.expect("semaphore");
+        // The probe + permit wait may have spanned a shutdown; don't start new work.
+        if self.shutdown.load(Ordering::SeqCst) {
+            self.active.lock().unwrap().remove(&monitor_id);
+            return;
+        }
+        let started_at = now_unix();
+        let plan = build_plan(&row, started_at, &auth, stream_id.as_deref(), pre_media.as_ref());
         if let Some(parent) = plan.capture_path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
@@ -979,6 +977,24 @@ impl Supervisor {
                 }
             } else {
                 final_path = plan.capture_path.clone();
+            }
+        }
+
+        // Post-capture: probe the finished file for actual media info and rename to
+        // the template (the accurate path for the post-rename modes).
+        if want_media && media_mode.post() && file_len(&final_path).await > 0 {
+            if let Some(mi) = probe_media(&final_path.to_string_lossy()).await {
+                let quality = resolved_quality(&row.monitor.quality);
+                let stem = monitor_stem(
+                    &row.monitor,
+                    &row.channel.name,
+                    started_at,
+                    stream_id.as_deref(),
+                    row.recording_count,
+                    &quality,
+                    Some(&mi),
+                );
+                final_path = rename_for_media(final_path, &stem).await;
             }
         }
 
@@ -1460,6 +1476,288 @@ async fn media_duration_secs(path: &Path) -> Option<i64> {
     }
 }
 
+/// Actual media properties of a capture, for the filename `{resolution}`/
+/// `{height}`/`{width}`/`{fps}`/`{vcodec}` variables. Empty fields render empty.
+#[derive(Clone, Debug, Default)]
+pub struct MediaInfo {
+    pub resolution: String, // "1920x1080"
+    pub width: String,
+    pub height: String,
+    pub fps: String,    // rounded whole number, e.g. "60"
+    pub vcodec: String, // e.g. "h264"
+}
+
+/// True if `template` uses any media-info variable (so we only probe when needed).
+fn template_wants_media(template: &str) -> bool {
+    ["{resolution}", "{height}", "{width}", "{fps}", "{vcodec}"]
+        .iter()
+        .any(|k| template.contains(k))
+}
+
+/// Round an ffprobe `r_frame_rate` ("60/1", "30000/1001") to a whole-number fps
+/// string; empty on parse failure.
+fn fmt_fps(rate: &str) -> String {
+    let (n, d) = match rate.split_once('/') {
+        Some((n, d)) => (n.trim().parse::<f64>().ok(), d.trim().parse::<f64>().ok()),
+        None => (rate.trim().parse::<f64>().ok(), Some(1.0)),
+    };
+    match (n, d) {
+        (Some(n), Some(d)) if d > 0.0 && n > 0.0 => (n / d).round().to_string(),
+        _ => String::new(),
+    }
+}
+
+/// ffprobe the first video stream of a file path or stream URL into [`MediaInfo`].
+/// `None` if ffprobe fails / there's no readable video stream.
+async fn probe_media(target: &str) -> Option<MediaInfo> {
+    let mut cmd = Command::new("ffprobe");
+    cmd.args([
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,r_frame_rate,codec_name",
+        "-of", "default=noprint_wrappers=1:nokey=0",
+    ])
+    .arg(target)
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let out = tokio::time::timeout(Duration::from_secs(30), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut info = MediaInfo::default();
+    for line in text.lines() {
+        if let Some((k, v)) = line.split_once('=') {
+            let v = v.trim();
+            match k.trim() {
+                "width" => info.width = v.to_string(),
+                "height" => info.height = v.to_string(),
+                "codec_name" => info.vcodec = v.to_string(),
+                "r_frame_rate" => info.fps = fmt_fps(v),
+                _ => {}
+            }
+        }
+    }
+    // Require real pixel dimensions (ffprobe can report "N/A" for odd inputs).
+    if info.width.parse::<u32>().is_err() || info.height.parse::<u32>().is_err() {
+        return None;
+    }
+    info.resolution = format!("{}x{}", info.width, info.height);
+    Some(info)
+}
+
+/// Resolve a playable media URL for a stream (for pre-probe), then ffprobe it.
+/// Best-effort; `None` on any failure (caller then leaves the media vars empty).
+async fn preprobe_media(
+    tool: Tool,
+    url: &str,
+    quality: &str,
+    auth: &AuthSource,
+) -> Option<MediaInfo> {
+    let target = resolve_play_url(tool, url, quality, auth).await?;
+    probe_media(&target).await
+}
+
+/// Resolve a stream's direct media URL via the capture tool (so ffprobe can read
+/// it before recording). `None` on failure.
+async fn resolve_play_url(
+    tool: Tool,
+    url: &str,
+    quality: &str,
+    auth: &AuthSource,
+) -> Option<String> {
+    let quality = resolved_quality(quality);
+    let (program, args): (&str, Vec<String>) = match tool {
+        // ffmpeg reads the source URL directly.
+        Tool::Ffmpeg => return Some(url.to_string()),
+        Tool::Streamlink => {
+            let mut a = Vec::new();
+            if Platform::detect(url) == Platform::Twitch {
+                a.push("--twitch-supported-codecs=h264,h265,av1".to_string());
+                if let AuthSource::Token(t) = auth {
+                    a.push(format!("--twitch-api-header=Authorization=OAuth {t}"));
+                }
+            }
+            a.push("--stream-url".into());
+            a.push(url.to_string());
+            a.push(quality);
+            ("streamlink", a)
+        }
+        Tool::YtDlp => {
+            let mut a = vec!["-g".to_string(), "--no-warnings".into(), "--no-playlist".into()];
+            if quality != "best" {
+                a.push("-f".into());
+                a.push(quality);
+            }
+            match auth {
+                AuthSource::CookiesBrowser(b) => {
+                    a.push("--cookies-from-browser".into());
+                    a.push(b.clone());
+                }
+                AuthSource::CookiesFile(p) => {
+                    a.push("--cookies".into());
+                    a.push(p.clone());
+                }
+                _ => {}
+            }
+            a.push(url.to_string());
+            ("yt-dlp", a)
+        }
+    };
+    let mut cmd = Command::new(program);
+    cmd.args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let out = tokio::time::timeout(Duration::from_secs(30), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // yt-dlp may print separate video+audio URLs; the first is the video stream.
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+}
+
+/// Rename a finished capture to `new_stem` (keeping its extension), avoiding
+/// collisions. Returns the resulting path (unchanged on no-op or failure).
+async fn rename_for_media(final_path: PathBuf, new_stem: &str) -> PathBuf {
+    let Some(dir) = final_path.parent().map(Path::to_path_buf) else {
+        return final_path;
+    };
+    let ext = final_path
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "mkv".into());
+    // Ignore the file we're renaming when checking collisions, so a "Both"-mode
+    // capture whose pre-probe name already matches (incl. a build-time collision
+    // suffix) resolves back to its own name and we no-op below.
+    let unique = unique_stem(&dir, new_stem, &ext, Some(&final_path));
+    let new_path = dir.join(format!("{unique}.{ext}"));
+    if new_path == final_path {
+        return final_path; // already correctly named (e.g. no media, or "Both")
+    }
+    match tokio::fs::rename(&final_path, &new_path).await {
+        Ok(()) => new_path,
+        Err(e) => {
+            warn!("media rename failed, keeping {}: {e:#}", final_path.display());
+            final_path
+        }
+    }
+}
+
+/// The configured quality selector with the `best` default applied.
+fn resolved_quality(q: &str) -> String {
+    if q.trim().is_empty() {
+        "best".to_string()
+    } else {
+        q.trim().to_string()
+    }
+}
+
+/// Read the global filename media-probe mode from settings.
+fn media_info_mode(store: &Store) -> MediaInfoMode {
+    MediaInfoMode::parse(
+        &store
+            .get_setting(K_FILENAME_MEDIA)
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+    )
+}
+
+/// Build a monitor recording's filename stem (no extension, no collision suffix).
+/// Shared by [`build_plan`] and the post-capture rename so they agree.
+fn monitor_stem(
+    m: &Monitor,
+    ch_name: &str,
+    started_at: i64,
+    stream_id: Option<&str>,
+    recording_count: i64,
+    quality: &str,
+    media: Option<&MediaInfo>,
+) -> String {
+    let take = (recording_count + 1).to_string();
+    let mi = media.cloned().unwrap_or_default();
+    expand_template(
+        &m.filename_template,
+        &TemplateVars {
+            name: ch_name,
+            video_id: stream_id.unwrap_or(""),
+            quality,
+            take: &take,
+            resolution: &mi.resolution,
+            height: &mi.height,
+            width: &mi.width,
+            fps: &mi.fps,
+            vcodec: &mi.vcodec,
+            secs: started_at,
+            ..Default::default()
+        },
+    )
+}
+
+/// The `{name}` value for an on-demand video: the user's Name, else the resolved
+/// title, else a generic fallback.
+fn video_name<'a>(v: &'a Video, resolved_title: &'a str) -> &'a str {
+    let name_field = v.title.trim();
+    if !name_field.is_empty() {
+        name_field
+    } else if !resolved_title.is_empty() {
+        resolved_title
+    } else {
+        "video"
+    }
+}
+
+/// Build an on-demand video's filename stem (no extension, no collision suffix).
+/// Shared by [`build_video_plan`] and the post-capture rename.
+#[allow(clippy::too_many_arguments)]
+fn video_stem(
+    v: &Video,
+    started_at: i64,
+    title: &str,
+    channel: &str,
+    video_id: &str,
+    quality: &str,
+    media: Option<&MediaInfo>,
+) -> String {
+    let resolved = title.trim();
+    let mi = media.cloned().unwrap_or_default();
+    expand_template(
+        &v.filename_template,
+        &TemplateVars {
+            name: video_name(v, resolved),
+            title: resolved,
+            channel: channel.trim(),
+            video_id: video_id.trim(),
+            quality,
+            resolution: &mi.resolution,
+            height: &mi.height,
+            width: &mi.width,
+            fps: &mi.fps,
+            vcodec: &mi.vcodec,
+            secs: started_at,
+            ..Default::default()
+        },
+    )
+}
+
 /// Watch a from-start recording's growing capture and zero its "lost time" once
 /// the captured media catches up to the live edge. Exits early when `done` is set
 /// (recording ended) so finalize can compute the exact residual without a race.
@@ -1604,9 +1902,14 @@ fn expand_template(template: &str, v: &TemplateVars) -> String {
 
 /// A stem (filename without extension) that doesn't collide with an existing
 /// `<stem>.<ext>` in `dir`: returns `stem`, else `stem (2)`, `stem (3)`, … —
-/// matching the file-manager convention. A missing `dir` can't collide.
-fn unique_stem(dir: &Path, stem: &str, ext: &str) -> String {
-    let taken = |s: &str| dir.join(format!("{s}.{ext}")).exists();
+/// matching the file-manager convention. A missing `dir` can't collide. `ignore`
+/// (the file being renamed, if any) is treated as free so a post-rename to the
+/// same/own name isn't pushed to a new suffix.
+fn unique_stem(dir: &Path, stem: &str, ext: &str, ignore: Option<&Path>) -> String {
+    let taken = |s: &str| {
+        let p = dir.join(format!("{s}.{ext}"));
+        Some(p.as_path()) != ignore && p.exists()
+    };
     if !taken(stem) {
         return stem.to_string();
     }
@@ -1720,17 +2023,40 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         // Nothing there yet -> stem unchanged.
-        assert_eq!(unique_stem(&dir, "Layna", "mkv"), "Layna");
+        assert_eq!(unique_stem(&dir, "Layna", "mkv", None), "Layna");
         std::fs::write(dir.join("Layna.mkv"), b"x").unwrap();
-        assert_eq!(unique_stem(&dir, "Layna", "mkv"), "Layna (2)");
+        assert_eq!(unique_stem(&dir, "Layna", "mkv", None), "Layna (2)");
         std::fs::write(dir.join("Layna (2).mkv"), b"x").unwrap();
-        assert_eq!(unique_stem(&dir, "Layna", "mkv"), "Layna (3)");
+        assert_eq!(unique_stem(&dir, "Layna", "mkv", None), "Layna (3)");
         // A different extension doesn't collide.
-        assert_eq!(unique_stem(&dir, "Layna", "ts"), "Layna");
+        assert_eq!(unique_stem(&dir, "Layna", "ts", None), "Layna");
         // A missing directory can't collide.
-        assert_eq!(unique_stem(&dir.join("nope"), "Layna", "mkv"), "Layna");
+        assert_eq!(unique_stem(&dir.join("nope"), "Layna", "mkv", None), "Layna");
+        // The file being renamed is ignored, so its own name is treated as free
+        // (the post-rename no-op case): "Layna (2).mkv" exists but is `ignore`.
+        let own = dir.join("Layna (2).mkv");
+        assert_eq!(unique_stem(&dir, "Layna", "mkv", Some(&own)), "Layna (2)");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fmt_fps_rounds() {
+        assert_eq!(fmt_fps("60/1"), "60");
+        assert_eq!(fmt_fps("30000/1001"), "30"); // 29.97 -> 30
+        assert_eq!(fmt_fps("60000/1001"), "60"); // 59.94 -> 60
+        assert_eq!(fmt_fps("50"), "50");
+        assert_eq!(fmt_fps("0/0"), "");
+        assert_eq!(fmt_fps("N/A"), "");
+    }
+
+    #[test]
+    fn template_wants_media_detects_vars() {
+        assert!(template_wants_media("{name}_{resolution}"));
+        assert!(template_wants_media("{fps}"));
+        assert!(template_wants_media("{vcodec}-{height}"));
+        assert!(!template_wants_media("{name}_{date}_{quality}"));
+        assert!(!template_wants_media("{name}_{video_id}"));
     }
 
     #[test]
@@ -1866,6 +2192,7 @@ mod tests {
             1_700_000_000,
             &AuthSource::None,
             None,
+            None,
         );
         assert_eq!(plan.program, "streamlink");
         assert!(plan.capture_path.to_string_lossy().ends_with(".ts"));
@@ -1886,6 +2213,7 @@ mod tests {
             1_700_000_000,
             &AuthSource::None,
             None,
+            None,
         );
         assert_eq!(plan.program, "yt-dlp");
         assert!(plan.capture_path.to_string_lossy().ends_with(".ts"));
@@ -1902,6 +2230,7 @@ mod tests {
             1_700_000_000,
             &AuthSource::Token("abc123".into()),
             None,
+            None,
         );
         assert!(
             plan.args
@@ -1917,6 +2246,7 @@ mod tests {
             1_700_000_000,
             &AuthSource::CookiesBrowser("firefox".into()),
             None,
+            None,
         );
         let joined = browser.args.join(" ");
         assert!(joined.contains("--cookies-from-browser firefox"));
@@ -1925,6 +2255,7 @@ mod tests {
             &row(Tool::YtDlp, Container::Mkv, Platform::YouTube),
             1_700_000_000,
             &AuthSource::CookiesFile("C:/c.txt".into()),
+            None,
             None,
         );
         assert!(file.args.join(" ").contains("--cookies C:/c.txt"));
@@ -1956,6 +2287,7 @@ mod tests {
             &row(Tool::Streamlink, Container::Ts, Platform::Twitch),
             1_700_000_000,
             &AuthSource::None,
+            None,
             None,
         );
         assert!(plan.final_path.to_string_lossy().ends_with(".ts"));
@@ -1996,6 +2328,7 @@ mod tests {
             "",
             "",
             &AuthSource::None,
+            None,
         );
         assert_eq!(plan.program, "yt-dlp");
         assert!(plan.final_path.to_string_lossy().ends_with(".mkv"));
@@ -2016,6 +2349,7 @@ mod tests {
             "",
             "",
             &AuthSource::CookiesBrowser("edge".into()),
+            None,
         );
         let joined = plan.args.join(" ");
         assert!(joined.contains("-f bv*+ba"));
@@ -2031,6 +2365,7 @@ mod tests {
             "",
             "",
             &AuthSource::None,
+            None,
         );
         assert_eq!(plan.program, "streamlink");
         assert!(plan.capture_path.to_string_lossy().ends_with(".ts"));

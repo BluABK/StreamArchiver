@@ -352,6 +352,95 @@ impl AuthKind {
     }
 }
 
+/// When to probe a capture for **actual** media info (resolution/fps/codec) used
+/// by the filename `{resolution}`/`{height}`/`{width}`/`{fps}`/`{vcodec}`
+/// variables. These aren't known when the name is first chosen (before capture),
+/// so the user picks how to obtain them. Only matters when the template uses one
+/// of those variables.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MediaInfoMode {
+    /// Don't probe; media variables stay empty.
+    #[default]
+    Off,
+    /// Probe the stream just before recording so the name is final from the start
+    /// (adds a little latency; can be wrong if the chosen format shifts).
+    PreProbe,
+    /// Probe the finished file and rename it afterwards (most accurate; the final
+    /// name only appears once the capture completes).
+    PostRename,
+    /// Pre-probe for an initial name, then correct it by renaming after capture.
+    Both,
+}
+
+impl MediaInfoMode {
+    pub const ALL: [MediaInfoMode; 4] = [
+        MediaInfoMode::Off,
+        MediaInfoMode::PreProbe,
+        MediaInfoMode::PostRename,
+        MediaInfoMode::Both,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MediaInfoMode::Off => "off",
+            MediaInfoMode::PreProbe => "preprobe",
+            MediaInfoMode::PostRename => "postrename",
+            MediaInfoMode::Both => "both",
+        }
+    }
+
+    pub fn parse(s: &str) -> MediaInfoMode {
+        match s {
+            "preprobe" => MediaInfoMode::PreProbe,
+            "postrename" => MediaInfoMode::PostRename,
+            "both" => MediaInfoMode::Both,
+            _ => MediaInfoMode::Off,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MediaInfoMode::Off => "Off",
+            MediaInfoMode::PreProbe => "Pre-probe (before recording)",
+            MediaInfoMode::PostRename => "Post-capture rename",
+            MediaInfoMode::Both => "Pre-probe + rename",
+        }
+    }
+
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            MediaInfoMode::Off => {
+                "Don't probe; the {resolution}/{height}/{width}/{fps}/{vcodec} \
+                 filename variables stay empty."
+            }
+            MediaInfoMode::PreProbe => {
+                "Probe the stream just before recording so the filename is final from \
+                 the start. Adds a little latency and can be wrong if the chosen \
+                 format shifts mid-stream."
+            }
+            MediaInfoMode::PostRename => {
+                "Record first, then probe the finished file and rename it to the \
+                 template. Most accurate; the final name only appears once the \
+                 capture completes."
+            }
+            MediaInfoMode::Both => {
+                "Pre-probe for an initial name, then correct it by renaming after \
+                 capture if the actual media differs."
+            }
+        }
+    }
+
+    /// Whether to probe the stream before recording.
+    pub fn pre(self) -> bool {
+        matches!(self, MediaInfoMode::PreProbe | MediaInfoMode::Both)
+    }
+
+    /// Whether to probe the finished file and rename.
+    pub fn post(self) -> bool {
+        matches!(self, MediaInfoMode::PostRename | MediaInfoMode::Both)
+    }
+}
+
 /// Output container. Default MKV (robust to mid-write kills, seekable). Never MP4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Container {
@@ -604,6 +693,9 @@ impl DownloadDefaults {
         }
     }
 }
+
+/// `app_settings` key for the global [`MediaInfoMode`] (filename media probing).
+pub const K_FILENAME_MEDIA: &str = "filename_media_info";
 
 /// Current unix timestamp in seconds.
 pub fn now_unix() -> i64 {
