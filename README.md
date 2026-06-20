@@ -83,8 +83,8 @@ available formats/qualities in a window — handy for picking a **Quality** valu
 title *and* channel/uploader (via yt-dlp) at download time. These populate the
 **Channel** column and the `{title}`/`{channel}` template variables — and
 `{title}` is used for `{name}` when **Name** is left blank (so files aren't named
-`video_…`). Filename template variables: `{name} {title} {channel} {date} {time}
-{timestamp}`.
+`video_…`). See [Filename templates](#filename-templates) for the full variable
+list.
 
 **Per-platform defaults.** The form pre-fills from saved defaults for the pasted
 URL's platform; edit any field to override it for that download. The
@@ -234,8 +234,42 @@ manages the hub subscriptions.
 Recordings capture to a progressively-flushed `.ts` (so a crash/forced-stop leaves
 usable data) and are remuxed losslessly to **`.mkv`** on clean stop. MKV is the
 default; pick TS per channel if you prefer. **MP4 is never produced** (poor for
-interrupted writes). Filename template variables: `{name} {title} {channel} {date} {time} {timestamp}`
-(`{title}`/`{channel}` are auto-detected; empty unless **Auto-detect** is on).
+interrupted writes).
+
+### Filename templates
+
+The **filename template** sets the output file's *name*. The separate **Output
+folder** field sets the directory, and the extension (`.mkv`/`.ts`) is appended
+automatically — don't include either. The template is available on the Streams
+add/edit form, the Videos download form, and the per-platform defaults. Leaving it
+blank uses `{name}_{date}_{time}`.
+
+These are the **only** variables (it's the app's own scheme — not streamlink's or
+yt-dlp's output templates):
+
+| Variable | Expands to |
+|---|---|
+| `{name}` | **Streams:** the channel (container) name. **Videos:** the **Name** field if set, else the auto-detected title, else `video`. |
+| `{title}` | The stream/video title. **Videos only**, and only when **Auto-detect** is on (live recordings don't resolve a title, so it's empty there). |
+| `{channel}` | The uploader/channel name. **Videos only**, when **Auto-detect** is on; empty otherwise. |
+| `{date}` | Capture-start date, **UTC**, `YYYYMMDD` (e.g. `20260620`). |
+| `{time}` | Capture-start time, **UTC**, `HHMMSS` (e.g. `183001`). |
+| `{timestamp}` | Capture start as a **Unix timestamp** (whole seconds). |
+
+Notes:
+
+- `{date}`/`{time}` are **UTC** (not local time) and use the moment the
+  capture/download *started*.
+- Characters illegal in filenames (`< > : " / \ | ? *`) and control characters are
+  replaced with `_` and the result is trimmed — so `{channel}/{name}` does **not**
+  create subfolders (use the Output folder for the directory).
+- Unknown `{…}` tokens are left as literal text; only the variables above are
+  substituted.
+- If a template expands to nothing usable, it falls back to `{name}_{date}_{time}`.
+
+Examples: `{name}_{date}_{time}` → `Layna_20260620_183001.mkv`; for a Videos
+download with **Auto-detect** on, `{channel} - {title} [{timestamp}]` →
+`SomeChannel - Cool Stream [1718908201].mkv`.
 
 ### Authentication
 
