@@ -39,6 +39,8 @@ fn main() {
     let major = env_or("CARGO_PKG_VERSION_MAJOR", "0");
     let minor = env_or("CARGO_PKG_VERSION_MINOR", "0");
 
+    decode_platform_icons();
+
     // Force a re-run on every build: we depend on `.build-counter`, which this
     // script rewrites each run, so Cargo always sees it as changed and re-runs
     // (keeping the counter, git hash, and timestamp fresh on every build).
@@ -67,6 +69,25 @@ fn next_build_patch() -> u64 {
     };
     let _ = std::fs::write(&path, patch.to_string());
     patch
+}
+
+/// Decode each platform favicon (`assets/platform/<name>.png`) to a uniform
+/// 32×32 RGBA buffer written to `OUT_DIR/platform_<name>.rgba`, which the app
+/// embeds with `include_bytes!`. Decoding happens at build time so the `image`
+/// crate never ships in the binary.
+fn decode_platform_icons() {
+    const SIZE: u32 = 32;
+    let out = PathBuf::from(env_or("OUT_DIR", "."));
+    for name in ["twitch", "youtube", "kick"] {
+        let src = format!("assets/platform/{name}.png");
+        println!("cargo:rerun-if-changed={src}");
+        let img = image::open(&src)
+            .unwrap_or_else(|e| panic!("decode {src}: {e}"))
+            .resize_exact(SIZE, SIZE, image::imageops::FilterType::Lanczos3)
+            .to_rgba8();
+        std::fs::write(out.join(format!("platform_{name}.rgba")), img.as_raw())
+            .unwrap_or_else(|e| panic!("write platform_{name}.rgba: {e}"));
+    }
 }
 
 fn env_or(key: &str, default: &str) -> String {

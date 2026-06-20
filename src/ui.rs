@@ -314,6 +314,8 @@ pub struct StreamArchiverApp {
     meta_change_cache: HashMap<i64, Vec<StreamMetaChange>>,
     /// Recording id whose metadata-change log is shown in a popup (None = closed).
     meta_popup: Option<i64>,
+    /// Platform favicons, uploaded to the GPU on first use (None until then).
+    platform_tex: Option<PlatformTextures>,
     /// Sort + per-column filters for the Videos table.
     videos_sort: SortState,
     videos_filters: Vec<String>,
@@ -419,6 +421,7 @@ impl StreamArchiverApp {
             ad_popup: None,
             meta_change_cache: HashMap::new(),
             meta_popup: None,
+            platform_tex: None,
             videos_sort: SortState::default(),
             videos_filters: vec![String::new(); VIDEO_COLS],
             twitch_flow,
@@ -1366,6 +1369,7 @@ struct RowActions {
 fn render_instance_row(
     tr: &mut egui_extras::TableRow<'_, '_>,
     row: &MonitorWithChannel,
+    ptex: &PlatformTextures,
     now: i64,
     recording: bool,
     highlight: bool,
@@ -1480,7 +1484,7 @@ fn render_instance_row(
         });
     });
     tr.col(|ui| {
-        platform_badge(ui, m.platform()).on_hover_text(m.platform().label());
+        platform_icon(ui, ptex, m.platform()).on_hover_text(m.platform().label());
     });
     tr.col(|ui| {
         disclosure_clicked = tree_name(
@@ -1578,13 +1582,67 @@ fn platform_badge(ui: &mut egui::Ui, platform: Platform) -> egui::Response {
     )
 }
 
-/// Draw the platform icon(s) for a cell: one badge per distinct platform, side by
-/// side (a channel may span several). Each shows the platform name on hover.
-fn platform_icons(ui: &mut egui::Ui, platforms: &[Platform]) {
+/// Platform favicons, decoded to raw 32×32 RGBA at build time (see build.rs) and
+/// embedded here so no image decoder ships in the binary.
+const ICON_SRC: usize = 32;
+/// On-screen icon size (favicons are designed for small sizes).
+const ICON_PX: f32 = 16.0;
+static TWITCH_ICON: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/platform_twitch.rgba"));
+static YOUTUBE_ICON: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/platform_youtube.rgba"));
+static KICK_ICON: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/platform_kick.rgba"));
+
+/// GPU textures for the platform favicons, uploaded once and cheaply cloned
+/// (each `TextureHandle` is reference-counted).
+#[derive(Clone)]
+struct PlatformTextures {
+    twitch: egui::TextureHandle,
+    youtube: egui::TextureHandle,
+    kick: egui::TextureHandle,
+}
+
+impl PlatformTextures {
+    fn load(ctx: &egui::Context) -> PlatformTextures {
+        let mk = |name: &str, rgba: &[u8]| {
+            let image = egui::ColorImage::from_rgba_unmultiplied([ICON_SRC, ICON_SRC], rgba);
+            ctx.load_texture(format!("platform_{name}"), image, egui::TextureOptions::LINEAR)
+        };
+        PlatformTextures {
+            twitch: mk("twitch", TWITCH_ICON),
+            youtube: mk("youtube", YOUTUBE_ICON),
+            kick: mk("kick", KICK_ICON),
+        }
+    }
+
+    /// The favicon for a platform, or `None` for `Generic` (no favicon → badge).
+    fn get(&self, p: Platform) -> Option<&egui::TextureHandle> {
+        match p {
+            Platform::Twitch => Some(&self.twitch),
+            Platform::YouTube => Some(&self.youtube),
+            Platform::Kick => Some(&self.kick),
+            Platform::Generic => None,
+        }
+    }
+}
+
+/// Draw one platform's icon (its favicon, or the colored badge for Generic),
+/// returning the response so callers can attach the platform name on hover.
+fn platform_icon(ui: &mut egui::Ui, ptex: &PlatformTextures, platform: Platform) -> egui::Response {
+    match ptex.get(platform) {
+        Some(handle) => {
+            let tex = egui::load::SizedTexture::new(handle.id(), egui::vec2(ICON_PX, ICON_PX));
+            ui.image(tex)
+        }
+        None => platform_badge(ui, platform),
+    }
+}
+
+/// Draw the platform icon(s) for a cell: one per distinct platform, side by side
+/// (a channel may span several). Each shows the platform name on hover.
+fn platform_icons(ui: &mut egui::Ui, ptex: &PlatformTextures, platforms: &[Platform]) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
         for &p in platforms {
-            platform_badge(ui, p).on_hover_text(p.label());
+            platform_icon(ui, ptex, p).on_hover_text(p.label());
         }
     });
 }
@@ -3019,6 +3077,11 @@ impl StreamArchiverApp {
                 // Theme accent used for recording/selected rows; ad/error states
                 // override the per-row selection color before each row.
                 let sel_color = ui.visuals().selection.bg_fill;
+                // Platform favicons, uploaded once and cheaply cloned per frame.
+                let ptex = self
+                    .platform_tex
+                    .get_or_insert_with(|| PlatformTextures::load(ui.ctx()))
+                    .clone();
                 let mut tb = TableBuilder::new(ui)
                     .striped(true)
                     .resizable(true)
@@ -3161,7 +3224,7 @@ impl StreamArchiverApp {
                                         });
                                     });
                                     tr.col(|ui| {
-                                        platform_icons(ui, &platforms);
+                                        platform_icons(ui, &ptex, &platforms);
                                     });
                                     tr.col(|ui| {
                                         disc = tree_name(
@@ -3284,7 +3347,7 @@ impl StreamArchiverApp {
                                 }
                                 body.row(24.0, |mut tr| {
                                     if render_instance_row(
-                                        &mut tr, row, now, recording, tint.is_some(), depth,
+                                        &mut tr, row, &ptex, now, recording, tint.is_some(), depth,
                                         has_hist, expanded, &mut acts,
                                     ) {
                                         toggle_instance = Some(mid);

@@ -4161,6 +4161,7 @@ dependencies = [
  "eframe",
  "egui_extras",
  "futures-util",
+ "image",
  "notify-rust",
  "reqwest",
  "rfd",
