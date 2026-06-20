@@ -1104,7 +1104,7 @@ fn channel_cells(channel: &Channel, monitors: &[&MonitorWithChannel], now: i64) 
         {
             let n = monitors
                 .iter()
-                .filter(|m| ad_free_status(m.monitor.ad_free, None).is_some())
+                .filter(|m| ad_free_status(m.monitor.ad_free, m.ad_free_sub).is_some())
                 .count();
             let (label, key) = ad_free_summary(n, monitors.len());
             Cell::num(key, label)
@@ -1270,7 +1270,7 @@ fn render_instance_row(
         }
     });
     tr.col(|ui| {
-        if let Some((label, hover)) = ad_free_status(m.ad_free, None) {
+        if let Some((label, hover)) = ad_free_status(m.ad_free, row.ad_free_sub) {
             ui.colored_label(egui::Color32::from_rgb(0x57, 0xc7, 0x57), label)
                 .on_hover_text(hover);
         }
@@ -2788,7 +2788,7 @@ impl StreamArchiverApp {
                                 let n_adfree = mons
                                     .iter()
                                     .filter(|m| {
-                                        ad_free_status(m.monitor.ad_free, None).is_some()
+                                        ad_free_status(m.monitor.ad_free, m.ad_free_sub).is_some()
                                     })
                                     .count();
                                 let ad_free = ad_free_summary(n_adfree, ninst);
@@ -3339,13 +3339,20 @@ impl StreamArchiverApp {
             };
             ctx.request_repaint();
             match oauth::poll_token(&http, &client_id, &dc).await {
-                Ok(tokens) => {
-                    let login = oauth::fetch_login(&http, &client_id, &tokens.access)
-                        .await
-                        .unwrap_or_default();
-                    let _ = oauth::store_tokens(&store, &tokens, &login);
-                    *flow.lock().unwrap() = AuthFlow::Connected { login };
-                }
+                Ok(tokens) => match oauth::fetch_user(&http, &client_id, &tokens.access).await {
+                    Ok((login, user_id)) => {
+                        let _ = oauth::store_tokens(&store, &tokens, &login);
+                        let _ = store.set_setting(oauth::K_USER_ID, &user_id);
+                        *flow.lock().unwrap() = AuthFlow::Connected { login };
+                    }
+                    // Authorized, but we couldn't resolve the account — don't persist
+                    // a half-connected state (empty user id breaks sub detection).
+                    Err(e) => {
+                        *flow.lock().unwrap() = AuthFlow::Failed {
+                            message: format!("Authorized, but couldn't read your account — try Connect again. ({e})"),
+                        };
+                    }
+                },
                 Err(e) => {
                     *flow.lock().unwrap() = AuthFlow::Failed {
                         message: e.to_string(),
@@ -3404,6 +3411,10 @@ impl StreamArchiverApp {
                             *self.twitch_flow.lock().unwrap() = AuthFlow::Idle;
                         }
                     });
+                    ui.small(
+                        "Tip: if you connected before the Ad-free feature, reconnect to grant \
+                         the subscriptions scope so ad-free (sub) detection works.",
+                    );
                 }
                 AuthFlow::Pending { user_code, url } => {
                     ui.label("Authorize in your browser, then wait:");

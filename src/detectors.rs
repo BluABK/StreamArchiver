@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -20,9 +21,9 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::Mutex;
-use tracing::debug;
+use tracing::{debug, info};
 
-use crate::models::Platform;
+use crate::models::{Platform, now_unix};
 use crate::store::Store;
 
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
@@ -199,6 +200,69 @@ impl DetectContext {
             expires_at: Instant::now() + ttl,
         });
         Ok(token)
+    }
+
+    /// Check whether the connected Twitch account is subscribed to
+    /// `broadcaster_login`. `Some(true)`/`Some(false)` when conclusively known;
+    /// `None` when undeterminable (not connected, missing the
+    /// `user:read:subscriptions` scope / 401, or a lookup error).
+    pub async fn check_twitch_sub(&self, broadcaster_login: &str) -> Option<bool> {
+        // Cheap local gates first, so an account that can't yield a determinate
+        // answer (no stored user id, no Client ID) bails before any network work.
+        let user_id = crate::oauth::connected_user_id(self.store.as_ref())?;
+        let client_id = self
+            .store
+            .get_setting("twitch_client_id")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if client_id.is_empty() {
+            return None;
+        }
+        // Serialize token refresh (device-code refresh tokens are one-time-use), as
+        // detect_twitch does, so a concurrent detection pass can't double-spend it.
+        let token = {
+            let _guard = self.twitch_refresh.lock().await;
+            crate::oauth::valid_user_token(&self.http, self.store.as_ref()).await
+        }?;
+        let broadcaster_id = self
+            .twitch_user_id(&client_id, &token, broadcaster_login)
+            .await?;
+        let resp = self
+            .http
+            .get("https://api.twitch.tv/helix/subscriptions/user")
+            .header("Client-Id", &client_id)
+            .bearer_auth(&token)
+            .query(&[
+                ("broadcaster_id", broadcaster_id.as_str()),
+                ("user_id", user_id.as_str()),
+            ])
+            .send()
+            .await
+            .ok()?;
+        match resp.status() {
+            s if s.is_success() => Some(true),
+            reqwest::StatusCode::NOT_FOUND => Some(false), // 404 = not subscribed
+            _ => None, // 401 (scope missing/expired), 400, 5xx -> unknown
+        }
+    }
+
+    /// Resolve a Twitch login to its numeric user id (Helix Get Users).
+    async fn twitch_user_id(&self, client_id: &str, token: &str, login: &str) -> Option<String> {
+        let resp = self
+            .http
+            .get("https://api.twitch.tv/helix/users")
+            .header("Client-Id", client_id)
+            .bearer_auth(token)
+            .query(&[("login", login)])
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let v: Value = resp.json().await.ok()?;
+        v["data"][0]["id"].as_str().map(str::to_string)
     }
 
     pub async fn detect_twitch(&self, items: &[DetectItem]) -> Vec<DetectOutcome> {
@@ -659,6 +723,88 @@ impl DetectContext {
             Ok(Err(e)) => DetectOutcome::err(item.monitor_id, e.to_string()),
             Err(_) => DetectOutcome::err(item.monitor_id, "probe timed out"),
         }
+    }
+}
+
+/// Background task: while a Twitch account is connected, periodically refresh the
+/// auto Twitch-sub ad-free status for Twitch monitors. Cheap and idle-friendly:
+/// at most one Helix lookup per unique broadcaster, no more than every few hours,
+/// and nothing at all when no account is connected.
+pub async fn refresh_ad_free(ctx: Arc<DetectContext>, shutdown: Arc<AtomicBool>) {
+    const INITIAL_DELAY_SECS: u64 = 30;
+    const PERIOD_SECS: u64 = 6 * 3600;
+    const STALE_AFTER_SECS: i64 = 6 * 3600;
+
+    interruptible_sleep(&shutdown, INITIAL_DELAY_SECS).await;
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        // Need a stored account id (set on connect with the subscriptions scope) to
+        // resolve subs at all; legacy connections without it do no work until a
+        // reconnect.
+        if crate::oauth::connected_user_id(ctx.store.as_ref()).is_some() {
+            refresh_ad_free_once(&ctx, STALE_AFTER_SECS).await;
+        }
+        interruptible_sleep(&shutdown, PERIOD_SECS).await;
+    }
+}
+
+/// One refresh pass: check each Twitch monitor whose cached status is stale,
+/// de-duplicating per broadcaster login. Only conclusive results are persisted;
+/// an undeterminable result (e.g. scope not yet granted) is left to retry.
+async fn refresh_ad_free_once(ctx: &Arc<DetectContext>, stale_after: i64) {
+    let rows = match ctx.store.list_monitors_with_channels() {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let now = now_unix();
+    let mut by_login: HashMap<String, Option<bool>> = HashMap::new();
+    for row in &rows {
+        if row.monitor.platform() != Platform::Twitch {
+            continue;
+        }
+        // The manual flag already wins in the UI, so the auto result would never be
+        // shown — don't spend a Helix call on it.
+        if row.monitor.ad_free {
+            continue;
+        }
+        if let Some(at) = row.ad_free_sub_at {
+            if now - at < stale_after {
+                continue; // checked recently
+            }
+        }
+        let Some(login) = twitch_login(&row.monitor.url) else {
+            continue;
+        };
+        let result = match by_login.get(&login) {
+            Some(r) => *r,
+            None => {
+                let r = ctx.check_twitch_sub(&login).await;
+                by_login.insert(login.clone(), r);
+                r
+            }
+        };
+        // Persist only a conclusive result, and only if still connected: a Disconnect
+        // during the await above clears cached results, so writing here would
+        // resurrect a stale "Yes (sub)" that never refreshes while disconnected.
+        if result.is_some() && crate::oauth::connected_user_id(ctx.store.as_ref()).is_some() {
+            let _ = ctx.store.set_monitor_ad_free_sub(row.monitor.id, result, now);
+            info!(monitor_id = row.monitor.id, subscribed = ?result, "ad-free sub status refreshed");
+        }
+    }
+}
+
+/// Sleep `secs`, waking within ~5s if `shutdown` is set.
+async fn interruptible_sleep(shutdown: &Arc<AtomicBool>, secs: u64) {
+    let mut remaining = secs;
+    while remaining > 0 {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        let chunk = remaining.min(5);
+        tokio::time::sleep(Duration::from_secs(chunk)).await;
+        remaining -= chunk;
     }
 }
 

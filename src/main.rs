@@ -347,6 +347,8 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
         last_recording_lost_secs: None,
         last_recording_ad_count: 0,
         last_recording_ad_secs: 0,
+        ad_free_sub: None,
+        ad_free_sub_at: None,
         recording_count: 0,
     };
     let plan = downloader::build_plan(&row, models::now_unix(), &downloader::AuthSource::None);
@@ -458,10 +460,9 @@ fn run_twitch_login() -> Result<()> {
         );
         println!("Waiting for authorization…");
         let tokens = oauth::poll_token(&http, &client_id, &dc).await?;
-        let login = oauth::fetch_login(&http, &client_id, &tokens.access)
-            .await
-            .unwrap_or_default();
+        let (login, user_id) = oauth::fetch_user(&http, &client_id, &tokens.access).await?;
         oauth::store_tokens(&store, &tokens, &login)?;
+        store.set_setting(oauth::K_USER_ID, &user_id)?;
         println!("Connected as {login}.");
         Ok::<_, anyhow::Error>(())
     })?;

@@ -27,6 +27,13 @@ pub const K_USER_TOKEN: &str = "twitch_user_token";
 pub const K_REFRESH: &str = "twitch_refresh_token";
 pub const K_EXPIRY: &str = "twitch_token_expiry";
 pub const K_LOGIN: &str = "twitch_user_login";
+pub const K_USER_ID: &str = "twitch_user_id";
+
+/// Scopes requested for the user token. `user:read:subscriptions` lets us check
+/// whether the connected account is subscribed to a broadcaster (ad-free
+/// detection). Detection (Get Streams) itself needs no scope, so accounts that
+/// connected before this was added keep working but must reconnect to grant it.
+const SCOPES: &str = "user:read:subscriptions";
 
 /// Live state of an interactive connect flow (for the UI to render).
 #[derive(Clone, Debug)]
@@ -49,7 +56,7 @@ pub struct DeviceCode {
 pub async fn start_device(http: &Client, client_id: &str) -> Result<DeviceCode> {
     let resp = http
         .post(DEVICE_URL)
-        .form(&[("client_id", client_id), ("scopes", "")])
+        .form(&[("client_id", client_id), ("scopes", SCOPES)])
         .send()
         .await?;
     if !resp.status().is_success() {
@@ -96,7 +103,7 @@ pub async fn poll_token(http: &Client, client_id: &str, dc: &DeviceCode) -> Resu
             .post(TOKEN_URL)
             .form(&[
                 ("client_id", client_id),
-                ("scopes", ""),
+                ("scopes", SCOPES),
                 ("device_code", dc.device_code.as_str()),
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
             ])
@@ -162,8 +169,8 @@ pub async fn refresh(
     })
 }
 
-/// Resolve the login name for an access token (also validates it).
-pub async fn fetch_login(http: &Client, client_id: &str, token: &str) -> Result<String> {
+/// Resolve the `(login, user_id)` for an access token (also validates it).
+pub async fn fetch_user(http: &Client, client_id: &str, token: &str) -> Result<(String, String)> {
     let resp = http
         .get(USERS_URL)
         .header("Client-Id", client_id)
@@ -174,10 +181,18 @@ pub async fn fetch_login(http: &Client, client_id: &str, token: &str) -> Result<
         bail!("get users failed: {}", resp.status());
     }
     let v: Value = resp.json().await?;
-    Ok(v["data"][0]["login"]
+    // The id is required (it drives the subscription check); a 200 with no id is
+    // a failure, not a silent empty.
+    let id = v["data"][0]["id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .context("Get Users response had no user id")?
+        .to_string();
+    let login = v["data"][0]["login"]
         .as_str()
         .unwrap_or("(unknown)")
-        .to_string())
+        .to_string();
+    Ok((login, id))
 }
 
 /// Persist a freshly obtained set of tokens (+ resolved login).
@@ -190,11 +205,13 @@ pub fn store_tokens(store: &Store, tokens: &Tokens, login: &str) -> Result<()> {
     Ok(())
 }
 
-/// Forget the stored Twitch connection.
+/// Forget the stored Twitch connection. Also clears cached ad-free (sub) results,
+/// which can no longer be verified once disconnected.
 pub fn disconnect(store: &Store) -> Result<()> {
-    for k in [K_USER_TOKEN, K_REFRESH, K_EXPIRY, K_LOGIN] {
+    for k in [K_USER_TOKEN, K_REFRESH, K_EXPIRY, K_LOGIN, K_USER_ID] {
         store.set_setting(k, "")?;
     }
+    let _ = store.clear_ad_free_sub();
     Ok(())
 }
 
@@ -202,6 +219,15 @@ pub fn disconnect(store: &Store) -> Result<()> {
 pub fn connected_login(store: &Store) -> Option<String> {
     store
         .get_setting(K_LOGIN)
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+}
+
+/// The connected account's user id, if any (needed for the subscription check).
+pub fn connected_user_id(store: &Store) -> Option<String> {
+    store
+        .get_setting(K_USER_ID)
         .ok()
         .flatten()
         .filter(|s| !s.is_empty())

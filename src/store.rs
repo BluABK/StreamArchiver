@@ -17,7 +17,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -232,7 +232,17 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 12)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 12);
+        if version < 13 {
+            // Cached auto Twitch-sub ad-free status: ad_free_sub is NULL (unknown /
+            // not checked), 0 (checked, not subscribed) or 1 (subscribed);
+            // ad_free_sub_at is the last successful check time (for staleness).
+            conn.execute_batch(
+                "ALTER TABLE monitor ADD COLUMN ad_free_sub INTEGER;
+                 ALTER TABLE monitor ADD COLUMN ad_free_sub_at INTEGER;",
+            )?;
+            conn.pragma_update(None, "user_version", 13)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 13);
         Ok(())
     }
 
@@ -423,6 +433,33 @@ impl Store {
         Ok(())
     }
 
+    /// Cache the auto-detected Twitch-subscription ad-free status for a monitor.
+    /// `sub` is None (unknown), Some(false) (not subscribed) or Some(true)
+    /// (subscribed); `checked_at` is the check time.
+    pub fn set_monitor_ad_free_sub(
+        &self,
+        id: i64,
+        sub: Option<bool>,
+        checked_at: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE monitor SET ad_free_sub = ?2, ad_free_sub_at = ?3 WHERE id = ?1",
+            params![id, sub.map(|b| b as i64), checked_at],
+        )?;
+        Ok(())
+    }
+
+    /// Clear all cached auto Twitch-sub ad-free results (e.g. on disconnect).
+    pub fn clear_ad_free_sub(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE monitor SET ad_free_sub = NULL, ad_free_sub_at = NULL",
+            [],
+        )?;
+        Ok(())
+    }
+
     /// Fetch a single monitor (joined with its channel) by monitor id.
     pub fn get_monitor_with_channel(&self, id: i64) -> Result<Option<MonitorWithChannel>> {
         Ok(self
@@ -556,7 +593,7 @@ impl Store {
                 m.url,
                 (SELECT COUNT(*) FROM ad_break ab WHERE ab.recording_id = r.id),
                 COALESCE((SELECT SUM(ab.duration_secs) FROM ad_break ab WHERE ab.recording_id = r.id), 0),
-                m.ad_free
+                m.ad_free, m.ad_free_sub, m.ad_free_sub_at
              FROM monitor m
              JOIN channel c ON c.id = m.channel_id
              LEFT JOIN recording r
@@ -604,6 +641,8 @@ impl Store {
                     last_recording_lost_secs: r.get(27)?,
                     last_recording_ad_count: r.get(30)?,
                     last_recording_ad_secs: r.get(31)?,
+                    ad_free_sub: r.get::<_, Option<i64>>(33)?.map(|v| v != 0),
+                    ad_free_sub_at: r.get(34)?,
                     recording_count: r.get(28)?,
                 })
             })?

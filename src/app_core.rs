@@ -106,6 +106,14 @@ impl AppCore {
             crate::websub::run(ws_store, ws_manual_tx, ws_shutdown).await;
         });
 
+        // Periodic ad-free (Twitch sub) status refresher. Idles when no Twitch
+        // account is connected; otherwise refreshes stale entries every few hours.
+        let af_ctx = ctx.clone();
+        let af_shutdown = self.shutdown.clone();
+        self.rt.spawn(async move {
+            crate::detectors::refresh_ad_free(af_ctx, af_shutdown).await;
+        });
+
         // Supervisor: live signals + manual commands -> recordings.
         let max_concurrent = self
             .store
