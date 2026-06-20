@@ -437,21 +437,37 @@ impl StreamArchiverApp {
             return;
         }
         let platform = Platform::detect(&form.url);
-        let channel_id =
-            match form.channel_id {
-                Some(id) => id,
-                None => match self.core.store.upsert_channel(
-                    form.name.trim(),
-                    form.url.trim(),
-                    platform,
-                ) {
+        let channel_id = match (form.channel_id, form.monitor_id) {
+            // Editing an existing monitor: persist any channel name/URL/platform
+            // edits too (shared across the channel's instances).
+            (Some(cid), Some(_)) => {
+                if let Err(e) =
+                    self.core
+                        .store
+                        .update_channel(cid, form.name.trim(), form.url.trim(), platform)
+                {
+                    self.status = format!("Error saving channel: {e}");
+                    return;
+                }
+                cid
+            }
+            // Adding an instance to an existing channel: leave the channel as-is.
+            (Some(cid), None) => cid,
+            // Brand-new channel.
+            (None, _) => {
+                match self
+                    .core
+                    .store
+                    .upsert_channel(form.name.trim(), form.url.trim(), platform)
+                {
                     Ok(id) => id,
                     Err(e) => {
                         self.status = format!("Error saving channel: {e}");
                         return;
                     }
-                },
-            };
+                }
+            }
+        };
 
         let monitor = Monitor {
             id: form.monitor_id.unwrap_or(0),
@@ -3043,7 +3059,11 @@ impl StreamArchiverApp {
             .open(&mut open)
             .show(ctx, |ui| {
                 let form = self.form.as_mut().unwrap();
-                let editing_channel = form.channel_id.is_none();
+                // Name/URL belong to the channel. They're editable when creating a
+                // channel or editing an existing monitor (the edit applies to the
+                // whole channel); locked only when *adding an instance* to an
+                // existing channel (that's the same channel, identified by URL).
+                let edit_identity = form.channel_id.is_none() || form.monitor_id.is_some();
                 let platform = Platform::detect(&form.url);
 
                 egui::Grid::new("form_grid")
@@ -3051,14 +3071,19 @@ impl StreamArchiverApp {
                     .spacing([12.0, 8.0])
                     .show(ui, |ui| {
                         ui.label("Name");
-                        ui.add_enabled(editing_channel, egui::TextEdit::singleline(&mut form.name));
+                        ui.add_enabled(edit_identity, egui::TextEdit::singleline(&mut form.name));
                         ui.end_row();
 
                         ui.label("URL");
                         ui.add_enabled(
-                            editing_channel,
+                            edit_identity,
                             egui::TextEdit::singleline(&mut form.url).desired_width(320.0),
-                        );
+                        )
+                        .on_hover_text(if edit_identity {
+                            "Editing applies to the whole channel (all its instances)."
+                        } else {
+                            "Adding an instance to this channel — the URL is fixed."
+                        });
                         ui.end_row();
 
                         ui.label("Platform");

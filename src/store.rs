@@ -258,6 +258,17 @@ impl Store {
         Ok(())
     }
 
+    /// Update an existing channel's name/URL/platform (e.g. from the edit dialog).
+    /// Applies to all of the channel's capture instances, since they share it.
+    pub fn update_channel(&self, id: i64, name: &str, url: &str, platform: Platform) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE channel SET name = ?2, url = ?3, platform = ?4 WHERE id = ?1",
+            params![id, name, url, platform.as_str()],
+        )?;
+        Ok(())
+    }
+
     // ----- monitors -----
 
     #[allow(clippy::too_many_arguments)]
