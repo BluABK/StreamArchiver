@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 use crate::detectors::{DetectContext, DetectItem, DetectOutcome};
 use crate::downloader::ActiveSet;
@@ -70,6 +70,8 @@ async fn tick(
     let mut youtube_api_items: Vec<DetectItem> = Vec::new();
     let mut kick_api_items: Vec<DetectItem> = Vec::new();
     let mut prev_state: HashMap<i64, String> = HashMap::new();
+    // monitor id -> (channel name, detection short label) for readable logs.
+    let mut meta: HashMap<i64, (String, &'static str)> = HashMap::new();
 
     let recording: std::collections::HashSet<i64> =
         active.lock().unwrap().keys().copied().collect();
@@ -108,6 +110,10 @@ async fn tick(
         let interval = m.poll_interval_secs.max(5);
         let due_at = m.last_checked_at.unwrap_or(0) + interval;
         if now >= due_at {
+            meta.insert(
+                m.id,
+                (row.channel.name.clone(), m.detection_method.short_label()),
+            );
             let item = DetectItem {
                 monitor_id: m.id,
                 url: row.channel.url.clone(),
@@ -127,6 +133,22 @@ async fn tick(
         } else {
             min_wait = min_wait.min(due_at - now);
         }
+    }
+
+    let due = twitch_items.len()
+        + scrape_items.len()
+        + generic_items.len()
+        + youtube_api_items.len()
+        + kick_api_items.len();
+    if due > 0 {
+        debug!(
+            "scheduler: polling {due} monitor(s) due [twitch={} scrape={} generic={} yt-api={} kick={}]",
+            twitch_items.len(),
+            scrape_items.len(),
+            generic_items.len(),
+            youtube_api_items.len(),
+            kick_api_items.len(),
+        );
     }
 
     let mut outcomes: Vec<DetectOutcome> = Vec::new();
@@ -164,12 +186,36 @@ async fn tick(
                 o.monitor_id
             );
         }
-        let changed = prev_state.get(&o.monitor_id).map(String::as_str) != Some(new_state);
+        let old_state = prev_state.get(&o.monitor_id).map(String::as_str);
+        let changed = old_state != Some(new_state);
+
+        // Readable per-poll logging: name [method] result (+ go-live / error
+        // detail). A state change is INFO; a routine poll is DEBUG.
+        let (name, method) = meta
+            .get(&o.monitor_id)
+            .map(|(n, m)| (n.as_str(), *m))
+            .unwrap_or(("?", "?"));
+        let extra = if o.error {
+            format!(" — {}", o.detail)
+        } else if o.live {
+            match o.went_live_at {
+                Some(t) => format!(" (live since {})", fmt_log_time(t)),
+                None => String::new(),
+            }
+        } else {
+            String::new()
+        };
         if changed {
+            info!(
+                "poll: {name} [{method}] {} -> {new_state}{extra}",
+                old_state.unwrap_or("?")
+            );
             let _ = events.send(AppEvent::MonitorState {
                 monitor_id: o.monitor_id,
                 state: new_state.to_string(),
             });
+        } else {
+            debug!("poll: {name} [{method}] {new_state}{extra}");
         }
         // Signal the supervisor to (consider) starting a recording. Use the
         // platform-reported go-live time when available, else approximate it
@@ -185,6 +231,13 @@ async fn tick(
     }
 
     min_wait.clamp(1, MAX_SLEEP_SECS) as u64
+}
+
+/// Local `HH:MM:SS` for a unix timestamp (log-friendly).
+fn fmt_log_time(t: i64) -> String {
+    chrono::DateTime::from_timestamp(t, 0)
+        .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
+        .unwrap_or_default()
 }
 
 async fn run_per_item(

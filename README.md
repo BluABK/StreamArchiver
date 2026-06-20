@@ -96,11 +96,17 @@ column (case-insensitive substring). Filters combine across columns. This works 
 the **Videos** and **Streams** tables alike.
 
 The channel table shows, per channel: On (enable/disable), Name, Platform (with a
-brand badge), Tool, Detection, poll interval, State, **Went Live** (the platform's
-go-live time — `~`-prefixed when only our first-detected time is known, e.g. for
-scrape), **Started On** (when we began recording), **Lost time** (how much of the
-stream we missed), **Duration** (live, `HH:MM:SS`), and **Added** (when the channel
-was added).
+brand badge), Tool, Detection, poll interval, **Last poll** (when it was last
+checked), State, **Went Live** (the platform's go-live time — `~`-prefixed when
+only our first-detected time is known, e.g. for scrape), **Started On** (when we
+began recording), **Lost time** (how much of the stream we missed), **Duration**
+(live, `HH:MM:SS`), and **Added** (when the channel was added).
+
+> The console log (run with `RUST_LOG=info,streamarchiver=debug`, the default)
+> reports detection: a `DEBUG scheduler: polling N monitor(s) due […]` line per
+> cycle, a `DEBUG poll: <name> [<method>] <result>` line per check, and an
+> `INFO poll: <name> [<method>] <old> -> <new>` line whenever a channel's state
+> changes (with the go-live time when it goes live, or the error detail).
 
 **Recording history (collapsible).** Each channel row is a tree you can expand
 (the ▶ triangle) to see its **past streams**, and each stream that took more than

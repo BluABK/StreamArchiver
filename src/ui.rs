@@ -647,7 +647,7 @@ fn fmt_speed(bytes_per_sec: f64) -> String {
 /// Sortable/filterable Videos columns (Video..File; excludes Actions).
 const VIDEO_COLS: usize = 9;
 /// Sortable/filterable Streams columns (On..Added; excludes Actions).
-const STREAM_COLS: usize = 12;
+const STREAM_COLS: usize = 13;
 
 /// Which column a table is sorted by and in what direction. `col == None` keeps
 /// the natural (database) order.
@@ -840,6 +840,10 @@ fn stream_cells(row: &MonitorWithChannel, now: i64) -> Vec<Cell> {
             key: SortKey::Text(m.detection_method.short_label().to_string()),
         },
         Cell::num(m.poll_interval_secs as f64, format!("{}s", m.poll_interval_secs)),
+        Cell::num(
+            m.last_checked_at.unwrap_or(0) as f64,
+            fmt_datetime_short(m.last_checked_at.unwrap_or(0)),
+        ),
         Cell::text(m.last_state.clone()),
         Cell::num(went_live_ts as f64, rec.went_live.clone()),
         Cell::num(started_ts as f64, rec.started_on.clone()),
@@ -970,6 +974,14 @@ fn channel_cells(monitors: &[&MonitorWithChannel], now: i64) -> Vec<Cell> {
         Cell::text("(multiple)"),
         Cell::text("(multiple)"),
         Cell::num(0.0, String::new()),
+        {
+            let last = monitors
+                .iter()
+                .filter_map(|m| m.monitor.last_checked_at)
+                .max()
+                .unwrap_or(0);
+            Cell::num(last as f64, fmt_datetime_short(last))
+        },
         Cell::text(state),
         Cell::num(
             primary.last_recording_went_live.unwrap_or(0) as f64,
@@ -1101,6 +1113,9 @@ fn render_instance_row(
     });
     tr.col(|ui| {
         ui.label(format!("{}s", m.poll_interval_secs));
+    });
+    tr.col(|ui| {
+        ui.label(fmt_datetime_short(m.last_checked_at.unwrap_or(0)));
     });
     tr.col(|ui| {
         ui.label(&m.last_state);
@@ -2292,6 +2307,7 @@ impl StreamArchiverApp {
                     .column(Column::auto().at_least(72.0)) // tool
                     .column(Column::auto().at_least(80.0)) // method
                     .column(Column::auto().at_least(52.0)) // interval
+                    .column(Column::auto().at_least(104.0)) // last poll
                     .column(Column::auto().at_least(64.0)) // state
                     .column(Column::auto().at_least(112.0)) // went live
                     .column(Column::auto().at_least(104.0)) // started on
@@ -2307,6 +2323,7 @@ impl StreamArchiverApp {
                             "Tool",
                             "Detection",
                             "Every",
+                            "Last poll",
                             "State",
                             "Went Live",
                             "Started On",
@@ -2425,8 +2442,9 @@ impl StreamArchiverApp {
                                         tr.col(|ui| {
                                             ui.weak(format!("{ninst} instances"));
                                         });
-                                        tr.col(|_ui| {});
-                                        tr.col(|_ui| {});
+                                        tr.col(|_ui| {}); // detection
+                                        tr.col(|_ui| {}); // every
+                                        tr.col(|_ui| {}); // last poll
                                         tr.col(|ui| {
                                             if any_rec {
                                                 ui.colored_label(
@@ -2526,10 +2544,11 @@ impl StreamArchiverApp {
                                             ui.weak(format!("· {} takes", g.takes.len()));
                                         }
                                     });
-                                    tr.col(|_ui| {});
-                                    tr.col(|_ui| {});
-                                    tr.col(|_ui| {});
-                                    tr.col(|_ui| {});
+                                    tr.col(|_ui| {}); // platform
+                                    tr.col(|_ui| {}); // tool
+                                    tr.col(|_ui| {}); // detection
+                                    tr.col(|_ui| {}); // every
+                                    tr.col(|_ui| {}); // last poll
                                     tr.col(|ui| {
                                         ui.colored_label(rec_status_color(g.status()), g.status());
                                     });
@@ -2583,10 +2602,11 @@ impl StreamArchiverApp {
                                             egui::RichText::new(format!("Take {}", ti + 1)).weak(),
                                         );
                                     });
-                                    tr.col(|_ui| {});
-                                    tr.col(|_ui| {});
-                                    tr.col(|_ui| {});
-                                    tr.col(|_ui| {});
+                                    tr.col(|_ui| {}); // platform
+                                    tr.col(|_ui| {}); // tool
+                                    tr.col(|_ui| {}); // detection
+                                    tr.col(|_ui| {}); // every
+                                    tr.col(|_ui| {}); // last poll
                                     tr.col(|ui| {
                                         let resp =
                                             ui.colored_label(rec_status_color(&t.status), &t.status);
