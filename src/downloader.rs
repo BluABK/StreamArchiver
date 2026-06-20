@@ -152,7 +152,7 @@ pub fn build_plan(row: &MonitorWithChannel, started_at: i64, auth: &AuthSource) 
     let (program, args) = match m.tool {
         Tool::Streamlink => {
             let mut args = Vec::new();
-            if ch.platform == Platform::Twitch {
+            if m.platform() == Platform::Twitch {
                 // Reach 1440p/2K (HEVC) enhanced-broadcasting sources.
                 args.push("--twitch-supported-codecs=h264,h265,av1".to_string());
                 // Authenticated capture (sub-only / Turbo ad-free) via the token.
@@ -171,7 +171,7 @@ pub fn build_plan(row: &MonitorWithChannel, started_at: i64, auth: &AuthSource) 
             args.extend(extra);
             args.push("-o".into());
             args.push(ts_str);
-            args.push(ch.url.clone());
+            args.push(m.url.clone());
             args.push(quality);
             ("streamlink".to_string(), args)
         }
@@ -200,14 +200,14 @@ pub fn build_plan(row: &MonitorWithChannel, started_at: i64, auth: &AuthSource) 
                 _ => {}
             }
             args.extend(extra);
-            args.push(ch.url.clone());
+            args.push(m.url.clone());
             ("yt-dlp".to_string(), args)
         }
         Tool::Ffmpeg => {
             let mut args = vec![
                 "-y".to_string(),
                 "-i".into(),
-                ch.url.clone(),
+                m.url.clone(),
                 "-c".into(),
                 "copy".into(),
             ];
@@ -725,8 +725,8 @@ impl Supervisor {
     async fn check_one(&self, row: &MonitorWithChannel) -> DetectOutcome {
         let item = DetectItem {
             monitor_id: row.monitor.id,
-            url: row.channel.url.clone(),
-            platform: row.channel.platform,
+            url: row.monitor.url.clone(),
+            platform: row.monitor.platform(),
         };
         match row.monitor.detection_method {
             // EventSub is push-only; check liveness now via Helix.
@@ -1410,17 +1410,26 @@ mod tests {
     use crate::models::{Channel, Container, DetectionMethod, Monitor, Tool};
 
     fn row(tool: Tool, container: Container, platform: Platform) -> MonitorWithChannel {
+        // The instance URL now drives the platform-specific plan, so give it one
+        // that matches `platform`.
+        let url = match platform {
+            Platform::Twitch => "https://twitch.tv/cool",
+            Platform::YouTube => "https://youtube.com/@cool",
+            Platform::Kick => "https://kick.com/cool",
+            Platform::Generic => "https://example.com/cool",
+        };
         MonitorWithChannel {
             channel: Channel {
                 id: 1,
                 name: "Cool Streamer".into(),
-                url: "https://twitch.tv/cool".into(),
+                url: url.into(),
                 platform,
                 created_at: 0,
             },
             monitor: Monitor {
                 id: 7,
                 channel_id: 1,
+                url: url.into(),
                 enabled: true,
                 tool,
                 detection_method: DetectionMethod::TwitchApi,

@@ -43,12 +43,25 @@ The window has three tabs: **Streams** (monitor channels for live broadcasts),
 
 ### Streams (live monitoring)
 
-1. **Add stream** → paste a URL (platform auto-detected). Pick the **tool**, the
-   **detection method** (platform-filtered), poll interval, quality, **container**
-   (MKV default), output folder, and an optional filename template.
-2. **＋Inst** adds another capture *instance* for the same channel — e.g. run both
-   `streamlink` and `yt-dlp` on one channel into different folders.
-3. **Settings** → Twitch/YouTube credentials, default output folder, max concurrent
+A **channel** is a *container* (just a name) holding one or more **instances**.
+Each instance has its **own URL/platform** + tool + detection + output, so one
+channel can mix sources — e.g. the same creator on **Twitch *and* YouTube**, or
+two tools on one URL.
+
+1. **Add stream** → name the channel and add its **first instance**: paste a URL
+   (platform auto-detected; tool + detection default to it), then adjust poll
+   interval, quality, **container** (MKV default), output folder, filename
+   template, auth. (Or **Add channel** to create an empty container and add
+   instances to it afterwards.)
+2. **➕** on a channel row (or **Add instance to channel** in the menu) adds
+   another instance — including one on a **different platform** (paste a YouTube
+   URL on a Twitch channel, etc.).
+3. **On** toggles work at both levels: the **channel** checkbox enables/disables
+   *all* its instances at once; each **instance** has its own checkbox (disable
+   just YouTube for the day, keep Twitch). **✏** renames the channel; the
+   per-instance **✏** edits that instance (incl. its URL). **🗑** deletes a
+   channel (and its instances) or a single instance.
+4. **Settings** → Twitch/YouTube credentials, default output folder, max concurrent
    downloads, and **start at login** (autostart). Folder fields have a **Browse…**
    button.
 

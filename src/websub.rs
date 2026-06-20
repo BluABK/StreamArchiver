@@ -225,10 +225,10 @@ fn load_websub_monitors(store: &Store) -> Vec<(String, i64)> {
     if let Ok(rows) = store.list_monitors_with_channels() {
         for row in rows {
             if row.monitor.enabled
-                && row.channel.platform == Platform::YouTube
+                && row.monitor.platform() == Platform::YouTube
                 && row.monitor.detection_method == DetectionMethod::WebSub
             {
-                out.push((row.channel.url.clone(), row.monitor.id));
+                out.push((row.monitor.url.clone(), row.monitor.id));
             }
         }
     }

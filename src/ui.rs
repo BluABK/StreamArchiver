@@ -64,7 +64,15 @@ enum VideoMenuChoice {
     Delete,
 }
 
-/// Backing state for the add/edit dialog.
+/// Backing state for the create/rename channel-container dialog.
+struct ChannelForm {
+    /// `Some(id)` = renaming an existing channel; `None` = creating a new one.
+    id: Option<i64>,
+    name: String,
+}
+
+/// Backing state for the add/edit dialog. `name` is the channel (container) name;
+/// `url` is this *instance's* source URL (the platform is derived from it).
 struct MonitorForm {
     monitor_id: Option<i64>,
     channel_id: Option<i64>,
@@ -82,9 +90,13 @@ struct MonitorForm {
     auth_kind: AuthKind,
     auth_value: String,
     extra_args: String,
+    /// Platform the tool/detection defaults were last set for; a URL change to a
+    /// different platform re-applies that platform's defaults.
+    last_platform: Option<Platform>,
 }
 
 impl MonitorForm {
+    /// "Add stream": a new channel container + its first instance.
     fn new_channel(default_output_dir: String) -> MonitorForm {
         MonitorForm {
             monitor_id: None,
@@ -103,6 +115,7 @@ impl MonitorForm {
             auth_kind: AuthKind::Inherit,
             auth_value: String::new(),
             extra_args: String::new(),
+            last_platform: None,
         }
     }
 
@@ -112,7 +125,7 @@ impl MonitorForm {
             monitor_id: Some(m.id),
             channel_id: Some(row.channel.id),
             name: row.channel.name.clone(),
-            url: row.channel.url.clone(),
+            url: m.url.clone(),
             tool: m.tool,
             detection_method: m.detection_method,
             poll_interval_secs: m.poll_interval_secs,
@@ -125,18 +138,21 @@ impl MonitorForm {
             auth_kind: m.auth_kind,
             auth_value: m.auth_value.clone(),
             extra_args: m.extra_args.clone(),
+            // Don't override the saved tool/detection just because the form opened.
+            last_platform: Some(m.platform()),
         }
     }
 
+    /// Add another instance to an existing channel container. The URL is blank so
+    /// the user enters a (possibly different-platform) source.
     fn add_instance(channel: &Channel, default_output_dir: String) -> MonitorForm {
-        let platform = channel.platform;
         MonitorForm {
             monitor_id: None,
             channel_id: Some(channel.id),
             name: channel.name.clone(),
-            url: channel.url.clone(),
-            tool: platform.default_tool(),
-            detection_method: platform.default_detection(),
+            url: String::new(),
+            tool: Tool::Streamlink,
+            detection_method: DetectionMethod::GenericProbe,
             poll_interval_secs: 60,
             quality: "best".into(),
             output_dir: default_output_dir,
@@ -147,6 +163,7 @@ impl MonitorForm {
             auth_kind: AuthKind::Inherit,
             auth_value: String::new(),
             extra_args: String::new(),
+            last_platform: None,
         }
     }
 }
@@ -229,6 +246,8 @@ pub struct StreamArchiverApp {
 
     view: View,
     rows: Vec<MonitorWithChannel>,
+    /// All channel containers (incl. empty ones), for the Streams tree.
+    channels: Vec<Channel>,
     videos: Vec<Video>,
     form: Option<MonitorForm>,
     video_form: VideoForm,
@@ -240,8 +259,12 @@ pub struct StreamArchiverApp {
     status: String,
     /// Monitor id of the currently selected row (target for keyboard shortcuts).
     selected_monitor: Option<i64>,
-    /// Pending delete confirmation: (monitor id, channel name).
+    /// Pending instance-delete confirmation: (monitor id, channel name).
     confirm_delete: Option<(i64, String)>,
+    /// Pending channel-delete confirmation: (channel id, name).
+    confirm_delete_channel: Option<(i64, String)>,
+    /// Backing state for the create/rename-channel dialog.
+    channel_form: Option<ChannelForm>,
     /// Sort + per-column filters for the Streams table.
     streams_sort: SortState,
     streams_filters: Vec<String>,
@@ -333,6 +356,7 @@ impl StreamArchiverApp {
             quitting: false,
             view: View::Streams,
             rows: Vec::new(),
+            channels: Vec::new(),
             videos: Vec::new(),
             form: None,
             video_form: VideoForm::new(),
@@ -342,6 +366,8 @@ impl StreamArchiverApp {
             status: String::new(),
             selected_monitor: None,
             confirm_delete: None,
+            confirm_delete_channel: None,
+            channel_form: None,
             streams_sort: SortState::default(),
             streams_filters: vec![String::new(); STREAM_COLS],
             expanded_channels: HashSet::new(),
@@ -365,11 +391,16 @@ impl StreamArchiverApp {
                 self.status = format!("Error loading channels: {e}");
             }
         }
+        // Load all containers (incl. empty ones) so they show in the tree.
+        match self.core.store.list_channels() {
+            Ok(chs) => self.channels = chs,
+            Err(e) => warn!("failed to load channels: {e:#}"),
+        }
         // History may have changed; re-fetch lazily on next expand.
         self.rec_cache.clear();
         // Drop expansion state for channels/monitors that no longer exist (avoids
         // an unbounded leak and "sticky" expansion if a row id is later reused).
-        let live_channels: HashSet<i64> = self.rows.iter().map(|r| r.channel.id).collect();
+        let live_channels: HashSet<i64> = self.channels.iter().map(|c| c.id).collect();
         let live_monitors: HashSet<i64> = self.rows.iter().map(|r| r.monitor.id).collect();
         self.expanded_channels.retain(|id| live_channels.contains(id));
         self.expanded_instances.retain(|id| live_monitors.contains(id));
@@ -432,34 +463,21 @@ impl StreamArchiverApp {
         let Some(form) = self.form.as_ref() else {
             return;
         };
-        if form.name.trim().is_empty() || form.url.trim().is_empty() {
-            self.status = "Name and URL are required.".into();
+        if form.url.trim().is_empty() {
+            self.status = "An instance URL is required.".into();
             return;
         }
-        let platform = Platform::detect(&form.url);
-        let channel_id = match (form.channel_id, form.monitor_id) {
-            // Editing an existing monitor: persist any channel name/URL/platform
-            // edits too (shared across the channel's instances).
-            (Some(cid), Some(_)) => {
-                if let Err(e) =
-                    self.core
-                        .store
-                        .update_channel(cid, form.name.trim(), form.url.trim(), platform)
-                {
-                    self.status = format!("Error saving channel: {e}");
+        let channel_id = match form.channel_id {
+            // Existing channel container (add instance / edit instance) — the
+            // channel is unchanged here; rename it from the channel row instead.
+            Some(cid) => cid,
+            // "Add stream": create a new channel container for this first instance.
+            None => {
+                if form.name.trim().is_empty() {
+                    self.status = "A channel name is required.".into();
                     return;
                 }
-                cid
-            }
-            // Adding an instance to an existing channel: leave the channel as-is.
-            (Some(cid), None) => cid,
-            // Brand-new channel.
-            (None, _) => {
-                match self
-                    .core
-                    .store
-                    .upsert_channel(form.name.trim(), form.url.trim(), platform)
-                {
+                match self.core.store.create_container(form.name.trim()) {
                     Ok(id) => id,
                     Err(e) => {
                         self.status = format!("Error saving channel: {e}");
@@ -472,6 +490,7 @@ impl StreamArchiverApp {
         let monitor = Monitor {
             id: form.monitor_id.unwrap_or(0),
             channel_id,
+            url: form.url.trim().to_string(),
             enabled: form.enabled,
             tool: form.tool,
             detection_method: form.detection_method,
@@ -815,60 +834,6 @@ fn video_cells(
     ]
 }
 
-/// Sort/filter cells for one stream row, in Streams-table column order: On,
-/// Name, Platform, Tool, Detection, Every, State, Went Live, Started On, Lost
-/// time, Duration, Added.
-fn stream_cells(row: &MonitorWithChannel, now: i64) -> Vec<Cell> {
-    let m = &row.monitor;
-    let rec = recording_cells(row, now);
-    let active = row.last_recording_status.as_deref() == Some("recording");
-    let started = row.last_recording_started;
-    let dur = match (started, row.last_recording_ended, active) {
-        (Some(s), _, true) => (now - s).max(0),
-        (Some(s), Some(e), false) => (e - s).max(0),
-        _ => 0,
-    };
-    let went_live_ts = row.last_recording_went_live.unwrap_or(0);
-    let started_ts = started.unwrap_or(0);
-    let lost = match row.last_recording_lost_secs {
-        Some(s) => s.max(0),
-        None => match (started, row.last_recording_went_live) {
-            (Some(s), Some(w)) => (s - w).max(0),
-            _ => 0,
-        },
-    };
-    vec![
-        Cell::num(
-            if m.enabled { 1.0 } else { 0.0 },
-            if m.enabled { "on" } else { "off" },
-        ),
-        Cell::text(row.channel.name.clone()),
-        Cell::text(row.channel.platform.label()),
-        Cell::text(m.tool.label()),
-        // Sort by the SHORT label that's actually shown in the cell, but let the
-        // filter match the long label too (so e.g. "youtube" finds "YT API").
-        Cell {
-            text: format!(
-                "{} {}",
-                m.detection_method.short_label(),
-                m.detection_method.label()
-            ),
-            key: SortKey::Text(m.detection_method.short_label().to_string()),
-        },
-        Cell::num(m.poll_interval_secs as f64, format!("{}s", m.poll_interval_secs)),
-        Cell::num(
-            m.last_checked_at.unwrap_or(0) as f64,
-            fmt_datetime_short(m.last_checked_at.unwrap_or(0)),
-        ),
-        Cell::text(m.last_state.clone()),
-        Cell::num(went_live_ts as f64, rec.went_live.clone()),
-        Cell::num(started_ts as f64, rec.started_on.clone()),
-        Cell::num(lost as f64, rec.lost.clone()),
-        Cell::num(dur as f64, rec.duration.clone()),
-        Cell::num(row.channel.created_at as f64, fmt_date(row.channel.created_at)),
-    ]
-}
-
 /// Columns derived from a monitor's latest recording.
 struct RecordingCells {
     /// When *we* started recording.
@@ -956,15 +921,40 @@ fn tree_name(
     clicked
 }
 
-/// Sort/filter cells for a channel's top-level row: a single-instance channel
-/// uses the monitor's own cells; a multi-instance channel aggregates.
-fn channel_cells(monitors: &[&MonitorWithChannel], now: i64) -> Vec<Cell> {
-    if monitors.len() == 1 {
-        return stream_cells(monitors[0], now);
+/// Compact, readable form of an instance's source URL for the Name cell (drops
+/// the scheme and a leading `www.`).
+fn instance_label(url: &str) -> String {
+    let s = url.trim();
+    let s = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+        .unwrap_or(s);
+    let s = s.strip_prefix("www.").unwrap_or(s);
+    let s = s.trim_end_matches('/');
+    if s.is_empty() { "(no URL)".to_string() } else { s.to_string() }
+}
+
+/// The platform shared by all of a channel's instances, or `None` if they differ
+/// (or there are none) — drives the container row's badge.
+fn channel_platform(monitors: &[&MonitorWithChannel]) -> Option<Platform> {
+    let mut it = monitors.iter().map(|m| m.monitor.platform());
+    let first = it.next()?;
+    if it.all(|p| p == first) { Some(first) } else { None }
+}
+
+/// Sort/filter cells for a channel container's top-level row (matches the table
+/// columns). `channel` is the container; `monitors` are its instances (possibly
+/// none, for an empty container).
+fn channel_cells(channel: &Channel, monitors: &[&MonitorWithChannel], now: i64) -> Vec<Cell> {
+    if monitors.is_empty() {
+        // Empty container: just the name + "added"; everything else blank.
+        let mut cells: Vec<Cell> = (0..STREAM_COLS).map(|_| Cell::text(String::new())).collect();
+        cells[0] = Cell::num(0.0, "off");
+        cells[1] = Cell::text(channel.name.clone());
+        cells[STREAM_COLS - 1] = Cell::num(channel.created_at as f64, fmt_date(channel.created_at));
+        return cells;
     }
-    let first = monitors[0];
-    let ch = &first.channel;
-    let any_enabled = monitors.iter().any(|m| m.monitor.enabled);
+    let all_enabled = monitors.iter().all(|m| m.monitor.enabled);
     let any_recording = monitors
         .iter()
         .any(|m| m.last_recording_status.as_deref() == Some("recording"));
@@ -973,32 +963,35 @@ fn channel_cells(monitors: &[&MonitorWithChannel], now: i64) -> Vec<Cell> {
         .iter()
         .copied()
         .max_by_key(|m| m.last_recording_started.unwrap_or(0))
-        .unwrap_or(first);
+        .unwrap_or(monitors[0]);
     let rec = recording_cells(primary, now);
-    let state = if any_recording {
-        "recording".to_string()
+    let ninst = monitors.len();
+    let tool = if ninst == 1 {
+        "1 instance".to_string()
     } else {
-        format!("{} instances", monitors.len())
+        format!("{ninst} instances")
     };
+    let last = monitors
+        .iter()
+        .filter_map(|m| m.monitor.last_checked_at)
+        .max()
+        .unwrap_or(0);
     vec![
         Cell::num(
-            if any_enabled { 1.0 } else { 0.0 },
-            if any_enabled { "on" } else { "off" },
+            if all_enabled { 1.0 } else { 0.0 },
+            if all_enabled { "on" } else { "off" },
         ),
-        Cell::text(ch.name.clone()),
-        Cell::text(ch.platform.label()),
-        Cell::text("(multiple)"),
-        Cell::text("(multiple)"),
-        Cell::num(0.0, String::new()),
-        {
-            let last = monitors
-                .iter()
-                .filter_map(|m| m.monitor.last_checked_at)
-                .max()
-                .unwrap_or(0);
-            Cell::num(last as f64, fmt_datetime_short(last))
-        },
-        Cell::text(state),
+        Cell::text(channel.name.clone()),
+        Cell::text(
+            channel_platform(monitors)
+                .map(|p| p.label().to_string())
+                .unwrap_or_else(|| "mixed".into()),
+        ),
+        Cell::text(tool),
+        Cell::text(String::new()), // detection
+        Cell::text(String::new()), // every
+        Cell::num(last as f64, fmt_datetime_short(last)),
+        Cell::text(if any_recording { "recording".to_string() } else { String::new() }),
         Cell::num(
             primary.last_recording_went_live.unwrap_or(0) as f64,
             rec.went_live.clone(),
@@ -1009,7 +1002,7 @@ fn channel_cells(monitors: &[&MonitorWithChannel], now: i64) -> Vec<Cell> {
         ),
         Cell::num(0.0, rec.lost.clone()),
         Cell::num(0.0, rec.duration.clone()),
-        Cell::num(ch.created_at as f64, fmt_date(ch.created_at)),
+        Cell::num(channel.created_at as f64, fmt_date(channel.created_at)),
     ]
 }
 
@@ -1058,7 +1051,7 @@ fn render_instance_row(
         }
         ui.separator();
         if ui.button("🔗  Open channel URL").clicked() {
-            ui.ctx().open_url(egui::OpenUrl::new_tab(row.channel.url.clone()));
+            ui.ctx().open_url(egui::OpenUrl::new_tab(row.monitor.url.clone()));
             ui.close();
         }
         let folder_exists = std::path::Path::new(&m.output_dir).is_dir();
@@ -1070,15 +1063,15 @@ fn render_instance_row(
             ui.close();
         }
         if ui.button("📋  Copy URL").clicked() {
-            ui.ctx().copy_text(row.channel.url.clone());
+            ui.ctx().copy_text(row.monitor.url.clone());
             ui.close();
         }
         ui.separator();
-        if ui.button("✏  Edit…").clicked() {
+        if ui.button("✏  Edit instance…").clicked() {
             a.edit = Some(m.id);
             ui.close();
         }
-        if ui.button("➕  Add tool instance").clicked() {
+        if ui.button("➕  Add instance to channel").clicked() {
             a.add_instance = Some(row.channel.id);
             ui.close();
         }
@@ -1109,13 +1102,13 @@ fn render_instance_row(
             depth,
             has_history,
             expanded,
-            egui::RichText::new(&row.channel.name),
+            egui::RichText::new(instance_label(&row.monitor.url)),
         );
-        ui.response().on_hover_text(&row.channel.url);
+        ui.response().on_hover_text(&row.monitor.url);
     });
     tr.col(|ui| {
-        platform_badge(ui, row.channel.platform);
-        ui.label(row.channel.platform.label());
+        platform_badge(ui, m.platform());
+        ui.label(m.platform().label());
     });
     tr.col(|ui| {
         ui.label(m.tool.label()).on_hover_text(m.tool.tooltip());
@@ -1297,10 +1290,26 @@ impl eframe::App for StreamArchiverApp {
                     ui.selectable_value(&mut self.view, View::Videos, "Videos");
                     ui.selectable_value(&mut self.view, View::Settings, "Settings");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if self.view == View::Streams && ui.button("➕ Add stream").clicked() {
-                            self.form = Some(MonitorForm::new_channel(
-                                self.settings.default_output_dir.clone(),
-                            ));
+                        if self.view == View::Streams {
+                            if ui
+                                .button("➕ Add stream")
+                                .on_hover_text("Create a channel with its first instance (a URL to record)")
+                                .clicked()
+                            {
+                                self.form = Some(MonitorForm::new_channel(
+                                    self.settings.default_output_dir.clone(),
+                                ));
+                            }
+                            if ui
+                                .button("➕ Add channel")
+                                .on_hover_text("Create an empty channel container; add instances to it afterwards")
+                                .clicked()
+                            {
+                                self.channel_form = Some(ChannelForm {
+                                    id: None,
+                                    name: String::new(),
+                                });
+                            }
                         }
                     });
                 });
@@ -1325,7 +1334,9 @@ impl eframe::App for StreamArchiverApp {
         });
 
         self.form_window(ui.ctx());
+        self.channel_form_window(ui.ctx());
         self.confirm_delete_window(ui.ctx());
+        self.confirm_delete_channel_window(ui.ctx());
         self.format_probe_window(ui.ctx());
     }
 }
@@ -1342,10 +1353,16 @@ impl StreamArchiverApp {
         const REFRESH: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F5);
 
         // A modal is open: Esc closes it, everything else is swallowed.
-        if self.form.is_some() || self.confirm_delete.is_some() {
+        if self.form.is_some()
+            || self.channel_form.is_some()
+            || self.confirm_delete.is_some()
+            || self.confirm_delete_channel.is_some()
+        {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                 self.form = None;
+                self.channel_form = None;
                 self.confirm_delete = None;
+                self.confirm_delete_channel = None;
             }
             return;
         }
@@ -1412,26 +1429,15 @@ impl StreamArchiverApp {
             });
 
         if do_delete {
+            // Stop a running capture first so the process isn't orphaned when its
+            // history row is cascade-deleted.
+            if self.core.active.lock().unwrap().contains_key(&id) {
+                self.core.manual(ManualCommand::Stop(id));
+            }
+            // The channel container is left in place even if this was its last
+            // instance (you can add another instance to it).
             match self.core.store.delete_monitor(id) {
-                Ok(()) => {
-                    self.status = "Deleted.".into();
-                    // If that was the channel's last capture instance, drop the
-                    // now-orphaned channel row too (the row snapshot still has it).
-                    if let Some(cid) = self
-                        .rows
-                        .iter()
-                        .find(|r| r.monitor.id == id)
-                        .map(|r| r.channel.id)
-                    {
-                        let last = !self
-                            .rows
-                            .iter()
-                            .any(|r| r.channel.id == cid && r.monitor.id != id);
-                        if last {
-                            let _ = self.core.store.delete_channel(cid);
-                        }
-                    }
-                }
+                Ok(()) => self.status = "Instance deleted.".into(),
                 Err(e) => self.status = format!("Error: {e}"),
             }
             if self.selected_monitor == Some(id) {
@@ -1441,6 +1447,126 @@ impl StreamArchiverApp {
             self.reload_rows();
         } else if do_cancel || !open {
             self.confirm_delete = None;
+        }
+    }
+
+    /// Modal confirmation for deleting a whole channel (and all its instances +
+    /// their history rows; recorded files are kept).
+    fn confirm_delete_channel_window(&mut self, ctx: &egui::Context) {
+        let Some((id, name)) = self.confirm_delete_channel.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut do_delete = false;
+        let mut do_cancel = false;
+
+        egui::Window::new("Delete channel")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(format!("Delete the channel “{name}” and all its instances?"));
+                ui.label("Removes every instance and its history. Recorded files are kept.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Delete").clicked() {
+                        do_delete = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        do_cancel = true;
+                    }
+                });
+            });
+
+        if do_delete {
+            // Stop any of this channel's instances that are recording, so no
+            // capture is left running after its rows are cascade-deleted.
+            let active: std::collections::HashSet<i64> =
+                self.core.active.lock().unwrap().keys().copied().collect();
+            for mid in self
+                .rows
+                .iter()
+                .filter(|r| r.channel.id == id && active.contains(&r.monitor.id))
+                .map(|r| r.monitor.id)
+                .collect::<Vec<_>>()
+            {
+                self.core.manual(ManualCommand::Stop(mid));
+            }
+            match self.core.store.delete_channel(id) {
+                Ok(()) => self.status = "Channel deleted.".into(),
+                Err(e) => self.status = format!("Error: {e}"),
+            }
+            self.confirm_delete_channel = None;
+            self.reload_rows();
+        } else if do_cancel || !open {
+            self.confirm_delete_channel = None;
+        }
+    }
+
+    /// Modal for creating a new channel container or renaming an existing one.
+    fn channel_form_window(&mut self, ctx: &egui::Context) {
+        if self.channel_form.is_none() {
+            return;
+        }
+        let renaming = self.channel_form.as_ref().unwrap().id.is_some();
+        let title = if renaming { "Rename channel" } else { "Add channel" };
+        let mut open = true;
+        let mut do_save = false;
+        let mut do_cancel = false;
+
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                let f = self.channel_form.as_mut().unwrap();
+                ui.horizontal(|ui| {
+                    ui.label("Name");
+                    ui.text_edit_singleline(&mut f.name);
+                });
+                if !renaming {
+                    ui.label(
+                        egui::RichText::new(
+                            "A channel is a container — add instances (URLs to record) to it with ➕.",
+                        )
+                        .small()
+                        .color(egui::Color32::from_gray(0x90)),
+                    );
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        do_save = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        do_cancel = true;
+                    }
+                });
+            });
+
+        if do_save {
+            let f = self.channel_form.as_ref().unwrap();
+            let name = f.name.trim().to_string();
+            if name.is_empty() {
+                self.status = "Name is required.".into();
+            } else {
+                let res = match f.id {
+                    Some(id) => self.core.store.rename_channel(id, &name),
+                    None => self.core.store.create_container(&name).map(|_| ()),
+                };
+                match res {
+                    Ok(()) => {
+                        self.status = "Saved.".into();
+                        self.channel_form = None;
+                        self.reload_rows();
+                    }
+                    Err(e) => self.status = format!("Error: {e}"),
+                }
+            }
+        } else if do_cancel || !open {
+            self.channel_form = None;
         }
     }
 
@@ -2227,11 +2353,11 @@ impl StreamArchiverApp {
     }
 
     fn channels_view(&mut self, ui: &mut egui::Ui) {
-        if self.rows.is_empty() {
+        if self.channels.is_empty() {
             ui.add_space(24.0);
             ui.vertical_centered(|ui| {
-                ui.label("No streams yet.");
-                ui.label("Click “Add stream” to start monitoring a channel for live broadcasts.");
+                ui.label("No channels yet.");
+                ui.label("Click “Add stream” to add a channel + its first instance, or “Add channel” for an empty container.");
             });
             return;
         }
@@ -2245,6 +2371,10 @@ impl StreamArchiverApp {
         let mut open_path: Option<std::path::PathBuf> = None;
         let mut copy_text: Option<String> = None;
         let mut delete_recording: Option<i64> = None;
+        // Container-level actions.
+        let mut toggle_channel_enabled: Option<(i64, bool)> = None; // set all instances
+        let mut rename_channel: Option<i64> = None;
+        let mut delete_channel: Option<(i64, String)> = None;
 
         let selected_monitor = self.selected_monitor;
         let now = crate::models::now_unix();
@@ -2253,38 +2383,39 @@ impl StreamArchiverApp {
             .iter()
             .any(|r| r.last_recording_status.as_deref() == Some("recording"));
 
-        // Group monitor rows into channels (rows are ordered by channel name then
-        // monitor id, so a channel's instances are contiguous).
+        // Build one entry per channel container (including empty ones), attaching
+        // its instance rows (indices into self.rows).
         struct ChanEntry {
             channel: Channel,
             rows: Vec<usize>,
         }
-        let mut chan_entries: Vec<ChanEntry> = Vec::new();
+        let mut rows_by_channel: HashMap<i64, Vec<usize>> = HashMap::new();
         for (i, row) in self.rows.iter().enumerate() {
-            match chan_entries.last_mut() {
-                Some(e) if e.channel.id == row.channel.id => e.rows.push(i),
-                _ => chan_entries.push(ChanEntry {
-                    channel: row.channel.clone(),
-                    rows: vec![i],
-                }),
-            }
+            rows_by_channel.entry(row.channel.id).or_default().push(i);
         }
+        let chan_entries: Vec<ChanEntry> = self
+            .channels
+            .iter()
+            .map(|c| ChanEntry {
+                channel: c.clone(),
+                rows: rows_by_channel.get(&c.id).cloned().unwrap_or_default(),
+            })
+            .collect();
 
         // Lazily load + cache recordings for currently-expanded monitors, then
         // group each monitor's takes into streams.
+        // A channel always shows its instances when expanded; an instance shows
+        // its stream history when *it* is expanded — so we only need recordings
+        // for expanded instances inside expanded channels.
         let mut expanded_monitors: Vec<i64> = Vec::new();
         for e in &chan_entries {
             if !self.expanded_channels.contains(&e.channel.id) {
                 continue;
             }
-            if e.rows.len() == 1 {
-                expanded_monitors.push(self.rows[e.rows[0]].monitor.id);
-            } else {
-                for &ri in &e.rows {
-                    let mid = self.rows[ri].monitor.id;
-                    if self.expanded_instances.contains(&mid) {
-                        expanded_monitors.push(mid);
-                    }
+            for &ri in &e.rows {
+                let mid = self.rows[ri].monitor.id;
+                if self.expanded_instances.contains(&mid) {
+                    expanded_monitors.push(mid);
                 }
             }
         }
@@ -2317,7 +2448,7 @@ impl StreamArchiverApp {
             .map(|e| {
                 let mons: Vec<&MonitorWithChannel> =
                     e.rows.iter().map(|&i| &self.rows[i]).collect();
-                channel_cells(&mons, now)
+                channel_cells(&e.channel, &mons, now)
             })
             .collect();
         let mut sort = self.streams_sort;
@@ -2401,31 +2532,20 @@ impl StreamArchiverApp {
                         if !exp_channels.contains(&e.channel.id) {
                             continue;
                         }
-                        if e.rows.len() == 1 {
-                            let mid = self.rows[e.rows[0]].monitor.id;
+                        // Channel container -> its instances -> each instance's
+                        // stream history -> takes.
+                        for &ri in &e.rows {
+                            let mid = self.rows[ri].monitor.id;
+                            vis.push(Vis::Instance { row: ri, depth: 1 });
+                            if !exp_instances.contains(&mid) {
+                                continue;
+                            }
                             if let Some(grps) = groups.get(&mid) {
                                 for (gi, g) in grps.iter().enumerate() {
-                                    vis.push(Vis::Stream { mid, gi, depth: 1 });
+                                    vis.push(Vis::Stream { mid, gi, depth: 2 });
                                     if g.takes.len() > 1 && exp_streams.contains(&g.key) {
                                         for ti in 0..g.takes.len() {
-                                            vis.push(Vis::Take { mid, gi, ti, depth: 2 });
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            for &ri in &e.rows {
-                                let mid = self.rows[ri].monitor.id;
-                                vis.push(Vis::Instance { row: ri, depth: 1 });
-                                if exp_instances.contains(&mid) {
-                                    if let Some(grps) = groups.get(&mid) {
-                                        for (gi, g) in grps.iter().enumerate() {
-                                            vis.push(Vis::Stream { mid, gi, depth: 2 });
-                                            if g.takes.len() > 1 && exp_streams.contains(&g.key) {
-                                                for ti in 0..g.takes.len() {
-                                                    vis.push(Vis::Take { mid, gi, ti, depth: 3 });
-                                                }
-                                            }
+                                            vis.push(Vis::Take { mid, gi, ti, depth: 3 });
                                         }
                                     }
                                 }
@@ -2437,101 +2557,145 @@ impl StreamArchiverApp {
                         match *v {
                             Vis::Channel(ci) => {
                                 let e = &chan_entries[ci];
-                                if e.rows.len() == 1 {
-                                    let row = &self.rows[e.rows[0]];
-                                    let recording = self
-                                        .core
-                                        .active
-                                        .lock()
-                                        .unwrap()
-                                        .contains_key(&row.monitor.id);
-                                    let is_selected = selected_monitor == Some(row.monitor.id);
-                                    let has_hist = row.recording_count > 0;
-                                    let expanded = exp_channels.contains(&e.channel.id);
-                                    body.row(24.0, |mut tr| {
-                                        if render_instance_row(
-                                            &mut tr, row, now, recording, is_selected, 0, has_hist,
-                                            expanded, &mut acts,
-                                        ) {
-                                            toggle_channel = Some(e.channel.id);
+                                let ch = &e.channel;
+                                let cid = ch.id;
+                                let mons: Vec<&MonitorWithChannel> =
+                                    e.rows.iter().map(|&ri| &self.rows[ri]).collect();
+                                let ninst = mons.len();
+                                let any_rec = mons.iter().any(|m| {
+                                    self.core.active.lock().unwrap().contains_key(&m.monitor.id)
+                                });
+                                let all_enabled =
+                                    ninst > 0 && mons.iter().all(|m| m.monitor.enabled);
+                                let expanded = exp_channels.contains(&cid);
+                                let plat = channel_platform(&mons);
+                                let last_poll = mons
+                                    .iter()
+                                    .filter_map(|m| m.monitor.last_checked_at)
+                                    .max()
+                                    .unwrap_or(0);
+                                // Latest activity across instances drives the time columns.
+                                let rec = mons
+                                    .iter()
+                                    .copied()
+                                    .max_by_key(|m| m.last_recording_started.unwrap_or(0))
+                                    .map(|m| recording_cells(m, now));
+                                body.row(24.0, |mut tr| {
+                                    tr.set_selected(any_rec);
+                                    let mut disc = false;
+                                    tr.col(|ui| {
+                                        let mut on = all_enabled;
+                                        let cb = ui
+                                            .add_enabled(ninst > 0, egui::Checkbox::new(&mut on, ""))
+                                            .on_hover_text("Enable/disable all of this channel's instances");
+                                        if cb.changed() {
+                                            toggle_channel_enabled = Some((cid, on));
                                         }
                                     });
-                                } else {
-                                    let ch = &e.channel;
-                                    let any_rec = e.rows.iter().any(|&ri| {
-                                        self.core
-                                            .active
-                                            .lock()
-                                            .unwrap()
-                                            .contains_key(&self.rows[ri].monitor.id)
+                                    tr.col(|ui| {
+                                        disc = tree_name(
+                                            ui, 0, ninst > 0, expanded,
+                                            egui::RichText::new(&ch.name).strong(),
+                                        );
                                     });
-                                    let expanded = exp_channels.contains(&ch.id);
-                                    let ninst = e.rows.len();
-                                    body.row(24.0, |mut tr| {
-                                        tr.set_selected(any_rec);
-                                        let mut disc = false;
-                                        tr.col(|_ui| {});
-                                        tr.col(|ui| {
-                                            disc = tree_name(
-                                                ui, 0, true, expanded,
-                                                egui::RichText::new(&ch.name).strong(),
+                                    tr.col(|ui| match plat {
+                                        Some(p) => {
+                                            platform_badge(ui, p);
+                                            ui.label(p.label());
+                                        }
+                                        None if ninst > 0 => {
+                                            ui.weak("mixed");
+                                        }
+                                        None => {}
+                                    });
+                                    tr.col(|ui| {
+                                        ui.weak(if ninst == 1 {
+                                            "1 instance".to_string()
+                                        } else {
+                                            format!("{ninst} instances")
+                                        });
+                                    });
+                                    tr.col(|_ui| {}); // detection
+                                    tr.col(|_ui| {}); // every
+                                    tr.col(|ui| {
+                                        ui.label(fmt_datetime_short(last_poll));
+                                    });
+                                    tr.col(|ui| {
+                                        if any_rec {
+                                            ui.colored_label(
+                                                rec_status_color("recording"),
+                                                "recording",
                                             );
-                                        });
-                                        tr.col(|ui| {
-                                            platform_badge(ui, ch.platform);
-                                            ui.label(ch.platform.label());
-                                        });
-                                        tr.col(|ui| {
-                                            ui.weak(format!("{ninst} instances"));
-                                        });
-                                        tr.col(|_ui| {}); // detection
-                                        tr.col(|_ui| {}); // every
-                                        tr.col(|_ui| {}); // last poll
-                                        tr.col(|ui| {
-                                            if any_rec {
-                                                ui.colored_label(
-                                                    rec_status_color("recording"),
-                                                    "recording",
-                                                );
-                                            }
-                                        });
-                                        tr.col(|_ui| {});
-                                        tr.col(|_ui| {});
-                                        tr.col(|_ui| {});
-                                        tr.col(|_ui| {});
-                                        tr.col(|ui| {
-                                            ui.label(fmt_date(ch.created_at));
-                                        });
-                                        tr.col(|ui| {
+                                        }
+                                    });
+                                    tr.col(|ui| {
+                                        if let Some(r) = &rec {
+                                            ui.label(&r.went_live);
+                                        }
+                                    });
+                                    tr.col(|ui| {
+                                        if let Some(r) = &rec {
+                                            ui.label(&r.started_on);
+                                        }
+                                    });
+                                    tr.col(|ui| {
+                                        if let Some(r) = &rec {
+                                            ui.label(&r.lost);
+                                        }
+                                    });
+                                    tr.col(|ui| {
+                                        if let Some(r) = &rec {
+                                            ui.label(&r.duration);
+                                        }
+                                    });
+                                    tr.col(|ui| {
+                                        ui.label(fmt_date(ch.created_at));
+                                    });
+                                    tr.col(|ui| {
+                                        ui.push_id(cid, |ui| {
                                             if ui
                                                 .small_button("➕")
-                                                .on_hover_text("Add tool instance")
+                                                .on_hover_text("Add an instance to this channel")
                                                 .clicked()
                                             {
-                                                acts.add_instance = Some(ch.id);
+                                                acts.add_instance = Some(cid);
+                                            }
+                                            if ui
+                                                .small_button("✏")
+                                                .on_hover_text("Rename channel")
+                                                .clicked()
+                                            {
+                                                rename_channel = Some(cid);
+                                            }
+                                            if ui
+                                                .small_button("🗑")
+                                                .on_hover_text("Delete channel and all its instances")
+                                                .clicked()
+                                            {
+                                                delete_channel = Some((cid, ch.name.clone()));
                                             }
                                         });
-                                        tr.response().context_menu(|ui| {
-                                            ui.set_min_width(160.0);
-                                            if ui.button("🔗  Open channel URL").clicked() {
-                                                ui.ctx()
-                                                    .open_url(egui::OpenUrl::new_tab(ch.url.clone()));
-                                                ui.close();
-                                            }
-                                            if ui.button("📋  Copy URL").clicked() {
-                                                ui.ctx().copy_text(ch.url.clone());
-                                                ui.close();
-                                            }
-                                            if ui.button("➕  Add tool instance").clicked() {
-                                                acts.add_instance = Some(ch.id);
-                                                ui.close();
-                                            }
-                                        });
-                                        if disc {
-                                            toggle_channel = Some(ch.id);
+                                    });
+                                    tr.response().context_menu(|ui| {
+                                        ui.set_min_width(170.0);
+                                        if ui.button("➕  Add instance").clicked() {
+                                            acts.add_instance = Some(cid);
+                                            ui.close();
+                                        }
+                                        if ui.button("✏  Rename channel").clicked() {
+                                            rename_channel = Some(cid);
+                                            ui.close();
+                                        }
+                                        ui.separator();
+                                        if ui.button("🗑  Delete channel").clicked() {
+                                            delete_channel = Some((cid, ch.name.clone()));
+                                            ui.close();
                                         }
                                     });
-                                }
+                                    if disc {
+                                        toggle_channel = Some(cid);
+                                    }
+                                });
                             }
                             Vis::Instance { row: ri, depth } => {
                                 let row = &self.rows[ri];
@@ -2756,9 +2920,11 @@ impl StreamArchiverApp {
             }
         }
         if let Some(cid) = acts.add_instance {
-            if let Some(r) = self.rows.iter().find(|r| r.channel.id == cid) {
+            // Look up the container in `channels` (not `rows`) so this also works
+            // for an empty container that has no instances yet.
+            if let Some(c) = self.channels.iter().find(|c| c.id == cid) {
                 self.form = Some(MonitorForm::add_instance(
-                    &r.channel,
+                    c,
                     self.settings.default_output_dir.clone(),
                 ));
             }
@@ -2774,6 +2940,23 @@ impl StreamArchiverApp {
         }
         if let Some((id, name)) = acts.delete {
             self.confirm_delete = Some((id, name));
+        }
+        if let Some((cid, on)) = toggle_channel_enabled {
+            if let Err(e) = self.core.store.set_channel_enabled(cid, on) {
+                self.status = format!("Error: {e}");
+            }
+            self.reload_rows();
+        }
+        if let Some(cid) = rename_channel {
+            if let Some(c) = self.channels.iter().find(|c| c.id == cid) {
+                self.channel_form = Some(ChannelForm {
+                    id: Some(cid),
+                    name: c.name.clone(),
+                });
+            }
+        }
+        if let Some((cid, name)) = delete_channel {
+            self.confirm_delete_channel = Some((cid, name));
         }
         if let Some(id) = acts.start {
             self.core.manual(ManualCommand::Start(id));
@@ -3072,10 +3255,13 @@ impl StreamArchiverApp {
         let mut do_save = false;
         let mut do_cancel = false;
 
-        let title = if self.form.as_ref().unwrap().monitor_id.is_some() {
-            "Edit monitor"
+        let f = self.form.as_ref().unwrap();
+        let title = if f.monitor_id.is_some() {
+            "Edit instance"
+        } else if f.channel_id.is_some() {
+            "Add instance"
         } else {
-            "Add monitor"
+            "Add stream (new channel)"
         };
 
         egui::Window::new(title)
@@ -3085,31 +3271,38 @@ impl StreamArchiverApp {
             .open(&mut open)
             .show(ctx, |ui| {
                 let form = self.form.as_mut().unwrap();
-                // Name/URL belong to the channel. They're editable when creating a
-                // channel or editing an existing monitor (the edit applies to the
-                // whole channel); locked only when *adding an instance* to an
-                // existing channel (that's the same channel, identified by URL).
-                let edit_identity = form.channel_id.is_none() || form.monitor_id.is_some();
                 let platform = Platform::detect(&form.url);
+                // When the URL's platform changes, re-apply that platform's
+                // tool/detection defaults (e.g. pasting a YouTube URL picks
+                // yt-dlp + a YouTube method). User overrides afterwards stick.
+                if form.last_platform != Some(platform) {
+                    form.tool = platform.default_tool();
+                    form.detection_method = platform.default_detection();
+                    form.last_platform = Some(platform);
+                }
+                // The name belongs to the channel container; it's editable only
+                // when creating a new channel. For an instance it's the container's
+                // (rename via the channel row's ✏). The URL is per-instance and
+                // always editable.
+                let name_editable = form.channel_id.is_none();
 
                 egui::Grid::new("form_grid")
                     .num_columns(2)
                     .spacing([12.0, 8.0])
                     .show(ui, |ui| {
                         ui.label("Name");
-                        ui.add_enabled(edit_identity, egui::TextEdit::singleline(&mut form.name));
+                        let name_resp =
+                            ui.add_enabled(name_editable, egui::TextEdit::singleline(&mut form.name));
+                        if !name_editable {
+                            name_resp.on_hover_text(
+                                "The channel name — rename it from the channel row's ✏.",
+                            );
+                        }
                         ui.end_row();
 
                         ui.label("URL");
-                        ui.add_enabled(
-                            edit_identity,
-                            egui::TextEdit::singleline(&mut form.url).desired_width(320.0),
-                        )
-                        .on_hover_text(if edit_identity {
-                            "Editing applies to the whole channel (all its instances)."
-                        } else {
-                            "Adding an instance to this channel — the URL is fixed."
-                        });
+                        ui.add(egui::TextEdit::singleline(&mut form.url).desired_width(320.0))
+                            .on_hover_text("This instance's source URL (platform auto-detected).");
                         ui.end_row();
 
                         ui.label("Platform");

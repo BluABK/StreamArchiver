@@ -17,7 +17,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -193,7 +193,19 @@ impl Store {
             conn.execute_batch("ALTER TABLE recording ADD COLUMN stream_id TEXT;")?;
             conn.pragma_update(None, "user_version", 9)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 9);
+        if version < 10 {
+            // The source URL/platform now lives on the monitor (instance), so a
+            // channel is a container that can hold instances on *different*
+            // platforms. Backfill each instance from its channel's URL so existing
+            // single-source channels keep working unchanged.
+            conn.execute_batch(
+                "ALTER TABLE monitor ADD COLUMN url TEXT NOT NULL DEFAULT '';
+                 UPDATE monitor SET url = COALESCE(
+                     (SELECT c.url FROM channel c WHERE c.id = monitor.channel_id), '');",
+            )?;
+            conn.pragma_update(None, "user_version", 10)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 10);
         Ok(())
     }
 
@@ -258,13 +270,42 @@ impl Store {
         Ok(())
     }
 
-    /// Update an existing channel's name/URL/platform (e.g. from the edit dialog).
-    /// Applies to all of the channel's capture instances, since they share it.
-    pub fn update_channel(&self, id: i64, name: &str, url: &str, platform: Platform) -> Result<()> {
+    /// All channel containers (including ones with no instances yet), ordered to
+    /// match the monitor list (name, then id).
+    pub fn list_channels(&self) -> Result<Vec<Channel>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, url, platform, created_at FROM channel
+             ORDER BY name COLLATE NOCASE, id",
+        )?;
+        let rows = stmt
+            .query_map([], Self::map_channel)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Create a new empty channel container (no URL/platform of its own; its
+    /// instances carry the source URLs). Always inserts a new row.
+    pub fn create_container(&self, name: &str) -> Result<i64> {
+        self.insert_channel(name, "", Platform::Generic)
+    }
+
+    /// Rename a channel container.
+    pub fn rename_channel(&self, id: i64, name: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE channel SET name = ?2, url = ?3, platform = ?4 WHERE id = ?1",
-            params![id, name, url, platform.as_str()],
+            "UPDATE channel SET name = ?2 WHERE id = ?1",
+            params![id, name],
+        )?;
+        Ok(())
+    }
+
+    /// Enable/disable every instance of a channel at once (the channel-level On).
+    pub fn set_channel_enabled(&self, channel_id: i64, enabled: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE monitor SET enabled = ?2 WHERE channel_id = ?1",
+            params![channel_id, enabled as i64],
         )?;
         Ok(())
     }
@@ -275,12 +316,13 @@ impl Store {
     pub fn insert_monitor(&self, m: &Monitor) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO monitor(channel_id, enabled, tool, detection_method, poll_interval_secs,
+            "INSERT INTO monitor(channel_id, url, enabled, tool, detection_method, poll_interval_secs,
                 quality, output_dir, filename_template, container, capture_from_start, auth_kind,
                 auth_value, extra_args, max_concurrent, last_state)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 m.channel_id,
+                m.url,
                 m.enabled as i64,
                 m.tool.as_str(),
                 m.detection_method.as_str(),
@@ -303,11 +345,12 @@ impl Store {
     pub fn update_monitor(&self, m: &Monitor) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE monitor SET enabled=?2, tool=?3, detection_method=?4, poll_interval_secs=?5,
-                quality=?6, output_dir=?7, filename_template=?8, container=?9, capture_from_start=?10,
-                auth_kind=?11, auth_value=?12, extra_args=?13, max_concurrent=?14 WHERE id=?1",
+            "UPDATE monitor SET url=?2, enabled=?3, tool=?4, detection_method=?5, poll_interval_secs=?6,
+                quality=?7, output_dir=?8, filename_template=?9, container=?10, capture_from_start=?11,
+                auth_kind=?12, auth_value=?13, extra_args=?14, max_concurrent=?15 WHERE id=?1",
             params![
                 m.id,
+                m.url,
                 m.enabled as i64,
                 m.tool.as_str(),
                 m.detection_method.as_str(),
@@ -443,7 +486,8 @@ impl Store {
                 m.auth_kind, m.auth_value, m.extra_args, m.max_concurrent, m.last_checked_at,
                 m.last_state,
                 r.started_at, r.ended_at, r.status, r.went_live_at, r.went_live_approx, r.lost_secs,
-                (SELECT COUNT(*) FROM recording rc WHERE rc.monitor_id = m.id)
+                (SELECT COUNT(*) FROM recording rc WHERE rc.monitor_id = m.id),
+                m.url
              FROM monitor m
              JOIN channel c ON c.id = m.channel_id
              LEFT JOIN recording r
@@ -462,6 +506,7 @@ impl Store {
                 let monitor = Monitor {
                     id: r.get(5)?,
                     channel_id: r.get(6)?,
+                    url: r.get(29)?,
                     enabled: r.get::<_, i64>(7)? != 0,
                     tool: Tool::parse(&r.get::<_, String>(8)?),
                     detection_method: DetectionMethod::parse(&r.get::<_, String>(9)?),
@@ -743,6 +788,7 @@ mod tests {
         Monitor {
             id: 0,
             channel_id,
+            url: "https://twitch.tv/sample".into(),
             enabled: true,
             tool: Tool::Streamlink,
             detection_method: DetectionMethod::TwitchApi,

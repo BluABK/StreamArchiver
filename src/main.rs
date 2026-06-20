@@ -255,6 +255,7 @@ fn run_add(args: &[String], pos: usize) -> Result<()> {
     let monitor = models::Monitor {
         id: 0,
         channel_id,
+        url: url.clone(),
         enabled: true,
         tool,
         detection_method: method,
@@ -281,13 +282,13 @@ fn run_list() -> Result<()> {
     let store = Store::open(&app_paths::db_path()).context("opening data store")?;
     for r in store.list_monitors_with_channels()? {
         println!(
-            "[{}] {:<20} {:<8} {:<14} state={:<8} checked={:?}",
+            "[{}] {:<20} {:<8} {:<14} state={:<8} {}",
             r.monitor.id,
             r.channel.name,
-            r.channel.platform.as_str(),
+            r.monitor.platform().as_str(),
             r.monitor.detection_method.as_str(),
             r.monitor.last_state,
-            r.monitor.last_checked_at,
+            r.monitor.url,
         );
     }
     Ok(())
@@ -319,6 +320,7 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
         monitor: models::Monitor {
             id: 0,
             channel_id: 0,
+            url: url.clone(),
             enabled: true,
             tool,
             detection_method: models::DetectionMethod::GenericProbe,

@@ -116,8 +116,8 @@ async fn tick(
             );
             let item = DetectItem {
                 monitor_id: m.id,
-                url: row.channel.url.clone(),
-                platform: row.channel.platform,
+                url: m.url.clone(),
+                platform: m.platform(),
             };
             match m.detection_method {
                 DetectionMethod::TwitchApi | DetectionMethod::EventSubHelix => {

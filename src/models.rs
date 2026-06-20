@@ -384,21 +384,29 @@ impl Container {
     }
 }
 
-/// A monitored channel/link.
+/// A channel container. `name` groups its instances; `url`/`platform` are legacy
+/// (the source URL/platform now live on each [`Monitor`]) and kept only for the
+/// schema/`find_channel_by_url`. New containers store an empty URL.
 #[derive(Clone, Debug)]
 pub struct Channel {
     pub id: i64,
     pub name: String,
+    #[allow(dead_code)]
     pub url: String,
+    #[allow(dead_code)]
     pub platform: Platform,
     pub created_at: i64,
 }
 
-/// One capture instance for a channel (tool + quality + detection + output).
+/// One capture instance for a channel (source URL + tool + quality + detection +
+/// output). The URL lives here (not on the channel) so one channel/container can
+/// hold instances on different platforms (e.g. the same creator on Twitch + YT).
 #[derive(Clone, Debug)]
 pub struct Monitor {
     pub id: i64,
     pub channel_id: i64,
+    /// Source URL for this instance (platform is derived from it).
+    pub url: String,
     pub enabled: bool,
     pub tool: Tool,
     pub detection_method: DetectionMethod,
@@ -418,6 +426,13 @@ pub struct Monitor {
     pub max_concurrent: i64,
     pub last_checked_at: Option<i64>,
     pub last_state: String,
+}
+
+impl Monitor {
+    /// Platform inferred from this instance's source URL.
+    pub fn platform(&self) -> Platform {
+        Platform::detect(&self.url)
+    }
 }
 
 /// A monitor joined with its parent channel, for table display and scheduling.
