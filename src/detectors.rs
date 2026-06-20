@@ -907,7 +907,7 @@ async fn refresh_ad_free_once(
 }
 
 /// Extract the Twitch login from a channel URL (`twitch.tv/<login>`).
-fn twitch_login(url: &str) -> Option<String> {
+pub(crate) fn twitch_login(url: &str) -> Option<String> {
     let trimmed = url.trim().trim_end_matches('/');
     let lower = trimmed.to_lowercase();
     let pos = lower.find("twitch.tv/")?;

@@ -17,7 +17,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -285,7 +285,16 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 15)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 15);
+        if version < 16 {
+            // Per-instance chat logging (Twitch IRC sidecar / yt-dlp live_chat).
+            // Default 0 leaves existing monitors unchanged; the Add form defaults
+            // new monitors on.
+            conn.execute_batch(
+                "ALTER TABLE monitor ADD COLUMN chat_log INTEGER NOT NULL DEFAULT 0;",
+            )?;
+            conn.pragma_update(None, "user_version", 16)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 16);
         Ok(())
     }
 
@@ -398,8 +407,9 @@ impl Store {
         conn.execute(
             "INSERT INTO monitor(channel_id, url, enabled, tool, detection_method, poll_interval_secs,
                 quality, output_dir, filename_template, container, capture_from_start, auth_kind,
-                auth_value, extra_args, max_concurrent, last_state, ad_free, audio_tracks, subtitle_tracks)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                auth_value, extra_args, max_concurrent, last_state, ad_free, audio_tracks, subtitle_tracks,
+                chat_log)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 m.channel_id,
                 m.url,
@@ -420,6 +430,7 @@ impl Store {
                 m.ad_free as i64,
                 m.audio_tracks,
                 m.subtitle_tracks,
+                m.chat_log as i64,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -431,7 +442,7 @@ impl Store {
             "UPDATE monitor SET url=?2, enabled=?3, tool=?4, detection_method=?5, poll_interval_secs=?6,
                 quality=?7, output_dir=?8, filename_template=?9, container=?10, capture_from_start=?11,
                 auth_kind=?12, auth_value=?13, extra_args=?14, max_concurrent=?15, ad_free=?16,
-                audio_tracks=?17, subtitle_tracks=?18 WHERE id=?1",
+                audio_tracks=?17, subtitle_tracks=?18, chat_log=?19 WHERE id=?1",
             params![
                 m.id,
                 m.url,
@@ -451,6 +462,7 @@ impl Store {
                 m.ad_free as i64,
                 m.audio_tracks,
                 m.subtitle_tracks,
+                m.chat_log as i64,
             ],
         )?;
         Ok(())
@@ -713,7 +725,8 @@ impl Store {
                 (SELECT COUNT(*) FROM ad_break ab WHERE ab.recording_id = r.id),
                 COALESCE((SELECT SUM(ab.duration_secs) FROM ad_break ab WHERE ab.recording_id = r.id), 0),
                 m.ad_free, m.ad_free_sub, m.audio_tracks, m.subtitle_tracks,
-                (SELECT COUNT(*) FROM stream_meta_change smc WHERE smc.recording_id = r.id)
+                (SELECT COUNT(*) FROM stream_meta_change smc WHERE smc.recording_id = r.id),
+                m.chat_log
              FROM monitor m
              JOIN channel c ON c.id = m.channel_id
              LEFT JOIN recording r
@@ -747,6 +760,7 @@ impl Store {
                     auth_value: r.get(17)?,
                     audio_tracks: r.get(34)?,
                     subtitle_tracks: r.get(35)?,
+                    chat_log: r.get::<_, i64>(37)? != 0,
                     extra_args: r.get(18)?,
                     max_concurrent: r.get(19)?,
                     last_checked_at: r.get(20)?,
@@ -1042,6 +1056,7 @@ mod tests {
             auth_value: String::new(),
             audio_tracks: String::new(),
             subtitle_tracks: String::new(),
+            chat_log: false,
             extra_args: String::new(),
             max_concurrent: 1,
             last_checked_at: None,

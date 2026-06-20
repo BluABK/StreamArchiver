@@ -99,6 +99,8 @@ struct MonitorForm {
     /// Subtitle tracks to capture (yt-dlp `--sub-langs`): empty = none, `all` =
     /// every subtitle, or a comma-separated list of language codes.
     subtitle_tracks: String,
+    /// Capture chat alongside the recording (Twitch IRC sidecar / yt-dlp live_chat).
+    chat_log: bool,
     extra_args: String,
     /// Platform the tool/detection defaults were last set for; a URL change to a
     /// different platform re-applies that platform's defaults.
@@ -125,9 +127,11 @@ impl MonitorForm {
             enabled: true,
             auth_kind: AuthKind::Inherit,
             auth_value: String::new(),
-            // New monitors default to max-archival: every audio + subtitle track.
+            // New monitors default to max-archival: every audio + subtitle track,
+            // and chat logging on.
             audio_tracks: "all".into(),
             subtitle_tracks: "all".into(),
+            chat_log: true,
             extra_args: String::new(),
             last_platform: None,
         }
@@ -154,6 +158,7 @@ impl MonitorForm {
             auth_value: m.auth_value.clone(),
             audio_tracks: m.audio_tracks.clone(),
             subtitle_tracks: m.subtitle_tracks.clone(),
+            chat_log: m.chat_log,
             extra_args: m.extra_args.clone(),
             // Don't override the saved tool/detection just because the form opened.
             last_platform: Some(m.platform()),
@@ -180,9 +185,11 @@ impl MonitorForm {
             enabled: true,
             auth_kind: AuthKind::Inherit,
             auth_value: String::new(),
-            // New monitors default to max-archival: every audio + subtitle track.
+            // New monitors default to max-archival: every audio + subtitle track,
+            // and chat logging on.
             audio_tracks: "all".into(),
             subtitle_tracks: "all".into(),
+            chat_log: true,
             extra_args: String::new(),
             last_platform: None,
         }
@@ -545,6 +552,7 @@ impl StreamArchiverApp {
             auth_value: form.auth_value.clone(),
             audio_tracks: form.audio_tracks.trim().to_string(),
             subtitle_tracks: form.subtitle_tracks.trim().to_string(),
+            chat_log: form.chat_log,
             extra_args: form.extra_args.clone(),
             max_concurrent: 1,
             last_checked_at: None,
@@ -4001,6 +4009,15 @@ impl StreamArchiverApp {
                              (or '*') = every subtitle; or a comma-separated list of \
                              language codes. yt-dlp-only; streamlink can't mux subtitles. \
                              Best-effort for live streams.",
+                        );
+                        ui.end_row();
+
+                        ui.label("Log chat");
+                        ui.checkbox(&mut form.chat_log, "").on_hover_text(
+                            "Save chat alongside the recording. Twitch: a built-in \
+                             anonymous chat logger writes a .chat.jsonl sidecar. YouTube \
+                             (yt-dlp tool): yt-dlp's live_chat writes a .live_chat.json \
+                             sidecar. Other platforms/tools don't capture chat.",
                         );
                         ui.end_row();
 

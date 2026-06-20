@@ -283,6 +283,25 @@ recording, so this runs as a dedicated per-recording poller.)
 
 A later option will let you fold the categories played into the filename.
 
+### Chat logs
+
+Tick **Log chat** on an instance to archive chat alongside the recording (new
+instances default it on):
+
+- **Twitch** — a built-in **anonymous** chat logger (read-only, no account
+  needed) connects over Twitch's IRC-over-WebSocket gateway and writes a
+  **`<name>.chat.jsonl`** sidecar — one JSON object per message with timestamp,
+  login, display name, text, color, and badges. Works with any tool (it's a
+  separate connection, independent of streamlink/yt-dlp).
+- **YouTube** (with the **yt-dlp** tool) — yt-dlp's `live_chat` writes a
+  **`<name>.live_chat.json`** sidecar (folded into `--sub-langs` with any
+  subtitles you selected).
+- Other platform/tool combinations don't capture chat. Kick chat isn't supported
+  yet.
+
+Chat sidecars sit next to the video and **follow it** if the file is renamed
+(see *Filename media info*), so they stay matched to their recording.
+
 ### Filename templates
 
 The **filename template** sets the output file's *name*. The separate **Output

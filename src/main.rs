@@ -4,6 +4,7 @@
 
 mod app_core;
 mod app_paths;
+mod chat;
 mod detectors;
 mod downloader;
 mod events;
@@ -270,6 +271,7 @@ fn run_add(args: &[String], pos: usize) -> Result<()> {
         auth_value: String::new(),
         audio_tracks: "all".into(),
         subtitle_tracks: "all".into(),
+        chat_log: true,
         extra_args: String::new(),
         max_concurrent: 1,
         last_checked_at: None,
@@ -338,6 +340,7 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
             auth_value: String::new(),
             audio_tracks: String::new(),
             subtitle_tracks: String::new(),
+            chat_log: false,
             extra_args: String::new(),
             max_concurrent: 1,
             last_checked_at: None,

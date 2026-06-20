@@ -176,7 +176,12 @@ pub fn resolve_auth_for(
 /// value; see the `Tool::Ffmpeg` arm of `build_plan`). Pushed before the user's
 /// `extra_args` so a power user can still override. Selector values use the
 /// `--flag=value` form so a value can never be mis-parsed as a separate option.
-fn push_track_args(args: &mut Vec<String>, tool: Tool, audio: &str, subs: &str) {
+///
+/// `chat` requests yt-dlp's `live_chat` pseudo-subtitle (YouTube chat), folded
+/// into the same `--sub-langs` list. Twitch chat is captured separately by a
+/// native logger (see `chat::log_twitch_chat`), so callers pass `chat = false`
+/// for Twitch yt-dlp monitors.
+fn push_track_args(args: &mut Vec<String>, tool: Tool, audio: &str, subs: &str, chat: bool) {
     let audio = audio.trim();
     let subs = subs.trim();
     let is_all = |s: &str| s.eq_ignore_ascii_case("all") || s == "*";
@@ -188,15 +193,21 @@ fn push_track_args(args: &mut Vec<String>, tool: Tool, audio: &str, subs: &str) 
             }
         }
         Tool::YtDlp => {
+            // Combine subtitle languages and (optionally) the live-chat pseudo-
+            // track into one --sub-langs list; both are written as sidecar files
+            // (`.vtt` / `.live_chat.json`) next to the capture — a lossless,
+            // replayable archive, NOT embedded into the container. The media-rename
+            // step moves these companions so they stay matched to the final file
+            // (see `rename_companion_sidecars`). `all`/`*` mean every subtitle.
+            let mut langs: Vec<&str> = Vec::new();
             if !subs.is_empty() {
-                // `all` and `*` both mean every subtitle; otherwise pass the
-                // comma-separated language list through. Sidecar `.vtt` files are
-                // written next to the capture (best-effort for live) — a lossless,
-                // replayable archive. They are NOT embedded into the container;
-                // the media-rename step moves them so they stay matched to the
-                // final file (see `rename_subtitle_sidecars`).
-                let langs = if is_all(subs) { "all" } else { subs };
-                args.push(format!("--sub-langs={langs}"));
+                langs.push(if is_all(subs) { "all" } else { subs });
+            }
+            if chat {
+                langs.push("live_chat");
+            }
+            if !langs.is_empty() {
+                args.push(format!("--sub-langs={}", langs.join(",")));
                 args.push("--write-subs".into());
             }
         }
@@ -254,7 +265,7 @@ pub fn build_plan(
             args.push("3".into());
             args.push("--retry-max".into());
             args.push("5".into());
-            push_track_args(&mut args, Tool::Streamlink, &m.audio_tracks, &m.subtitle_tracks);
+            push_track_args(&mut args, Tool::Streamlink, &m.audio_tracks, &m.subtitle_tracks, false);
             args.extend(extra);
             args.push("-o".into());
             args.push(ts_str);
@@ -286,7 +297,10 @@ pub fn build_plan(
                 }
                 _ => {}
             }
-            push_track_args(&mut args, Tool::YtDlp, &m.audio_tracks, &m.subtitle_tracks);
+            // YouTube chat goes through yt-dlp's live_chat; Twitch chat is logged
+            // by the native WS logger instead, so don't ask yt-dlp for it there.
+            let chat_subs = m.chat_log && m.platform() != Platform::Twitch;
+            push_track_args(&mut args, Tool::YtDlp, &m.audio_tracks, &m.subtitle_tracks, chat_subs);
             args.extend(extra);
             args.push(m.url.clone());
             ("yt-dlp".to_string(), args)
@@ -1021,6 +1035,22 @@ impl Supervisor {
             ))
         });
 
+        // Twitch chat -> a native anonymous IRC-over-WebSocket logger, written as
+        // a `.chat.jsonl` sidecar next to the capture (so it follows the file's
+        // stem, incl. the media rename). Twitch only; YouTube chat is captured by
+        // yt-dlp (live_chat) via build_plan.
+        let chat_done = Arc::new(AtomicBool::new(false));
+        let chat_task = (row.monitor.chat_log && row.monitor.platform() == Platform::Twitch)
+            .then(|| {
+                let chat_path = plan.capture_path.with_extension("chat.jsonl");
+                tokio::spawn(crate::chat::log_twitch_chat(
+                    row.monitor.url.clone(),
+                    chat_path,
+                    chat_done.clone(),
+                    self.shutdown.clone(),
+                ))
+            });
+
         let outcome = self
             .run_process(&self.active, monitor_id, &plan, None, None, ad_sink)
             .await;
@@ -1035,6 +1065,12 @@ impl Supervisor {
         // so a final in-flight poll can't insert after the recording is finalized).
         meta_done.store(true, Ordering::SeqCst);
         if let Some(t) = meta_task {
+            let _ = t.await;
+        }
+        // Stop the chat logger and let it flush/close its sidecar before we touch
+        // the capture file (the post-rename moves the .chat.jsonl alongside it).
+        chat_done.store(true, Ordering::SeqCst);
+        if let Some(t) = chat_task {
             let _ = t.await;
         }
         // Broadcast end ~= when the tool exited; snapshot it before remux so the
@@ -1747,10 +1783,11 @@ async fn rename_for_media(final_path: PathBuf, new_stem: &str) -> PathBuf {
         .map(|s| s.to_string_lossy().into_owned());
     match tokio::fs::rename(&final_path, &new_path).await {
         Ok(()) => {
-            // Move any subtitle sidecars (yt-dlp `--write-subs` writes
-            // `{stem}.<lang>.vtt`) so they stay matched to the renamed video.
+            // Move subtitle / chat sidecars (e.g. `{stem}.en.vtt`,
+            // `{stem}.chat.jsonl`, `{stem}.live_chat.json`) so they stay matched
+            // to the renamed video instead of orphaning under the old stem.
             if let Some(old) = old_stem {
-                rename_subtitle_sidecars(&dir, &old, &unique).await;
+                rename_companion_sidecars(&dir, &old, &unique).await;
             }
             new_path
         }
@@ -1765,12 +1802,26 @@ async fn rename_for_media(final_path: PathBuf, new_stem: &str) -> PathBuf {
 /// renamed (so external subs stay associated with their recording).
 const SUBTITLE_EXTS: [&str; 6] = ["vtt", "srt", "ass", "ssa", "sub", "lrc"];
 
-/// When the main recording file is renamed, move its subtitle sidecars
-/// (`{old_stem}.<lang>.<ext>`, e.g. `cap.en.vtt` written by yt-dlp `--write-subs`)
-/// to follow `new_stem`, so they don't become orphaned next to a renamed video.
-/// Best-effort: per-file failures are logged, not fatal; existing targets are
-/// never clobbered.
-async fn rename_subtitle_sidecars(dir: &Path, old_stem: &str, new_stem: &str) {
+/// True if `rest` (the part of a sibling filename after `{old_stem}.`) is a
+/// recognized companion: a subtitle sidecar (by final extension) or a chat log
+/// (`.chat.jsonl` from the Twitch logger, `.live_chat.json` from yt-dlp).
+fn is_companion_suffix(rest: &str) -> bool {
+    if rest.ends_with("chat.jsonl") || rest.ends_with("live_chat.json") {
+        return true;
+    }
+    Path::new(rest)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| SUBTITLE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// When the main recording file is renamed, move its companion sidecars
+/// (`{old_stem}.<lang>.vtt` subtitles, `{old_stem}.chat.jsonl` /
+/// `{old_stem}.live_chat.json` chat logs) to follow `new_stem`, so they don't
+/// become orphaned next to a renamed video. Best-effort: per-file failures are
+/// logged, not fatal; existing targets are never clobbered.
+async fn rename_companion_sidecars(dir: &Path, old_stem: &str, new_stem: &str) {
     if old_stem == new_stem || old_stem.is_empty() {
         return;
     }
@@ -1784,12 +1835,7 @@ async fn rename_subtitle_sidecars(dir: &Path, old_stem: &str, new_stem: &str) {
         let Some(rest) = name.strip_prefix(&prefix) else {
             continue;
         };
-        let is_sub = Path::new(&name)
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| SUBTITLE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
-            .unwrap_or(false);
-        if !is_sub {
+        if !is_companion_suffix(rest) {
             continue;
         }
         let to = dir.join(format!("{new_stem}.{rest}"));
@@ -1797,7 +1843,7 @@ async fn rename_subtitle_sidecars(dir: &Path, old_stem: &str, new_stem: &str) {
             continue; // don't clobber an unrelated existing file
         }
         if let Err(e) = tokio::fs::rename(entry.path(), &to).await {
-            warn!("subtitle sidecar rename failed for {}: {e:#}", name);
+            warn!("companion sidecar rename failed for {}: {e:#}", name);
         }
     }
 }
@@ -2216,6 +2262,7 @@ mod tests {
                 auth_value: String::new(),
                 audio_tracks: String::new(),
                 subtitle_tracks: String::new(),
+                chat_log: false,
                 extra_args: String::new(),
                 max_concurrent: 1,
                 last_checked_at: None,
@@ -2260,25 +2307,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subtitle_sidecars_follow_rename() {
+    async fn companion_sidecars_follow_rename() {
         let dir = std::env::temp_dir()
             .join(format!("sa_subs_{}_{}", std::process::id(), now_unix()));
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
         let old = "cap_20260620";
         let new = "Show_1080p";
-        // The video has already been renamed; its subtitle sidecars have not.
+        // The video has already been renamed; its companions have not.
         tokio::fs::write(dir.join(format!("{new}.mkv")), b"v").await.unwrap();
         tokio::fs::write(dir.join(format!("{old}.en.vtt")), b"s").await.unwrap();
-        tokio::fs::write(dir.join(format!("{old}.de.vtt")), b"s").await.unwrap();
-        // A same-stem non-subtitle companion must be left alone.
+        tokio::fs::write(dir.join(format!("{old}.chat.jsonl")), b"c").await.unwrap();
+        tokio::fs::write(dir.join(format!("{old}.live_chat.json")), b"c").await.unwrap();
+        // A same-stem non-companion file must be left alone.
         tokio::fs::write(dir.join(format!("{old}.notes.txt")), b"x").await.unwrap();
 
-        rename_subtitle_sidecars(&dir, old, new).await;
+        rename_companion_sidecars(&dir, old, new).await;
 
         assert!(dir.join(format!("{new}.en.vtt")).exists());
-        assert!(dir.join(format!("{new}.de.vtt")).exists());
+        assert!(dir.join(format!("{new}.chat.jsonl")).exists());
+        assert!(dir.join(format!("{new}.live_chat.json")).exists());
         assert!(!dir.join(format!("{old}.en.vtt")).exists());
+        assert!(!dir.join(format!("{old}.chat.jsonl")).exists());
         assert!(dir.join(format!("{old}.notes.txt")).exists());
         assert!(!dir.join(format!("{new}.notes.txt")).exists());
 
@@ -2558,6 +2608,32 @@ mod tests {
                 .iter()
                 .any(|a| a.starts_with("--hls-audio-select"))
         );
+    }
+
+    #[test]
+    fn chat_logging_ytdlp_live_chat() {
+        // YouTube + yt-dlp + chat_log -> --sub-langs includes live_chat.
+        let mut y = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
+        y.monitor.chat_log = true;
+        y.monitor.subtitle_tracks = String::new();
+        let plan = build_plan(&y, 1_700_000_000, &AuthSource::None, None, None);
+        assert!(plan.args.iter().any(|a| a == "--sub-langs=live_chat"));
+        assert!(plan.args.iter().any(|a| a == "--write-subs"));
+
+        // Folded together with an explicit subtitle selection.
+        let mut y2 = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
+        y2.monitor.chat_log = true;
+        y2.monitor.subtitle_tracks = "en".into();
+        let plan2 = build_plan(&y2, 1_700_000_000, &AuthSource::None, None, None);
+        assert!(plan2.args.iter().any(|a| a == "--sub-langs=en,live_chat"));
+
+        // Twitch + yt-dlp + chat_log -> NO yt-dlp live_chat (the native Twitch
+        // chat logger handles it instead).
+        let mut t = row(Tool::YtDlp, Container::Mkv, Platform::Twitch);
+        t.monitor.chat_log = true;
+        t.monitor.subtitle_tracks = String::new();
+        let plant = build_plan(&t, 1_700_000_000, &AuthSource::None, None, None);
+        assert!(!plant.args.iter().any(|a| a.contains("live_chat")));
     }
 
     #[test]

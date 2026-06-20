@@ -525,6 +525,11 @@ pub struct Monitor {
     /// otherwise a comma-separated pass-through list of language codes. Honored by
     /// yt-dlp (`--sub-langs` + write sidecars); streamlink can't mux subtitles.
     pub subtitle_tracks: String,
+    /// Capture chat to a sidecar alongside the recording. Twitch: a native
+    /// anonymous IRC-over-WebSocket logger (`.chat.jsonl`). YouTube (yt-dlp tool):
+    /// yt-dlp `--sub-langs live_chat` (`.live_chat.json`). Other combinations
+    /// don't capture chat.
+    pub chat_log: bool,
     pub extra_args: String,
     pub max_concurrent: i64,
     pub last_checked_at: Option<i64>,
