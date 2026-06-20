@@ -460,10 +460,19 @@ fn run_twitch_login() -> Result<()> {
         );
         println!("Waiting for authorization…");
         let tokens = oauth::poll_token(&http, &client_id, &dc).await?;
-        let (login, user_id) = oauth::fetch_user(&http, &client_id, &tokens.access).await?;
-        oauth::store_tokens(&store, &tokens, &login)?;
-        store.set_setting(oauth::K_USER_ID, &user_id)?;
-        println!("Connected as {login}.");
+        match oauth::fetch_user(&http, &client_id, &tokens.access).await {
+            Ok((login, user_id)) => {
+                oauth::store_tokens(&store, &tokens, &login)?;
+                store.set_setting(oauth::K_USER_ID, &user_id)?;
+                println!("Connected as {login}.");
+            }
+            // Keep the valid tokens (detection only needs the token); the account
+            // lookup failed, so ad-free sub detection stays off until a reconnect.
+            Err(e) => {
+                oauth::store_tokens(&store, &tokens, "")?;
+                println!("Connected (couldn't read account: {e}). Reconnect later to enable ad-free sub detection.");
+            }
+        }
         Ok::<_, anyhow::Error>(())
     })?;
     Ok(())

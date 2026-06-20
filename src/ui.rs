@@ -3345,11 +3345,15 @@ impl StreamArchiverApp {
                         let _ = store.set_setting(oauth::K_USER_ID, &user_id);
                         *flow.lock().unwrap() = AuthFlow::Connected { login };
                     }
-                    // Authorized, but we couldn't resolve the account — don't persist
-                    // a half-connected state (empty user id breaks sub detection).
+                    // Authorized, but the account lookup failed (after retries). Keep
+                    // the valid tokens — detection only needs the token — but leave
+                    // the user id unset, so sub-based ad-free detection stays off
+                    // until a reconnect (rather than discarding the connection).
                     Err(e) => {
-                        *flow.lock().unwrap() = AuthFlow::Failed {
-                            message: format!("Authorized, but couldn't read your account — try Connect again. ({e})"),
+                        let _ = oauth::store_tokens(&store, &tokens, "");
+                        warn!("Twitch connected, but Get Users failed: {e}");
+                        *flow.lock().unwrap() = AuthFlow::Connected {
+                            login: String::new(),
                         };
                     }
                 },
@@ -3405,7 +3409,11 @@ impl StreamArchiverApp {
             match flow {
                 AuthFlow::Connected { login } => {
                     ui.horizontal(|ui| {
-                        ui.label(format!("✅ Connected as {login}"));
+                        if login.is_empty() {
+                            ui.label("✅ Connected");
+                        } else {
+                            ui.label(format!("✅ Connected as {login}"));
+                        }
                         if ui.button("Disconnect").clicked() {
                             let _ = oauth::disconnect(&self.core.store);
                             *self.twitch_flow.lock().unwrap() = AuthFlow::Idle;

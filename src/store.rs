@@ -433,21 +433,28 @@ impl Store {
         Ok(())
     }
 
-    /// Cache the auto-detected Twitch-subscription ad-free status for a monitor.
-    /// `sub` is None (unknown), Some(false) (not subscribed) or Some(true)
-    /// (subscribed); `checked_at` is the check time.
-    pub fn set_monitor_ad_free_sub(
+    /// Cache the auto-detected Twitch-subscription ad-free status for a monitor,
+    /// but only while a Twitch account is connected, atomically under the single
+    /// connection lock: the `EXISTS` check on `connected_key` and the update can't
+    /// interleave with a concurrent `disconnect` (which clears that key + the
+    /// cache), so a Disconnect landing mid-refresh can't resurrect a stale result.
+    /// `sub` is `Some(true)` subscribed / `Some(false)` not / `None` unknown.
+    /// Returns whether a row was written.
+    pub fn set_monitor_ad_free_sub_if_connected(
         &self,
         id: i64,
         sub: Option<bool>,
         checked_at: i64,
-    ) -> Result<()> {
+        connected_key: &str,
+    ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE monitor SET ad_free_sub = ?2, ad_free_sub_at = ?3 WHERE id = ?1",
-            params![id, sub.map(|b| b as i64), checked_at],
+        let n = conn.execute(
+            "UPDATE monitor SET ad_free_sub = ?2, ad_free_sub_at = ?3
+             WHERE id = ?1
+               AND EXISTS (SELECT 1 FROM app_settings WHERE key = ?4 AND value <> '')",
+            params![id, sub.map(|b| b as i64), checked_at, connected_key],
         )?;
-        Ok(())
+        Ok(n > 0)
     }
 
     /// Clear all cached auto Twitch-sub ad-free results (e.g. on disconnect).
@@ -1068,6 +1075,48 @@ mod tests {
         m2.ad_free = false;
         store.update_monitor(&m2).unwrap();
         assert!(!store.get_monitor_with_channel(mid).unwrap().unwrap().monitor.ad_free);
+    }
+
+    #[test]
+    fn ad_free_sub_write_is_gated_on_connection() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        // Not connected (key absent): the guarded write is a no-op.
+        let wrote = store
+            .set_monitor_ad_free_sub_if_connected(mid, Some(true), 100, "twitch_user_id")
+            .unwrap();
+        assert!(!wrote);
+        assert_eq!(
+            store.get_monitor_with_channel(mid).unwrap().unwrap().ad_free_sub,
+            None
+        );
+
+        // Connected: the write lands.
+        store.set_setting("twitch_user_id", "12345").unwrap();
+        let wrote = store
+            .set_monitor_ad_free_sub_if_connected(mid, Some(true), 100, "twitch_user_id")
+            .unwrap();
+        assert!(wrote);
+        assert_eq!(
+            store.get_monitor_with_channel(mid).unwrap().unwrap().ad_free_sub,
+            Some(true)
+        );
+
+        // Disconnect (key emptied): a later write can't resurrect a value.
+        store.set_setting("twitch_user_id", "").unwrap();
+        store.clear_ad_free_sub().unwrap();
+        let wrote = store
+            .set_monitor_ad_free_sub_if_connected(mid, Some(true), 200, "twitch_user_id")
+            .unwrap();
+        assert!(!wrote);
+        assert_eq!(
+            store.get_monitor_with_channel(mid).unwrap().unwrap().ad_free_sub,
+            None
+        );
     }
 
     #[test]

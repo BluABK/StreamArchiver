@@ -67,9 +67,17 @@ struct AdSink {
     store: Arc<Store>,
     events: EventTx,
     monitor_id: i64,
+    /// Always > 0 (the sink is only built for a real recording row).
     recording_id: i64,
-    /// Take start (unix secs); used for the wall-clock fallback offset.
+    /// Take start (unix secs); the live-edge wall-clock fallback anchor.
     started_at: i64,
+    /// Broadcast go-live time when known — a better fallback anchor than the
+    /// process start for capture-from-start/DVR takes (their file timeline begins
+    /// at go-live, not at recording start).
+    went_live_at: Option<i64>,
+    /// Whether this take rewinds to the broadcast start (DVR), which decides the
+    /// fallback anchor.
+    from_start: bool,
     /// The growing capture file; its media duration is the true cut position
     /// (ad segments are filtered out, so captured content == the finished file).
     capture_path: PathBuf,
@@ -878,8 +886,11 @@ impl Supervisor {
         });
 
         // Twitch+streamlink filters ads into hard cuts and logs each break; record
-        // them so the UI can show ad count/time and the cut timestamps.
-        let ad_sink = (row.monitor.tool == Tool::Streamlink
+        // them so the UI can show ad count/time and the cut timestamps. Skip when
+        // the recording row failed to insert (rec_id 0) — an ad break with a 0
+        // recording_id would violate the FK and be dropped anyway.
+        let ad_sink = (rec_id != 0
+            && row.monitor.tool == Tool::Streamlink
             && row.monitor.platform() == Platform::Twitch)
             .then(|| AdSink {
                 store: self.store.clone(),
@@ -887,6 +898,8 @@ impl Supervisor {
                 monitor_id,
                 recording_id: rec_id,
                 started_at,
+                went_live_at,
+                from_start,
                 capture_path: plan.capture_path.clone(),
             });
 
@@ -1098,11 +1111,32 @@ impl Supervisor {
         let ad_task = match (ads, ad_rx) {
             (Some(sink), Some(mut rx)) => Some(tokio::spawn(async move {
                 let mut prior_ad_secs: i64 = 0;
+                let mut last_at: i64 = 0;
                 while let Some((detected_at, dur)) = rx.recv().await {
-                    let at = match media_duration_secs(&sink.capture_path).await {
+                    // Prefer the actual captured-content position (one quick retry,
+                    // since a just-written .ts can momentarily lack a readable
+                    // duration). Fall back to wall clock minus already-skipped ad
+                    // time, anchored at go-live for DVR takes (whose file timeline
+                    // starts at go-live) and at recording start at the live edge.
+                    let mut probed = media_duration_secs(&sink.capture_path).await;
+                    if probed.is_none() {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        probed = media_duration_secs(&sink.capture_path).await;
+                    }
+                    let at = match probed {
                         Some(d) => d,
-                        None => (detected_at - sink.started_at - prior_ad_secs).max(0),
+                        None => {
+                            let anchor = match (sink.from_start, sink.went_live_at) {
+                                (true, Some(wl)) => wl,
+                                _ => sink.started_at,
+                            };
+                            (detected_at - anchor - prior_ad_secs).max(0)
+                        }
                     };
+                    // Cut positions only move forward; guard against a probe that
+                    // momentarily reports a smaller duration.
+                    let at = at.max(last_at);
+                    last_at = at;
                     prior_ad_secs += dur;
                     match sink.store.insert_ad_break(sink.recording_id, at, dur) {
                         Ok(_) => {

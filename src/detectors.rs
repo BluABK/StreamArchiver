@@ -244,7 +244,11 @@ impl DetectContext {
         match resp.status() {
             s if s.is_success() => Some(true),
             reqwest::StatusCode::NOT_FOUND => Some(false), // 404 = not subscribed
-            _ => None, // 401 (scope missing/expired), 400, 5xx -> unknown
+            // 400 is returned when broadcaster_id == user_id (you can't subscribe to
+            // your own channel). That's conclusive ("no sub benefit"), so cache it
+            // instead of re-querying this monitor every refresh pass forever.
+            reqwest::StatusCode::BAD_REQUEST => Some(false),
+            _ => None, // 401 (scope missing/expired), 5xx -> unknown (retry later)
         }
     }
 
@@ -747,7 +751,7 @@ pub async fn refresh_ad_free(ctx: Arc<DetectContext>, events: EventTx, shutdown:
         // reconnect. The pass itself only spends a Helix call on stale/unchecked
         // monitors, so an idle tick is just one local DB query.
         if crate::oauth::connected_user_id(ctx.store.as_ref()).is_some() {
-            refresh_ad_free_once(&ctx, &events, STALE_AFTER_SECS).await;
+            refresh_ad_free_once(&ctx, &events, &shutdown, STALE_AFTER_SECS).await;
         }
         interruptible_sleep(&shutdown, TICK_SECS).await;
     }
@@ -757,7 +761,12 @@ pub async fn refresh_ad_free(ctx: Arc<DetectContext>, events: EventTx, shutdown:
 /// de-duplicating per broadcaster login. Only conclusive results are persisted;
 /// an undeterminable result (e.g. scope not yet granted) is left to retry. Emits
 /// a bus event when a status actually changes so the UI reloads the column.
-async fn refresh_ad_free_once(ctx: &Arc<DetectContext>, events: &EventTx, stale_after: i64) {
+async fn refresh_ad_free_once(
+    ctx: &Arc<DetectContext>,
+    events: &EventTx,
+    shutdown: &Arc<AtomicBool>,
+    stale_after: i64,
+) {
     let rows = match ctx.store.list_monitors_with_channels() {
         Ok(r) => r,
         Err(_) => return,
@@ -765,6 +774,10 @@ async fn refresh_ad_free_once(ctx: &Arc<DetectContext>, events: &EventTx, stale_
     let now = now_unix();
     let mut by_login: HashMap<String, Option<bool>> = HashMap::new();
     for row in &rows {
+        // Quitting: stop doing network + DB work mid-pass.
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
         if row.monitor.platform() != Platform::Twitch {
             continue;
         }
@@ -789,18 +802,28 @@ async fn refresh_ad_free_once(ctx: &Arc<DetectContext>, events: &EventTx, stale_
                 r
             }
         };
-        // Persist only a conclusive result, and only if still connected: a Disconnect
-        // during the await above clears cached results, so writing here would
-        // resurrect a stale "Yes (sub)" that never refreshes while disconnected.
-        if result.is_some() && crate::oauth::connected_user_id(ctx.store.as_ref()).is_some() {
-            let _ = ctx.store.set_monitor_ad_free_sub(row.monitor.id, result, now);
-            info!(monitor_id = row.monitor.id, subscribed = ?result, "ad-free sub status refreshed");
-            // Reload the UI only when the displayed status actually changed.
-            if result != row.ad_free_sub {
-                let _ = events.send(AppEvent::MonitorState {
-                    monitor_id: row.monitor.id,
-                    state: row.monitor.last_state.clone(),
-                });
+        // Persist only a conclusive result, atomically gated on still being
+        // connected: a Disconnect during the await above clears cached results, and
+        // this guarded write won't resurrect a stale "Yes (sub)" in that race.
+        if let Some(sub) = result {
+            let wrote = ctx
+                .store
+                .set_monitor_ad_free_sub_if_connected(
+                    row.monitor.id,
+                    Some(sub),
+                    now,
+                    crate::oauth::K_USER_ID,
+                )
+                .unwrap_or(false);
+            if wrote {
+                info!(monitor_id = row.monitor.id, subscribed = sub, "ad-free sub status refreshed");
+                // Reload the UI only when the displayed status actually changed.
+                if result != row.ad_free_sub {
+                    let _ = events.send(AppEvent::MonitorState {
+                        monitor_id: row.monitor.id,
+                        state: row.monitor.last_state.clone(),
+                    });
+                }
             }
         }
     }

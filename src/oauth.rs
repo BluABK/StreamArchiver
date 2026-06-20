@@ -169,8 +169,26 @@ pub async fn refresh(
     })
 }
 
-/// Resolve the `(login, user_id)` for an access token (also validates it).
+/// Resolve the `(login, user_id)` for an access token (also validates it),
+/// retrying a few times since this runs right after authorization and a transient
+/// failure here would otherwise cost the freshly granted tokens.
 pub async fn fetch_user(http: &Client, client_id: &str, token: &str) -> Result<(String, String)> {
+    let mut last_err = None;
+    for attempt in 0..3 {
+        match fetch_user_once(http, client_id, token).await {
+            Ok(u) => return Ok(u),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < 2 {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("get users failed")))
+}
+
+async fn fetch_user_once(http: &Client, client_id: &str, token: &str) -> Result<(String, String)> {
     let resp = http
         .get(USERS_URL)
         .header("Client-Id", client_id)
