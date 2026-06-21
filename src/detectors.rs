@@ -25,7 +25,10 @@ use tracing::{debug, info};
 
 use crate::app_core::sleep_cancellable;
 use crate::events::{AppEvent, EventTx};
-use crate::models::{K_YT_API_DETECT, K_YT_API_SCHEDULE, Platform, ScheduleSegment, now_unix};
+use crate::models::{
+    K_DISCORD_SCHEDULE, K_DISCORD_TOKEN, K_YT_API_DETECT, K_YT_API_SCHEDULE, MonitorWithChannel,
+    Platform, ScheduleSegment, now_unix,
+};
 use crate::store::Store;
 
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
@@ -109,6 +112,14 @@ fn parse_rfc3339(s: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|dt| dt.timestamp())
+}
+
+/// Unix seconds at the start of the local day (00:00). Used as the floor for the
+/// Discord/platform dedup so it matches the calendar's start-of-today display.
+fn local_day_start() -> i64 {
+    use chrono::Timelike;
+    let now = chrono::Local::now();
+    now.timestamp() - now.time().num_seconds_from_midnight() as i64
 }
 
 /// Turn a raw "no Twitch auth available" error into actionable UI guidance.
@@ -662,6 +673,165 @@ impl DetectContext {
             .is_empty()
     }
 
+    /// Whether Discord schedule import is on: the toggle is set AND a token exists.
+    pub fn discord_enabled(&self) -> bool {
+        let on = self
+            .store
+            .get_setting(K_DISCORD_SCHEDULE)
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("1");
+        on && !self
+            .store
+            .get_setting(K_DISCORD_TOKEN)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .is_empty()
+    }
+
+    /// GET a Discord API endpoint with the user token, parsing JSON. Handles one
+    /// 429 (rate-limit) retry honoring `retry-after`. `None` on auth/HTTP error.
+    /// The token is sent raw in the Authorization header (Discord user-token form).
+    async fn discord_get(&self, token: &str, url: &str) -> Option<Value> {
+        for attempt in 0..2 {
+            let resp = self
+                .http
+                .get(url)
+                .header("Authorization", token)
+                .send()
+                .await
+                .ok()?;
+            match resp.status() {
+                s if s.is_success() => return resp.json::<Value>().await.ok(),
+                reqwest::StatusCode::TOO_MANY_REQUESTS if attempt == 0 => {
+                    let wait = resp
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .unwrap_or(2.0)
+                        .clamp(0.0, 10.0);
+                    tokio::time::sleep(Duration::from_millis((wait * 1000.0) as u64 + 250)).await;
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// The ids of the guilds (servers) the token's user is a member of.
+    async fn discord_guild_ids(&self, token: &str) -> Option<Vec<String>> {
+        let v = self
+            .discord_get(token, "https://discord.com/api/v10/users/@me/guilds?limit=200")
+            .await?;
+        Some(
+            v.as_array()?
+                .iter()
+                .filter_map(|g| g["id"].as_str().map(String::from))
+                .collect(),
+        )
+    }
+
+    /// One guild's upcoming scheduled events as [`DiscordEvt`] (with matchable text).
+    async fn discord_guild_events(&self, token: &str, guild_id: &str) -> Option<Vec<DiscordEvt>> {
+        let url = format!("https://discord.com/api/v10/guilds/{guild_id}/scheduled-events");
+        let v = self.discord_get(token, &url).await?;
+        let mut out = Vec::new();
+        for e in v.as_array()? {
+            let Some(start) = e["scheduled_start_time"].as_str().and_then(parse_rfc3339) else {
+                continue;
+            };
+            // 1 SCHEDULED, 2 ACTIVE, 3 COMPLETED, 4 CANCELED.
+            let status = e["status"].as_i64().unwrap_or(1);
+            if status == 3 {
+                continue;
+            }
+            let name = e["name"].as_str().unwrap_or("").to_string();
+            let desc = e["description"].as_str().unwrap_or("");
+            let loc = e["entity_metadata"]["location"].as_str().unwrap_or("");
+            out.push(DiscordEvt {
+                start_time: start,
+                end_time: e["scheduled_end_time"].as_str().and_then(parse_rfc3339),
+                title: name.clone(),
+                canceled: status == 4,
+                text: format!("{name}\n{desc}\n{loc}").to_lowercase(),
+            });
+        }
+        Some(out)
+    }
+
+    /// Sweep the user's Discord guilds for scheduled events and match them to
+    /// monitors by the stream URL appearing in the event (location/description/
+    /// name). Returns `(monitor_id -> events, complete)` where `complete` is true
+    /// only if every guild was fetched successfully — the caller reconciles
+    /// (clears unmatched) only on a complete sweep, so a partial outage never wipes
+    /// a streamer whose guild happened to fail. `None` if the guild list itself
+    /// couldn't be fetched (auth/network). Paced + shutdown-aware.
+    async fn discord_sweep(
+        &self,
+        rows: &[MonitorWithChannel],
+        shutdown: &Arc<AtomicBool>,
+    ) -> Option<(HashMap<i64, Vec<ScheduleSegment>>, bool)> {
+        let token = self
+            .store
+            .get_setting(K_DISCORD_TOKEN)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if token.is_empty() {
+            return None;
+        }
+        let guilds = self.discord_guild_ids(&token).await?;
+        // URL needles per enabled monitor (skip monitors we can't match by URL).
+        let needles: Vec<(i64, Vec<String>)> = rows
+            .iter()
+            .filter(|r| r.monitor.enabled)
+            .map(|r| (r.monitor.id, monitor_needles(&r.monitor.url)))
+            .filter(|(_, n)| !n.is_empty())
+            .collect();
+        if needles.is_empty() {
+            return Some((HashMap::new(), true));
+        }
+        let mut matched: HashMap<i64, Vec<ScheduleSegment>> = HashMap::new();
+        let guild_count = guilds.len();
+        let mut ok_guilds = 0usize;
+        for gid in guilds {
+            if shutdown.load(Ordering::SeqCst) {
+                return None;
+            }
+            // Gentle pacing so the sweep isn't a bursty rate-limit magnet.
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let Some(events) = self.discord_guild_events(&token, &gid).await else {
+                continue;
+            };
+            ok_guilds += 1;
+            for ev in events {
+                for (mid, ns) in &needles {
+                    if ns.iter().any(|n| text_contains_token(&ev.text, n)) {
+                        matched.entry(*mid).or_default().push(ScheduleSegment {
+                            id: 0,
+                            monitor_id: 0,
+                            start_time: ev.start_time,
+                            end_time: ev.end_time,
+                            title: ev.title.clone(),
+                            category: String::new(),
+                            canceled: ev.canceled,
+                        });
+                    }
+                }
+            }
+        }
+        // If the guild list was non-empty but every per-guild fetch failed, treat
+        // the sweep as failed (return None) rather than silently wiping stored
+        // Discord events on a transient outage.
+        if guild_count > 0 && ok_guilds == 0 {
+            return None;
+        }
+        Some((matched, ok_guilds == guild_count))
+    }
+
     pub async fn detect_youtube_api(&self, item: &DetectItem) -> DetectOutcome {
         let key = self
             .store
@@ -1204,12 +1374,21 @@ pub async fn refresh_schedules(
     const REFRESH_SECS: u64 = 6 * 3600;
 
     let mut last_fetched: HashMap<i64, Instant> = HashMap::new();
+    let mut discord_last: Option<Instant> = None;
     sleep_cancellable(Duration::from_secs(INITIAL_DELAY_SECS), &shutdown).await;
     loop {
         if shutdown.load(Ordering::SeqCst) {
             return;
         }
-        refresh_schedules_once(&ctx, &events, &shutdown, &mut last_fetched, REFRESH_SECS).await;
+        refresh_schedules_once(
+            &ctx,
+            &events,
+            &shutdown,
+            &mut last_fetched,
+            &mut discord_last,
+            REFRESH_SECS,
+        )
+        .await;
         // Wake on either the periodic tick or a UI-requested reload; the latter
         // forces a full re-fetch immediately (staleness window 0 = refresh all).
         tokio::select! {
@@ -1218,7 +1397,10 @@ pub async fn refresh_schedules(
                 if shutdown.load(Ordering::SeqCst) {
                     return;
                 }
-                refresh_schedules_once(&ctx, &events, &shutdown, &mut last_fetched, 0).await;
+                refresh_schedules_once(
+                    &ctx, &events, &shutdown, &mut last_fetched, &mut discord_last, 0,
+                )
+                .await;
             }
         }
     }
@@ -1233,6 +1415,7 @@ async fn refresh_schedules_once(
     events: &EventTx,
     shutdown: &Arc<AtomicBool>,
     last_fetched: &mut HashMap<i64, Instant>,
+    discord_last: &mut Option<Instant>,
     refresh_secs: u64,
 ) {
     let rows = match ctx.store.list_monitors_with_channels() {
@@ -1290,6 +1473,53 @@ async fn refresh_schedules_once(
             last_fetched.insert(row.monitor.id, now);
         }
     }
+
+    // Discord scheduled-events import (opt-in; uses the user's Discord token).
+    // Runs on the platform cadence, but never more often than DISCORD_MIN_SECS even
+    // on a forced reload (refresh_secs == 0) — a sweep hits the user-token endpoints
+    // for every guild, so we debounce it to avoid bursty, ban-flaggable traffic.
+    const DISCORD_MIN_SECS: u64 = 60;
+    let discord_interval = refresh_secs.max(DISCORD_MIN_SECS);
+    let discord_due = ctx.discord_enabled()
+        && discord_last.is_none_or(|t| now.duration_since(t).as_secs() >= discord_interval);
+    if discord_due {
+        // Stamp the attempt up front so a failing token / outage retries on the
+        // interval, not every 60s tick (which would hammer Discord's auth endpoint).
+        *discord_last = Some(now);
+        if let Some((matched, complete)) = ctx.discord_sweep(&rows, shutdown).await {
+            // Don't attach a Discord event to a monitor that already has a platform
+            // schedule, so the two sources never duplicate. Use the start-of-today
+            // floor the calendar uses, so an in-progress block (started earlier
+            // today) still counts as a platform schedule.
+            let platform_mons = ctx
+                .store
+                .monitors_with_upcoming_platform(local_day_start())
+                .unwrap_or_default();
+            if complete {
+                // Full sweep: authoritative — reconcile every monitor (clear ones
+                // with no matched event).
+                for row in &rows {
+                    let mid = row.monitor.id;
+                    let segs = if platform_mons.contains(&mid) {
+                        Vec::new()
+                    } else {
+                        matched.get(&mid).cloned().unwrap_or_default()
+                    };
+                    let _ = ctx.store.replace_schedule_source(mid, "discord", &segs);
+                }
+            } else {
+                // Partial sweep: only update monitors we actually got events for, so
+                // a streamer whose guild failed this pass keeps their stored events.
+                for (mid, found) in &matched {
+                    let segs: &[ScheduleSegment] =
+                        if platform_mons.contains(mid) { &[] } else { found };
+                    let _ = ctx.store.replace_schedule_source(*mid, "discord", segs);
+                }
+            }
+            changed = true;
+        }
+    }
+
     if changed {
         // Wake the UI to reload the Next stream column (monitor_id 0 = "any").
         let _ = events.send(AppEvent::MonitorState {
@@ -1336,6 +1566,80 @@ fn youtube_handle(url: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// One Discord scheduled event reduced to what we need: the segment fields plus a
+/// lowercased `text` blob (name + description + location) for URL matching.
+struct DiscordEvt {
+    start_time: i64,
+    end_time: Option<i64>,
+    title: String,
+    canceled: bool,
+    text: String,
+}
+
+/// Lowercased substrings that, if present in a Discord event's text, identify it as
+/// belonging to this monitor's channel — the platform-specific `host/path`
+/// (e.g. `twitch.tv/login`, `youtube.com/@handle`, `kick.com/slug`) plus the bare
+/// normalized URL. Empty when nothing distinctive can be derived.
+fn monitor_needles(url: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    match Platform::detect(url) {
+        Platform::Twitch => {
+            if let Some(l) = twitch_login(url) {
+                out.push(format!("twitch.tv/{l}"));
+            }
+        }
+        Platform::YouTube => {
+            if let Some(h) = youtube_handle(url) {
+                // Host-qualified only — a bare "@handle" would substring-match
+                // unrelated @-mentions in event text.
+                out.push(format!("youtube.com/{}", h.to_lowercase()));
+            }
+        }
+        Platform::Kick => {
+            if let Some(s) = kick_slug(url) {
+                out.push(format!("kick.com/{}", s.to_lowercase()));
+            }
+        }
+        Platform::Generic => {}
+    }
+    // The bare host/path (scheme + www stripped), as a catch-all / for generic URLs.
+    let norm = url
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_start_matches("www.")
+        .trim_end_matches('/')
+        .to_lowercase();
+    if norm.len() > 3 && !out.contains(&norm) {
+        out.push(norm);
+    }
+    out
+}
+
+/// Whether `needle` occurs in `haystack` as a whole token — i.e. not immediately
+/// preceded or followed by an identifier char (alphanumeric / `_` / `-`). This
+/// stops a needle like `twitch.tv/ana` from matching `twitch.tv/anastasia` (and a
+/// `youtube.com/@ab` from matching `…@abby`), while still allowing `www.` prefixes
+/// and trailing punctuation. Both inputs are expected lowercased.
+fn text_contains_token(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(needle) {
+        let i = from + rel;
+        let before_ok = haystack[..i].chars().next_back().map(is_ident) != Some(true);
+        let after = i + needle.len();
+        let after_ok = haystack[after..].chars().next().map(is_ident) != Some(true);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = i + 1;
+    }
+    false
 }
 
 /// Build the YouTube live URL for a channel URL (append `/live`).
@@ -1542,6 +1846,43 @@ mod tests {
     fn parse_kick_slug() {
         assert_eq!(kick_slug("https://kick.com/Bar/").as_deref(), Some("Bar"));
         assert_eq!(kick_slug("https://kick.com/").as_deref(), None);
+    }
+
+    #[test]
+    fn monitor_needles_are_host_qualified() {
+        assert_eq!(
+            monitor_needles("https://www.twitch.tv/Layna"),
+            vec!["twitch.tv/layna".to_string()],
+        );
+        // YouTube is host-qualified only (no bare "@handle" needle).
+        assert_eq!(
+            monitor_needles("https://youtube.com/@Layna"),
+            vec!["youtube.com/@layna".to_string()],
+        );
+    }
+
+    #[test]
+    fn token_match_respects_boundaries() {
+        // A needle must match as a whole token, not a prefix of a longer name.
+        assert!(text_contains_token(
+            "join me at twitch.tv/ana tonight!",
+            "twitch.tv/ana"
+        ));
+        assert!(!text_contains_token(
+            "watch twitch.tv/anastasia live",
+            "twitch.tv/ana"
+        ));
+        // `www.` prefix and trailing punctuation are fine.
+        assert!(text_contains_token(
+            "(https://www.twitch.tv/ana).",
+            "twitch.tv/ana"
+        ));
+        // A bare @-mention must not match a host-qualified youtube needle.
+        assert!(!text_contains_token("shoutout @ana!", "youtube.com/@ana"));
+        assert!(text_contains_token(
+            "live on youtube.com/@ana today",
+            "youtube.com/@ana"
+        ));
     }
 
     #[test]

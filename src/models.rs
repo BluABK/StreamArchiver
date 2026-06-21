@@ -672,12 +672,20 @@ pub struct UpcomingStream {
     pub end_time: Option<i64>,
     pub title: String,
     pub category: String,
+    /// Where this segment came from: `"platform"` (Twitch/YouTube published
+    /// schedule) or `"discord"` (matched from a Discord scheduled event).
+    pub source: String,
 }
 
 impl UpcomingStream {
     /// Platform inferred from the source URL.
     pub fn platform(&self) -> Platform {
         Platform::detect(&self.url)
+    }
+
+    /// Whether this segment came from a Discord event (for the source hint).
+    pub fn is_discord(&self) -> bool {
+        self.source == "discord"
     }
 }
 
@@ -820,6 +828,13 @@ pub const K_FILENAME_MEDIA: &str = "filename_media_info";
 /// (instead of scraping). Each is gated on a non-empty `youtube_api_key`.
 pub const K_YT_API_DETECT: &str = "youtube_api_detect";
 pub const K_YT_API_SCHEDULE: &str = "youtube_api_schedule";
+
+/// `app_settings` keys for importing stream schedules from Discord scheduled
+/// events. `K_DISCORD_TOKEN` is the user's Discord token (sent raw in the
+/// Authorization header — automating it is against Discord's ToS); the import is
+/// gated on `K_DISCORD_SCHEDULE == "1"` and a non-empty token.
+pub const K_DISCORD_TOKEN: &str = "discord_user_token";
+pub const K_DISCORD_SCHEDULE: &str = "discord_schedule";
 
 /// Current unix timestamp in seconds.
 pub fn now_unix() -> i64 {

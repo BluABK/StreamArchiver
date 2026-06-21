@@ -17,7 +17,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -324,7 +324,17 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 18)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 18);
+        if version < 19 {
+            // Schedule segments can now come from more than one source per monitor
+            // (the platform's published schedule, or matched Discord events), so each
+            // row records its `source` and is replaced per-source. Existing rows came
+            // from the platform fetchers, so they default to 'platform'.
+            conn.execute_batch(
+                "ALTER TABLE schedule_segment ADD COLUMN source TEXT NOT NULL DEFAULT 'platform';",
+            )?;
+            conn.pragma_update(None, "user_version", 19)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 19);
         Ok(())
     }
 
@@ -730,19 +740,32 @@ impl Store {
 
     // ----- schedule (upcoming streams) -----
 
-    /// Replace a monitor's stored schedule wholesale with a freshly-fetched set
-    /// (delete-then-insert in one transaction). Called by the schedule refresher.
+    /// Replace a monitor's *platform-sourced* schedule wholesale with a
+    /// freshly-fetched set. Called by the Twitch/YouTube schedule refresher.
     pub fn replace_schedule(&self, monitor_id: i64, segs: &[ScheduleSegment]) -> Result<()> {
+        self.replace_schedule_source(monitor_id, "platform", segs)
+    }
+
+    /// Replace one monitor's schedule for a single `source` (`"platform"` or
+    /// `"discord"`), leaving its other sources intact (delete-then-insert in one
+    /// transaction). Lets the platform schedule and Discord events coexist without
+    /// clobbering each other.
+    pub fn replace_schedule_source(
+        &self,
+        monitor_id: i64,
+        source: &str,
+        segs: &[ScheduleSegment],
+    ) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
-            "DELETE FROM schedule_segment WHERE monitor_id = ?1",
-            params![monitor_id],
+            "DELETE FROM schedule_segment WHERE monitor_id = ?1 AND source = ?2",
+            params![monitor_id, source],
         )?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO schedule_segment(monitor_id, start_time, end_time, title, category, canceled)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO schedule_segment(monitor_id, start_time, end_time, title, category, canceled, source)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             for s in segs {
                 stmt.execute(params![
@@ -752,11 +775,42 @@ impl Store {
                     s.title,
                     s.category,
                     s.canceled as i64,
+                    source,
                 ])?;
             }
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Delete every schedule segment from one `source` across all monitors. Used to
+    /// purge imported Discord events when that import is turned off.
+    pub fn clear_schedule_source(&self, source: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM schedule_segment WHERE source = ?1",
+            params![source],
+        )?;
+        Ok(())
+    }
+
+    /// Monitor ids that currently have at least one upcoming (non-canceled,
+    /// start ≥ `after`) *platform*-sourced schedule segment. The Discord sweep uses
+    /// this to avoid attaching Discord events to a channel whose platform already
+    /// publishes a schedule (so the two sources never duplicate).
+    pub fn monitors_with_upcoming_platform(
+        &self,
+        after: i64,
+    ) -> Result<std::collections::HashSet<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT monitor_id FROM schedule_segment
+             WHERE source = 'platform' AND canceled = 0 AND start_time >= ?1",
+        )?;
+        let ids = stmt
+            .query_map(params![after], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+        Ok(ids)
     }
 
     /// Upcoming (non-canceled, start ≥ `after`) schedule segments for one monitor,
@@ -812,7 +866,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT s.monitor_id, m.channel_id, c.name, m.url,
-                    s.start_time, s.end_time, s.title, s.category
+                    s.start_time, s.end_time, s.title, s.category, s.source
              FROM schedule_segment s
              JOIN monitor m ON m.id = s.monitor_id
              JOIN channel c ON c.id = m.channel_id
@@ -830,6 +884,7 @@ impl Store {
                     end_time: r.get(5)?,
                     title: r.get(6)?,
                     category: r.get(7)?,
+                    source: r.get(8)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1624,6 +1679,49 @@ mod tests {
         assert_eq!(yt.platform(), Platform::YouTube);
         let tw = all.iter().find(|s| s.title == "TW soon").unwrap();
         assert_eq!(tw.platform(), Platform::Twitch);
+    }
+
+    #[test]
+    fn schedule_sources_coexist_and_replace_independently() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        let seg = |start: i64, title: &str| ScheduleSegment {
+            id: 0,
+            monitor_id: 0,
+            start_time: start,
+            end_time: Some(start + 3600),
+            title: title.into(),
+            category: String::new(),
+            canceled: false,
+        };
+
+        // A platform segment and a Discord segment for the same monitor coexist.
+        store.replace_schedule(mid, &[seg(2_000, "Platform")]).unwrap();
+        store
+            .replace_schedule_source(mid, "discord", &[seg(3_000, "Discord")])
+            .unwrap();
+        let all = store.all_upcoming_schedule(1_000).unwrap();
+        let mut titles: Vec<&str> = all.iter().map(|s| s.title.as_str()).collect();
+        titles.sort_unstable();
+        assert_eq!(titles, vec!["Discord", "Platform"]);
+        assert!(all.iter().any(|s| s.title == "Discord" && s.is_discord()));
+        assert!(all.iter().any(|s| s.title == "Platform" && !s.is_discord()));
+
+        // The monitor counts as having an upcoming platform schedule.
+        assert!(store.monitors_with_upcoming_platform(1_000).unwrap().contains(&mid));
+
+        // Replacing one source leaves the other intact.
+        store.replace_schedule_source(mid, "discord", &[]).unwrap();
+        let all = store.all_upcoming_schedule(1_000).unwrap();
+        assert_eq!(all.iter().map(|s| s.title.as_str()).collect::<Vec<_>>(), vec!["Platform"]);
+
+        // Clearing the platform source drops it from the platform-presence set.
+        store.replace_schedule(mid, &[]).unwrap();
+        assert!(!store.monitors_with_upcoming_platform(1_000).unwrap().contains(&mid));
     }
 
     #[test]

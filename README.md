@@ -386,7 +386,32 @@ just re-read the stored copy — and the calendar updates when the fetch returns
 > On Twitch that's the streamer's **Schedule** feature — if a channel hasn't set
 > one up, Twitch's API returns no segments and the channel shows nothing here,
 > even though its *past* broadcasts still appear on the channel's Twitch schedule
-> page. YouTube uses the channel's upcoming/scheduled livestreams.
+> page. YouTube uses the channel's upcoming/scheduled livestreams. For channels
+> that only post their schedule on Discord, see below.
+
+#### Discord schedule import (opt-in, experimental)
+
+Many streamers publish their schedule as **Discord scheduled events** in their
+community server rather than via Twitch/YouTube. **Settings → Discord schedule
+import** can pull those in:
+
+1. Paste your **Discord user token** and tick **Import schedules from Discord
+   events**.
+2. The app periodically sweeps the servers *you're already in* for scheduled
+   events and matches each one to a monitored channel by the **stream URL** found
+   in the event's location/description (e.g. `twitch.tv/<name>`). Matched events
+   appear on the calendar (hover shows *Source: Discord event*).
+3. Discord events are only used for channels that **don't** publish a
+   Twitch/YouTube schedule, so the two never duplicate. Events with no recognizable
+   stream URL are ignored.
+
+> ⚠ **This uses your personal Discord token.** Automating a user account token is
+> against [Discord's Terms of Service](https://discord.com/terms) and could get
+> your account suspended or banned. It's off by default; enable it only if you
+> accept that risk. The token is stored locally (like your other credentials) and
+> never displayed or logged. A compliant bot can't read events in servers where
+> you're only a member (a bot must be invited by that server's admin), which is
+> why this path uses your own account.
 
 ### Chat logs
 

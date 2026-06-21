@@ -16,8 +16,9 @@ use tray_icon::TrayIcon;
 use crate::app_core::AppCore;
 use crate::events::{ManualCommand, UiCommand};
 use crate::models::{
-    AdBreak, AuthKind, Channel, Container, DetectionMethod, DownloadDefaults, K_FILENAME_MEDIA,
-    K_YT_API_DETECT, K_YT_API_SCHEDULE, MediaInfoMode, Monitor, MonitorWithChannel, Platform,
+    AdBreak, AuthKind, Channel, Container, DetectionMethod, DownloadDefaults, K_DISCORD_SCHEDULE,
+    K_DISCORD_TOKEN, K_FILENAME_MEDIA, K_YT_API_DETECT, K_YT_API_SCHEDULE, MediaInfoMode, Monitor,
+    MonitorWithChannel, Platform,
     Recording, ScheduleSegment, StreamGroup, StreamMetaChange, Tool, UpcomingStream, Video,
     group_recordings, now_unix,
 };
@@ -296,6 +297,10 @@ struct SettingsForm {
     filename_media_info: MediaInfoMode,
     /// How dates/timestamps are displayed throughout the UI.
     date_fmt: DateFmt,
+    /// Discord user token + whether to import stream schedules from Discord events
+    /// (opt-in; automating a user token is against Discord's ToS).
+    discord_token: String,
+    discord_schedule: bool,
 }
 
 pub struct StreamArchiverApp {
@@ -442,6 +447,8 @@ impl StreamArchiverApp {
                 .unwrap_or_else(|| "15".into()),
             filename_media_info: MediaInfoMode::parse(&setting_or_empty(&core, K_FILENAME_MEDIA)),
             date_fmt: DateFmt::parse(&setting_or_empty(&core, K_DATE_FORMAT)),
+            discord_token: setting_or_empty(&core, K_DISCORD_TOKEN),
+            discord_schedule: setting_or_empty(&core, K_DISCORD_SCHEDULE) == "1",
         };
         // Apply the loaded date format before the first render.
         set_active_date_fmt(settings.date_fmt);
@@ -719,6 +726,8 @@ impl StreamArchiverApp {
 
     fn save_settings(&mut self) {
         let s = &self.settings;
+        // Discord import counts as on only when a token backs the toggle.
+        let discord_on = s.discord_schedule && !s.discord_token.trim().is_empty();
         // Persist the browser + optional profile as one `browser:profile` value.
         let cookies_value = compose_browser_profile(&s.cookies_browser, &s.cookies_profile);
         let pairs = [
@@ -738,12 +747,25 @@ impl StreamArchiverApp {
             (K_DATE_FORMAT, s.date_fmt.as_str()),
             (K_YT_API_DETECT, if s.youtube_api_detect { "1" } else { "0" }),
             (K_YT_API_SCHEDULE, if s.youtube_api_schedule { "1" } else { "0" }),
+            (K_DISCORD_TOKEN, s.discord_token.trim()),
+            // Only persist the import as on when a token actually backs it, so the
+            // consent flag can't be left latched with no token.
+            (
+                K_DISCORD_SCHEDULE,
+                if discord_on { "1" } else { "0" },
+            ),
         ];
         for (k, v) in pairs {
             if let Err(e) = self.core.store.set_setting(k, v) {
                 self.status = format!("Error saving settings: {e}");
                 return;
             }
+        }
+        // If Discord import is now off (toggled off or token cleared), purge any
+        // previously-imported Discord events so they don't linger on the calendar.
+        if !discord_on {
+            let _ = self.core.store.clear_schedule_source("discord");
+            self.reload_schedule();
         }
         // Apply the (possibly changed) date format to the live UI.
         set_active_date_fmt(self.settings.date_fmt);
@@ -1073,6 +1095,9 @@ fn schedule_detail_line(s: &UpcomingStream) -> String {
     }
     if !s.url.is_empty() {
         parts.push(s.url.clone());
+    }
+    if s.is_discord() {
+        parts.push("Source: Discord event".to_string());
     }
     parts.join("\n")
 }
@@ -5456,6 +5481,46 @@ impl StreamArchiverApp {
                 .on_hover_text(
                     "Use the Data API for the Next stream schedule. ~100 quota units per channel \
                      per refresh (refreshed a few hours apart).",
+                );
+            });
+
+            ui.add_space(12.0);
+            ui.heading("Discord schedule import");
+            ui.label(
+                "Import upcoming streams from Discord scheduled events in the servers you're in. \
+                 Events whose location/description contains a monitored channel's stream URL are \
+                 attached to it — useful for streamers who post their schedule on Discord but \
+                 don't publish a Twitch/YouTube one.",
+            );
+            ui.colored_label(
+                egui::Color32::from_rgb(0xe0, 0x6c, 0x6c),
+                "⚠ This uses your personal Discord token. Automating a user token is against \
+                 Discord's Terms of Service and could get your account banned — use at your own risk.",
+            );
+            ui.horizontal(|ui| {
+                ui.label("Discord user token");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.settings.discord_token)
+                        .password(true)
+                        .desired_width(280.0),
+                );
+            });
+            let token_set = !self.settings.discord_token.trim().is_empty();
+            if !token_set {
+                ui.colored_label(
+                    egui::Color32::from_rgb(0xe0, 0xb0, 0x6c),
+                    "⚠ Paste your Discord token above to enable import.",
+                );
+            }
+            ui.add_enabled_ui(token_set, |ui| {
+                ui.checkbox(
+                    &mut self.settings.discord_schedule,
+                    "Import schedules from Discord events",
+                )
+                .on_hover_text(
+                    "Sweeps your Discord servers a few hours apart (and on a manual reload), \
+                     matching scheduled events to your monitors by stream URL. Discord events are \
+                     only used for channels without a published Twitch/YouTube schedule.",
                 );
             });
 
