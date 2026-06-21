@@ -37,6 +37,8 @@ const K_WEBSUB_TOKEN: &str = "websub_token";
 const K_WEBSUB_POLL: &str = "websub_poll_secs";
 /// Whether Streams rows get a status background tint (recording / ad / error).
 const K_STATUS_BGCOLOR: &str = "status_bgcolor";
+/// How dates/timestamps are formatted throughout the UI (see [`DateFmt`]).
+const K_DATE_FORMAT: &str = "date_format";
 
 /// Browsers yt-dlp can read cookies from (for the Settings dropdown).
 const COOKIE_BROWSERS: [&str; 8] = [
@@ -265,6 +267,8 @@ struct SettingsForm {
     websub_poll_secs: String,
     /// When to probe captures for the {resolution}/{fps}/… filename variables.
     filename_media_info: MediaInfoMode,
+    /// How dates/timestamps are displayed throughout the UI.
+    date_fmt: DateFmt,
 }
 
 pub struct StreamArchiverApp {
@@ -380,7 +384,10 @@ impl StreamArchiverApp {
                 .flatten()
                 .unwrap_or_else(|| "15".into()),
             filename_media_info: MediaInfoMode::parse(&setting_or_empty(&core, K_FILENAME_MEDIA)),
+            date_fmt: DateFmt::parse(&setting_or_empty(&core, K_DATE_FORMAT)),
         };
+        // Apply the loaded date format before the first render.
+        set_active_date_fmt(settings.date_fmt);
 
         let twitch_flow = Arc::new(Mutex::new(match oauth::connected_login(&core.store) {
             Some(login) => AuthFlow::Connected { login },
@@ -610,6 +617,7 @@ impl StreamArchiverApp {
             (K_WEBSUB_TOKEN, s.websub_token.trim()),
             (K_WEBSUB_POLL, s.websub_poll_secs.trim()),
             (K_FILENAME_MEDIA, s.filename_media_info.as_str()),
+            (K_DATE_FORMAT, s.date_fmt.as_str()),
         ];
         for (k, v) in pairs {
             if let Err(e) = self.core.store.set_setting(k, v) {
@@ -617,6 +625,8 @@ impl StreamArchiverApp {
                 return;
             }
         }
+        // Apply the (possibly changed) date format to the live UI.
+        set_active_date_fmt(self.settings.date_fmt);
         self.status = "Settings saved.".into();
     }
 }
@@ -654,7 +664,102 @@ fn compose_browser_profile(browser: &str, profile: &str) -> String {
     }
 }
 
-/// Format a unix timestamp as a local `YYYY-MM-DD` date (empty if unset).
+/// User-selectable display format for dates/timestamps (the Settings "Date
+/// format" control). Read globally via [`active_date_fmt`] so the free-function
+/// formatters can honor it without threading the setting through every call site.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+enum DateFmt {
+    /// ISO 8601-style `2026-06-21` / `2026-06-21 14:02:33` (the default).
+    #[default]
+    Iso,
+    /// ISO without seconds: `2026-06-21 14:02`.
+    IsoNoSecs,
+    /// US `06/21/2026` / `06/21/2026 02:02 PM`.
+    Us,
+    /// European `21.06.2026` / `21.06.2026 14:02`.
+    Eu,
+    /// Compact, year-less `06-21` / `06-21 14:02:33` (narrowest).
+    Compact,
+}
+
+impl DateFmt {
+    const ALL: [DateFmt; 5] = [
+        DateFmt::Iso,
+        DateFmt::IsoNoSecs,
+        DateFmt::Us,
+        DateFmt::Eu,
+        DateFmt::Compact,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            DateFmt::Iso => "iso",
+            DateFmt::IsoNoSecs => "iso_no_secs",
+            DateFmt::Us => "us",
+            DateFmt::Eu => "eu",
+            DateFmt::Compact => "compact",
+        }
+    }
+
+    fn parse(s: &str) -> DateFmt {
+        match s {
+            "iso_no_secs" => DateFmt::IsoNoSecs,
+            "us" => DateFmt::Us,
+            "eu" => DateFmt::Eu,
+            "compact" => DateFmt::Compact,
+            _ => DateFmt::Iso,
+        }
+    }
+
+    /// chrono pattern for a date-only value.
+    fn date_pattern(self) -> &'static str {
+        match self {
+            DateFmt::Iso | DateFmt::IsoNoSecs => "%Y-%m-%d",
+            DateFmt::Us => "%m/%d/%Y",
+            DateFmt::Eu => "%d.%m.%Y",
+            DateFmt::Compact => "%m-%d",
+        }
+    }
+
+    /// chrono pattern for a full timestamp.
+    fn datetime_pattern(self) -> &'static str {
+        match self {
+            DateFmt::Iso => "%Y-%m-%d %H:%M:%S",
+            DateFmt::IsoNoSecs => "%Y-%m-%d %H:%M",
+            DateFmt::Us => "%m/%d/%Y %I:%M %p",
+            DateFmt::Eu => "%d.%m.%Y %H:%M",
+            DateFmt::Compact => "%m-%d %H:%M:%S",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            DateFmt::Iso => "ISO — 2026-06-21 14:02:33",
+            DateFmt::IsoNoSecs => "ISO, no seconds — 2026-06-21 14:02",
+            DateFmt::Us => "US — 06/21/2026 02:02 PM",
+            DateFmt::Eu => "EU — 21.06.2026 14:02",
+            DateFmt::Compact => "Compact — 06-21 14:02:33",
+        }
+    }
+}
+
+/// The active [`DateFmt`] discriminant (index into [`DateFmt::ALL`]). The UI runs
+/// single-threaded; this is a cheap shared cell set at startup and on save so the
+/// formatters below don't need the setting passed in.
+static ACTIVE_DATE_FMT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn active_date_fmt() -> DateFmt {
+    let i = ACTIVE_DATE_FMT.load(std::sync::atomic::Ordering::Relaxed) as usize;
+    DateFmt::ALL.get(i).copied().unwrap_or(DateFmt::Iso)
+}
+
+fn set_active_date_fmt(f: DateFmt) {
+    let i = DateFmt::ALL.iter().position(|&x| x == f).unwrap_or(0) as u8;
+    ACTIVE_DATE_FMT.store(i, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Format a unix timestamp as a local date in the active [`DateFmt`] (empty if
+/// unset).
 fn fmt_date(secs: i64) -> String {
     if secs <= 0 {
         return String::new();
@@ -662,13 +767,14 @@ fn fmt_date(secs: i64) -> String {
     chrono::DateTime::from_timestamp(secs, 0)
         .map(|dt| {
             dt.with_timezone(&chrono::Local)
-                .format("%Y-%m-%d")
+                .format(active_date_fmt().date_pattern())
                 .to_string()
         })
         .unwrap_or_default()
 }
 
-/// Compact local timestamp `MM-DD HH:MM:SS` (drops the year to save table width).
+/// Local timestamp in the active [`DateFmt`] (empty if unset). Used for the
+/// Polled / Went Live / Started On columns and the history tree.
 fn fmt_datetime_short(secs: i64) -> String {
     if secs <= 0 {
         return String::new();
@@ -676,10 +782,22 @@ fn fmt_datetime_short(secs: i64) -> String {
     chrono::DateTime::from_timestamp(secs, 0)
         .map(|dt| {
             dt.with_timezone(&chrono::Local)
-                .format("%m-%d %H:%M:%S")
+                .format(active_date_fmt().datetime_pattern())
                 .to_string()
         })
         .unwrap_or_default()
+}
+
+/// "Polled" cell text: the last-checked timestamp with the poll interval in
+/// parentheses, e.g. `2026-06-21 14:02:33 (60s)`. When never polled, shows just
+/// the interval `(60s)` so the configured cadence is still visible.
+fn fmt_polled(last_checked: Option<i64>, interval_secs: i64) -> String {
+    let when = fmt_datetime_short(last_checked.unwrap_or(0));
+    if when.is_empty() {
+        format!("({interval_secs}s)")
+    } else {
+        format!("{when} ({interval_secs}s)")
+    }
 }
 
 /// Format a duration in seconds as `HH:MM:SS`.
@@ -997,15 +1115,14 @@ struct StreamCol {
 /// just left of Name; the current Game/Title sit just right of State. Widths are
 /// floors — `Column::auto` shrinks tight columns to their content — except the
 /// `initial`-width columns, which start narrow and truncate (full value on hover).
-const STREAM_COLUMNS: [StreamCol; 20] = [
+const STREAM_COLUMNS: [StreamCol; 19] = [
     StreamCol { title: "On", tooltip: "Enable/disable monitoring. A channel's checkbox toggles all its instances at once.", min_width: 26.0, initial: 0.0, sortable: true },
     StreamCol { title: "Actions", tooltip: "Per-row actions: start/stop recording, edit, add instance, open folder, delete.", min_width: 126.0, initial: 0.0, sortable: false },
     StreamCol { title: "Plat", tooltip: "Source platform (icon): Twitch, YouTube, Kick, or a generic URL. A channel shows every platform among its instances.", min_width: 52.0, initial: 0.0, sortable: true },
     StreamCol { title: "Name", tooltip: "Channel (container) name. Expand it to see its instances and recording history.", min_width: 130.0, initial: 0.0, sortable: true },
     StreamCol { title: "Tool", tooltip: "Capture tool: streamlink, yt-dlp, or ffmpeg.", min_width: 60.0, initial: 0.0, sortable: true },
     StreamCol { title: "Detection", tooltip: "How a live stream is detected (API poll, page scrape, Twitch EventSub, or a generic probe).", min_width: 70.0, initial: 0.0, sortable: true },
-    StreamCol { title: "Every", tooltip: "Poll interval — how often this instance is checked for a live stream.", min_width: 44.0, initial: 0.0, sortable: true },
-    StreamCol { title: "Last poll", tooltip: "When this instance was last checked.", min_width: 92.0, initial: 0.0, sortable: true },
+    StreamCol { title: "Polled", tooltip: "When this instance was last checked, with its poll interval in parentheses (e.g. \"2026-06-21 14:02:33 (60s)\").", min_width: 100.0, initial: 0.0, sortable: true },
     StreamCol { title: "State", tooltip: "Current state (idle / live / recording / failed). Hover a failed row to see why it failed.", min_width: 66.0, initial: 0.0, sortable: true },
     StreamCol { title: "Game", tooltip: "Current game / category of the most recent recording (Twitch, Kick & YouTube — YouTube shows its broad content category; blank for generic URLs). Truncated — hover for the full name.", min_width: 60.0, initial: 96.0, sortable: true },
     StreamCol { title: "Title", tooltip: "Current stream title of the most recent recording (Twitch, Kick & YouTube; blank for generic URLs). Truncated — hover for the full title. Its full change history is in the Changes column.", min_width: 80.0, initial: 170.0, sortable: true },
@@ -1337,8 +1454,8 @@ fn channel_cells(channel: &Channel, monitors: &[&MonitorWithChannel], now: i64) 
         .max()
         .unwrap_or(0);
     // In STREAM_COLUMNS order: On, Actions(empty), Plat, Name, Tool, Detection,
-    // Every, Last poll, State, Game, Title, Went Live, Started On, Lost, Duration,
-    // Ads, Ad time, Ad-free, Changes, Added.
+    // Polled, State, Game, Title, Went Live, Started On, Lost, Duration, Ads,
+    // Ad time, Ad-free, Changes, Added.
     vec![
         Cell::num(
             if all_enabled { 1.0 } else { 0.0 },
@@ -1353,8 +1470,7 @@ fn channel_cells(channel: &Channel, monitors: &[&MonitorWithChannel], now: i64) 
         Cell::text(channel.name.clone()),
         Cell::text(tool),
         Cell::text(String::new()), // detection
-        Cell::text(String::new()), // every
-        Cell::num(last as f64, fmt_datetime_short(last)),
+        Cell::num(last as f64, fmt_datetime_short(last)), // polled (datetime only)
         Cell::text(if any_recording { "recording".to_string() } else { String::new() }),
         Cell::text(primary.last_recording_category.clone()),
         Cell::text(primary.last_recording_title.clone()),
@@ -1473,9 +1589,9 @@ fn render_instance_row(
     };
 
     let mut disclosure_clicked = false;
-    // Column order: On · Actions · Platform · Name · Tool · Detection · Every ·
-    // Last poll · State · Game · Title · Went Live · Started On · Lost · Duration ·
-    // Ads · Ad time · Ad-free · Changes · Added.
+    // Column order: On · Actions · Platform · Name · Tool · Detection · Polled ·
+    // State · Game · Title · Went Live · Started On · Lost · Duration · Ads ·
+    // Ad time · Ad-free · Changes · Added.
     tr.col(|ui| {
         let mut on = m.enabled;
         let cb = ui.checkbox(&mut on, "");
@@ -1546,10 +1662,16 @@ fn render_instance_row(
         ));
     });
     tr.col(|ui| {
-        ui.label(format!("{}s", m.poll_interval_secs));
-    });
-    tr.col(|ui| {
-        ui.label(fmt_datetime_short(m.last_checked_at.unwrap_or(0)));
+        ui.label(fmt_polled(m.last_checked_at, m.poll_interval_secs))
+            .on_hover_text(format!(
+                "Last checked {} · polled every {}s",
+                if m.last_checked_at.unwrap_or(0) > 0 {
+                    fmt_datetime_short(m.last_checked_at.unwrap_or(0))
+                } else {
+                    "never".to_string()
+                },
+                m.poll_interval_secs,
+            ));
     });
     tr.col(|ui| {
         let resp = ui.label(&m.last_state);
@@ -3315,7 +3437,6 @@ impl StreamArchiverApp {
                                         });
                                     });
                                     tr.col(|_ui| {}); // detection
-                                    tr.col(|_ui| {}); // every
                                     tr.col(|ui| {
                                         ui.label(fmt_datetime_short(last_poll));
                                     });
@@ -3493,8 +3614,7 @@ impl StreamArchiverApp {
                                     });
                                     tr.col(|_ui| {}); // tool
                                     tr.col(|_ui| {}); // detection
-                                    tr.col(|_ui| {}); // every
-                                    tr.col(|_ui| {}); // last poll
+                                    tr.col(|_ui| {}); // polled
                                     tr.col(|ui| {
                                         let resp =
                                             ui.colored_label(rec_status_color(g.status()), g.status());
@@ -3627,8 +3747,7 @@ impl StreamArchiverApp {
                                     });
                                     tr.col(|_ui| {}); // tool
                                     tr.col(|_ui| {}); // detection
-                                    tr.col(|_ui| {}); // every
-                                    tr.col(|_ui| {}); // last poll
+                                    tr.col(|_ui| {}); // polled
                                     tr.col(|ui| {
                                         let resp =
                                             ui.colored_label(rec_status_color(&t.status), &t.status);
@@ -4023,6 +4142,21 @@ impl StreamArchiverApp {
                             }
                         });
                     ui.end_row();
+
+                    ui.label("Date format").on_hover_text(
+                        "How dates and timestamps are shown throughout the app \
+                         (the Polled / Went Live / Started On / Added columns, the \
+                         history tree, etc.). Applies on Save.",
+                    );
+                    let df = &mut self.settings.date_fmt;
+                    egui::ComboBox::from_id_salt("date_fmt_cb")
+                        .selected_text(df.label())
+                        .show_ui(ui, |ui| {
+                            for f in DateFmt::ALL {
+                                ui.selectable_value(df, f, f.label());
+                            }
+                        });
+                    ui.end_row();
                 });
 
             ui.add_space(12.0);
@@ -4343,7 +4477,41 @@ impl StreamArchiverApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{compose_browser_profile, split_browser_profile};
+    use super::{
+        DateFmt, active_date_fmt, compose_browser_profile, fmt_polled, set_active_date_fmt,
+        split_browser_profile,
+    };
+
+    #[test]
+    fn date_fmt_parse_roundtrip() {
+        for f in DateFmt::ALL {
+            assert_eq!(DateFmt::parse(f.as_str()), f);
+        }
+        // Unknown / empty falls back to the ISO default.
+        assert_eq!(DateFmt::parse("bogus"), DateFmt::Iso);
+        assert_eq!(DateFmt::parse(""), DateFmt::Iso);
+    }
+
+    #[test]
+    fn active_date_fmt_roundtrip() {
+        for f in DateFmt::ALL {
+            set_active_date_fmt(f);
+            assert_eq!(active_date_fmt(), f);
+        }
+        set_active_date_fmt(DateFmt::Iso); // restore default for other tests
+    }
+
+    #[test]
+    fn fmt_polled_shows_interval() {
+        // Never polled -> just the interval, so the cadence is still visible.
+        assert_eq!(fmt_polled(None, 60), "(60s)");
+        assert_eq!(fmt_polled(Some(0), 30), "(30s)");
+        // Polled -> "<timestamp> (Ns)"; the timestamp is local/tz-dependent, so
+        // assert only the stable suffix and that a timestamp is present.
+        let s = fmt_polled(Some(1_700_000_000), 45);
+        assert!(s.ends_with(" (45s)"), "got {s:?}");
+        assert!(s.len() > " (45s)".len());
+    }
 
     #[test]
     fn browser_profile_roundtrip() {
