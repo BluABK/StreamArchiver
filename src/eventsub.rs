@@ -355,13 +355,18 @@ async fn read_welcome(
     >,
 ) -> Result<(String, u64)> {
     use tokio_tungstenite::tungstenite::Message;
-    // The welcome must arrive within ~10s.
-    let msg = timeout(Duration::from_secs(15), ws.next())
-        .await
-        .context("timed out waiting for session_welcome")?
-        .context("websocket closed before welcome")??;
-    let Message::Text(text) = msg else {
-        bail!("expected text welcome frame");
+    // The welcome must arrive within ~10s. Skip non-text frames (e.g. Ping)
+    // that may precede it; reply to Pings so the server doesn't drop us.
+    let text = loop {
+        let msg = timeout(Duration::from_secs(15), ws.next())
+            .await
+            .context("timed out waiting for session_welcome")?
+            .context("websocket closed before welcome")??;
+        match msg {
+            Message::Text(t) => break t,
+            Message::Ping(p) => { let _ = ws.send(Message::Pong(p)).await; }
+            _ => {}
+        }
     };
     let v: Value = serde_json::from_str(&text)?;
     if v["metadata"]["message_type"].as_str() != Some("session_welcome") {

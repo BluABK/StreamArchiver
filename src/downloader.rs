@@ -1227,6 +1227,9 @@ impl Supervisor {
             status: status.into(),
         });
         info!(monitor_id, bytes, status, "recording finished");
+        if status == "failed" && !outcome.log.is_empty() {
+            warn!(monitor_id, "recording stderr:\n{}", outcome.log);
+        }
 
         self.note_result(monitor_id, duration, ok);
         self.active.lock().unwrap().remove(&monitor_id);
