@@ -169,10 +169,16 @@ confirmed.
 
 ### Row actions & shortcuts
 
-Left-click a row to select it; **right-click** any row for a context menu:
+Left-click a row to select it; **right-click** any row — channel, instance,
+stream, or take — for a context menu with that row's actions. For an instance:
 Start/Stop recording, **Open channel URL** (browser), **Open output folder** (file
-manager), **Copy URL**, Edit…, Add tool instance, Enable/Disable, and Delete. The
-inline per-row buttons (▶/⏹ ✏ ➕ 🗑) do the same.
+manager), **Copy URL**, Edit…, Add tool instance, Enable/Disable, and Delete. A
+stream/take row's menu offers Open folder / Open file / Copy path (and Delete for
+a take). The inline per-row buttons (▶/⏹ ✏ ➕ 🗑) do the same.
+
+The inline **Actions** column can be hidden via **Settings → Display → Show
+Actions column** (applies to the Streams and Videos tables) to reclaim width — the
+right-click context menu still provides every action.
 
 Keyboard shortcuts:
 

@@ -39,6 +39,9 @@ const K_WEBSUB_POLL: &str = "websub_poll_secs";
 const K_STATUS_BGCOLOR: &str = "status_bgcolor";
 /// How dates/timestamps are formatted throughout the UI (see [`DateFmt`]).
 const K_DATE_FORMAT: &str = "date_format";
+/// Whether the per-row Actions column is shown (the row context menu has the same
+/// actions, so it can be hidden to reclaim width).
+const K_SHOW_ACTIONS: &str = "show_actions";
 
 /// Browsers yt-dlp can read cookies from (for the Settings dropdown).
 const COOKIE_BROWSERS: [&str; 8] = [
@@ -342,6 +345,10 @@ pub struct StreamArchiverApp {
     /// Toggled from the top bar; persisted under [`K_STATUS_BGCOLOR`]. Keyboard
     /// row selection is still highlighted regardless.
     status_bgcolor: bool,
+    /// Whether the per-row Actions column (inline action buttons) is shown in the
+    /// Streams + Videos tables. Off reclaims width; every action is also on the
+    /// row's right-click context menu. Persisted under [`K_SHOW_ACTIONS`].
+    show_actions: bool,
 }
 
 impl StreamArchiverApp {
@@ -413,6 +420,14 @@ impl StreamArchiverApp {
             .flatten()
             .map(|v| v != "0")
             .unwrap_or(true);
+        // The Actions column defaults on; only an explicit "0" hides it.
+        let show_actions = core
+            .store
+            .get_setting(K_SHOW_ACTIONS)
+            .ok()
+            .flatten()
+            .map(|v| v != "0")
+            .unwrap_or(true);
 
         let download_defaults = core
             .store
@@ -459,6 +474,7 @@ impl StreamArchiverApp {
             videos_filters: vec![String::new(); VIDEO_COLS],
             twitch_flow,
             status_bgcolor,
+            show_actions,
         };
         app.reload_rows();
         app.reload_videos();
@@ -1140,12 +1156,14 @@ fn fmt_speed(bytes_per_sec: f64) -> String {
 
 // ─── Sortable + filterable tables ───────────────────────────────────────────
 //
-// Both tables share a tiny model: each row is turned into a `Vec<Cell>` (one per
-// sortable/filterable column, in header order; the trailing "Actions" column is
-// excluded). The header renders a click-to-sort title + a per-column filter box;
-// `ordered_rows` filters then sorts and returns the surviving original-row
-// indices in display order. The data cells themselves are still drawn by the
-// existing per-row code, indexed by those original indices.
+// Both tables share a tiny model: each row is turned into a `Vec<Cell>` in header
+// order. Videos excludes its trailing Actions column (`VIDEO_COLS` = 9); Streams
+// keeps a (non-sortable, empty) Actions placeholder slot so the model indices line
+// up with `STREAM_COLUMNS` (`STREAM_COLS`). The header renders a click-to-sort
+// title + a per-column filter box; `ordered_rows` filters then sorts and returns
+// the surviving original-row indices in display order. The data cells themselves
+// are still drawn by the existing per-row code, indexed by those original indices.
+// (The optional Actions column is skipped at render time, not in the model.)
 
 /// Sortable/filterable Videos columns (Video..File; excludes Actions).
 const VIDEO_COLS: usize = 9;
@@ -1194,6 +1212,11 @@ const STREAM_COLUMNS: [StreamCol; 19] = [
 
 /// Total Streams columns (includes the non-sortable Actions slot).
 const STREAM_COLS: usize = STREAM_COLUMNS.len();
+
+/// Index of the optional Actions column in [`STREAM_COLUMNS`]. When the Actions
+/// column is hidden, this column is skipped in the builder, header, and every row
+/// renderer (kept in the sort/filter model — it's a non-sortable, empty slot).
+const STREAM_ACTIONS_COL: usize = 1;
 
 /// Which column a table is sorted by and in what direction. `col == None` keeps
 /// the natural (database) order.
@@ -1588,6 +1611,7 @@ fn render_instance_row(
     depth: usize,
     has_history: bool,
     expanded: bool,
+    show_actions: bool,
     a: &mut RowActions,
 ) -> bool {
     let m = &row.monitor;
@@ -1657,44 +1681,46 @@ fn render_instance_row(
         }
         cb.context_menu(|ui| add_menu(ui, a));
     });
-    tr.col(|ui| {
-        ui.push_id(m.id, |ui| {
-            let mut btns: Vec<egui::Response> = Vec::with_capacity(4);
-            if recording {
-                let b = ui.small_button("⏹").on_hover_text("Stop / abort recording");
+    if show_actions {
+        tr.col(|ui| {
+            ui.push_id(m.id, |ui| {
+                let mut btns: Vec<egui::Response> = Vec::with_capacity(4);
+                if recording {
+                    let b = ui.small_button("⏹").on_hover_text("Stop / abort recording");
+                    if b.clicked() {
+                        a.stop = Some(m.id);
+                    }
+                    btns.push(b);
+                } else {
+                    let b = ui
+                        .small_button("▶")
+                        .on_hover_text("Start recording now (checks if live)");
+                    if b.clicked() {
+                        a.start = Some(m.id);
+                    }
+                    btns.push(b);
+                }
+                let b = ui.small_button("✏").on_hover_text("Edit");
                 if b.clicked() {
-                    a.stop = Some(m.id);
+                    a.edit = Some(m.id);
                 }
                 btns.push(b);
-            } else {
-                let b = ui
-                    .small_button("▶")
-                    .on_hover_text("Start recording now (checks if live)");
+                let b = ui.small_button("➕").on_hover_text("Add another tool instance");
                 if b.clicked() {
-                    a.start = Some(m.id);
+                    a.add_instance = Some(row.channel.id);
                 }
                 btns.push(b);
-            }
-            let b = ui.small_button("✏").on_hover_text("Edit");
-            if b.clicked() {
-                a.edit = Some(m.id);
-            }
-            btns.push(b);
-            let b = ui.small_button("➕").on_hover_text("Add another tool instance");
-            if b.clicked() {
-                a.add_instance = Some(row.channel.id);
-            }
-            btns.push(b);
-            let b = ui.small_button("🗑").on_hover_text("Delete this instance");
-            if b.clicked() {
-                a.delete = Some((m.id, row.channel.name.clone()));
-            }
-            btns.push(b);
-            for b in &btns {
-                b.context_menu(|ui| add_menu(ui, a));
-            }
+                let b = ui.small_button("🗑").on_hover_text("Delete this instance");
+                if b.clicked() {
+                    a.delete = Some((m.id, row.channel.name.clone()));
+                }
+                btns.push(b);
+                for b in &btns {
+                    b.context_menu(|ui| add_menu(ui, a));
+                }
+            });
         });
-    });
+    }
     tr.col(|ui| {
         platform_icon(ui, ptex, m.platform()).on_hover_text(m.platform().label());
     });
@@ -2473,6 +2499,9 @@ impl StreamArchiverApp {
             .get_or_insert_with(|| PlatformTextures::load(ui.ctx()))
             .clone();
         let status_bgcolor = self.status_bgcolor;
+        // Whether the Actions column is shown (Settings → Display). Skipped in the
+        // builder, header, and each row when off so the column counts match.
+        let show_actions = self.show_actions;
 
         egui::ScrollArea::both()
             .auto_shrink([false, false])
@@ -2480,7 +2509,7 @@ impl StreamArchiverApp {
                 // Non-selectable labels so a right-click reaches the row (menu).
                 ui.style_mut().interaction.selectable_labels = false;
                 let sel_color = ui.visuals().selection.bg_fill;
-                let table = TableBuilder::new(ui)
+                let mut tb = TableBuilder::new(ui)
                     .striped(true)
                     .resizable(true)
                     .sense(egui::Sense::click())
@@ -2493,8 +2522,11 @@ impl StreamArchiverApp {
                     .column(Column::auto().at_least(82.0)) // speed
                     .column(Column::auto().at_least(72.0)) // size
                     .column(Column::auto().at_least(80.0)) // added
-                    .column(Column::auto().at_least(160.0)) // file
-                    .column(Column::remainder().at_least(150.0)) // actions
+                    .column(Column::auto().at_least(160.0)); // file
+                if show_actions {
+                    tb = tb.column(Column::remainder().at_least(150.0)); // actions
+                }
+                let table = tb
                     .header(46.0, |mut header| {
                         // (title, hover tooltip) per sortable column.
                         let cols: [(&str, &str); 9] = [
@@ -2513,11 +2545,13 @@ impl StreamArchiverApp {
                                 sort_filter_header(ui, i, t, tip, true, &mut sort, &mut filters[i]);
                             });
                         }
-                        header.col(|ui| {
-                            ui.strong("Actions").on_hover_text(
-                                "Per-row actions: stop / retry, open file, open folder, copy URL, delete.",
-                            );
-                        });
+                        if show_actions {
+                            header.col(|ui| {
+                                ui.strong("Actions").on_hover_text(
+                                    "Per-row actions: stop / retry, open file, open folder, copy URL, delete.",
+                                );
+                            });
+                        }
                     });
                 table.body(|mut body| {
                         let order = ordered_rows(&model, &sort, &filters);
@@ -2657,6 +2691,7 @@ impl StreamArchiverApp {
                                         ui.label(&v.output_path).on_hover_text(&v.output_path);
                                     }
                                 });
+                                if show_actions {
                                 tr.col(|ui| {
                                     ui.push_id(v.id, |ui| {
                                         let mut btns: Vec<egui::Response> = Vec::with_capacity(5);
@@ -2716,6 +2751,7 @@ impl StreamArchiverApp {
                                         }
                                     });
                                 });
+                                }
 
                                 // Right-click anywhere on the row opens the menu.
                                 tr.response()
@@ -3394,6 +3430,9 @@ impl StreamArchiverApp {
         }
         // Whether status row tints are drawn (top-bar "Status bgcolor" toggle).
         let status_bgcolor = self.status_bgcolor;
+        // Whether the Actions column is shown (Settings → Display). When off it's
+        // skipped in the builder, header, and every renderer so the counts match.
+        let show_actions = self.show_actions;
 
         // Fill the available height so the horizontal scrollbar sits at the
         // bottom of the window rather than directly under the (short) row list.
@@ -3421,8 +3460,13 @@ impl StreamArchiverApp {
                     .sense(egui::Sense::click())
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
                 // One column per descriptor — count is guaranteed to match the
-                // header and the per-row cells (all driven by STREAM_COLUMNS).
-                for c in &STREAM_COLUMNS {
+                // header and the per-row cells (all driven by STREAM_COLUMNS). The
+                // Actions column is skipped (here, in the header, and in every
+                // renderer) when hidden, so the counts still match.
+                for (i, c) in STREAM_COLUMNS.iter().enumerate() {
+                    if !show_actions && i == STREAM_ACTIONS_COL {
+                        continue;
+                    }
                     let col = if c.initial > 0.0 {
                         // Content-capped column (Title / Game): start narrow and
                         // clip — the cell truncates and shows the full text on hover.
@@ -3434,6 +3478,9 @@ impl StreamArchiverApp {
                 }
                 let table = tb.header(46.0, |mut header| {
                     for (i, c) in STREAM_COLUMNS.iter().enumerate() {
+                        if !show_actions && i == STREAM_ACTIONS_COL {
+                            continue;
+                        }
                         header.col(|ui| {
                             if c.sortable {
                                 sort_filter_header(
@@ -3543,31 +3590,33 @@ impl StreamArchiverApp {
                                             toggle_channel_enabled = Some((cid, on));
                                         }
                                     });
-                                    tr.col(|ui| {
-                                        ui.push_id(cid, |ui| {
-                                            if ui
-                                                .small_button("➕")
-                                                .on_hover_text("Add an instance to this channel")
-                                                .clicked()
-                                            {
-                                                acts.add_instance = Some(cid);
-                                            }
-                                            if ui
-                                                .small_button("✏")
-                                                .on_hover_text("Rename channel")
-                                                .clicked()
-                                            {
-                                                rename_channel = Some(cid);
-                                            }
-                                            if ui
-                                                .small_button("🗑")
-                                                .on_hover_text("Delete channel and all its instances")
-                                                .clicked()
-                                            {
-                                                delete_channel = Some((cid, ch.name.clone()));
-                                            }
+                                    if show_actions {
+                                        tr.col(|ui| {
+                                            ui.push_id(cid, |ui| {
+                                                if ui
+                                                    .small_button("➕")
+                                                    .on_hover_text("Add an instance to this channel")
+                                                    .clicked()
+                                                {
+                                                    acts.add_instance = Some(cid);
+                                                }
+                                                if ui
+                                                    .small_button("✏")
+                                                    .on_hover_text("Rename channel")
+                                                    .clicked()
+                                                {
+                                                    rename_channel = Some(cid);
+                                                }
+                                                if ui
+                                                    .small_button("🗑")
+                                                    .on_hover_text("Delete channel and all its instances")
+                                                    .clicked()
+                                                {
+                                                    delete_channel = Some((cid, ch.name.clone()));
+                                                }
+                                            });
                                         });
-                                    });
+                                    }
                                     tr.col(|ui| {
                                         platform_icons(ui, &ptex, &platforms);
                                     });
@@ -3699,7 +3748,7 @@ impl StreamArchiverApp {
                                 body.row(24.0, |mut tr| {
                                     if render_instance_row(
                                         &mut tr, row, &ptex, now, recording, tint.is_some(), depth,
-                                        has_hist, expanded, &mut acts,
+                                        has_hist, expanded, show_actions, &mut acts,
                                     ) {
                                         toggle_instance = Some(mid);
                                     }
@@ -3725,6 +3774,11 @@ impl StreamArchiverApp {
                                             .parent()
                                             .map(|p| p.to_path_buf())
                                     });
+                                // A single-take stream maps to one file (offer it in
+                                // the context menu); multi-take streams don't.
+                                let single_file = (g.takes.len() == 1
+                                    && !g.takes[0].output_path.is_empty())
+                                .then(|| g.takes[0].output_path.clone());
                                 let ad_count = g.ad_count();
                                 let ad_secs = g.ad_secs();
                                 // A single-take stream carries the cut detail on its
@@ -3740,16 +3794,19 @@ impl StreamArchiverApp {
                                 body.row(24.0, |mut tr| {
                                     let mut disc = false;
                                     tr.col(|_ui| {}); // on
-                                    tr.col(|ui| {
-                                        let ok = dir.as_ref().map(|d| d.is_dir()).unwrap_or(false);
-                                        if ui
-                                            .add_enabled(ok, egui::Button::new("📂").small())
-                                            .on_hover_text("Open folder")
-                                            .clicked()
-                                        {
-                                            open_path = dir.clone();
-                                        }
-                                    });
+                                    if show_actions {
+                                        tr.col(|ui| {
+                                            let ok =
+                                                dir.as_ref().map(|d| d.is_dir()).unwrap_or(false);
+                                            if ui
+                                                .add_enabled(ok, egui::Button::new("📂").small())
+                                                .on_hover_text("Open folder")
+                                                .clicked()
+                                            {
+                                                open_path = dir.clone();
+                                            }
+                                        });
+                                    }
                                     tr.col(|_ui| {}); // platform
                                     tr.col(|ui| {
                                         disc = tree_name(
@@ -3831,6 +3888,46 @@ impl StreamArchiverApp {
                                         }
                                     });
                                     tr.col(|_ui| {}); // added
+                                    tr.response().context_menu(|ui| {
+                                        ui.set_min_width(180.0);
+                                        let dir_ok =
+                                            dir.as_ref().map(|d| d.is_dir()).unwrap_or(false);
+                                        if ui
+                                            .add_enabled(dir_ok, egui::Button::new("📂  Open folder"))
+                                            .clicked()
+                                        {
+                                            open_path = dir.clone();
+                                            ui.close();
+                                        }
+                                        if let Some(f) = &single_file {
+                                            let file_ok = std::path::Path::new(f).is_file();
+                                            if ui
+                                                .add_enabled(
+                                                    file_ok,
+                                                    egui::Button::new("▶  Open file"),
+                                                )
+                                                .clicked()
+                                            {
+                                                open_path = Some(std::path::PathBuf::from(f));
+                                                ui.close();
+                                            }
+                                            if ui.button("📋  Copy file path").clicked() {
+                                                copy_text = Some(f.clone());
+                                                ui.close();
+                                            }
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                dir.is_some(),
+                                                egui::Button::new("📋  Copy folder path"),
+                                            )
+                                            .clicked()
+                                        {
+                                            copy_text =
+                                                dir.as_ref().map(|d| d.to_string_lossy().into_owned());
+                                            ui.close();
+                                        }
+                                    });
                                     if disc {
                                         toggle_stream = Some(g.key.clone());
                                     }
@@ -3843,54 +3940,56 @@ impl StreamArchiverApp {
                                     .map(|p| p.to_path_buf());
                                 body.row(24.0, |mut tr| {
                                     tr.col(|_ui| {}); // on
-                                    tr.col(|ui| {
-                                        ui.push_id(t.id, |ui| {
-                                            let file_ok = !t.output_path.is_empty()
-                                                && std::path::Path::new(&t.output_path).is_file();
-                                            if ui
-                                                .add_enabled(file_ok, egui::Button::new("▶").small())
-                                                .on_hover_text("Open file")
-                                                .clicked()
-                                            {
-                                                open_path =
-                                                    Some(std::path::PathBuf::from(&t.output_path));
-                                            }
-                                            let dir_ok =
-                                                dir.as_ref().map(|d| d.is_dir()).unwrap_or(false);
-                                            if ui
-                                                .add_enabled(dir_ok, egui::Button::new("📂").small())
-                                                .on_hover_text("Open folder")
-                                                .clicked()
-                                            {
-                                                open_path = dir.clone();
-                                            }
-                                            if ui
-                                                .add_enabled(
-                                                    !t.output_path.is_empty(),
-                                                    egui::Button::new("📋").small(),
-                                                )
-                                                .on_hover_text("Copy file path")
-                                                .clicked()
-                                            {
-                                                copy_text = Some(t.output_path.clone());
-                                            }
-                                            let del_hint = if t.is_active() {
-                                                "Stop the recording before removing this take"
-                                            } else {
-                                                "Remove this take from the list (keeps the file)"
-                                            };
-                                            if ui
-                                                .add_enabled(
-                                                    !t.is_active(),
-                                                    egui::Button::new("🗑").small(),
-                                                )
-                                                .on_hover_text(del_hint)
-                                                .clicked()
-                                            {
-                                                delete_recording = Some(t.id);
-                                            }
+                                    if show_actions {
+                                        tr.col(|ui| {
+                                            ui.push_id(t.id, |ui| {
+                                                let file_ok = !t.output_path.is_empty()
+                                                    && std::path::Path::new(&t.output_path).is_file();
+                                                if ui
+                                                    .add_enabled(file_ok, egui::Button::new("▶").small())
+                                                    .on_hover_text("Open file")
+                                                    .clicked()
+                                                {
+                                                    open_path =
+                                                        Some(std::path::PathBuf::from(&t.output_path));
+                                                }
+                                                let dir_ok =
+                                                    dir.as_ref().map(|d| d.is_dir()).unwrap_or(false);
+                                                if ui
+                                                    .add_enabled(dir_ok, egui::Button::new("📂").small())
+                                                    .on_hover_text("Open folder")
+                                                    .clicked()
+                                                {
+                                                    open_path = dir.clone();
+                                                }
+                                                if ui
+                                                    .add_enabled(
+                                                        !t.output_path.is_empty(),
+                                                        egui::Button::new("📋").small(),
+                                                    )
+                                                    .on_hover_text("Copy file path")
+                                                    .clicked()
+                                                {
+                                                    copy_text = Some(t.output_path.clone());
+                                                }
+                                                let del_hint = if t.is_active() {
+                                                    "Stop the recording before removing this take"
+                                                } else {
+                                                    "Remove this take from the list (keeps the file)"
+                                                };
+                                                if ui
+                                                    .add_enabled(
+                                                        !t.is_active(),
+                                                        egui::Button::new("🗑").small(),
+                                                    )
+                                                    .on_hover_text(del_hint)
+                                                    .clicked()
+                                                {
+                                                    delete_recording = Some(t.id);
+                                                }
+                                            });
                                         });
-                                    });
+                                    }
                                     tr.col(|_ui| {}); // platform
                                     tr.col(|ui| {
                                         tree_name(
@@ -3966,6 +4065,55 @@ impl StreamArchiverApp {
                                         }
                                     });
                                     tr.col(|_ui| {}); // added
+                                    tr.response().context_menu(|ui| {
+                                        ui.set_min_width(180.0);
+                                        let file_ok = !t.output_path.is_empty()
+                                            && std::path::Path::new(&t.output_path).is_file();
+                                        if ui
+                                            .add_enabled(file_ok, egui::Button::new("▶  Open file"))
+                                            .clicked()
+                                        {
+                                            open_path =
+                                                Some(std::path::PathBuf::from(&t.output_path));
+                                            ui.close();
+                                        }
+                                        let dir_ok =
+                                            dir.as_ref().map(|d| d.is_dir()).unwrap_or(false);
+                                        if ui
+                                            .add_enabled(dir_ok, egui::Button::new("📂  Open folder"))
+                                            .clicked()
+                                        {
+                                            open_path = dir.clone();
+                                            ui.close();
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                !t.output_path.is_empty(),
+                                                egui::Button::new("📋  Copy file path"),
+                                            )
+                                            .clicked()
+                                        {
+                                            copy_text = Some(t.output_path.clone());
+                                            ui.close();
+                                        }
+                                        ui.separator();
+                                        let del_hint = if t.is_active() {
+                                            "Stop the recording before removing this take"
+                                        } else {
+                                            "Remove this take from the list (keeps the file)"
+                                        };
+                                        if ui
+                                            .add_enabled(
+                                                !t.is_active(),
+                                                egui::Button::new("🗑  Delete from list"),
+                                            )
+                                            .on_hover_text(del_hint)
+                                            .clicked()
+                                        {
+                                            delete_recording = Some(t.id);
+                                            ui.close();
+                                        }
+                                    });
                                 });
                             }
                         }
@@ -4322,6 +4470,23 @@ impl StreamArchiverApp {
                 });
 
             ui.add_space(12.0);
+            ui.heading("Display");
+            if ui
+                .checkbox(&mut self.show_actions, "Show Actions column")
+                .on_hover_text(
+                    "Show the per-row Actions buttons column in the Streams and Videos \
+                     tables. Turn it off to reclaim width — every action is also on each \
+                     row's right-click context menu. Applies immediately.",
+                )
+                .changed()
+            {
+                let _ = self.core.store.set_setting(
+                    K_SHOW_ACTIONS,
+                    if self.show_actions { "1" } else { "0" },
+                );
+            }
+
+            ui.add_space(12.0);
             ui.heading("Download authentication");
             ui.label("Default for capturing sub-only / members-only / ad-reduced streams. Per-channel settings override this.");
             egui::Grid::new("auth_grid")
@@ -4644,6 +4809,16 @@ mod tests {
         compose_browser_profile, fmt_polled, meta_change_lines, set_active_date_fmt,
         split_browser_profile,
     };
+
+    #[test]
+    fn actions_col_index_is_actions() {
+        // The optional-Actions logic skips this index in the builder/header/rows;
+        // guard that it actually points at the Actions column.
+        assert_eq!(
+            super::STREAM_COLUMNS[super::STREAM_ACTIONS_COL].title,
+            "Actions"
+        );
+    }
 
     #[test]
     fn stream_meta_aggregation_dedups_rebaseline() {
