@@ -354,28 +354,39 @@ scrapes (the API needs the live video id and returns no better category).
 ### Schedule (calendar)
 
 The **Schedule** tab shows every upcoming scheduled stream (from the same Twitch +
-YouTube sources as the Next stream column) in a **month calendar**:
+YouTube sources as the Next stream column) in a calendar, with **Month**, **Week**,
+and **Day** views (picked from the buttons in the header):
 
-- **Navigation** — `◀` / `▶` step months, **Today** jumps back to the current
-  month, `⟳` (or **F5**) reloads from the store. Today's cell is tinted.
-- **Day cells** show up to three streams as chips (platform icon + start time +
-  channel). **Click** a day number — or the **+N more…** when a day is busy — to
-  open a popup listing that day's full schedule.
-- **Right-click** any stream (chip or day popup) to **copy** its URL, platform,
-  title, channel, or full details, or **open it in the browser**. The day popup
-  also has **Copy all**. Hover a stream for its full details.
+- **Month** — a 6×7 grid; each day cell shows up to three streams as chips
+  (platform icon + start time + channel). **Click** a day number, or the
+  **+N more…** when a day is busy, to open that day's full list.
+- **Week** — seven day columns (Mon–Sun), each listing *all* of that day's streams.
+- **Day** — a detailed, time-sorted list of one day's streams (time · platform ·
+  channel — title (category)).
+- **Navigation** — `◀` / `▶` step by the current view (month/week/day), **Today**
+  returns to now. Today is tinted/highlighted.
+- **Right-click** any stream (chip, day list, or popup) to **copy** its URL,
+  platform, title, channel, or full details, or **open it in the browser**. The
+  day popup also has **Copy all**. Hover a stream for its full details.
 - **Left sidebar** filters which channels are shown: an **All channels** toggle
   plus a per-channel checkbox (with each channel's platform icon and upcoming
   count). Newly-added channels default to visible.
 - **Highlight collisions** (on by default) flags with a `⚠` any streams whose
   times overlap — handy for spotting clashes across channels. YouTube upcoming
   streams carry no end time, so they're treated as two hours long for the overlap
-  check. The header shows how many overlapping streams are visible in the month
-  on screen.
+  check. The header shows how many overlapping streams are visible in the current
+  view.
 
-Times respect the **date format** setting (12- vs 24-hour). The calendar reads the
-stored schedule, so use `⟳` / **F5** after the background refresh to pull in newly
-fetched streams.
+Times respect the **date format** setting (12- vs 24-hour). `⟳` (or **F5** on the
+tab) **fetches the latest schedules from Twitch/YouTube right away** — it doesn't
+just re-read the stored copy — and the calendar updates when the fetch returns
+(schedules also refresh in the background every few hours).
+
+> **Note:** the schedule comes from a channel's *published upcoming schedule*.
+> On Twitch that's the streamer's **Schedule** feature — if a channel hasn't set
+> one up, Twitch's API returns no segments and the channel shows nothing here,
+> even though its *past* broadcasts still appear on the channel's Twitch schedule
+> page. YouTube uses the channel's upcoming/scheduled livestreams.
 
 ### Chat logs
 

@@ -49,6 +49,9 @@ pub struct AppCore {
     pub shutdown: Arc<AtomicBool>,
     /// Sends on-demand Start/Stop commands to the supervisor (set in `start`).
     manual_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::events::ManualCommand>>>,
+    /// Notified to make the schedule refresher do an immediate forced pass (the
+    /// UI "reload" action), instead of waiting out its periodic tick.
+    schedule_refresh: Arc<tokio::sync::Notify>,
 }
 
 impl AppCore {
@@ -70,6 +73,7 @@ impl AppCore {
             ad_active: Arc::new(Mutex::new(HashMap::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             manual_tx: Mutex::new(None),
+            schedule_refresh: Arc::new(tokio::sync::Notify::new()),
         }))
     }
 
@@ -137,8 +141,10 @@ impl AppCore {
         let sch_ctx = ctx.clone();
         let sch_events = self.events.clone();
         let sch_shutdown = self.shutdown.clone();
+        let sch_refresh = self.schedule_refresh.clone();
         self.rt.spawn(async move {
-            crate::detectors::refresh_schedules(sch_ctx, sch_events, sch_shutdown).await;
+            crate::detectors::refresh_schedules(sch_ctx, sch_events, sch_shutdown, sch_refresh)
+                .await;
         });
 
         // Supervisor: live signals + manual commands -> recordings.
@@ -178,6 +184,13 @@ impl AppCore {
         if let Some(tx) = self.manual_tx.lock().unwrap().as_ref() {
             let _ = tx.send(cmd);
         }
+    }
+
+    /// Ask the schedule refresher to fetch all monitors' schedules now (the UI
+    /// "reload" action), rather than waiting for its periodic tick. The refresher
+    /// emits a state event when done, which makes the UI reload from the store.
+    pub fn request_schedule_refresh(&self) {
+        self.schedule_refresh.notify_one();
     }
 
     /// Gracefully stop all recordings and on-demand video downloads: signal

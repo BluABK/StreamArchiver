@@ -1193,7 +1193,12 @@ async fn refresh_ad_free_once(
 /// Twitch/YouTube monitors. A short poll tick picks up newly-added monitors
 /// quickly; each monitor is re-fetched at most every few hours (tracked
 /// in-memory), and fetches are de-duplicated per URL within a pass.
-pub async fn refresh_schedules(ctx: Arc<DetectContext>, events: EventTx, shutdown: Arc<AtomicBool>) {
+pub async fn refresh_schedules(
+    ctx: Arc<DetectContext>,
+    events: EventTx,
+    shutdown: Arc<AtomicBool>,
+    refresh_now: Arc<tokio::sync::Notify>,
+) {
     const INITIAL_DELAY_SECS: u64 = 30;
     const TICK_SECS: u64 = 60;
     const REFRESH_SECS: u64 = 6 * 3600;
@@ -1205,7 +1210,17 @@ pub async fn refresh_schedules(ctx: Arc<DetectContext>, events: EventTx, shutdow
             return;
         }
         refresh_schedules_once(&ctx, &events, &shutdown, &mut last_fetched, REFRESH_SECS).await;
-        sleep_cancellable(Duration::from_secs(TICK_SECS), &shutdown).await;
+        // Wake on either the periodic tick or a UI-requested reload; the latter
+        // forces a full re-fetch immediately (staleness window 0 = refresh all).
+        tokio::select! {
+            _ = sleep_cancellable(Duration::from_secs(TICK_SECS), &shutdown) => {}
+            _ = refresh_now.notified() => {
+                if shutdown.load(Ordering::SeqCst) {
+                    return;
+                }
+                refresh_schedules_once(&ctx, &events, &shutdown, &mut last_fetched, 0).await;
+            }
+        }
     }
 }
 

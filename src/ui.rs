@@ -57,6 +57,14 @@ enum View {
     Settings,
 }
 
+/// The Schedule tab's calendar granularity.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScheduleMode {
+    Month,
+    Week,
+    Day,
+}
+
 /// State of the on-demand "List formats" probe (Videos tab), shown in a window.
 #[derive(Clone)]
 enum FormatProbe {
@@ -350,9 +358,12 @@ pub struct StreamArchiverApp {
     schedule_all: Vec<UpcomingStream>,
     /// Whether [`Self::schedule_all`] has been loaded yet (lazy on first view).
     schedule_loaded: bool,
-    /// The month shown by the Schedule calendar as `(year, month)` (`month` 1-12).
-    /// `(0, 0)` until initialized to the current month on first view.
-    schedule_month: (i32, u32),
+    /// Schedule calendar granularity (month / week / day).
+    schedule_mode: ScheduleMode,
+    /// The focused date the Schedule calendar is centered on; `None` until set to
+    /// today on first view. Month view uses its year+month, week view the week
+    /// containing it, day view the date itself.
+    schedule_anchor: Option<chrono::NaiveDate>,
     /// Channel ids hidden from the Schedule calendar (sidebar filter). Tracking
     /// *hidden* (not visible) means newly-added channels default to visible.
     schedule_hidden: HashSet<i64>,
@@ -501,7 +512,8 @@ impl StreamArchiverApp {
             schedule_popup: None,
             schedule_all: Vec::new(),
             schedule_loaded: false,
-            schedule_month: (0, 0),
+            schedule_mode: ScheduleMode::Month,
+            schedule_anchor: None,
             schedule_hidden: HashSet::new(),
             schedule_collisions: true,
             schedule_day_popup: None,
@@ -962,13 +974,6 @@ fn today_start_unix() -> i64 {
     at(0).or_else(|| at(1)).unwrap_or_else(|| now.timestamp())
 }
 
-/// Current local `(year, month)` (month 1-12) — the calendar's default view.
-fn current_year_month() -> (i32, u32) {
-    use chrono::Datelike;
-    let now = chrono::Local::now();
-    (now.year(), now.month())
-}
-
 /// When a scheduled stream has no end time (YouTube upcoming streams don't carry
 /// one), assume this duration when checking for time collisions.
 const COLLISION_DEFAULT_SECS: i64 = 2 * 3600;
@@ -1007,14 +1012,37 @@ fn schedule_collisions(all: &[UpcomingStream], hidden: &HashSet<i64>) -> HashSet
     out
 }
 
-/// The `(year, month)` before the given one (month 1-12), rolling the year over.
-fn prev_month(y: i32, m: u32) -> (i32, u32) {
-    if m <= 1 { (y - 1, 12) } else { (y, m - 1) }
+/// Shift a date by `delta` whole months, clamping the day to the target month's
+/// length (e.g. Jan 31 + 1 month → Feb 28). Used by month-view navigation.
+fn shift_month(d: chrono::NaiveDate, delta: i32) -> chrono::NaiveDate {
+    use chrono::Datelike;
+    let total = d.year() * 12 + (d.month() as i32 - 1) + delta;
+    let ny = total.div_euclid(12);
+    let nm = total.rem_euclid(12) as u32 + 1;
+    // Try the same day, then earlier, until one is valid for the target month.
+    for day in (1..=d.day()).rev() {
+        if let Some(nd) = chrono::NaiveDate::from_ymd_opt(ny, nm, day) {
+            return nd;
+        }
+    }
+    d
 }
 
-/// The `(year, month)` after the given one (month 1-12), rolling the year over.
-fn next_month(y: i32, m: u32) -> (i32, u32) {
-    if m >= 12 { (y + 1, 1) } else { (y, m + 1) }
+/// The Monday of the week containing `d` (weeks start on Monday).
+fn week_start(d: chrono::NaiveDate) -> chrono::NaiveDate {
+    use chrono::Datelike;
+    let lead = d.weekday().num_days_from_monday();
+    d.checked_sub_days(chrono::Days::new(lead as u64)).unwrap_or(d)
+}
+
+/// Offset a date by `n` days (negative = backwards), saturating on overflow.
+fn add_days(d: chrono::NaiveDate, n: i64) -> chrono::NaiveDate {
+    if n >= 0 {
+        d.checked_add_days(chrono::Days::new(n as u64))
+    } else {
+        d.checked_sub_days(chrono::Days::new(n.unsigned_abs()))
+    }
+    .unwrap_or(d)
 }
 
 /// Calendar header title, e.g. `June 2026`.
@@ -1088,6 +1116,39 @@ fn schedule_copy_menu(ui: &mut egui::Ui, s: &UpcomingStream) {
         ui.ctx().open_url(egui::OpenUrl::new_tab(s.url.clone()));
         ui.close();
     }
+}
+
+/// One detailed schedule row (⚠ if colliding · time · platform · channel — title
+/// (category)) with a hover detail and the copy context menu. Shared by the day
+/// popup and the Day view.
+fn schedule_detail_row(
+    ui: &mut egui::Ui,
+    s: &UpcomingStream,
+    colliding: bool,
+    ptex: &PlatformTextures,
+) {
+    let resp = ui
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 5.0;
+            if colliding {
+                ui.colored_label(HL_COLLISION, "⚠");
+            }
+            ui.label(egui::RichText::new(fmt_time_short(s.start_time)).monospace());
+            platform_icon(ui, ptex, s.platform());
+            let mut line = s.channel_name.clone();
+            if !s.title.is_empty() {
+                line.push_str(" — ");
+                line.push_str(&s.title);
+            }
+            if !s.category.is_empty() {
+                line.push_str(&format!("  ({})", s.category));
+            }
+            ui.add(egui::Label::new(line).truncate());
+        })
+        .response
+        .interact(egui::Sense::click());
+    resp.on_hover_text(schedule_detail_line(s))
+        .context_menu(|ui| schedule_copy_menu(ui, s));
 }
 
 /// Subtle background tint for today's calendar cell (low-alpha accent, so it reads
@@ -2403,6 +2464,8 @@ impl StreamArchiverApp {
         if ctx.input_mut(|i| i.consume_shortcut(&REFRESH)) {
             self.reload_rows();
             if self.view == View::Schedule {
+                // Force a network re-fetch (not just a DB reload) + show current data.
+                self.core.request_schedule_refresh();
                 self.reload_schedule();
             }
             self.status = "Refreshed.".into();
@@ -3638,18 +3701,18 @@ impl StreamArchiverApp {
         }
     }
 
-    /// The Schedule tab: a month calendar of all upcoming scheduled streams, with
-    /// a left sidebar to filter which channels are shown and a collision highlight.
+    /// The Schedule tab: a month/week/day calendar of all upcoming scheduled
+    /// streams, with a left sidebar to filter channels and a collision highlight.
     fn schedule_view(&mut self, ui: &mut egui::Ui) {
         use chrono::Datelike;
 
-        // Lazy load on first view + initialize the displayed month to now.
+        // Lazy load on first view + initialize the focused date to today.
         if !self.schedule_loaded {
             self.reload_schedule();
         }
-        if self.schedule_month == (0, 0) {
-            self.schedule_month = current_year_month();
-        }
+        let anchor = *self
+            .schedule_anchor
+            .get_or_insert_with(|| chrono::Local::now().date_naive());
 
         // Empty state: nothing scheduled across any monitor.
         if self.schedule_all.is_empty() {
@@ -3657,11 +3720,12 @@ impl StreamArchiverApp {
             ui.vertical_centered(|ui| {
                 ui.label("No upcoming streams scheduled.");
                 ui.label(
-                    "Schedules are fetched periodically for Twitch + YouTube monitors. \
-                     Add a stream, then check back.",
+                    "Schedules come from a channel's published Twitch/YouTube upcoming \
+                     streams — channels without one (Twitch returns no segments) show nothing.",
                 );
                 ui.add_space(8.0);
-                if ui.button("⟳  Refresh").clicked() {
+                if ui.button("⟳  Fetch now").clicked() {
+                    self.core.request_schedule_refresh();
                     self.reload_schedule();
                 }
             });
@@ -3695,7 +3759,8 @@ impl StreamArchiverApp {
 
         // Actions collected during rendering, applied after the borrowing closures.
         let mut open_day: Option<chrono::NaiveDate> = None;
-        let mut nav_month: Option<(i32, u32)> = None;
+        let mut nav_anchor: Option<chrono::NaiveDate> = None;
+        let mut set_mode: Option<ScheduleMode> = None;
         let mut do_refresh = false;
         let mut clear_hidden = false;
         let mut hide_all = false;
@@ -3766,49 +3831,82 @@ impl StreamArchiverApp {
                     });
             });
 
-        // ── Center: month calendar. ──
+        // Visible date range + header title for the current mode.
+        let mode = self.schedule_mode;
+        let today = chrono::Local::now().date_naive();
+        let (range_start, range_end, title) = match mode {
+            ScheduleMode::Month => {
+                let first = chrono::NaiveDate::from_ymd_opt(anchor.year(), anchor.month(), 1)
+                    .unwrap_or(anchor);
+                let gs = week_start(first);
+                (gs, add_days(gs, 42), month_title(anchor.year(), anchor.month()))
+            }
+            ScheduleMode::Week => {
+                let ws = week_start(anchor);
+                let we = add_days(ws, 6);
+                // Honor the date-format setting on both ends (so the start year shows
+                // for a cross-year week, and the order matches the user's preference).
+                let pat = active_date_fmt().date_pattern();
+                let title = format!("{} – {}", ws.format(pat), we.format(pat));
+                (ws, add_days(ws, 7), title)
+            }
+            ScheduleMode::Day => {
+                let title = anchor
+                    .format(&format!("%A, {}", active_date_fmt().date_pattern()))
+                    .to_string();
+                (anchor, add_days(anchor, 1), title)
+            }
+        };
+        let (prev_date, next_date) = match mode {
+            // Snap month nav to the 1st: the grid only uses the month anyway, and it
+            // keeps paging idempotent (no day-of-month drift across short months).
+            ScheduleMode::Month => (
+                shift_month(anchor, -1).with_day(1).unwrap_or(anchor),
+                shift_month(anchor, 1).with_day(1).unwrap_or(anchor),
+            ),
+            ScheduleMode::Week => (add_days(anchor, -7), add_days(anchor, 7)),
+            ScheduleMode::Day => (add_days(anchor, -1), add_days(anchor, 1)),
+        };
+        // Collisions visible in the current view (the per-chip ⚠ uses the global
+        // `collide` set; the badge counts only what's on screen).
+        let collisions_in_view = collide
+            .iter()
+            .filter(|&&i| {
+                local_date(self.schedule_all[i].start_time)
+                    .is_some_and(|d| d >= range_start && d < range_end)
+            })
+            .count();
+
+        // ── Center: the calendar for the selected mode. ──
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            let (year, month) = self.schedule_month;
-
-            // Grid geometry: the cell grid runs from the Monday on/before the 1st
-            // for 6 weeks (42 cells), covering any month layout.
-            let first = chrono::NaiveDate::from_ymd_opt(year, month, 1)
-                .unwrap_or_else(|| chrono::Local::now().date_naive());
-            let lead = first.weekday().num_days_from_monday();
-            let grid_start = first
-                .checked_sub_days(chrono::Days::new(lead as u64))
-                .unwrap_or(first);
-            let grid_end = grid_start
-                .checked_add_days(chrono::Days::new(42))
-                .unwrap_or(grid_start);
-            let today = chrono::Local::now().date_naive();
-
-            // Collisions actually visible in this month's grid (the per-chip ⚠ uses
-            // the global `collide` set; the badge counts only what's on screen).
-            let collisions_in_view = collide
-                .iter()
-                .filter(|&&i| {
-                    local_date(self.schedule_all[i].start_time)
-                        .is_some_and(|d| d >= grid_start && d < grid_end)
-                })
-                .count();
-
-            // Header: navigation + month title + collision controls.
+            // Header: view mode + navigation + title + collision controls.
             ui.horizontal(|ui| {
-                if ui.button("◀").on_hover_text("Previous month").clicked() {
-                    nav_month = Some(prev_month(year, month));
+                let mut m = mode;
+                ui.selectable_value(&mut m, ScheduleMode::Month, "Month");
+                ui.selectable_value(&mut m, ScheduleMode::Week, "Week");
+                ui.selectable_value(&mut m, ScheduleMode::Day, "Day");
+                if m != mode {
+                    set_mode = Some(m);
+                }
+                ui.separator();
+                if ui.button("◀").on_hover_text("Previous").clicked() {
+                    nav_anchor = Some(prev_date);
                 }
                 if ui.button("Today").clicked() {
-                    nav_month = Some(current_year_month());
+                    nav_anchor = Some(today);
                 }
-                if ui.button("▶").on_hover_text("Next month").clicked() {
-                    nav_month = Some(next_month(year, month));
+                if ui.button("▶").on_hover_text("Next").clicked() {
+                    nav_anchor = Some(next_date);
                 }
                 ui.add_space(8.0);
-                ui.heading(month_title(year, month));
+                ui.heading(title);
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("⟳").on_hover_text("Reload schedule (F5)").clicked() {
+                    if ui
+                        .button("⟳")
+                        .on_hover_text("Fetch the latest schedules now (F5)")
+                        .clicked()
+                    {
                         do_refresh = true;
                     }
                     let mut hc = self.schedule_collisions;
@@ -3821,73 +3919,31 @@ impl StreamArchiverApp {
                     }
                     if self.schedule_collisions && collisions_in_view > 0 {
                         ui.colored_label(HL_COLLISION, format!("⚠ {collisions_in_view}"))
-                            .on_hover_text("Overlapping streams shown this month");
+                            .on_hover_text("Overlapping streams in view");
                     }
                 });
             });
             ui.separator();
 
-            // 7 equal columns; reserve room for a vertical scrollbar so the columns
-            // don't shift when it appears, and floor the width so a too-narrow panel
-            // gets a horizontal scrollbar instead of clipping the weekend columns.
-            let spacing = 4.0;
-            let cell_h = 108.0;
-            const WD: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-            const MAX_CHIPS: usize = 3;
-            let usable = (ui.available_width() - 16.0).max(160.0);
-            let col_w = ((usable - spacing * 6.0) / 7.0).floor().max(72.0);
-
-            // Header + weeks share one scroll viewport so their columns stay aligned
-            // (the weekday row scrolls with the grid).
-            egui::ScrollArea::both()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(spacing, spacing);
-                    ui.horizontal(|ui| {
-                        for &wd in &WD {
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(col_w, 16.0),
-                                egui::Layout::top_down(egui::Align::Center),
-                                |ui| {
-                                    ui.label(egui::RichText::new(wd).strong());
-                                },
-                            );
-                        }
-                    });
-                    for week in 0..6u64 {
-                        ui.horizontal(|ui| {
-                            for dow in 0..7u64 {
-                                let day = grid_start
-                                    .checked_add_days(chrono::Days::new(week * 7 + dow))
-                                    .unwrap_or(grid_start);
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(col_w, cell_h),
-                                    egui::Layout::top_down(egui::Align::Min),
-                                    |ui| {
-                                        self.schedule_cell(
-                                            ui,
-                                            day,
-                                            month,
-                                            today,
-                                            col_w,
-                                            cell_h,
-                                            MAX_CHIPS,
-                                            by_day.get(&day),
-                                            &collide,
-                                            &ptex,
-                                            &mut open_day,
-                                        );
-                                    },
-                                );
-                            }
-                        });
-                    }
-                });
+            match mode {
+                ScheduleMode::Month => {
+                    self.schedule_month_grid(ui, anchor, today, &by_day, &collide, &ptex, &mut open_day)
+                }
+                ScheduleMode::Week => {
+                    self.schedule_week_grid(ui, anchor, today, &by_day, &collide, &ptex, &mut open_day)
+                }
+                ScheduleMode::Day => {
+                    self.schedule_day_list(ui, by_day.get(&anchor), &collide, &ptex)
+                }
+            }
         });
 
         // ── Apply collected actions. ──
-        if let Some(ym) = nav_month {
-            self.schedule_month = ym;
+        if let Some(m) = set_mode {
+            self.schedule_mode = m;
+        }
+        if let Some(d) = nav_anchor {
+            self.schedule_anchor = Some(d);
         }
         if clear_hidden {
             self.schedule_hidden.clear();
@@ -3911,14 +3967,237 @@ impl StreamArchiverApp {
             self.schedule_day_popup = Some(d);
         }
         if do_refresh {
+            // Trigger a real network re-fetch (not just a DB reload); the refresher
+            // emits an event when done, which reloads the calendar. Also reload now
+            // so the current stored data shows immediately.
+            self.core.request_schedule_refresh();
             self.reload_schedule();
+            self.status = "Fetching latest schedules…".into();
         }
     }
 
-    /// Render one calendar day cell: a bordered box with the day number and up to
+    /// One compact calendar chip (⚠ if colliding · platform icon · time · channel)
+    /// with a hover detail and the copy context menu. Returns the click response so
+    /// the caller can react (e.g. open the day popup). Shared by month + week views.
+    fn schedule_chip(
+        &self,
+        ui: &mut egui::Ui,
+        i: usize,
+        colliding: bool,
+        ptex: &PlatformTextures,
+    ) -> egui::Response {
+        let s = &self.schedule_all[i];
+        let resp = ui
+            .horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                if colliding {
+                    ui.colored_label(HL_COLLISION, "⚠");
+                }
+                platform_icon(ui, ptex, s.platform());
+                ui.add(
+                    egui::Label::new(format!(
+                        "{} {}",
+                        fmt_time_short(s.start_time),
+                        s.channel_name
+                    ))
+                    .truncate(),
+                );
+            })
+            .response
+            .interact(egui::Sense::click());
+        let resp = resp.on_hover_text(schedule_detail_line(s));
+        resp.context_menu(|ui| schedule_copy_menu(ui, s));
+        resp
+    }
+
+    /// Month view: a 6×7 grid of day cells.
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_month_grid(
+        &self,
+        ui: &mut egui::Ui,
+        anchor: chrono::NaiveDate,
+        today: chrono::NaiveDate,
+        by_day: &HashMap<chrono::NaiveDate, Vec<usize>>,
+        collide: &HashSet<usize>,
+        ptex: &PlatformTextures,
+        open_day: &mut Option<chrono::NaiveDate>,
+    ) {
+        use chrono::Datelike;
+        let month = anchor.month();
+        let first = chrono::NaiveDate::from_ymd_opt(anchor.year(), month, 1).unwrap_or(anchor);
+        let grid_start = week_start(first);
+
+        let spacing = 4.0;
+        let cell_h = 108.0;
+        const WD: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+        const MAX_CHIPS: usize = 3;
+        // Reserve room for a vertical scrollbar so the columns don't shift when it
+        // appears, and floor the width so a too-narrow panel gets a horizontal
+        // scrollbar instead of clipping the weekend columns.
+        let usable = (ui.available_width() - 16.0).max(160.0);
+        let col_w = ((usable - spacing * 6.0) / 7.0).floor().max(72.0);
+
+        // Header + weeks share one scroll viewport so their columns stay aligned.
+        egui::ScrollArea::both()
+            .id_salt("sched_month")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(spacing, spacing);
+                ui.horizontal(|ui| {
+                    for &wd in &WD {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(col_w, 16.0),
+                            egui::Layout::top_down(egui::Align::Center),
+                            |ui| {
+                                ui.label(egui::RichText::new(wd).strong());
+                            },
+                        );
+                    }
+                });
+                for week in 0..6u64 {
+                    ui.horizontal(|ui| {
+                        for dow in 0..7u64 {
+                            let day = add_days(grid_start, (week * 7 + dow) as i64);
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(col_w, cell_h),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    self.schedule_cell(
+                                        ui,
+                                        day,
+                                        month,
+                                        today,
+                                        col_w,
+                                        cell_h,
+                                        MAX_CHIPS,
+                                        by_day.get(&day),
+                                        collide,
+                                        ptex,
+                                        open_day,
+                                    );
+                                },
+                            );
+                        }
+                    });
+                }
+            });
+    }
+
+    /// Week view: 7 day columns (Mon–Sun), each listing all of that day's streams.
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_week_grid(
+        &self,
+        ui: &mut egui::Ui,
+        anchor: chrono::NaiveDate,
+        today: chrono::NaiveDate,
+        by_day: &HashMap<chrono::NaiveDate, Vec<usize>>,
+        collide: &HashSet<usize>,
+        ptex: &PlatformTextures,
+        open_day: &mut Option<chrono::NaiveDate>,
+    ) {
+        use chrono::Datelike;
+        let ws = week_start(anchor);
+        let spacing = 4.0;
+        let usable = (ui.available_width() - 16.0).max(160.0);
+        let col_w = ((usable - spacing * 6.0) / 7.0).floor().max(96.0);
+        let col_h = (ui.available_height() - 8.0).max(160.0);
+
+        egui::ScrollArea::both()
+            .id_salt("sched_week")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(spacing, spacing);
+                ui.horizontal_top(|ui| {
+                    for dow in 0..7i64 {
+                        let day = add_days(ws, dow);
+                        let is_today = day == today;
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(col_w, col_h),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                let mut frame =
+                                    egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(4));
+                                if is_today {
+                                    frame = frame.fill(TODAY_BG);
+                                }
+                                frame.show(ui, |ui| {
+                                    ui.set_min_size(egui::vec2(col_w - 10.0, col_h - 10.0));
+                                    ui.vertical(|ui| {
+                                        let hdr = format!("{} {}", day.format("%a"), day.day());
+                                        if ui
+                                            .add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(hdr).strong(),
+                                                )
+                                                .sense(egui::Sense::click()),
+                                            )
+                                            .on_hover_text("Show this day's streams")
+                                            .clicked()
+                                        {
+                                            *open_day = Some(day);
+                                        }
+                                        ui.separator();
+                                        match by_day.get(&day) {
+                                            Some(list) => {
+                                                for &i in list {
+                                                    let c = collide.contains(&i);
+                                                    if self
+                                                        .schedule_chip(ui, i, c, ptex)
+                                                        .clicked()
+                                                    {
+                                                        *open_day = Some(day);
+                                                    }
+                                                }
+                                            }
+                                            None => {
+                                                ui.label(egui::RichText::new("—").weak());
+                                            }
+                                        }
+                                    });
+                                });
+                            },
+                        );
+                    }
+                });
+            });
+    }
+
+    /// Day view: a detailed, time-sorted list of one day's streams.
+    fn schedule_day_list(
+        &self,
+        ui: &mut egui::Ui,
+        entries: Option<&Vec<usize>>,
+        collide: &HashSet<usize>,
+        ptex: &PlatformTextures,
+    ) {
+        match entries {
+            Some(list) if !list.is_empty() => {
+                ui.label(format!("{} scheduled stream(s).", list.len()));
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("sched_day")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for &i in list {
+                            schedule_detail_row(
+                                ui,
+                                &self.schedule_all[i],
+                                collide.contains(&i),
+                                ptex,
+                            );
+                        }
+                    });
+            }
+            _ => {
+                ui.add_space(12.0);
+                ui.label(egui::RichText::new("No streams scheduled this day.").weak());
+            }
+        }
+    }
+
+    /// Render one month-grid day cell: a bordered box with the day number and up to
     /// `max_chips` stream chips (overflow folds into a clickable "+N more"). A
-    /// left-click on the day or "+N more" opens the day popup (`open_day`); a
-    /// right-click on a chip opens its copy menu.
+    /// left-click on the day or a chip opens the day popup (`open_day`).
     #[allow(clippy::too_many_arguments)]
     fn schedule_cell(
         &self,
@@ -3965,27 +4244,10 @@ impl StreamArchiverApp {
                 let entries = entries.map(Vec::as_slice).unwrap_or(&[]);
                 let shown = entries.len().min(max_chips);
                 for &i in &entries[..shown] {
-                    let s = &self.schedule_all[i];
                     let colliding = collide.contains(&i);
-                    let resp = ui
-                        .horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 3.0;
-                            if colliding {
-                                ui.colored_label(HL_COLLISION, "⚠");
-                            }
-                            platform_icon(ui, ptex, s.platform());
-                            let label = egui::Label::new(format!(
-                                "{} {}",
-                                fmt_time_short(s.start_time),
-                                s.channel_name
-                            ))
-                            .truncate();
-                            ui.add(label);
-                        })
-                        .response
-                        .interact(egui::Sense::click());
-                    resp.on_hover_text(schedule_detail_line(s))
-                        .context_menu(|ui| schedule_copy_menu(ui, s));
+                    if self.schedule_chip(ui, i, colliding, ptex).clicked() {
+                        *open_day = Some(day);
+                    }
                 }
                 if entries.len() > shown {
                     let more = entries.len() - shown;
@@ -4045,29 +4307,9 @@ impl StreamArchiverApp {
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         for s in &entries {
-                            let resp = ui
-                                .horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 5.0;
-                                    ui.label(
-                                        egui::RichText::new(fmt_time_short(s.start_time)).monospace(),
-                                    );
-                                    // No per-icon hover — the whole row already shows
-                                    // the full detail on hover (avoids a double tooltip).
-                                    platform_icon(ui, &ptex, s.platform());
-                                    let mut line = s.channel_name.clone();
-                                    if !s.title.is_empty() {
-                                        line.push_str(" — ");
-                                        line.push_str(&s.title);
-                                    }
-                                    if !s.category.is_empty() {
-                                        line.push_str(&format!("  ({})", s.category));
-                                    }
-                                    ui.add(egui::Label::new(line).truncate());
-                                })
-                                .response
-                                .interact(egui::Sense::click());
-                            resp.on_hover_text(schedule_detail_line(s))
-                                .context_menu(|ui| schedule_copy_menu(ui, s));
+                            // The popup doesn't carry the collision set; the calendar
+                            // surfaces ⚠ markers, so rows here are shown unmarked.
+                            schedule_detail_row(ui, s, false, &ptex);
                         }
                     });
                 ui.add_space(6.0);
