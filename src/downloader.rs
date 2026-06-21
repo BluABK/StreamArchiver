@@ -215,6 +215,24 @@ fn push_track_args(args: &mut Vec<String>, tool: Tool, audio: &str, subs: &str, 
     }
 }
 
+/// Returns the URL yt-dlp should receive for a live YouTube recording.
+/// Channel URLs (/@handle, /channel/UC…, /c/name, /user/name) are resolved to
+/// their /live variant so yt-dlp goes straight to the active stream instead of
+/// enumerating the whole channel. Specific-video URLs (watch?v=, youtu.be/,
+/// /live/<id>) and already-suffixed /live URLs are left unchanged.
+fn youtube_live_url(url: &str) -> String {
+    let u = url.trim_end_matches('/');
+    let is_specific = u.contains("/watch?")
+        || u.contains("/live/")
+        || u.contains("youtu.be/")
+        || u.ends_with("/live");
+    if is_specific {
+        url.to_string()
+    } else {
+        format!("{u}/live")
+    }
+}
+
 pub fn build_plan(
     row: &MonitorWithChannel,
     started_at: i64,
@@ -303,7 +321,12 @@ pub fn build_plan(
             let chat_subs = m.chat_log && m.platform() != Platform::Twitch;
             push_track_args(&mut args, Tool::YtDlp, &m.audio_tracks, &m.subtitle_tracks, chat_subs);
             args.extend(extra);
-            args.push(m.url.clone());
+            let url = if m.platform() == Platform::YouTube {
+                youtube_live_url(&m.url)
+            } else {
+                m.url.clone()
+            };
+            args.push(url);
             ("yt-dlp".to_string(), args)
         }
         Tool::Ffmpeg => {
@@ -994,7 +1017,7 @@ impl Supervisor {
             recording_id: rec_id,
             channel: row.channel.name.clone(),
         });
-        info!(monitor_id, program = %plan.program, "starting recording -> {}", plan.final_path.display());
+        info!(monitor_id, program = %plan.program, "starting recording -> {}", plan.capture_path.display());
 
         // When capturing from the start of the broadcast (live-from-start /
         // hls-live-restart), the early footage isn't lost — it's pulled from the
@@ -1229,13 +1252,12 @@ impl Supervisor {
         let mut cmd = Command::new(&plan.program);
         cmd.args(&plan.args)
             .stdin(Stdio::null())
-            // Capture stdout only when we want to parse progress/speed (yt-dlp
-            // prints the progress line there); otherwise discard it.
-            .stdout(if progress.is_some() || speed.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
+            // Always pipe stdout. Passing Stdio::null() on Windows gives child
+            // processes a NUL device handle; yt-dlp calls GetConsoleScreenBufferInfo
+            // on it (to detect terminal width), gets ERROR_INVALID_HANDLE (0x6), and
+            // crashes before writing a byte. A pipe handle causes Python to see
+            // isatty()=False and skip the console-width call entirely.
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         #[cfg(windows)]
@@ -1262,6 +1284,8 @@ impl Supervisor {
         }
 
         // Parse progress + speed lines from stdout (yt-dlp `--progress-template`).
+        // When not tracking progress/speed, drain the pipe anyway so the 64 KB
+        // pipe buffer never fills and blocks the child process.
         if let Some(stdout) = child.stdout.take() {
             let prog = progress.clone();
             let spd = speed.clone();
@@ -2971,5 +2995,21 @@ mod tests {
             "ERROR: unable to download video data: HTTP Error 403: Forbidden"
         ));
         assert!(!stream_ended_or_unavailable(""));
+    }
+
+    #[test]
+    fn youtube_live_url_appends_live_to_channel_urls() {
+        // Channel forms — must get /live appended.
+        assert_eq!(youtube_live_url("https://www.youtube.com/@YUY_IX"), "https://www.youtube.com/@YUY_IX/live");
+        assert_eq!(youtube_live_url("https://www.youtube.com/@YUY_IX/"), "https://www.youtube.com/@YUY_IX/live");
+        assert_eq!(youtube_live_url("https://youtube.com/channel/UCabc123"), "https://youtube.com/channel/UCabc123/live");
+        assert_eq!(youtube_live_url("https://youtube.com/c/SomeName"), "https://youtube.com/c/SomeName/live");
+        assert_eq!(youtube_live_url("https://youtube.com/user/SomeName"), "https://youtube.com/user/SomeName/live");
+        // Already has /live — unchanged.
+        assert_eq!(youtube_live_url("https://www.youtube.com/@YUY_IX/live"), "https://www.youtube.com/@YUY_IX/live");
+        // Specific video URLs — unchanged.
+        assert_eq!(youtube_live_url("https://www.youtube.com/watch?v=abc123"), "https://www.youtube.com/watch?v=abc123");
+        assert_eq!(youtube_live_url("https://youtu.be/abc123"), "https://youtu.be/abc123");
+        assert_eq!(youtube_live_url("https://www.youtube.com/live/abc123"), "https://www.youtube.com/live/abc123");
     }
 }

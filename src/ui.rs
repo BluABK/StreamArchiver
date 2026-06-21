@@ -1563,7 +1563,7 @@ struct StreamCol {
 /// floors — `Column::auto` shrinks tight columns to their content — except the
 /// `initial`-width columns, which start narrow and truncate (full value on hover).
 const STREAM_COLUMNS: [StreamCol; 20] = [
-    StreamCol { title: "On", tooltip: "Enable/disable monitoring. A channel's checkbox toggles all its instances at once.", min_width: 26.0, initial: 0.0, sortable: true },
+    StreamCol { title: "Auto", tooltip: "Enable/disable monitoring. A channel's checkbox toggles all its instances at once.", min_width: 36.0, initial: 0.0, sortable: true },
     StreamCol { title: "Actions", tooltip: "Per-row actions: start/stop recording, edit, add instance, open folder, delete.", min_width: 126.0, initial: 0.0, sortable: false },
     StreamCol { title: "Plat", tooltip: "Source platform (icon): Twitch, YouTube, Kick, or a generic URL. A channel shows every platform among its instances.", min_width: 52.0, initial: 0.0, sortable: true },
     StreamCol { title: "Name", tooltip: "Channel (container) name. Expand it to see its instances and recording history.", min_width: 130.0, initial: 0.0, sortable: true },

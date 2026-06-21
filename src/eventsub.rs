@@ -1,17 +1,24 @@
-//! Twitch EventSub real-time detection over the **conduit + app-token**
-//! transport.
+//! Twitch EventSub real-time detection over WebSocket.
 //!
-//! Why conduit (not a plain user-token websocket): the websocket transport with
-//! a user token caps `max_total_cost` at 10 (~10 unowned channels). Binding a
-//! websocket shard to a *conduit* created with an **app access token** raises the
-//! cap to 10,000 — and reuses the same Client ID/Secret already configured for
-//! Helix polling (no interactive OAuth).
+//! Two transport modes are supported, chosen automatically:
 //!
-//! Flow: app token -> resolve logins to user IDs -> ensure a conduit -> open the
-//! websocket -> bind shard 0 to the session -> subscribe `stream.online` for each
+//! * **Conduit + app token** (Client ID + Secret): app `client_credentials`
+//!   token, conduit bound to the WebSocket shard. Scales to 10,000 channels.
+//! * **Direct WebSocket + user token** (Client ID + "Connect with Twitch"
+//!   OAuth): the stored user access token is used directly. No conduit or
+//!   Client Secret required. Twitch caps this at 10 `stream.online`
+//!   subscriptions — sufficient for most users.
+//!
+//! When both are present the conduit path is preferred (higher channel cap).
+//!
+//! Flow (conduit): app token -> resolve logins to user IDs -> ensure a conduit
+//! -> open the websocket -> bind shard 0 -> subscribe `stream.online` for each
 //! channel -> reconcile current live state via Get Streams -> stream events.
-//! EventSub has no replay, so we reconcile on every (re)connect. Any disconnect
-//! drops out and the outer loop reconnects and re-binds.
+//!
+//! Flow (user token): resolve user IDs -> open websocket -> read welcome ->
+//! subscribe `stream.online` (websocket transport) -> reconcile -> stream events.
+//!
+//! EventSub has no replay, so we reconcile on every (re)connect.
 //!
 //! NOTE: This path needs live Twitch credentials + a channel going live to
 //! verify end-to-end; use `--eventsub-test` to exercise it.
@@ -32,6 +39,7 @@ use tracing::{debug, info, warn};
 use crate::app_core::sleep_cancellable;
 use crate::events::LiveSignal;
 use crate::models::{DetectionMethod, Platform};
+use crate::oauth;
 use crate::store::Store;
 
 const WS_URL: &str = "wss://eventsub.wss.twitch.tv/ws";
@@ -73,23 +81,44 @@ async fn run_session(
     if login_to_monitors.is_empty() {
         return Ok(false);
     }
-    let Some((client_id, secret)) = credentials(store) else {
-        // We have EventSub monitors but no Client Secret — log the reason once.
+
+    let http = Client::builder().timeout(Duration::from_secs(20)).build()?;
+
+    // Prefer conduit + app token (scales to 10k channels). Fall back to direct
+    // WebSocket with the stored user OAuth token (≤10 channels, no Client Secret).
+    enum Transport {
+        Conduit { token: String },
+        UserToken { token: String },
+    }
+    let (client_id, transport) = if let Some((id, secret)) = app_credentials(store) {
+        let token = app_token(&http, &id, &secret).await?;
+        (id, Transport::Conduit { token })
+    } else if let Some((id, token)) = user_credentials(&http, store).await {
+        if login_to_monitors.len() > 10 {
+            warn!(
+                "eventsub: user-token mode supports up to 10 channels; {} configured \
+                 (add a Client Secret in Settings for unlimited)",
+                login_to_monitors.len()
+            );
+        }
+        (id, Transport::UserToken { token })
+    } else {
         if !*warned_no_creds {
             debug!(
-                "eventsub: have EventSub monitor(s) but no Twitch Client Secret; idling \
-                 (set a Client Secret in Settings to enable EventSub push)"
+                "eventsub: have EventSub monitor(s) but no credentials; idling \
+                 (connect with Twitch in Settings, or set Client ID + Client Secret)"
             );
             *warned_no_creds = true;
         }
         return Ok(false);
     };
 
-    let http = Client::builder().timeout(Duration::from_secs(20)).build()?;
-    let token = app_token(&http, &client_id, &secret).await?;
+    let token = match &transport {
+        Transport::Conduit { token, .. } | Transport::UserToken { token } => token.as_str(),
+    };
 
     let logins: Vec<String> = login_to_monitors.keys().cloned().collect();
-    let login_to_uid = resolve_user_ids(&http, &client_id, &token, &logins).await?;
+    let login_to_uid = resolve_user_ids(&http, &client_id, token, &logins).await?;
     // user_id -> [monitor_id]
     let mut uid_to_monitors: HashMap<String, Vec<i64>> = HashMap::new();
     for (login, mons) in &login_to_monitors {
@@ -103,22 +132,31 @@ async fn run_session(
         return Ok(false);
     }
 
-    let conduit_id = ensure_conduit(&http, &client_id, &token).await?;
-
     let (mut ws, _) = tokio_tungstenite::connect_async(WS_URL)
         .await
         .context("connecting eventsub websocket")?;
     let (session_id, keepalive) = read_welcome(&mut ws).await?;
-    bind_shard(&http, &client_id, &token, &conduit_id, &session_id).await?;
-    let subscribed =
-        subscribe_online(&http, &client_id, &token, &conduit_id, &uid_to_monitors).await;
-    info!(
-        "eventsub: connected (conduit {conduit_id}); {subscribed}/{} channel(s) subscribed",
-        uid_to_monitors.len()
-    );
 
+    match &transport {
+        Transport::Conduit { token } => {
+            let conduit_id = ensure_conduit(&http, &client_id, token).await?;
+            bind_shard(&http, &client_id, token, &conduit_id, &session_id).await?;
+            let n = subscribe_online(&http, &client_id, token, &conduit_id, &uid_to_monitors).await;
+            info!(
+                "eventsub: connected (conduit {conduit_id}); {n}/{} channel(s) subscribed",
+                uid_to_monitors.len()
+            );
+        }
+        Transport::UserToken { token } => {
+            let n = subscribe_online_ws(&http, &client_id, token, &session_id, &uid_to_monitors).await;
+            info!(
+                "eventsub: connected (user-token); {n}/{} channel(s) subscribed",
+                uid_to_monitors.len()
+            );
+        }
+    }
     // Reconcile: anything already live should start recording now.
-    reconcile(&http, &client_id, &token, &login_to_monitors, live_tx).await;
+    reconcile(&http, &client_id, token, &login_to_monitors, live_tx).await;
 
     // Event loop. Twitch sends `session_keepalive` every `keepalive` seconds; if
     // none (plus slack) arrives, treat the connection as dead.
@@ -187,7 +225,7 @@ fn handle_message(
     false
 }
 
-fn credentials(store: &Store) -> Option<(String, String)> {
+fn app_credentials(store: &Store) -> Option<(String, String)> {
     let id = store.get_setting("twitch_client_id").ok().flatten()?;
     let secret = store.get_setting("twitch_client_secret").ok().flatten()?;
     if id.is_empty() || secret.is_empty() {
@@ -195,6 +233,16 @@ fn credentials(store: &Store) -> Option<(String, String)> {
     } else {
         Some((id, secret))
     }
+}
+
+async fn user_credentials(http: &Client, store: &Store) -> Option<(String, String)> {
+    let client_id = store
+        .get_setting("twitch_client_id")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())?;
+    let token = oauth::valid_user_token(http, store).await?;
+    Some((client_id, token))
 }
 
 fn load_eventsub_monitors(store: &Store) -> Result<HashMap<String, Vec<i64>>> {
@@ -380,6 +428,44 @@ async fn subscribe_online(
                 "version": "1",
                 "condition": { "broadcaster_user_id": uid },
                 "transport": { "method": "conduit", "conduit_id": conduit_id }
+            }))
+            .send()
+            .await;
+        match resp {
+            Ok(r) if r.status().is_success() => covered += 1,
+            Ok(r) => warn!("eventsub: subscribe {uid} failed: {}", r.status()),
+            Err(e) => warn!("eventsub: subscribe {uid} error: {e}"),
+        }
+    }
+    covered
+}
+
+/// Like `subscribe_online` but uses the direct WebSocket transport (user-token
+/// mode). The `session_id` from the welcome frame is embedded in each
+/// subscription instead of a conduit id.
+async fn subscribe_online_ws(
+    http: &Client,
+    client_id: &str,
+    token: &str,
+    session_id: &str,
+    uid_to_monitors: &HashMap<String, Vec<i64>>,
+) -> usize {
+    let existing = existing_online_subs(http, client_id, token).await;
+    let mut covered = 0;
+    for uid in uid_to_monitors.keys() {
+        if existing.contains(uid) {
+            covered += 1;
+            continue;
+        }
+        let resp = http
+            .post(format!("{HELIX}/eventsub/subscriptions"))
+            .header("Client-Id", client_id)
+            .bearer_auth(token)
+            .json(&json!({
+                "type": "stream.online",
+                "version": "1",
+                "condition": { "broadcaster_user_id": uid },
+                "transport": { "method": "websocket", "session_id": session_id }
             }))
             .send()
             .await;
