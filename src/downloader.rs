@@ -1174,7 +1174,18 @@ impl Supervisor {
 
         let duration = now_unix() - started_at;
         let ok = bytes > 0;
-        let status = if ok { "completed" } else { "failed" };
+        // A 0-byte capture isn't always a failure: a livestream that had already
+        // ended (or hadn't started, or exposed no live video formats) leaves
+        // nothing to capture but isn't an error. Classify those as `ended` so they
+        // don't show as red failures. (`ok` still drives backoff, so we don't
+        // hammer an ended broadcast.)
+        let status = if ok {
+            "completed"
+        } else if stream_ended_or_unavailable(&outcome.log) {
+            "ended"
+        } else {
+            "failed"
+        };
         let _ = self.store.finish_recording(
             rec_id,
             now_unix(),
@@ -2179,6 +2190,27 @@ async fn newest_with_stem(predicted: &Path) -> Option<PathBuf> {
     best.map(|(_, p)| p)
 }
 
+/// True when a capture produced no footage because the stream wasn't actually
+/// capturable — it had already ended, hadn't started yet, or exposed no live
+/// video formats — rather than because of a real error. Detected from the tool's
+/// stderr tail, so a concluded YouTube live (yt-dlp prints "Only images are
+/// available …" once the live formats are gone) or an offline/ended Twitch
+/// channel (streamlink: "No playable streams found") is classified as `ended`,
+/// not `failed`.
+fn stream_ended_or_unavailable(log: &str) -> bool {
+    const PATTERNS: [&str; 5] = [
+        // yt-dlp: a live that has ended/not-started has no video formats, only
+        // thumbnail/storyboard images.
+        "Only images are available",
+        "This live event has ended",
+        "This live event will begin",
+        "Premieres in",
+        // streamlink: channel offline or stream ended.
+        "No playable streams found",
+    ];
+    PATTERNS.iter().any(|p| log.contains(p))
+}
+
 /// Minimal whitespace arg splitter (double-quoted segments kept together).
 fn split_args(s: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -2912,5 +2944,30 @@ mod tests {
         let plan = build_video_plan(&s, 1_700_000_000, "", "", "", &AuthSource::None, None);
         let joined = plan.args.join(" ");
         assert!(joined.contains("--hls-audio-select=en,de"), "{joined}");
+    }
+
+    #[test]
+    fn ended_stream_is_not_a_failure() {
+        // A concluded/upcoming YouTube live: yt-dlp has only thumbnail images left
+        // (the exact stderr from the Layna YouTube take 3 bug).
+        assert!(stream_ended_or_unavailable(
+            "ERROR: [youtube] aEhxflmEYGA: Requested format is not available\n\
+             WARNING: Only images are available for download. use --list-formats to see them"
+        ));
+        assert!(stream_ended_or_unavailable("This live event has ended."));
+        assert!(stream_ended_or_unavailable("This live event will begin in 2 hours."));
+        // streamlink: offline / ended channel.
+        assert!(stream_ended_or_unavailable(
+            "error: No playable streams found on this URL: https://twitch.tv/x"
+        ));
+        // A *real* failure must stay a failure (e.g. the Layna take 1: bad cookies),
+        // and a generic error too.
+        assert!(!stream_ended_or_unavailable(
+            "WARNING: [youtube] The provided YouTube account cookies are no longer valid."
+        ));
+        assert!(!stream_ended_or_unavailable(
+            "ERROR: unable to download video data: HTTP Error 403: Forbidden"
+        ));
+        assert!(!stream_ended_or_unavailable(""));
     }
 }

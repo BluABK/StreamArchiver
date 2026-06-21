@@ -1407,7 +1407,9 @@ fn rec_status_color(status: &str) -> egui::Color32 {
         "recording" => Color32::from_rgb(0x4d, 0x9b, 0xff),
         "completed" => SUCCESS_GREEN,
         "failed" => Color32::from_rgb(0xe0, 0x6c, 0x6c),
-        _ => Color32::from_gray(0xa0), // stopped / orphaned
+        // "ended" (stream had ended / wasn't live), "stopped", "orphaned": neutral
+        // gray — terminal but not an error.
+        _ => Color32::from_gray(0xa0),
     }
 }
 
@@ -3908,6 +3910,11 @@ impl StreamArchiverApp {
                                                 msg = format!("{msg}\n(exit code {code})");
                                             }
                                             resp.on_hover_text(msg);
+                                        } else if t.status == "ended" {
+                                            resp.on_hover_text(
+                                                "The stream had already ended or wasn't live when we \
+                                                 tried — nothing to capture (not a failure).",
+                                            );
                                         } else if let Some(code) = t.exit_code {
                                             resp.on_hover_text(format!("exit code {code}"));
                                         }

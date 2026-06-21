@@ -884,6 +884,14 @@ impl StreamGroup {
             "completed"
         } else if self.takes.iter().all(|t| t.status == "orphaned") {
             "orphaned"
+        } else if self
+            .takes
+            .iter()
+            .all(|t| matches!(t.status.as_str(), "ended" | "orphaned"))
+        {
+            // No footage, but the broadcast had simply ended / wasn't live when we
+            // tried — not a failure (see the downloader's `ended` classification).
+            "ended"
         } else {
             "failed"
         }
@@ -985,6 +993,57 @@ mod tests {
             category: String::new(),
             log_excerpt: String::new(),
         }
+    }
+
+    /// Build a finished take with a specific status (and no footage).
+    fn take_with_status(id: i64, status: &str) -> Recording {
+        let mut t = rec(id, 1000, Some(1100), None);
+        t.status = status.into();
+        t.bytes = 0;
+        t
+    }
+
+    fn group_of(takes: Vec<Recording>) -> StreamGroup {
+        StreamGroup {
+            key: "k".into(),
+            stream_id: None,
+            went_live_at: None,
+            went_live_approx: true,
+            takes,
+        }
+    }
+
+    #[test]
+    fn ended_takes_dont_roll_up_to_failed() {
+        // A broadcast that had already ended when we tried = `ended`, not `failed`.
+        assert_eq!(group_of(vec![take_with_status(1, "ended")]).status(), "ended");
+        // ended + a crash-orphan (both footage-less, benign) still reads as ended.
+        assert_eq!(
+            group_of(vec![
+                take_with_status(1, "ended"),
+                take_with_status(2, "orphaned"),
+            ])
+            .status(),
+            "ended",
+        );
+        // A real failure anywhere in the broadcast keeps it `failed`.
+        assert_eq!(
+            group_of(vec![
+                take_with_status(1, "ended"),
+                take_with_status(2, "failed"),
+            ])
+            .status(),
+            "failed",
+        );
+        // A completed take wins regardless.
+        assert_eq!(
+            group_of(vec![
+                take_with_status(1, "ended"),
+                rec(2, 2000, Some(2100), None), // completed (bytes=1)
+            ])
+            .status(),
+            "completed",
+        );
     }
 
     #[test]

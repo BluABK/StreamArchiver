@@ -22,7 +22,11 @@ pub async fn run(mut rx: EventRx) {
             Ok(AppEvent::RecordingFinished {
                 channel, status, ..
             }) => {
-                notify("Recording finished", &format!("{channel} — {status}"));
+                // An "ended" take captured nothing because the stream had already
+                // concluded / wasn't live — a non-event, not worth a toast.
+                if status != "ended" {
+                    notify("Recording finished", &format!("{channel} — {status}"));
+                }
             }
             Ok(AppEvent::Error { context, message }) => {
                 notify("StreamArchiver error", &format!("{context}: {message}"));
