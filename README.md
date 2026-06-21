@@ -325,11 +325,31 @@ streams (datetime — title, with the category when known).
   credentials, same as detection). Includes the segment title + category; canceled
   occurrences are skipped.
 - **YouTube** — scraped from the channel's `/streams` page (no API key / quota);
-  reads each upcoming livestream's scheduled start + title.
+  reads each upcoming livestream's scheduled start + title. Can optionally use the
+  Data API instead — see *Settings → YouTube Data API usage*.
 - **Kick / generic URLs** have no schedule source, so the column stays blank.
 
 Schedules are refreshed in the background a few hours apart (new monitors are
 picked up within a minute) and stored, so the column is populated on launch.
+
+#### YouTube: scrape vs Data API
+
+By default the YouTube features above (and live detection) get their data by
+**scraping** public pages — free, no API key, but they can break when YouTube
+changes a page. If you set a **YouTube API Key** (Settings → Detection
+credentials), the **YouTube Data API usage** section lets you opt individual
+operations into the API for more reliable results, at a quota cost (the free
+daily quota is ~10,000 units):
+
+- **Live detection** — `search.list` (~100 units/check) instead of scraping
+  `/live`, for monitors whose detection method is *Scrape*. Use a long poll
+  interval. (Monitors set to the *YouTube Data API* detection method already use
+  it.)
+- **Upcoming schedule** — the Data API (~100 units per channel per refresh)
+  instead of scraping `/streams`.
+
+Each is a checkbox; off = keep scraping. Live title/category logging always
+scrapes (the API needs the live video id and returns no better category).
 
 ### Chat logs
 

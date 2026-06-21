@@ -25,7 +25,7 @@ use tracing::{debug, info};
 
 use crate::app_core::sleep_cancellable;
 use crate::events::{AppEvent, EventTx};
-use crate::models::{Platform, ScheduleSegment, now_unix};
+use crate::models::{K_YT_API_DETECT, K_YT_API_SCHEDULE, Platform, ScheduleSegment, now_unix};
 use crate::store::Store;
 
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
@@ -642,6 +642,26 @@ impl DetectContext {
 
     // ----- YouTube Data API (API key) -----
 
+    /// Whether a given YouTube operation should use the Data API instead of
+    /// scraping: its per-operation setting (`setting_key`) is on AND an API key is
+    /// configured.
+    pub fn youtube_api_enabled(&self, setting_key: &str) -> bool {
+        let on = self
+            .store
+            .get_setting(setting_key)
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("1");
+        on && !self
+            .store
+            .get_setting("youtube_api_key")
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .is_empty()
+    }
+
     pub async fn detect_youtube_api(&self, item: &DetectItem) -> DetectOutcome {
         let key = self
             .store
@@ -728,6 +748,90 @@ impl DetectContext {
         let v: Value = resp.json().await.ok()?;
         let s = v["items"][0]["liveStreamingDetails"]["actualStartTime"].as_str()?;
         parse_rfc3339(s)
+    }
+
+    /// A YouTube channel's upcoming streams via the Data API (instead of the
+    /// `/streams` scrape): `search.list?eventType=upcoming` (~100 quota units) for
+    /// the upcoming video ids, then `videos.list` for each one's scheduled start +
+    /// title (~1 unit). `Some(vec)` on success (possibly empty); `None` on error /
+    /// missing key (so the refresher won't wipe stored data on a transient fail).
+    pub async fn youtube_schedule_api(&self, url: &str) -> Option<Vec<ScheduleSegment>> {
+        let key = self
+            .store
+            .get_setting("youtube_api_key")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if key.is_empty() {
+            return None;
+        }
+        let channel_id = self.youtube_channel_id(url, &key).await.ok()?;
+        let resp = self
+            .http
+            .get("https://www.googleapis.com/youtube/v3/search")
+            .query(&[
+                ("part", "id"),
+                ("channelId", channel_id.as_str()),
+                ("eventType", "upcoming"),
+                ("type", "video"),
+                ("maxResults", "25"),
+                ("key", key.as_str()),
+            ])
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let v: Value = resp.json().await.ok()?;
+        let ids: Vec<String> = v["items"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|it| it["id"]["videoId"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if ids.is_empty() {
+            return Some(Vec::new());
+        }
+        let ids_joined = ids.join(",");
+        let resp = self
+            .http
+            .get("https://www.googleapis.com/youtube/v3/videos")
+            .query(&[
+                ("part", "snippet,liveStreamingDetails"),
+                ("id", ids_joined.as_str()),
+                ("key", key.as_str()),
+            ])
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let v: Value = resp.json().await.ok()?;
+        let mut segs: Vec<ScheduleSegment> = v["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|it| {
+                let start = it["liveStreamingDetails"]["scheduledStartTime"]
+                    .as_str()
+                    .and_then(parse_rfc3339)?;
+                Some(ScheduleSegment {
+                    id: 0,
+                    monitor_id: 0,
+                    start_time: start,
+                    end_time: None,
+                    title: it["snippet"]["title"].as_str().unwrap_or_default().to_string(),
+                    category: String::new(),
+                    canceled: false,
+                })
+            })
+            .collect();
+        segs.sort_by_key(|s| s.start_time);
+        Some(segs)
     }
 
     // ----- Kick official API (client-credentials app token) -----
@@ -830,6 +934,12 @@ impl DetectContext {
 
     pub async fn detect_scrape(&self, item: &DetectItem) -> DetectOutcome {
         match item.platform {
+            // Opt-in (Settings): use the Data API for liveness instead of scraping
+            // the /live page. (Monitors set to the "YouTube Data API" detection
+            // method already use it directly, never reaching here.)
+            Platform::YouTube if self.youtube_api_enabled(K_YT_API_DETECT) => {
+                self.detect_youtube_api(item).await
+            }
             Platform::YouTube => self.scrape_youtube(item).await,
             Platform::Kick => self.scrape_kick(item).await,
             _ => self.detect_generic(item).await,
@@ -1119,6 +1229,8 @@ async fn refresh_schedules_once(
     let live: std::collections::HashSet<i64> = rows.iter().map(|r| r.monitor.id).collect();
     last_fetched.retain(|id, _| live.contains(id));
     let now = Instant::now();
+    // Whether YouTube schedules use the Data API (Settings) — read once per pass.
+    let yt_api_schedule = ctx.youtube_api_enabled(K_YT_API_SCHEDULE);
     // Per-URL fetch cache for this pass: the same channel under multiple instances
     // is fetched once. `None` = the fetch failed (don't overwrite stored data).
     let mut fetched: HashMap<String, Option<Vec<ScheduleSegment>>> = HashMap::new();
@@ -1146,6 +1258,9 @@ async fn refresh_schedules_once(
             None => {
                 let s = match platform {
                     Platform::Twitch => ctx.twitch_schedule(&url).await,
+                    Platform::YouTube if yt_api_schedule => {
+                        ctx.youtube_schedule_api(&url).await
+                    }
                     Platform::YouTube => ctx.youtube_schedule(&url).await,
                     _ => None,
                 };

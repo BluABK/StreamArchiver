@@ -17,8 +17,9 @@ use crate::app_core::AppCore;
 use crate::events::{ManualCommand, UiCommand};
 use crate::models::{
     AdBreak, AuthKind, Channel, Container, DetectionMethod, DownloadDefaults, K_FILENAME_MEDIA,
-    MediaInfoMode, Monitor, MonitorWithChannel, Platform, Recording, ScheduleSegment, StreamGroup,
-    StreamMetaChange, Tool, Video, group_recordings, now_unix,
+    K_YT_API_DETECT, K_YT_API_SCHEDULE, MediaInfoMode, Monitor, MonitorWithChannel, Platform,
+    Recording, ScheduleSegment, StreamGroup, StreamMetaChange, Tool, Video, group_recordings,
+    now_unix,
 };
 use crate::oauth::{self, AuthFlow};
 use crate::platform::AutoStart;
@@ -264,6 +265,10 @@ struct SettingsForm {
     twitch_client_id: String,
     twitch_client_secret: String,
     youtube_api_key: String,
+    /// Per-operation opt-ins to use the YouTube Data API key instead of scraping
+    /// (each costs quota — see the Settings section).
+    youtube_api_detect: bool,
+    youtube_api_schedule: bool,
     kick_client_id: String,
     kick_client_secret: String,
     default_output_dir: String,
@@ -381,6 +386,8 @@ impl StreamArchiverApp {
             twitch_client_id: setting_or_empty(&core, K_TWITCH_ID),
             twitch_client_secret: setting_or_empty(&core, K_TWITCH_SECRET),
             youtube_api_key: setting_or_empty(&core, K_YT_KEY),
+            youtube_api_detect: setting_or_empty(&core, K_YT_API_DETECT) == "1",
+            youtube_api_schedule: setting_or_empty(&core, K_YT_API_SCHEDULE) == "1",
             kick_client_id: setting_or_empty(&core, K_KICK_ID),
             kick_client_secret: setting_or_empty(&core, K_KICK_SECRET),
             default_output_dir: default_out,
@@ -665,6 +672,8 @@ impl StreamArchiverApp {
             (K_WEBSUB_POLL, s.websub_poll_secs.trim()),
             (K_FILENAME_MEDIA, s.filename_media_info.as_str()),
             (K_DATE_FORMAT, s.date_fmt.as_str()),
+            (K_YT_API_DETECT, if s.youtube_api_detect { "1" } else { "0" }),
+            (K_YT_API_SCHEDULE, if s.youtube_api_schedule { "1" } else { "0" }),
         ];
         for (k, v) in pairs {
             if let Err(e) = self.core.store.set_setting(k, v) {
@@ -4481,6 +4490,41 @@ impl StreamArchiverApp {
                     );
                     ui.end_row();
                 });
+
+            ui.add_space(12.0);
+            ui.heading("YouTube Data API usage");
+            let key_set = !self.settings.youtube_api_key.trim().is_empty();
+            ui.label(
+                "By default these YouTube features scrape public pages (free, but can break \
+                 when YouTube changes them). With the YouTube API Key set above you can use the \
+                 Data API instead for more reliable results — but each call spends quota (the \
+                 free daily quota is ~10,000 units).",
+            );
+            if !key_set {
+                ui.colored_label(
+                    egui::Color32::from_rgb(0xe0, 0xb0, 0x6c),
+                    "⚠ Set a YouTube API Key above to enable these.",
+                );
+            }
+            ui.add_enabled_ui(key_set, |ui| {
+                ui.checkbox(
+                    &mut self.settings.youtube_api_detect,
+                    "Live detection (instead of scraping /live)",
+                )
+                .on_hover_text(
+                    "Use search.list for liveness on YouTube monitors whose detection method is \
+                     'Scrape'. ~100 quota units per check — with a long poll interval. (Monitors \
+                     already set to the 'YouTube Data API' method use it regardless.)",
+                );
+                ui.checkbox(
+                    &mut self.settings.youtube_api_schedule,
+                    "Upcoming schedule (instead of scraping /streams)",
+                )
+                .on_hover_text(
+                    "Use the Data API for the Next stream schedule. ~100 quota units per channel \
+                     per refresh (refreshed a few hours apart).",
+                );
+            });
 
             ui.add_space(12.0);
             ui.heading("Twitch account (OAuth)");

@@ -789,6 +789,11 @@ impl DownloadDefaults {
 /// `app_settings` key for the global [`MediaInfoMode`] (filename media probing).
 pub const K_FILENAME_MEDIA: &str = "filename_media_info";
 
+/// `app_settings` keys for opting individual YouTube operations into the Data API
+/// (instead of scraping). Each is gated on a non-empty `youtube_api_key`.
+pub const K_YT_API_DETECT: &str = "youtube_api_detect";
+pub const K_YT_API_SCHEDULE: &str = "youtube_api_schedule";
+
 /// Current unix timestamp in seconds.
 pub fn now_unix() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
