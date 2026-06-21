@@ -13,7 +13,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::models::{
     AdBreak, AuthKind, Channel, Container, DetectionMethod, Monitor, MonitorWithChannel, Platform,
-    ScheduleSegment, StreamMetaChange, Tool, Video, now_unix,
+    ScheduleSegment, StreamMetaChange, Tool, UpcomingStream, Video, now_unix,
 };
 
 /// Latest schema version understood by this build.
@@ -804,6 +804,38 @@ impl Store {
         Ok(rows)
     }
 
+    /// Every upcoming (non-canceled, start ≥ `after`) scheduled stream across all
+    /// monitors, joined with channel name + the monitor's source URL, soonest
+    /// first. Drives the Schedule calendar (one row per occurrence, unlike
+    /// [`Self::next_scheduled_streams`] which collapses to the soonest per monitor).
+    pub fn all_upcoming_schedule(&self, after: i64) -> Result<Vec<UpcomingStream>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT s.monitor_id, m.channel_id, c.name, m.url,
+                    s.start_time, s.end_time, s.title, s.category
+             FROM schedule_segment s
+             JOIN monitor m ON m.id = s.monitor_id
+             JOIN channel c ON c.id = m.channel_id
+             WHERE s.canceled = 0 AND s.start_time >= ?1
+             ORDER BY s.start_time, c.name COLLATE NOCASE",
+        )?;
+        let rows = stmt
+            .query_map(params![after], |r| {
+                Ok(UpcomingStream {
+                    monitor_id: r.get(0)?,
+                    channel_id: r.get(1)?,
+                    channel_name: r.get(2)?,
+                    url: r.get(3)?,
+                    start_time: r.get(4)?,
+                    end_time: r.get(5)?,
+                    title: r.get(6)?,
+                    category: r.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Mark any recordings still flagged 'recording' (i.e. left over from a
     /// crash) as 'orphaned'. Returns the number updated. Called on startup.
     pub fn mark_orphaned_recordings(&self, ended_at: i64) -> Result<usize> {
@@ -1542,6 +1574,56 @@ mod tests {
         // Deleting the monitor cascades to its schedule.
         store.delete_monitor(mid).unwrap();
         assert!(store.schedule_for_monitor(mid, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn all_upcoming_schedule_joins_channel() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m1 = sample_monitor(cid);
+        m1.channel_id = cid;
+        m1.url = "https://twitch.tv/streamer".into();
+        let mid1 = store.insert_monitor(&m1).unwrap();
+        let mut m2 = sample_monitor(cid);
+        m2.channel_id = cid;
+        m2.url = "https://youtube.com/@streamer".into();
+        let mid2 = store.insert_monitor(&m2).unwrap();
+
+        let seg = |start: i64, title: &str, canceled: bool| ScheduleSegment {
+            id: 0,
+            monitor_id: 0,
+            start_time: start,
+            end_time: Some(start + 3600),
+            title: title.into(),
+            category: String::new(),
+            canceled,
+        };
+        store
+            .replace_schedule(
+                mid1,
+                &[seg(500, "Past", false), seg(2_000, "TW soon", false)],
+            )
+            .unwrap();
+        store
+            .replace_schedule(
+                mid2,
+                &[seg(3_000, "Canceled", true), seg(1_500, "YT soon", false)],
+            )
+            .unwrap();
+
+        // Every upcoming occurrence, soonest first, canceled + past excluded.
+        let all = store.all_upcoming_schedule(1_000).unwrap();
+        assert_eq!(
+            all.iter().map(|s| s.title.as_str()).collect::<Vec<_>>(),
+            vec!["YT soon", "TW soon"],
+        );
+        // The join carries the channel name + each monitor's own URL/platform.
+        assert!(all.iter().all(|s| s.channel_name == "Streamer"));
+        let yt = all.iter().find(|s| s.title == "YT soon").unwrap();
+        assert_eq!(yt.monitor_id, mid2);
+        assert_eq!(yt.platform(), Platform::YouTube);
+        let tw = all.iter().find(|s| s.title == "TW soon").unwrap();
+        assert_eq!(tw.platform(), Platform::Twitch);
     }
 
     #[test]

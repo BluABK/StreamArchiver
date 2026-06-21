@@ -351,6 +351,32 @@ daily quota is ~10,000 units):
 Each is a checkbox; off = keep scraping. Live title/category logging always
 scrapes (the API needs the live video id and returns no better category).
 
+### Schedule (calendar)
+
+The **Schedule** tab shows every upcoming scheduled stream (from the same Twitch +
+YouTube sources as the Next stream column) in a **month calendar**:
+
+- **Navigation** — `◀` / `▶` step months, **Today** jumps back to the current
+  month, `⟳` (or **F5**) reloads from the store. Today's cell is tinted.
+- **Day cells** show up to three streams as chips (platform icon + start time +
+  channel). **Click** a day number — or the **+N more…** when a day is busy — to
+  open a popup listing that day's full schedule.
+- **Right-click** any stream (chip or day popup) to **copy** its URL, platform,
+  title, channel, or full details, or **open it in the browser**. The day popup
+  also has **Copy all**. Hover a stream for its full details.
+- **Left sidebar** filters which channels are shown: an **All channels** toggle
+  plus a per-channel checkbox (with each channel's platform icon and upcoming
+  count). Newly-added channels default to visible.
+- **Highlight collisions** (on by default) flags with a `⚠` any streams whose
+  times overlap — handy for spotting clashes across channels. YouTube upcoming
+  streams carry no end time, so they're treated as two hours long for the overlap
+  check. The header shows how many overlapping streams are visible in the month
+  on screen.
+
+Times respect the **date format** setting (12- vs 24-hour). The calendar reads the
+stored schedule, so use `⟳` / **F5** after the background refresh to pull in newly
+fetched streams.
+
 ### Chat logs
 
 Tick **Log chat** on an instance to archive chat alongside the recording (new

@@ -654,6 +654,33 @@ pub struct ScheduleSegment {
     pub canceled: bool,
 }
 
+/// One upcoming scheduled stream joined with its channel + monitor, for the
+/// Schedule calendar. Flattens a [`ScheduleSegment`] with the channel name and
+/// the monitor's source URL so the calendar can show who streams when and offer
+/// the URL/platform on a right-click. `platform` is derived from [`Self::url`].
+#[derive(Clone, Debug)]
+pub struct UpcomingStream {
+    // Carried from the join for a future "jump to this monitor" action; the
+    // calendar itself filters/derives everything from the channel + URL.
+    #[allow(dead_code)]
+    pub monitor_id: i64,
+    pub channel_id: i64,
+    pub channel_name: String,
+    /// The monitor's source URL (right-click → copy; platform derived from it).
+    pub url: String,
+    pub start_time: i64,
+    pub end_time: Option<i64>,
+    pub title: String,
+    pub category: String,
+}
+
+impl UpcomingStream {
+    /// Platform inferred from the source URL.
+    pub fn platform(&self) -> Platform {
+        Platform::detect(&self.url)
+    }
+}
+
 /// An on-demand, one-shot video/VOD download (a YouTube video, a Twitch VOD,
 /// etc.) — distinct from a [`Monitor`], which watches a channel for live streams.
 ///
