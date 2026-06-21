@@ -961,30 +961,34 @@ fn fmt_meta_count(n: i64) -> String {
     if n > 0 { n.to_string() } else { String::new() }
 }
 
-/// One human-readable line per metadata change (offset + kind + value/transition).
+/// One human-readable line per *actual* metadata change (offset + kind +
+/// `old → new`). The initial value of each field (logged with an empty
+/// `old_value`) is the starting state, not a change, so it's skipped — it still
+/// shows as the `old` side of the first real change.
 fn meta_change_lines(changes: &[StreamMetaChange]) -> Vec<String> {
     changes
         .iter()
+        .filter(|c| !c.old_value.is_empty())
         .map(|c| {
             let at = fmt_duration(c.at_secs.max(0));
             let kind = if c.kind == "category" { "Category" } else { "Title" };
-            if c.old_value.is_empty() {
-                // First entry per kind: the value the recording started with.
-                format!("{at}  {kind}: {}", c.new_value)
+            let new = if c.new_value.is_empty() {
+                "(cleared)"
             } else {
-                format!("{at}  {kind}: {} → {}", c.old_value, c.new_value)
-            }
+                c.new_value.as_str()
+            };
+            format!("{at}  {kind}: {} → {new}", c.old_value)
         })
         .collect()
 }
 
 /// Multi-line tooltip body for a Changes cell: a heading plus the change list
-/// (or just the heading when the detail isn't loaded for this row).
+/// (just the heading when the detail isn't loaded or there are no changes).
 fn meta_tooltip(count: i64, changes: Option<&Vec<StreamMetaChange>>) -> String {
     let mut s = format!("{count} title/category change(s) during this recording.");
-    if let Some(c) = changes.filter(|c| !c.is_empty()) {
+    if let Some(lines) = changes.map(|c| meta_change_lines(c)).filter(|l| !l.is_empty()) {
         s.push('\n');
-        s.push_str(&meta_change_lines(c).join("\n"));
+        s.push_str(&lines.join("\n"));
     }
     s
 }
@@ -3060,17 +3064,19 @@ impl StreamArchiverApp {
             .default_size([420.0, 260.0])
             .open(&mut open)
             .show(ctx, |ui| {
-                if changes.is_empty() {
+                // Only actual changes (the initial value of each field is the
+                // starting state, not a change); shown as `old → new`.
+                let lines = meta_change_lines(&changes);
+                if lines.is_empty() {
                     ui.label("No title or category changes recorded for this take.");
                     return;
                 }
                 ui.label(format!(
                     "{} change(s) during this recording (offset from the take's start; \
-                     the first entry per kind is the value it started with).",
-                    changes.len(),
+                     each shows the value before → after).",
+                    lines.len(),
                 ));
                 ui.add_space(6.0);
-                let lines = meta_change_lines(&changes);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, true])
                     .show(ui, |ui| {

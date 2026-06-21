@@ -725,7 +725,8 @@ impl Store {
                 (SELECT COUNT(*) FROM ad_break ab WHERE ab.recording_id = r.id),
                 COALESCE((SELECT SUM(ab.duration_secs) FROM ad_break ab WHERE ab.recording_id = r.id), 0),
                 m.ad_free, m.ad_free_sub, m.audio_tracks, m.subtitle_tracks,
-                (SELECT COUNT(*) FROM stream_meta_change smc WHERE smc.recording_id = r.id),
+                (SELECT COUNT(*) FROM stream_meta_change smc
+                 WHERE smc.recording_id = r.id AND smc.old_value != ''),
                 m.chat_log, COALESCE(r.log_excerpt, ''),
                 COALESCE((SELECT new_value FROM stream_meta_change smc
                           WHERE smc.recording_id = r.id AND smc.kind = 'title'
@@ -803,7 +804,8 @@ impl Store {
                     COALESCE(output_path, ''), went_live_at, went_live_approx, lost_secs, stream_id,
                     (SELECT COUNT(*) FROM ad_break ab WHERE ab.recording_id = recording.id),
                     COALESCE((SELECT SUM(ab.duration_secs) FROM ad_break ab WHERE ab.recording_id = recording.id), 0),
-                    (SELECT COUNT(*) FROM stream_meta_change smc WHERE smc.recording_id = recording.id),
+                    (SELECT COUNT(*) FROM stream_meta_change smc
+                     WHERE smc.recording_id = recording.id AND smc.old_value != ''),
                     COALESCE(log_excerpt, ''),
                     COALESCE((SELECT new_value FROM stream_meta_change smc
                               WHERE smc.recording_id = recording.id AND smc.kind = 'title'
@@ -1327,6 +1329,8 @@ mod tests {
         store.insert_meta_change(rid, 0, "title", "", "starting soon").unwrap();
         store.insert_meta_change(rid, 0, "category", "", "Just Chatting").unwrap();
 
+        // The raw log keeps all 3 rows (incl. the two initial values), so the
+        // current-value lookups and {games} still see them.
         let changes = store.meta_changes_for_recording(rid).unwrap();
         assert_eq!(changes.len(), 3);
         assert_eq!(changes[0].at_secs, 0);
@@ -1335,11 +1339,13 @@ mod tests {
         assert_eq!(changes[2].kind, "category");
         assert_eq!(changes[2].new_value, "Valorant");
 
-        // Count rolls up on both the take and the latest-recording monitor row.
+        // The COUNT, however, is only *actual* changes (a non-empty old_value):
+        // here just the "Just Chatting" -> "Valorant" category transition. The two
+        // initial values (empty old_value) are the starting state, not changes.
         let recs = store.recordings_for_monitor(mid).unwrap();
-        assert_eq!(recs[0].meta_change_count, 3);
+        assert_eq!(recs[0].meta_change_count, 1);
         let row = store.get_monitor_with_channel(mid).unwrap().unwrap();
-        assert_eq!(row.last_recording_meta_changes, 3);
+        assert_eq!(row.last_recording_meta_changes, 1);
 
         // Current title/category = the chronologically-latest value of each kind
         // (at_secs DESC, id DESC) — so they agree with the LAST entry shown in the

@@ -277,11 +277,12 @@ recording, so this runs as a dedicated per-recording poller.)
 - **Game** and **Title** columns show the *current* (latest-logged) value of the
   most recent recording, updating live as the stream changes. Both are narrow and
   truncated — **hover** to read the full value.
-- A **Changes** column shows the number of changes for the latest take. **Hover**
-  a stream/take row's count to see the list inline, or **double-click** it to open
-  a scrollable, copyable log window. Each entry shows the offset from the take's
-  start, the kind, and the value (the first entry per kind is what it *started*
-  with; later entries show `old → new`).
+- A **Changes** column counts only *actual* changes for the latest take — the
+  value each field *started* with is the initial state, not a change, so it isn't
+  counted or listed (it still shows as the `old` side of the first real change).
+  **Hover** a stream/take row's count to see the list inline, or **double-click**
+  it to open a scrollable, copyable log window; each entry shows the offset from
+  the take's start, the kind, and `old → new`.
 - **Sources, per platform:**
   - **Twitch** — Helix (`Get Streams`); needs Twitch credentials (Settings), the
     same app/user token as live detection. Title + the game/category.
