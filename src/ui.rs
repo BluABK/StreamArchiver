@@ -35,6 +35,8 @@ const K_COOKIES_BROWSER: &str = "cookies_browser";
 const K_WEBSUB_URL: &str = "websub_vps_url";
 const K_WEBSUB_TOKEN: &str = "websub_token";
 const K_WEBSUB_POLL: &str = "websub_poll_secs";
+/// Whether Streams rows get a status background tint (recording / ad / error).
+const K_STATUS_BGCOLOR: &str = "status_bgcolor";
 
 /// Browsers yt-dlp can read cookies from (for the Settings dropdown).
 const COOKIE_BROWSERS: [&str; 8] = [
@@ -321,6 +323,10 @@ pub struct StreamArchiverApp {
     videos_filters: Vec<String>,
     /// Shared state of the interactive "Connect Twitch" device-code flow.
     twitch_flow: Arc<Mutex<AuthFlow>>,
+    /// Whether Streams rows show a status background tint (recording / ad / error).
+    /// Toggled from the top bar; persisted under [`K_STATUS_BGCOLOR`]. Keyboard
+    /// row selection is still highlighted regardless.
+    status_bgcolor: bool,
 }
 
 impl StreamArchiverApp {
@@ -381,6 +387,15 @@ impl StreamArchiverApp {
             None => AuthFlow::Idle,
         }));
 
+        // Status row tint defaults on; only an explicit "0" disables it.
+        let status_bgcolor = core
+            .store
+            .get_setting(K_STATUS_BGCOLOR)
+            .ok()
+            .flatten()
+            .map(|v| v != "0")
+            .unwrap_or(true);
+
         let download_defaults = core
             .store
             .get_setting("download_defaults")
@@ -425,6 +440,7 @@ impl StreamArchiverApp {
             videos_sort: SortState::default(),
             videos_filters: vec![String::new(); VIDEO_COLS],
             twitch_flow,
+            status_bgcolor,
         };
         app.reload_rows();
         app.reload_videos();
@@ -684,25 +700,27 @@ const HL_ERROR: egui::Color32 = egui::Color32::from_rgb(0x6e, 0x2f, 0x2f);
 /// Background tint for a Streams row, by state (highest priority first): an ad is
 /// playing > recording > last poll/recording errored > keyboard-selected.
 /// `accent` is the theme's selection color (so recording/selected keep the
-/// existing look). `None` = no tint.
+/// existing look). When `status_colors` is off, the status tints (ad / recording
+/// / error) are suppressed but a keyboard-`selected` row is still highlighted.
+/// `None` = no tint.
 fn row_tint(
     recording: bool,
     ad_running: bool,
     errored: bool,
     selected: bool,
     accent: egui::Color32,
+    status_colors: bool,
 ) -> Option<egui::Color32> {
-    if recording && ad_running {
-        Some(HL_AD)
-    } else if recording {
-        Some(accent)
-    } else if errored {
-        Some(HL_ERROR)
-    } else if selected {
-        Some(accent)
-    } else {
-        None
+    if status_colors {
+        if recording && ad_running {
+            return Some(HL_AD);
+        } else if recording {
+            return Some(accent);
+        } else if errored {
+            return Some(HL_ERROR);
+        }
     }
+    selected.then_some(accent)
 }
 
 /// Whether a monitor's last poll or recording ended in an error/failure.
@@ -1767,6 +1785,20 @@ impl eframe::App for StreamArchiverApp {
                     ui.selectable_value(&mut self.view, View::Streams, "Streams");
                     ui.selectable_value(&mut self.view, View::Videos, "Videos");
                     ui.selectable_value(&mut self.view, View::Settings, "Settings");
+                    ui.separator();
+                    if ui
+                        .checkbox(&mut self.status_bgcolor, "Status bgcolor")
+                        .on_hover_text(
+                            "Tint Streams rows by status (recording / ad playing / failed). \
+                             Row selection is still highlighted when this is off.",
+                        )
+                        .changed()
+                    {
+                        let _ = self.core.store.set_setting(
+                            K_STATUS_BGCOLOR,
+                            if self.status_bgcolor { "1" } else { "0" },
+                        );
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if self.view == View::Streams {
                             if ui
@@ -3090,6 +3122,8 @@ impl StreamArchiverApp {
         if filters.len() != STREAM_COLS {
             filters = vec![String::new(); STREAM_COLS];
         }
+        // Whether status row tints are drawn (top-bar "Status bgcolor" toggle).
+        let status_bgcolor = self.status_bgcolor;
 
         // Fill the available height so the horizontal scrollbar sits at the
         // bottom of the window rather than directly under the (short) row list.
@@ -3222,7 +3256,8 @@ impl StreamArchiverApp {
                                 // its instances (ad playing / recording / errored).
                                 let any_ad = mons.iter().any(|m| ad_running(m.monitor.id));
                                 let any_err = mons.iter().copied().any(monitor_errored);
-                                let tint = row_tint(any_rec, any_ad, any_err, false, sel_color);
+                                let tint =
+                                    row_tint(any_rec, any_ad, any_err, false, sel_color, status_bgcolor);
                                 if let Some(c) = tint {
                                     body.ui_mut().visuals_mut().selection.bg_fill = c;
                                 }
@@ -3387,6 +3422,7 @@ impl StreamArchiverApp {
                                     monitor_errored(row),
                                     is_selected,
                                     sel_color,
+                                    status_bgcolor,
                                 );
                                 if let Some(c) = tint {
                                     body.ui_mut().visuals_mut().selection.bg_fill = c;
