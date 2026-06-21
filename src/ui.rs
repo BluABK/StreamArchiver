@@ -318,8 +318,9 @@ pub struct StreamArchiverApp {
     /// Lazy per-recording title/category change log, keyed by recording id;
     /// cleared on reload. Same caching role as `ad_break_cache`.
     meta_change_cache: HashMap<i64, Vec<StreamMetaChange>>,
-    /// Recording id whose metadata-change log is shown in a popup (None = closed).
-    meta_popup: Option<i64>,
+    /// What the metadata-change popup shows (None = closed): a single take or a
+    /// whole stream's aggregated takes.
+    meta_popup: Option<MetaPopup>,
     /// Platform favicons, uploaded to the GPU on first use (None until then).
     platform_tex: Option<PlatformTextures>,
     /// Sort + per-column filters for the Videos table.
@@ -982,6 +983,36 @@ fn meta_change_lines(changes: &[StreamMetaChange]) -> Vec<String> {
         .collect()
 }
 
+/// What the metadata-change popup shows.
+#[derive(Clone)]
+enum MetaPopup {
+    /// A single take's change log (recording id).
+    Take(i64),
+    /// A whole stream's takes — `(recording id, started_at)`, oldest-first —
+    /// aggregated chronologically with the per-take re-baselines omitted.
+    Stream(Vec<(i64, i64)>),
+}
+
+/// Merge a stream's takes into one chronological change list. Each take's offsets
+/// (`at_secs`, relative to that take's start) are rebased onto the whole stream's
+/// timeline (`take.started_at - stream_start + at_secs`); the rows are then sorted
+/// and run through [`meta_change_lines`], which drops each take's initial value
+/// (empty `old_value`) — so a take re-observing the value the previous take ended
+/// on adds no duplicate line, while genuine changes are kept.
+fn aggregate_stream_changes(takes: &[(i64, Vec<StreamMetaChange>)]) -> Vec<StreamMetaChange> {
+    let stream_start = takes.iter().map(|(s, _)| *s).min().unwrap_or(0);
+    let mut all: Vec<StreamMetaChange> = Vec::new();
+    for (started_at, rows) in takes {
+        for r in rows {
+            let mut adj = r.clone();
+            adj.at_secs = (started_at - stream_start) + r.at_secs;
+            all.push(adj);
+        }
+    }
+    all.sort_by_key(|c| (c.at_secs, c.id));
+    all
+}
+
 /// Multi-line tooltip body for a Changes cell: a heading plus the change list
 /// (just the heading when the detail isn't loaded or there are no changes).
 fn meta_tooltip(count: i64, changes: Option<&Vec<StreamMetaChange>>) -> String {
@@ -994,32 +1025,28 @@ fn meta_tooltip(count: i64, changes: Option<&Vec<StreamMetaChange>>) -> String {
 }
 
 /// Render one Changes table cell, mirroring [`ad_cell`]: blank when the count is
-/// zero, a lazily-built hover list, and (when `clickable_rec` is set) a
-/// double-click that returns the recording id to open its change-log popup.
+/// zero, a lazily-built hover list, and (when `clickable`) a double-click to open
+/// the change-log popup. Returns whether it was double-clicked so the caller can
+/// open the right popup (a single take, or a whole stream's aggregated takes).
 fn meta_cell(
     ui: &mut egui::Ui,
     count: i64,
     detail: Option<&Vec<StreamMetaChange>>,
-    clickable_rec: Option<i64>,
-) -> Option<i64> {
+    clickable: bool,
+) -> bool {
     let text = fmt_meta_count(count);
     if text.is_empty() {
-        return None;
+        return false;
     }
-    let label = if clickable_rec.is_some() {
+    let label = if clickable {
         egui::Label::new(text).sense(egui::Sense::click())
     } else {
         egui::Label::new(text)
     };
-    let resp = ui
-        .add(label)
-        .on_hover_ui(|ui| {
-            ui.label(meta_tooltip(count, detail));
-        });
-    match clickable_rec {
-        Some(rec) if resp.double_clicked() => Some(rec),
-        _ => None,
-    }
+    let resp = ui.add(label).on_hover_ui(|ui| {
+        ui.label(meta_tooltip(count, detail));
+    });
+    clickable && resp.double_clicked()
 }
 
 /// Render a current-Title / current-Game cell: blank when empty, otherwise a
@@ -1721,7 +1748,7 @@ fn render_instance_row(
         }
     });
     tr.col(|ui| {
-        meta_cell(ui, row.last_recording_meta_changes, None, None);
+        meta_cell(ui, row.last_recording_meta_changes, None, false);
     });
     tr.col(|ui| {
         ui.label(fmt_date(row.channel.created_at));
@@ -3044,10 +3071,8 @@ impl StreamArchiverApp {
         }
     }
 
-    fn meta_popup_window(&mut self, ctx: &egui::Context) {
-        let Some(rid) = self.meta_popup else {
-            return;
-        };
+    /// Load a recording's metadata-change rows into the cache if absent.
+    fn ensure_meta_cached(&mut self, rid: i64) {
         if !self.meta_change_cache.contains_key(&rid) {
             let v = self
                 .core
@@ -3056,24 +3081,54 @@ impl StreamArchiverApp {
                 .unwrap_or_default();
             self.meta_change_cache.insert(rid, v);
         }
-        let changes = self.meta_change_cache.get(&rid).cloned().unwrap_or_default();
+    }
+
+    fn meta_popup_window(&mut self, ctx: &egui::Context) {
+        let Some(popup) = self.meta_popup.clone() else {
+            return;
+        };
+        // Build the change list: one take directly, or a stream's takes merged
+        // chronologically with the per-take re-baselines dropped.
+        let (changes, multi) = match &popup {
+            MetaPopup::Take(rid) => {
+                self.ensure_meta_cached(*rid);
+                (self.meta_change_cache.get(rid).cloned().unwrap_or_default(), false)
+            }
+            MetaPopup::Stream(takes) => {
+                for (rid, _) in takes {
+                    self.ensure_meta_cached(*rid);
+                }
+                let loaded: Vec<(i64, Vec<StreamMetaChange>)> = takes
+                    .iter()
+                    .map(|(rid, started)| {
+                        (*started, self.meta_change_cache.get(rid).cloned().unwrap_or_default())
+                    })
+                    .collect();
+                (aggregate_stream_changes(&loaded), takes.len() > 1)
+            }
+        };
         let mut open = true;
         egui::Window::new("Title & category changes")
             .collapsible(false)
             .resizable(true)
-            .default_size([420.0, 260.0])
+            .default_size([460.0, 260.0])
             .open(&mut open)
             .show(ctx, |ui| {
                 // Only actual changes (the initial value of each field is the
                 // starting state, not a change); shown as `old → new`.
                 let lines = meta_change_lines(&changes);
                 if lines.is_empty() {
-                    ui.label("No title or category changes recorded for this take.");
+                    ui.label("No title or category changes recorded.");
                     return;
                 }
+                let scope = if multi {
+                    "across this stream's takes"
+                } else {
+                    "during this recording"
+                };
                 ui.label(format!(
-                    "{} change(s) during this recording (offset from the take's start; \
-                     each shows the value before → after).",
+                    "{} change(s) {scope} (offset from the start; each shows the \
+                     value before → after).",
                     lines.len(),
                 ));
                 ui.add_space(6.0);
@@ -3226,7 +3281,7 @@ impl StreamArchiverApp {
         // Collected in the table closure (which borrows `self` immutably), applied
         // afterwards: a double-click on an ad / changes cell opens that take's popup.
         let mut open_ad_popup: Option<i64> = None;
-        let mut open_meta_popup: Option<i64> = None;
+        let mut open_meta_popup: Option<MetaPopup> = None;
 
         // Snapshot expansion state for read-only use inside the table closure.
         let exp_channels = self.expanded_channels.clone();
@@ -3502,7 +3557,7 @@ impl StreamArchiverApp {
                                     });
                                     tr.col(|ui| {
                                         if let Some(c) = meta_changes {
-                                            meta_cell(ui, c, None, None);
+                                            meta_cell(ui, c, None, false);
                                         }
                                     });
                                     tr.col(|ui| {
@@ -3678,9 +3733,14 @@ impl StreamArchiverApp {
                                     });
                                     tr.col(|_ui| {}); // ad-free (n/a per stream)
                                     tr.col(|ui| {
+                                        // Single-take streams show the change list on
+                                        // hover; double-click (any take count) opens the
+                                        // popup with all takes aggregated chronologically.
                                         let det = meta_rec.and_then(|id| meta_logs.get(&id));
-                                        if let Some(r) = meta_cell(ui, meta_count, det, meta_rec) {
-                                            open_meta_popup = Some(r);
+                                        if meta_cell(ui, meta_count, det, true) {
+                                            open_meta_popup = Some(MetaPopup::Stream(
+                                                g.takes.iter().map(|t| (t.id, t.started_at)).collect(),
+                                            ));
                                         }
                                     });
                                     tr.col(|_ui| {}); // added
@@ -3809,10 +3869,8 @@ impl StreamArchiverApp {
                                     tr.col(|_ui| {}); // ad-free (n/a per take)
                                     tr.col(|ui| {
                                         let det = meta_logs.get(&t.id);
-                                        if let Some(r) =
-                                            meta_cell(ui, t.meta_change_count, det, Some(t.id))
-                                        {
-                                            open_meta_popup = Some(r);
+                                        if meta_cell(ui, t.meta_change_count, det, true) {
+                                            open_meta_popup = Some(MetaPopup::Take(t.id));
                                         }
                                     });
                                     tr.col(|_ui| {}); // added
@@ -3827,8 +3885,8 @@ impl StreamArchiverApp {
         if let Some(rid) = open_ad_popup {
             self.ad_popup = Some(rid);
         }
-        if let Some(rid) = open_meta_popup {
-            self.meta_popup = Some(rid);
+        if let Some(p) = open_meta_popup {
+            self.meta_popup = Some(p);
         }
 
         // Tick the live Duration column ~1/sec while anything is recording.
@@ -3915,11 +3973,17 @@ impl StreamArchiverApp {
                 self.status = format!("Error: {e}");
             }
             // The take (and its cascaded ad breaks / meta changes) is gone; close
-            // any popup for it.
+            // any popup that referenced it (a take popup for it, or a stream popup
+            // that included it).
             if self.ad_popup == Some(rid) {
                 self.ad_popup = None;
             }
-            if self.meta_popup == Some(rid) {
+            let meta_refs_rid = match &self.meta_popup {
+                Some(MetaPopup::Take(id)) => *id == rid,
+                Some(MetaPopup::Stream(takes)) => takes.iter().any(|(id, _)| *id == rid),
+                None => false,
+            };
+            if meta_refs_rid {
                 self.meta_popup = None;
             }
             self.reload_rows();
@@ -4484,9 +4548,40 @@ impl StreamArchiverApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        DateFmt, active_date_fmt, compose_browser_profile, fmt_polled, set_active_date_fmt,
+        DateFmt, StreamMetaChange, active_date_fmt, aggregate_stream_changes,
+        compose_browser_profile, fmt_polled, meta_change_lines, set_active_date_fmt,
         split_browser_profile,
     };
+
+    #[test]
+    fn stream_meta_aggregation_dedups_rebaseline() {
+        let smc = |id, at, old: &str, new: &str| StreamMetaChange {
+            id,
+            recording_id: 0,
+            at_secs: at,
+            kind: "title".into(),
+            old_value: old.into(),
+            new_value: new.into(),
+        };
+        // Take 1 (started 1000): initial "A", then A -> B at +300s.
+        let t1 = vec![smc(1, 0, "", "A"), smc(2, 300, "A", "B")];
+        // Take 2 (started 2000): re-observes "B" (the duplicate), then B -> C at +120s.
+        let t2 = vec![smc(3, 0, "", "B"), smc(4, 120, "B", "C")];
+
+        let agg = aggregate_stream_changes(&[(1000, t1), (2000, t2)]);
+        // All rows kept, offsets rebased onto the stream timeline (min start 1000)
+        // and sorted: 0, 300, (2000-1000)+0=1000, (2000-1000)+120=1120.
+        assert_eq!(
+            agg.iter().map(|c| c.at_secs).collect::<Vec<_>>(),
+            vec![0, 300, 1000, 1120]
+        );
+        // The displayed list drops both initial values — including take 2's
+        // re-baseline of "B" (the omitted duplicate) — and keeps the real changes.
+        let lines = meta_change_lines(&agg);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("A → B"), "{:?}", lines[0]);
+        assert!(lines[1].contains("B → C"), "{:?}", lines[1]);
+    }
 
     #[test]
     fn date_fmt_parse_roundtrip() {
