@@ -237,6 +237,7 @@ pub fn build_plan(
     row: &MonitorWithChannel,
     started_at: i64,
     auth: &AuthSource,
+    ytdlp_global_args: &[String],
     stream_id: Option<&str>,
     media: Option<&MediaInfo>,
 ) -> DownloadPlan {
@@ -316,6 +317,9 @@ pub fn build_plan(
                 }
                 _ => {}
             }
+            // Global defaults from Settings → yt-dlp default arguments.
+            // Per-monitor extra_args extend after and can override these.
+            args.extend_from_slice(ytdlp_global_args);
             // YouTube chat goes through yt-dlp's live_chat; Twitch chat is logged
             // by the native WS logger instead, so don't ask yt-dlp for it there.
             let chat_subs = m.chat_log && m.platform() != Platform::Twitch;
@@ -988,8 +992,15 @@ impl Supervisor {
             self.active.lock().unwrap().remove(&monitor_id);
             return;
         }
+        let ytdlp_global_raw = self
+            .store
+            .get_setting("ytdlp_default_args")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let ytdlp_global_args = split_args(&ytdlp_global_raw);
         let started_at = now_unix();
-        let plan = build_plan(&row, started_at, &auth, stream_id.as_deref(), pre_media.as_ref());
+        let plan = build_plan(&row, started_at, &auth, &ytdlp_global_args, stream_id.as_deref(), pre_media.as_ref());
         if let Some(parent) = plan.capture_path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
@@ -2686,6 +2697,7 @@ mod tests {
             &row(Tool::Streamlink, Container::Mkv, Platform::Twitch),
             1_700_000_000,
             &AuthSource::None,
+            &[],
             None,
             None,
         );
@@ -2707,6 +2719,7 @@ mod tests {
             &row(Tool::YtDlp, Container::Mkv, Platform::YouTube),
             1_700_000_000,
             &AuthSource::None,
+            &[],
             None,
             None,
         );
@@ -2724,6 +2737,7 @@ mod tests {
             &row(Tool::Streamlink, Container::Mkv, Platform::Twitch),
             1_700_000_000,
             &AuthSource::Token("abc123".into()),
+            &[],
             None,
             None,
         );
@@ -2740,6 +2754,7 @@ mod tests {
             &row(Tool::YtDlp, Container::Mkv, Platform::YouTube),
             1_700_000_000,
             &AuthSource::CookiesBrowser("firefox".into()),
+            &[],
             None,
             None,
         );
@@ -2750,6 +2765,7 @@ mod tests {
             &row(Tool::YtDlp, Container::Mkv, Platform::YouTube),
             1_700_000_000,
             &AuthSource::CookiesFile("C:/c.txt".into()),
+            &[],
             None,
             None,
         );
@@ -2762,13 +2778,13 @@ mod tests {
         let mut r = row(Tool::Streamlink, Container::Mkv, Platform::Twitch);
         r.monitor.audio_tracks = "all".into();
         r.monitor.subtitle_tracks = "all".into(); // ignored by streamlink
-        let plan = build_plan(&r, 1_700_000_000, &AuthSource::None, None, None);
+        let plan = build_plan(&r, 1_700_000_000, &AuthSource::None, &[], None, None);
         assert!(plan.args.iter().any(|a| a == "--hls-audio-select=*"));
         assert!(!plan.args.iter().any(|a| a == "--sub-langs"));
 
         let mut r2 = row(Tool::Streamlink, Container::Mkv, Platform::Twitch);
         r2.monitor.audio_tracks = "en,de".into();
-        let plan2 = build_plan(&r2, 1_700_000_000, &AuthSource::None, None, None);
+        let plan2 = build_plan(&r2, 1_700_000_000, &AuthSource::None, &[], None, None);
         assert!(plan2.args.iter().any(|a| a == "--hls-audio-select=en,de"));
 
         // yt-dlp: "all" subs -> --sub-langs=all --write-subs; audio ignored. The
@@ -2776,7 +2792,7 @@ mod tests {
         let mut y = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
         y.monitor.subtitle_tracks = "all".into();
         y.monitor.audio_tracks = "all".into(); // ignored by yt-dlp
-        let yplan = build_plan(&y, 1_700_000_000, &AuthSource::None, None, None);
+        let yplan = build_plan(&y, 1_700_000_000, &AuthSource::None, &[], None, None);
         assert!(yplan.args.iter().any(|a| a == "--sub-langs=all"));
         assert!(yplan.args.iter().any(|a| a == "--write-subs"));
         assert!(!yplan.args.iter().any(|a| a == "--hls-audio-select=*"));
@@ -2785,13 +2801,13 @@ mod tests {
         // so it never reaches yt-dlp as the invalid regex `--sub-langs *`.
         let mut y2 = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
         y2.monitor.subtitle_tracks = "*".into();
-        let yplan2 = build_plan(&y2, 1_700_000_000, &AuthSource::None, None, None);
+        let yplan2 = build_plan(&y2, 1_700_000_000, &AuthSource::None, &[], None, None);
         assert!(yplan2.args.iter().any(|a| a == "--sub-langs=all"));
 
         // A language list passes through verbatim (joined form).
         let mut y3 = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
         y3.monitor.subtitle_tracks = "en,de".into();
-        let yplan3 = build_plan(&y3, 1_700_000_000, &AuthSource::None, None, None);
+        let yplan3 = build_plan(&y3, 1_700_000_000, &AuthSource::None, &[], None, None);
         assert!(yplan3.args.iter().any(|a| a == "--sub-langs=en,de"));
 
         // Empty (existing-monitor default) adds no track flags at all.
@@ -2799,6 +2815,7 @@ mod tests {
             &row(Tool::Streamlink, Container::Mkv, Platform::Twitch),
             1_700_000_000,
             &AuthSource::None,
+            &[],
             None,
             None,
         );
@@ -2816,7 +2833,7 @@ mod tests {
         let mut y = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
         y.monitor.chat_log = true;
         y.monitor.subtitle_tracks = String::new();
-        let plan = build_plan(&y, 1_700_000_000, &AuthSource::None, None, None);
+        let plan = build_plan(&y, 1_700_000_000, &AuthSource::None, &[], None, None);
         assert!(plan.args.iter().any(|a| a == "--sub-langs=live_chat"));
         assert!(plan.args.iter().any(|a| a == "--write-subs"));
 
@@ -2824,7 +2841,7 @@ mod tests {
         let mut y2 = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
         y2.monitor.chat_log = true;
         y2.monitor.subtitle_tracks = "en".into();
-        let plan2 = build_plan(&y2, 1_700_000_000, &AuthSource::None, None, None);
+        let plan2 = build_plan(&y2, 1_700_000_000, &AuthSource::None, &[], None, None);
         assert!(plan2.args.iter().any(|a| a == "--sub-langs=en,live_chat"));
 
         // Twitch + yt-dlp + chat_log -> NO yt-dlp live_chat (the native Twitch
@@ -2832,7 +2849,7 @@ mod tests {
         let mut t = row(Tool::YtDlp, Container::Mkv, Platform::Twitch);
         t.monitor.chat_log = true;
         t.monitor.subtitle_tracks = String::new();
-        let plant = build_plan(&t, 1_700_000_000, &AuthSource::None, None, None);
+        let plant = build_plan(&t, 1_700_000_000, &AuthSource::None, &[], None, None);
         assert!(!plant.args.iter().any(|a| a.contains("live_chat")));
     }
 
@@ -2862,6 +2879,7 @@ mod tests {
             &row(Tool::Streamlink, Container::Ts, Platform::Twitch),
             1_700_000_000,
             &AuthSource::None,
+            &[],
             None,
             None,
         );

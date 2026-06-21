@@ -34,6 +34,7 @@ const K_DEFAULT_OUT: &str = "default_output_dir";
 const K_MAX_CONCURRENT: &str = "max_concurrent_downloads";
 const K_DOWNLOAD_AUTH: &str = "download_auth_method";
 const K_COOKIES_BROWSER: &str = "cookies_browser";
+const K_YTDLP_ARGS: &str = "ytdlp_default_args";
 const K_WEBSUB_URL: &str = "websub_vps_url";
 const K_WEBSUB_TOKEN: &str = "websub_token";
 const K_WEBSUB_POLL: &str = "websub_poll_secs";
@@ -297,6 +298,9 @@ struct SettingsForm {
     filename_media_info: MediaInfoMode,
     /// How dates/timestamps are displayed throughout the UI.
     date_fmt: DateFmt,
+    /// Global extra arguments prepended to every yt-dlp invocation (all monitors).
+    /// Per-monitor extra_args are appended after these, so they take precedence.
+    ytdlp_default_args: String,
     /// Discord user token + whether to import stream schedules from Discord events
     /// (opt-in; automating a user token is against Discord's ToS).
     discord_token: String,
@@ -447,6 +451,7 @@ impl StreamArchiverApp {
                 .unwrap_or_else(|| "15".into()),
             filename_media_info: MediaInfoMode::parse(&setting_or_empty(&core, K_FILENAME_MEDIA)),
             date_fmt: DateFmt::parse(&setting_or_empty(&core, K_DATE_FORMAT)),
+            ytdlp_default_args: setting_or_empty(&core, K_YTDLP_ARGS),
             discord_token: setting_or_empty(&core, K_DISCORD_TOKEN),
             discord_schedule: setting_or_empty(&core, K_DISCORD_SCHEDULE) == "1",
         };
@@ -747,6 +752,7 @@ impl StreamArchiverApp {
             (K_DATE_FORMAT, s.date_fmt.as_str()),
             (K_YT_API_DETECT, if s.youtube_api_detect { "1" } else { "0" }),
             (K_YT_API_SCHEDULE, if s.youtube_api_schedule { "1" } else { "0" }),
+            (K_YTDLP_ARGS, s.ytdlp_default_args.trim()),
             (K_DISCORD_TOKEN, s.discord_token.trim()),
             // Only persist the import as on when a token actually backs it, so the
             // consent flag can't be left latched with no token.
@@ -5722,6 +5728,28 @@ impl StreamArchiverApp {
                         );
                         ui.end_row();
                     }
+                });
+
+            ui.add_space(12.0);
+            ui.heading("yt-dlp default arguments");
+            ui.label("Prepended to every yt-dlp invocation. Per-channel extra args are appended after and override these.");
+            egui::Grid::new("ytdlp_args_grid")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("Extra args");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.ytdlp_default_args)
+                            .hint_text("e.g. --js-runtimes node --cookies-from-browser firefox:dmrf6eed.YouTube")
+                            .desired_width(f32::INFINITY),
+                    )
+                    .on_hover_text(
+                        "Shell-style space-separated arguments. Quoted strings are supported \
+                         (e.g. \"value with spaces\"). Applied to all yt-dlp monitors; \
+                         useful for --js-runtimes node, --cookies-from-browser, \
+                         --concurrent-fragments, --throttled-rate, etc.",
+                    );
+                    ui.end_row();
                 });
 
             ui.add_space(12.0);

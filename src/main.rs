@@ -364,7 +364,7 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
         next_stream_title: String::new(),
     };
     let plan =
-        downloader::build_plan(&row, models::now_unix(), &downloader::AuthSource::None, None, None);
+        downloader::build_plan(&row, models::now_unix(), &downloader::AuthSource::None, &[], None, None);
     println!("plan: {} {:?}", plan.program, plan.args);
 
     let rt = tokio::runtime::Runtime::new()?;
