@@ -222,6 +222,11 @@ struct VideoForm {
     extra_args: String,
     /// Resolve and use the real stream/video title (sticky across downloads).
     auto_title: bool,
+    /// Audio / subtitle track selection + chat logging (sticky across downloads,
+    /// like `auto_title` — not reset when the platform changes). See [`Video`].
+    audio_tracks: String,
+    subtitle_tracks: String,
+    chat_log: bool,
     /// Platform the form is currently filled for; a change triggers a re-fill.
     last_platform: Option<Platform>,
 }
@@ -241,6 +246,11 @@ impl VideoForm {
             default_auth_value: String::new(),
             extra_args: String::new(),
             auto_title: false,
+            // Archive all audio + subtitle tracks by default (matches new
+            // monitors); chat is the niche extra, opt-in per download.
+            audio_tracks: "all".into(),
+            subtitle_tracks: "all".into(),
+            chat_log: false,
             last_platform: None,
         }
     }
@@ -840,6 +850,20 @@ fn row_tint(
         }
     }
     selected.then_some(accent)
+}
+
+/// Background tint for a Videos row, by download status: in-flight = the theme
+/// accent, failed = the error red. `None` (incl. when `status_colors` is off) =
+/// no tint. Mirrors [`row_tint`] for the Streams table.
+fn video_row_tint(status: &str, accent: egui::Color32, status_colors: bool) -> Option<egui::Color32> {
+    if !status_colors {
+        return None;
+    }
+    match status {
+        "downloading" | "queued" => Some(accent),
+        "failed" => Some(HL_ERROR),
+        _ => None,
+    }
 }
 
 /// Whether a monitor's last poll or recording ended in an error/failure.
@@ -2440,12 +2464,20 @@ impl StreamArchiverApp {
         if filters.len() != VIDEO_COLS {
             filters = vec![String::new(); VIDEO_COLS];
         }
+        // Platform favicons (uploaded once, cheaply cloned per frame) + whether to
+        // tint rows by status — captured before the table closures borrow `self`.
+        let ptex = self
+            .platform_tex
+            .get_or_insert_with(|| PlatformTextures::load(ui.ctx()))
+            .clone();
+        let status_bgcolor = self.status_bgcolor;
 
         egui::ScrollArea::both()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 // Non-selectable labels so a right-click reaches the row (menu).
                 ui.style_mut().interaction.selectable_labels = false;
+                let sel_color = ui.visuals().selection.bg_fill;
                 let table = TableBuilder::new(ui)
                     .striped(true)
                     .resizable(true)
@@ -2462,24 +2494,41 @@ impl StreamArchiverApp {
                     .column(Column::auto().at_least(160.0)) // file
                     .column(Column::remainder().at_least(150.0)) // actions
                     .header(46.0, |mut header| {
-                        let titles = [
-                            "Video", "Channel", "Platform", "Tool", "Status", "Speed", "Size",
-                            "Added", "File",
+                        // (title, hover tooltip) per sortable column.
+                        let cols: [(&str, &str); 9] = [
+                            ("Video", "The video's title (or the URL until detected). Hover a row for the full URL."),
+                            ("Channel", "Uploader / channel name (filled when Auto-detect is on)."),
+                            ("Platform", "Source platform: YouTube, Twitch, Kick, or a generic URL."),
+                            ("Tool", "Download tool: yt-dlp, streamlink, or ffmpeg."),
+                            ("Status", "queued / downloading / completed / failed / stopped. Hover a failed row to see why."),
+                            ("Speed", "Current download speed (shown while downloading)."),
+                            ("Size", "Size of the output file (grows while downloading)."),
+                            ("Added", "When the download was added."),
+                            ("File", "Output file path once written. Hover for the full path."),
                         ];
-                        for (i, t) in titles.into_iter().enumerate() {
+                        for (i, (t, tip)) in cols.into_iter().enumerate() {
                             header.col(|ui| {
-                                sort_filter_header(ui, i, t, "", true, &mut sort, &mut filters[i]);
+                                sort_filter_header(ui, i, t, tip, true, &mut sort, &mut filters[i]);
                             });
                         }
                         header.col(|ui| {
-                            ui.strong("Actions");
+                            ui.strong("Actions").on_hover_text(
+                                "Per-row actions: stop / retry, open file, open folder, copy URL, delete.",
+                            );
                         });
                     });
                 table.body(|mut body| {
                         let order = ordered_rows(&model, &sort, &filters);
                         for &vi in &order {
                             let v = &self.videos[vi];
+                            // Tint by status (in-flight = accent, failed = red),
+                            // honoring the top-bar "Status bgcolor" toggle.
+                            let tint = video_row_tint(&v.status, sel_color, status_bgcolor);
+                            if let Some(c) = tint {
+                                body.ui_mut().visuals_mut().selection.bg_fill = c;
+                            }
                             body.row(24.0, |mut tr| {
+                                tr.set_selected(tint.is_some());
                                 // Reusable menu body (a `Fn`), attached to the row and
                                 // each inline action button so right-clicking anywhere
                                 // on the row opens it. Open/copy are handled inline;
@@ -2557,11 +2606,12 @@ impl StreamArchiverApp {
                                     }
                                 });
                                 tr.col(|ui| {
-                                    platform_badge(ui, v.platform);
+                                    platform_icon(ui, &ptex, v.platform)
+                                        .on_hover_text(v.platform.label());
                                     ui.label(v.platform.label());
                                 });
                                 tr.col(|ui| {
-                                    ui.label(v.tool.label());
+                                    ui.label(v.tool.label()).on_hover_text(v.tool.tooltip());
                                 });
                                 tr.col(|ui| match progress.get(&v.id) {
                                     Some(&f) if v.status == "downloading" => {
@@ -2572,7 +2622,15 @@ impl StreamArchiverApp {
                                         );
                                     }
                                     _ => {
-                                        ui.colored_label(video_status_color(&v.status), &v.status);
+                                        let resp = ui
+                                            .colored_label(video_status_color(&v.status), &v.status);
+                                        if v.status == "failed" {
+                                            let mut msg = fail_hover(&v.log_excerpt);
+                                            if let Some(code) = v.exit_code {
+                                                msg = format!("{msg}\n(exit code {code})");
+                                            }
+                                            resp.on_hover_text(msg);
+                                        }
                                     }
                                 });
                                 tr.col(|ui| {
@@ -2861,6 +2919,31 @@ impl StreamArchiverApp {
                     ui.label("Extra args");
                     ui.text_edit_singleline(&mut vf.extra_args);
                     ui.end_row();
+
+                    ui.label("Audio tracks");
+                    ui.text_edit_singleline(&mut vf.audio_tracks).on_hover_text(
+                        "Audio tracks to capture (streamlink --hls-audio-select). \
+                         Empty = the tool's default; 'all' (or '*') = every track; or a \
+                         comma-separated list of language codes/names. streamlink-only; \
+                         yt-dlp/ffmpeg keep the chosen format's tracks.",
+                    );
+                    ui.end_row();
+
+                    ui.label("Subtitle tracks");
+                    ui.text_edit_singleline(&mut vf.subtitle_tracks).on_hover_text(
+                        "Subtitle tracks to download (yt-dlp --sub-langs, written as sidecar \
+                         files next to the video). Empty = none; 'all' (or '*') = every \
+                         subtitle; or a comma-separated list of language codes. yt-dlp-only.",
+                    );
+                    ui.end_row();
+
+                    ui.label("Log chat");
+                    ui.checkbox(&mut vf.chat_log, "").on_hover_text(
+                        "Download chat alongside the video (yt-dlp's live_chat → a \
+                         .live_chat.json sidecar, e.g. a YouTube VOD's chat replay). \
+                         Sources without a chat track simply produce none.",
+                    );
+                    ui.end_row();
                 });
 
             ui.add_space(6.0);
@@ -2921,12 +3004,16 @@ impl StreamArchiverApp {
             filename_template: self.video_form.filename_template.clone(),
             auth_kind,
             auth_value,
+            audio_tracks: self.video_form.audio_tracks.trim().to_string(),
+            subtitle_tracks: self.video_form.subtitle_tracks.trim().to_string(),
+            chat_log: self.video_form.chat_log,
             extra_args: self.video_form.extra_args.clone(),
             auto_title: self.video_form.auto_title,
             status: "queued".into(),
             output_path: String::new(),
             bytes: 0,
             exit_code: None,
+            log_excerpt: String::new(),
             created_at: 0,
             started_at: None,
             ended_at: None,

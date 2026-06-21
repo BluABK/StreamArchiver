@@ -398,6 +398,16 @@ pub fn build_video_plan(
                 }
                 _ => {}
             }
+            // Subtitle + chat (live_chat) sidecars; the post-rename step moves them
+            // with the file. audio_tracks is a no-op for yt-dlp (it keeps the
+            // chosen format's tracks).
+            push_track_args(
+                &mut args,
+                Tool::YtDlp,
+                &v.audio_tracks,
+                &v.subtitle_tracks,
+                v.chat_log,
+            );
             args.extend(extra);
             args.push(v.url.clone());
             DownloadPlan {
@@ -418,6 +428,14 @@ pub fn build_video_plan(
                     args.push(format!("--twitch-api-header=Authorization=OAuth {t}"));
                 }
             }
+            // Audio-track selection (streamlink can't mux subtitles/chat).
+            push_track_args(
+                &mut args,
+                Tool::Streamlink,
+                &v.audio_tracks,
+                &v.subtitle_tracks,
+                v.chat_log,
+            );
             args.extend(extra);
             args.push("-o".into());
             args.push(ts_path.to_string_lossy().into_owned());
@@ -2803,12 +2821,16 @@ mod tests {
             filename_template: "{name}_{date}".into(),
             auth_kind: AuthKind::Inherit,
             auth_value: String::new(),
+            audio_tracks: String::new(),
+            subtitle_tracks: String::new(),
+            chat_log: false,
             extra_args: String::new(),
             auto_title: false,
             status: "queued".into(),
             output_path: String::new(),
             bytes: 0,
             exit_code: None,
+            log_excerpt: String::new(),
             created_at: 0,
             started_at: None,
             ended_at: None,
@@ -2869,5 +2891,26 @@ mod tests {
         assert!(plan.remux_to_mkv);
         // No live-only retry flags for a VOD.
         assert!(!plan.args.iter().any(|a| a == "--retry-streams"));
+    }
+
+    #[test]
+    fn video_plan_track_and_chat_args() {
+        // yt-dlp: subtitle + chat selection -> --sub-langs (incl. live_chat) + --write-subs.
+        let mut v = video(Tool::YtDlp, "https://youtube.com/watch?v=abc");
+        v.subtitle_tracks = "all".into();
+        v.chat_log = true;
+        let plan = build_video_plan(&v, 1_700_000_000, "", "", "", &AuthSource::None, None);
+        let joined = plan.args.join(" ");
+        assert!(joined.contains("--sub-langs=all,live_chat"), "{joined}");
+        assert!(plan.args.iter().any(|a| a == "--write-subs"), "{joined}");
+        // The URL stays last (track args were inserted before it, not after).
+        assert_eq!(plan.args.last().map(String::as_str), Some(v.url.as_str()));
+
+        // streamlink: audio-track selection -> --hls-audio-select (subtitles n/a).
+        let mut s = video(Tool::Streamlink, "https://twitch.tv/videos/123");
+        s.audio_tracks = "en,de".into();
+        let plan = build_video_plan(&s, 1_700_000_000, "", "", "", &AuthSource::None, None);
+        let joined = plan.args.join(" ");
+        assert!(joined.contains("--hls-audio-select=en,de"), "{joined}");
     }
 }

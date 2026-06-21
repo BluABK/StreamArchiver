@@ -17,7 +17,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -294,7 +294,18 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 16)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 16);
+        if version < 17 {
+            // Bring on-demand video downloads to parity with monitors: per-download
+            // audio/subtitle track selection and chat logging. Empty/0 defaults
+            // leave existing rows behaving exactly as before (no track args).
+            conn.execute_batch(
+                "ALTER TABLE video ADD COLUMN audio_tracks    TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE video ADD COLUMN subtitle_tracks TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE video ADD COLUMN chat_log        INTEGER NOT NULL DEFAULT 0;",
+            )?;
+            conn.pragma_update(None, "user_version", 17)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 17);
         Ok(())
     }
 
@@ -874,8 +885,9 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO video(url, title, channel, platform, tool, quality, output_dir,
-                filename_template, auth_kind, auth_value, extra_args, auto_title, status, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'queued', ?13)",
+                filename_template, auth_kind, auth_value, extra_args, auto_title, status, created_at,
+                audio_tracks, subtitle_tracks, chat_log)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'queued', ?13, ?14, ?15, ?16)",
             params![
                 v.url,
                 v.title,
@@ -890,6 +902,9 @@ impl Store {
                 v.extra_args,
                 v.auto_title as i64,
                 now_unix(),
+                v.audio_tracks,
+                v.subtitle_tracks,
+                v.chat_log as i64,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -994,7 +1009,8 @@ impl Store {
             .query_row(
                 "SELECT id, url, title, platform, tool, quality, output_dir, filename_template,
                     auth_kind, auth_value, extra_args, status, output_path, bytes, exit_code,
-                    created_at, started_at, ended_at, auto_title, channel
+                    created_at, started_at, ended_at, auto_title, channel,
+                    audio_tracks, subtitle_tracks, chat_log, log_excerpt
                  FROM video WHERE id=?1",
                 params![id],
                 Self::map_video,
@@ -1009,7 +1025,8 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT id, url, title, platform, tool, quality, output_dir, filename_template,
                 auth_kind, auth_value, extra_args, status, output_path, bytes, exit_code,
-                created_at, started_at, ended_at, auto_title, channel
+                created_at, started_at, ended_at, auto_title, channel,
+                audio_tracks, subtitle_tracks, chat_log, log_excerpt
              FROM video ORDER BY id DESC",
         )?;
         let rows = stmt
@@ -1040,6 +1057,10 @@ impl Store {
             started_at: r.get(16)?,
             ended_at: r.get(17)?,
             auto_title: r.get::<_, i64>(18)? != 0,
+            audio_tracks: r.get(20)?,
+            subtitle_tracks: r.get(21)?,
+            chat_log: r.get::<_, i64>(22)? != 0,
+            log_excerpt: r.get(23)?,
         })
     }
 
@@ -1143,12 +1164,16 @@ mod tests {
             filename_template: "{name}_{date}".into(),
             auth_kind: AuthKind::Inherit,
             auth_value: String::new(),
+            audio_tracks: String::new(),
+            subtitle_tracks: String::new(),
+            chat_log: false,
             extra_args: String::new(),
             auto_title: false,
             status: "queued".into(),
             output_path: String::new(),
             bytes: 0,
             exit_code: None,
+            log_excerpt: String::new(),
             created_at: 0,
             started_at: None,
             ended_at: None,
@@ -1160,6 +1185,9 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let mut sample = sample_video();
         sample.auto_title = true;
+        sample.audio_tracks = "all".into();
+        sample.subtitle_tracks = "en,no".into();
+        sample.chat_log = true;
         let id = store.insert_video(&sample).unwrap();
 
         let v = store.get_video(id).unwrap().unwrap();
@@ -1168,6 +1196,10 @@ mod tests {
         // auto_title must survive the round-trip (guards the insert/select/map
         // param + column-index wiring for the v6 column).
         assert!(v.auto_title);
+        // Track/chat selection must survive too (the v17 columns).
+        assert_eq!(v.audio_tracks, "all");
+        assert_eq!(v.subtitle_tracks, "en,no");
+        assert!(v.chat_log);
         store.set_video_title(id, "Resolved Title").unwrap();
         assert_eq!(
             store.get_video(id).unwrap().unwrap().title,

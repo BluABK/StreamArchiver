@@ -646,6 +646,18 @@ pub struct Video {
     pub filename_template: String,
     pub auth_kind: AuthKind,
     pub auth_value: String,
+    /// Audio tracks to capture. Empty = the tool's default; `all`/`*` = every
+    /// track; otherwise a comma-separated list. Honored by streamlink
+    /// (`--hls-audio-select`); yt-dlp/ffmpeg keep what the chosen format carries.
+    pub audio_tracks: String,
+    /// Subtitle tracks to write as sidecars. Empty = none; `all` = every subtitle;
+    /// otherwise a comma-separated language list. Honored by yt-dlp (`--sub-langs`
+    /// + `--write-subs`); streamlink can't mux subtitles.
+    pub subtitle_tracks: String,
+    /// Capture chat to a sidecar (yt-dlp `--sub-langs live_chat` → a
+    /// `.live_chat.json`, e.g. a YouTube VOD's chat replay). Other tools/sources
+    /// without a chat track simply produce none.
+    pub chat_log: bool,
     pub extra_args: String,
     /// Resolve the real stream/video title at download time (via yt-dlp) and use
     /// it for `{title}` (and `{name}` when no Name is set).
@@ -654,10 +666,14 @@ pub struct Video {
     pub output_path: String,
     pub bytes: i64,
     pub created_at: i64,
+    /// Process exit code of the last run (`None` until it finishes); shown with
+    /// the failure reason on hover of a failed row.
+    pub exit_code: Option<i64>,
+    /// Captured stderr tail of the last run — the failure reason for a failed
+    /// download. Empty until/unless it failed.
+    pub log_excerpt: String,
     // Persisted run metadata, round-tripped through the store but not yet shown
     // in the UI (kept so the data is available without a schema/struct change).
-    #[allow(dead_code)]
-    pub exit_code: Option<i64>,
     #[allow(dead_code)]
     pub started_at: Option<i64>,
     #[allow(dead_code)]

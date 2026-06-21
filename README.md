@@ -95,13 +95,23 @@ and Generic (each collapsible) — saved automatically. The form's **Auth** has 
 plus the explicit choices; **Inherit (global)** stays available and chains to the
 Settings → *Download authentication* default.
 
+**Audio / subtitle tracks + chat.** Like monitors, each download can pick which
+**audio tracks** (streamlink `--hls-audio-select`) and **subtitle tracks** (yt-dlp
+`--sub-langs`, written as sidecars) to capture, and can **Log chat** (yt-dlp's
+`live_chat` → a `.live_chat.json` sidecar, e.g. a YouTube VOD's chat replay). New
+downloads default to *all* audio + subtitle tracks (chat off); the choices are
+sticky across downloads. See [Audio & subtitle tracks](#audio--subtitle-tracks).
+
 Each row shows the title, **Channel** (when detected), status (`queued` →
 `downloading` → `completed`/`failed`/`stopped`), live **Speed** (download rate
-while active; yt-dlp downloads only), size, and the **File** path on disk. Per-row
-inline actions plus a **right-click context menu** offer: **Open file**, **Open
-folder**, **Copy URL**, **Copy file path**, **Stop**/**Retry**, and **Delete**
-(removes the row; the file is kept). A download left in flight by a crash/quit is
-marked `orphaned` on the next start.
+while active; yt-dlp downloads only), size, and the **File** path on disk, with a
+platform favicon and per-column header tooltips. Rows are **tinted by status**
+(in-flight — queued/downloading — = accent, failed = red), honoring the top-bar
+**Status bgcolor** toggle; **hover a failed row** to see why it failed (the
+captured error + exit code). Per-row inline actions plus a **right-click context menu** offer: **Open
+file**, **Open folder**, **Copy URL**, **Copy file path**, **Stop**/**Retry**, and
+**Delete** (removes the row; the file is kept). A download left in flight by a
+crash/quit is marked `orphaned` on the next start.
 
 **Sort & filter.** Click any column header to sort by it (click again to reverse;
 a ▲/▼ shows the active column); type in the box under a header to filter that
@@ -242,7 +252,8 @@ interrupted writes).
 ### Audio & subtitle tracks
 
 To archive as much of a stream as possible, each instance has **Audio tracks** and
-**Subtitle tracks** fields (on the Streams add/edit form):
+**Subtitle tracks** fields (on the Streams add/edit form — and the same fields are
+on the Videos download form, applying to one-shot VOD/video downloads):
 
 - **Audio tracks** — which audio tracks to capture, via streamlink's
   `--hls-audio-select`. Empty = the tool's default (one track); **`all`** (or
@@ -312,6 +323,9 @@ instances default it on):
   subtitles you selected).
 - Other platform/tool combinations don't capture chat. Kick chat isn't supported
   yet.
+
+The same **Log chat** option is on the Videos download form: a one-shot yt-dlp
+download captures `live_chat` (e.g. a YouTube VOD's chat replay) the same way.
 
 Chat sidecars sit next to the video and **follow it** if the file is renamed
 (see *Filename media info*), so they stay matched to their recording.
