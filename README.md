@@ -120,7 +120,8 @@ the **Videos** and **Streams** tables alike.
 
 The channel table shows, per channel: On (enable/disable), Name, Platform (with a
 brand badge), Tool, Detection, **Polled** (when it was last checked, with the poll
-interval in parentheses — e.g. `2026-06-21 14:02:33 (60s)`), State, **Game** and
+interval in parentheses — e.g. `2026-06-21 14:02:33 (60s)`), State, **Next stream**
+(the next scheduled stream — see below), **Game** and
 **Title** (the current category/title of the latest recording), **Went Live** (the
 platform's go-live time — `~`-prefixed when only our first-detected time is known,
 e.g. for scrape), **Started On** (when we began recording), **Lost time** (how
@@ -313,6 +314,22 @@ recording, so this runs as a dedicated per-recording poller.)
   endpoints; the YouTube path fetches the full `/live` watch page each poll.)
 
 The categories played can also be folded into the filename — see `{games}` below.
+
+### Upcoming stream schedule
+
+The **Next stream** column shows when a channel's next stream is scheduled.
+**Hover** it for the title; **double-click** it for a popup listing all upcoming
+streams (datetime — title, with the category when known).
+
+- **Twitch** — the Helix *Get Channel Stream Schedule* API (needs Twitch
+  credentials, same as detection). Includes the segment title + category; canceled
+  occurrences are skipped.
+- **YouTube** — scraped from the channel's `/streams` page (no API key / quota);
+  reads each upcoming livestream's scheduled start + title.
+- **Kick / generic URLs** have no schedule source, so the column stays blank.
+
+Schedules are refreshed in the background a few hours apart (new monitors are
+picked up within a minute) and stored, so the column is populated on launch.
 
 ### Chat logs
 

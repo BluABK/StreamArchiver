@@ -360,6 +360,8 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
         last_recording_log: String::new(),
         ad_free_sub: None,
         recording_count: 0,
+        next_stream_at: None,
+        next_stream_title: String::new(),
     };
     let plan =
         downloader::build_plan(&row, models::now_unix(), &downloader::AuthSource::None, None, None);

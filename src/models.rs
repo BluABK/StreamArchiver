@@ -586,6 +586,13 @@ pub struct MonitorWithChannel {
     /// Total recording takes for this monitor (drives the history-tree disclosure
     /// without loading the full history until a row is expanded).
     pub recording_count: i64,
+    /// Start time of the next upcoming scheduled stream (soonest future,
+    /// non-canceled [`ScheduleSegment`]), or `None` when none is known. Twitch
+    /// (Helix schedule) + YouTube (scraped upcoming streams); drives the Next
+    /// stream column. Filled by the UI from a separate lookup, not the row query.
+    pub next_stream_at: Option<i64>,
+    /// Title of that next scheduled stream (for the cell hover); empty when none.
+    pub next_stream_title: String,
 }
 
 /// One advertisement break detected during a recording take.
@@ -624,6 +631,27 @@ pub struct StreamMetaChange {
     pub kind: String,
     pub old_value: String,
     pub new_value: String,
+}
+
+/// One upcoming scheduled stream for a monitor — a Twitch schedule segment or a
+/// YouTube upcoming livestream. Refreshed periodically and stored in
+/// `schedule_segment`; drives the Next stream column + popup. `start_time` is unix
+/// seconds; `end_time` is set by Twitch (its segments are bounded) but not by
+/// YouTube. `category`/`end_time` may be empty/None depending on the source.
+/// Fetchers leave `id`/`monitor_id` at 0 (the store assigns them on insert).
+#[derive(Clone, Debug)]
+pub struct ScheduleSegment {
+    #[allow(dead_code)]
+    pub id: i64,
+    #[allow(dead_code)]
+    pub monitor_id: i64,
+    pub start_time: i64,
+    pub end_time: Option<i64>,
+    pub title: String,
+    pub category: String,
+    /// A specific occurrence the broadcaster canceled (Twitch). Excluded from the
+    /// Next stream column + popup.
+    pub canceled: bool,
 }
 
 /// An on-demand, one-shot video/VOD download (a YouTube video, a Twitch VOD,

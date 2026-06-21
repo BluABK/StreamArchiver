@@ -132,6 +132,15 @@ impl AppCore {
             crate::detectors::refresh_ad_free(af_ctx, af_events, af_shutdown).await;
         });
 
+        // Periodic upcoming-stream schedule refresher (Twitch Helix schedule /
+        // YouTube scraped upcoming) -> the Next stream column. Cheap + idle-friendly.
+        let sch_ctx = ctx.clone();
+        let sch_events = self.events.clone();
+        let sch_shutdown = self.shutdown.clone();
+        self.rt.spawn(async move {
+            crate::detectors::refresh_schedules(sch_ctx, sch_events, sch_shutdown).await;
+        });
+
         // Supervisor: live signals + manual commands -> recordings.
         let max_concurrent = self
             .store

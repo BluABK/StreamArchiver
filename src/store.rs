@@ -13,11 +13,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::models::{
     AdBreak, AuthKind, Channel, Container, DetectionMethod, Monitor, MonitorWithChannel, Platform,
-    StreamMetaChange, Tool, Video, now_unix,
+    ScheduleSegment, StreamMetaChange, Tool, Video, now_unix,
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -305,7 +305,26 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 17)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 17);
+        if version < 18 {
+            // Upcoming scheduled streams per monitor (Twitch Helix schedule /
+            // YouTube upcoming), refreshed periodically. Replaced wholesale on each
+            // refresh; cascades when the monitor is deleted.
+            conn.execute_batch(
+                "CREATE TABLE schedule_segment (
+                    id         INTEGER PRIMARY KEY,
+                    monitor_id INTEGER NOT NULL,
+                    start_time INTEGER NOT NULL,
+                    end_time   INTEGER,
+                    title      TEXT NOT NULL DEFAULT '',
+                    category   TEXT NOT NULL DEFAULT '',
+                    canceled   INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY(monitor_id) REFERENCES monitor(id) ON DELETE CASCADE
+                );
+                CREATE INDEX idx_schedule_monitor ON schedule_segment(monitor_id, start_time);",
+            )?;
+            conn.pragma_update(None, "user_version", 18)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 18);
         Ok(())
     }
 
@@ -709,6 +728,82 @@ impl Store {
         Ok(rows)
     }
 
+    // ----- schedule (upcoming streams) -----
+
+    /// Replace a monitor's stored schedule wholesale with a freshly-fetched set
+    /// (delete-then-insert in one transaction). Called by the schedule refresher.
+    pub fn replace_schedule(&self, monitor_id: i64, segs: &[ScheduleSegment]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM schedule_segment WHERE monitor_id = ?1",
+            params![monitor_id],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO schedule_segment(monitor_id, start_time, end_time, title, category, canceled)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for s in segs {
+                stmt.execute(params![
+                    monitor_id,
+                    s.start_time,
+                    s.end_time,
+                    s.title,
+                    s.category,
+                    s.canceled as i64,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Upcoming (non-canceled, start ≥ `after`) schedule segments for one monitor,
+    /// soonest first — for the Next stream popup.
+    pub fn schedule_for_monitor(&self, monitor_id: i64, after: i64) -> Result<Vec<ScheduleSegment>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, monitor_id, start_time, end_time, title, category, canceled
+             FROM schedule_segment
+             WHERE monitor_id = ?1 AND canceled = 0 AND start_time >= ?2
+             ORDER BY start_time",
+        )?;
+        let rows = stmt
+            .query_map(params![monitor_id, after], |r| {
+                Ok(ScheduleSegment {
+                    id: r.get(0)?,
+                    monitor_id: r.get(1)?,
+                    start_time: r.get(2)?,
+                    end_time: r.get(3)?,
+                    title: r.get(4)?,
+                    category: r.get(5)?,
+                    canceled: r.get::<_, i64>(6)? != 0,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The soonest upcoming (non-canceled, start ≥ `after`) stream per monitor:
+    /// `(monitor_id, start_time, title)`. Drives the Next stream column. (SQLite
+    /// returns the bare `title` from the same row as `MIN(start_time)`.)
+    pub fn next_scheduled_streams(&self, after: i64) -> Result<Vec<(i64, i64, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT monitor_id, MIN(start_time), title
+             FROM schedule_segment
+             WHERE canceled = 0 AND start_time >= ?1
+             GROUP BY monitor_id",
+        )?;
+        let rows = stmt
+            .query_map(params![after], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Mark any recordings still flagged 'recording' (i.e. left over from a
     /// crash) as 'orphaned'. Returns the number updated. Called on startup.
     pub fn mark_orphaned_recordings(&self, ended_at: i64) -> Result<usize> {
@@ -801,6 +896,9 @@ impl Store {
                     last_recording_category: r.get(40)?,
                     ad_free_sub: r.get::<_, Option<i64>>(33)?.map(|v| v != 0),
                     recording_count: r.get(28)?,
+                    // Filled by the UI from next_scheduled_streams(), not this query.
+                    next_stream_at: None,
+                    next_stream_title: String::new(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1394,6 +1492,56 @@ mod tests {
         store.finish_recording(rid, 2_000, 1, Some(0), "completed", "C:/rec/out.mkv", "").unwrap();
         store.delete_recording(rid).unwrap();
         assert!(store.meta_changes_for_recording(rid).unwrap().is_empty());
+    }
+
+    #[test]
+    fn schedule_replace_and_next() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        let seg = |start: i64, title: &str, canceled: bool| ScheduleSegment {
+            id: 0,
+            monitor_id: 0,
+            start_time: start,
+            end_time: Some(start + 3600),
+            title: title.into(),
+            category: String::new(),
+            canceled,
+        };
+        // Out of order; a past one, a canceled one, and two future.
+        store
+            .replace_schedule(
+                mid,
+                &[
+                    seg(5_000, "Later", false),
+                    seg(500, "Past", false),
+                    seg(3_000, "Canceled soon", true),
+                    seg(2_000, "Next up", false),
+                ],
+            )
+            .unwrap();
+
+        // Upcoming (start >= now), non-canceled, soonest first.
+        let upcoming = store.schedule_for_monitor(mid, 1_000).unwrap();
+        assert_eq!(
+            upcoming.iter().map(|s| s.title.as_str()).collect::<Vec<_>>(),
+            vec!["Next up", "Later"],
+        );
+        // The soonest future per monitor drives the Next stream column.
+        let next = store.next_scheduled_streams(1_000).unwrap();
+        assert_eq!(next, vec![(mid, 2_000, "Next up".to_string())]);
+
+        // Replace wipes the old set.
+        store.replace_schedule(mid, &[seg(9_000, "Fresh", false)]).unwrap();
+        let next = store.next_scheduled_streams(1_000).unwrap();
+        assert_eq!(next, vec![(mid, 9_000, "Fresh".to_string())]);
+
+        // Deleting the monitor cascades to its schedule.
+        store.delete_monitor(mid).unwrap();
+        assert!(store.schedule_for_monitor(mid, 0).unwrap().is_empty());
     }
 
     #[test]

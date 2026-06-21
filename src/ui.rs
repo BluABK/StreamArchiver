@@ -17,8 +17,8 @@ use crate::app_core::AppCore;
 use crate::events::{ManualCommand, UiCommand};
 use crate::models::{
     AdBreak, AuthKind, Channel, Container, DetectionMethod, DownloadDefaults, K_FILENAME_MEDIA,
-    MediaInfoMode, Monitor, MonitorWithChannel, Platform, Recording, StreamGroup, StreamMetaChange,
-    Tool, Video, group_recordings,
+    MediaInfoMode, Monitor, MonitorWithChannel, Platform, Recording, ScheduleSegment, StreamGroup,
+    StreamMetaChange, Tool, Video, group_recordings, now_unix,
 };
 use crate::oauth::{self, AuthFlow};
 use crate::platform::AutoStart;
@@ -334,6 +334,11 @@ pub struct StreamArchiverApp {
     /// What the metadata-change popup shows (None = closed): a single take or a
     /// whole stream's aggregated takes.
     meta_popup: Option<MetaPopup>,
+    /// Lazy per-monitor upcoming-schedule detail, keyed by monitor id; cleared on
+    /// reload. Backs the Next stream popup.
+    schedule_cache: HashMap<i64, Vec<ScheduleSegment>>,
+    /// Monitor id whose upcoming schedule is shown in a popup (None = closed).
+    schedule_popup: Option<i64>,
     /// Platform favicons, uploaded to the GPU on first use (None until then).
     platform_tex: Option<PlatformTextures>,
     /// Sort + per-column filters for the Videos table.
@@ -469,6 +474,8 @@ impl StreamArchiverApp {
             ad_popup: None,
             meta_change_cache: HashMap::new(),
             meta_popup: None,
+            schedule_cache: HashMap::new(),
+            schedule_popup: None,
             platform_tex: None,
             videos_sort: SortState::default(),
             videos_filters: vec![String::new(); VIDEO_COLS],
@@ -489,6 +496,18 @@ impl StreamArchiverApp {
                 self.status = format!("Error loading channels: {e}");
             }
         }
+        // Merge in each monitor's next upcoming scheduled stream (the row query
+        // doesn't carry it — it's refreshed on a separate cadence).
+        if let Ok(next) = self.core.store.next_scheduled_streams(now_unix()) {
+            let by_mid: HashMap<i64, (i64, String)> =
+                next.into_iter().map(|(mid, at, title)| (mid, (at, title))).collect();
+            for row in &mut self.rows {
+                if let Some((at, title)) = by_mid.get(&row.monitor.id) {
+                    row.next_stream_at = Some(*at);
+                    row.next_stream_title = title.clone();
+                }
+            }
+        }
         // Load all containers (incl. empty ones) so they show in the tree.
         match self.core.store.list_channels() {
             Ok(chs) => self.channels = chs,
@@ -498,6 +517,7 @@ impl StreamArchiverApp {
         self.rec_cache.clear();
         self.ad_break_cache.clear();
         self.meta_change_cache.clear();
+        self.schedule_cache.clear();
         // Drop expansion state for channels/monitors that no longer exist (avoids
         // an unbounded leak and "sticky" expansion if a row id is later reused).
         let live_channels: HashSet<i64> = self.channels.iter().map(|c| c.id).collect();
@@ -1002,6 +1022,31 @@ fn fmt_meta_count(n: i64) -> String {
     if n > 0 { n.to_string() } else { String::new() }
 }
 
+/// Render a "Next stream" cell: blank when no upcoming stream is known, else the
+/// scheduled start datetime. When `clickable`, a double-click returns true so the
+/// caller can open the full-schedule popup; the hover shows the title.
+fn next_stream_cell(ui: &mut egui::Ui, at: Option<i64>, title: &str, clickable: bool) -> bool {
+    let Some(at) = at.filter(|&a| a > 0) else {
+        return false;
+    };
+    let label = if clickable {
+        egui::Label::new(fmt_datetime_short(at)).sense(egui::Sense::click())
+    } else {
+        egui::Label::new(fmt_datetime_short(at))
+    };
+    let resp = ui.add(label).on_hover_ui(|ui| {
+        if title.is_empty() {
+            ui.label("Next scheduled stream.");
+        } else {
+            ui.label(format!("Next: {title}"));
+        }
+        if clickable {
+            ui.label("Double-click for the full upcoming schedule.");
+        }
+    });
+    clickable && resp.double_clicked()
+}
+
 /// One human-readable line per *actual* metadata change (offset + kind +
 /// `old → new`). The initial value of each field (logged with an empty
 /// `old_value`) is the starting state, not a change, so it's skipped — it still
@@ -1188,7 +1233,7 @@ struct StreamCol {
 /// just left of Name; the current Game/Title sit just right of State. Widths are
 /// floors — `Column::auto` shrinks tight columns to their content — except the
 /// `initial`-width columns, which start narrow and truncate (full value on hover).
-const STREAM_COLUMNS: [StreamCol; 19] = [
+const STREAM_COLUMNS: [StreamCol; 20] = [
     StreamCol { title: "On", tooltip: "Enable/disable monitoring. A channel's checkbox toggles all its instances at once.", min_width: 26.0, initial: 0.0, sortable: true },
     StreamCol { title: "Actions", tooltip: "Per-row actions: start/stop recording, edit, add instance, open folder, delete.", min_width: 126.0, initial: 0.0, sortable: false },
     StreamCol { title: "Plat", tooltip: "Source platform (icon): Twitch, YouTube, Kick, or a generic URL. A channel shows every platform among its instances.", min_width: 52.0, initial: 0.0, sortable: true },
@@ -1197,6 +1242,7 @@ const STREAM_COLUMNS: [StreamCol; 19] = [
     StreamCol { title: "Detection", tooltip: "How a live stream is detected (API poll, page scrape, Twitch EventSub, or a generic probe).", min_width: 70.0, initial: 0.0, sortable: true },
     StreamCol { title: "Polled", tooltip: "When this instance was last checked, with its poll interval in parentheses (e.g. \"2026-06-21 14:02:33 (60s)\").", min_width: 100.0, initial: 0.0, sortable: true },
     StreamCol { title: "State", tooltip: "Current state (idle / live / recording / failed). Hover a failed row to see why it failed.", min_width: 66.0, initial: 0.0, sortable: true },
+    StreamCol { title: "Next stream", tooltip: "Next scheduled stream (Twitch schedule / YouTube upcoming; blank for Kick & generic, or when nothing is scheduled). Hover for its title; double-click for the full upcoming schedule.", min_width: 96.0, initial: 0.0, sortable: true },
     StreamCol { title: "Game", tooltip: "Current game / category of the most recent recording (Twitch, Kick & YouTube — YouTube shows its broad content category; blank for generic URLs). Truncated — hover for the full name.", min_width: 60.0, initial: 96.0, sortable: true },
     StreamCol { title: "Title", tooltip: "Current stream title of the most recent recording (Twitch, Kick & YouTube; blank for generic URLs). Truncated — hover for the full title. Its full change history is in the Changes column.", min_width: 80.0, initial: 170.0, sortable: true },
     StreamCol { title: "Went Live", tooltip: "When the stream went live on the platform (a \"~\" prefix means it's our approximate time).", min_width: 96.0, initial: 0.0, sortable: true },
@@ -1534,8 +1580,8 @@ fn channel_cells(channel: &Channel, monitors: &[&MonitorWithChannel], now: i64) 
         .max()
         .unwrap_or(0);
     // In STREAM_COLUMNS order: On, Actions(empty), Plat, Name, Tool, Detection,
-    // Polled, State, Game, Title, Went Live, Started On, Lost, Duration, Ads,
-    // Ad time, Ad-free, Changes, Added.
+    // Polled, State, Next stream, Game, Title, Went Live, Started On, Lost,
+    // Duration, Ads, Ad time, Ad-free, Changes, Added.
     vec![
         Cell::num(
             if all_enabled { 1.0 } else { 0.0 },
@@ -1552,6 +1598,14 @@ fn channel_cells(channel: &Channel, monitors: &[&MonitorWithChannel], now: i64) 
         Cell::text(String::new()), // detection
         Cell::num(last as f64, fmt_datetime_short(last)), // polled (datetime only)
         Cell::text(if any_recording { "recording".to_string() } else { String::new() }),
+        {
+            // Sort/show the channel's SOONEST upcoming stream across its instances.
+            let next_at = monitors.iter().filter_map(|m| m.next_stream_at).min();
+            Cell::num(
+                next_at.unwrap_or(0) as f64,
+                next_at.map(fmt_datetime_short).unwrap_or_default(),
+            )
+        },
         Cell::text(primary.last_recording_category.clone()),
         Cell::text(primary.last_recording_title.clone()),
         Cell::num(
@@ -1595,6 +1649,7 @@ struct RowActions {
     delete: Option<(i64, String)>,      // (monitor id, channel name)
     toggle_enabled: Option<(i64, bool)>,
     select: Option<i64>,                // monitor id
+    open_schedule: Option<i64>,         // monitor id (open its Next stream popup)
 }
 
 /// Render one capture-instance (monitor) row across all columns, with the Name
@@ -1671,8 +1726,8 @@ fn render_instance_row(
 
     let mut disclosure_clicked = false;
     // Column order: On · Actions · Platform · Name · Tool · Detection · Polled ·
-    // State · Game · Title · Went Live · Started On · Lost · Duration · Ads ·
-    // Ad time · Ad-free · Changes · Added.
+    // State · Next stream · Game · Title · Went Live · Started On · Lost · Duration
+    // · Ads · Ad time · Ad-free · Changes · Added.
     tr.col(|ui| {
         let mut on = m.enabled;
         let cb = ui.checkbox(&mut on, "");
@@ -1760,6 +1815,11 @@ fn render_instance_row(
         let resp = ui.label(&m.last_state);
         if m.last_state == "failed" || row.last_recording_status.as_deref() == Some("failed") {
             resp.on_hover_text(fail_hover(&row.last_recording_log));
+        }
+    });
+    tr.col(|ui| {
+        if next_stream_cell(ui, row.next_stream_at, &row.next_stream_title, true) {
+            a.open_schedule = Some(m.id);
         }
     });
     tr.col(|ui| {
@@ -2055,6 +2115,7 @@ impl eframe::App for StreamArchiverApp {
         self.format_probe_window(ui.ctx());
         self.ad_popup_window(ui.ctx());
         self.meta_popup_window(ui.ctx());
+        self.schedule_popup_window(ui.ctx());
     }
 }
 
@@ -3272,6 +3333,62 @@ impl StreamArchiverApp {
         }
     }
 
+    /// Window listing a monitor's upcoming scheduled streams (datetime — title).
+    /// Opened by double-clicking a Next stream cell.
+    fn schedule_popup_window(&mut self, ctx: &egui::Context) {
+        let Some(mid) = self.schedule_popup else {
+            return;
+        };
+        if !self.schedule_cache.contains_key(&mid) {
+            let v = self
+                .core
+                .store
+                .schedule_for_monitor(mid, now_unix())
+                .unwrap_or_default();
+            self.schedule_cache.insert(mid, v);
+        }
+        let segs = self.schedule_cache.get(&mid).cloned().unwrap_or_default();
+        let mut open = true;
+        egui::Window::new("Upcoming streams")
+            .collapsible(false)
+            .resizable(true)
+            .default_size([460.0, 260.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                if segs.is_empty() {
+                    ui.label("No upcoming scheduled streams.");
+                    return;
+                }
+                ui.label(format!("{} upcoming scheduled stream(s).", segs.len()));
+                ui.add_space(6.0);
+                let lines: Vec<String> = segs
+                    .iter()
+                    .map(|s| {
+                        let when = fmt_datetime_short(s.start_time);
+                        if s.category.is_empty() {
+                            format!("{when}  —  {}", s.title)
+                        } else {
+                            format!("{when}  —  {}  ({})", s.title, s.category)
+                        }
+                    })
+                    .collect();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for l in &lines {
+                            ui.label(egui::RichText::new(l).monospace());
+                        }
+                    });
+                ui.add_space(6.0);
+                if ui.button("📋  Copy").clicked() {
+                    ui.ctx().copy_text(lines.join("\n"));
+                }
+            });
+        if !open {
+            self.schedule_popup = None;
+        }
+    }
+
     fn channels_view(&mut self, ui: &mut egui::Ui) {
         if self.channels.is_empty() {
             ui.add_space(24.0);
@@ -3405,6 +3522,7 @@ impl StreamArchiverApp {
         // afterwards: a double-click on an ad / changes cell opens that take's popup.
         let mut open_ad_popup: Option<i64> = None;
         let mut open_meta_popup: Option<MetaPopup> = None;
+        let mut open_schedule_popup: Option<i64> = None;
 
         // Snapshot expansion state for read-only use inside the table closure.
         let exp_channels = self.expanded_channels.clone();
@@ -3567,6 +3685,18 @@ impl StreamArchiverApp {
                                 let cur_title = primary
                                     .map(|m| m.last_recording_title.clone())
                                     .unwrap_or_default();
+                                // The channel's next stream = the SOONEST upcoming
+                                // across its instances (the past-recording primary
+                                // may be a different platform with no schedule).
+                                let next_mon = mons
+                                    .iter()
+                                    .filter(|m| m.next_stream_at.is_some())
+                                    .min_by_key(|m| m.next_stream_at.unwrap());
+                                let next_stream_at = next_mon.and_then(|m| m.next_stream_at);
+                                let next_stream_title = next_mon
+                                    .map(|m| m.next_stream_title.clone())
+                                    .unwrap_or_default();
+                                let next_stream_mid = next_mon.map(|m| m.monitor.id);
                                 let ad_free =
                                     ad_free_summary(channel_ad_free_count(&mons), ninst);
                                 // Tint the container row by the rolled-up state of
@@ -3648,6 +3778,11 @@ impl StreamArchiverApp {
                                                 ui.colored_label(rec_status_color("failed"), "failed")
                                                     .on_hover_text(fail_hover(&p.last_recording_log));
                                             }
+                                        }
+                                    });
+                                    tr.col(|ui| {
+                                        if next_stream_cell(ui, next_stream_at, &next_stream_title, true) {
+                                            open_schedule_popup = next_stream_mid;
                                         }
                                     });
                                     tr.col(|ui| {
@@ -3832,6 +3967,7 @@ impl StreamArchiverApp {
                                             resp.on_hover_text(fail_hover(log));
                                         }
                                     });
+                                    tr.col(|_ui| {}); // next stream (n/a per stream)
                                     tr.col(|ui| {
                                         meta_value_cell(ui, g.category());
                                     });
@@ -4018,6 +4154,7 @@ impl StreamArchiverApp {
                                             resp.on_hover_text(format!("exit code {code}"));
                                         }
                                     });
+                                    tr.col(|_ui| {}); // next stream (n/a per take)
                                     tr.col(|ui| {
                                         meta_value_cell(ui, &t.category);
                                     });
@@ -4127,6 +4264,11 @@ impl StreamArchiverApp {
         }
         if let Some(p) = open_meta_popup {
             self.meta_popup = Some(p);
+        }
+        // Next stream double-click: a channel/stream/take row sets the local; an
+        // instance row routes through RowActions.
+        if let Some(mid) = open_schedule_popup.or(acts.open_schedule) {
+            self.schedule_popup = Some(mid);
         }
 
         // Tick the live Duration column ~1/sec while anything is recording.

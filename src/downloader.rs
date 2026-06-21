@@ -2417,6 +2417,8 @@ mod tests {
             last_recording_log: String::new(),
             ad_free_sub: None,
             recording_count: 0,
+            next_stream_at: None,
+            next_stream_title: String::new(),
         }
     }
 
