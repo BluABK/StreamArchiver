@@ -2800,15 +2800,19 @@ impl StreamArchiverApp {
                 );
             });
 
+            // Four columns (label · field · label · field) so two fields share a
+            // row — the form flows across the available width instead of stacking
+            // into a tall, scrolling single column.
             egui::Grid::new("video_form_grid")
-                .num_columns(2)
+                .num_columns(4)
                 .spacing([12.0, 6.0])
                 .show(ui, |ui| {
+                    // URL (wide) + Name.
                     ui.label("URL");
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut vf.url)
-                                .desired_width(360.0)
+                                .desired_width(340.0)
                                 .hint_text(
                                     "YouTube video, Twitch VOD, or any streamlink/yt-dlp URL",
                                 ),
@@ -2816,14 +2820,13 @@ impl StreamArchiverApp {
                         platform_badge(ui, platform);
                         ui.label(platform.label());
                     });
-                    ui.end_row();
-
                     ui.label("Name");
                     ui.add(egui::TextEdit::singleline(&mut vf.title).hint_text(
                         "optional — used for the filename (default: the title, else \"video\")",
                     ));
                     ui.end_row();
 
+                    // Auto-detect + Tool.
                     ui.label("Auto-detect");
                     ui.checkbox(&mut vf.auto_title, "Detect title + channel")
                         .on_hover_text(
@@ -2831,8 +2834,6 @@ impl StreamArchiverApp {
                              fills the Channel column and the {title}/{channel} variables (and \
                              {name} when Name is left blank).",
                         );
-                    ui.end_row();
-
                     ui.label("Tool").on_hover_text(vf.tool.tooltip());
                     egui::ComboBox::from_id_salt("video_tool_cb")
                         .selected_text(vf.tool.label())
@@ -2844,13 +2845,12 @@ impl StreamArchiverApp {
                         });
                     ui.end_row();
 
+                    // Quality + Auth.
                     ui.label("Quality");
                     ui.add(
                         egui::TextEdit::singleline(&mut vf.quality)
                             .hint_text("best, 1080p, or a yt-dlp -f selector"),
                     );
-                    ui.end_row();
-
                     ui.label("Auth");
                     let auth_text = match vf.auth_override {
                         None => "Default (per-platform)".to_string(),
@@ -2870,6 +2870,7 @@ impl StreamArchiverApp {
                         });
                     ui.end_row();
 
+                    // Auth value (only for cookie/token overrides) — its own row.
                     match vf.auth_override {
                         Some(AuthKind::CookiesBrowser) => {
                             ui.label("Browser");
@@ -2899,6 +2900,7 @@ impl StreamArchiverApp {
                         _ => {}
                     }
 
+                    // Output folder + Filename template.
                     ui.label("Output folder");
                     ui.horizontal(|ui| {
                         ui.text_edit_singleline(&mut vf.output_dir);
@@ -2908,18 +2910,15 @@ impl StreamArchiverApp {
                             }
                         }
                     });
-                    ui.end_row();
-
                     let tmpl_hint = "Variables: {name} {title} {channel} {date} {time} {timestamp}";
                     ui.label("Filename template").on_hover_text(tmpl_hint);
                     ui.text_edit_singleline(&mut vf.filename_template)
                         .on_hover_text(tmpl_hint);
                     ui.end_row();
 
+                    // Extra args + Audio tracks.
                     ui.label("Extra args");
                     ui.text_edit_singleline(&mut vf.extra_args);
-                    ui.end_row();
-
                     ui.label("Audio tracks");
                     ui.text_edit_singleline(&mut vf.audio_tracks).on_hover_text(
                         "Audio tracks to capture (streamlink --hls-audio-select). \
@@ -2929,14 +2928,13 @@ impl StreamArchiverApp {
                     );
                     ui.end_row();
 
+                    // Subtitle tracks + Log chat.
                     ui.label("Subtitle tracks");
                     ui.text_edit_singleline(&mut vf.subtitle_tracks).on_hover_text(
                         "Subtitle tracks to download (yt-dlp --sub-langs, written as sidecar \
                          files next to the video). Empty = none; 'all' (or '*') = every \
                          subtitle; or a comma-separated list of language codes. yt-dlp-only.",
                     );
-                    ui.end_row();
-
                     ui.label("Log chat");
                     ui.checkbox(&mut vf.chat_log, "").on_hover_text(
                         "Download chat alongside the video (yt-dlp's live_chat → a \
