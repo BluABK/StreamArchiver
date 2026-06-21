@@ -1018,11 +1018,13 @@ impl Supervisor {
                 ad_active: self.ad_active.clone(),
             });
 
-        // Log Twitch title / game-category changes during the take (Helix has the
-        // metadata; the scheduler pauses normal polling while recording). Twitch
-        // only; no-ops gracefully if credentials are unset.
+        // Log title / game-category changes during the take (the scheduler pauses
+        // normal polling while recording, so poll the source directly). Supported
+        // for Twitch (Helix), Kick (v2 JSON), and YouTube (/live scrape); no-ops
+        // gracefully when the source is unavailable. Generic URLs have no source.
+        let meta_platform = row.monitor.platform();
         let meta_done = Arc::new(AtomicBool::new(false));
-        let meta_task = (rec_id != 0 && row.monitor.platform() == Platform::Twitch).then(|| {
+        let meta_task = (rec_id != 0 && meta_platform != Platform::Generic).then(|| {
             tokio::spawn(meta_watcher(
                 self.ctx.clone(),
                 self.store.clone(),
@@ -1031,6 +1033,7 @@ impl Supervisor {
                 rec_id,
                 started_at,
                 row.monitor.url.clone(),
+                meta_platform,
                 meta_done.clone(),
                 self.shutdown.clone(),
             ))
@@ -1669,7 +1672,8 @@ fn format_games(categories: &[String]) -> String {
 }
 
 /// The `{games}` value for a finished recording: every distinct category logged
-/// to `stream_meta_change` for it (empty when none / non-Twitch).
+/// to `stream_meta_change` for it (empty when none was logged — e.g. a generic
+/// URL, which has no metadata source).
 fn games_for_recording(store: &Store, rec_id: i64) -> String {
     let cats: Vec<String> = store
         .meta_changes_for_recording(rec_id)
@@ -2050,17 +2054,22 @@ async fn catch_up_watcher(
     }
 }
 
-/// How often to poll Twitch Helix for title/category changes during a recording.
-/// Changes are infrequent and not time-critical for an archive log, so a coarse
-/// interval keeps the API cost negligible (one call per active Twitch recording).
+/// How often to poll a stream's title/category for changes during a recording
+/// (Twitch Helix, Kick v2 JSON, or the YouTube `/live` page). Changes are
+/// infrequent and not time-critical for an archive log, so a coarse interval
+/// keeps the cost low — one request per active recording (the YouTube path
+/// fetches the full watch page; the others a small JSON response).
 const META_POLL_INTERVAL_SECS: i64 = 60;
 
-/// Poll a live Twitch channel's title + game/category for the duration of a
-/// recording, logging each change to `stream_meta_change`. The first observed
-/// value of each field is logged as the baseline (empty `old_value`); later
-/// transitions record `old -> new` (including a change to empty, e.g. a cleared
-/// category). Stops when `done` (recording ended) or `shutdown` is set. No-ops
-/// gracefully when Twitch credentials are unset (`twitch_stream_meta` -> `None`).
+/// Poll a live channel's title + game/category for the duration of a recording,
+/// logging each change to `stream_meta_change`. The metadata source is chosen by
+/// `platform`: Twitch via Helix, Kick via its v2 channel JSON, YouTube by
+/// scraping the `/live` page (its `game` is the broad content category, as
+/// YouTube has no per-stream game field). The first observed value of each field
+/// is logged as the baseline (empty `old_value`); later transitions record
+/// `old -> new` (including a change to empty, e.g. a cleared category). Stops
+/// when `done` (recording ended) or `shutdown` is set. No-ops gracefully when
+/// the source is unavailable (creds unset / offline / blocked -> `None`).
 #[allow(clippy::too_many_arguments)]
 async fn meta_watcher(
     ctx: Arc<DetectContext>,
@@ -2070,6 +2079,7 @@ async fn meta_watcher(
     rec_id: i64,
     started_at: i64,
     url: String,
+    platform: Platform,
     done: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
 ) {
@@ -2079,7 +2089,13 @@ async fn meta_watcher(
         if done.load(Ordering::SeqCst) || shutdown.load(Ordering::SeqCst) {
             return;
         }
-        if let Some(meta) = ctx.twitch_stream_meta(&url).await {
+        let fetched = match platform {
+            Platform::Twitch => ctx.twitch_stream_meta(&url).await,
+            Platform::Kick => ctx.kick_stream_meta(&url).await,
+            Platform::YouTube => ctx.youtube_stream_meta(&url).await,
+            Platform::Generic => None,
+        };
+        if let Some(meta) = fetched {
             let at = (now_unix() - started_at).max(0);
             let mut changed = false;
             // Title: log the initial non-empty value, then every transition.

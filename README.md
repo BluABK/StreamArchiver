@@ -266,22 +266,32 @@ instances keep their previous behavior (empty) until you edit them. Power-user
 
 ### Title & category change log
 
-While a Twitch stream records, StreamArchiver polls Helix and logs every **title**
+While a stream records, StreamArchiver polls its metadata and logs every **title**
 and **game/category** change for that take — so the archive captures *what* the
 broadcast was, not just the footage. (The normal scheduler pauses polling during a
 recording, so this runs as a dedicated per-recording poller.)
 
+- **Game** and **Title** columns show the *current* (latest-logged) value of the
+  most recent recording, updating live as the stream changes. Both are narrow and
+  truncated — **hover** to read the full value.
 - A **Changes** column shows the number of changes for the latest take. **Hover**
   a stream/take row's count to see the list inline, or **double-click** it to open
   a scrollable, copyable log window. Each entry shows the offset from the take's
   start, the kind, and the value (the first entry per kind is what it *started*
   with; later entries show `old → new`).
-- **Twitch only**, and it needs Twitch credentials configured (Settings) — it uses
-  the same app/user token as live detection. Other platforms don't log changes.
-- Polling is coarse (about once a minute) since changes are infrequent, so the API
-  cost is negligible (one call per active Twitch recording).
+- **Sources, per platform:**
+  - **Twitch** — Helix (`Get Streams`); needs Twitch credentials (Settings), the
+    same app/user token as live detection. Title + the game/category.
+  - **Kick** — the public v2 channel JSON (no credentials). Title + category.
+  - **YouTube** — scraped from the `/live` page (no credentials). Title, plus the
+    broad *content category* (e.g. “Gaming”) — YouTube has no public per-stream
+    game field, so the category is the closest stable signal.
+  - Generic URLs have no metadata source, so they log nothing.
+- Polling is coarse (about once a minute) since changes are infrequent, so the cost
+  is low — one request per active recording. (Twitch and Kick hit small JSON
+  endpoints; the YouTube path fetches the full `/live` watch page each poll.)
 
-A later option will let you fold the categories played into the filename.
+The categories played can also be folded into the filename — see `{games}` below.
 
 ### Chat logs
 
@@ -325,7 +335,7 @@ yt-dlp's output templates):
 | `{fps}` | Actual frame rate, rounded to a whole number (e.g. `60`, `30`). Same probing requirement. |
 | `{vcodec}` | Actual video codec (e.g. `h264`, `hevc`, `av1`). Same probing requirement. |
 | `{take}` | **Streams:** this monitor's attempt number (1, 2, 3, …) — a built-in way to keep names unique when you omit `{date}`/`{time}`. Empty for Videos. |
-| `{games}` | **Streams (Twitch):** the distinct game/category names played during the recording, in order of first appearance, joined with `, ` and length-capped. Only known once the stream ends, so it's filled by a **post-capture rename** (see below). Empty for non-Twitch / Videos / when no category was set. |
+| `{games}` | **Streams:** the distinct game/category names played during the recording (Twitch, Kick & YouTube — see *Title & category change log*), in order of first appearance, joined with `, ` and length-capped. Only known once the stream ends, so it's filled by a **post-capture rename** (see below). Empty for generic URLs / Videos / when no category was logged. |
 | `{date}` | Capture-start date, **UTC**, `YYYYMMDD` (e.g. `20260620`). |
 | `{time}` | Capture-start time, **UTC**, `HHMMSS` (e.g. `183001`). |
 | `{timestamp}` | Capture start as a **Unix timestamp** (whole seconds). |

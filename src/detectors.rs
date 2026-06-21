@@ -735,6 +735,29 @@ impl DetectContext {
         }
     }
 
+    /// Title + (broad) content category of a currently-live YouTube channel,
+    /// scraped from the `/live` watch page's `ytInitialPlayerResponse` (no
+    /// credentials). For the in-recording metadata change log. `None` when the
+    /// page has no live video details (offline) or on error. YouTube exposes no
+    /// public "current game" field, so `game` carries the page's content category
+    /// (e.g. "Gaming") — the closest stable signal.
+    pub async fn youtube_stream_meta(&self, url: &str) -> Option<StreamMeta> {
+        let live_url = youtube_live_url(url);
+        let resp = self
+            .http
+            .get(&live_url)
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Cookie", "CONSENT=YES+1; SOCS=CAI")
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body = resp.text().await.ok()?;
+        parse_youtube_meta(&body)
+    }
+
     async fn scrape_kick(&self, item: &DetectItem) -> DetectOutcome {
         let Some(slug) = kick_slug(&item.url) else {
             return DetectOutcome::err(item.monitor_id, "cannot parse kick slug");
@@ -775,6 +798,29 @@ impl DetectContext {
             Ok(r) => DetectOutcome::err(item.monitor_id, format!("kick {}", r.status())),
             Err(e) => DetectOutcome::err(item.monitor_id, e.to_string()),
         }
+    }
+
+    /// Title + category of a currently-live Kick channel (the unofficial v2
+    /// channel JSON; no credentials). For the in-recording metadata change log.
+    /// `None` when offline, on error, or behind a Cloudflare challenge. Always
+    /// uses the v2 endpoint (even when Kick API credentials are configured), so
+    /// metadata may be unavailable if v2 is Cloudflare-blocked while detection
+    /// runs on the official API — detection and recording are unaffected.
+    pub async fn kick_stream_meta(&self, url: &str) -> Option<StreamMeta> {
+        let slug = kick_slug(url)?;
+        let api = format!("https://kick.com/api/v2/channels/{slug}");
+        let resp = self
+            .http
+            .get(&api)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let v: Value = resp.json().await.ok()?;
+        parse_kick_meta(&v)
     }
 
     // ----- generic probe via streamlink -----
@@ -955,6 +1001,100 @@ fn youtube_live_url(url: &str) -> String {
     }
 }
 
+/// Parse the JSON object from a `marker = {…}` assignment in `body`, reading
+/// exactly one value and ignoring the surrounding page (so a
+/// `name = {…};</script>` blob parses cleanly). Used for YouTube's inline
+/// `ytInitialPlayerResponse = {…}`.
+///
+/// Anchors to a genuine assignment of `marker` as a whole identifier: the match
+/// must be a standalone token (the char before it is not a JS identifier char, so
+/// `fooMARKER` is rejected) followed (whitespace-insensitively) by `=` then `{`.
+/// This rejects unrelated mentions — an identifier *ending* in the marker, a
+/// quoted key, a minified deref like `a.ytInitialPlayerResponse,…`, an HTML
+/// attribute's stray `=`, or `marker = null` — instead of latching onto the next
+/// brace anywhere on the page. Walks every occurrence, returning the first that
+/// is a valid assignment whose object parses.
+fn extract_json_after(body: &str, marker: &str) -> Option<Value> {
+    use serde::Deserialize;
+    let bytes = body.as_bytes();
+    let mut start = 0;
+    while let Some(rel) = body[start..].find(marker) {
+        let pos = start + rel; // absolute start of this occurrence
+        start = pos + marker.len(); // advance for the next iteration (strictly grows)
+        // Left boundary: reject when the marker is a suffix of a longer
+        // identifier (`fooMARKER = {…}`). A multibyte char before it has a
+        // high byte that isn't in these ASCII ranges, so it reads as a boundary.
+        if pos > 0
+            && matches!(bytes[pos - 1], b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'$')
+        {
+            continue;
+        }
+        // Right boundary: a real `= {…}` assignment.
+        let Some(after_eq) = body[start..].trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let obj = after_eq.trim_start();
+        if !obj.starts_with('{') {
+            continue;
+        }
+        // Read exactly one JSON value; trailing JS (`;</script>…`) is ignored.
+        if let Ok(v) = Value::deserialize(&mut serde_json::Deserializer::from_str(obj)) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Extract a *live* YouTube stream's title + content category from a `/live`
+/// watch page body. `None` unless the page is a genuinely-live watch page — the
+/// `/live` URL can also resolve to the channel page, a finished VOD, or an
+/// upcoming premiere, all of which still embed a player response with a title, so
+/// we require `videoDetails.isLive == true`. The title comes from
+/// `videoDetails.title` (empty/absent ⇒ partial page ⇒ `None`, not a blank
+/// title); `game` carries the broad content category (YouTube has no public
+/// per-stream "game" field).
+fn parse_youtube_meta(body: &str) -> Option<StreamMeta> {
+    let pr = extract_json_after(body, "ytInitialPlayerResponse")?;
+    let details = &pr["videoDetails"];
+    if details["isLive"].as_bool() != Some(true) {
+        return None;
+    }
+    // A live stream always has a non-empty title; an empty/absent one means a
+    // degraded page — skip rather than log a spurious empty-title change.
+    let title = details["title"]
+        .as_str()
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let game = pr["microformat"]["playerMicroformatRenderer"]["category"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    Some(StreamMeta { title, game })
+}
+
+/// Extract a live Kick stream's title + category from the v2 channel JSON. `None`
+/// when offline (no `livestream` object, or an explicit `is_live: false`) or when
+/// the title can't be read (empty/absent `session_title` ⇒ partial response ⇒
+/// skip, rather than logging a blank title).
+fn parse_kick_meta(v: &Value) -> Option<StreamMeta> {
+    let ls = &v["livestream"];
+    if !ls.is_object() || ls["is_live"].as_bool() == Some(false) {
+        return None;
+    }
+    let title = ls["session_title"]
+        .as_str()
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    Some(StreamMeta {
+        title,
+        // v2 exposes the category under `categories[0].name`.
+        game: ls["categories"][0]["name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -989,5 +1129,74 @@ mod tests {
             youtube_live_url("https://youtube.com/@chan/live/"),
             "https://youtube.com/@chan/live"
         );
+    }
+
+    #[test]
+    fn youtube_meta_parses_title_and_category() {
+        // `&` is a JSON unicode escape that serde must decode to `&`; the
+        // trailing `var other = 1;` JS after the object must be ignored.
+        let body = r#"<script nonce="x">var ytInitialPlayerResponse = {"videoDetails":{"title":"Dev & Chill","isLive":true},"microformat":{"playerMicroformatRenderer":{"category":"Gaming"}}};var other = 1;</script>"#;
+        let m = parse_youtube_meta(body).unwrap();
+        assert_eq!(m.title, "Dev & Chill");
+        assert_eq!(m.game, "Gaming");
+    }
+
+    #[test]
+    fn youtube_meta_handles_minified_and_missing() {
+        // Minified `name={…}` form, and a missing category -> empty game.
+        let body = r#"ytInitialPlayerResponse={"videoDetails":{"title":"Solo","isLive":true}};"#;
+        let m = parse_youtube_meta(body).unwrap();
+        assert_eq!(m.title, "Solo");
+        assert_eq!(m.game, "");
+        // No player response at all -> None (treated as offline).
+        assert!(parse_youtube_meta("<html>nothing here</html>").is_none());
+    }
+
+    #[test]
+    fn youtube_meta_requires_live_and_real_assignment() {
+        // A finished VOD or upcoming premiere still embeds a player response with
+        // a title, but isn't live -> None.
+        let vod = r#"var ytInitialPlayerResponse = {"videoDetails":{"title":"Old VOD","isLive":false}};"#;
+        assert!(parse_youtube_meta(vod).is_none());
+        let upcoming = r#"ytInitialPlayerResponse = {"videoDetails":{"title":"Premiere Soon"}};"#;
+        assert!(parse_youtube_meta(upcoming).is_none());
+
+        // A non-assignment mention (quoted key, then a stray `=` inside an href)
+        // must not be latched onto; with no real assignment present -> None.
+        let decoy = r#"x"ytInitialPlayerResponse" rel="x" href="a=b" {"videoDetails":{"title":"WRONG","isLive":true}}"#;
+        assert!(parse_youtube_meta(decoy).is_none());
+
+        // A decoy mention *before* the real assignment -> the real object wins.
+        let mixed = r#"if(window.ytInitialPlayerResponse){} var ytInitialPlayerResponse = {"videoDetails":{"title":"Real","isLive":true}};"#;
+        assert_eq!(parse_youtube_meta(mixed).unwrap().title, "Real");
+
+        // A longer identifier *ending* in the marker (`fooMARKER = {…}`) must not
+        // be latched onto; the real standalone assignment after it wins.
+        let suffixed = r#"var preloadytInitialPlayerResponse = {"videoDetails":{"title":"DECOY","isLive":true}}; var ytInitialPlayerResponse = {"videoDetails":{"title":"Real","isLive":true}};"#;
+        assert_eq!(parse_youtube_meta(suffixed).unwrap().title, "Real");
+    }
+
+    #[test]
+    fn kick_meta_parses_title_and_category() {
+        let v: Value = serde_json::from_str(
+            r#"{"livestream":{"is_live":true,"session_title":"first stream","categories":[{"name":"Just Chatting"}]}}"#,
+        )
+        .unwrap();
+        let m = parse_kick_meta(&v).unwrap();
+        assert_eq!(m.title, "first stream");
+        assert_eq!(m.game, "Just Chatting");
+    }
+
+    #[test]
+    fn kick_meta_none_when_offline() {
+        let offline: Value = serde_json::from_str(r#"{"livestream":null}"#).unwrap();
+        assert!(parse_kick_meta(&offline).is_none());
+        let not_live: Value =
+            serde_json::from_str(r#"{"livestream":{"is_live":false,"session_title":"x"}}"#).unwrap();
+        assert!(parse_kick_meta(&not_live).is_none());
+        // Live but no readable title -> None (partial response; don't log a blank).
+        let no_title: Value =
+            serde_json::from_str(r#"{"livestream":{"is_live":true,"session_title":""}}"#).unwrap();
+        assert!(parse_kick_meta(&no_title).is_none());
     }
 }
