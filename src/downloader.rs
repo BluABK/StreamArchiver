@@ -1385,6 +1385,7 @@ impl Supervisor {
         let duration = now_unix() - started_at;
         let ok = bytes > 0;
         let manually_stopped = self.stopping_monitors.lock().unwrap().remove(&monitor_id);
+        let shutting_down = self.shutdown.load(Ordering::SeqCst);
         // A 0-byte capture isn't always a failure: a livestream that had already
         // ended (or hadn't started, or exposed no live video formats) leaves
         // nothing to capture but isn't an error. Classify those as `ended` so they
@@ -1393,6 +1394,9 @@ impl Supervisor {
         let status = if manually_stopped {
             // User explicitly stopped the recording; never show it as `failed`.
             if ok { "completed" } else { "stopped" }
+        } else if shutting_down {
+            // App shutdown killed the process tree; recording was cut short.
+            "aborted"
         } else if ok {
             "completed"
         } else if stream_ended_or_unavailable(&outcome.log) {

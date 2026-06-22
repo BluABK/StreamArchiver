@@ -2271,6 +2271,8 @@ fn rec_status_color(status: &str) -> egui::Color32 {
         "recording" => Color32::from_rgb(0x4d, 0x9b, 0xff),
         "completed" => SUCCESS_GREEN,
         "failed" => Color32::from_rgb(0xe0, 0x6c, 0x6c),
+        // Cut short by app shutdown — amber, not an error but not clean either.
+        "aborted" => Color32::from_rgb(0xe0, 0xa8, 0x50),
         // "ended" (stream had ended / wasn't live), "stopped", "orphaned": neutral
         // gray — terminal but not an error.
         _ => Color32::from_gray(0xa0),

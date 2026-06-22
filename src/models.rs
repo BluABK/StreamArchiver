@@ -1092,6 +1092,9 @@ impl StreamGroup {
             "recording"
         } else if self.takes.iter().any(|t| t.status == "completed") {
             "completed"
+        } else if self.takes.iter().any(|t| t.status == "aborted") {
+            // All non-completed takes were cut short by app shutdown.
+            "aborted"
         } else if self.takes.iter().all(|t| t.status == "orphaned") {
             "orphaned"
         } else if self
