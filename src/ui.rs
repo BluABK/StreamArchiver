@@ -59,6 +59,7 @@ enum View {
     Streams,
     Videos,
     Schedule,
+    Background,
     Settings,
 }
 
@@ -426,6 +427,10 @@ pub struct StreamArchiverApp {
     /// Streams + Videos tables. Off reclaims width; every action is also on the
     /// row's right-click context menu. Persisted under [`K_SHOW_ACTIONS`].
     show_actions: bool,
+    /// Currently running background tasks (asset fetches, thumbnail downloads).
+    background_tasks: Vec<crate::events::BackgroundTask>,
+    /// Completed/failed background tasks, newest first; capped at 100.
+    finished_tasks: Vec<(crate::events::BackgroundTask, crate::events::TaskOutcome)>,
 }
 
 impl StreamArchiverApp {
@@ -578,6 +583,8 @@ impl StreamArchiverApp {
             twitch_flow,
             status_bgcolor,
             show_actions,
+            background_tasks: Vec::new(),
+            finished_tasks: Vec::new(),
         };
         app.reload_rows();
         app.reload_videos();
@@ -694,6 +701,18 @@ impl StreamArchiverApp {
             match self.events_rx.try_recv() {
                 Ok(crate::events::AppEvent::Error { context, message }) => {
                     self.status = format!("{context}: {message}");
+                    dirty = true;
+                }
+                Ok(crate::events::AppEvent::BackgroundTaskStarted(task)) => {
+                    self.background_tasks.push(task);
+                    dirty = true;
+                }
+                Ok(crate::events::AppEvent::BackgroundTaskFinished { id, outcome }) => {
+                    if let Some(pos) = self.background_tasks.iter().position(|t| t.id == id) {
+                        let task = self.background_tasks.remove(pos);
+                        self.finished_tasks.insert(0, (task, outcome));
+                        self.finished_tasks.truncate(100);
+                    }
                     dirty = true;
                 }
                 Ok(_) => dirty = true,
@@ -2901,6 +2920,7 @@ impl eframe::App for StreamArchiverApp {
                     ui.selectable_value(&mut self.view, View::Streams, "Streams");
                     ui.selectable_value(&mut self.view, View::Videos, "Videos");
                     ui.selectable_value(&mut self.view, View::Schedule, "Schedule");
+                    ui.selectable_value(&mut self.view, View::Background, "Background");
                     ui.selectable_value(&mut self.view, View::Settings, "Settings");
                     ui.separator();
                     if ui
@@ -2960,6 +2980,7 @@ impl eframe::App for StreamArchiverApp {
             View::Streams => self.channels_view(ui),
             View::Videos => self.videos_view(ui),
             View::Schedule => self.schedule_view(ui),
+            View::Background => self.background_view(ui),
             View::Settings => self.settings_view(ui),
         });
 
@@ -6121,6 +6142,108 @@ impl StreamArchiverApp {
         });
     }
 
+    fn background_view(&mut self, ui: &mut egui::Ui) {
+        use egui_extras::{Column, TableBuilder};
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.add_space(8.0);
+
+            // ── Active tasks ─────────────────────────────────────────────
+            ui.strong("Active");
+            ui.add_space(4.0);
+
+            if self.background_tasks.is_empty() {
+                ui.weak("No tasks running.");
+            } else {
+                let table = TableBuilder::new(ui)
+                    .striped(true)
+                    .resizable(false)
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .column(Column::remainder().clip(true))  // Label
+                    .column(Column::auto())                  // Kind
+                    .column(Column::auto())                  // Started
+                    .column(Column::auto());                 // Status
+
+                table
+                    .header(20.0, |mut h| {
+                        h.col(|ui| { ui.strong("Channel / Label"); });
+                        h.col(|ui| { ui.strong("Task"); });
+                        h.col(|ui| { ui.strong("Started"); });
+                        h.col(|ui| { ui.strong("Status"); });
+                    })
+                    .body(|mut body| {
+                        for task in &self.background_tasks {
+                            let started = chrono::DateTime::from_timestamp(task.started_at, 0)
+                                .map(|dt| {
+                                    dt.with_timezone(&chrono::Local)
+                                        .format("%H:%M:%S")
+                                        .to_string()
+                                })
+                                .unwrap_or_default();
+                            body.row(20.0, |mut row| {
+                                row.col(|ui| { ui.label(&task.label); });
+                                row.col(|ui| { ui.label(task.kind.label()); });
+                                row.col(|ui| { ui.label(&started); });
+                                row.col(|ui| { ui.label("⏳ Running"); });
+                            });
+                        }
+                    });
+            }
+
+            ui.add_space(12.0);
+
+            // ── Recent completed / failed ────────────────────────────────
+            ui.strong("Recent");
+            ui.add_space(4.0);
+
+            if self.finished_tasks.is_empty() {
+                ui.weak("No completed tasks yet.");
+            } else {
+                let table = TableBuilder::new(ui)
+                    .striped(true)
+                    .resizable(false)
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .column(Column::remainder().clip(true))
+                    .column(Column::auto())
+                    .column(Column::auto())
+                    .column(Column::remainder().clip(true));
+
+                table
+                    .header(20.0, |mut h| {
+                        h.col(|ui| { ui.strong("Channel / Label"); });
+                        h.col(|ui| { ui.strong("Task"); });
+                        h.col(|ui| { ui.strong("Started"); });
+                        h.col(|ui| { ui.strong("Outcome"); });
+                    })
+                    .body(|mut body| {
+                        for (task, outcome) in &self.finished_tasks {
+                            let started = chrono::DateTime::from_timestamp(task.started_at, 0)
+                                .map(|dt| {
+                                    dt.with_timezone(&chrono::Local)
+                                        .format("%H:%M:%S")
+                                        .to_string()
+                                })
+                                .unwrap_or_default();
+                            let outcome_str = match outcome {
+                                crate::events::TaskOutcome::Completed => "✔ Completed".to_string(),
+                                crate::events::TaskOutcome::Failed(e) => {
+                                    format!("✘ Failed: {e}")
+                                }
+                            };
+                            body.row(20.0, |mut row| {
+                                row.col(|ui| { ui.label(&task.label); });
+                                row.col(|ui| { ui.label(task.kind.label()); });
+                                row.col(|ui| { ui.label(&started); });
+                                row.col(|ui| { ui.label(&outcome_str); });
+                            });
+                        }
+                    });
+            }
+
+            ui.add_space(8.0);
+        });
+    }
+
     fn settings_view(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add_space(8.0);
@@ -7191,7 +7314,7 @@ impl StreamArchiverApp {
         let m = &row.monitor;
 
         let safe_name = crate::downloader::sanitize_filename(&ch.name);
-        let asset_dir = std::path::PathBuf::from(&m.output_dir)
+        let asset_dir = crate::app_paths::asset_cache_dir()
             .join("channel_assets")
             .join(&safe_name);
 
@@ -7374,15 +7497,37 @@ impl StreamArchiverApp {
                             ui.label(if banner_ok { "✔" } else { "—" });
                             ui.end_row();
 
-                            let badge_versions =
+                            // Channel-specific badges
+                            let ch_badges =
                                 prop_count_nested_dirs(&asset_dir.join("badges"), 2);
-                            ui.label("Badges");
-                            ui.label(format!("{badge_versions} versions"));
+                            ui.label("Badges (channel)");
+                            ui.label(format!("{ch_badges} versions"));
                             ui.end_row();
 
-                            for src in &["twitch", "bttv", "ffz", "7tv"] {
-                                let n = prop_count_dir_files(
-                                    &asset_dir.join("emotes").join(src),
+                            // Global Twitch badges (shared across all channels)
+                            let platform_dir = crate::app_paths::platform_assets_dir();
+                            let global_badges = prop_count_nested_dirs(
+                                &platform_dir.join("twitch").join("global_badges"),
+                                2,
+                            );
+                            ui.label("Badges (global)");
+                            ui.label(format!("{global_badges} versions"));
+                            ui.end_row();
+
+                            // Twitch channel emotes (still per-channel)
+                            let n_twitch = prop_count_dir_files(
+                                &asset_dir.join("emotes").join("twitch"),
+                            );
+                            if n_twitch > 0 {
+                                ui.label("Emotes (twitch)");
+                                ui.label(n_twitch.to_string());
+                                ui.end_row();
+                            }
+
+                            // BTTV/FFZ/7TV: read per-channel manifests for count
+                            for src in &["bttv", "ffz", "7tv"] {
+                                let n = prop_read_manifest_count(
+                                    &asset_dir.join("emotes").join(format!("{src}.json")),
                                 );
                                 if n > 0 {
                                     ui.label(format!("Emotes ({src})"));
@@ -7494,6 +7639,16 @@ fn prop_truncate_path(p: &str, max_chars: usize) -> String {
     } else {
         format!("…{}", &p[p.len() - max_chars..])
     }
+}
+
+/// Read the length of a JSON-array manifest file (BTTV/FFZ/7TV emote manifests).
+/// Returns 0 if the file is absent or unparseable.
+fn prop_read_manifest_count(path: &std::path::Path) -> usize {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.as_array().map(|a| a.len()))
+        .unwrap_or(0)
 }
 
 // ── Chat viewer helpers ──────────────────────────────────────────────────────

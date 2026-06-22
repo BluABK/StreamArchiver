@@ -5,7 +5,50 @@
 //! [`UiCommand`]s on a plain mpsc channel and wakes the egui loop via
 //! `Context::request_repaint`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use tokio::sync::broadcast;
+
+// ---------- Background task tracking ----------
+
+static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
+
+pub fn next_task_id() -> u64 {
+    NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BackgroundTaskKind {
+    AssetFetch,
+    ThumbnailFetch,
+}
+
+impl BackgroundTaskKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            BackgroundTaskKind::AssetFetch => "Asset fetch",
+            BackgroundTaskKind::ThumbnailFetch => "Thumbnail",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum TaskOutcome {
+    Completed,
+    Failed(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct BackgroundTask {
+    pub id: u64,
+    pub kind: BackgroundTaskKind,
+    /// Channel name or recording label shown in the Background view.
+    pub label: String,
+    /// Unix timestamp when the task was started.
+    pub started_at: i64,
+}
+
+// ---------- App event bus ----------
 
 /// State-change notifications emitted by the core for the UI to render.
 ///
@@ -34,6 +77,13 @@ pub enum AppEvent {
     Error {
         context: String,
         message: String,
+    },
+    /// A background task (asset fetch, thumbnail download, etc.) has started.
+    BackgroundTaskStarted(BackgroundTask),
+    /// A background task has finished.
+    BackgroundTaskFinished {
+        id: u64,
+        outcome: TaskOutcome,
     },
 }
 

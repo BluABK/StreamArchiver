@@ -7,7 +7,7 @@ use tracing::warn;
 
 use crate::models::now_unix;
 
-// ---------- Cache stamp ----------
+// ---------- Cache stamps ----------
 
 /// True if the channel asset directory has not been fetched in the last 24 hours.
 pub fn should_refetch_assets(asset_dir: &Path) -> bool {
@@ -23,6 +23,20 @@ pub fn should_refetch_assets(asset_dir: &Path) -> bool {
 
 fn write_fetched_stamp(asset_dir: &Path) {
     let _ = std::fs::write(asset_dir.join(".assets_fetched_at"), now_unix().to_string());
+}
+
+fn should_refetch_global_badges(platform_dir: &Path) -> bool {
+    let stamp = platform_dir.join("twitch").join(".global_badges_fetched_at");
+    match std::fs::read_to_string(&stamp) {
+        Ok(s) => s.trim().parse::<i64>().map(|t| now_unix() - t > 86_400).unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
+fn write_global_badges_stamp(platform_dir: &Path) {
+    let dir = platform_dir.join("twitch");
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join(".global_badges_fetched_at"), now_unix().to_string());
 }
 
 // ---------- Core utility ----------
@@ -190,36 +204,42 @@ async fn fetch_helix_badges(
     Ok(())
 }
 
-/// Download global + channel Twitch badges into `asset_dir/badges/`.
+/// Download global Twitch badges into `platform_dir/twitch/global_badges/` (once per 24h)
+/// and channel-specific badges into `asset_dir/badges/`.
 async fn fetch_twitch_badges(
     client: &Client,
     client_id: &str,
     token: &str,
     broadcaster_id: &str,
     asset_dir: &Path,
+    platform_dir: &Path,
 ) -> Result<()> {
-    let badge_dir = asset_dir.join("badges");
-    tokio::fs::create_dir_all(&badge_dir).await?;
-
-    if let Err(e) = fetch_helix_badges(
-        client,
-        client_id,
-        token,
-        "https://api.twitch.tv/helix/chat/badges/global",
-        &badge_dir,
-    )
-    .await
-    {
-        warn!("global Twitch badges: {e}");
+    // Global badges are shared across all Twitch channels — fetch once per 24h.
+    if should_refetch_global_badges(platform_dir) {
+        let global_dir = platform_dir.join("twitch").join("global_badges");
+        tokio::fs::create_dir_all(&global_dir).await?;
+        match fetch_helix_badges(
+            client,
+            client_id,
+            token,
+            "https://api.twitch.tv/helix/chat/badges/global",
+            &global_dir,
+        )
+        .await
+        {
+            Ok(_) => write_global_badges_stamp(platform_dir),
+            Err(e) => warn!("global Twitch badges: {e}"),
+        }
     }
 
+    // Channel-specific badges go per-channel.
     if !broadcaster_id.is_empty() {
+        let badge_dir = asset_dir.join("badges");
+        tokio::fs::create_dir_all(&badge_dir).await?;
         let url = format!(
             "https://api.twitch.tv/helix/chat/badges?broadcaster_id={broadcaster_id}"
         );
-        if let Err(e) =
-            fetch_helix_badges(client, client_id, token, &url, &badge_dir).await
-        {
+        if let Err(e) = fetch_helix_badges(client, client_id, token, &url, &badge_dir).await {
             warn!("channel Twitch badges ({broadcaster_id}): {e}");
         }
     }
@@ -245,6 +265,7 @@ struct HelixEmotesResp {
 }
 
 /// Download Twitch channel emotes into `asset_dir/emotes/twitch/`.
+/// These are per-channel by nature so no global dedup is applied.
 async fn fetch_twitch_emotes(
     client: &Client,
     client_id: &str,
@@ -298,11 +319,22 @@ async fn fetch_twitch_emotes(
 
 // ---------- BTTV ----------
 
-/// Download BTTV channel + shared emotes into `asset_dir/emotes/bttv/`.
+/// Manifest entry written to `asset_dir/emotes/bttv.json`.
+#[derive(serde::Serialize)]
+struct EmoteManifestEntry {
+    id: String,
+    ext: String,
+}
+
+/// Download BTTV emotes:
+/// - Channel emotes → `asset_dir/emotes/bttv/{id}.ext` (per-channel, unchanged)
+/// - Shared emotes  → `platform_dir/bttv/emotes/{id}.ext` (global dedup, skip if present)
+/// Writes a manifest `asset_dir/emotes/bttv.json` listing all active emote IDs for this channel.
 async fn fetch_bttv_emotes(
     client: &Client,
     broadcaster_id: &str,
     asset_dir: &Path,
+    platform_dir: &Path,
 ) -> Result<()> {
     if broadcaster_id.is_empty() {
         return Ok(());
@@ -334,31 +366,75 @@ async fn fetch_bttv_emotes(
     }
     let r: BttvResp = resp.json().await?;
 
-    let emote_dir = asset_dir.join("emotes").join("bttv");
-    tokio::fs::create_dir_all(&emote_dir).await?;
+    let mut manifest: Vec<EmoteManifestEntry> = Vec::new();
 
-    let all = r.channel_emotes.iter().chain(r.shared_emotes.iter());
-    for emote in all {
-        let ext = &emote.image_type;
-        let url = format!("https://cdn.betterttv.net/emote/{}/3x.{ext}", emote.id);
-        let dest = emote_dir.join(format!("{}.{ext}", emote.id));
-        if dest.exists() {
-            continue;
-        }
-        if let Err(e) = download_image(client, &url, &dest).await {
-            warn!("BTTV emote {}: {e}", emote.id);
+    // Channel emotes — per-channel directory
+    if !r.channel_emotes.is_empty() {
+        let dir = asset_dir.join("emotes").join("bttv");
+        tokio::fs::create_dir_all(&dir).await?;
+        for emote in &r.channel_emotes {
+            manifest.push(EmoteManifestEntry {
+                id: emote.id.clone(),
+                ext: emote.image_type.clone(),
+            });
+            let dest = dir.join(format!("{}.{}", emote.id, emote.image_type));
+            if dest.exists() {
+                continue;
+            }
+            let url = format!(
+                "https://cdn.betterttv.net/emote/{}/3x.{}",
+                emote.id, emote.image_type
+            );
+            if let Err(e) = download_image(client, &url, &dest).await {
+                warn!("BTTV channel emote {}: {e}", emote.id);
+            }
         }
     }
+
+    // Shared emotes — global dedup cache
+    if !r.shared_emotes.is_empty() {
+        let global_dir = platform_dir.join("bttv").join("emotes");
+        tokio::fs::create_dir_all(&global_dir).await?;
+        for emote in &r.shared_emotes {
+            manifest.push(EmoteManifestEntry {
+                id: emote.id.clone(),
+                ext: emote.image_type.clone(),
+            });
+            let dest = global_dir.join(format!("{}.{}", emote.id, emote.image_type));
+            if dest.exists() {
+                continue;
+            }
+            let url = format!(
+                "https://cdn.betterttv.net/emote/{}/3x.{}",
+                emote.id, emote.image_type
+            );
+            if let Err(e) = download_image(client, &url, &dest).await {
+                warn!("BTTV shared emote {}: {e}", emote.id);
+            }
+        }
+    }
+
+    // Write manifest listing all active emote IDs for this channel
+    if !manifest.is_empty() {
+        let manifest_dir = asset_dir.join("emotes");
+        tokio::fs::create_dir_all(&manifest_dir).await?;
+        if let Ok(json) = serde_json::to_string(&manifest) {
+            let _ = tokio::fs::write(manifest_dir.join("bttv.json"), json).await;
+        }
+    }
+
     Ok(())
 }
 
 // ---------- FFZ ----------
 
-/// Download FFZ channel emotes into `asset_dir/emotes/ffz/`.
+/// Download FFZ channel emotes into the global dedup cache `platform_dir/ffz/emotes/`
+/// and write a per-channel manifest `asset_dir/emotes/ffz.json`.
 async fn fetch_ffz_emotes(
     client: &Client,
     broadcaster_id: &str,
     asset_dir: &Path,
+    platform_dir: &Path,
 ) -> Result<()> {
     if broadcaster_id.is_empty() {
         return Ok(());
@@ -377,8 +453,10 @@ async fn fetch_ffz_emotes(
         None => return Ok(()),
     };
 
-    let emote_dir = asset_dir.join("emotes").join("ffz");
-    tokio::fs::create_dir_all(&emote_dir).await?;
+    let global_dir = platform_dir.join("ffz").join("emotes");
+    tokio::fs::create_dir_all(&global_dir).await?;
+
+    let mut manifest: Vec<EmoteManifestEntry> = Vec::new();
 
     for set_val in sets.values() {
         let emotes = match set_val["emoticons"].as_array() {
@@ -404,7 +482,11 @@ async fn fetch_ffz_emotes(
                 url_raw.to_string()
             };
             let ext = ext_from_url(&full_url).unwrap_or("png");
-            let dest = emote_dir.join(format!("{id}.{ext}"));
+            manifest.push(EmoteManifestEntry {
+                id: id.clone(),
+                ext: ext.to_string(),
+            });
+            let dest = global_dir.join(format!("{id}.{ext}"));
             if dest.exists() {
                 continue;
             }
@@ -413,16 +495,27 @@ async fn fetch_ffz_emotes(
             }
         }
     }
+
+    if !manifest.is_empty() {
+        let manifest_dir = asset_dir.join("emotes");
+        tokio::fs::create_dir_all(&manifest_dir).await?;
+        if let Ok(json) = serde_json::to_string(&manifest) {
+            let _ = tokio::fs::write(manifest_dir.join("ffz.json"), json).await;
+        }
+    }
+
     Ok(())
 }
 
 // ---------- 7TV ----------
 
-/// Download 7TV channel emotes into `asset_dir/emotes/7tv/`.
+/// Download 7TV channel emotes into the global dedup cache `platform_dir/7tv/emotes/`
+/// and write a per-channel manifest `asset_dir/emotes/7tv.json`.
 async fn fetch_7tv_emotes(
     client: &Client,
     broadcaster_id: &str,
     asset_dir: &Path,
+    platform_dir: &Path,
 ) -> Result<()> {
     if broadcaster_id.is_empty() {
         return Ok(());
@@ -441,23 +534,38 @@ async fn fetch_7tv_emotes(
         None => return Ok(()),
     };
 
-    let emote_dir = asset_dir.join("emotes").join("7tv");
-    tokio::fs::create_dir_all(&emote_dir).await?;
+    let global_dir = platform_dir.join("7tv").join("emotes");
+    tokio::fs::create_dir_all(&global_dir).await?;
+
+    let mut manifest: Vec<EmoteManifestEntry> = Vec::new();
 
     for emote in &emotes {
         let Some(id) = emote["id"].as_str() else {
             continue;
         };
-        // Prefer animated WebP; fall back to static
-        let url = format!("https://cdn.7tv.app/emote/{id}/4x.webp");
-        let dest = emote_dir.join(format!("{id}.webp"));
+        manifest.push(EmoteManifestEntry {
+            id: id.to_string(),
+            ext: "webp".to_string(),
+        });
+        let dest = global_dir.join(format!("{id}.webp"));
         if dest.exists() {
             continue;
         }
+        // Prefer animated WebP; fall back to static
+        let url = format!("https://cdn.7tv.app/emote/{id}/4x.webp");
         if let Err(e) = download_image(client, &url, &dest).await {
             warn!("7TV emote {id}: {e}");
         }
     }
+
+    if !manifest.is_empty() {
+        let manifest_dir = asset_dir.join("emotes");
+        tokio::fs::create_dir_all(&manifest_dir).await?;
+        if let Ok(json) = serde_json::to_string(&manifest) {
+            let _ = tokio::fs::write(manifest_dir.join("7tv.json"), json).await;
+        }
+    }
+
     Ok(())
 }
 
@@ -558,14 +666,22 @@ async fn fetch_kick_channel_assets(
 
 // ---------- Platform orchestrators ----------
 
-/// Run all Twitch channel asset fetches (icon, banner, badges, emotes, BTTV, FFZ, 7TV).
-/// Errors from individual steps are logged as warnings; the stamp is written on completion.
+/// Run all Twitch channel asset fetches:
+/// - Icon + banner → `asset_dir/`
+/// - Channel badges → `asset_dir/badges/`
+/// - Global badges  → `platform_dir/twitch/global_badges/` (once per 24h, shared)
+/// - Twitch channel emotes → `asset_dir/emotes/twitch/`
+/// - BTTV channel emotes → `asset_dir/emotes/bttv/` + manifest `asset_dir/emotes/bttv.json`
+/// - BTTV shared emotes → `platform_dir/bttv/emotes/` (global dedup)
+/// - FFZ emotes → `platform_dir/ffz/emotes/` + manifest `asset_dir/emotes/ffz.json`
+/// - 7TV emotes → `platform_dir/7tv/emotes/` + manifest `asset_dir/emotes/7tv.json`
 pub async fn run_twitch_assets(
     client: &Client,
     client_id: &str,
     token: &str,
     broadcaster_id: &str,
     asset_dir: &Path,
+    platform_dir: &Path,
 ) {
     if let Err(e) =
         fetch_twitch_channel_assets(client, client_id, token, broadcaster_id, asset_dir).await
@@ -573,7 +689,7 @@ pub async fn run_twitch_assets(
         warn!("Twitch channel assets ({broadcaster_id}): {e}");
     }
     if let Err(e) =
-        fetch_twitch_badges(client, client_id, token, broadcaster_id, asset_dir).await
+        fetch_twitch_badges(client, client_id, token, broadcaster_id, asset_dir, platform_dir).await
     {
         warn!("Twitch badges ({broadcaster_id}): {e}");
     }
@@ -582,13 +698,13 @@ pub async fn run_twitch_assets(
     {
         warn!("Twitch emotes ({broadcaster_id}): {e}");
     }
-    if let Err(e) = fetch_bttv_emotes(client, broadcaster_id, asset_dir).await {
+    if let Err(e) = fetch_bttv_emotes(client, broadcaster_id, asset_dir, platform_dir).await {
         warn!("BTTV ({broadcaster_id}): {e}");
     }
-    if let Err(e) = fetch_ffz_emotes(client, broadcaster_id, asset_dir).await {
+    if let Err(e) = fetch_ffz_emotes(client, broadcaster_id, asset_dir, platform_dir).await {
         warn!("FFZ ({broadcaster_id}): {e}");
     }
-    if let Err(e) = fetch_7tv_emotes(client, broadcaster_id, asset_dir).await {
+    if let Err(e) = fetch_7tv_emotes(client, broadcaster_id, asset_dir, platform_dir).await {
         warn!("7TV ({broadcaster_id}): {e}");
     }
     write_fetched_stamp(asset_dir);

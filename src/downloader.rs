@@ -1194,33 +1194,72 @@ impl Supervisor {
                 let http = self.ctx.http_client();
                 let url = url.clone();
                 let dest = plan.final_path.with_extension("thumbnail.jpg");
+                let task_id = crate::events::next_task_id();
+                let task_label = row.channel.name.clone();
+                let _ = self.events.send(AppEvent::BackgroundTaskStarted(
+                    crate::events::BackgroundTask {
+                        id: task_id,
+                        kind: crate::events::BackgroundTaskKind::ThumbnailFetch,
+                        label: task_label,
+                        started_at: crate::models::now_unix(),
+                    },
+                ));
+                let tx = self.events.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = crate::assets::fetch_stream_thumbnail(&http, &url, &dest).await {
-                        tracing::warn!(monitor_id, "thumbnail fetch failed: {e}");
-                    }
+                    let outcome = match crate::assets::fetch_stream_thumbnail(&http, &url, &dest).await {
+                        Ok(_) => crate::events::TaskOutcome::Completed,
+                        Err(e) => {
+                            tracing::warn!(monitor_id, "thumbnail fetch failed: {e}");
+                            crate::events::TaskOutcome::Failed(e.to_string())
+                        }
+                    };
+                    let _ = tx.send(AppEvent::BackgroundTaskFinished { id: task_id, outcome });
                 });
             }
         }
         if row.monitor.fetch_chat_assets {
-            let asset_dir = std::path::PathBuf::from(&row.monitor.output_dir)
+            // All channel assets live in the centralised app-data cache, not in output_dir.
+            let asset_dir = crate::app_paths::asset_cache_dir()
                 .join("channel_assets")
                 .join(sanitize_filename(&row.channel.name));
             if crate::assets::should_refetch_assets(&asset_dir) {
                 let http = self.ctx.http_client();
                 let platform = row.monitor.platform();
                 let bid = broadcaster_id.clone().unwrap_or_default();
+                let task_id = crate::events::next_task_id();
+                let _ = self.events.send(AppEvent::BackgroundTaskStarted(
+                    crate::events::BackgroundTask {
+                        id: task_id,
+                        kind: crate::events::BackgroundTaskKind::AssetFetch,
+                        label: row.channel.name.clone(),
+                        started_at: crate::models::now_unix(),
+                    },
+                ));
+                let tx = self.events.clone();
                 match platform {
                     Platform::Twitch => {
                         match self.ctx.twitch_helix_auth().await {
                             Ok((client_id, token)) => {
+                                let platform_dir = crate::app_paths::platform_assets_dir();
                                 tokio::spawn(async move {
                                     crate::assets::run_twitch_assets(
-                                        &http, &client_id, &token, &bid, &asset_dir,
+                                        &http, &client_id, &token, &bid,
+                                        &asset_dir, &platform_dir,
                                     )
                                     .await;
+                                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                                        id: task_id,
+                                        outcome: crate::events::TaskOutcome::Completed,
+                                    });
                                 });
                             }
-                            Err(e) => tracing::warn!(monitor_id, "Twitch auth for assets failed: {e}"),
+                            Err(e) => {
+                                tracing::warn!(monitor_id, "Twitch auth for assets failed: {e}");
+                                let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                                    id: task_id,
+                                    outcome: crate::events::TaskOutcome::Failed(e.to_string()),
+                                });
+                            }
                         }
                     }
                     Platform::YouTube => {
@@ -1233,14 +1272,27 @@ impl Supervisor {
                         tokio::spawn(async move {
                             crate::assets::run_youtube_assets(&http, &api_key, &bid, &asset_dir)
                                 .await;
+                            let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                                id: task_id,
+                                outcome: crate::events::TaskOutcome::Completed,
+                            });
                         });
                     }
                     Platform::Kick => {
                         tokio::spawn(async move {
                             crate::assets::run_kick_assets(&http, &bid, &asset_dir).await;
+                            let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                                id: task_id,
+                                outcome: crate::events::TaskOutcome::Completed,
+                            });
                         });
                     }
-                    _ => {}
+                    _ => {
+                        let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                            id: task_id,
+                            outcome: crate::events::TaskOutcome::Completed,
+                        });
+                    }
                 }
             }
         }
