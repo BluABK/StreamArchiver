@@ -485,6 +485,9 @@ pub struct Channel {
     #[allow(dead_code)]
     pub platform: Platform,
     pub created_at: i64,
+    /// Optional custom hex color for this channel (e.g. `"#ff9800"`).
+    /// Empty string means "use the automatic palette color".
+    pub color: String,
 }
 
 /// One capture instance for a channel (source URL + tool + quality + detection +
@@ -675,6 +678,9 @@ pub struct UpcomingStream {
     /// Where this segment came from: `"platform"` (Twitch/YouTube published
     /// schedule) or `"discord"` (matched from a Discord scheduled event).
     pub source: String,
+    /// Custom hex color for this channel (mirrors `Channel::color`). Empty
+    /// means "use the automatic palette color".
+    pub channel_color: String,
 }
 
 impl UpcomingStream {
@@ -820,6 +826,131 @@ impl DownloadDefaults {
         }
     }
 }
+
+/// Per-platform (or global) monitor-creation defaults stored as part of
+/// [`MonitorDefaults`]. Every field is `Option<T>` — `None` means "not set;
+/// inherit from the global defaults (or the built-in hardcoded fallback)."
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PlatformMonitorDefault {
+    pub tool: Option<Tool>,
+    pub detection_method: Option<DetectionMethod>,
+    pub container: Option<Container>,
+    /// `None` or empty string = use the hardcoded/global default (`"best"`).
+    #[serde(default)]
+    pub quality: Option<String>,
+    /// `None` = inherit (global default is 60 s).
+    pub poll_interval_secs: Option<i64>,
+    /// `None` or empty string = use the hardcoded/global default.
+    #[serde(default)]
+    pub filename_template: Option<String>,
+    /// `None` or empty string = use the global `default_output_dir`.
+    #[serde(default)]
+    pub output_dir: Option<String>,
+}
+
+/// Global + per-platform monitor-creation defaults, persisted as JSON in
+/// `app_settings` under [`K_MONITOR_DEFAULTS`].
+///
+/// Resolution order when creating a monitor for platform P:
+///   platform-specific value → global value → hardcoded fallback
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MonitorDefaults {
+    pub global: PlatformMonitorDefault,
+    pub twitch: PlatformMonitorDefault,
+    pub youtube: PlatformMonitorDefault,
+    pub kick: PlatformMonitorDefault,
+    pub generic: PlatformMonitorDefault,
+}
+
+impl MonitorDefaults {
+    pub fn get(&self, platform: Platform) -> &PlatformMonitorDefault {
+        match platform {
+            Platform::Twitch => &self.twitch,
+            Platform::YouTube => &self.youtube,
+            Platform::Kick => &self.kick,
+            Platform::Generic => &self.generic,
+        }
+    }
+
+    pub fn get_mut(&mut self, platform: Platform) -> &mut PlatformMonitorDefault {
+        match platform {
+            Platform::Twitch => &mut self.twitch,
+            Platform::YouTube => &mut self.youtube,
+            Platform::Kick => &mut self.kick,
+            Platform::Generic => &mut self.generic,
+        }
+    }
+
+    /// Resolve tool: platform override → global → hardcoded platform default.
+    pub fn resolve_tool(&self, platform: Platform) -> Tool {
+        self.get(platform)
+            .tool
+            .or(self.global.tool)
+            .unwrap_or_else(|| platform.default_tool())
+    }
+
+    /// Resolve detection method: platform override → global → hardcoded platform default.
+    pub fn resolve_detection(&self, platform: Platform) -> DetectionMethod {
+        self.get(platform)
+            .detection_method
+            .or(self.global.detection_method)
+            .unwrap_or_else(|| platform.default_detection())
+    }
+
+    /// Resolve container: platform override → global → MKV.
+    pub fn resolve_container(&self, platform: Platform) -> Container {
+        self.get(platform)
+            .container
+            .or(self.global.container)
+            .unwrap_or(Container::Mkv)
+    }
+
+    /// Resolve quality string: platform override → global → `"best"`.
+    pub fn resolve_quality(&self, platform: Platform) -> String {
+        self.get(platform)
+            .quality
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.global.quality.clone().filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| "best".to_string())
+    }
+
+    /// Resolve poll interval: platform override → global → 60 s.
+    pub fn resolve_poll_interval(&self, platform: Platform) -> i64 {
+        self.get(platform)
+            .poll_interval_secs
+            .or(self.global.poll_interval_secs)
+            .unwrap_or(60)
+    }
+
+    /// Resolve filename template: platform override → global → `"{name}_{date}_{time}"`.
+    pub fn resolve_filename_template(&self, platform: Platform) -> String {
+        self.get(platform)
+            .filename_template
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                self.global
+                    .filename_template
+                    .clone()
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or_else(|| "{name}_{date}_{time}".to_string())
+    }
+
+    /// Resolve output dir: platform override → global → `fallback`.
+    pub fn resolve_output_dir(&self, platform: Platform, fallback: &str) -> String {
+        self.get(platform)
+            .output_dir
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.global.output_dir.clone().filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| fallback.to_string())
+    }
+}
+
+/// `app_settings` key under which [`MonitorDefaults`] is persisted as JSON.
+pub const K_MONITOR_DEFAULTS: &str = "monitor_defaults";
 
 /// `app_settings` key for the global [`MediaInfoMode`] (filename media probing).
 pub const K_FILENAME_MEDIA: &str = "filename_media_info";

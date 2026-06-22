@@ -20,8 +20,8 @@ use crate::app_core::AppCore;
 use crate::events::{ManualCommand, UiCommand};
 use crate::models::{
     AdBreak, AuthKind, Channel, Container, DetectionMethod, DownloadDefaults, K_DISCORD_SCHEDULE,
-    K_DISCORD_TOKEN, K_FILENAME_MEDIA, K_YT_API_DETECT, K_YT_API_SCHEDULE, MediaInfoMode, Monitor,
-    MonitorWithChannel, Platform,
+    K_DISCORD_TOKEN, K_FILENAME_MEDIA, K_MONITOR_DEFAULTS, K_YT_API_DETECT, K_YT_API_SCHEDULE,
+    MediaInfoMode, Monitor, MonitorDefaults, MonitorWithChannel, Platform,
     Recording, ScheduleSegment, StreamGroup, StreamMetaChange, Tool, UpcomingStream, Video,
     group_recordings, now_unix,
 };
@@ -93,6 +93,8 @@ struct ChannelForm {
     /// `Some(id)` = renaming an existing channel; `None` = creating a new one.
     id: Option<i64>,
     name: String,
+    /// Hex color string (e.g. `"#ff9800"` or `"ff9800"`). Empty = auto palette.
+    color: String,
 }
 
 /// Backing state for the add/edit dialog. `name` is the channel (container) name;
@@ -132,19 +134,22 @@ struct MonitorForm {
 
 impl MonitorForm {
     /// "Add stream": a new channel container + its first instance.
-    fn new_channel(default_output_dir: String) -> MonitorForm {
+    fn new_channel(defaults: &MonitorDefaults, default_output_dir: &str) -> MonitorForm {
+        // Use Generic platform as the starting point; once the user pastes a URL
+        // the platform-change handler re-resolves tool/detection/etc. for that platform.
+        let p = Platform::Generic;
         MonitorForm {
             monitor_id: None,
             channel_id: None,
             name: String::new(),
             url: String::new(),
-            tool: Tool::Streamlink,
-            detection_method: DetectionMethod::GenericProbe,
-            poll_interval_secs: 60,
-            quality: "best".into(),
-            output_dir: default_output_dir,
-            filename_template: "{name}_{date}_{time}".into(),
-            container: Container::Mkv,
+            tool: defaults.resolve_tool(p),
+            detection_method: defaults.resolve_detection(p),
+            poll_interval_secs: defaults.resolve_poll_interval(p),
+            quality: defaults.resolve_quality(p),
+            output_dir: defaults.resolve_output_dir(p, default_output_dir),
+            filename_template: defaults.resolve_filename_template(p),
+            container: defaults.resolve_container(p),
             capture_from_start: true,
             ad_free: false,
             enabled: true,
@@ -190,19 +195,20 @@ impl MonitorForm {
 
     /// Add another instance to an existing channel container. The URL is blank so
     /// the user enters a (possibly different-platform) source.
-    fn add_instance(channel: &Channel, default_output_dir: String) -> MonitorForm {
+    fn add_instance(channel: &Channel, defaults: &MonitorDefaults, default_output_dir: &str) -> MonitorForm {
+        let p = Platform::Generic;
         MonitorForm {
             monitor_id: None,
             channel_id: Some(channel.id),
             name: channel.name.clone(),
             url: String::new(),
-            tool: Tool::Streamlink,
-            detection_method: DetectionMethod::GenericProbe,
-            poll_interval_secs: 60,
-            quality: "best".into(),
-            output_dir: default_output_dir,
-            filename_template: "{name}_{date}_{time}".into(),
-            container: Container::Mkv,
+            tool: defaults.resolve_tool(p),
+            detection_method: defaults.resolve_detection(p),
+            poll_interval_secs: defaults.resolve_poll_interval(p),
+            quality: defaults.resolve_quality(p),
+            output_dir: defaults.resolve_output_dir(p, default_output_dir),
+            filename_template: defaults.resolve_filename_template(p),
+            container: defaults.resolve_container(p),
             capture_from_start: true,
             ad_free: false,
             enabled: true,
@@ -329,6 +335,8 @@ pub struct StreamArchiverApp {
     video_form: VideoForm,
     /// Per-platform download defaults editable on the Videos tab (persisted JSON).
     download_defaults: DownloadDefaults,
+    /// Per-platform monitor-creation defaults editable in Settings (persisted JSON).
+    monitor_defaults: MonitorDefaults,
     /// Shared state of the async "List formats" probe (Videos tab).
     format_probe: Arc<Mutex<FormatProbe>>,
     settings: SettingsForm,
@@ -494,6 +502,14 @@ impl StreamArchiverApp {
             .and_then(|s| serde_json::from_str::<DownloadDefaults>(&s).ok())
             .unwrap_or_else(|| DownloadDefaults::seeded(&settings.default_output_dir));
 
+        let monitor_defaults = core
+            .store
+            .get_setting(K_MONITOR_DEFAULTS)
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str::<MonitorDefaults>(&s).ok())
+            .unwrap_or_default();
+
         let mut app = StreamArchiverApp {
             core,
             _tray: tray,
@@ -509,6 +525,7 @@ impl StreamArchiverApp {
             form: None,
             video_form: VideoForm::new(),
             download_defaults,
+            monitor_defaults,
             format_probe: Arc::new(Mutex::new(FormatProbe::Idle)),
             settings,
             status: String::new(),
@@ -626,6 +643,15 @@ impl StreamArchiverApp {
                 let _ = self.core.store.set_setting("download_defaults", &json);
             }
             Err(e) => warn!("failed to serialize download defaults: {e:#}"),
+        }
+    }
+
+    fn persist_monitor_defaults(&self) {
+        match serde_json::to_string(&self.monitor_defaults) {
+            Ok(json) => {
+                let _ = self.core.store.set_setting(K_MONITOR_DEFAULTS, &json);
+            }
+            Err(e) => warn!("failed to serialize monitor defaults: {e:#}"),
         }
     }
 
@@ -782,6 +808,7 @@ impl StreamArchiverApp {
         }
         // Apply the (possibly changed) date format to the live UI.
         set_active_date_fmt(self.settings.date_fmt);
+        self.persist_monitor_defaults();
         self.status = "Settings saved.".into();
     }
 }
@@ -1032,7 +1059,28 @@ fn fmt_time_range(start: i64, end: Option<i64>) -> String {
 
 /// 16-color palette for calendar event blocks. Indexed by `channel_id % 16` so each
 /// channel gets a consistent, distinct color across all schedule views.
-fn channel_event_color(channel_id: i64) -> egui::Color32 {
+/// Parse a CSS-style hex color string (`"#rrggbb"` or `"rrggbb"`) into an egui
+/// color. Returns `None` for any other input so callers can fall back gracefully.
+fn parse_hex_color(s: &str) -> Option<egui::Color32> {
+    let s = s.trim().trim_start_matches('#');
+    if s.len() == 6 {
+        let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+        let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+        let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+        Some(egui::Color32::from_rgb(r, g, b))
+    } else {
+        None
+    }
+}
+
+/// Return the display color for a channel: the custom hex `color` if set and
+/// valid, otherwise a deterministic palette color keyed on `channel_id`.
+fn channel_event_color(channel_id: i64, color: &str) -> egui::Color32 {
+    if !color.is_empty() {
+        if let Some(c) = parse_hex_color(color) {
+            return c;
+        }
+    }
     const PALETTE: &[egui::Color32] = &[
         egui::Color32::from_rgb(0x42, 0x88, 0xc4), // steel blue
         egui::Color32::from_rgb(0x9c, 0x27, 0xb0), // purple
@@ -1200,7 +1248,7 @@ fn schedule_detail_row(
     colliding: bool,
     ptex: &PlatformTextures,
 ) {
-    let color = channel_event_color(s.channel_id);
+    let color = channel_event_color(s.channel_id, &s.channel_color);
     let resp = ui
         .horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 5.0;
@@ -1431,7 +1479,7 @@ fn schedule_time_grid(
                     );
                     event_rects.push((block_rect, stream_idx, day));
 
-                    let color = channel_event_color(s.channel_id);
+                    let color = channel_event_color(s.channel_id, &s.channel_color);
                     let hovered = hover_pos.is_some_and(|p| block_rect.contains(p));
                     let fill = if hovered {
                         color // brighter on hover — stroke already provides accent
@@ -2847,7 +2895,8 @@ impl eframe::App for StreamArchiverApp {
                                 .clicked()
                             {
                                 self.form = Some(MonitorForm::new_channel(
-                                    self.settings.default_output_dir.clone(),
+                                    &self.monitor_defaults,
+                                    &self.settings.default_output_dir,
                                 ));
                             }
                             if ui
@@ -2858,6 +2907,7 @@ impl eframe::App for StreamArchiverApp {
                                 self.channel_form = Some(ChannelForm {
                                     id: None,
                                     name: String::new(),
+                                    color: String::new(),
                                 });
                             }
                         }
@@ -2926,7 +2976,8 @@ impl StreamArchiverApp {
         if ctx.input_mut(|i| i.consume_shortcut(&ADD)) {
             self.view = View::Streams;
             self.form = Some(MonitorForm::new_channel(
-                self.settings.default_output_dir.clone(),
+                &self.monitor_defaults,
+                &self.settings.default_output_dir,
             ));
         }
         if ctx.input_mut(|i| i.consume_shortcut(&SETTINGS)) {
@@ -3083,10 +3134,45 @@ impl StreamArchiverApp {
             .open(&mut open)
             .show(ctx, |ui| {
                 let f = self.channel_form.as_mut().unwrap();
-                ui.horizontal(|ui| {
-                    ui.label("Name");
-                    ui.text_edit_singleline(&mut f.name);
-                });
+                egui::Grid::new("channel_form_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Name");
+                        ui.text_edit_singleline(&mut f.name);
+                        ui.end_row();
+
+                        ui.label("Color");
+                        ui.horizontal(|ui| {
+                            // Colored swatch preview
+                            let swatch_color = if f.color.is_empty() {
+                                egui::Color32::from_gray(0x60)
+                            } else {
+                                parse_hex_color(&f.color)
+                                    .unwrap_or(egui::Color32::from_gray(0x60))
+                            };
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(20.0, 20.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().rect_filled(rect, 4.0, swatch_color);
+                            ui.painter().rect_stroke(
+                                rect,
+                                4.0,
+                                egui::Stroke::new(1.0, egui::Color32::from_gray(0x80)),
+                                egui::StrokeKind::Inside,
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut f.color)
+                                    .hint_text("#rrggbb")
+                                    .desired_width(80.0),
+                            );
+                            if !f.color.is_empty() && ui.small_button("✕").clicked() {
+                                f.color.clear();
+                            }
+                        });
+                        ui.end_row();
+                    });
                 if !renaming {
                     ui.label(
                         egui::RichText::new(
@@ -3113,8 +3199,14 @@ impl StreamArchiverApp {
             if name.is_empty() {
                 self.status = "Name is required.".into();
             } else {
-                let res = match f.id {
-                    Some(id) => self.core.store.rename_channel(id, &name),
+                let id_opt = f.id;
+                let color = f.color.trim().to_string();
+                let res = match id_opt {
+                    Some(id) => self
+                        .core
+                        .store
+                        .rename_channel(id, &name)
+                        .and_then(|()| self.core.store.set_channel_color(id, &color)),
                     None => self.core.store.create_container(&name).map(|_| ()),
                 };
                 match res {
@@ -4467,7 +4559,7 @@ impl StreamArchiverApp {
         ptex: &PlatformTextures,
     ) -> egui::Response {
         let s = &self.schedule_all[i];
-        let color = channel_event_color(s.channel_id);
+        let color = channel_event_color(s.channel_id, &s.channel_color);
         let resp = ui
             .horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 3.0;
@@ -4785,7 +4877,7 @@ impl StreamArchiverApp {
 
                     for &i in indices {
                         let s = &self.schedule_all[i];
-                        let color = channel_event_color(s.channel_id);
+                        let color = channel_event_color(s.channel_id, &s.channel_color);
                         let colliding = collide.contains(&i);
 
                         let row_resp = ui.horizontal(|ui| {
@@ -5280,7 +5372,9 @@ impl StreamArchiverApp {
                                     tr.col(|ui| {
                                         disc = tree_name(
                                             ui, 0, ninst > 0, expanded,
-                                            egui::RichText::new(&ch.name).strong(),
+                                            egui::RichText::new(&ch.name)
+                                                .strong()
+                                                .color(channel_event_color(cid, &ch.color)),
                                         );
                                     });
                                     tr.col(|ui| {
@@ -5837,7 +5931,8 @@ impl StreamArchiverApp {
             if let Some(c) = self.channels.iter().find(|c| c.id == cid) {
                 self.form = Some(MonitorForm::add_instance(
                     c,
-                    self.settings.default_output_dir.clone(),
+                    &self.monitor_defaults,
+                    &self.settings.default_output_dir,
                 ));
             }
         }
@@ -5864,6 +5959,7 @@ impl StreamArchiverApp {
                 self.channel_form = Some(ChannelForm {
                     id: Some(cid),
                     name: c.name.clone(),
+                    color: c.color.clone(),
                 });
             }
         }
@@ -6321,6 +6417,177 @@ impl StreamArchiverApp {
                 });
 
             ui.add_space(12.0);
+            ui.heading("Stream monitor defaults");
+            ui.label(
+                "Applied when creating a new monitor. Platform settings override the global; \
+                 leave a field unset / empty to inherit from the global (or the built-in fallback).",
+            );
+            ui.add_space(4.0);
+
+            // Work on a local clone to avoid borrow-checker issues (cross-field access
+            // for hint text vs mutable edit access for the combo/text widgets).
+            let mut md = self.monitor_defaults.clone();
+
+            for (label, platform_opt) in [
+                ("🌐  Global", None),
+                ("  Twitch",   Some(Platform::Twitch)),
+                ("  YouTube",  Some(Platform::YouTube)),
+                ("  Kick",     Some(Platform::Kick)),
+                ("  Generic",  Some(Platform::Generic)),
+            ] {
+                let default_open = platform_opt.is_none();
+                egui::CollapsingHeader::new(label)
+                    .default_open(default_open)
+                    .show(ui, |ui| {
+                        let inherit = if platform_opt.is_some() { "Inherit" } else { "Not set" };
+
+                        let methods: &[DetectionMethod] = match platform_opt {
+                            None => &[
+                                DetectionMethod::TwitchApi,
+                                DetectionMethod::EventSubHelix,
+                                DetectionMethod::YouTubeApi,
+                                DetectionMethod::WebSub,
+                                DetectionMethod::Scrape,
+                                DetectionMethod::KickApi,
+                                DetectionMethod::GenericProbe,
+                            ],
+                            Some(p) => p.detection_methods(),
+                        };
+
+                        // Pre-compute hints from global for per-platform sections.
+                        let q_hint: String = match platform_opt {
+                            None => "best".to_string(),
+                            Some(_) => md.global.quality.clone()
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or_else(|| "best".to_string()),
+                        };
+                        let pi_hint: String = match platform_opt {
+                            None => "60".to_string(),
+                            Some(_) => md.global.poll_interval_secs
+                                .unwrap_or(60)
+                                .to_string(),
+                        };
+                        let ft_hint: String = match platform_opt {
+                            None => "{name}_{date}_{time}".to_string(),
+                            Some(_) => md.global.filename_template.clone()
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or_else(|| "{name}_{date}_{time}".to_string()),
+                        };
+                        let od_hint: String = match platform_opt {
+                            None => self.settings.default_output_dir.clone(),
+                            Some(_) => md.global.output_dir.clone()
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or_else(|| self.settings.default_output_dir.clone()),
+                        };
+
+                        let d = match platform_opt {
+                            None => &mut md.global,
+                            Some(p) => md.get_mut(p),
+                        };
+
+                        egui::Grid::new(format!("mdef_{label}"))
+                            .num_columns(4)
+                            .spacing([8.0, 6.0])
+                            .show(ui, |ui| {
+                                // Row 1: Tool, Detection
+                                ui.label("Tool");
+                                egui::ComboBox::from_id_salt(format!("mdef_tool_{label}"))
+                                    .selected_text(match d.tool {
+                                        None => inherit,
+                                        Some(t) => t.label(),
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut d.tool, None, inherit);
+                                        for &t in &Tool::ALL {
+                                            ui.selectable_value(&mut d.tool, Some(t), t.label());
+                                        }
+                                    });
+                                ui.label("Detection");
+                                egui::ComboBox::from_id_salt(format!("mdef_det_{label}"))
+                                    .selected_text(match d.detection_method {
+                                        None => inherit,
+                                        Some(m) => m.label(),
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut d.detection_method, None, inherit);
+                                        for &m in methods {
+                                            ui.selectable_value(&mut d.detection_method, Some(m), m.label());
+                                        }
+                                    });
+                                ui.end_row();
+
+                                // Row 2: Container, Quality
+                                ui.label("Container");
+                                egui::ComboBox::from_id_salt(format!("mdef_cont_{label}"))
+                                    .selected_text(match d.container {
+                                        None => inherit,
+                                        Some(c) => c.label(),
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut d.container, None, inherit);
+                                        for &c in &Container::ALL {
+                                            ui.selectable_value(&mut d.container, Some(c), c.label());
+                                        }
+                                    });
+                                ui.label("Quality");
+                                let q_ref = d.quality.get_or_insert_with(String::new);
+                                ui.add(
+                                    egui::TextEdit::singleline(q_ref)
+                                        .hint_text(q_hint)
+                                        .desired_width(100.0),
+                                );
+                                ui.end_row();
+
+                                // Row 3: Poll interval
+                                ui.label("Poll interval (s)");
+                                let mut pi_str = d.poll_interval_secs
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_default();
+                                if ui.add(
+                                    egui::TextEdit::singleline(&mut pi_str)
+                                        .hint_text(pi_hint)
+                                        .desired_width(80.0),
+                                ).changed() {
+                                    d.poll_interval_secs = pi_str.trim().parse::<i64>().ok()
+                                        .filter(|&v| v > 0);
+                                }
+                                ui.label("");
+                                ui.label("");
+                                ui.end_row();
+
+                                // Row 4: Filename template
+                                ui.label("Filename");
+                                let ft_ref = d.filename_template.get_or_insert_with(String::new);
+                                ui.add(
+                                    egui::TextEdit::singleline(ft_ref)
+                                        .hint_text(ft_hint)
+                                        .desired_width(200.0),
+                                ).on_hover_text(
+                                    "Tokens: {name} {date} {time} {ts} {title} {category} {id}",
+                                );
+                                ui.label("");
+                                ui.label("");
+                                ui.end_row();
+
+                                // Row 5: Output directory
+                                ui.label("Output dir");
+                                let od_ref = d.output_dir.get_or_insert_with(String::new);
+                                ui.add(
+                                    egui::TextEdit::singleline(od_ref)
+                                        .hint_text(od_hint)
+                                        .desired_width(200.0),
+                                );
+                                ui.label("");
+                                ui.label("");
+                                ui.end_row();
+                            });
+                    });
+            }
+
+            // Write back the (possibly edited) clone.
+            self.monitor_defaults = md;
+
+            ui.add_space(12.0);
             ui.heading("Startup");
             let mut on = self.autostart_on;
             if ui
@@ -6373,11 +6640,17 @@ impl StreamArchiverApp {
                 let form = self.form.as_mut().unwrap();
                 let platform = Platform::detect(&form.url);
                 // When the URL's platform changes, re-apply that platform's
-                // tool/detection defaults (e.g. pasting a YouTube URL picks
-                // yt-dlp + a YouTube method). User overrides afterwards stick.
+                // defaults (tool, detection, container, quality, poll interval,
+                // filename template, output dir). User overrides afterwards stick.
                 if form.last_platform != Some(platform) {
-                    form.tool = platform.default_tool();
-                    form.detection_method = platform.default_detection();
+                    let md = &self.monitor_defaults;
+                    form.tool = md.resolve_tool(platform);
+                    form.detection_method = md.resolve_detection(platform);
+                    form.container = md.resolve_container(platform);
+                    form.quality = md.resolve_quality(platform);
+                    form.poll_interval_secs = md.resolve_poll_interval(platform);
+                    form.filename_template = md.resolve_filename_template(platform);
+                    form.output_dir = md.resolve_output_dir(platform, &self.settings.default_output_dir);
                     form.last_platform = Some(platform);
                 }
                 // The name belongs to the channel container; it's editable only

@@ -17,7 +17,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 19;
+const SCHEMA_VERSION: i64 = 20;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -334,7 +334,15 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 19)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 19);
+        if version < 20 {
+            // Optional custom hex color for a channel container (e.g. "#ff9800").
+            // Empty string = use the auto-assigned palette color.
+            conn.execute_batch(
+                "ALTER TABLE channel ADD COLUMN color TEXT NOT NULL DEFAULT '';",
+            )?;
+            conn.pragma_update(None, "user_version", 20)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 20);
         Ok(())
     }
 
@@ -368,7 +376,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let ch = conn
             .query_row(
-                "SELECT id, name, url, platform, created_at FROM channel WHERE url = ?1",
+                "SELECT id, name, url, platform, created_at, color FROM channel WHERE url = ?1",
                 params![url],
                 Self::map_channel,
             )
@@ -404,7 +412,7 @@ impl Store {
     pub fn list_channels(&self) -> Result<Vec<Channel>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, url, platform, created_at FROM channel
+            "SELECT id, name, url, platform, created_at, color FROM channel
              ORDER BY name COLLATE NOCASE, id",
         )?;
         let rows = stmt
@@ -425,6 +433,17 @@ impl Store {
         conn.execute(
             "UPDATE channel SET name = ?2 WHERE id = ?1",
             params![id, name],
+        )?;
+        Ok(())
+    }
+
+    /// Set (or clear) the custom hex color for a channel container.
+    /// Pass an empty string to revert to the automatic palette color.
+    pub fn set_channel_color(&self, id: i64, color: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE channel SET color = ?2 WHERE id = ?1",
+            params![id, color],
         )?;
         Ok(())
     }
@@ -866,7 +885,8 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT s.monitor_id, m.channel_id, c.name, m.url,
-                    s.start_time, s.end_time, s.title, s.category, s.source
+                    s.start_time, s.end_time, s.title, s.category, s.source,
+                    c.color
              FROM schedule_segment s
              JOIN monitor m ON m.id = s.monitor_id
              JOIN channel c ON c.id = m.channel_id
@@ -885,6 +905,7 @@ impl Store {
                     title: r.get(6)?,
                     category: r.get(7)?,
                     source: r.get(8)?,
+                    channel_color: r.get(9)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -926,7 +947,8 @@ impl Store {
                           ORDER BY smc.at_secs DESC, smc.id DESC LIMIT 1), ''),
                 COALESCE((SELECT new_value FROM stream_meta_change smc
                           WHERE smc.recording_id = r.id AND smc.kind = 'category'
-                          ORDER BY smc.at_secs DESC, smc.id DESC LIMIT 1), '')
+                          ORDER BY smc.at_secs DESC, smc.id DESC LIMIT 1), ''),
+                c.color
              FROM monitor m
              JOIN channel c ON c.id = m.channel_id
              LEFT JOIN recording r
@@ -941,6 +963,7 @@ impl Store {
                     url: r.get(2)?,
                     platform: Platform::parse(&r.get::<_, String>(3)?),
                     created_at: r.get(4)?,
+                    color: r.get(41)?,
                 };
                 let monitor = Monitor {
                     id: r.get(5)?,
@@ -1256,6 +1279,7 @@ impl Store {
             url: r.get(2)?,
             platform: Platform::parse(&r.get::<_, String>(3)?),
             created_at: r.get(4)?,
+            color: r.get(5)?,
         })
     }
 }
