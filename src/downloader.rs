@@ -2596,6 +2596,7 @@ mod tests {
                 url: url.into(),
                 platform,
                 created_at: 0,
+                color: String::new(),
             },
             monitor: Monitor {
                 id: 7,

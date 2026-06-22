@@ -54,6 +54,9 @@ pub struct AppCore {
     /// Notified to make the schedule refresher do an immediate forced pass (the
     /// UI "reload" action), instead of waiting out its periodic tick.
     schedule_refresh: Arc<tokio::sync::Notify>,
+    /// Set to `true` by `request_yt_video_id_refetch()` so the next schedule pass
+    /// re-scrapes only the YouTube monitors whose stored segments are missing video IDs.
+    yt_video_id_refetch: Arc<AtomicBool>,
 }
 
 impl AppCore {
@@ -77,6 +80,7 @@ impl AppCore {
             shutdown: Arc::new(AtomicBool::new(false)),
             manual_tx: Mutex::new(None),
             schedule_refresh: Arc::new(tokio::sync::Notify::new()),
+            yt_video_id_refetch: Arc::new(AtomicBool::new(false)),
         }))
     }
 
@@ -145,9 +149,12 @@ impl AppCore {
         let sch_events = self.events.clone();
         let sch_shutdown = self.shutdown.clone();
         let sch_refresh = self.schedule_refresh.clone();
+        let sch_vid_refetch = self.yt_video_id_refetch.clone();
         self.rt.spawn(async move {
-            crate::detectors::refresh_schedules(sch_ctx, sch_events, sch_shutdown, sch_refresh)
-                .await;
+            crate::detectors::refresh_schedules(
+                sch_ctx, sch_events, sch_shutdown, sch_refresh, sch_vid_refetch,
+            )
+            .await;
         });
 
         // Supervisor: live signals + manual commands -> recordings.
@@ -194,6 +201,14 @@ impl AppCore {
     /// "reload" action), rather than waiting for its periodic tick. The refresher
     /// emits a state event when done, which makes the UI reload from the store.
     pub fn request_schedule_refresh(&self) {
+        self.schedule_refresh.notify_one();
+    }
+
+    /// Trigger a targeted re-scrape of YouTube monitors whose stored schedule
+    /// segments are missing video IDs (so they can be refined by `videos.list`).
+    /// Only those monitors are re-fetched; others keep their cached schedules.
+    pub fn request_yt_video_id_refetch(&self) {
+        self.yt_video_id_refetch.store(true, Ordering::SeqCst);
         self.schedule_refresh.notify_one();
     }
 

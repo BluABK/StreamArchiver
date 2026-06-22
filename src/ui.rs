@@ -6146,12 +6146,27 @@ impl StreamArchiverApp {
                 );
                 ui.checkbox(
                     &mut self.settings.youtube_api_schedule,
-                    "Upcoming schedule (instead of scraping /streams)",
+                    "Upcoming schedule — exact times via videos.list",
                 )
                 .on_hover_text(
-                    "Use the Data API for the Next stream schedule. ~100 quota units per channel \
-                     per refresh (refreshed a few hours apart).",
+                    "Scraping /streams parses human-readable text so times are approximate. \
+                     With this enabled, scheduled stream video IDs are collected during scraping \
+                     and batched into a single videos.list call (~1 quota unit for ALL channels \
+                     combined) to get exact scheduled start times from the API.",
                 );
+                if self.settings.youtube_api_schedule {
+                    if ui
+                        .button("Re-fetch missing video IDs")
+                        .on_hover_text(
+                            "Re-scrape YouTube channels whose schedule entries are missing video \
+                             IDs (needed for exact times). Only fetches channels with gaps — \
+                             others keep their cached schedules.",
+                        )
+                        .clicked()
+                    {
+                        self.core.request_yt_video_id_refetch();
+                    }
+                }
             });
 
             ui.add_space(12.0);

@@ -321,6 +321,7 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
             url: url.clone(),
             platform: Platform::detect(&url),
             created_at: 0,
+            color: String::new(),
         },
         monitor: models::Monitor {
             id: 0,

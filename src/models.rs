@@ -655,6 +655,10 @@ pub struct ScheduleSegment {
     /// A specific occurrence the broadcaster canceled (Twitch). Excluded from the
     /// Next stream column + popup.
     pub canceled: bool,
+    /// Platform video ID (YouTube: `dQw4w9WgXcQ`). Populated by the lockupViewModel
+    /// scraper so we can batch `videos.list` calls for exact scheduled times.
+    /// `None` for Twitch, Discord, and old YouTube rows.
+    pub video_id: Option<String>,
 }
 
 /// One upcoming scheduled stream joined with its channel + monitor, for the

@@ -614,6 +614,7 @@ impl DetectContext {
                                 title: seg.title,
                                 category: seg.category.map(|c| c.name).unwrap_or_default(),
                                 canceled: seg.canceled_until.is_some(),
+                                video_id: None,
                             })
                         })
                         .collect();
@@ -818,6 +819,7 @@ impl DetectContext {
                             title: ev.title.clone(),
                             category: String::new(),
                             canceled: ev.canceled,
+                            video_id: None,
                         });
                     }
                 }
@@ -925,83 +927,55 @@ impl DetectContext {
     /// the upcoming video ids, then `videos.list` for each one's scheduled start +
     /// title (~1 unit). `Some(vec)` on success (possibly empty); `None` on error /
     /// missing key (so the refresher won't wipe stored data on a transient fail).
-    pub async fn youtube_schedule_api(&self, url: &str) -> Option<Vec<ScheduleSegment>> {
+    /// Batch `videos.list` call to get exact `scheduledStartTime` for up to 50
+    /// YouTube video IDs at a time. Returns a map of `video_id → Unix timestamp`
+    /// for items that have `liveStreamingDetails.scheduledStartTime` set.
+    ///
+    /// Cost: **~1 quota unit per call** (all IDs batched; chunks of 50 if needed).
+    /// The video IDs come from scraping — no `search.list` (100 units/call) needed.
+    pub async fn youtube_videos_list(
+        &self,
+        video_ids: &[&str],
+    ) -> Option<HashMap<String, i64>> {
         let key = self
             .store
             .get_setting("youtube_api_key")
             .ok()
             .flatten()
             .unwrap_or_default();
-        if key.is_empty() {
+        if key.is_empty() || video_ids.is_empty() {
             return None;
         }
-        let channel_id = self.youtube_channel_id(url, &key).await.ok()?;
-        let resp = self
-            .http
-            .get("https://www.googleapis.com/youtube/v3/search")
-            .query(&[
-                ("part", "id"),
-                ("channelId", channel_id.as_str()),
-                ("eventType", "upcoming"),
-                ("type", "video"),
-                ("maxResults", "25"),
-                ("key", key.as_str()),
-            ])
-            .send()
-            .await
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
+        let mut result: HashMap<String, i64> = HashMap::new();
+        for chunk in video_ids.chunks(50) {
+            let ids_str = chunk.join(",");
+            let resp = self
+                .http
+                .get("https://www.googleapis.com/youtube/v3/videos")
+                .query(&[
+                    ("part", "liveStreamingDetails"),
+                    ("id", ids_str.as_str()),
+                    ("key", key.as_str()),
+                ])
+                .send()
+                .await
+                .ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            let v: Value = resp.json().await.ok()?;
+            for item in v["items"].as_array().into_iter().flatten() {
+                if let (Some(id), Some(ts)) = (
+                    item["id"].as_str(),
+                    item["liveStreamingDetails"]["scheduledStartTime"]
+                        .as_str()
+                        .and_then(parse_rfc3339),
+                ) {
+                    result.insert(id.to_string(), ts);
+                }
+            }
         }
-        let v: Value = resp.json().await.ok()?;
-        let ids: Vec<String> = v["items"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|it| it["id"]["videoId"].as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if ids.is_empty() {
-            return Some(Vec::new());
-        }
-        let ids_joined = ids.join(",");
-        let resp = self
-            .http
-            .get("https://www.googleapis.com/youtube/v3/videos")
-            .query(&[
-                ("part", "snippet,liveStreamingDetails"),
-                ("id", ids_joined.as_str()),
-                ("key", key.as_str()),
-            ])
-            .send()
-            .await
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        let v: Value = resp.json().await.ok()?;
-        let mut segs: Vec<ScheduleSegment> = v["items"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|it| {
-                let start = it["liveStreamingDetails"]["scheduledStartTime"]
-                    .as_str()
-                    .and_then(parse_rfc3339)?;
-                Some(ScheduleSegment {
-                    id: 0,
-                    monitor_id: 0,
-                    start_time: start,
-                    end_time: None,
-                    title: it["snippet"]["title"].as_str().unwrap_or_default().to_string(),
-                    category: String::new(),
-                    canceled: false,
-                })
-            })
-            .collect();
-        segs.sort_by_key(|s| s.start_time);
-        Some(segs)
+        Some(result)
     }
 
     // ----- Kick official API (client-credentials app token) -----
@@ -1383,6 +1357,7 @@ pub async fn refresh_schedules(
     events: EventTx,
     shutdown: Arc<AtomicBool>,
     refresh_now: Arc<tokio::sync::Notify>,
+    yt_video_id_refetch: Arc<AtomicBool>,
 ) {
     const INITIAL_DELAY_SECS: u64 = 30;
     const TICK_SECS: u64 = 60;
@@ -1401,6 +1376,7 @@ pub async fn refresh_schedules(
             &shutdown,
             &mut last_fetched,
             &mut discord_last,
+            &yt_video_id_refetch,
             REFRESH_SECS,
         )
         .await;
@@ -1413,7 +1389,8 @@ pub async fn refresh_schedules(
                     return;
                 }
                 refresh_schedules_once(
-                    &ctx, &events, &shutdown, &mut last_fetched, &mut discord_last, 0,
+                    &ctx, &events, &shutdown, &mut last_fetched, &mut discord_last,
+                    &yt_video_id_refetch, 0,
                 )
                 .await;
             }
@@ -1425,29 +1402,53 @@ pub async fn refresh_schedules(
 /// Twitch/YouTube monitor due for a refresh. A failed fetch (`None`) is left
 /// alone (so a transient error doesn't wipe a previously-stored schedule), and
 /// retried next tick.
+///
+/// YouTube is always scraped first (free); if `K_YT_API_SCHEDULE` is enabled
+/// and an API key is set, all YouTube segments across **all** channels are batched
+/// into one `videos.list` call (~1 quota unit) to get exact `scheduledStartTime`
+/// values that supersede the approximate local-time parse from the scrape.
 async fn refresh_schedules_once(
     ctx: &Arc<DetectContext>,
     events: &EventTx,
     shutdown: &Arc<AtomicBool>,
     last_fetched: &mut HashMap<i64, Instant>,
     discord_last: &mut Option<Instant>,
+    yt_video_id_refetch: &Arc<AtomicBool>,
     refresh_secs: u64,
 ) {
     let rows = match ctx.store.list_monitors_with_channels() {
         Ok(r) => r,
         Err(_) => return,
     };
-    // Drop staleness entries for monitors that no longer exist (avoid an unbounded
-    // leak across the process lifetime as monitors are added/removed).
+    // Drop staleness entries for monitors that no longer exist.
     let live: std::collections::HashSet<i64> = rows.iter().map(|r| r.monitor.id).collect();
     last_fetched.retain(|id, _| live.contains(id));
     let now = Instant::now();
-    // Whether YouTube schedules use the Data API (Settings) — read once per pass.
-    let yt_api_schedule = ctx.youtube_api_enabled(K_YT_API_SCHEDULE);
-    // Per-URL fetch cache for this pass: the same channel under multiple instances
-    // is fetched once. `None` = the fetch failed (don't overwrite stored data).
+
+    // If the UI requested a targeted re-scrape for YouTube monitors whose stored
+    // schedule segments are missing video IDs, clear those monitors from
+    // `last_fetched` so they are refreshed this pass.
+    if yt_video_id_refetch.swap(false, Ordering::SeqCst) {
+        let missing_ids: std::collections::HashSet<i64> = ctx
+            .store
+            .youtube_monitors_missing_video_ids()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        last_fetched.retain(|id, _| !missing_ids.contains(id));
+    }
+
+    // Whether to refine YouTube timestamps with a batched videos.list call.
+    let yt_api_enabled = ctx.youtube_api_enabled(K_YT_API_SCHEDULE);
+    // Per-URL fetch cache: the same channel URL shared across multiple monitors
+    // is fetched once. `None` = fetch failed (don't overwrite stored schedule).
     let mut fetched: HashMap<String, Option<Vec<ScheduleSegment>>> = HashMap::new();
+    // YouTube results are deferred so we can batch all video IDs in one API call
+    // before storing. Twitch is stored immediately (no API refinement step).
+    let mut yt_pending: Vec<(i64, Vec<ScheduleSegment>)> = Vec::new();
     let mut changed = false;
+
     for row in &rows {
         if shutdown.load(Ordering::SeqCst) {
             return;
@@ -1466,14 +1467,11 @@ async fn refresh_schedules_once(
             }
         }
         let url = row.monitor.url.clone();
-        let segs = match fetched.get(&url) {
+        let segs_opt = match fetched.get(&url) {
             Some(s) => s.clone(),
             None => {
                 let s = match platform {
                     Platform::Twitch => ctx.twitch_schedule(&url).await,
-                    Platform::YouTube if yt_api_schedule => {
-                        ctx.youtube_schedule_api(&url).await
-                    }
                     Platform::YouTube => ctx.youtube_schedule(&url).await,
                     _ => None,
                 };
@@ -1481,11 +1479,51 @@ async fn refresh_schedules_once(
                 s
             }
         };
-        if let Some(segs) = segs {
-            if ctx.store.replace_schedule(row.monitor.id, &segs).is_ok() {
-                changed = true;
-            }
+        if let Some(segs) = segs_opt {
             last_fetched.insert(row.monitor.id, now);
+            match platform {
+                Platform::Twitch => {
+                    if ctx.store.replace_schedule(row.monitor.id, &segs).is_ok() {
+                        changed = true;
+                    }
+                }
+                Platform::YouTube => {
+                    yt_pending.push((row.monitor.id, segs));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Batch videos.list for all pending YouTube segments (one call, ~1 quota unit).
+    // API timestamps supersede the approximate local-time parse from the scrape.
+    if yt_api_enabled && !yt_pending.is_empty() {
+        let all_ids: Vec<&str> = yt_pending
+            .iter()
+            .flat_map(|(_, segs)| segs.iter())
+            .filter_map(|s| s.video_id.as_deref())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        if !all_ids.is_empty() {
+            if let Some(api_times) = ctx.youtube_videos_list(&all_ids).await {
+                for (_, segs) in &mut yt_pending {
+                    for seg in segs.iter_mut() {
+                        if let Some(vid) = seg.video_id.as_deref() {
+                            if let Some(&t) = api_times.get(vid) {
+                                seg.start_time = t;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Store YouTube results (after optional API refinement).
+    for (monitor_id, segs) in &yt_pending {
+        if ctx.store.replace_schedule(*monitor_id, segs).is_ok() {
+            changed = true;
         }
     }
 
@@ -1691,11 +1729,14 @@ fn parse_youtube_schedule(body: &str) -> Vec<ScheduleSegment> {
     out
 }
 
-/// Recursively collect objects carrying `upcomingEventData.startTime` (a
-/// `videoRenderer` for an upcoming stream) into `out`.
+/// Recursively collect upcoming-stream entries from `ytInitialData`:
+/// - Old format: `videoRenderer.upcomingEventData.startTime` (Unix seconds string).
+/// - New Polymer format: `lockupViewModel` with `contentImage` (thumbnail → video ID)
+///   and `metadata.lockupMetadataViewModel` containing "Scheduled for M/D/YY, H:MM AM/PM".
 fn collect_upcoming(v: &Value, out: &mut Vec<ScheduleSegment>) {
     match v {
         Value::Object(map) => {
+            // Old format: videoRenderer → upcomingEventData.startTime (Unix seconds).
             if let Some(start) = map
                 .get("upcomingEventData")
                 .and_then(|u| u.get("startTime"))
@@ -1712,6 +1753,23 @@ fn collect_upcoming(v: &Value, out: &mut Vec<ScheduleSegment>) {
                         title,
                         category: String::new(),
                         canceled: false,
+                        video_id: None,
+                    });
+                }
+            }
+            // New Polymer format: `lockupViewModel` carries `contentImage` (thumbnail
+            // URL encodes the video ID) and `metadata.lockupMetadataViewModel`.
+            if map.contains_key("contentImage") {
+                if let Some((start, title, vid)) = extract_lockup_viewmodel(map) {
+                    out.push(ScheduleSegment {
+                        id: 0,
+                        monitor_id: 0,
+                        start_time: start,
+                        end_time: None,
+                        title,
+                        category: String::new(),
+                        canceled: false,
+                        video_id: Some(vid),
                     });
                 }
             }
@@ -1726,6 +1784,138 @@ fn collect_upcoming(v: &Value, out: &mut Vec<ScheduleSegment>) {
         }
         _ => {}
     }
+}
+
+/// Extract `(start_unix, title, video_id)` from a `lockupViewModel` object.
+/// The video ID is parsed from the thumbnail URL in `contentImage`.
+fn extract_lockup_viewmodel(
+    map: &serde_json::Map<String, Value>,
+) -> Option<(i64, String, String)> {
+    let video_id = extract_yt_video_id_from_thumbnail(map)?;
+    let lmvm = map
+        .get("metadata")
+        .and_then(|m| m.as_object())
+        .and_then(|m| m.get("lockupMetadataViewModel"))
+        .and_then(|v| v.as_object())?;
+    let (start, title) = extract_lockup_schedule(lmvm)?;
+    Some((start, title, video_id))
+}
+
+/// Extract the YouTube video ID from the thumbnail URL inside a `lockupViewModel`
+/// `contentImage.thumbnailViewModel.image.sources[0].url`.
+/// URL shape: `https://i.ytimg.com/vi/<VIDEO_ID>/hqdefault.jpg?...`
+fn extract_yt_video_id_from_thumbnail(map: &serde_json::Map<String, Value>) -> Option<String> {
+    let url = map
+        .get("contentImage")
+        .and_then(|ci| ci.get("thumbnailViewModel"))
+        .and_then(|tv| tv.get("image"))
+        .and_then(|img| img.get("sources"))
+        .and_then(|s| s.as_array())
+        .and_then(|a| a.first())
+        .and_then(|s| s.get("url"))
+        .and_then(|u| u.as_str())?;
+    let after_vi = url.split("/vi/").nth(1)?;
+    let video_id = after_vi.split('/').next().filter(|s| !s.is_empty())?;
+    Some(video_id.to_string())
+}
+
+/// Extract `(start_unix, title)` from a `lockupMetadataViewModel` object.
+/// Returns `None` if no "Scheduled for" row is present.
+fn extract_lockup_schedule(
+    lmvm: &serde_json::Map<String, Value>,
+) -> Option<(i64, String)> {
+    let title = lmvm
+        .get("title")
+        .and_then(|t| t.get("content"))
+        .and_then(|c| c.as_str())
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let rows = lmvm
+        .get("metadata")
+        .and_then(|m| m.get("contentMetadataViewModel"))
+        .and_then(|c| c.get("metadataRows"))
+        .and_then(|r| r.as_array())?;
+    for row in rows {
+        if let Some(parts) = row.get("metadataParts").and_then(|p| p.as_array()) {
+            for part in parts {
+                if let Some(content) = part
+                    .get("text")
+                    .and_then(|t| t.get("content"))
+                    .and_then(|c| c.as_str())
+                {
+                    if let Some(start) = parse_yt_scheduled_text(content) {
+                        return Some((start, title));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Parse `"Scheduled for ..."` date text to a Unix timestamp.
+///
+/// YouTube geo-targets its server-rendered times to the viewer's IP timezone,
+/// so we interpret the parsed date/time as local time. Two date formats occur:
+///
+/// - **US** (2-digit year): `"Scheduled for M/D/YY, H:MM AM/PM"` — seen from
+///   US IP addresses with `Accept-Language: en-US`.
+/// - **European** (4-digit year): `"Scheduled for D/M/YYYY, H:MM [AM/PM]"` —
+///   seen from European IP addresses even with `Accept-Language: en-US`.
+///
+/// We distinguish them by the year field length: 2 digits → US (M/D), 4 digits
+/// → European (D/M). Both 12-hour (AM/PM) and 24-hour time are handled.
+fn parse_yt_scheduled_text(s: &str) -> Option<i64> {
+    use chrono::{NaiveDate, NaiveTime, TimeZone};
+    let rest = s.strip_prefix("Scheduled for ")?;
+    let (date_str, time_str) = rest.split_once(", ")?;
+    // Parse date; year-field length tells us which ordering to use.
+    let mut dp = date_str.split('/');
+    let first: u32 = dp.next()?.parse().ok()?;
+    let second: u32 = dp.next()?.parse().ok()?;
+    let year_raw = dp.next()?.trim();
+    let (year, month, day) = if year_raw.len() == 4 {
+        // European: D/M/YYYY
+        let yr: i32 = year_raw.parse().ok()?;
+        (yr, second, first)
+    } else {
+        // US: M/D/YY
+        let yr: i32 = 2000 + year_raw.parse::<i32>().ok()?;
+        (yr, first, second)
+    };
+    // Parse time: "H:MM AM/PM" (12-hour) or "H:MM" / "HH:MM" (24-hour).
+    let time_str = time_str.trim();
+    let (hour, minute) = if let Some((hm, ampm)) = time_str.split_once(' ') {
+        let mut tp = hm.split(':');
+        let mut h: u32 = tp.next()?.parse().ok()?;
+        let m: u32 = tp.next()?.parse().ok()?;
+        match ampm {
+            "AM" => {
+                if h == 12 {
+                    h = 0;
+                }
+            }
+            "PM" => {
+                if h != 12 {
+                    h += 12;
+                }
+            }
+            _ => return None,
+        }
+        (h, m)
+    } else {
+        // 24-hour clock
+        let mut tp = time_str.split(':');
+        let h: u32 = tp.next()?.parse().ok()?;
+        let m: u32 = tp.next()?.parse().ok()?;
+        (h, m)
+    };
+    let naive = NaiveDate::from_ymd_opt(year, month, day)?
+        .and_time(NaiveTime::from_hms_opt(hour, minute, 0)?);
+    chrono::Local
+        .from_local_datetime(&naive)
+        .earliest()
+        .map(|dt| dt.timestamp())
 }
 
 /// Read a YouTube text node (`{simpleText}` or `{runs:[{text}]}`).
@@ -2011,5 +2201,56 @@ mod tests {
         assert_eq!(segs[1].title, "Q&A");
         // A page with no upcoming events -> empty.
         assert!(parse_youtube_schedule("<html>no data here</html>").is_empty());
+    }
+
+    #[test]
+    fn youtube_schedule_parses_lockup_viewmodel() {
+        // New Polymer format: lockupViewModel with contentImage (thumbnail URL encodes video ID)
+        // and lockupMetadataViewModel with "Scheduled for" row.
+        let body = r#"<script>var ytInitialData = {"richGridRenderer":{"contents":[{"richItemRenderer":{"content":{"lockupViewModel":{"contentImage":{"thumbnailViewModel":{"image":{"sources":[{"url":"https://i.ytimg.com/vi/ABC123XYZ_0/hqdefault.jpg","width":320,"height":180}]}}},"overlays":[],"metadata":{"lockupMetadataViewModel":{"title":{"content":"Stream Title"},"metadata":{"contentMetadataViewModel":{"metadataRows":[{"metadataParts":[{"text":{"content":"123 waiting"}},{"text":{"content":"Scheduled for 6/22/26, 12:00 PM"}}]}]}}}}}}}}]}};</script>"#;
+        let segs = parse_youtube_schedule(body);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].title, "Stream Title");
+        assert_eq!(segs[0].video_id, Some("ABC123XYZ_0".to_string()));
+        // The timestamp is parsed as local time so we can't assert an exact value,
+        // but it must be within the correct calendar day (UTC ±14h of noon on 2026-06-22).
+        let june22_noon_utc = 1_782_129_600i64; // 2026-06-22 12:00:00 UTC
+        assert!(
+            (segs[0].start_time - june22_noon_utc).abs() < 14 * 3600,
+            "timestamp {} is more than 14h from 2026-06-22 12:00 UTC",
+            segs[0].start_time
+        );
+        // Streams with no "Scheduled for" row are ignored.
+        let no_sched = r#"<script>var ytInitialData = {"lockupMetadataViewModel":{"title":{"content":"Past Stream"},"metadata":{"contentMetadataViewModel":{"metadataRows":[{"metadataParts":[{"text":{"content":"1.2K views"}}]}]}}}};</script>"#;
+        assert!(parse_youtube_schedule(no_sched).is_empty());
+    }
+
+    #[test]
+    fn parse_yt_scheduled_text_cases() {
+        // US format M/D/YY, 12-hour AM/PM (2-digit year).
+        assert!(parse_yt_scheduled_text("Scheduled for 6/22/26, 12:00 PM").is_some());
+        assert!(parse_yt_scheduled_text("Scheduled for 1/1/26, 12:00 AM").is_some());
+        assert!(parse_yt_scheduled_text("Scheduled for 12/31/25, 11:59 PM").is_some());
+        // European format D/M/YYYY (4-digit year), AM/PM or 24-hour.
+        assert!(parse_yt_scheduled_text("Scheduled for 23/06/2026, 3:00 AM").is_some());
+        assert!(parse_yt_scheduled_text("Scheduled for 1/1/2026, 12:00 AM").is_some());
+        assert!(parse_yt_scheduled_text("Scheduled for 23/06/2026, 03:00").is_some());
+        assert!(parse_yt_scheduled_text("Scheduled for 23/06/2026, 21:00").is_some());
+        // Unrecognised strings return None.
+        assert!(parse_yt_scheduled_text("1.2K views").is_none());
+        assert!(parse_yt_scheduled_text("349 waiting").is_none());
+        // Midnight: 12:00 AM should parse to hour 0, not 12.
+        let midnight = parse_yt_scheduled_text("Scheduled for 6/22/26, 12:00 AM").unwrap();
+        let noon = parse_yt_scheduled_text("Scheduled for 6/22/26, 12:00 PM").unwrap();
+        assert!(noon > midnight, "noon ({noon}) should be after midnight ({midnight})");
+        assert_eq!(noon - midnight, 12 * 3600, "noon and midnight should be 12h apart");
+        // US and European format should yield the same timestamp for the same moment.
+        let us = parse_yt_scheduled_text("Scheduled for 6/23/26, 3:00 AM").unwrap();
+        let eu = parse_yt_scheduled_text("Scheduled for 23/6/2026, 3:00 AM").unwrap();
+        assert_eq!(us, eu, "US and European formats should parse to the same timestamp");
+        // European 24-hour matches 12-hour for the same time.
+        let ampm = parse_yt_scheduled_text("Scheduled for 23/06/2026, 9:00 PM").unwrap();
+        let h24 = parse_yt_scheduled_text("Scheduled for 23/06/2026, 21:00").unwrap();
+        assert_eq!(ampm, h24, "12h and 24h formats should parse to the same timestamp");
     }
 }

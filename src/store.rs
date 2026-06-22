@@ -17,7 +17,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 20;
+const SCHEMA_VERSION: i64 = 21;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -342,7 +342,17 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 20)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 20);
+        if version < 21 {
+            // YouTube video ID for each scheduled segment (e.g. "dQw4w9WgXcQ").
+            // Populated by the lockupViewModel scraper; used to batch videos.list
+            // API calls for exact scheduledStartTime. NULL for Twitch/Discord rows
+            // and pre-21 YouTube rows.
+            conn.execute_batch(
+                "ALTER TABLE schedule_segment ADD COLUMN video_id TEXT;",
+            )?;
+            conn.pragma_update(None, "user_version", 21)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 21);
         Ok(())
     }
 
@@ -783,8 +793,8 @@ impl Store {
         )?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO schedule_segment(monitor_id, start_time, end_time, title, category, canceled, source)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO schedule_segment(monitor_id, start_time, end_time, title, category, canceled, source, video_id)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
             for s in segs {
                 stmt.execute(params![
@@ -795,6 +805,7 @@ impl Store {
                     s.category,
                     s.canceled as i64,
                     source,
+                    s.video_id.as_deref(),
                 ])?;
             }
         }
@@ -837,7 +848,7 @@ impl Store {
     pub fn schedule_for_monitor(&self, monitor_id: i64, after: i64) -> Result<Vec<ScheduleSegment>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, monitor_id, start_time, end_time, title, category, canceled
+            "SELECT id, monitor_id, start_time, end_time, title, category, canceled, video_id
              FROM schedule_segment
              WHERE monitor_id = ?1 AND canceled = 0 AND start_time >= ?2
              ORDER BY start_time",
@@ -852,8 +863,28 @@ impl Store {
                     title: r.get(4)?,
                     category: r.get(5)?,
                     canceled: r.get::<_, i64>(6)? != 0,
+                    video_id: r.get(7)?,
                 })
             })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// YouTube monitors that have at least one `platform` schedule segment with a
+    /// NULL `video_id`. Used by the "Re-fetch missing video IDs" button to target
+    /// only the channels that need a scrape pass, not every YouTube monitor.
+    pub fn youtube_monitors_missing_video_ids(&self) -> Result<Vec<(i64, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT m.id, m.url
+             FROM monitor m
+             JOIN schedule_segment ss ON ss.monitor_id = m.id
+             WHERE (m.url LIKE '%youtube.com%' OR m.url LIKE '%youtu.be%')
+               AND ss.source = 'platform'
+               AND ss.video_id IS NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -1621,6 +1652,7 @@ mod tests {
             title: title.into(),
             category: String::new(),
             canceled,
+            video_id: None,
         };
         // Out of order; a past one, a canceled one, and two future.
         store
@@ -1676,6 +1708,7 @@ mod tests {
             title: title.into(),
             category: String::new(),
             canceled,
+            video_id: None,
         };
         store
             .replace_schedule(
@@ -1721,6 +1754,7 @@ mod tests {
             title: title.into(),
             category: String::new(),
             canceled: false,
+            video_id: None,
         };
 
         // A platform segment and a Discord segment for the same monitor coexist.
