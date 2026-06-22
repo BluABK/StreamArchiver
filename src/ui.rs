@@ -1819,6 +1819,10 @@ struct ChatPopup {
     /// When `true`: show the entire log from the top (no cap, stick-to-bottom off).
     /// When `false` (default): show the last 500 msgs and stick to bottom.
     full_view: bool,
+    /// When the popup last triggered a background re-read of the chat file.
+    /// Used to tail a live recording: the file is re-parsed every few seconds
+    /// while `recording.ended_at` is `None`.
+    last_reload: std::time::Instant,
 }
 
 /// Merge a stream's takes into one chronological change list. Each take's offsets
@@ -6625,15 +6629,40 @@ impl StreamArchiverApp {
             load_state: state,
             search: String::new(),
             full_view: false,
+            last_reload: std::time::Instant::now(),
         });
     }
 
     fn chat_popup_window(&mut self, ctx: &egui::Context) {
+        const CHAT_RELOAD_SECS: u64 = 3;
         let Some(popup) = &mut self.chat_popup else {
             return;
         };
         let mut open = true;
         let title = format!("💬  Chat — {}", popup.monitor_name);
+
+        // Whether the selected recording is still in progress (chat file is growing).
+        let rec_active = popup.recording.as_ref().map_or(false, |r| r.ended_at.is_none());
+        // Collect everything needed for a tail-reload before the `show` closure
+        // borrows `popup` so we can act on it cleanly afterwards.
+        let reload_info: Option<(std::path::PathBuf, i64, Arc<Mutex<ChatLoadState>>)> =
+            if rec_active
+                && popup.last_reload.elapsed()
+                    >= std::time::Duration::from_secs(CHAT_RELOAD_SECS)
+            {
+                popup.recording.as_ref().and_then(|r| {
+                    chat_file_for_recording(r).map(|path| {
+                        (
+                            path,
+                            r.went_live_at.unwrap_or(r.started_at),
+                            popup.load_state.clone(),
+                        )
+                    })
+                })
+            } else {
+                None
+            };
+
         egui::Window::new(&title)
             .open(&mut open)
             .default_size([480.0, 600.0])
@@ -6672,6 +6701,7 @@ impl StreamArchiverApp {
                                             new_rec.went_live_at.unwrap_or(new_rec.started_at);
                                         popup.load_state = state;
                                         popup.recording = Some(new_rec);
+                                        popup.last_reload = std::time::Instant::now();
                                         self.core.rt.spawn(async move {
                                             let r = tokio::task::spawn_blocking(move || {
                                                 match path_opt {
@@ -6779,6 +6809,31 @@ impl StreamArchiverApp {
                     }
                 }
             });
+
+        // Tail-reload: re-parse the chat file in the background while the
+        // recording is still live so new messages appear without re-opening.
+        if let Some((path, start_ts, state)) = reload_info {
+            if let Some(p) = &mut self.chat_popup {
+                p.last_reload = std::time::Instant::now();
+            }
+            self.core.rt.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    match parse_chat_file(&path, start_ts) {
+                        Ok(msgs) => ChatLoadState::Loaded(msgs),
+                        Err(e) => ChatLoadState::Error(e.to_string()),
+                    }
+                })
+                .await
+                .unwrap_or_else(|e| ChatLoadState::Error(e.to_string()));
+                *state.lock().unwrap() = result;
+            });
+        }
+        // Keep the UI alive while a live recording is open so the next
+        // interval check fires automatically.
+        if rec_active {
+            ctx.request_repaint_after(std::time::Duration::from_secs(CHAT_RELOAD_SECS));
+        }
+
         if !open {
             self.chat_popup = None;
         }
