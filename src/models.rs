@@ -533,6 +533,13 @@ pub struct Monitor {
     /// yt-dlp `--sub-langs live_chat` (`.live_chat.json`). Other combinations
     /// don't capture chat.
     pub chat_log: bool,
+    /// Download the stream thumbnail at recording start as `{stem}.thumbnail.jpg`.
+    /// For yt-dlp, passes `--write-thumbnail`; for other tools fetches the URL
+    /// reported by the platform API.
+    pub fetch_thumbnail: bool,
+    /// Download channel icon, banner, badges, and emotes (BTTV/FFZ/7TV for Twitch)
+    /// into `{output_dir}/channel_assets/{name}/`. Refreshed at most once per 24h.
+    pub fetch_chat_assets: bool,
     pub extra_args: String,
     pub max_concurrent: i64,
     pub last_checked_at: Option<i64>,

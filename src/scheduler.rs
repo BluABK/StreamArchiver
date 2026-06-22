@@ -225,7 +225,9 @@ async fn tick(
                 Some(t) => LiveSignal::new(o.monitor_id, Some(t), false),
                 None => LiveSignal::new(o.monitor_id, Some(checked_at), true),
             }
-            .with_stream_id(o.stream_id.clone());
+            .with_stream_id(o.stream_id.clone())
+            .with_thumbnail_url(o.thumbnail_url.clone())
+            .with_broadcaster_id(o.broadcaster_id.clone());
             let _ = live_tx.send(signal);
         }
     }

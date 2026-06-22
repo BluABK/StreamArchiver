@@ -57,6 +57,11 @@ pub struct DetectOutcome {
     /// Platform stream/video id, when the source provides it (groups recording
     /// takes of one broadcast). `None` for id-less methods (scrape/probe).
     pub stream_id: Option<String>,
+    /// Live stream thumbnail URL (may contain `{width}`/`{height}` placeholders).
+    pub thumbnail_url: Option<String>,
+    /// Platform user/channel identifier for asset fetching: Twitch numeric user_id,
+    /// YouTube UC… channel ID, or Kick slug. `None` for id-less detection paths.
+    pub broadcaster_id: Option<String>,
 }
 
 impl DetectOutcome {
@@ -68,6 +73,8 @@ impl DetectOutcome {
             error: false,
             went_live_at: None,
             stream_id: None,
+            thumbnail_url: None,
+            broadcaster_id: None,
         }
     }
     fn live_at(
@@ -85,6 +92,14 @@ impl DetectOutcome {
         self.stream_id = stream_id;
         self
     }
+    fn with_thumbnail_url(mut self, thumbnail_url: Option<String>) -> DetectOutcome {
+        self.thumbnail_url = thumbnail_url;
+        self
+    }
+    fn with_broadcaster_id(mut self, broadcaster_id: Option<String>) -> DetectOutcome {
+        self.broadcaster_id = broadcaster_id;
+        self
+    }
     fn offline(monitor_id: i64) -> DetectOutcome {
         DetectOutcome {
             monitor_id,
@@ -93,6 +108,8 @@ impl DetectOutcome {
             error: false,
             went_live_at: None,
             stream_id: None,
+            thumbnail_url: None,
+            broadcaster_id: None,
         }
     }
     fn err(monitor_id: i64, detail: impl Into<String>) -> DetectOutcome {
@@ -103,6 +120,8 @@ impl DetectOutcome {
             error: true,
             went_live_at: None,
             stream_id: None,
+            thumbnail_url: None,
+            broadcaster_id: None,
         }
     }
 }
@@ -169,6 +188,22 @@ impl DetectContext {
             kick_token: Mutex::new(None),
             twitch_refresh: Mutex::new(()),
         }
+    }
+
+    /// Clone of the shared HTTP client for use outside this struct (e.g. asset fetching).
+    pub fn http_client(&self) -> Client {
+        self.http.clone()
+    }
+
+    /// Obtain a valid Twitch app token and the configured Client-Id.
+    /// Suitable for Helix API calls that don't need a user scope (badges, emotes, users).
+    pub async fn twitch_helix_auth(&self) -> anyhow::Result<(String, String)> {
+        let client_id = self
+            .store
+            .get_setting("twitch_client_id")?
+            .unwrap_or_default();
+        let token = self.twitch_app_token().await?;
+        Ok((client_id, token))
     }
 
     // ----- Twitch Helix -----
@@ -338,6 +373,8 @@ impl DetectContext {
         struct Stream {
             id: String,
             user_login: String,
+            user_id: String,
+            thumbnail_url: String,
             #[serde(rename = "type")]
             kind: String,
             started_at: Option<String>,
@@ -366,7 +403,8 @@ impl DetectContext {
                 match resp {
                     Ok(r) if r.status().is_success() => {
                         // login -> (go-live time, stream id) for currently-live channels.
-                        let live: HashMap<String, (Option<i64>, Option<String>)> =
+                        // login -> (go-live time, stream id, user_id, thumbnail_url)
+                        let live: HashMap<String, (Option<i64>, Option<String>, String, String)> =
                             match r.json::<StreamsResp>().await
                         {
                             Ok(sr) => sr
@@ -375,7 +413,10 @@ impl DetectContext {
                                 .filter(|s| s.kind == "live")
                                 .map(|s| {
                                     let when = s.started_at.as_deref().and_then(parse_rfc3339);
-                                    (s.user_login.to_lowercase(), (when, Some(s.id)))
+                                    (
+                                        s.user_login.to_lowercase(),
+                                        (when, Some(s.id), s.user_id, s.thumbnail_url),
+                                    )
                                 })
                                 .collect(),
                             Err(e) => {
@@ -394,8 +435,12 @@ impl DetectContext {
                             let key = l.to_lowercase();
                             for mid in &login_to_mons[l] {
                                 outcomes.push(match live.get(&key) {
-                                    Some((went, id)) => DetectOutcome::live_at(*mid, "live", *went)
-                                        .with_stream_id(id.clone()),
+                                    Some((went, id, uid, thumb)) => {
+                                        DetectOutcome::live_at(*mid, "live", *went)
+                                            .with_stream_id(id.clone())
+                                            .with_broadcaster_id(Some(uid.clone()))
+                                            .with_thumbnail_url(Some(thumb.clone()))
+                                    }
                                     None => DetectOutcome::offline(*mid),
                                 });
                             }
@@ -867,8 +912,11 @@ impl DetectContext {
                 match v["items"][0]["id"]["videoId"].as_str() {
                     Some(vid) => {
                         let went = self.youtube_actual_start(vid, &key).await;
+                        let thumb = format!("https://i.ytimg.com/vi/{vid}/maxresdefault.jpg");
                         DetectOutcome::live_at(item.monitor_id, "live", went)
                             .with_stream_id(Some(vid.to_string()))
+                            .with_broadcaster_id(Some(channel_id.clone()))
+                            .with_thumbnail_url(Some(thumb))
                     }
                     None => DetectOutcome::offline(item.monitor_id),
                 }
@@ -1064,7 +1112,14 @@ impl DetectContext {
                         .as_i64()
                         .map(|n| n.to_string())
                         .or_else(|| stream["id"].as_str().map(str::to_string));
-                    DetectOutcome::live_at(item.monitor_id, "live", went).with_stream_id(id)
+                    let thumb = stream["thumbnail"]["url"]
+                        .as_str()
+                        .or_else(|| stream["thumbnail"].as_str())
+                        .map(str::to_string);
+                    DetectOutcome::live_at(item.monitor_id, "live", went)
+                        .with_stream_id(id)
+                        .with_broadcaster_id(kick_slug(&item.url).map(|s| s.to_string()))
+                        .with_thumbnail_url(thumb)
                 } else {
                     DetectOutcome::offline(item.monitor_id)
                 }
@@ -1110,19 +1165,33 @@ impl DetectContext {
                 // page for a while after a stream ends.  This stops the scrape from
                 // returning a false positive that immediately re-triggers a recording
                 // attempt on a just-concluded stream.
-                let live =
-                    if let Some(pr) = extract_json_after(&body, "ytInitialPlayerResponse") {
-                        pr["videoDetails"]["isLive"].as_bool().unwrap_or(false)
-                    } else {
-                        // Fallback: structured data absent (degraded/bot-challenged
-                        // page, network truncation). The string probes are less
-                        // precise but better than silently returning offline.
-                        body.contains("hqdefault_live")
-                            || body.contains("\"isLive\":true")
-                            || body.contains("\"isLiveNow\":true")
-                    };
+                let pr_opt = extract_json_after(&body, "ytInitialPlayerResponse");
+                let live = if let Some(pr) = &pr_opt {
+                    pr["videoDetails"]["isLive"].as_bool().unwrap_or(false)
+                } else {
+                    // Fallback: structured data absent (degraded/bot-challenged
+                    // page, network truncation). The string probes are less
+                    // precise but better than silently returning offline.
+                    body.contains("hqdefault_live")
+                        || body.contains("\"isLive\":true")
+                        || body.contains("\"isLiveNow\":true")
+                };
                 if live {
+                    let (broadcaster_id, thumbnail_url) = if let Some(pr) = &pr_opt {
+                        let ch_id =
+                            pr["videoDetails"]["channelId"].as_str().map(str::to_string);
+                        let thumb = pr["videoDetails"]["thumbnail"]["thumbnails"]
+                            .as_array()
+                            .and_then(|arr| arr.last())
+                            .and_then(|t| t["url"].as_str())
+                            .map(str::to_string);
+                        (ch_id, thumb)
+                    } else {
+                        (None, None)
+                    };
                     DetectOutcome::live(item.monitor_id, "live")
+                        .with_broadcaster_id(broadcaster_id)
+                        .with_thumbnail_url(thumbnail_url)
                 } else {
                     DetectOutcome::offline(item.monitor_id)
                 }

@@ -126,6 +126,12 @@ struct MonitorForm {
     subtitle_tracks: String,
     /// Capture chat alongside the recording (Twitch IRC sidecar / yt-dlp live_chat).
     chat_log: bool,
+    /// Download stream thumbnail at recording start (yt-dlp: --write-thumbnail;
+    /// Twitch/Kick/YouTube: fetch URL from detection metadata).
+    fetch_thumbnail: bool,
+    /// Download channel icon, banner, badges, and emotes (Twitch: BTTV/FFZ/7TV too)
+    /// into channel_assets/ alongside recordings.
+    fetch_chat_assets: bool,
     extra_args: String,
     /// Platform the tool/detection defaults were last set for; a URL change to a
     /// different platform re-applies that platform's defaults.
@@ -156,10 +162,12 @@ impl MonitorForm {
             auth_kind: AuthKind::Inherit,
             auth_value: String::new(),
             // New monitors default to max-archival: every audio + subtitle track,
-            // and chat logging on.
+            // chat logging, thumbnails, and channel assets all on.
             audio_tracks: "all".into(),
             subtitle_tracks: "all".into(),
             chat_log: true,
+            fetch_thumbnail: true,
+            fetch_chat_assets: true,
             extra_args: String::new(),
             last_platform: None,
         }
@@ -187,6 +195,8 @@ impl MonitorForm {
             audio_tracks: m.audio_tracks.clone(),
             subtitle_tracks: m.subtitle_tracks.clone(),
             chat_log: m.chat_log,
+            fetch_thumbnail: m.fetch_thumbnail,
+            fetch_chat_assets: m.fetch_chat_assets,
             extra_args: m.extra_args.clone(),
             // Don't override the saved tool/detection just because the form opened.
             last_platform: Some(m.platform()),
@@ -215,10 +225,12 @@ impl MonitorForm {
             auth_kind: AuthKind::Inherit,
             auth_value: String::new(),
             // New monitors default to max-archival: every audio + subtitle track,
-            // and chat logging on.
+            // chat logging, thumbnails, and channel assets all on.
             audio_tracks: "all".into(),
             subtitle_tracks: "all".into(),
             chat_log: true,
+            fetch_thumbnail: true,
+            fetch_chat_assets: true,
             extra_args: String::new(),
             last_platform: None,
         }
@@ -742,6 +754,8 @@ impl StreamArchiverApp {
             audio_tracks: form.audio_tracks.trim().to_string(),
             subtitle_tracks: form.subtitle_tracks.trim().to_string(),
             chat_log: form.chat_log,
+            fetch_thumbnail: form.fetch_thumbnail,
+            fetch_chat_assets: form.fetch_chat_assets,
             extra_args: form.extra_args.clone(),
             max_concurrent: 1,
             last_checked_at: None,
@@ -6769,6 +6783,23 @@ impl StreamArchiverApp {
                              anonymous chat logger writes a .chat.jsonl sidecar. YouTube \
                              (yt-dlp tool): yt-dlp's live_chat writes a .live_chat.json \
                              sidecar. Other platforms/tools don't capture chat.",
+                        );
+                        ui.end_row();
+
+                        ui.label("Fetch thumbnail");
+                        ui.checkbox(&mut form.fetch_thumbnail, "").on_hover_text(
+                            "Download the stream thumbnail alongside the recording \
+                             ({stem}.thumbnail.jpg). For yt-dlp, passes --write-thumbnail; \
+                             for Twitch/Kick/YouTube, fetches the URL from detection metadata.",
+                        );
+                        ui.end_row();
+
+                        ui.label("Fetch chat assets");
+                        ui.checkbox(&mut form.fetch_chat_assets, "").on_hover_text(
+                            "Download channel icon, offline banner, Twitch badges, and \
+                             emotes (including BTTV, FFZ, 7TV) into channel_assets/ \
+                             alongside recordings. Needed for full offline chat replay. \
+                             Refreshed at most once per 24 hours.",
                         );
                         ui.end_row();
 

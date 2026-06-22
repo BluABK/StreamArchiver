@@ -380,6 +380,9 @@ pub fn build_plan(
             // via build_video_plan (which does pass chat_log through). Twitch chat
             // uses the native WS logger regardless.
             push_track_args(&mut args, Tool::YtDlp, &m.audio_tracks, &m.subtitle_tracks, false);
+            if m.fetch_thumbnail {
+                args.push("--write-thumbnail".to_string());
+            }
             args.extend(extra);
             let url = if m.platform() == Platform::YouTube {
                 youtube_live_url(&m.url)
@@ -642,7 +645,7 @@ impl Supervisor {
                     if self.shutdown.load(Ordering::SeqCst) {
                         continue; // draining: don't start new recordings
                     }
-                    self.try_begin(signal.monitor_id, signal.went_live_at, signal.approximate, signal.stream_id, false);
+                    self.try_begin(signal.monitor_id, signal.went_live_at, signal.approximate, signal.stream_id, signal.thumbnail_url, signal.broadcaster_id, false);
                 }
                 Some(cmd) = manual_rx.recv() => match cmd {
                     ManualCommand::Start(id) => {
@@ -672,6 +675,8 @@ impl Supervisor {
         went_live_at: Option<i64>,
         approximate: bool,
         stream_id: Option<String>,
+        thumbnail_url: Option<String>,
+        broadcaster_id: Option<String>,
         bypass_backoff: bool,
     ) -> bool {
         {
@@ -697,7 +702,7 @@ impl Supervisor {
         };
         let this = self.clone();
         tokio::spawn(async move {
-            this.record(row, went_live_at, approximate, stream_id).await;
+            this.record(row, went_live_at, approximate, stream_id, thumbnail_url, broadcaster_id).await;
         });
         true
     }
@@ -718,7 +723,7 @@ impl Supervisor {
                 Some(t) => (Some(t), false),
                 None => (Some(now_unix()), true),
             };
-            self.try_begin(monitor_id, went, approx, outcome.stream_id, true);
+            self.try_begin(monitor_id, went, approx, outcome.stream_id, outcome.thumbnail_url, outcome.broadcaster_id, true);
         } else {
             let message = if outcome.error && !outcome.detail.is_empty() {
                 format!("{name}: {}", outcome.detail)
@@ -1064,6 +1069,8 @@ impl Supervisor {
                     error: true,
                     went_live_at: None,
                     stream_id: None,
+                    thumbnail_url: None,
+                    broadcaster_id: None,
                 }),
             DetectionMethod::GenericProbe => self.ctx.detect_generic(&item).await,
             DetectionMethod::YouTubeApi => self.ctx.detect_youtube_api(&item).await,
@@ -1108,6 +1115,8 @@ impl Supervisor {
         went_live_at: Option<i64>,
         approximate: bool,
         stream_id: Option<String>,
+        thumbnail_url: Option<String>,
+        broadcaster_id: Option<String>,
     ) {
         let monitor_id = row.monitor.id;
         let global_method = self
@@ -1178,6 +1187,64 @@ impl Supervisor {
             recording_id: rec_id,
             channel: row.channel.name.clone(),
         });
+        // Asset fetching — fire-and-forget tasks that don't block the recording.
+        let is_ytdlp = matches!(row.monitor.tool, Tool::YtDlp);
+        if row.monitor.fetch_thumbnail && !is_ytdlp {
+            if let Some(ref url) = thumbnail_url {
+                let http = self.ctx.http_client();
+                let url = url.clone();
+                let dest = plan.final_path.with_extension("thumbnail.jpg");
+                tokio::spawn(async move {
+                    if let Err(e) = crate::assets::fetch_stream_thumbnail(&http, &url, &dest).await {
+                        tracing::warn!(monitor_id, "thumbnail fetch failed: {e}");
+                    }
+                });
+            }
+        }
+        if row.monitor.fetch_chat_assets {
+            let asset_dir = std::path::PathBuf::from(&row.monitor.output_dir)
+                .join("channel_assets")
+                .join(sanitize_filename(&row.channel.name));
+            if crate::assets::should_refetch_assets(&asset_dir) {
+                let http = self.ctx.http_client();
+                let platform = row.monitor.platform();
+                let bid = broadcaster_id.clone().unwrap_or_default();
+                match platform {
+                    Platform::Twitch => {
+                        match self.ctx.twitch_helix_auth().await {
+                            Ok((client_id, token)) => {
+                                tokio::spawn(async move {
+                                    crate::assets::run_twitch_assets(
+                                        &http, &client_id, &token, &bid, &asset_dir,
+                                    )
+                                    .await;
+                                });
+                            }
+                            Err(e) => tracing::warn!(monitor_id, "Twitch auth for assets failed: {e}"),
+                        }
+                    }
+                    Platform::YouTube => {
+                        let api_key = self
+                            .store
+                            .get_setting("youtube_api_key")
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
+                        tokio::spawn(async move {
+                            crate::assets::run_youtube_assets(&http, &api_key, &bid, &asset_dir)
+                                .await;
+                        });
+                    }
+                    Platform::Kick => {
+                        tokio::spawn(async move {
+                            crate::assets::run_kick_assets(&http, &bid, &asset_dir).await;
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         info!(monitor_id, program = %plan.program, "starting recording -> {}", plan.capture_path.display());
         {
             let redacted: Vec<String> = plan.args.iter().map(|a| {
@@ -1281,9 +1348,14 @@ impl Supervisor {
             tokio::spawn(async move { this.run_chat_download(mid, chat_plan).await });
         }
 
-        let outcome = self
-            .run_process(&self.active, monitor_id, &plan, None, None, ad_sink)
-            .await;
+        // If a manual stop arrived while we were setting up (pid was 0 so kill
+        // couldn't fire yet), honour it now: skip spawning the process entirely.
+        let outcome = if self.stopping_monitors.lock().unwrap().contains(&monitor_id) {
+            ProcessOutcome { exit_code: None, log: String::new() }
+        } else {
+            self.run_process(&self.active, monitor_id, &plan, None, None, ad_sink)
+                .await
+        };
 
         // Stop the catch-up watcher before we touch the capture file (so it can't
         // race finalize's authoritative lost-time write).
@@ -2621,6 +2693,8 @@ mod tests {
                 audio_tracks: String::new(),
                 subtitle_tracks: String::new(),
                 chat_log: false,
+                fetch_thumbnail: false,
+                fetch_chat_assets: false,
                 extra_args: String::new(),
                 max_concurrent: 1,
                 last_checked_at: None,

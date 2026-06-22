@@ -17,7 +17,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 21;
+const SCHEMA_VERSION: i64 = 22;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -352,7 +352,16 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 21)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 21);
+        if version < 22 {
+            // Per-monitor asset archival: download stream thumbnail and
+            // channel/chat assets (icon, banner, badges, emotes) alongside recordings.
+            conn.execute_batch(
+                "ALTER TABLE monitor ADD COLUMN fetch_thumbnail   INTEGER NOT NULL DEFAULT 0;\
+                 ALTER TABLE monitor ADD COLUMN fetch_chat_assets INTEGER NOT NULL DEFAULT 0;",
+            )?;
+            conn.pragma_update(None, "user_version", 22)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 22);
         Ok(())
     }
 
@@ -477,8 +486,8 @@ impl Store {
             "INSERT INTO monitor(channel_id, url, enabled, tool, detection_method, poll_interval_secs,
                 quality, output_dir, filename_template, container, capture_from_start, auth_kind,
                 auth_value, extra_args, max_concurrent, last_state, ad_free, audio_tracks, subtitle_tracks,
-                chat_log)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                chat_log, fetch_thumbnail, fetch_chat_assets)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             params![
                 m.channel_id,
                 m.url,
@@ -500,6 +509,8 @@ impl Store {
                 m.audio_tracks,
                 m.subtitle_tracks,
                 m.chat_log as i64,
+                m.fetch_thumbnail as i64,
+                m.fetch_chat_assets as i64,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -511,7 +522,8 @@ impl Store {
             "UPDATE monitor SET url=?2, enabled=?3, tool=?4, detection_method=?5, poll_interval_secs=?6,
                 quality=?7, output_dir=?8, filename_template=?9, container=?10, capture_from_start=?11,
                 auth_kind=?12, auth_value=?13, extra_args=?14, max_concurrent=?15, ad_free=?16,
-                audio_tracks=?17, subtitle_tracks=?18, chat_log=?19 WHERE id=?1",
+                audio_tracks=?17, subtitle_tracks=?18, chat_log=?19,
+                fetch_thumbnail=?20, fetch_chat_assets=?21 WHERE id=?1",
             params![
                 m.id,
                 m.url,
@@ -532,6 +544,8 @@ impl Store {
                 m.audio_tracks,
                 m.subtitle_tracks,
                 m.chat_log as i64,
+                m.fetch_thumbnail as i64,
+                m.fetch_chat_assets as i64,
             ],
         )?;
         Ok(())
@@ -973,6 +987,7 @@ impl Store {
                 (SELECT COUNT(*) FROM stream_meta_change smc
                  WHERE smc.recording_id = r.id AND smc.old_value != ''),
                 m.chat_log, COALESCE(r.log_excerpt, ''),
+                m.fetch_thumbnail, m.fetch_chat_assets,
                 COALESCE((SELECT new_value FROM stream_meta_change smc
                           WHERE smc.recording_id = r.id AND smc.kind = 'title'
                           ORDER BY smc.at_secs DESC, smc.id DESC LIMIT 1), ''),
@@ -994,7 +1009,7 @@ impl Store {
                     url: r.get(2)?,
                     platform: Platform::parse(&r.get::<_, String>(3)?),
                     created_at: r.get(4)?,
-                    color: r.get(41)?,
+                    color: r.get(43)?,
                 };
                 let monitor = Monitor {
                     id: r.get(5)?,
@@ -1015,6 +1030,8 @@ impl Store {
                     audio_tracks: r.get(34)?,
                     subtitle_tracks: r.get(35)?,
                     chat_log: r.get::<_, i64>(37)? != 0,
+                    fetch_thumbnail: r.get::<_, i64>(39)? != 0,
+                    fetch_chat_assets: r.get::<_, i64>(40)? != 0,
                     extra_args: r.get(18)?,
                     max_concurrent: r.get(19)?,
                     last_checked_at: r.get(20)?,
@@ -1033,8 +1050,8 @@ impl Store {
                     last_recording_ad_secs: r.get(31)?,
                     last_recording_meta_changes: r.get(36)?,
                     last_recording_log: r.get(38)?,
-                    last_recording_title: r.get(39)?,
-                    last_recording_category: r.get(40)?,
+                    last_recording_title: r.get(41)?,
+                    last_recording_category: r.get(42)?,
                     ad_free_sub: r.get::<_, Option<i64>>(33)?.map(|v| v != 0),
                     recording_count: r.get(28)?,
                     // Filled by the UI from next_scheduled_streams(), not this query.
@@ -1339,6 +1356,8 @@ mod tests {
             audio_tracks: String::new(),
             subtitle_tracks: String::new(),
             chat_log: false,
+            fetch_thumbnail: false,
+            fetch_chat_assets: false,
             extra_args: String::new(),
             max_concurrent: 1,
             last_checked_at: None,

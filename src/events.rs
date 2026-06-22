@@ -55,6 +55,10 @@ pub struct LiveSignal {
     pub approximate: bool,
     /// Platform stream/video id, if known (groups recording takes of one stream).
     pub stream_id: Option<String>,
+    /// Live stream thumbnail URL, if the platform provided it.
+    pub thumbnail_url: Option<String>,
+    /// Platform user/channel identifier (Twitch user_id, YouTube UC… ID, Kick slug).
+    pub broadcaster_id: Option<String>,
 }
 
 impl LiveSignal {
@@ -64,12 +68,24 @@ impl LiveSignal {
             went_live_at,
             approximate,
             stream_id: None,
+            thumbnail_url: None,
+            broadcaster_id: None,
         }
     }
 
     /// Attach a platform stream id (builder-style).
     pub fn with_stream_id(mut self, stream_id: Option<String>) -> LiveSignal {
         self.stream_id = stream_id;
+        self
+    }
+
+    pub fn with_thumbnail_url(mut self, thumbnail_url: Option<String>) -> LiveSignal {
+        self.thumbnail_url = thumbnail_url;
+        self
+    }
+
+    pub fn with_broadcaster_id(mut self, broadcaster_id: Option<String>) -> LiveSignal {
+        self.broadcaster_id = broadcaster_id;
         self
     }
 }

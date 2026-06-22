@@ -4,6 +4,7 @@
 
 mod app_core;
 mod app_paths;
+mod assets;
 mod chat;
 mod detectors;
 mod downloader;
@@ -272,6 +273,8 @@ fn run_add(args: &[String], pos: usize) -> Result<()> {
         audio_tracks: "all".into(),
         subtitle_tracks: "all".into(),
         chat_log: true,
+        fetch_thumbnail: true,
+        fetch_chat_assets: true,
         extra_args: String::new(),
         max_concurrent: 1,
         last_checked_at: None,
@@ -342,6 +345,8 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
             audio_tracks: String::new(),
             subtitle_tracks: String::new(),
             chat_log: false,
+            fetch_thumbnail: false,
+            fetch_chat_assets: false,
             extra_args: String::new(),
             max_concurrent: 1,
             last_checked_at: None,
