@@ -25,7 +25,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use reqwest::Client;
@@ -46,6 +46,12 @@ const K_POLL: &str = "websub_poll_secs";
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 /// How long to wait between API polls by default (the VPS is our own; cheap).
 const DEFAULT_POLL_SECS: u64 = 15;
+/// Minimum time between liveness checks for the same (monitor, video_id) pair.
+/// YouTube fires repeated `updated` events for the same video after a stream
+/// ends (metadata edits, final processing), each with a new VPS seq number.
+/// Without a cooldown every one would re-trigger a `ManualCommand::Start`.
+/// A new video_id (genuine new stream or upload) always bypasses this gate.
+const VIDEO_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 /// Events fetched per `/api/events` page; a full page means more are pending.
 const EVENTS_PAGE: usize = 500;
 /// How long to idle when there's nothing to do (no monitors / no VPS config).
@@ -76,6 +82,10 @@ pub async fn run(
     let mut last_sig: Option<String> = None;
     let mut cursor: Option<u64> = None;
     let mut warned_no_config = false;
+    // Tracks when each (monitor_id, video_id) last triggered a liveness check,
+    // so repeated hub pings for the same ended-stream video don't re-check every
+    // poll cycle.  Pruned to a 1-hour horizon each cycle to prevent growth.
+    let mut video_last_checked: HashMap<(i64, String), Instant> = HashMap::new();
 
     while !shutdown.load(Ordering::SeqCst) {
         let monitors = load_websub_monitors(&store);
@@ -173,6 +183,13 @@ pub async fn run(
             // the monitors to check: YouTube fires new + updated and delivery is
             // at-least-once, so one channel can recur within a page — a single
             // liveness check per monitor is enough.
+            //
+            // Additionally gate on VIDEO_COOLDOWN: YouTube keeps firing `updated`
+            // events for the same video_id after a stream ends (metadata edits,
+            // final processing), each with a fresh VPS seq.  We suppress repeat
+            // checks for the same (monitor, video_id) within the cooldown window.
+            // A genuinely new video_id (new stream or upload) always passes through.
+            let now = Instant::now();
             let mut to_check: HashSet<i64> = HashSet::new();
             let mut newcur = after;
             for e in &events {
@@ -182,15 +199,30 @@ pub async fn run(
                 }
                 if let Some(mons) = uc_to_monitors.get(&e.channel_id) {
                     for &mid in mons {
-                        if to_check.insert(mid) {
-                            info!(
-                                "websub: {} (video {}) -> check monitor {mid}",
+                        let key = (mid, e.video_id.clone());
+                        let cooled_down = video_last_checked
+                            .get(&key)
+                            .map_or(true, |&t| now.duration_since(t) >= VIDEO_COOLDOWN);
+                        if cooled_down {
+                            if to_check.insert(mid) {
+                                info!(
+                                    "websub: {} (video {}) -> check monitor {mid}",
+                                    e.kind, e.video_id
+                                );
+                            }
+                            video_last_checked.insert(key, now);
+                        } else {
+                            debug!(
+                                "websub: {} (video {}) suppressed for monitor {mid} (cooldown)",
                                 e.kind, e.video_id
                             );
                         }
                     }
                 }
             }
+            // Prune entries older than 1 hour to keep the map bounded.
+            video_last_checked
+                .retain(|_, &mut t| now.duration_since(t) < Duration::from_secs(3600));
             for mid in &to_check {
                 let _ = manual_tx.send(ManualCommand::Start(*mid));
             }

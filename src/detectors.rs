@@ -1129,9 +1129,24 @@ impl DetectContext {
         match resp {
             Ok(r) => {
                 let body = r.text().await.unwrap_or_default();
-                let live = body.contains("hqdefault_live")
-                    || body.contains("\"isLive\":true")
-                    || body.contains("\"isLiveNow\":true");
+                // Prefer the structured player response: `videoDetails.isLive` is
+                // authoritative and stays `false` for ended/upcoming streams even
+                // when other live-related strings (e.g. `hqdefault_live`, or
+                // `"isLive":true` in badge/DVR metadata nodes) still appear on the
+                // page for a while after a stream ends.  This stops the scrape from
+                // returning a false positive that immediately re-triggers a recording
+                // attempt on a just-concluded stream.
+                let live =
+                    if let Some(pr) = extract_json_after(&body, "ytInitialPlayerResponse") {
+                        pr["videoDetails"]["isLive"].as_bool().unwrap_or(false)
+                    } else {
+                        // Fallback: structured data absent (degraded/bot-challenged
+                        // page, network truncation). The string probes are less
+                        // precise but better than silently returning offline.
+                        body.contains("hqdefault_live")
+                            || body.contains("\"isLive\":true")
+                            || body.contains("\"isLiveNow\":true")
+                    };
                 if live {
                     DetectOutcome::live(item.monitor_id, "live")
                 } else {
