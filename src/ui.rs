@@ -408,6 +408,11 @@ pub struct StreamArchiverApp {
     chat_popup: Option<ChatPopup>,
     /// Platform favicons, uploaded to the GPU on first use (None until then).
     platform_tex: Option<PlatformTextures>,
+    /// Which monitor's Properties window is open (None = closed).
+    properties_popup: Option<i64>,
+    /// Per-channel cached icon textures loaded from disk for the Properties window.
+    /// A `None` value means the lookup was attempted but no icon file was found.
+    channel_icons: HashMap<i64, Option<egui::TextureHandle>>,
     /// Sort + per-column filters for the Videos table.
     videos_sort: SortState,
     videos_filters: Vec<String>,
@@ -566,6 +571,8 @@ impl StreamArchiverApp {
             schedule_day_popup: None,
             chat_popup: None,
             platform_tex: None,
+            properties_popup: None,
+            channel_icons: HashMap::new(),
             videos_sort: SortState::default(),
             videos_filters: vec![String::new(); VIDEO_COLS],
             twitch_flow,
@@ -2463,6 +2470,7 @@ struct RowActions {
     toggle_enabled: Option<(i64, bool)>,
     select: Option<i64>,                // monitor id
     open_schedule: Option<i64>,         // monitor id (open its Next stream popup)
+    properties: Option<i64>,            // monitor id
 }
 
 /// Render one capture-instance (monitor) row across all columns, with the Name
@@ -2546,6 +2554,11 @@ fn render_instance_row(
         ui.separator();
         if ui.button("🗑  Delete").clicked() {
             a.delete = Some((m.id, row.channel.name.clone()));
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("ℹ  Properties").clicked() {
+            a.properties = Some(m.id);
             ui.close();
         }
     };
@@ -2960,6 +2973,7 @@ impl eframe::App for StreamArchiverApp {
         self.schedule_popup_window(ui.ctx());
         self.schedule_day_window(ui.ctx());
         self.chat_popup_window(ui.ctx());
+        self.properties_window(ui.ctx());
     }
 }
 
@@ -5941,6 +5955,13 @@ impl StreamArchiverApp {
                 self.form = Some(MonitorForm::from_existing(r));
             }
         }
+        if let Some(mid) = acts.properties {
+            self.properties_popup = Some(mid);
+            // Invalidate cached icon so it reloads (assets may have been fetched since last open).
+            if let Some(r) = self.rows.iter().find(|r| r.monitor.id == mid) {
+                self.channel_icons.remove(&r.channel.id);
+            }
+        }
         if let Some(cid) = acts.add_instance {
             // Look up the container in `channels` (not `rows`) so this also works
             // for an empty container that has no instances yet.
@@ -7158,6 +7179,320 @@ impl StreamArchiverApp {
         if !open {
             self.chat_popup = None;
         }
+    }
+
+    fn properties_window(&mut self, ctx: &egui::Context) {
+        let Some(mid) = self.properties_popup else { return };
+        let Some(row) = self.rows.iter().find(|r| r.monitor.id == mid).cloned() else {
+            self.properties_popup = None;
+            return;
+        };
+        let ch = &row.channel;
+        let m = &row.monitor;
+
+        let safe_name = crate::downloader::sanitize_filename(&ch.name);
+        let asset_dir = std::path::PathBuf::from(&m.output_dir)
+            .join("channel_assets")
+            .join(&safe_name);
+
+        // Lazy-load (or serve cached) channel icon texture.
+        let icon_tex = self
+            .channel_icons
+            .entry(ch.id)
+            .or_insert_with(|| load_channel_icon(&asset_dir, ctx, &ch.id.to_string()))
+            .clone();
+
+        let mut open = true;
+        egui::Window::new(format!("Properties — {}", ch.name))
+            .id(egui::Id::new("properties_popup"))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(420.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                // ── Header ──────────────────────────────────────────────
+                ui.horizontal(|ui| {
+                    if let Some(tex) = &icon_tex {
+                        ui.add(
+                            egui::Image::from_texture(tex)
+                                .max_size(egui::vec2(64.0, 64.0))
+                                .corner_radius(egui::CornerRadius::same(6)),
+                        );
+                    } else {
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(64.0, 64.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().rect_filled(
+                            rect,
+                            6.0,
+                            ui.visuals().weak_text_color(),
+                        );
+                    }
+                    ui.add_space(8.0);
+                    ui.vertical(|ui| {
+                        ui.add_space(4.0);
+                        ui.heading(&ch.name);
+                        ui.horizontal(|ui| {
+                            let ptex = self
+                                .platform_tex
+                                .get_or_insert_with(|| PlatformTextures::load(ui.ctx()));
+                            if let Some(t) = ptex.get(ch.platform) {
+                                ui.add(
+                                    egui::Image::from_texture(t)
+                                        .max_size(egui::vec2(14.0, 14.0)),
+                                );
+                            }
+                            ui.label(ch.platform.as_str());
+                        });
+                    });
+                });
+
+                ui.separator();
+
+                // ── Channel ─────────────────────────────────────────────
+                ui.strong("Channel");
+                egui::Grid::new("props_ch")
+                    .num_columns(2)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("DB channel ID");
+                        ui.label(ch.id.to_string());
+                        ui.end_row();
+
+                        ui.label("URL");
+                        if ui.link(&ch.url).clicked() {
+                            ui.ctx()
+                                .open_url(egui::OpenUrl::new_tab(ch.url.clone()));
+                        }
+                        ui.end_row();
+
+                        if ch.platform == Platform::YouTube {
+                            let yt_id = extract_yt_channel_id(&ch.url)
+                                .unwrap_or_else(|| "— (handle URL, ID not in URL)".into());
+                            ui.label("Channel ID");
+                            ui.horizontal(|ui| {
+                                ui.label(&yt_id);
+                                if !yt_id.starts_with('—')
+                                    && ui
+                                        .small_button("⧉")
+                                        .on_hover_text("Copy")
+                                        .clicked()
+                                {
+                                    ui.ctx().copy_text(yt_id.clone());
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
+
+                ui.add_space(6.0);
+
+                // ── Monitor (instance) ───────────────────────────────────
+                ui.strong("Monitor (instance)");
+                egui::Grid::new("props_mon")
+                    .num_columns(2)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("DB monitor ID");
+                        ui.label(m.id.to_string());
+                        ui.end_row();
+                        ui.label("Detection");
+                        ui.label(m.detection_method.as_str());
+                        ui.end_row();
+                        ui.label("Tool");
+                        ui.label(format!("{:?}", m.tool));
+                        ui.end_row();
+                        ui.label("Poll interval");
+                        ui.label(format!("{}s", m.poll_interval_secs));
+                        ui.end_row();
+                        ui.label("Quality");
+                        ui.label(&m.quality);
+                        ui.end_row();
+                        ui.label("Max concurrent");
+                        ui.label(m.max_concurrent.to_string());
+                        ui.end_row();
+                        ui.label("Last state");
+                        ui.label(&m.last_state);
+                        ui.end_row();
+                        ui.label("Recordings");
+                        ui.label(row.recording_count.to_string());
+                        ui.end_row();
+                        ui.label("Output dir");
+                        ui.horizontal(|ui| {
+                            ui.label(prop_truncate_path(&m.output_dir, 28));
+                            if ui
+                                .small_button("📂")
+                                .on_hover_text("Open folder")
+                                .clicked()
+                            {
+                                crate::platform::open_path(
+                                    std::path::Path::new(&m.output_dir),
+                                );
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("Fetch thumbnail");
+                        ui.label(prop_bool(m.fetch_thumbnail));
+                        ui.end_row();
+                        ui.label("Fetch assets");
+                        ui.label(prop_bool(m.fetch_chat_assets));
+                        ui.end_row();
+                    });
+
+                // ── Assets ───────────────────────────────────────────────
+                if m.fetch_chat_assets {
+                    ui.add_space(6.0);
+                    ui.strong("Fetched assets");
+
+                    let stamp_path = asset_dir.join(".assets_fetched_at");
+                    let last_fetched = std::fs::read_to_string(&stamp_path)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<i64>().ok())
+                        .map(|t| {
+                            chrono::DateTime::from_timestamp(t, 0)
+                                .map(|dt| {
+                                    dt.with_timezone(&chrono::Local)
+                                        .format("%Y-%m-%d %H:%M")
+                                        .to_string()
+                                })
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_else(|| "never".into());
+                    ui.label(format!("Last fetched: {last_fetched}"));
+
+                    egui::Grid::new("props_assets")
+                        .num_columns(2)
+                        .spacing([12.0, 4.0])
+                        .show(ui, |ui| {
+                            let icon_ok = prop_find_first(&asset_dir, "icon.").is_some();
+                            let banner_ok = prop_find_first(&asset_dir, "banner.").is_some();
+                            ui.label("Icon");
+                            ui.label(if icon_ok { "✔" } else { "—" });
+                            ui.end_row();
+                            ui.label("Banner");
+                            ui.label(if banner_ok { "✔" } else { "—" });
+                            ui.end_row();
+
+                            let badge_versions =
+                                prop_count_nested_dirs(&asset_dir.join("badges"), 2);
+                            ui.label("Badges");
+                            ui.label(format!("{badge_versions} versions"));
+                            ui.end_row();
+
+                            for src in &["twitch", "bttv", "ffz", "7tv"] {
+                                let n = prop_count_dir_files(
+                                    &asset_dir.join("emotes").join(src),
+                                );
+                                if n > 0 {
+                                    ui.label(format!("Emotes ({src})"));
+                                    ui.label(n.to_string());
+                                    ui.end_row();
+                                }
+                            }
+                        });
+
+                    if let Some(tex) = &icon_tex {
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Image::from_texture(tex)
+                                .max_size(egui::vec2(96.0, 96.0))
+                                .corner_radius(egui::CornerRadius::same(8)),
+                        );
+                    }
+                }
+            });
+
+        if !open {
+            self.properties_popup = None;
+        }
+    }
+}
+
+// ── Properties window helpers ────────────────────────────────────────────────
+
+/// Load a channel icon from `asset_dir/icon.*` into an egui texture.
+/// Returns `None` when no icon file is found or decoding fails.
+fn load_channel_icon(
+    asset_dir: &std::path::Path,
+    ctx: &egui::Context,
+    key: &str,
+) -> Option<egui::TextureHandle> {
+    let entry = prop_find_first(asset_dir, "icon.")?;
+    let bytes = std::fs::read(&entry).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let size = [img.width() as usize, img.height() as usize];
+    let color_image =
+        egui::ColorImage::from_rgba_unmultiplied(size, &img.into_raw());
+    Some(ctx.load_texture(
+        format!("chan_icon_{key}"),
+        color_image,
+        egui::TextureOptions::LINEAR,
+    ))
+}
+
+/// Try to extract a YouTube UC… channel ID from a channel URL.
+fn extract_yt_channel_id(url: &str) -> Option<String> {
+    // Matches "/channel/UCxxxxxxxxx" style URLs.
+    let idx = url.find("/channel/")?;
+    let after = &url[idx + "/channel/".len()..];
+    let id: String = after.chars().take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '_').collect();
+    if id.starts_with("UC") && id.len() > 10 {
+        Some(id)
+    } else {
+        None
+    }
+}
+
+/// Find the first entry in `dir` whose filename starts with `prefix`.
+fn prop_find_first(dir: &std::path::Path, prefix: &str) -> Option<std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .find(|e| e.file_name().to_string_lossy().starts_with(prefix))
+        .map(|e| e.path())
+}
+
+/// Count files (non-recursive) in `dir`.
+fn prop_count_dir_files(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().is_file())
+        .count()
+}
+
+/// Count directories at exactly `depth` levels below `root`.
+fn prop_count_nested_dirs(root: &std::path::Path, depth: usize) -> usize {
+    if depth == 0 || !root.is_dir() {
+        return 0;
+    }
+    std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| {
+            if depth == 1 {
+                if e.path().is_dir() { 1 } else { 0 }
+            } else {
+                prop_count_nested_dirs(&e.path(), depth - 1)
+            }
+        })
+        .sum()
+}
+
+/// "yes" / "no" display for boolean fields.
+fn prop_bool(v: bool) -> &'static str {
+    if v { "yes" } else { "no" }
+}
+
+/// Truncate a long path string keeping its tail (for compact display).
+fn prop_truncate_path(p: &str, max_chars: usize) -> String {
+    if p.len() <= max_chars {
+        p.to_string()
+    } else {
+        format!("…{}", &p[p.len() - max_chars..])
     }
 }
 

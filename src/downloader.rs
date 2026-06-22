@@ -2614,7 +2614,7 @@ fn unique_stem(dir: &Path, stem: &str, ext: &str, ignore: Option<&Path>) -> Stri
     format!("{stem} ({})", now_unix())
 }
 
-fn sanitize_filename(s: &str) -> String {
+pub(crate) fn sanitize_filename(s: &str) -> String {
     s.chars()
         .map(|c| {
             if "<>:\"/\\|?*".contains(c) || c.is_control() {
