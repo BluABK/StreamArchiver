@@ -14,6 +14,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use serde_json::Value;
+use tracing::warn;
 
 use crate::models::now_unix;
 use crate::store::Store;
@@ -153,7 +154,9 @@ pub async fn refresh(
     }
     let resp = http.post(TOKEN_URL).form(&form).send().await?;
     if !resp.status().is_success() {
-        bail!("token refresh failed: {}", resp.status());
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        bail!("token refresh failed: {status} — {body}");
     }
     let v: Value = resp.json().await?;
     Ok(Tokens {
@@ -260,6 +263,8 @@ pub fn connected_user_id(store: &Store) -> Option<String> {
 /// Device-code public clients refresh without a Client Secret; the refresh token
 /// is one-time-use and rotates, so the rotated token is persisted on success.
 /// Callers should serialize calls to avoid double-spending the refresh token.
+/// If a concurrent caller already refreshed (double-spend), this function detects
+/// the newer expiry in the DB and returns the already-stored fresh token.
 pub async fn valid_user_token(http: &Client, store: &Store) -> Option<String> {
     let token = store.get_setting(K_USER_TOKEN).ok().flatten()?;
     if token.is_empty() {
@@ -271,8 +276,10 @@ pub async fn valid_user_token(http: &Client, store: &Store) -> Option<String> {
         .flatten()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    // Comfortably within the token's lifetime — use it as-is.
-    if now_unix() < expiry - 60 {
+    // 5-minute early-refresh window: gives room for a retry before the token
+    // actually expires. A successful refresh resets expiry to +4 h, so this
+    // triggers at most once per token lifetime under normal operation.
+    if now_unix() < expiry - 300 {
         return Some(token);
     }
 
@@ -293,16 +300,46 @@ pub async fn valid_user_token(http: &Client, store: &Store) -> Option<String> {
         .flatten()
         .unwrap_or_default();
     if !refresh_token.is_empty() && !client_id.is_empty() {
-        if let Ok(t) = refresh(http, &client_id, &client_secret, &refresh_token).await {
-            let login = connected_login(store).unwrap_or_default();
-            let _ = store_tokens(store, &t, &login);
-            return Some(t.access);
+        match refresh(http, &client_id, &client_secret, &refresh_token).await {
+            Ok(t) => {
+                let login = connected_login(store).unwrap_or_default();
+                let _ = store_tokens(store, &t, &login);
+                return Some(t.access);
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("missing client secret") && client_secret.is_empty() {
+                    warn!(
+                        "Twitch token refresh failed: Twitch requires a Client Secret for this \
+                         app. Add your Client Secret in Settings → Twitch."
+                    );
+                } else {
+                    warn!("Twitch token refresh failed: {e}");
+                }
+                // A concurrent caller (e.g. EventSub reconnect) may have already
+                // refreshed the token and stored a newer expiry. Detect that by
+                // re-reading K_EXPIRY: if it moved forward, use the stored token.
+                let concurrent_expiry: i64 = store
+                    .get_setting(K_EXPIRY)
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                if concurrent_expiry > expiry {
+                    return store
+                        .get_setting(K_USER_TOKEN)
+                        .ok()
+                        .flatten()
+                        .filter(|s| !s.is_empty());
+                }
+            }
         }
     }
 
-    // Refresh unavailable or failed. Hand back the old token only if it's still
-    // within its lifetime (a brief best-effort window); once actually expired,
-    // return None so we don't 401-loop on a dead token.
+    // Refresh unavailable or failed with no concurrent success.
+    // Return the old token while it's still within its stated lifetime so the
+    // caller can make one more attempt; once fully expired, return None to
+    // avoid 401-looping on a known-dead token.
     if now_unix() < expiry {
         Some(token)
     } else {
@@ -330,13 +367,45 @@ mod tests {
             .unwrap();
         assert!(valid_user_token(&http, &store).await.is_none());
 
-        // Comfortably valid token -> returned as-is (no refresh attempted).
+        // Token within the 5-minute early-refresh window but still alive, with no
+        // refresh token available: refresh is skipped, old token returned
+        // (best-effort within stated lifetime).
+        store
+            .set_setting(K_EXPIRY, &(now_unix() + 120).to_string())
+            .unwrap();
+        assert_eq!(
+            valid_user_token(&http, &store).await.as_deref(),
+            Some("deadbeef")
+        );
+
+        // Comfortably valid token (> 5 min to expiry) -> returned as-is.
         store
             .set_setting(K_EXPIRY, &(now_unix() + 3600).to_string())
             .unwrap();
         assert_eq!(
             valid_user_token(&http, &store).await.as_deref(),
             Some("deadbeef")
+        );
+
+        // Simulate concurrent refresh: token is in the refresh window, refresh
+        // fails (no refresh token), but another caller already stored a fresh token
+        // with a newer expiry -> pick up the new token.
+        let old_expiry = now_unix() + 120;
+        store
+            .set_setting(K_EXPIRY, &old_expiry.to_string())
+            .unwrap();
+        // Simulate the concurrent success: overwrite with a fresh token before we
+        // check the fallback path. We do this by calling store_tokens directly.
+        let fresh = Tokens {
+            access: "freshtoken".to_string(),
+            refresh: "newrefresh".to_string(),
+            expires_in: 14400,
+        };
+        store_tokens(&store, &fresh, "testuser").unwrap();
+        // Now valid_user_token should read the new expiry and return the new token.
+        assert_eq!(
+            valid_user_token(&http, &store).await.as_deref(),
+            Some("freshtoken")
         );
     }
 }

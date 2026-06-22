@@ -5,6 +5,9 @@
 //! tray "Quit" item triggers a real close.
 
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
@@ -65,6 +68,7 @@ enum ScheduleMode {
     Month,
     Week,
     Day,
+    Agenda,
 }
 
 /// State of the on-demand "List formats" probe (Videos tab), shown in a window.
@@ -380,6 +384,8 @@ pub struct StreamArchiverApp {
     schedule_collisions: bool,
     /// The day whose full stream list is shown in a popup (local date; None = closed).
     schedule_day_popup: Option<chrono::NaiveDate>,
+    /// Chat log viewer popup (None = closed).
+    chat_popup: Option<ChatPopup>,
     /// Platform favicons, uploaded to the GPU on first use (None until then).
     platform_tex: Option<PlatformTextures>,
     /// Sort + per-column filters for the Videos table.
@@ -529,6 +535,7 @@ impl StreamArchiverApp {
             schedule_hidden: HashSet::new(),
             schedule_collisions: true,
             schedule_day_popup: None,
+            chat_popup: None,
             platform_tex: None,
             videos_sort: SortState::default(),
             videos_filters: vec![String::new(); VIDEO_COLS],
@@ -1006,6 +1013,47 @@ fn today_start_unix() -> i64 {
 /// one), assume this duration when checking for time collisions.
 const COLLISION_DEFAULT_SECS: i64 = 2 * 3600;
 
+/// The effective end time of a stream: its stated end if valid, else 2 hours past start.
+/// Used by collision detection and the time-grid painter.
+fn effective_end(s: &UpcomingStream) -> i64 {
+    s.end_time
+        .filter(|&e| e > s.start_time)
+        .unwrap_or(s.start_time + COLLISION_DEFAULT_SECS)
+}
+
+/// Format a time range for display: "HH:MM – HH:MM" when end is valid, else "HH:MM".
+fn fmt_time_range(start: i64, end: Option<i64>) -> String {
+    let s = fmt_time_short(start);
+    match end.filter(|&e| e > start) {
+        Some(e) => format!("{s} – {}", fmt_time_short(e)),
+        None => s,
+    }
+}
+
+/// 16-color palette for calendar event blocks. Indexed by `channel_id % 16` so each
+/// channel gets a consistent, distinct color across all schedule views.
+fn channel_event_color(channel_id: i64) -> egui::Color32 {
+    const PALETTE: &[egui::Color32] = &[
+        egui::Color32::from_rgb(0x42, 0x88, 0xc4), // steel blue
+        egui::Color32::from_rgb(0x9c, 0x27, 0xb0), // purple
+        egui::Color32::from_rgb(0xe9, 0x1e, 0x63), // pink
+        egui::Color32::from_rgb(0xf4, 0x43, 0x36), // red
+        egui::Color32::from_rgb(0xff, 0x98, 0x00), // orange
+        egui::Color32::from_rgb(0xc0, 0x90, 0x00), // amber (darkened for readability)
+        egui::Color32::from_rgb(0x38, 0x8e, 0x3c), // green
+        egui::Color32::from_rgb(0x00, 0x83, 0x8f), // cyan (darkened)
+        egui::Color32::from_rgb(0x00, 0x79, 0x6b), // teal
+        egui::Color32::from_rgb(0x30, 0x3f, 0x9f), // indigo
+        egui::Color32::from_rgb(0x02, 0x77, 0xbd), // sky blue
+        egui::Color32::from_rgb(0x55, 0x8b, 0x2f), // light green
+        egui::Color32::from_rgb(0x82, 0x77, 0x17), // lime (darkened)
+        egui::Color32::from_rgb(0x6d, 0x40, 0x2f), // brown
+        egui::Color32::from_rgb(0x45, 0x5a, 0x64), // blue-grey
+        egui::Color32::from_rgb(0x75, 0x75, 0x75), // grey
+    ];
+    PALETTE[(channel_id.unsigned_abs() as usize) % PALETTE.len()]
+}
+
 /// Indices into `all` whose visible (channel not in `hidden`) time window overlaps
 /// another visible stream's — i.e. two streams scheduled at the same time. A
 /// stream with no/invalid end time is treated as [`COLLISION_DEFAULT_SECS`] long.
@@ -1015,13 +1063,7 @@ fn schedule_collisions(all: &[UpcomingStream], hidden: &HashSet<i64>) -> HashSet
         .iter()
         .enumerate()
         .filter(|(_, s)| !hidden.contains(&s.channel_id))
-        .map(|(i, s)| {
-            let end = s
-                .end_time
-                .filter(|&e| e > s.start_time)
-                .unwrap_or(s.start_time + COLLISION_DEFAULT_SECS);
-            (i, s.start_time, end)
-        })
+        .map(|(i, s)| (i, s.start_time, effective_end(s)))
         .collect();
     spans.sort_by_key(|&(_, start, _)| start);
     let mut out = HashSet::new();
@@ -1158,13 +1200,20 @@ fn schedule_detail_row(
     colliding: bool,
     ptex: &PlatformTextures,
 ) {
+    let color = channel_event_color(s.channel_id);
     let resp = ui
         .horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 5.0;
+            // 3px colored left stripe
+            let (stripe_rect, _) = ui.allocate_exact_size(
+                egui::vec2(3.0, ui.text_style_height(&egui::TextStyle::Body)),
+                egui::Sense::hover(),
+            );
+            ui.painter().rect_filled(stripe_rect, egui::CornerRadius::same(2), color);
             if colliding {
                 ui.colored_label(HL_COLLISION, "⚠");
             }
-            ui.label(egui::RichText::new(fmt_time_short(s.start_time)).monospace());
+            ui.label(egui::RichText::new(fmt_time_range(s.start_time, s.end_time)).monospace());
             platform_icon(ui, ptex, s.platform());
             let mut line = s.channel_name.clone();
             if !s.title.is_empty() {
@@ -1187,6 +1236,323 @@ fn schedule_detail_row(
 const TODAY_BG: egui::Color32 = egui::Color32::from_rgba_premultiplied(0x2c, 0x4a, 0x6e, 0x40);
 /// Marker color for a stream that overlaps another (a scheduling collision).
 const HL_COLLISION: egui::Color32 = egui::Color32::from_rgb(0xff, 0x8a, 0x5c);
+
+// ── Time-grid calendar constants ─────────────────────────────────────────────
+/// Pixels per hour in the time-grid (Week + Day) views.
+const SCHED_HOUR_PX: f32 = 60.0;
+/// Total scrollable height of the 24-hour time grid.
+const SCHED_TOTAL_H: f32 = 24.0 * SCHED_HOUR_PX;
+/// Width of the left-side "HH:MM" hour-label column in the time grid.
+const SCHED_TIME_COL_W: f32 = 44.0;
+/// Gap between day columns in the time grid.
+const SCHED_COL_GAP: f32 = 4.0;
+/// Minimum event block height so zero/short-duration events remain clickable.
+const SCHED_MIN_BLOCK_H: f32 = 22.0;
+
+/// Seconds past local midnight for a unix timestamp (for positioning on the time grid).
+fn secs_since_midnight(unix: i64) -> f32 {
+    use chrono::Timelike;
+    chrono::DateTime::from_timestamp(unix, 0)
+        .map(|dt| {
+            let local = dt.with_timezone(&chrono::Local);
+            (local.hour() * 3600 + local.minute() * 60 + local.second()) as f32
+        })
+        .unwrap_or(0.0)
+}
+
+/// Assign events to non-overlapping lanes (columns within a day column) so that
+/// concurrent events are displayed side-by-side. Returns `(stream_idx, lane, total_lanes)`.
+fn layout_event_lanes(
+    indices: &[usize],
+    all: &[UpcomingStream],
+) -> Vec<(usize, usize, usize)> {
+    if indices.is_empty() {
+        return vec![];
+    }
+    // lane_end[i] = effective end of the last event assigned to lane i
+    let mut lane_end: Vec<i64> = Vec::new();
+    let mut assignments: Vec<(usize, usize)> = Vec::new(); // (stream_idx, lane)
+
+    for &idx in indices {
+        let s = &all[idx];
+        let end = effective_end(s);
+        // Find the first lane that is free at s.start_time.
+        let lane = lane_end
+            .iter()
+            .position(|&le| le <= s.start_time)
+            .unwrap_or_else(|| {
+                lane_end.push(0);
+                lane_end.len() - 1
+            });
+        lane_end[lane] = end;
+        assignments.push((idx, lane));
+    }
+
+    let total = lane_end.len().max(1);
+    assignments.into_iter().map(|(i, l)| (i, l, total)).collect()
+}
+
+/// Draw a 24-hour time-grid for one or more day columns. Called by both the Week
+/// and Day views. `days` lists the calendar dates; `col_w` is the per-column
+/// content width (excluding the time label column and gaps).
+#[allow(clippy::too_many_arguments)]
+fn schedule_time_grid(
+    ui: &mut egui::Ui,
+    id: &str,
+    days: &[chrono::NaiveDate],
+    col_w: f32,
+    all: &[UpcomingStream],
+    by_day: &HashMap<chrono::NaiveDate, Vec<usize>>,
+    collide: &HashSet<usize>,
+    open_day: &mut Option<chrono::NaiveDate>,
+) {
+    use chrono::Timelike;
+    // Scroll to show the current local hour when the view first appears.
+    let now_hour = chrono::Local::now().hour() as f32;
+    let initial_offset = (now_hour * SCHED_HOUR_PX - 120.0).max(0.0);
+
+    let grid_w = SCHED_TIME_COL_W + days.len() as f32 * (col_w + SCHED_COL_GAP);
+
+    let mut hovered_tip: Option<String> = None;
+    let mut clicked_day: Option<chrono::NaiveDate> = None;
+    let mut ctx_stream: Option<usize> = None; // stream idx for context menu
+
+    egui::ScrollArea::vertical()
+        .id_salt(id)
+        .auto_shrink([false, false])
+        .vertical_scroll_offset(initial_offset)
+        .show(ui, |ui| {
+            let (response, painter) = ui.allocate_painter(
+                egui::vec2(grid_w, SCHED_TOTAL_H),
+                egui::Sense::click(),
+            );
+            let origin = response.rect.min;
+
+            // ── Hour grid lines + labels ──────────────────────────────────
+            let grid_line_color = egui::Color32::from_white_alpha(18);
+            let half_line_color = egui::Color32::from_white_alpha(8);
+            let label_color = ui.visuals().weak_text_color();
+            let font = egui::FontId::proportional(10.0);
+
+            for hour in 0u32..24 {
+                let y = origin.y + hour as f32 * SCHED_HOUR_PX;
+                // Hour label
+                painter.text(
+                    egui::pos2(origin.x + 2.0, y + 2.0),
+                    egui::Align2::LEFT_TOP,
+                    format!("{hour:02}:00"),
+                    font.clone(),
+                    label_color,
+                );
+                // Full-hour line across all columns
+                painter.line_segment(
+                    [
+                        egui::pos2(origin.x + SCHED_TIME_COL_W, y),
+                        egui::pos2(origin.x + grid_w, y),
+                    ],
+                    egui::Stroke::new(1.0, grid_line_color),
+                );
+                // Half-hour line (lighter)
+                let yh = y + SCHED_HOUR_PX / 2.0;
+                painter.line_segment(
+                    [
+                        egui::pos2(origin.x + SCHED_TIME_COL_W, yh),
+                        egui::pos2(origin.x + grid_w, yh),
+                    ],
+                    egui::Stroke::new(1.0, half_line_color),
+                );
+            }
+
+            // ── Vertical column dividers ──────────────────────────────────
+            let divider_color = egui::Color32::from_white_alpha(22);
+            for col in 0..=days.len() {
+                let x = origin.x + SCHED_TIME_COL_W + col as f32 * (col_w + SCHED_COL_GAP);
+                painter.line_segment(
+                    [egui::pos2(x, origin.y), egui::pos2(x, origin.y + SCHED_TOTAL_H)],
+                    egui::Stroke::new(1.0, divider_color),
+                );
+            }
+
+            // ── Current-time indicator (red line) ─────────────────────────
+            {
+                let now = chrono::Local::now();
+                let today = now.date_naive();
+                let now_secs = (now.hour() * 3600 + now.minute() * 60 + now.second()) as f32;
+                if let Some(col_idx) = days.iter().position(|&d| d == today) {
+                    let x_start = origin.x + SCHED_TIME_COL_W + col_idx as f32 * (col_w + SCHED_COL_GAP);
+                    let x_end = x_start + col_w;
+                    let y = origin.y + now_secs / 3600.0 * SCHED_HOUR_PX;
+                    painter.line_segment(
+                        [egui::pos2(x_start, y), egui::pos2(x_end, y)],
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(0xff, 0x44, 0x44)),
+                    );
+                    // Small circle at left edge
+                    painter.circle_filled(
+                        egui::pos2(x_start, y),
+                        4.0,
+                        egui::Color32::from_rgb(0xff, 0x44, 0x44),
+                    );
+                }
+            }
+
+            // ── Event blocks ──────────────────────────────────────────────
+            let hover_pos = response.hover_pos();
+
+            // Collect all event rects for hit-testing after painting.
+            let mut event_rects: Vec<(egui::Rect, usize, chrono::NaiveDate)> = Vec::new();
+
+            for (col_idx, &day) in days.iter().enumerate() {
+                let col_x = origin.x + SCHED_TIME_COL_W + col_idx as f32 * (col_w + SCHED_COL_GAP);
+                let indices = by_day.get(&day).map(Vec::as_slice).unwrap_or(&[]);
+                let layout = layout_event_lanes(indices, all);
+
+                for (stream_idx, lane, total_lanes) in layout {
+                    let s = &all[stream_idx];
+                    let start_secs = secs_since_midnight(s.start_time);
+                    let end_secs = secs_since_midnight(effective_end(s));
+
+                    // Clip to day boundaries (midnight transitions handled by bucketing).
+                    let end_secs = if end_secs <= start_secs {
+                        // Event ends on next day — clip at midnight.
+                        SCHED_TOTAL_H / SCHED_HOUR_PX * 3600.0
+                    } else {
+                        end_secs
+                    };
+                    let duration_secs = (end_secs - start_secs).max(0.0);
+
+                    let top = origin.y + start_secs / 3600.0 * SCHED_HOUR_PX;
+                    let block_h = (duration_secs / 3600.0 * SCHED_HOUR_PX).max(SCHED_MIN_BLOCK_H);
+                    let lane_w = (col_w - 2.0 * (total_lanes as f32 - 1.0)) / total_lanes as f32;
+                    let left = col_x + 1.0 + lane as f32 * (lane_w + 2.0);
+
+                    let block_rect = egui::Rect::from_min_size(
+                        egui::pos2(left, top),
+                        egui::vec2(lane_w, block_h),
+                    );
+                    event_rects.push((block_rect, stream_idx, day));
+
+                    let color = channel_event_color(s.channel_id);
+                    let hovered = hover_pos.is_some_and(|p| block_rect.contains(p));
+                    let fill = if hovered {
+                        color // brighter on hover — stroke already provides accent
+                    } else {
+                        egui::Color32::from_rgba_unmultiplied(
+                            color.r(), color.g(), color.b(), 210,
+                        )
+                    };
+                    let rounding = egui::CornerRadius::same(4);
+                    painter.rect_filled(block_rect, rounding, fill);
+                    // Slightly darker left edge strip for depth
+                    painter.rect_filled(
+                        egui::Rect::from_min_size(block_rect.min, egui::vec2(3.0, block_h)),
+                        egui::CornerRadius { nw: 4, sw: 4, ne: 0, se: 0 },
+                        egui::Color32::from_rgba_unmultiplied(
+                            (color.r() as i32 - 30).max(0) as u8,
+                            (color.g() as i32 - 30).max(0) as u8,
+                            (color.b() as i32 - 30).max(0) as u8,
+                            255,
+                        ),
+                    );
+                    if collide.contains(&stream_idx) {
+                        painter.rect_stroke(
+                            block_rect,
+                            rounding,
+                            egui::Stroke::new(1.5, HL_COLLISION),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+
+                    // Text inside the block (white, clipped to block height)
+                    let text_rect = block_rect.shrink2(egui::vec2(5.0, 3.0));
+                    if text_rect.height() >= 12.0 {
+                        let name_font = egui::FontId::proportional(11.0);
+                        let time_font = egui::FontId::proportional(10.0);
+                        let white = egui::Color32::WHITE;
+                        let text_y = text_rect.top();
+                        // Channel name
+                        painter.text(
+                            egui::pos2(text_rect.left(), text_y),
+                            egui::Align2::LEFT_TOP,
+                            &s.channel_name,
+                            name_font,
+                            white,
+                        );
+                        // Time range (below channel name if enough space)
+                        if block_h >= 36.0 {
+                            painter.text(
+                                egui::pos2(text_rect.left(), text_y + 13.0),
+                                egui::Align2::LEFT_TOP,
+                                fmt_time_range(s.start_time, s.end_time),
+                                time_font.clone(),
+                                egui::Color32::from_white_alpha(200),
+                            );
+                        }
+                        // Title (if enough height)
+                        if block_h >= 56.0 && !s.title.is_empty() {
+                            painter.text(
+                                egui::pos2(text_rect.left(), text_y + 26.0),
+                                egui::Align2::LEFT_TOP,
+                                &s.title,
+                                time_font,
+                                egui::Color32::from_white_alpha(180),
+                            );
+                        }
+                    }
+
+                    if hovered {
+                        hovered_tip = Some(schedule_detail_line(s));
+                    }
+                }
+            }
+
+            // ── Hit-testing: click + right-click ─────────────────────────
+            if response.clicked() {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    for &(rect, _idx, day) in &event_rects {
+                        if rect.contains(pos) {
+                            clicked_day = Some(day);
+                            break;
+                        }
+                    }
+                }
+            }
+            if response.secondary_clicked() {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    for &(rect, idx, _day) in &event_rects {
+                        if rect.contains(pos) {
+                            ctx_stream = Some(idx);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Tooltip for hovered event — only set when pointer is over an event block.
+            if let Some(tip) = hovered_tip {
+                response.on_hover_text(tip);
+            }
+        });
+
+    // Context menu (must be outside the closure since it borrows ui)
+    if let Some(idx) = ctx_stream {
+        let s = &all[idx];
+        // Use a small invisible area near the mouse for the context menu.
+        // egui doesn't easily support per-painted-rect context menus, so we
+        // surface a right-click popup via a dummy response.
+        let resp = ui.allocate_rect(
+            egui::Rect::from_min_size(
+                ui.ctx().pointer_interact_pos().unwrap_or_default(),
+                egui::vec2(1.0, 1.0),
+            ),
+            egui::Sense::click(),
+        );
+        resp.context_menu(|ui| schedule_copy_menu(ui, s));
+    }
+
+    if let Some(day) = clicked_day {
+        *open_day = Some(day);
+    }
+}
 
 /// Success/affirmative green, shared across the table (recording "completed",
 /// video "completed", ad-free "Yes").
@@ -1411,6 +1777,48 @@ enum MetaPopup {
     /// A whole stream's takes — `(recording id, started_at)`, oldest-first —
     /// aggregated chronologically with the per-take re-baselines omitted.
     Stream(Vec<(i64, i64)>),
+}
+
+/// Source platform of a captured chat message (drives username colouring).
+#[derive(Clone)]
+enum ChatPlatform {
+    YouTube,
+    Twitch,
+}
+
+/// A single parsed chat message (YouTube `.live_chat.json` or Twitch `.chat.jsonl`).
+#[derive(Clone)]
+struct ChatMessage {
+    /// Seconds from stream start (negative = chat arrived before we started recording).
+    timestamp_secs: f64,
+    author: String,
+    text: String,
+    /// Twitch: raw IRC badge segment per entry, e.g. `"subscriber/12"`.
+    /// YouTube: badge tooltip text, e.g. `"Member"`.
+    badges: Vec<String>,
+    /// Explicit hex colour from Twitch USERCOLOR; `None` when unset or YouTube.
+    color_override: Option<egui::Color32>,
+    platform: ChatPlatform,
+}
+
+#[derive(Clone)]
+enum ChatLoadState {
+    Loading,
+    Loaded(Vec<ChatMessage>),
+    NoFile,
+    Error(String),
+}
+
+struct ChatPopup {
+    monitor_name: String,
+    /// Currently-viewed recording (`None` = monitor has no recordings at all).
+    recording: Option<Recording>,
+    all_recordings: Vec<Recording>,
+    load_state: Arc<Mutex<ChatLoadState>>,
+    search: String,
+    /// When `true`: show the entire log from the top (no cap, stick-to-bottom off).
+    /// When `false` (default): show the last 500 msgs and stick to bottom.
+    full_view: bool,
 }
 
 /// Merge a stream's takes into one chronological change list. Each take's offsets
@@ -1980,6 +2388,7 @@ struct RowActions {
     start: Option<i64>,                 // monitor id
     stop: Option<i64>,                  // monitor id
     stop_chat: Option<i64>,             // monitor id
+    view_chat: Option<i64>,             // monitor id
     edit: Option<i64>,                  // monitor id
     add_instance: Option<i64>,          // channel id
     delete: Option<(i64, String)>,      // (monitor id, channel name)
@@ -2026,6 +2435,12 @@ fn render_instance_row(
         if chat_active {
             if ui.button("💬  Stop chat download").clicked() {
                 a.stop_chat = Some(m.id);
+                ui.close();
+            }
+        }
+        if m.chat_log {
+            if ui.button("💬  View chat").clicked() {
+                a.view_chat = Some(m.id);
                 ui.close();
             }
         }
@@ -2474,6 +2889,7 @@ impl eframe::App for StreamArchiverApp {
         self.meta_popup_window(ui.ctx());
         self.schedule_popup_window(ui.ctx());
         self.schedule_day_window(ui.ctx());
+        self.chat_popup_window(ui.ctx());
     }
 }
 
@@ -3907,6 +4323,11 @@ impl StreamArchiverApp {
                     .to_string();
                 (anchor, add_days(anchor, 1), title)
             }
+            ScheduleMode::Agenda => {
+                // Show all upcoming from anchor; use far-future end so the collision
+                // badge counts everything visible.
+                (anchor, add_days(anchor, 365), "Agenda".to_string())
+            }
         };
         let (prev_date, next_date) = match mode {
             // Snap month nav to the 1st: the grid only uses the month anyway, and it
@@ -3915,7 +4336,7 @@ impl StreamArchiverApp {
                 shift_month(anchor, -1).with_day(1).unwrap_or(anchor),
                 shift_month(anchor, 1).with_day(1).unwrap_or(anchor),
             ),
-            ScheduleMode::Week => (add_days(anchor, -7), add_days(anchor, 7)),
+            ScheduleMode::Week | ScheduleMode::Agenda => (add_days(anchor, -7), add_days(anchor, 7)),
             ScheduleMode::Day => (add_days(anchor, -1), add_days(anchor, 1)),
         };
         // Collisions visible in the current view (the per-chip ⚠ uses the global
@@ -3936,6 +4357,7 @@ impl StreamArchiverApp {
                 ui.selectable_value(&mut m, ScheduleMode::Month, "Month");
                 ui.selectable_value(&mut m, ScheduleMode::Week, "Week");
                 ui.selectable_value(&mut m, ScheduleMode::Day, "Day");
+                ui.selectable_value(&mut m, ScheduleMode::Agenda, "Agenda");
                 if m != mode {
                     set_mode = Some(m);
                 }
@@ -3984,7 +4406,10 @@ impl StreamArchiverApp {
                     self.schedule_week_grid(ui, anchor, today, &by_day, &collide, &ptex, &mut open_day)
                 }
                 ScheduleMode::Day => {
-                    self.schedule_day_list(ui, by_day.get(&anchor), &collide, &ptex)
+                    self.schedule_day_grid(ui, anchor, today, &by_day, &collide, &mut open_day)
+                }
+                ScheduleMode::Agenda => {
+                    self.schedule_agenda_view(ui, anchor, &by_day, &collide, &ptex, &mut open_day)
                 }
             }
         });
@@ -4027,7 +4452,7 @@ impl StreamArchiverApp {
         }
     }
 
-    /// One compact calendar chip (⚠ if colliding · platform icon · time · channel)
+    /// One compact calendar chip (colored stripe · ⚠ · platform icon · time range · channel)
     /// with a hover detail and the copy context menu. Returns the click response so
     /// the caller can react (e.g. open the day popup). Shared by month + week views.
     fn schedule_chip(
@@ -4038,17 +4463,24 @@ impl StreamArchiverApp {
         ptex: &PlatformTextures,
     ) -> egui::Response {
         let s = &self.schedule_all[i];
+        let color = channel_event_color(s.channel_id);
         let resp = ui
             .horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 3.0;
+                // 3px colored left stripe
+                let (stripe_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(3.0, ui.text_style_height(&egui::TextStyle::Body)),
+                    egui::Sense::hover(),
+                );
+                ui.painter().rect_filled(stripe_rect, egui::CornerRadius::same(2), color);
                 if colliding {
                     ui.colored_label(HL_COLLISION, "⚠");
                 }
                 platform_icon(ui, ptex, s.platform());
                 ui.add(
                     egui::Label::new(format!(
-                        "{} {}",
-                        fmt_time_short(s.start_time),
+                        "{}  {}",
+                        fmt_time_range(s.start_time, s.end_time),
                         s.channel_name
                     ))
                     .truncate(),
@@ -4134,7 +4566,7 @@ impl StreamArchiverApp {
             });
     }
 
-    /// Week view: 7 day columns (Mon–Sun), each listing all of that day's streams.
+    /// Week view: 7-column time-grid with a 24-hour vertical axis.
     #[allow(clippy::too_many_arguments)]
     fn schedule_week_grid(
         &self,
@@ -4143,107 +4575,93 @@ impl StreamArchiverApp {
         today: chrono::NaiveDate,
         by_day: &HashMap<chrono::NaiveDate, Vec<usize>>,
         collide: &HashSet<usize>,
-        ptex: &PlatformTextures,
+        _ptex: &PlatformTextures,
         open_day: &mut Option<chrono::NaiveDate>,
     ) {
         use chrono::Datelike;
         let ws = week_start(anchor);
-        let spacing = 4.0;
-        let usable = (ui.available_width() - 16.0).max(160.0);
-        let col_w = ((usable - spacing * 6.0) / 7.0).floor().max(96.0);
-        let col_h = (ui.available_height() - 8.0).max(160.0);
+        let days: Vec<chrono::NaiveDate> = (0..7).map(|d| add_days(ws, d)).collect();
 
-        egui::ScrollArea::both()
-            .id_salt("sched_week")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(spacing, spacing);
-                ui.horizontal_top(|ui| {
-                    for dow in 0..7i64 {
-                        let day = add_days(ws, dow);
-                        let is_today = day == today;
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(col_w, col_h),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                let mut frame =
-                                    egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(4));
-                                if is_today {
-                                    frame = frame.fill(TODAY_BG);
-                                }
-                                frame.show(ui, |ui| {
-                                    ui.set_min_size(egui::vec2(col_w - 10.0, col_h - 10.0));
-                                    ui.vertical(|ui| {
-                                        let hdr = format!("{} {}", day.format("%a"), day.day());
-                                        if ui
-                                            .add(
-                                                egui::Label::new(
-                                                    egui::RichText::new(hdr).strong(),
-                                                )
-                                                .sense(egui::Sense::click()),
-                                            )
-                                            .on_hover_text("Show this day's streams")
-                                            .clicked()
-                                        {
-                                            *open_day = Some(day);
-                                        }
-                                        ui.separator();
-                                        match by_day.get(&day) {
-                                            Some(list) => {
-                                                for &i in list {
-                                                    let c = collide.contains(&i);
-                                                    if self
-                                                        .schedule_chip(ui, i, c, ptex)
-                                                        .clicked()
-                                                    {
-                                                        *open_day = Some(day);
-                                                    }
-                                                }
-                                            }
-                                            None => {
-                                                ui.label(egui::RichText::new("—").weak());
-                                            }
-                                        }
-                                    });
-                                });
-                            },
-                        );
-                    }
-                });
-            });
+        // Day-header row (outside the scroll area so it stays fixed).
+        let time_col_w = SCHED_TIME_COL_W;
+        let avail_w = ui.available_width();
+        let col_w = ((avail_w - time_col_w - 6.0 * SCHED_COL_GAP) / 7.0).max(60.0);
+        ui.horizontal(|ui| {
+            ui.add_space(time_col_w);
+            for &day in &days {
+                let is_today = day == today;
+                let hdr = format!("{}\n{}", day.format("%a"), day.day());
+                let text = if is_today {
+                    egui::RichText::new(hdr).strong().color(ui.visuals().hyperlink_color)
+                } else {
+                    egui::RichText::new(hdr).strong()
+                };
+                let resp = ui.allocate_ui_with_layout(
+                    egui::vec2(col_w + SCHED_COL_GAP, 36.0),
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        if is_today {
+                            let r = ui.max_rect();
+                            ui.painter().rect_filled(r, egui::CornerRadius::ZERO, TODAY_BG);
+                        }
+                        ui.add(egui::Label::new(text).sense(egui::Sense::click()))
+                            .on_hover_text("Open day detail")
+                    },
+                );
+                if resp.inner.clicked() {
+                    *open_day = Some(day);
+                }
+            }
+        });
+        ui.separator();
+
+        schedule_time_grid(
+            ui,
+            "sched_week",
+            &days,
+            col_w,
+            &self.schedule_all,
+            by_day,
+            collide,
+            open_day,
+        );
     }
 
-    /// Day view: a detailed, time-sorted list of one day's streams.
-    fn schedule_day_list(
+    /// Day view: single-column time-grid with full-width event blocks.
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_day_grid(
         &self,
         ui: &mut egui::Ui,
-        entries: Option<&Vec<usize>>,
+        anchor: chrono::NaiveDate,
+        today: chrono::NaiveDate,
+        by_day: &HashMap<chrono::NaiveDate, Vec<usize>>,
         collide: &HashSet<usize>,
-        ptex: &PlatformTextures,
+        open_day: &mut Option<chrono::NaiveDate>,
     ) {
-        match entries {
-            Some(list) if !list.is_empty() => {
-                ui.label(format!("{} scheduled stream(s).", list.len()));
-                ui.add_space(4.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("sched_day")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for &i in list {
-                            schedule_detail_row(
-                                ui,
-                                &self.schedule_all[i],
-                                collide.contains(&i),
-                                ptex,
-                            );
-                        }
-                    });
-            }
-            _ => {
-                ui.add_space(12.0);
-                ui.label(egui::RichText::new("No streams scheduled this day.").weak());
-            }
-        }
+        let is_today = anchor == today;
+        let hdr = anchor
+            .format(&format!("%A, {}", active_date_fmt().date_pattern()))
+            .to_string();
+        let text = if is_today {
+            egui::RichText::new(hdr).strong().color(ui.visuals().hyperlink_color)
+        } else {
+            egui::RichText::new(hdr).strong()
+        };
+        ui.label(text);
+        ui.separator();
+
+        let avail_w = ui.available_width();
+        let col_w = (avail_w - SCHED_TIME_COL_W - 2.0).max(80.0);
+        schedule_time_grid(
+            ui,
+            "sched_day",
+            &[anchor],
+            col_w,
+            &self.schedule_all,
+            by_day,
+            collide,
+            open_day,
+        );
     }
 
     /// Render one month-grid day cell: a bordered box with the day number and up to
@@ -4316,6 +4734,118 @@ impl StreamArchiverApp {
                 }
             });
         });
+    }
+
+    /// Agenda view: date-grouped chronological list of all upcoming streams from `anchor`.
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_agenda_view(
+        &self,
+        ui: &mut egui::Ui,
+        anchor: chrono::NaiveDate,
+        by_day: &HashMap<chrono::NaiveDate, Vec<usize>>,
+        collide: &HashSet<usize>,
+        ptex: &PlatformTextures,
+        open_day: &mut Option<chrono::NaiveDate>,
+    ) {
+        // Collect and sort the days from `anchor` forward that have visible entries.
+        let mut days: Vec<chrono::NaiveDate> = by_day
+            .keys()
+            .filter(|&&d| d >= anchor)
+            .copied()
+            .collect();
+        days.sort();
+
+        if days.is_empty() {
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new("No streams scheduled from this date.").weak());
+            return;
+        }
+
+        egui::ScrollArea::vertical()
+            .id_salt("sched_agenda")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for day in &days {
+                    let Some(indices) = by_day.get(day) else { continue };
+                    if indices.is_empty() { continue }
+
+                    // Date group header
+                    let heading = day
+                        .format(&format!("%A, {}", active_date_fmt().date_pattern()))
+                        .to_string();
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.strong(heading);
+                    });
+                    ui.separator();
+
+                    for &i in indices {
+                        let s = &self.schedule_all[i];
+                        let color = channel_event_color(s.channel_id);
+                        let colliding = collide.contains(&i);
+
+                        let row_resp = ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+
+                            // Colored stripe
+                            let (stripe_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(4.0, ui.text_style_height(&egui::TextStyle::Body) * 1.4),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().rect_filled(stripe_rect, egui::CornerRadius::same(2), color);
+
+                            // Time range
+                            if colliding {
+                                ui.colored_label(HL_COLLISION, "⚠");
+                            }
+                            ui.add(egui::Label::new(
+                                egui::RichText::new(fmt_time_range(s.start_time, s.end_time))
+                                    .monospace()
+                                    .size(12.0),
+                            ));
+
+                            // Platform icon
+                            platform_icon(ui, ptex, s.platform());
+
+                            // Channel name (bold)
+                            ui.strong(&s.channel_name);
+
+                            // Title (muted, truncated)
+                            if !s.title.is_empty() {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(format!("— {}", s.title))
+                                            .weak()
+                                            .size(12.0),
+                                    )
+                                    .truncate(),
+                                );
+                            }
+
+                            // Category in parens (weak)
+                            if !s.category.is_empty() {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(format!("({})", s.category))
+                                            .weak()
+                                            .size(11.0),
+                                    )
+                                    .truncate(),
+                                );
+                            }
+                        })
+                        .response
+                        .interact(egui::Sense::click());
+
+                        let row_resp = row_resp.on_hover_text(schedule_detail_line(s));
+                        row_resp.context_menu(|ui| schedule_copy_menu(ui, s));
+                        if row_resp.clicked() {
+                            *open_day = Some(*day);
+                        }
+                        ui.add_space(1.0);
+                    }
+                }
+            });
     }
 
     /// Popup listing every (visible) stream on one calendar day, with the same
@@ -5348,6 +5878,9 @@ impl StreamArchiverApp {
             self.core.manual(ManualCommand::StopChat(id));
             self.status = "Stopping chat download…".into();
         }
+        if let Some(mid) = acts.view_chat {
+            self.open_chat_popup(mid);
+        }
         if let Some(p) = open_path {
             crate::platform::open_path(&p);
         }
@@ -6043,6 +6576,473 @@ impl StreamArchiverApp {
             self.form = None;
         }
     }
+
+    // ── Chat log viewer ──────────────────────────────────────────────────────
+
+    fn open_chat_popup(&mut self, monitor_id: i64) {
+        let monitor_name = self
+            .rows
+            .iter()
+            .find(|r| r.monitor.id == monitor_id)
+            .map(|r| r.channel.name.clone())
+            .unwrap_or_default();
+        let recs = self
+            .core
+            .store
+            .recordings_for_monitor(monitor_id)
+            .unwrap_or_default();
+        let rec = recs
+            .iter()
+            .rev()
+            .find(|r| chat_file_for_recording(r).is_some())
+            .or_else(|| recs.last())
+            .cloned();
+
+        let state = Arc::new(Mutex::new(ChatLoadState::Loading));
+        if let Some(r) = &rec {
+            let state2 = state.clone();
+            let path_opt = chat_file_for_recording(r);
+            let start_ts = r.went_live_at.unwrap_or(r.started_at);
+            self.core.rt.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || match path_opt {
+                    None => ChatLoadState::NoFile,
+                    Some(p) => match parse_chat_file(&p, start_ts) {
+                        Ok(msgs) => ChatLoadState::Loaded(msgs),
+                        Err(e) => ChatLoadState::Error(e.to_string()),
+                    },
+                })
+                .await
+                .unwrap_or_else(|e| ChatLoadState::Error(e.to_string()));
+                *state2.lock().unwrap() = result;
+            });
+        } else {
+            *state.lock().unwrap() = ChatLoadState::NoFile;
+        }
+        self.chat_popup = Some(ChatPopup {
+            monitor_name,
+            recording: rec,
+            all_recordings: recs,
+            load_state: state,
+            search: String::new(),
+            full_view: false,
+        });
+    }
+
+    fn chat_popup_window(&mut self, ctx: &egui::Context) {
+        let Some(popup) = &mut self.chat_popup else {
+            return;
+        };
+        let mut open = true;
+        let title = format!("💬  Chat — {}", popup.monitor_name);
+        egui::Window::new(&title)
+            .open(&mut open)
+            .default_size([480.0, 600.0])
+            .resizable(true)
+            .show(ctx, |ui| {
+                // ── Toolbar ──────────────────────────────────────────────
+                ui.horizontal(|ui| {
+                    // Recording picker: only if >1 recording has a chat file.
+                    let recs_with_chat: Vec<_> = popup
+                        .all_recordings
+                        .iter()
+                        .filter(|r| chat_file_for_recording(r).is_some())
+                        .collect();
+                    if recs_with_chat.len() > 1 {
+                        let cur_label = popup
+                            .recording
+                            .as_ref()
+                            .map(fmt_recording_label)
+                            .unwrap_or_default();
+                        egui::ComboBox::from_id_salt("chat_rec_pick")
+                            .selected_text(cur_label)
+                            .show_ui(ui, |ui| {
+                                for rec in &recs_with_chat {
+                                    let label = fmt_recording_label(rec);
+                                    let selected = popup
+                                        .recording
+                                        .as_ref()
+                                        .map(|r| r.id == rec.id)
+                                        .unwrap_or(false);
+                                    if ui.selectable_label(selected, &label).clicked() {
+                                        let new_rec = (*rec).clone();
+                                        let state = Arc::new(Mutex::new(ChatLoadState::Loading));
+                                        let state2 = state.clone();
+                                        let path_opt = chat_file_for_recording(&new_rec);
+                                        let start_ts =
+                                            new_rec.went_live_at.unwrap_or(new_rec.started_at);
+                                        popup.load_state = state;
+                                        popup.recording = Some(new_rec);
+                                        self.core.rt.spawn(async move {
+                                            let r = tokio::task::spawn_blocking(move || {
+                                                match path_opt {
+                                                    None => ChatLoadState::NoFile,
+                                                    Some(p) => {
+                                                        match parse_chat_file(&p, start_ts) {
+                                                            Ok(m) => ChatLoadState::Loaded(m),
+                                                            Err(e) => {
+                                                                ChatLoadState::Error(e.to_string())
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            })
+                                            .await
+                                            .unwrap_or_else(|e| {
+                                                ChatLoadState::Error(e.to_string())
+                                            });
+                                            *state2.lock().unwrap() = r;
+                                        });
+                                    }
+                                }
+                            });
+                        ui.separator();
+                    }
+
+                    // Search filter
+                    ui.label("🔍");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut popup.search)
+                            .hint_text("Filter…")
+                            .desired_width(150.0),
+                    );
+                    if !popup.search.is_empty() && ui.small_button("✕").clicked() {
+                        popup.search.clear();
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.toggle_value(&mut popup.full_view, "View full");
+                    });
+                });
+                ui.separator();
+
+                // ── Content ──────────────────────────────────────────────
+                let state = popup.load_state.lock().unwrap().clone();
+                match state {
+                    ChatLoadState::Loading => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Loading chat…");
+                        });
+                        ctx.request_repaint();
+                    }
+                    ChatLoadState::NoFile => {
+                        ui.add_space(8.0);
+                        ui.label("No chat file found for this recording.");
+                        ui.weak("Chat logging must be enabled and a recording must exist.");
+                    }
+                    ChatLoadState::Error(ref e) => {
+                        ui.colored_label(egui::Color32::RED, format!("Failed to load: {e}"));
+                    }
+                    ChatLoadState::Loaded(ref msgs) => {
+                        let q = popup.search.to_lowercase();
+                        let all_filtered: Vec<&ChatMessage> = msgs
+                            .iter()
+                            .filter(|m| {
+                                q.is_empty()
+                                    || m.text.to_lowercase().contains(&q)
+                                    || m.author.to_lowercase().contains(&q)
+                            })
+                            .collect();
+
+                        const DEFAULT_CAP: usize = 500;
+                        let (visible, capped) =
+                            if popup.full_view || all_filtered.len() <= DEFAULT_CAP {
+                                (all_filtered.as_slice(), false)
+                            } else {
+                                (&all_filtered[all_filtered.len() - DEFAULT_CAP..], true)
+                            };
+
+                        if capped {
+                            ui.horizontal(|ui| {
+                                ui.weak(format!(
+                                    "Showing last {DEFAULT_CAP} of {} messages",
+                                    all_filtered.len()
+                                ));
+                                if ui.small_button("View full").clicked() {
+                                    popup.full_view = true;
+                                }
+                            });
+                        } else {
+                            ui.weak(format!("{} messages", all_filtered.len()));
+                        }
+
+                        let stick = q.is_empty() && !popup.full_view;
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .stick_to_bottom(stick)
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                for msg in visible {
+                                    render_chat_message(ui, msg);
+                                }
+                            });
+                    }
+                }
+            });
+        if !open {
+            self.chat_popup = None;
+        }
+    }
+}
+
+// ── Chat viewer helpers ──────────────────────────────────────────────────────
+
+/// Derive the chat sidecar path from a recording's output path.
+/// Tries `.live_chat.json` (yt-dlp YouTube) then `.chat.jsonl` (Twitch).
+fn chat_file_for_recording(rec: &Recording) -> Option<std::path::PathBuf> {
+    let base = Path::new(&rec.output_path);
+    for ext in &["live_chat.json", "chat.jsonl"] {
+        let p = base.with_extension(ext);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+fn fmt_recording_label(rec: &Recording) -> String {
+    let dt = chrono::DateTime::from_timestamp(rec.started_at, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| rec.started_at.to_string());
+    format!("{dt} ({})", rec.status)
+}
+
+fn fmt_chat_ts(secs: f64) -> String {
+    if secs < 0.0 {
+        return format!("-{}", fmt_chat_ts(-secs));
+    }
+    let s = secs as u64;
+    format!("[{:02}:{:02}:{:02}]", s / 3600, (s % 3600) / 60, s % 60)
+}
+
+fn render_chat_message(ui: &mut egui::Ui, msg: &ChatMessage) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        // Timestamp — muted monospace
+        ui.label(
+            egui::RichText::new(fmt_chat_ts(msg.timestamp_secs))
+                .monospace()
+                .small()
+                .color(ui.visuals().weak_text_color()),
+        );
+        // Badges
+        for badge in &msg.badges {
+            let (sym, color) = badge_display(badge, &msg.platform);
+            ui.label(egui::RichText::new(sym).small().color(color));
+        }
+        // Username — bold, platform/user colour
+        let name_color = chat_username_color(msg);
+        ui.label(
+            egui::RichText::new(format!("{}:", msg.author))
+                .strong()
+                .color(name_color),
+        );
+        // Message text
+        ui.label(&msg.text);
+    });
+}
+
+fn badge_display(badge: &str, platform: &ChatPlatform) -> (&'static str, egui::Color32) {
+    match platform {
+        ChatPlatform::Twitch => {
+            let name = badge.split('/').next().unwrap_or(badge);
+            match name {
+                "broadcaster" => ("📡", egui::Color32::from_rgb(0xe9, 0x1e, 0x63)),
+                "moderator" | "mod" => ("⚔", egui::Color32::from_rgb(0x00, 0xad, 0x03)),
+                "subscriber" => ("★", egui::Color32::from_rgb(0x96, 0x4b, 0xff)),
+                "bits" => ("💎", egui::Color32::from_rgb(0x00, 0xc7, 0xac)),
+                "premium" => ("👑", egui::Color32::from_rgb(0xff, 0xd7, 0x00)),
+                "partner" => ("✓", egui::Color32::from_rgb(0x97, 0x45, 0xff)),
+                _ => ("•", egui::Color32::GRAY),
+            }
+        }
+        ChatPlatform::YouTube => {
+            let lower = badge.to_lowercase();
+            if lower.contains("member") {
+                ("⭐", egui::Color32::from_rgb(0xff, 0xd7, 0x00))
+            } else if lower.contains("moderator") {
+                ("⚔", egui::Color32::from_rgb(0x00, 0xad, 0x03))
+            } else if lower.contains("verified") || lower.contains("owner") {
+                ("✓", egui::Color32::from_rgb(0x4a, 0xc2, 0xff))
+            } else {
+                ("•", egui::Color32::GRAY)
+            }
+        }
+    }
+}
+
+fn chat_username_color(msg: &ChatMessage) -> egui::Color32 {
+    if let Some(c) = msg.color_override {
+        return c;
+    }
+    match msg.platform {
+        ChatPlatform::YouTube => egui::Color32::from_rgb(0x4a, 0xc2, 0xff),
+        ChatPlatform::Twitch => twitch_username_color(&msg.author),
+    }
+}
+
+fn twitch_username_color(name: &str) -> egui::Color32 {
+    const DEFAULTS: &[&str] = &[
+        "#FF0000", "#0000FF", "#00FF00", "#B22222", "#FF7F50", "#9ACD32", "#FF4500", "#2E8B57",
+        "#DAA520", "#D2691E", "#5F9EA0", "#1E90FF", "#FF69B4", "#8A2BE2", "#00FF7F",
+    ];
+    let b = name.as_bytes();
+    if b.is_empty() {
+        return egui::Color32::WHITE;
+    }
+    let n = (b[0] as usize + b[b.len() - 1] as usize) % DEFAULTS.len();
+    parse_chat_hex_color(DEFAULTS[n]).unwrap_or(egui::Color32::WHITE)
+}
+
+fn parse_chat_hex_color(s: &str) -> Option<egui::Color32> {
+    let s = s.strip_prefix('#')?;
+    if s.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some(egui::Color32::from_rgb(r, g, b))
+}
+
+fn parse_chat_file(path: &Path, start_unix_secs: i64) -> anyhow::Result<Vec<ChatMessage>> {
+    let s = path.to_string_lossy();
+    if s.ends_with("live_chat.json") {
+        parse_yt_live_chat(path)
+    } else {
+        parse_twitch_chat(path, start_unix_secs)
+    }
+}
+
+fn parse_yt_live_chat(path: &Path) -> anyhow::Result<Vec<ChatMessage>> {
+    let mut out = Vec::new();
+    let reader = BufReader::new(File::open(path)?);
+    for line in reader.lines() {
+        let line = line?;
+        if line.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        // Stream-relative offset (ms) is at replayChatItemAction.videoOffsetTimeMsec
+        let offset_ms = v
+            .pointer("/replayChatItemAction/videoOffsetTimeMsec")
+            .and_then(|x| x.as_str().and_then(|s| s.parse::<i64>().ok()).or_else(|| x.as_i64()));
+
+        let Some(actions) = v
+            .pointer("/replayChatItemAction/actions")
+            .and_then(|a| a.as_array())
+        else {
+            continue;
+        };
+        for action in actions {
+            let Some(r) =
+                action.pointer("/addChatItemAction/item/liveChatTextMessageRenderer")
+            else {
+                continue;
+            };
+            let ts_secs = if let Some(ms) = offset_ms {
+                ms as f64 / 1000.0
+            } else {
+                r["timestampUsec"]
+                    .as_str()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(0.0)
+                    / 1_000_000.0
+            };
+            let author = r
+                .pointer("/authorName/simpleText")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let text = r["message"]["runs"]
+                .as_array()
+                .map(|runs| {
+                    runs.iter()
+                        .map(|run| {
+                            if let Some(t) = run["text"].as_str() {
+                                t.to_string()
+                            } else if let Some(emoji) = run.get("emoji") {
+                                emoji["shortcuts"]
+                                    .as_array()
+                                    .and_then(|s| s.first())
+                                    .and_then(|e| e.as_str())
+                                    .or_else(|| emoji["emojiId"].as_str())
+                                    .unwrap_or("[emoji]")
+                                    .to_string()
+                            } else {
+                                String::new()
+                            }
+                        })
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
+            let badges: Vec<String> = r["authorBadges"]
+                .as_array()
+                .map(|bs| {
+                    bs.iter()
+                        .filter_map(|b| {
+                            b.pointer("/liveChatAuthorBadgeRenderer/tooltip")
+                                .and_then(|t| t.as_str())
+                                .map(|t| {
+                                    t.split('(').next().unwrap_or(t).trim().to_string()
+                                })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push(ChatMessage {
+                timestamp_secs: ts_secs,
+                author,
+                text,
+                badges,
+                color_override: None,
+                platform: ChatPlatform::YouTube,
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn parse_twitch_chat(path: &Path, start_unix_secs: i64) -> anyhow::Result<Vec<ChatMessage>> {
+    let start_ms = start_unix_secs as f64 * 1000.0;
+    let mut out = Vec::new();
+    let reader = BufReader::new(File::open(path)?);
+    for line in reader.lines() {
+        let line = line?;
+        if line.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let ts_ms = v["ts"].as_f64().unwrap_or(0.0);
+        let author = v["name"]
+            .as_str()
+            .or_else(|| v["login"].as_str())
+            .unwrap_or("")
+            .to_string();
+        let text = v["text"].as_str().unwrap_or("").to_string();
+        let color_override = v["color"].as_str().and_then(parse_chat_hex_color);
+        // Split raw badge tag "subscriber/12,moderator/1" into one entry per badge.
+        let badges = v["badges"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.split(',').map(str::to_string).collect::<Vec<_>>())
+            .unwrap_or_default();
+        out.push(ChatMessage {
+            timestamp_secs: (ts_ms - start_ms) / 1000.0,
+            author,
+            text,
+            badges,
+            color_override,
+            platform: ChatPlatform::Twitch,
+        });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
