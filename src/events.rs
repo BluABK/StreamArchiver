@@ -94,4 +94,8 @@ pub enum ManualCommand {
     StartVideo(i64),
     /// Abort an in-flight on-demand video download (by `video` id).
     StopVideo(i64),
+    /// Abort the live-chat sidecar download for a monitor (by monitor id).
+    /// The chat download runs independently of the video recording so it needs
+    /// its own stop command.
+    StopChat(i64),
 }

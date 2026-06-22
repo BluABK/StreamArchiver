@@ -205,6 +205,15 @@ fn push_track_args(args: &mut Vec<String>, tool: Tool, audio: &str, subs: &str, 
             }
             if chat {
                 langs.push("live_chat");
+            } else {
+                // live_chat blocks video download on live streams: yt-dlp downloads
+                // the chat stream indefinitely before starting the video. Exclude it
+                // so `all` doesn't pull it in. The dedicated chat sidecar
+                // (run_chat_download) handles it when chat_log is enabled.
+                langs.retain(|l| *l != "live_chat");
+                if langs.iter().any(|l| *l == "all") {
+                    langs.push("-live_chat");
+                }
             }
             if !langs.is_empty() {
                 args.push(format!("--sub-langs={}", langs.join(",")));
@@ -230,6 +239,51 @@ fn youtube_live_url(url: &str) -> String {
         url.to_string()
     } else {
         format!("{u}/live")
+    }
+}
+
+/// Build a yt-dlp chat-only plan: `--skip-download --sub-langs=live_chat
+/// --write-subs` with the same output path as the video so the `.live_chat.json`
+/// sidecar lands next to it. Auth and global defaults are forwarded as-is so the
+/// cookies / token work the same as they do for the video process.
+pub fn build_chat_plan(
+    row: &MonitorWithChannel,
+    capture_path: &Path,
+    auth: &AuthSource,
+    ytdlp_global_args: &[String],
+) -> DownloadPlan {
+    let mut args = vec![
+        "--no-part".to_string(),
+        "--skip-download".into(),
+        "--sub-langs=live_chat".into(),
+        "--write-subs".into(),
+        "-o".into(),
+        capture_path.to_string_lossy().into_owned(),
+    ];
+    match auth {
+        AuthSource::CookiesBrowser(b) => {
+            args.push("--cookies-from-browser".into());
+            args.push(b.clone());
+        }
+        AuthSource::CookiesFile(p) => {
+            args.push("--cookies".into());
+            args.push(p.clone());
+        }
+        _ => {}
+    }
+    args.extend_from_slice(ytdlp_global_args);
+    let url = if row.monitor.platform() == Platform::YouTube {
+        youtube_live_url(&row.monitor.url)
+    } else {
+        row.monitor.url.clone()
+    };
+    args.push(url);
+    DownloadPlan {
+        program: "yt-dlp".to_string(),
+        args,
+        capture_path: capture_path.to_path_buf(),
+        final_path: capture_path.to_path_buf(),
+        remux_to_mkv: false,
     }
 }
 
@@ -320,10 +374,12 @@ pub fn build_plan(
             // Global defaults from Settings → yt-dlp default arguments.
             // Per-monitor extra_args extend after and can override these.
             args.extend_from_slice(ytdlp_global_args);
-            // YouTube chat goes through yt-dlp's live_chat; Twitch chat is logged
-            // by the native WS logger instead, so don't ask yt-dlp for it there.
-            let chat_subs = m.chat_log && m.platform() != Platform::Twitch;
-            push_track_args(&mut args, Tool::YtDlp, &m.audio_tracks, &m.subtitle_tracks, chat_subs);
+            // Never request live_chat for live recordings: yt-dlp's live_chat
+            // downloader runs until the stream ends and blocks video download in the
+            // same process. YouTube chat replay can be downloaded after the stream
+            // via build_video_plan (which does pass chat_log through). Twitch chat
+            // uses the native WS logger regardless.
+            push_track_args(&mut args, Tool::YtDlp, &m.audio_tracks, &m.subtitle_tracks, false);
             args.extend(extra);
             let url = if m.platform() == Platform::YouTube {
                 youtube_live_url(&m.url)
@@ -517,6 +573,14 @@ pub struct Supervisor {
     video_speed: VideoSpeed,
     /// video_ids whose download was asked to stop (so it finalizes as `stopped`).
     stopping_videos: Arc<Mutex<HashSet<i64>>>,
+    /// monitor_ids whose live recording was manually stopped (so it finalizes as
+    /// `stopped` rather than `failed` even when bytes = 0).
+    stopping_monitors: Arc<Mutex<HashSet<i64>>>,
+    /// monitor_id -> child PID of in-flight live-chat sidecar downloads.
+    /// Shared with AppCore so the UI can show the chat-active indicator.
+    pub active_chats: Arc<Mutex<HashMap<i64, u32>>>,
+    /// monitor_ids whose chat download was asked to stop.
+    stopping_chats: Arc<Mutex<HashSet<i64>>>,
     shutdown: Arc<AtomicBool>,
     /// Shared detection context for on-demand (manual Start) liveness checks.
     ctx: Arc<DetectContext>,
@@ -541,6 +605,7 @@ impl Supervisor {
         active_videos: ActiveSet,
         video_progress: VideoProgress,
         video_speed: VideoSpeed,
+        active_chats: Arc<Mutex<HashMap<i64, u32>>>,
         shutdown: Arc<AtomicBool>,
         ctx: Arc<DetectContext>,
         ad_active: AdActive,
@@ -554,6 +619,9 @@ impl Supervisor {
             video_progress,
             video_speed,
             stopping_videos: Arc::new(Mutex::new(HashSet::new())),
+            stopping_monitors: Arc::new(Mutex::new(HashSet::new())),
+            active_chats,
+            stopping_chats: Arc::new(Mutex::new(HashSet::new())),
             shutdown,
             ctx,
             ad_active,
@@ -589,6 +657,7 @@ impl Supervisor {
                         }
                     }
                     ManualCommand::StopVideo(id) => self.stop_video(id),
+                    ManualCommand::StopChat(id) => self.stop_chat_download(id),
                 },
                 else => break,
             }
@@ -668,6 +737,7 @@ impl Supervisor {
     fn manual_stop(&self, monitor_id: i64) {
         let pid = self.active.lock().unwrap().get(&monitor_id).copied();
         if let Some(pid) = pid {
+            self.stopping_monitors.lock().unwrap().insert(monitor_id);
             if pid > 0 {
                 crate::platform::kill_process_tree(pid);
             }
@@ -680,6 +750,86 @@ impl Supervisor {
             );
             info!(monitor_id, "manual stop");
         }
+    }
+
+    /// Stop the live-chat sidecar download for a monitor, if one is running.
+    fn stop_chat_download(&self, monitor_id: i64) {
+        let pid = self.active_chats.lock().unwrap().get(&monitor_id).copied();
+        let Some(pid) = pid else { return };
+        self.stopping_chats.lock().unwrap().insert(monitor_id);
+        if pid > 0 {
+            crate::platform::kill_process_tree(pid);
+        }
+        info!(monitor_id, "stop chat download");
+    }
+
+    /// Run a live-chat sidecar yt-dlp process for `monitor_id`. Spawns yt-dlp
+    /// with `--skip-download --sub-langs=live_chat --write-subs` so it captures
+    /// only chat alongside the video recording. Registers its PID in
+    /// `active_chats` (visible to the UI), and removes it when the process exits
+    /// (either stream ended naturally, or the user called `stop_chat_download`).
+    async fn run_chat_download(&self, monitor_id: i64, plan: DownloadPlan) {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        let job = match ProcessJob::new() {
+            Ok(j) => Some(j),
+            Err(e) => {
+                warn!(monitor_id, "chat job object create failed: {e:#}");
+                None
+            }
+        };
+        let mut cmd = Command::new(&plan.program);
+        cmd.args(&plan.args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(monitor_id, "chat download spawn failed: {e}");
+                return;
+            }
+        };
+        if let Some(j) = &job {
+            if let Err(e) = j.assign_child(&child) {
+                warn!(monitor_id, "chat job assign failed: {e:#}");
+            }
+        }
+        if let Some(pid) = child.id() {
+            self.active_chats.lock().unwrap().insert(monitor_id, pid);
+        }
+        // Drain stdout so the pipe buffer never fills and blocks the child.
+        if let Some(stdout) = child.stdout.take() {
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stdout).lines();
+                while lines.next_line().await.ok().flatten().is_some() {}
+            });
+        }
+        info!(monitor_id, "chat download started");
+        // Fire any event so the UI repaints and shows the chat-active indicator.
+        let _ = self.events.send(AppEvent::MonitorState {
+            monitor_id,
+            state: "chat_active".into(),
+        });
+
+        let _ = child.wait().await;
+        let stopped = self.stopping_chats.lock().unwrap().remove(&monitor_id);
+        self.active_chats.lock().unwrap().remove(&monitor_id);
+        if stopped {
+            info!(monitor_id, "chat download stopped by user");
+        } else {
+            info!(monitor_id, "chat download ended");
+        }
+        // Repaint so the indicator disappears.
+        let _ = self.events.send(AppEvent::MonitorState {
+            monitor_id,
+            state: "idle".into(),
+        });
     }
 
     /// Begin an on-demand video download: reserve it and spawn its task.
@@ -1029,6 +1179,17 @@ impl Supervisor {
             channel: row.channel.name.clone(),
         });
         info!(monitor_id, program = %plan.program, "starting recording -> {}", plan.capture_path.display());
+        {
+            let redacted: Vec<String> = plan.args.iter().map(|a| {
+                if a.contains("Authorization=OAuth ") {
+                    let prefix = &a[..a.find("OAuth ").map(|i| i + 6).unwrap_or(a.len())];
+                    format!("{prefix}<redacted>")
+                } else {
+                    a.clone()
+                }
+            }).collect();
+            info!(monitor_id, "args: {}", redacted.join(" "));
+        }
 
         // When capturing from the start of the broadcast (live-from-start /
         // hls-live-restart), the early footage isn't lost — it's pulled from the
@@ -1093,8 +1254,7 @@ impl Supervisor {
 
         // Twitch chat -> a native anonymous IRC-over-WebSocket logger, written as
         // a `.chat.jsonl` sidecar next to the capture (so it follows the file's
-        // stem, incl. the media rename). Twitch only; YouTube chat is captured by
-        // yt-dlp (live_chat) via build_plan.
+        // stem, incl. the media rename). Twitch only.
         let chat_done = Arc::new(AtomicBool::new(false));
         let chat_task = (row.monitor.chat_log && row.monitor.platform() == Platform::Twitch)
             .then(|| {
@@ -1106,6 +1266,20 @@ impl Supervisor {
                     self.shutdown.clone(),
                 ))
             });
+
+        // YouTube chat -> separate yt-dlp sidecar process with --skip-download
+        // --sub-langs=live_chat. Runs concurrently with (and outlives) the video
+        // recording so the video download is never blocked by the chat stream.
+        // Visible in the UI as a "Chat ●" indicator; user can stop it independently.
+        if row.monitor.chat_log
+            && row.monitor.tool == Tool::YtDlp
+            && row.monitor.platform() != Platform::Twitch
+        {
+            let chat_plan = build_chat_plan(&row, &plan.capture_path, &auth, &ytdlp_global_args);
+            let this = self.clone();
+            let mid = monitor_id;
+            tokio::spawn(async move { this.run_chat_download(mid, chat_plan).await });
+        }
 
         let outcome = self
             .run_process(&self.active, monitor_id, &plan, None, None, ad_sink)
@@ -1156,7 +1330,8 @@ impl Supervisor {
         // post-rename media modes); `{games}` is the list of categories played,
         // and triggers a rename even when media probing is off.
         let want_games = template_wants_games(&row.monitor.filename_template);
-        let do_post_media = want_media && media_mode.post() && file_len(&final_path).await > 0;
+        let final_size = file_len(&final_path).await;
+        let do_post_media = want_media && media_mode.post() && final_size > 0;
         if do_post_media || want_games {
             let mi = if do_post_media {
                 probe_media(&final_path.to_string_lossy()).await
@@ -1168,8 +1343,9 @@ impl Supervisor {
             } else {
                 String::new()
             };
-            // Only rename when we actually resolved something to substitute in.
-            if mi.is_some() || !games.is_empty() {
+            // Only rename when we actually resolved something to substitute in,
+            // and only when the capture exists (no-op on failed/0-byte recordings).
+            if (mi.is_some() || !games.is_empty()) && final_size > 0 {
                 let quality = resolved_quality(&row.monitor.quality);
                 // Prefer the post-probe; fall back to the pre-probe so a {games}
                 // rename in pre-probe mode doesn't drop already-resolved media vars.
@@ -1208,12 +1384,16 @@ impl Supervisor {
 
         let duration = now_unix() - started_at;
         let ok = bytes > 0;
+        let manually_stopped = self.stopping_monitors.lock().unwrap().remove(&monitor_id);
         // A 0-byte capture isn't always a failure: a livestream that had already
         // ended (or hadn't started, or exposed no live video formats) leaves
         // nothing to capture but isn't an error. Classify those as `ended` so they
         // don't show as red failures. (`ok` still drives backoff, so we don't
         // hammer an ended broadcast.)
-        let status = if ok {
+        let status = if manually_stopped {
+            // User explicitly stopped the recording; never show it as `failed`.
+            if ok { "completed" } else { "stopped" }
+        } else if ok {
             "completed"
         } else if stream_ended_or_unavailable(&outcome.log) {
             "ended"
@@ -2793,16 +2973,17 @@ mod tests {
         y.monitor.subtitle_tracks = "all".into();
         y.monitor.audio_tracks = "all".into(); // ignored by yt-dlp
         let yplan = build_plan(&y, 1_700_000_000, &AuthSource::None, &[], None, None);
-        assert!(yplan.args.iter().any(|a| a == "--sub-langs=all"));
+        // live_chat is excluded from the main process via negation so "all"
+        // doesn't pull in the chat stream and block the video download.
+        assert!(yplan.args.iter().any(|a| a == "--sub-langs=all,-live_chat"));
         assert!(yplan.args.iter().any(|a| a == "--write-subs"));
         assert!(!yplan.args.iter().any(|a| a == "--hls-audio-select=*"));
 
-        // "*" is normalized to "all" for subtitles too (matches the audio path),
-        // so it never reaches yt-dlp as the invalid regex `--sub-langs *`.
+        // "*" is normalized to "all,-live_chat" for subtitles too.
         let mut y2 = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
         y2.monitor.subtitle_tracks = "*".into();
         let yplan2 = build_plan(&y2, 1_700_000_000, &AuthSource::None, &[], None, None);
-        assert!(yplan2.args.iter().any(|a| a == "--sub-langs=all"));
+        assert!(yplan2.args.iter().any(|a| a == "--sub-langs=all,-live_chat"));
 
         // A language list passes through verbatim (joined form).
         let mut y3 = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
@@ -2829,20 +3010,23 @@ mod tests {
 
     #[test]
     fn chat_logging_ytdlp_live_chat() {
-        // YouTube + yt-dlp + chat_log -> --sub-langs includes live_chat.
+        // live_chat is NEVER requested by build_plan: the yt-dlp live_chat downloader
+        // runs until the stream ends and blocks video download in the same process.
+        // Chat replay is downloaded by build_video_plan (VOD) after the stream ends.
         let mut y = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
         y.monitor.chat_log = true;
         y.monitor.subtitle_tracks = String::new();
         let plan = build_plan(&y, 1_700_000_000, &AuthSource::None, &[], None, None);
-        assert!(plan.args.iter().any(|a| a == "--sub-langs=live_chat"));
-        assert!(plan.args.iter().any(|a| a == "--write-subs"));
+        assert!(!plan.args.iter().any(|a| a.contains("live_chat")));
+        assert!(!plan.args.iter().any(|a| a == "--write-subs"));
 
-        // Folded together with an explicit subtitle selection.
+        // Explicit subtitle selection still works (just no live_chat folded in).
         let mut y2 = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
         y2.monitor.chat_log = true;
         y2.monitor.subtitle_tracks = "en".into();
         let plan2 = build_plan(&y2, 1_700_000_000, &AuthSource::None, &[], None, None);
-        assert!(plan2.args.iter().any(|a| a == "--sub-langs=en,live_chat"));
+        assert!(!plan2.args.iter().any(|a| a.contains("live_chat")));
+        assert!(plan2.args.iter().any(|a| a == "--sub-langs=en"));
 
         // Twitch + yt-dlp + chat_log -> NO yt-dlp live_chat (the native Twitch
         // chat logger handles it instead).

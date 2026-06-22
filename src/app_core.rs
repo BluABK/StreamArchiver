@@ -39,6 +39,8 @@ pub struct AppCore {
     pub active: ActiveSet,
     /// video_id -> child PID of in-flight on-demand video downloads.
     pub active_videos: ActiveSet,
+    /// monitor_id -> child PID of in-flight live-chat sidecar downloads.
+    pub active_chats: ActiveSet,
     /// video_id -> live download progress fraction (for the UI progress bar).
     pub video_progress: crate::downloader::VideoProgress,
     /// video_id -> live download speed in bytes/sec (for the UI Speed column).
@@ -68,6 +70,7 @@ impl AppCore {
             rt,
             active: Arc::new(Mutex::new(HashMap::new())),
             active_videos: Arc::new(Mutex::new(HashMap::new())),
+            active_chats: Arc::new(Mutex::new(HashMap::new())),
             video_progress: Arc::new(Mutex::new(HashMap::new())),
             video_speed: Arc::new(Mutex::new(HashMap::new())),
             ad_active: Arc::new(Mutex::new(HashMap::new())),
@@ -163,6 +166,7 @@ impl AppCore {
             self.active_videos.clone(),
             self.video_progress.clone(),
             self.video_speed.clone(),
+            self.active_chats.clone(),
             self.shutdown.clone(),
             ctx,
             self.ad_active.clone(),
@@ -198,7 +202,9 @@ impl AppCore {
     /// wait for those tasks to remux `.ts` -> `.mkv` and finalize before returning.
     pub fn stop_all_recordings(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        let initial = self.active.lock().unwrap().len() + self.active_videos.lock().unwrap().len();
+        let initial = self.active.lock().unwrap().len()
+            + self.active_videos.lock().unwrap().len()
+            + self.active_chats.lock().unwrap().len();
         if initial == 0 {
             return;
         }
@@ -211,6 +217,7 @@ impl AppCore {
                 .unwrap()
                 .values()
                 .chain(self.active_videos.lock().unwrap().values())
+                .chain(self.active_chats.lock().unwrap().values())
                 .copied()
                 .filter(|p| *p > 0)
                 .collect();
@@ -219,13 +226,15 @@ impl AppCore {
             }
             if self.active.lock().unwrap().is_empty()
                 && self.active_videos.lock().unwrap().is_empty()
+                && self.active_chats.lock().unwrap().is_empty()
             {
                 info!("all downloads finalized");
                 break;
             }
             if start.elapsed() > SHUTDOWN_DRAIN_TIMEOUT {
-                let n =
-                    self.active.lock().unwrap().len() + self.active_videos.lock().unwrap().len();
+                let n = self.active.lock().unwrap().len()
+                    + self.active_videos.lock().unwrap().len()
+                    + self.active_chats.lock().unwrap().len();
                 warn!("timed out waiting for {n} download(s) to finalize");
                 break;
             }

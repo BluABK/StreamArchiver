@@ -1979,6 +1979,7 @@ fn channel_cells(channel: &Channel, monitors: &[&MonitorWithChannel], now: i64) 
 struct RowActions {
     start: Option<i64>,                 // monitor id
     stop: Option<i64>,                  // monitor id
+    stop_chat: Option<i64>,             // monitor id
     edit: Option<i64>,                  // monitor id
     add_instance: Option<i64>,          // channel id
     delete: Option<(i64, String)>,      // (monitor id, channel name)
@@ -1997,6 +1998,7 @@ fn render_instance_row(
     ptex: &PlatformTextures,
     now: i64,
     recording: bool,
+    chat_active: bool,
     highlight: bool,
     depth: usize,
     has_history: bool,
@@ -2020,6 +2022,12 @@ fn render_instance_row(
         } else if ui.button("▶  Start recording").clicked() {
             a.start = Some(m.id);
             ui.close();
+        }
+        if chat_active {
+            if ui.button("💬  Stop chat download").clicked() {
+                a.stop_chat = Some(m.id);
+                ui.close();
+            }
         }
         ui.separator();
         if ui.button("🔗  Open channel URL").clicked() {
@@ -2147,10 +2155,22 @@ fn render_instance_row(
             ));
     });
     tr.col(|ui| {
-        let resp = ui.label(&m.last_state);
-        if m.last_state == "failed" || row.last_recording_status.as_deref() == Some("failed") {
-            resp.on_hover_text(fail_hover(&row.last_recording_log));
-        }
+        ui.horizontal(|ui| {
+            let resp = ui.label(&m.last_state);
+            if m.last_state == "failed" || row.last_recording_status.as_deref() == Some("failed") {
+                resp.on_hover_text(fail_hover(&row.last_recording_log));
+            }
+            if chat_active {
+                ui.colored_label(
+                    egui::Color32::from_rgb(0x4a, 0xc2, 0xff),
+                    egui::RichText::new("Chat ●").small(),
+                )
+                .on_hover_text(
+                    "Live-chat download is still running.\n\
+                     Right-click → Stop chat download to abort it.",
+                );
+            }
+        });
     });
     tr.col(|ui| {
         if next_stream_cell(ui, row.next_stream_at, &row.next_stream_title, true) {
@@ -4830,16 +4850,22 @@ impl StreamArchiverApp {
                             }
                             Vis::Instance { row: ri, depth } => {
                                 let row = &self.rows[ri];
+                                let mid = row.monitor.id;
                                 let recording = self
                                     .core
                                     .active
                                     .lock()
                                     .unwrap()
-                                    .contains_key(&row.monitor.id);
-                                let is_selected = selected_monitor == Some(row.monitor.id);
+                                    .contains_key(&mid);
+                                let chat_active = self
+                                    .core
+                                    .active_chats
+                                    .lock()
+                                    .unwrap()
+                                    .contains_key(&mid);
+                                let is_selected = selected_monitor == Some(mid);
                                 let has_hist = row.recording_count > 0;
-                                let expanded = exp_instances.contains(&row.monitor.id);
-                                let mid = row.monitor.id;
+                                let expanded = exp_instances.contains(&mid);
                                 // Tint by state: ad playing / recording / errored /
                                 // keyboard-selected.
                                 let tint = row_tint(
@@ -4855,8 +4881,9 @@ impl StreamArchiverApp {
                                 }
                                 body.row(24.0, |mut tr| {
                                     if render_instance_row(
-                                        &mut tr, row, &ptex, now, recording, tint.is_some(), depth,
-                                        has_hist, expanded, show_actions, &mut acts,
+                                        &mut tr, row, &ptex, now, recording, chat_active,
+                                        tint.is_some(), depth, has_hist, expanded,
+                                        show_actions, &mut acts,
                                     ) {
                                         toggle_instance = Some(mid);
                                     }
@@ -5316,6 +5343,10 @@ impl StreamArchiverApp {
         if let Some(id) = acts.stop {
             self.core.manual(ManualCommand::Stop(id));
             self.status = "Stopping recording…".into();
+        }
+        if let Some(id) = acts.stop_chat {
+            self.core.manual(ManualCommand::StopChat(id));
+            self.status = "Stopping chat download…".into();
         }
         if let Some(p) = open_path {
             crate::platform::open_path(&p);
