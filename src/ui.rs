@@ -50,6 +50,9 @@ const K_SABR_FORMAT: &str = "ytdlp_sabr_format";
 const K_SABR_EXTRACTOR_ARGS: &str = "ytdlp_sabr_extractor_args";
 /// Manual raw SABR args; when non-empty, replaces the format+extractor-args preset.
 const K_SABR_RAW_ARGS: &str = "ytdlp_sabr_raw_args";
+/// PO-token-provider `--extractor-args` (e.g. bgutil), a separate `--extractor-args`
+/// entry on the SABR command. Absent ⇒ bgutil default; explicit empty ⇒ disabled.
+const K_SABR_POT_ARGS: &str = "ytdlp_sabr_pot_args";
 /// DASH-companion format selector for dual capture.
 const K_DASH_FORMAT: &str = "ytdlp_dash_format";
 const K_WEBSUB_URL: &str = "websub_vps_url";
@@ -355,6 +358,8 @@ struct SettingsForm {
     sabr_extractor_args: String,
     /// Manual raw SABR args; non-empty overrides the format+extractor-args preset.
     sabr_raw_args: String,
+    /// PO-token-provider `--extractor-args` (e.g. bgutil) for the SABR command.
+    sabr_pot_args: String,
     /// DASH-companion format selector used by dual (SABR+DASH) capture.
     dash_format: String,
     /// Discord user token + whether to import stream schedules from Discord events
@@ -542,6 +547,12 @@ impl StreamArchiverApp {
                 }
             },
             sabr_raw_args: setting_or_empty(&core, K_SABR_RAW_ARGS),
+            // Absent ⇒ bgutil default; present (even empty) ⇒ honor it verbatim so
+            // the user can disable it and rely on the plugin's auto-detection.
+            sabr_pot_args: match core.store.get_setting(K_SABR_POT_ARGS) {
+                Ok(Some(v)) => v,
+                _ => crate::downloader::SABR_DEFAULT_POT_ARGS.to_string(),
+            },
             dash_format: {
                 let v = setting_or_empty(&core, K_DASH_FORMAT);
                 if v.is_empty() {
@@ -895,6 +906,7 @@ impl StreamArchiverApp {
             (K_SABR_FORMAT, s.sabr_format.trim()),
             (K_SABR_EXTRACTOR_ARGS, s.sabr_extractor_args.trim()),
             (K_SABR_RAW_ARGS, s.sabr_raw_args.trim()),
+            (K_SABR_POT_ARGS, s.sabr_pot_args.trim()),
             (K_DASH_FORMAT, s.dash_format.trim()),
             (K_DISCORD_TOKEN, s.discord_token.trim()),
             // Only persist the import as on when a token actually backs it, so the
@@ -6777,6 +6789,22 @@ impl StreamArchiverApp {
                     .on_hover_text(
                         "When set, these raw args replace the SABR format + extractor-args \
                          preset entirely (put your own -f / --extractor-args here).",
+                    );
+                    ui.end_row();
+
+                    ui.label("PO token extractor-args");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.sabr_pot_args)
+                            .hint_text(crate::downloader::SABR_DEFAULT_POT_ARGS)
+                            .desired_width(f32::INFINITY),
+                    )
+                    .on_hover_text(
+                        "Passed as a SEPARATE --extractor-args entry on the SABR command \
+                         (different extractor key than the format args above), for a GVS \
+                         PO-token provider such as bgutil. Default points at the bgutil HTTP \
+                         server on its standard port 4416. Leave empty to rely on the \
+                         provider plugin's own auto-detection. Requires the provider plugin \
+                         installed for the SABR build + its server running.",
                     );
                     ui.end_row();
 

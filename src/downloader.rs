@@ -112,6 +112,12 @@ pub const SABR_DEFAULT_FORMAT: &str = "ba[protocol=sabr]+bv[protocol=sabr]";
 /// Default SABR `--extractor-args` when the setting is unset/empty.
 pub const SABR_DEFAULT_EXTRACTOR_ARGS: &str =
     "youtube:formats=duplicate,missing_pot;player-client=web;webpage-client=web";
+/// Default PO-token-provider `--extractor-args` (bgutil HTTP server on its default
+/// port). Passed as a *separate* `--extractor-args` entry because it targets a
+/// different extractor key (`youtubepot-bgutilhttp`) than the `youtube:` args.
+/// Used when the setting key has never been written; an explicit empty value
+/// disables it (rely on the plugin's own auto-detection instead).
+pub const SABR_DEFAULT_POT_ARGS: &str = "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416";
 /// Default DASH-companion format selector when the setting is unset/empty.
 pub const DASH_DEFAULT_FORMAT: &str = "bestvideo+bestaudio/best";
 
@@ -131,6 +137,11 @@ pub struct SabrConfig {
     pub extractor_args: String,
     /// Manual raw args; when non-empty, replaces the format + extractor-args preset.
     pub raw_args: String,
+    /// PO-token-provider `--extractor-args`, passed as its own `--extractor-args`
+    /// entry (different extractor key than `extractor_args`). Empty ⇒ not passed.
+    /// Applied regardless of the preset/`raw_args` choice (it's orthogonal to
+    /// format selection).
+    pub pot_args: String,
 }
 
 impl SabrConfig {
@@ -176,6 +187,12 @@ fn load_ytdlp_bins(store: &Store) -> YtDlpBins {
         .unwrap_or(true);
     let fmt = setting_str(store, "ytdlp_sabr_format");
     let xargs = setting_str(store, "ytdlp_sabr_extractor_args");
+    // PO-token args: absent (never written) ⇒ the bgutil default; present (even
+    // empty) ⇒ honor it verbatim, so the user can deliberately disable it.
+    let pot_args = match store.get_setting("ytdlp_sabr_pot_args") {
+        Ok(Some(v)) => v,
+        _ => SABR_DEFAULT_POT_ARGS.to_string(),
+    };
     YtDlpBins {
         system: setting_str(store, "ytdlp_binary_path"),
         sabr: SabrConfig {
@@ -188,6 +205,7 @@ fn load_ytdlp_bins(store: &Store) -> YtDlpBins {
                 xargs
             },
             raw_args: setting_str(store, "ytdlp_sabr_raw_args"),
+            pot_args,
         },
     }
 }
@@ -572,6 +590,12 @@ pub fn build_plan(
             }
             // Global Settings args (e.g. --js-runtimes node) still apply.
             args.extend_from_slice(ytdlp_global_args);
+            // PO-token provider args (e.g. bgutil) — a separate --extractor-args
+            // entry, applied regardless of the preset/raw choice below.
+            if !ytdlp.sabr.pot_args.is_empty() {
+                args.push("--extractor-args".into());
+                args.push(ytdlp.sabr.pot_args.clone());
+            }
             // Manual raw args override the format + extractor-args preset entirely.
             let raw = split_args(&ytdlp.sabr.raw_args);
             if raw.is_empty() {
@@ -3672,6 +3696,7 @@ mod tests {
                 format: SABR_DEFAULT_FORMAT.into(),
                 extractor_args: SABR_DEFAULT_EXTRACTOR_ARGS.into(),
                 raw_args: String::new(),
+                pot_args: SABR_DEFAULT_POT_ARGS.into(),
             },
         }
     }
@@ -3700,6 +3725,41 @@ mod tests {
         assert!(plan.args.iter().any(|a| a == SABR_DEFAULT_FORMAT));
         assert!(plan.args.iter().any(|a| a == "--extractor-args"));
         assert!(plan.args.iter().any(|a| a == SABR_DEFAULT_EXTRACTOR_ARGS));
+    }
+
+    #[test]
+    fn sabr_pot_args_added_as_separate_extractor_args() {
+        let plan = build_plan(
+            &row(Tool::YtDlp, Container::Mkv, Platform::YouTube),
+            1_700_000_000,
+            &AuthSource::None,
+            &[],
+            None,
+            "",
+            None,
+            &sabr_bins(),
+        );
+        // The PO-token provider args ride on their own --extractor-args entry,
+        // distinct from the youtube: SABR args — so there are two of them.
+        let xargs = plan.args.iter().filter(|a| *a == "--extractor-args").count();
+        assert_eq!(xargs, 2);
+        assert!(plan.args.iter().any(|a| a == SABR_DEFAULT_POT_ARGS));
+        assert!(plan.args.iter().any(|a| a == SABR_DEFAULT_EXTRACTOR_ARGS));
+
+        // Empty pot args ⇒ only the youtube: --extractor-args entry.
+        let mut bins = sabr_bins();
+        bins.sabr.pot_args = String::new();
+        let plan2 = build_plan(
+            &row(Tool::YtDlp, Container::Mkv, Platform::YouTube),
+            1_700_000_000,
+            &AuthSource::None,
+            &[],
+            None,
+            "",
+            None,
+            &bins,
+        );
+        assert_eq!(plan2.args.iter().filter(|a| *a == "--extractor-args").count(), 1);
     }
 
     #[test]
