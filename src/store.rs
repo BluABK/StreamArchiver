@@ -17,7 +17,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 22;
+const SCHEMA_VERSION: i64 = 23;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -361,7 +361,17 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 22)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 22);
+        if version < 23 {
+            // SABR dual capture: a per-monitor toggle to also run a DASH companion
+            // capture, plus a take_group key that links the two recordings (SABR
+            // primary + DASH companion) produced by one capture attempt.
+            conn.execute_batch(
+                "ALTER TABLE monitor ADD COLUMN dual_capture INTEGER NOT NULL DEFAULT 0;\
+                 ALTER TABLE recording ADD COLUMN take_group TEXT;",
+            )?;
+            conn.pragma_update(None, "user_version", 23)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 23);
         Ok(())
     }
 
@@ -486,8 +496,8 @@ impl Store {
             "INSERT INTO monitor(channel_id, url, enabled, tool, detection_method, poll_interval_secs,
                 quality, output_dir, filename_template, container, capture_from_start, auth_kind,
                 auth_value, extra_args, max_concurrent, last_state, ad_free, audio_tracks, subtitle_tracks,
-                chat_log, fetch_thumbnail, fetch_chat_assets)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+                chat_log, fetch_thumbnail, fetch_chat_assets, dual_capture)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
             params![
                 m.channel_id,
                 m.url,
@@ -511,6 +521,7 @@ impl Store {
                 m.chat_log as i64,
                 m.fetch_thumbnail as i64,
                 m.fetch_chat_assets as i64,
+                m.dual_capture as i64,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -523,7 +534,7 @@ impl Store {
                 quality=?7, output_dir=?8, filename_template=?9, container=?10, capture_from_start=?11,
                 auth_kind=?12, auth_value=?13, extra_args=?14, max_concurrent=?15, ad_free=?16,
                 audio_tracks=?17, subtitle_tracks=?18, chat_log=?19,
-                fetch_thumbnail=?20, fetch_chat_assets=?21 WHERE id=?1",
+                fetch_thumbnail=?20, fetch_chat_assets=?21, dual_capture=?22 WHERE id=?1",
             params![
                 m.id,
                 m.url,
@@ -546,6 +557,7 @@ impl Store {
                 m.chat_log as i64,
                 m.fetch_thumbnail as i64,
                 m.fetch_chat_assets as i64,
+                m.dual_capture as i64,
             ],
         )?;
         Ok(())
@@ -644,6 +656,7 @@ impl Store {
 
     // ----- recordings -----
 
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_recording(
         &self,
         monitor_id: i64,
@@ -652,12 +665,13 @@ impl Store {
         went_live_at: Option<i64>,
         went_live_approx: bool,
         stream_id: Option<&str>,
+        take_group: Option<&str>,
     ) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO recording(monitor_id, started_at, output_path, status, went_live_at, went_live_approx, stream_id)
-             VALUES(?1, ?2, ?3, 'recording', ?4, ?5, ?6)",
-            params![monitor_id, started_at, output_path, went_live_at, went_live_approx as i64, stream_id],
+            "INSERT INTO recording(monitor_id, started_at, output_path, status, went_live_at, went_live_approx, stream_id, take_group)
+             VALUES(?1, ?2, ?3, 'recording', ?4, ?5, ?6, ?7)",
+            params![monitor_id, started_at, output_path, went_live_at, went_live_approx as i64, stream_id, take_group],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -994,7 +1008,8 @@ impl Store {
                 COALESCE((SELECT new_value FROM stream_meta_change smc
                           WHERE smc.recording_id = r.id AND smc.kind = 'category'
                           ORDER BY smc.at_secs DESC, smc.id DESC LIMIT 1), ''),
-                c.color
+                c.color,
+                m.dual_capture
              FROM monitor m
              JOIN channel c ON c.id = m.channel_id
              LEFT JOIN recording r
@@ -1024,6 +1039,7 @@ impl Store {
                     filename_template: r.get(13)?,
                     container: Container::parse(&r.get::<_, String>(14)?),
                     capture_from_start: r.get::<_, i64>(15)? != 0,
+                    dual_capture: r.get::<_, i64>(44)? != 0,
                     ad_free: r.get::<_, i64>(32)? != 0,
                     auth_kind: AuthKind::parse(&r.get::<_, String>(16)?),
                     auth_value: r.get(17)?,
@@ -1079,7 +1095,8 @@ impl Store {
                               ORDER BY smc.at_secs DESC, smc.id DESC LIMIT 1), ''),
                     COALESCE((SELECT new_value FROM stream_meta_change smc
                               WHERE smc.recording_id = recording.id AND smc.kind = 'category'
-                              ORDER BY smc.at_secs DESC, smc.id DESC LIMIT 1), '')
+                              ORDER BY smc.at_secs DESC, smc.id DESC LIMIT 1), ''),
+                    take_group
              FROM recording WHERE monitor_id = ?1 ORDER BY started_at, id",
         )?;
         let rows = stmt
@@ -1097,6 +1114,7 @@ impl Store {
                     went_live_approx: r.get::<_, Option<i64>>(9)?.unwrap_or(0) != 0,
                     lost_secs: r.get(10)?,
                     stream_id: r.get(11)?,
+                    take_group: r.get(18)?,
                     ad_count: r.get(12)?,
                     ad_secs: r.get(13)?,
                     meta_change_count: r.get(14)?,
@@ -1350,6 +1368,7 @@ mod tests {
             filename_template: "{name}_{date}_{time}".into(),
             container: Container::Mkv,
             capture_from_start: true,
+            dual_capture: false,
             ad_free: false,
             auth_kind: AuthKind::Inherit,
             auth_value: String::new(),
@@ -1574,7 +1593,7 @@ mod tests {
         let mid = store.insert_monitor(&m).unwrap();
 
         let rid = store
-            .insert_recording(mid, 1_000, "C:/rec/out.mkv", Some(1_000), false, Some("s1"))
+            .insert_recording(mid, 1_000, "C:/rec/out.mkv", Some(1_000), false, Some("s1"), None)
             .unwrap();
 
         // Insert out of order; the query must return them ordered by offset.
@@ -1612,7 +1631,7 @@ mod tests {
         m.channel_id = cid;
         let mid = store.insert_monitor(&m).unwrap();
         let rid = store
-            .insert_recording(mid, 1_000, "C:/rec/out.mkv", Some(1_000), false, Some("s1"))
+            .insert_recording(mid, 1_000, "C:/rec/out.mkv", Some(1_000), false, Some("s1"), None)
             .unwrap();
 
         // Insert out of order; the query returns them ordered by offset.

@@ -510,6 +510,11 @@ pub struct Monitor {
     /// Capture from the start of the broadcast (yt-dlp `--live-from-start`,
     /// streamlink `--hls-live-restart`) vs. from the live edge. Default true.
     pub capture_from_start: bool,
+    /// Dual capture (YouTube only): in addition to the primary capture, run a
+    /// second concurrent DASH process (system yt-dlp, live edge) when wanted
+    /// formats span both SABR and DASH. Produces a second recording in the same
+    /// take. See the SABR settings + the DASH companion format selector.
+    pub dual_capture: bool,
     /// Manually marked ad-free for our account (YouTube membership/Premium,
     /// Twitch Turbo/sub) — captures won't have ad-break hard cuts. Auto Twitch-sub
     /// detection can also set the displayed status; see `MonitorWithChannel`.
@@ -1019,6 +1024,10 @@ pub struct Recording {
     pub lost_secs: Option<i64>,
     /// Platform stream/video id when detection knew it; `None` for id-less methods.
     pub stream_id: Option<String>,
+    /// Groups the recordings of one capture attempt (a "take"). Dual capture
+    /// produces two recordings — a SABR primary and a DASH companion — that share
+    /// this key. `None` for legacy/single recordings (each is its own take).
+    pub take_group: Option<String>,
     /// Ad breaks detected during this take (count + total seconds). Each break is
     /// a hard cut in the finished file; the per-break offsets live in `ad_break`.
     pub ad_count: i64,
@@ -1130,6 +1139,27 @@ impl StreamGroup {
             "failed"
         }
     }
+
+    /// Cluster the takes into capture attempts: recordings that share a non-null
+    /// `take_group` (a dual SABR+DASH capture) are grouped together; `None` keys
+    /// and distinct keys are their own singletons. Preserves take order (oldest
+    /// first). The UI renders one take per inner vec.
+    pub fn take_groups(&self) -> Vec<Vec<&Recording>> {
+        let mut out: Vec<Vec<&Recording>> = Vec::new();
+        for r in &self.takes {
+            if let Some(key) = &r.take_group {
+                if let Some(grp) = out
+                    .iter_mut()
+                    .find(|g| g.first().and_then(|f| f.take_group.as_ref()) == Some(key))
+                {
+                    grp.push(r);
+                    continue;
+                }
+            }
+            out.push(vec![r]);
+        }
+        out
+    }
 }
 
 /// Gap (seconds) within which two id-less takes are treated as the same
@@ -1220,6 +1250,7 @@ mod tests {
             went_live_approx: true,
             lost_secs: None,
             stream_id: stream_id.map(str::to_string),
+            take_group: None,
             ad_count: 0,
             ad_secs: 0,
             meta_change_count: 0,
@@ -1245,6 +1276,29 @@ mod tests {
             went_live_approx: true,
             takes,
         }
+    }
+
+    #[test]
+    fn take_groups_cluster_dual_recordings() {
+        // Two recordings sharing a take_group (SABR + DASH) form one take; a
+        // recording with a different take_group is its own take.
+        let mut a = rec(1, 1000, Some(1100), Some("s1"));
+        a.take_group = Some("m:1000".into());
+        a.output_path = "stream.mkv".into();
+        let mut b = rec(2, 1000, Some(1100), Some("s1"));
+        b.take_group = Some("m:1000".into());
+        b.output_path = "stream.dash.mkv".into();
+        let mut c = rec(3, 2000, Some(2100), Some("s1"));
+        c.take_group = Some("m:2000".into());
+
+        let g = group_of(vec![a, b, c]);
+        let groups = g.take_groups();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].len(), 2); // SABR + DASH clustered together
+        assert_eq!(groups[1].len(), 1); // the later take stands alone
+        // The pair preserves order (SABR primary first, DASH companion second).
+        assert_eq!(groups[0][0].id, 1);
+        assert_eq!(groups[0][1].id, 2);
     }
 
     #[test]

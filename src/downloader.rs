@@ -101,6 +101,101 @@ pub struct DownloadPlan {
     /// Final file after any remux (== capture_path when no remux).
     pub final_path: PathBuf,
     pub remux_to_mkv: bool,
+    /// True when the tool writes its own thumbnail inline (normal yt-dlp with
+    /// `--write-thumbnail`). When false and a thumbnail is wanted, the supervisor
+    /// fetches it over HTTP instead (streamlink, ffmpeg, and SABR captures).
+    pub writes_own_thumbnail: bool,
+}
+
+/// Default SABR format selector when the setting is unset/empty.
+pub const SABR_DEFAULT_FORMAT: &str = "ba[protocol=sabr]+bv[protocol=sabr]";
+/// Default SABR `--extractor-args` when the setting is unset/empty.
+pub const SABR_DEFAULT_EXTRACTOR_ARGS: &str =
+    "youtube:formats=duplicate,missing_pot;player-client=web;webpage-client=web";
+/// Default DASH-companion format selector when the setting is unset/empty.
+pub const DASH_DEFAULT_FORMAT: &str = "bestvideo+bestaudio/best";
+
+/// SABR (Server Adaptive Bit Rate) capture configuration for YouTube. SABR is the
+/// only protocol that reliably supports `--live-from-start` today, but it lives in
+/// a yt-dlp dev fork (a separate binary). See the YouTube SABR settings section.
+#[derive(Clone, Debug, Default)]
+pub struct SabrConfig {
+    /// Master toggle (Settings). When false, YouTube capture-from-start uses the
+    /// system binary's normal path.
+    pub enabled: bool,
+    /// Path to the SABR dev-build binary; empty ⇒ SABR unavailable.
+    pub binary: String,
+    /// Format selector injected by the preset (e.g. `ba[protocol=sabr]+bv[protocol=sabr]`).
+    pub format: String,
+    /// `--extractor-args` value injected by the preset.
+    pub extractor_args: String,
+    /// Manual raw args; when non-empty, replaces the format + extractor-args preset.
+    pub raw_args: String,
+}
+
+impl SabrConfig {
+    /// True when SABR capture is configured and usable.
+    fn usable(&self) -> bool {
+        self.enabled && !self.binary.is_empty()
+    }
+}
+
+/// The two yt-dlp binaries available to the supervisor: the system build (PATH or
+/// an explicit path) and the optional SABR dev build.
+#[derive(Clone, Debug, Default)]
+pub struct YtDlpBins {
+    /// Explicit system yt-dlp path; empty ⇒ `yt-dlp` on PATH.
+    pub system: String,
+    pub sabr: SabrConfig,
+}
+
+impl YtDlpBins {
+    /// The program name/path for the system yt-dlp.
+    pub fn system_program(&self) -> String {
+        if self.system.is_empty() {
+            "yt-dlp".to_string()
+        } else {
+            self.system.clone()
+        }
+    }
+}
+
+/// Read a setting as a string, defaulting to empty when absent.
+fn setting_str(store: &Store, key: &str) -> String {
+    store.get_setting(key).ok().flatten().unwrap_or_default()
+}
+
+/// Load the configured yt-dlp binaries + SABR preset from settings, applying the
+/// built-in fallbacks for any empty preset fields.
+fn load_ytdlp_bins(store: &Store) -> YtDlpBins {
+    let enabled = store
+        .get_setting("ytdlp_sabr_enabled")
+        .ok()
+        .flatten()
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    let fmt = setting_str(store, "ytdlp_sabr_format");
+    let xargs = setting_str(store, "ytdlp_sabr_extractor_args");
+    YtDlpBins {
+        system: setting_str(store, "ytdlp_binary_path"),
+        sabr: SabrConfig {
+            enabled,
+            binary: setting_str(store, "ytdlp_sabr_binary_path"),
+            format: if fmt.is_empty() { SABR_DEFAULT_FORMAT.to_string() } else { fmt },
+            extractor_args: if xargs.is_empty() {
+                SABR_DEFAULT_EXTRACTOR_ARGS.to_string()
+            } else {
+                xargs
+            },
+            raw_args: setting_str(store, "ytdlp_sabr_raw_args"),
+        },
+    }
+}
+
+/// Load the DASH-companion format selector (dual capture), with fallback.
+fn load_dash_format(store: &Store) -> String {
+    let f = setting_str(store, "ytdlp_dash_format");
+    if f.is_empty() { DASH_DEFAULT_FORMAT.to_string() } else { f }
 }
 
 /// Resolved download authentication for a monitor.
@@ -280,6 +375,7 @@ pub fn build_chat_plan(
     capture_path: &Path,
     auth: &AuthSource,
     ytdlp_global_args: &[String],
+    system_program: &str,
 ) -> DownloadPlan {
     let mut args = vec!["--no-part".to_string()];
     match auth {
@@ -307,14 +403,70 @@ pub fn build_chat_plan(
     };
     args.push(url);
     DownloadPlan {
-        program: "yt-dlp".to_string(),
+        program: system_program.to_string(),
         args,
         capture_path: capture_path.to_path_buf(),
         final_path: capture_path.to_path_buf(),
         remux_to_mkv: false,
+        writes_own_thumbnail: false,
     }
 }
 
+/// Build the DASH companion plan for dual capture. Mirrors the system yt-dlp live
+/// path (.ts → MKV remux) but forces the configured DASH format, captures from the
+/// live edge (`--no-live-from-start` — the SABR primary owns capture-from-start),
+/// and writes a sibling `{stem}.dash.{ts,mkv}` next to the primary so both files
+/// belong to the same take.
+fn build_dash_companion_plan(
+    primary_final: &Path,
+    row: &MonitorWithChannel,
+    auth: &AuthSource,
+    ytdlp_global_args: &[String],
+    system_program: &str,
+    dash_format: &str,
+) -> DownloadPlan {
+    let dir = primary_final.parent().unwrap_or_else(|| Path::new("."));
+    let stem = primary_final
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ts_path = dir.join(format!("{stem}.dash.ts"));
+    let mkv_path = dir.join(format!("{stem}.dash.mkv"));
+    let mut args = vec![
+        "--no-part".to_string(),
+        "--hls-use-mpegts".into(),
+        "-o".into(),
+        ts_path.to_string_lossy().into_owned(),
+        // DASH can't reliably rewind; the SABR primary owns capture-from-start.
+        "--no-live-from-start".into(),
+    ];
+    match auth {
+        AuthSource::CookiesBrowser(b) => {
+            args.push("--cookies-from-browser".into());
+            args.push(b.clone());
+        }
+        AuthSource::CookiesFile(p) => {
+            args.push("--cookies".into());
+            args.push(p.clone());
+        }
+        _ => {}
+    }
+    args.extend_from_slice(ytdlp_global_args);
+    args.push("-f".into());
+    args.push(dash_format.to_string());
+    args.extend(split_args(&row.monitor.extra_args));
+    args.push(youtube_live_url(&row.monitor.url));
+    DownloadPlan {
+        program: system_program.to_string(),
+        args,
+        capture_path: ts_path,
+        final_path: mkv_path,
+        remux_to_mkv: true,
+        writes_own_thumbnail: false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn build_plan(
     row: &MonitorWithChannel,
     started_at: i64,
@@ -323,6 +475,7 @@ pub fn build_plan(
     stream_id: Option<&str>,
     stream_title: &str,
     media: Option<&MediaInfo>,
+    ytdlp: &YtDlpBins,
 ) -> DownloadPlan {
     let m = &row.monitor;
     let ch = &row.channel;
@@ -336,19 +489,36 @@ pub fn build_plan(
         m, &ch.name, started_at, stream_id, stream_title, row.recording_count, &quality, media, "",
     );
     let extra = split_args(&m.extra_args);
-    let final_ext = match m.container {
-        Container::Mkv => "mkv",
-        Container::Ts => "ts",
+    // SABR (YouTube capture-from-start via the dev build) writes the final MKV
+    // directly — it merges separate SABR audio+video through ffmpeg, which the
+    // mpegts/.ts intermediate can't hold. Everything else captures to .ts first.
+    let use_sabr = m.tool == Tool::YtDlp
+        && m.platform() == Platform::YouTube
+        && m.capture_from_start
+        && ytdlp.sabr.usable();
+    let final_ext = if use_sabr {
+        "mkv"
+    } else {
+        match m.container {
+            Container::Mkv => "mkv",
+            Container::Ts => "ts",
+        }
     };
     let stem = unique_stem(&dir, &stem, final_ext, None);
 
     let ts_path = dir.join(format!("{stem}.ts"));
     let ts_str = ts_path.to_string_lossy().into_owned();
-    let (final_path, remux_to_mkv) = match m.container {
-        Container::Mkv => (dir.join(format!("{stem}.mkv")), true),
-        Container::Ts => (ts_path.clone(), false),
+    let mkv_path = dir.join(format!("{stem}.mkv"));
+    let (capture_path, final_path, remux_to_mkv) = if use_sabr {
+        (mkv_path.clone(), mkv_path.clone(), false)
+    } else {
+        match m.container {
+            Container::Mkv => (ts_path.clone(), mkv_path.clone(), true),
+            Container::Ts => (ts_path.clone(), ts_path.clone(), false),
+        }
     };
 
+    let mut writes_own_thumbnail = false;
     let (program, args) = match m.tool {
         Tool::Streamlink => {
             let mut args = Vec::new();
@@ -375,6 +545,46 @@ pub fn build_plan(
             args.push(m.url.clone());
             args.push(quality);
             ("streamlink".to_string(), args)
+        }
+        Tool::YtDlp if use_sabr => {
+            // SABR capture via the dev build: write the final MKV directly (SABR
+            // merges separate audio+video, so no mpegts/.ts), force the SABR
+            // formats, and pass the extractor-args the protocol needs. Chat,
+            // assets, and thumbnails are handled off this process (the dev build
+            // is a stale fork — keep its surface minimal): no --write-thumbnail
+            // / --sub-langs here.
+            let mut args = vec![
+                "--no-part".to_string(),
+                "-o".into(),
+                mkv_path.to_string_lossy().into_owned(),
+                "--live-from-start".into(),
+            ];
+            match auth {
+                AuthSource::CookiesBrowser(b) => {
+                    args.push("--cookies-from-browser".into());
+                    args.push(b.clone());
+                }
+                AuthSource::CookiesFile(p) => {
+                    args.push("--cookies".into());
+                    args.push(p.clone());
+                }
+                _ => {}
+            }
+            // Global Settings args (e.g. --js-runtimes node) still apply.
+            args.extend_from_slice(ytdlp_global_args);
+            // Manual raw args override the format + extractor-args preset entirely.
+            let raw = split_args(&ytdlp.sabr.raw_args);
+            if raw.is_empty() {
+                args.push("--extractor-args".into());
+                args.push(ytdlp.sabr.extractor_args.clone());
+                args.push("-f".into());
+                args.push(ytdlp.sabr.format.clone());
+            } else {
+                args.extend(raw);
+            }
+            args.extend(extra);
+            args.push(youtube_live_url(&m.url));
+            (ytdlp.sabr.binary.clone(), args)
         }
         Tool::YtDlp => {
             let mut args = vec![
@@ -411,6 +621,7 @@ pub fn build_plan(
             push_track_args(&mut args, Tool::YtDlp, &m.audio_tracks, &m.subtitle_tracks, false);
             if m.fetch_thumbnail {
                 args.push("--write-thumbnail".to_string());
+                writes_own_thumbnail = true;
             }
             args.extend(extra);
             let url = if m.platform() == Platform::YouTube {
@@ -419,7 +630,7 @@ pub fn build_plan(
                 m.url.clone()
             };
             args.push(url);
-            ("yt-dlp".to_string(), args)
+            (ytdlp.system_program(), args)
         }
         Tool::Ffmpeg => {
             let mut args = vec![
@@ -445,9 +656,10 @@ pub fn build_plan(
     DownloadPlan {
         program,
         args,
-        capture_path: ts_path,
+        capture_path,
         final_path,
         remux_to_mkv,
+        writes_own_thumbnail,
     }
 }
 
@@ -532,6 +744,7 @@ pub fn build_video_plan(
                 capture_path: final_path.clone(),
                 final_path,
                 remux_to_mkv: false,
+                writes_own_thumbnail: false,
             }
         }
         Tool::Streamlink => {
@@ -562,6 +775,7 @@ pub fn build_video_plan(
                 capture_path: ts_path,
                 final_path,
                 remux_to_mkv: true,
+                writes_own_thumbnail: false,
             }
         }
         Tool::Ffmpeg => {
@@ -587,6 +801,7 @@ pub fn build_video_plan(
                 capture_path: ts_path,
                 final_path,
                 remux_to_mkv: true,
+                writes_own_thumbnail: false,
             }
         }
     }
@@ -597,6 +812,10 @@ pub struct Supervisor {
     store: Arc<Store>,
     events: EventTx,
     active: ActiveSet,
+    /// monitor_id -> child PID of the DASH companion capture (dual capture). The
+    /// primary capture occupies `active`; this holds the second concurrent process
+    /// so manual stop / shutdown can kill both.
+    active_secondary: ActiveSet,
     /// video_id -> child PID of in-flight on-demand video downloads.
     active_videos: ActiveSet,
     /// video_id -> live download progress fraction, for the UI bar.
@@ -647,6 +866,7 @@ impl Supervisor {
             store,
             events,
             active,
+            active_secondary: Arc::new(Mutex::new(HashMap::new())),
             active_videos,
             video_progress,
             video_speed,
@@ -771,6 +991,14 @@ impl Supervisor {
     /// doesn't immediately restart on the next poll.
     fn manual_stop(&self, monitor_id: i64) {
         let pid = self.active.lock().unwrap().get(&monitor_id).copied();
+        // Kill the DASH companion (dual capture) too, if one is running.
+        let companion_pid = self.active_secondary.lock().unwrap().get(&monitor_id).copied();
+        if let Some(p) = companion_pid {
+            self.stopping_monitors.lock().unwrap().insert(monitor_id);
+            if p > 0 {
+                crate::platform::kill_process_tree(p);
+            }
+        }
         if let Some(pid) = pid {
             self.stopping_monitors.lock().unwrap().insert(monitor_id);
             if pid > 0 {
@@ -1205,12 +1433,16 @@ impl Supervisor {
             .flatten()
             .unwrap_or_default();
         let ytdlp_global_args = split_args(&ytdlp_global_raw);
+        let ytdlp_bins = load_ytdlp_bins(&self.store);
         let started_at = now_unix();
-        let plan = build_plan(&row, started_at, &auth, &ytdlp_global_args, stream_id.as_deref(), stream_title.as_deref().unwrap_or(""), pre_media.as_ref());
+        let plan = build_plan(&row, started_at, &auth, &ytdlp_global_args, stream_id.as_deref(), stream_title.as_deref().unwrap_or(""), pre_media.as_ref(), &ytdlp_bins);
         if let Some(parent) = plan.capture_path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
 
+        // A take key links the recordings of this capture attempt: the primary
+        // and, in dual capture, the DASH companion share it (they're one "take").
+        let take_group = format!("{monitor_id}:{started_at}");
         let rec_id = self
             .store
             .insert_recording(
@@ -1220,6 +1452,7 @@ impl Supervisor {
                 went_live_at,
                 approximate,
                 stream_id.as_deref(),
+                Some(&take_group),
             )
             .unwrap_or(0);
         let _ = self
@@ -1234,9 +1467,39 @@ impl Supervisor {
             recording_id: rec_id,
             channel: row.channel.name.clone(),
         });
+
+        // Dual capture: also run a DASH companion via the system yt-dlp for formats
+        // that only DASH carries. It captures from the live edge (SABR owns
+        // from-start), writes a sibling `{stem}.dash.mkv`, and finalizes as its own
+        // recording sharing this take. Only meaningful when SABR drives the primary.
+        if row.monitor.dual_capture
+            && row.monitor.platform() == Platform::YouTube
+            && row.monitor.capture_from_start
+            && ytdlp_bins.sabr.usable()
+        {
+            let dash_plan = build_dash_companion_plan(
+                &plan.final_path,
+                &row,
+                &auth,
+                &ytdlp_global_args,
+                &ytdlp_bins.system_program(),
+                &load_dash_format(&self.store),
+            );
+            let this = self.clone();
+            let tg = take_group.clone();
+            let sid = stream_id.clone();
+            let cname = row.channel.name.clone();
+            tokio::spawn(async move {
+                this.run_dash_companion(
+                    monitor_id, dash_plan, tg, sid, went_live_at, approximate, cname,
+                )
+                .await;
+            });
+        }
         // Asset fetching — fire-and-forget tasks that don't block the recording.
-        let is_ytdlp = matches!(row.monitor.tool, Tool::YtDlp);
-        if row.monitor.fetch_thumbnail && !is_ytdlp {
+        // Normal yt-dlp writes its own thumbnail inline (`--write-thumbnail`); for
+        // streamlink and SABR captures (which don't) we fetch it over HTTP instead.
+        if row.monitor.fetch_thumbnail && !plan.writes_own_thumbnail {
             if let Some(ref url) = thumbnail_url {
                 let http = self.ctx.http_client();
                 let url = url.clone();
@@ -1441,7 +1704,7 @@ impl Supervisor {
             && row.monitor.tool == Tool::YtDlp
             && row.monitor.platform() != Platform::Twitch
         {
-            let chat_plan = build_chat_plan(&row, &plan.capture_path, &auth, &ytdlp_global_args);
+            let chat_plan = build_chat_plan(&row, &plan.capture_path, &auth, &ytdlp_global_args, &ytdlp_bins.system_program());
             let this = self.clone();
             let mid = monitor_id;
             tokio::spawn(async move { this.run_chat_download(mid, chat_plan).await });
@@ -1607,6 +1870,101 @@ impl Supervisor {
         self.note_result(monitor_id, duration, ok);
         self.active.lock().unwrap().remove(&monitor_id);
         self.ad_active.lock().unwrap().remove(&monitor_id);
+    }
+
+    /// Run the DASH companion capture (dual capture): a self-contained second
+    /// recording (system yt-dlp, live edge) that shares the primary's take. Inserts
+    /// its own recording row, runs the process tracked under `active_secondary`,
+    /// remuxes, and finalizes independently of the primary. Watchers, chat, and
+    /// asset fetching all stay on the primary — this just grabs the extra formats.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_dash_companion(
+        &self,
+        monitor_id: i64,
+        plan: DownloadPlan,
+        take_group: String,
+        stream_id: Option<String>,
+        went_live_at: Option<i64>,
+        approximate: bool,
+        channel_name: String,
+    ) {
+        if let Some(parent) = plan.capture_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        let started_at = now_unix();
+        let rec_id = self
+            .store
+            .insert_recording(
+                monitor_id,
+                started_at,
+                &plan.final_path.to_string_lossy(),
+                went_live_at,
+                approximate,
+                stream_id.as_deref(),
+                Some(&take_group),
+            )
+            .unwrap_or(0);
+        let _ = self.events.send(AppEvent::RecordingStarted {
+            monitor_id,
+            recording_id: rec_id,
+            channel: channel_name.clone(),
+        });
+
+        let outcome = if self.stopping_monitors.lock().unwrap().contains(&monitor_id) {
+            ProcessOutcome { exit_code: None, log: String::new() }
+        } else {
+            self.run_process(&self.active_secondary, monitor_id, &plan, None, None, None)
+                .await
+        };
+
+        let mut final_path = plan.final_path.clone();
+        if plan.remux_to_mkv {
+            if file_len(&plan.capture_path).await > 0 {
+                match remux_ts_to_mkv(&plan.capture_path, &plan.final_path).await {
+                    Ok(()) => {
+                        let _ = tokio::fs::remove_file(&plan.capture_path).await;
+                    }
+                    Err(e) => {
+                        warn!(monitor_id, "dash companion remux failed, keeping .ts: {e:#}");
+                        final_path = plan.capture_path.clone();
+                    }
+                }
+            } else {
+                final_path = plan.capture_path.clone();
+            }
+        }
+
+        let bytes = file_len(&final_path).await as i64;
+        let ok = bytes > 0;
+        let manually_stopped = self.stopping_monitors.lock().unwrap().contains(&monitor_id);
+        let shutting_down = self.shutdown.load(Ordering::SeqCst);
+        let status = if manually_stopped {
+            if ok { "completed" } else { "stopped" }
+        } else if shutting_down {
+            "aborted"
+        } else if ok {
+            "completed"
+        } else if stream_ended_or_unavailable(&outcome.log) {
+            "ended"
+        } else {
+            "failed"
+        };
+        let _ = self.store.finish_recording(
+            rec_id,
+            now_unix(),
+            bytes,
+            outcome.exit_code,
+            status,
+            &final_path.to_string_lossy(),
+            &outcome.log,
+        );
+        let _ = self.events.send(AppEvent::RecordingFinished {
+            recording_id: rec_id,
+            channel: channel_name,
+            status: status.into(),
+        });
+        info!(monitor_id, bytes, status, "dash companion finished");
+        self.active_secondary.lock().unwrap().remove(&monitor_id);
     }
 
     async fn run_process(
@@ -2827,6 +3185,7 @@ mod tests {
                 filename_template: "{name}_{date}_{time}".into(),
                 container,
                 capture_from_start: true,
+                dual_capture: false,
                 ad_free: false,
                 auth_kind: AuthKind::Inherit,
                 auth_value: String::new(),
@@ -3100,6 +3459,7 @@ mod tests {
             None,
             "",
             None,
+            &YtDlpBins::default(),
         );
         assert_eq!(plan.program, "streamlink");
         assert!(plan.capture_path.to_string_lossy().ends_with(".ts"));
@@ -3123,6 +3483,7 @@ mod tests {
             None,
             "",
             None,
+            &YtDlpBins::default(),
         );
         assert_eq!(plan.program, "yt-dlp");
         assert!(plan.capture_path.to_string_lossy().ends_with(".ts"));
@@ -3142,6 +3503,7 @@ mod tests {
             None,
             "",
             None,
+            &YtDlpBins::default(),
         );
         assert!(
             plan.args
@@ -3160,6 +3522,7 @@ mod tests {
             None,
             "",
             None,
+            &YtDlpBins::default(),
         );
         let joined = browser.args.join(" ");
         assert!(joined.contains("--cookies-from-browser firefox"));
@@ -3172,6 +3535,7 @@ mod tests {
             None,
             "",
             None,
+            &YtDlpBins::default(),
         );
         assert!(file.args.join(" ").contains("--cookies C:/c.txt"));
     }
@@ -3182,13 +3546,13 @@ mod tests {
         let mut r = row(Tool::Streamlink, Container::Mkv, Platform::Twitch);
         r.monitor.audio_tracks = "all".into();
         r.monitor.subtitle_tracks = "all".into(); // ignored by streamlink
-        let plan = build_plan(&r, 1_700_000_000, &AuthSource::None, &[], None, "", None);
+        let plan = build_plan(&r, 1_700_000_000, &AuthSource::None, &[], None, "", None, &YtDlpBins::default());
         assert!(plan.args.iter().any(|a| a == "--hls-audio-select=*"));
         assert!(!plan.args.iter().any(|a| a == "--sub-langs"));
 
         let mut r2 = row(Tool::Streamlink, Container::Mkv, Platform::Twitch);
         r2.monitor.audio_tracks = "en,de".into();
-        let plan2 = build_plan(&r2, 1_700_000_000, &AuthSource::None, &[], None, "", None);
+        let plan2 = build_plan(&r2, 1_700_000_000, &AuthSource::None, &[], None, "", None, &YtDlpBins::default());
         assert!(plan2.args.iter().any(|a| a == "--hls-audio-select=en,de"));
 
         // yt-dlp: "all" subs -> --sub-langs=all --write-subs; audio ignored. The
@@ -3196,7 +3560,7 @@ mod tests {
         let mut y = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
         y.monitor.subtitle_tracks = "all".into();
         y.monitor.audio_tracks = "all".into(); // ignored by yt-dlp
-        let yplan = build_plan(&y, 1_700_000_000, &AuthSource::None, &[], None, "", None);
+        let yplan = build_plan(&y, 1_700_000_000, &AuthSource::None, &[], None, "", None, &YtDlpBins::default());
         // live_chat is excluded from the main process via negation so "all"
         // doesn't pull in the chat stream and block the video download.
         assert!(yplan.args.iter().any(|a| a == "--sub-langs=all,-live_chat"));
@@ -3206,13 +3570,13 @@ mod tests {
         // "*" is normalized to "all,-live_chat" for subtitles too.
         let mut y2 = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
         y2.monitor.subtitle_tracks = "*".into();
-        let yplan2 = build_plan(&y2, 1_700_000_000, &AuthSource::None, &[], None, "", None);
+        let yplan2 = build_plan(&y2, 1_700_000_000, &AuthSource::None, &[], None, "", None, &YtDlpBins::default());
         assert!(yplan2.args.iter().any(|a| a == "--sub-langs=all,-live_chat"));
 
         // A language list passes through verbatim (joined form).
         let mut y3 = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
         y3.monitor.subtitle_tracks = "en,de".into();
-        let yplan3 = build_plan(&y3, 1_700_000_000, &AuthSource::None, &[], None, "", None);
+        let yplan3 = build_plan(&y3, 1_700_000_000, &AuthSource::None, &[], None, "", None, &YtDlpBins::default());
         assert!(yplan3.args.iter().any(|a| a == "--sub-langs=en,de"));
 
         // Empty (existing-monitor default) adds no track flags at all.
@@ -3224,6 +3588,7 @@ mod tests {
             None,
             "",
             None,
+            &YtDlpBins::default(),
         );
         assert!(
             !plain
@@ -3241,7 +3606,7 @@ mod tests {
         let mut y = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
         y.monitor.chat_log = true;
         y.monitor.subtitle_tracks = String::new();
-        let plan = build_plan(&y, 1_700_000_000, &AuthSource::None, &[], None, "", None);
+        let plan = build_plan(&y, 1_700_000_000, &AuthSource::None, &[], None, "", None, &YtDlpBins::default());
         assert!(!plan.args.iter().any(|a| a.contains("live_chat")));
         assert!(!plan.args.iter().any(|a| a == "--write-subs"));
 
@@ -3249,7 +3614,7 @@ mod tests {
         let mut y2 = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
         y2.monitor.chat_log = true;
         y2.monitor.subtitle_tracks = "en".into();
-        let plan2 = build_plan(&y2, 1_700_000_000, &AuthSource::None, &[], None, "", None);
+        let plan2 = build_plan(&y2, 1_700_000_000, &AuthSource::None, &[], None, "", None, &YtDlpBins::default());
         assert!(!plan2.args.iter().any(|a| a.contains("live_chat")));
         assert!(plan2.args.iter().any(|a| a == "--sub-langs=en"));
 
@@ -3258,7 +3623,7 @@ mod tests {
         let mut t = row(Tool::YtDlp, Container::Mkv, Platform::Twitch);
         t.monitor.chat_log = true;
         t.monitor.subtitle_tracks = String::new();
-        let plant = build_plan(&t, 1_700_000_000, &AuthSource::None, &[], None, "", None);
+        let plant = build_plan(&t, 1_700_000_000, &AuthSource::None, &[], None, "", None, &YtDlpBins::default());
         assert!(!plant.args.iter().any(|a| a.contains("live_chat")));
     }
 
@@ -3292,9 +3657,118 @@ mod tests {
             None,
             "",
             None,
+            &YtDlpBins::default(),
         );
         assert!(plan.final_path.to_string_lossy().ends_with(".ts"));
         assert!(!plan.remux_to_mkv);
+    }
+
+    fn sabr_bins() -> YtDlpBins {
+        YtDlpBins {
+            system: String::new(),
+            sabr: SabrConfig {
+                enabled: true,
+                binary: "C:/git/yt-dlp-dev/dist/yt-dlp.exe".into(),
+                format: SABR_DEFAULT_FORMAT.into(),
+                extractor_args: SABR_DEFAULT_EXTRACTOR_ARGS.into(),
+                raw_args: String::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn youtube_capture_from_start_uses_sabr_binary_and_mkv() {
+        let plan = build_plan(
+            &row(Tool::YtDlp, Container::Mkv, Platform::YouTube),
+            1_700_000_000,
+            &AuthSource::None,
+            &[],
+            None,
+            "",
+            None,
+            &sabr_bins(),
+        );
+        assert_eq!(plan.program, "C:/git/yt-dlp-dev/dist/yt-dlp.exe");
+        // SABR writes the final MKV directly — no .ts intermediate, no remux.
+        assert!(plan.capture_path.to_string_lossy().ends_with(".mkv"));
+        assert_eq!(plan.capture_path, plan.final_path);
+        assert!(!plan.remux_to_mkv);
+        assert!(!plan.writes_own_thumbnail);
+        assert!(plan.args.iter().any(|a| a == "--live-from-start"));
+        assert!(!plan.args.iter().any(|a| a == "--hls-use-mpegts"));
+        assert!(plan.args.iter().any(|a| a == "-f"));
+        assert!(plan.args.iter().any(|a| a == SABR_DEFAULT_FORMAT));
+        assert!(plan.args.iter().any(|a| a == "--extractor-args"));
+        assert!(plan.args.iter().any(|a| a == SABR_DEFAULT_EXTRACTOR_ARGS));
+    }
+
+    #[test]
+    fn sabr_raw_args_override_replaces_preset() {
+        let mut bins = sabr_bins();
+        bins.sabr.raw_args = "-f custom+best --extractor-args youtube:foo".into();
+        let plan = build_plan(
+            &row(Tool::YtDlp, Container::Mkv, Platform::YouTube),
+            1_700_000_000,
+            &AuthSource::None,
+            &[],
+            None,
+            "",
+            None,
+            &bins,
+        );
+        assert!(plan.args.iter().any(|a| a == "custom+best"));
+        assert!(plan.args.iter().any(|a| a == "youtube:foo"));
+        // The preset format/extractor-args are NOT injected when raw args are set.
+        assert!(!plan.args.iter().any(|a| a == SABR_DEFAULT_FORMAT));
+        assert!(!plan.args.iter().any(|a| a == SABR_DEFAULT_EXTRACTOR_ARGS));
+    }
+
+    #[test]
+    fn sabr_skipped_when_disabled_or_not_from_start() {
+        // Disabled SABR → normal system yt-dlp path (.ts + mpegts).
+        let mut bins = sabr_bins();
+        bins.sabr.enabled = false;
+        let plan = build_plan(
+            &row(Tool::YtDlp, Container::Mkv, Platform::YouTube),
+            1_700_000_000,
+            &AuthSource::None,
+            &[],
+            None,
+            "",
+            None,
+            &bins,
+        );
+        assert_eq!(plan.program, "yt-dlp");
+        assert!(plan.args.iter().any(|a| a == "--hls-use-mpegts"));
+
+        // Enabled SABR but capture_from_start = false → still the normal path.
+        let mut r = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
+        r.monitor.capture_from_start = false;
+        let plan2 = build_plan(
+            &r, 1_700_000_000, &AuthSource::None, &[], None, "", None, &sabr_bins(),
+        );
+        assert_eq!(plan2.program, "yt-dlp");
+        assert!(plan2.args.iter().any(|a| a == "--no-live-from-start"));
+        assert!(plan2.args.iter().any(|a| a == "--hls-use-mpegts"));
+    }
+
+    #[test]
+    fn explicit_system_binary_path_is_used() {
+        let bins = YtDlpBins {
+            system: "C:/tools/yt-dlp.exe".into(),
+            ..Default::default()
+        };
+        let plan = build_plan(
+            &row(Tool::YtDlp, Container::Mkv, Platform::YouTube),
+            1_700_000_000,
+            &AuthSource::None,
+            &[],
+            None,
+            "",
+            None,
+            &bins,
+        );
+        assert_eq!(plan.program, "C:/tools/yt-dlp.exe");
     }
 
     fn video(tool: Tool, url: &str) -> Video {

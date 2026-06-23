@@ -267,6 +267,7 @@ fn run_add(args: &[String], pos: usize) -> Result<()> {
         filename_template: "{name}_{date}_{time}".into(),
         container: models::Container::Mkv,
         capture_from_start: std::env::var("STREAMARCHIVER_FROM_START").as_deref() != Ok("0"),
+        dual_capture: false,
         ad_free: false,
         auth_kind: models::AuthKind::Inherit,
         auth_value: String::new(),
@@ -339,6 +340,7 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
             filename_template: "captest_{time}".into(),
             container: models::Container::Mkv,
             capture_from_start: false,
+            dual_capture: false,
             ad_free: false,
             auth_kind: models::AuthKind::Inherit,
             auth_value: String::new(),
@@ -369,8 +371,16 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
         next_stream_at: None,
         next_stream_title: String::new(),
     };
-    let plan =
-        downloader::build_plan(&row, models::now_unix(), &downloader::AuthSource::None, &[], None, "", None);
+    let plan = downloader::build_plan(
+        &row,
+        models::now_unix(),
+        &downloader::AuthSource::None,
+        &[],
+        None,
+        "",
+        None,
+        &downloader::YtDlpBins::default(),
+    );
     println!("plan: {} {:?}", plan.program, plan.args);
 
     let rt = tokio::runtime::Runtime::new()?;

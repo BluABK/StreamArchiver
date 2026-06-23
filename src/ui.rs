@@ -38,6 +38,20 @@ const K_MAX_CONCURRENT: &str = "max_concurrent_downloads";
 const K_DOWNLOAD_AUTH: &str = "download_auth_method";
 const K_COOKIES_BROWSER: &str = "cookies_browser";
 const K_YTDLP_ARGS: &str = "ytdlp_default_args";
+/// Optional explicit path to the system yt-dlp binary; empty ⇒ `yt-dlp` on PATH.
+const K_YTDLP_BINARY: &str = "ytdlp_binary_path";
+/// Path to the SABR dev-build yt-dlp; empty ⇒ SABR capture disabled.
+const K_SABR_BINARY: &str = "ytdlp_sabr_binary_path";
+/// Master toggle: use the SABR build for YouTube capture-from-start.
+const K_SABR_ENABLED: &str = "ytdlp_sabr_enabled";
+/// SABR format selector (e.g. `ba[protocol=sabr]+bv[protocol=sabr]`).
+const K_SABR_FORMAT: &str = "ytdlp_sabr_format";
+/// SABR `--extractor-args` value.
+const K_SABR_EXTRACTOR_ARGS: &str = "ytdlp_sabr_extractor_args";
+/// Manual raw SABR args; when non-empty, replaces the format+extractor-args preset.
+const K_SABR_RAW_ARGS: &str = "ytdlp_sabr_raw_args";
+/// DASH-companion format selector for dual capture.
+const K_DASH_FORMAT: &str = "ytdlp_dash_format";
 const K_WEBSUB_URL: &str = "websub_vps_url";
 const K_WEBSUB_TOKEN: &str = "websub_token";
 const K_WEBSUB_POLL: &str = "websub_poll_secs";
@@ -113,6 +127,8 @@ struct MonitorForm {
     filename_template: String,
     container: Container,
     capture_from_start: bool,
+    /// YouTube dual capture: also run a DASH companion process (system yt-dlp).
+    dual_capture: bool,
     /// Manually mark this instance ad-free (member/sub/Turbo) — drives the Ad-free
     /// column when auto detection isn't available.
     ad_free: bool,
@@ -158,6 +174,7 @@ impl MonitorForm {
             filename_template: defaults.resolve_filename_template(p),
             container: defaults.resolve_container(p),
             capture_from_start: defaults.resolve_from_start(p),
+            dual_capture: false,
             ad_free: false,
             enabled: true,
             auth_kind: AuthKind::Inherit,
@@ -189,6 +206,7 @@ impl MonitorForm {
             filename_template: m.filename_template.clone(),
             container: m.container,
             capture_from_start: m.capture_from_start,
+            dual_capture: m.dual_capture,
             ad_free: m.ad_free,
             enabled: m.enabled,
             auth_kind: m.auth_kind,
@@ -221,6 +239,7 @@ impl MonitorForm {
             filename_template: defaults.resolve_filename_template(p),
             container: defaults.resolve_container(p),
             capture_from_start: defaults.resolve_from_start(p),
+            dual_capture: false,
             ad_free: false,
             enabled: true,
             auth_kind: AuthKind::Inherit,
@@ -324,6 +343,20 @@ struct SettingsForm {
     /// Global extra arguments prepended to every yt-dlp invocation (all monitors).
     /// Per-monitor extra_args are appended after these, so they take precedence.
     ytdlp_default_args: String,
+    /// Explicit path to the system yt-dlp binary; empty ⇒ `yt-dlp` on PATH.
+    ytdlp_binary_path: String,
+    /// Path to the SABR dev-build yt-dlp (for YouTube capture-from-start). Empty ⇒
+    /// SABR disabled (capture-from-start uses the system binary's normal path).
+    sabr_binary_path: String,
+    /// Master toggle: use the SABR build for YouTube capture-from-start.
+    sabr_enabled: bool,
+    /// SABR format selector + extractor-args preset.
+    sabr_format: String,
+    sabr_extractor_args: String,
+    /// Manual raw SABR args; non-empty overrides the format+extractor-args preset.
+    sabr_raw_args: String,
+    /// DASH-companion format selector used by dual (SABR+DASH) capture.
+    dash_format: String,
     /// Discord user token + whether to import stream schedules from Discord events
     /// (opt-in; automating a user token is against Discord's ToS).
     discord_token: String,
@@ -488,6 +521,35 @@ impl StreamArchiverApp {
             filename_media_info: MediaInfoMode::parse(&setting_or_empty(&core, K_FILENAME_MEDIA)),
             date_fmt: DateFmt::parse(&setting_or_empty(&core, K_DATE_FORMAT)),
             ytdlp_default_args: setting_or_empty(&core, K_YTDLP_ARGS),
+            ytdlp_binary_path: setting_or_empty(&core, K_YTDLP_BINARY),
+            sabr_binary_path: setting_or_empty(&core, K_SABR_BINARY),
+            // Absent ⇒ enabled by default; an explicit "0" disables it.
+            sabr_enabled: setting_or_empty(&core, K_SABR_ENABLED) != "0",
+            sabr_format: {
+                let v = setting_or_empty(&core, K_SABR_FORMAT);
+                if v.is_empty() {
+                    crate::downloader::SABR_DEFAULT_FORMAT.to_string()
+                } else {
+                    v
+                }
+            },
+            sabr_extractor_args: {
+                let v = setting_or_empty(&core, K_SABR_EXTRACTOR_ARGS);
+                if v.is_empty() {
+                    crate::downloader::SABR_DEFAULT_EXTRACTOR_ARGS.to_string()
+                } else {
+                    v
+                }
+            },
+            sabr_raw_args: setting_or_empty(&core, K_SABR_RAW_ARGS),
+            dash_format: {
+                let v = setting_or_empty(&core, K_DASH_FORMAT);
+                if v.is_empty() {
+                    crate::downloader::DASH_DEFAULT_FORMAT.to_string()
+                } else {
+                    v
+                }
+            },
             discord_token: setting_or_empty(&core, K_DISCORD_TOKEN),
             discord_schedule: setting_or_empty(&core, K_DISCORD_SCHEDULE) == "1",
         };
@@ -774,6 +836,7 @@ impl StreamArchiverApp {
             filename_template: form.filename_template.clone(),
             container: form.container,
             capture_from_start: form.capture_from_start,
+            dual_capture: form.dual_capture,
             ad_free: form.ad_free,
             auth_kind: form.auth_kind,
             auth_value: form.auth_value.clone(),
@@ -826,6 +889,13 @@ impl StreamArchiverApp {
             (K_YT_API_DETECT, if s.youtube_api_detect { "1" } else { "0" }),
             (K_YT_API_SCHEDULE, if s.youtube_api_schedule { "1" } else { "0" }),
             (K_YTDLP_ARGS, s.ytdlp_default_args.trim()),
+            (K_YTDLP_BINARY, s.ytdlp_binary_path.trim()),
+            (K_SABR_BINARY, s.sabr_binary_path.trim()),
+            (K_SABR_ENABLED, if s.sabr_enabled { "1" } else { "0" }),
+            (K_SABR_FORMAT, s.sabr_format.trim()),
+            (K_SABR_EXTRACTOR_ARGS, s.sabr_extractor_args.trim()),
+            (K_SABR_RAW_ARGS, s.sabr_raw_args.trim()),
+            (K_DASH_FORMAT, s.dash_format.trim()),
             (K_DISCORD_TOKEN, s.discord_token.trim()),
             // Only persist the import as on when a token actually backs it, so the
             // consent flag can't be left latched with no token.
@@ -859,6 +929,24 @@ fn setting_or_empty(core: &AppCore, key: &str) -> String {
         .ok()
         .flatten()
         .unwrap_or_default()
+}
+
+/// Label a take as "SABR"/"DASH" when it's part of a dual capture (two recordings
+/// sharing a `take_group`). Returns `None` for ordinary single-recording takes.
+fn dual_take_variant(g: &StreamGroup, t: &Recording) -> Option<&'static str> {
+    // Only label takes that belong to a multi-recording (dual) capture cluster.
+    let in_dual = g
+        .take_groups()
+        .iter()
+        .any(|grp| grp.len() >= 2 && grp.iter().any(|r| r.id == t.id));
+    if !in_dual {
+        return None;
+    }
+    if t.output_path.contains(".dash.") {
+        Some("DASH")
+    } else {
+        Some("SABR")
+    }
 }
 
 /// Split a stored `--cookies-from-browser` value into `(browser, profile)`.
@@ -5762,7 +5850,9 @@ impl StreamArchiverApp {
                                 });
                             }
                             Vis::Take { mid, gi, ti, depth } => {
-                                let t = &groups[&mid][gi].takes[ti];
+                                let g = &groups[&mid][gi];
+                                let t = &g.takes[ti];
+                                let take_variant = dual_take_variant(g, t);
                                 let dir = std::path::Path::new(&t.output_path)
                                     .parent()
                                     .map(|p| p.to_path_buf());
@@ -5820,9 +5910,13 @@ impl StreamArchiverApp {
                                     }
                                     tr.col(|_ui| {}); // platform
                                     tr.col(|ui| {
+                                        let label = match take_variant {
+                                            Some(v) => format!("Take {} · {}", ti + 1, v),
+                                            None => format!("Take {}", ti + 1),
+                                        };
                                         tree_name(
                                             ui, depth, false, false,
-                                            egui::RichText::new(format!("Take {}", ti + 1)).weak(),
+                                            egui::RichText::new(label).weak(),
                                         );
                                     });
                                     tr.col(|_ui| {}); // tool
@@ -6605,6 +6699,101 @@ impl StreamArchiverApp {
                 });
 
             ui.add_space(12.0);
+            ui.heading("YouTube SABR (live-from-start)");
+            ui.label(
+                "YouTube live capture-from-start needs the SABR protocol, which only the \
+                 yt-dlp dev build provides. Point to that binary below; it is used ONLY for \
+                 YouTube monitors with Capture-from-start. Chat, assets, VODs, and every other \
+                 capture keep using the system yt-dlp.",
+            );
+            egui::Grid::new("sabr_grid")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("System yt-dlp path");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings.ytdlp_binary_path)
+                                .hint_text("(empty = yt-dlp on PATH)")
+                                .desired_width(360.0),
+                        );
+                        if ui.button("Browse…").clicked() {
+                            if let Some(p) = browse_file(&self.settings.ytdlp_binary_path) {
+                                self.settings.ytdlp_binary_path = p;
+                            }
+                        }
+                    });
+                    ui.end_row();
+
+                    ui.label("SABR build path");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings.sabr_binary_path)
+                                .hint_text(r"e.g. C:\git\yt-dlp-dev\dist\yt-dlp.exe")
+                                .desired_width(360.0),
+                        );
+                        if ui.button("Browse…").clicked() {
+                            if let Some(p) = browse_file(&self.settings.sabr_binary_path) {
+                                self.settings.sabr_binary_path = p;
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "The yt-dlp dev fork with SABR support (bashonly's feat/youtube/sabr). \
+                         A moving target — re-point this after rebuilding it. Empty = SABR off.",
+                    );
+                    ui.end_row();
+
+                    ui.label("Use SABR for capture-from-start");
+                    ui.checkbox(&mut self.settings.sabr_enabled, "").on_hover_text(
+                        "When on (and a SABR build is set), YouTube monitors with \
+                         Capture-from-start record via the SABR build.",
+                    );
+                    ui.end_row();
+
+                    ui.label("SABR format");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.sabr_format)
+                            .hint_text(crate::downloader::SABR_DEFAULT_FORMAT)
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.end_row();
+
+                    ui.label("SABR extractor-args");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.sabr_extractor_args)
+                            .hint_text(crate::downloader::SABR_DEFAULT_EXTRACTOR_ARGS)
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.end_row();
+
+                    ui.label("SABR manual args");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.sabr_raw_args)
+                            .hint_text("(optional — overrides format + extractor-args above)")
+                            .desired_width(f32::INFINITY),
+                    )
+                    .on_hover_text(
+                        "When set, these raw args replace the SABR format + extractor-args \
+                         preset entirely (put your own -f / --extractor-args here).",
+                    );
+                    ui.end_row();
+
+                    ui.label("DASH companion format");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.dash_format)
+                            .hint_text(crate::downloader::DASH_DEFAULT_FORMAT)
+                            .desired_width(f32::INFINITY),
+                    )
+                    .on_hover_text(
+                        "Format selector for the DASH companion process when a monitor has \
+                         Dual capture (SABR + DASH) enabled. Uses the system yt-dlp.",
+                    );
+                    ui.end_row();
+                });
+
+            ui.add_space(12.0);
             ui.heading("Stream monitor defaults");
             ui.label(
                 "Applied when creating a new monitor. Platform settings override the global; \
@@ -6995,6 +7184,17 @@ impl StreamArchiverApp {
                             "yt-dlp --live-from-start / streamlink --hls-live-restart",
                         );
                         ui.end_row();
+
+                        if Platform::detect(&form.url) == Platform::YouTube {
+                            ui.label("Dual capture (SABR + DASH)");
+                            ui.checkbox(&mut form.dual_capture, "").on_hover_text(
+                                "YouTube only: also run a second concurrent DASH capture \
+                                 (system yt-dlp, live edge) when wanted formats span both SABR \
+                                 and DASH. Produces a second recording in the same take. \
+                                 Needs Capture-from-start and a configured SABR build.",
+                            );
+                            ui.end_row();
+                        }
 
                         ui.label("Ad-free");
                         ui.checkbox(&mut form.ad_free, "").on_hover_text(
