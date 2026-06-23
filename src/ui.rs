@@ -7792,84 +7792,84 @@ fn parse_yt_live_chat(path: &Path) -> anyhow::Result<Vec<ChatMessage>> {
             Ok(v) => v,
             Err(_) => continue,
         };
-        // Stream-relative offset (ms) is at replayChatItemAction.videoOffsetTimeMsec
-        let offset_ms = v
-            .pointer("/replayChatItemAction/videoOffsetTimeMsec")
-            .and_then(|x| x.as_str().and_then(|s| s.parse::<i64>().ok()).or_else(|| x.as_i64()));
-
-        let Some(actions) = v
-            .pointer("/replayChatItemAction/actions")
-            .and_then(|a| a.as_array())
-        else {
-            continue;
-        };
-        for action in actions {
-            let Some(r) =
-                action.pointer("/addChatItemAction/item/liveChatTextMessageRenderer")
-            else {
-                continue;
-            };
-            let ts_secs = if let Some(ms) = offset_ms {
-                ms as f64 / 1000.0
-            } else {
-                r["timestampUsec"]
-                    .as_str()
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(0.0)
-                    / 1_000_000.0
-            };
-            let author = r
-                .pointer("/authorName/simpleText")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let text = r["message"]["runs"]
-                .as_array()
-                .map(|runs| {
-                    runs.iter()
-                        .map(|run| {
-                            if let Some(t) = run["text"].as_str() {
-                                t.to_string()
-                            } else if let Some(emoji) = run.get("emoji") {
-                                emoji["shortcuts"]
-                                    .as_array()
-                                    .and_then(|s| s.first())
-                                    .and_then(|e| e.as_str())
-                                    .or_else(|| emoji["emojiId"].as_str())
-                                    .unwrap_or("[emoji]")
-                                    .to_string()
-                            } else {
-                                String::new()
-                            }
-                        })
-                        .collect::<String>()
-                })
-                .unwrap_or_default();
-            let badges: Vec<String> = r["authorBadges"]
-                .as_array()
-                .map(|bs| {
-                    bs.iter()
-                        .filter_map(|b| {
-                            b.pointer("/liveChatAuthorBadgeRenderer/tooltip")
-                                .and_then(|t| t.as_str())
-                                .map(|t| {
-                                    t.split('(').next().unwrap_or(t).trim().to_string()
-                                })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            out.push(ChatMessage {
-                timestamp_secs: ts_secs,
-                author,
-                text,
-                badges,
-                color_override: None,
-                platform: ChatPlatform::YouTube,
-            });
+        if let Some(replay) = v.get("replayChatItemAction") {
+            // VOD replay format: replayChatItemAction.{videoOffsetTimeMsec, actions[]}
+            let offset_ms = replay
+                .get("videoOffsetTimeMsec")
+                .and_then(|x| x.as_str().and_then(|s| s.parse::<i64>().ok()).or_else(|| x.as_i64()));
+            if let Some(actions) = replay.get("actions").and_then(|a| a.as_array()) {
+                for action in actions {
+                    if let Some(msg) = yt_action_to_msg(action, offset_ms) {
+                        out.push(msg);
+                    }
+                }
+            }
+        } else if let Some(msg) = yt_action_to_msg(&v, None) {
+            // Live format: addChatItemAction directly at the top level of each line.
+            out.push(msg);
         }
     }
     Ok(out)
+}
+
+fn yt_action_to_msg(action: &serde_json::Value, offset_ms: Option<i64>) -> Option<ChatMessage> {
+    let r = action.pointer("/addChatItemAction/item/liveChatTextMessageRenderer")?;
+    let ts_secs = if let Some(ms) = offset_ms {
+        ms as f64 / 1000.0
+    } else {
+        r["timestampUsec"]
+            .as_str()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0)
+            / 1_000_000.0
+    };
+    let author = r
+        .pointer("/authorName/simpleText")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let text = r["message"]["runs"]
+        .as_array()
+        .map(|runs| {
+            runs.iter()
+                .map(|run| {
+                    if let Some(t) = run["text"].as_str() {
+                        t.to_string()
+                    } else if let Some(emoji) = run.get("emoji") {
+                        emoji["shortcuts"]
+                            .as_array()
+                            .and_then(|s| s.first())
+                            .and_then(|e| e.as_str())
+                            .or_else(|| emoji["emojiId"].as_str())
+                            .unwrap_or("[emoji]")
+                            .to_string()
+                    } else {
+                        String::new()
+                    }
+                })
+                .collect::<String>()
+        })
+        .unwrap_or_default();
+    let badges: Vec<String> = r["authorBadges"]
+        .as_array()
+        .map(|bs| {
+            bs.iter()
+                .filter_map(|b| {
+                    b.pointer("/liveChatAuthorBadgeRenderer/tooltip")
+                        .and_then(|t| t.as_str())
+                        .map(|t| t.split('(').next().unwrap_or(t).trim().to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(ChatMessage {
+        timestamp_secs: ts_secs,
+        author,
+        text,
+        badges,
+        color_override: None,
+        platform: ChatPlatform::YouTube,
+    })
 }
 
 fn parse_twitch_chat(path: &Path, start_unix_secs: i64) -> anyhow::Result<Vec<ChatMessage>> {

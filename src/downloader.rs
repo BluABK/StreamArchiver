@@ -252,14 +252,7 @@ pub fn build_chat_plan(
     auth: &AuthSource,
     ytdlp_global_args: &[String],
 ) -> DownloadPlan {
-    let mut args = vec![
-        "--no-part".to_string(),
-        "--skip-download".into(),
-        "--sub-langs=live_chat".into(),
-        "--write-subs".into(),
-        "-o".into(),
-        capture_path.to_string_lossy().into_owned(),
-    ];
+    let mut args = vec!["--no-part".to_string()];
     match auth {
         AuthSource::CookiesBrowser(b) => {
             args.push("--cookies-from-browser".into());
@@ -271,7 +264,13 @@ pub fn build_chat_plan(
         }
         _ => {}
     }
+    // Global defaults first so our required args below can override them.
     args.extend_from_slice(ytdlp_global_args);
+    args.push("--skip-download".into());
+    args.push("--sub-langs=live_chat".into());
+    args.push("--write-subs".into());
+    args.push("-o".into());
+    args.push(capture_path.to_string_lossy().into_owned());
     let url = if row.monitor.platform() == Platform::YouTube {
         youtube_live_url(&row.monitor.url)
     } else {
@@ -788,7 +787,7 @@ impl Supervisor {
         cmd.args(&plan.args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
@@ -813,6 +812,16 @@ impl Supervisor {
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stdout).lines();
                 while lines.next_line().await.ok().flatten().is_some() {}
+            });
+        }
+        // Log stderr so yt-dlp errors (auth failures, format unavailable, etc.) are visible.
+        if let Some(stderr) = child.stderr.take() {
+            let mid = monitor_id;
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Some(line) = lines.next_line().await.ok().flatten() {
+                    warn!(monitor_id = mid, "chat yt-dlp: {line}");
+                }
             });
         }
         info!(monitor_id, "chat download started");
