@@ -781,6 +781,8 @@ pub struct PlatformDownloadDefault {
     pub output_dir: String,
     pub filename_template: String,
     pub extra_args: String,
+    #[serde(default)]
+    pub auto_title: bool,
 }
 
 impl PlatformDownloadDefault {
@@ -795,6 +797,7 @@ impl PlatformDownloadDefault {
             output_dir: default_output_dir.to_string(),
             filename_template: "{name}_{date}_{time}".into(),
             extra_args: String::new(),
+            auto_title: false,
         }
     }
 }
@@ -857,6 +860,9 @@ pub struct PlatformMonitorDefault {
     /// `None` or empty string = use the global `default_output_dir`.
     #[serde(default)]
     pub output_dir: Option<String>,
+    /// `None` = inherit; `Some(true/false)` = capture from start on/off.
+    #[serde(default)]
+    pub from_start: Option<bool>,
 }
 
 /// Global + per-platform monitor-creation defaults, persisted as JSON in
@@ -947,6 +953,14 @@ impl MonitorDefaults {
                     .filter(|s| !s.is_empty())
             })
             .unwrap_or_else(|| "{name}_{date}_{time}".to_string())
+    }
+
+    /// Resolve capture-from-start: platform override → global → `true`.
+    pub fn resolve_from_start(&self, platform: Platform) -> bool {
+        self.get(platform)
+            .from_start
+            .or(self.global.from_start)
+            .unwrap_or(true)
     }
 
     /// Resolve output dir: platform override → global → `fallback`.

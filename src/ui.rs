@@ -157,7 +157,7 @@ impl MonitorForm {
             output_dir: defaults.resolve_output_dir(p, default_output_dir),
             filename_template: defaults.resolve_filename_template(p),
             container: defaults.resolve_container(p),
-            capture_from_start: true,
+            capture_from_start: defaults.resolve_from_start(p),
             ad_free: false,
             enabled: true,
             auth_kind: AuthKind::Inherit,
@@ -220,7 +220,7 @@ impl MonitorForm {
             output_dir: defaults.resolve_output_dir(p, default_output_dir),
             filename_template: defaults.resolve_filename_template(p),
             container: defaults.resolve_container(p),
-            capture_from_start: true,
+            capture_from_start: defaults.resolve_from_start(p),
             ad_free: false,
             enabled: true,
             auth_kind: AuthKind::Inherit,
@@ -3439,6 +3439,18 @@ impl StreamArchiverApp {
                                 dirty = true;
                             }
                             ui.end_row();
+
+                            ui.label("Detect title");
+                            if ui.checkbox(&mut d.auto_title, "Detect title + channel")
+                                .on_hover_text(
+                                    "Default state of the \"Detect title + channel\" checkbox \
+                                     for new downloads on this platform.",
+                                )
+                                .changed()
+                            {
+                                dirty = true;
+                            }
+                            ui.end_row();
                         });
                 });
         }
@@ -3800,6 +3812,7 @@ impl StreamArchiverApp {
             vf.output_dir = d.output_dir;
             vf.filename_template = d.filename_template;
             vf.extra_args = d.extra_args;
+            vf.auto_title = d.auto_title;
             vf.auth_override = None; // "Default (per-platform)"
             vf.auth_value = String::new();
             // Snapshot the default auth too, so a later edit to the default
@@ -6654,6 +6667,15 @@ impl StreamArchiverApp {
                                 .filter(|s| !s.is_empty())
                                 .unwrap_or_else(|| self.settings.default_output_dir.clone()),
                         };
+                        let fs_hint: String = if platform_opt.is_some() {
+                            match md.global.from_start {
+                                Some(true) => "Inherit (on)".to_string(),
+                                Some(false) => "Inherit (off)".to_string(),
+                                None => "Inherit (on)".to_string(),
+                            }
+                        } else {
+                            "on".to_string()
+                        };
 
                         let d = match platform_opt {
                             None => &mut md.global,
@@ -6752,6 +6774,27 @@ impl StreamArchiverApp {
                                         .hint_text(od_hint)
                                         .desired_width(200.0),
                                 );
+                                ui.label("");
+                                ui.label("");
+                                ui.end_row();
+
+                                // Row 6: Capture from start
+                                ui.label("Capture from start")
+                                    .on_hover_text(
+                                        "yt-dlp --live-from-start / streamlink --hls-live-restart.\n\
+                                         Default for new stream monitors on this platform.",
+                                    );
+                                egui::ComboBox::from_id_salt(format!("mdef_fs_{label}"))
+                                    .selected_text(match d.from_start {
+                                        None => inherit,
+                                        Some(true) => "On",
+                                        Some(false) => "Off",
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut d.from_start, None, format!("{inherit} ({fs_hint})"));
+                                        ui.selectable_value(&mut d.from_start, Some(true), "On");
+                                        ui.selectable_value(&mut d.from_start, Some(false), "Off");
+                                    });
                                 ui.label("");
                                 ui.label("");
                                 ui.end_row();
