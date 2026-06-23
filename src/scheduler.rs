@@ -227,7 +227,8 @@ async fn tick(
             }
             .with_stream_id(o.stream_id.clone())
             .with_thumbnail_url(o.thumbnail_url.clone())
-            .with_broadcaster_id(o.broadcaster_id.clone());
+            .with_broadcaster_id(o.broadcaster_id.clone())
+            .with_stream_title(o.stream_title.clone());
             let _ = live_tx.send(signal);
         }
     }

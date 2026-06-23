@@ -109,6 +109,8 @@ pub struct LiveSignal {
     pub thumbnail_url: Option<String>,
     /// Platform user/channel identifier (Twitch user_id, YouTube UC… ID, Kick slug).
     pub broadcaster_id: Option<String>,
+    /// Stream title at go-live time, if the platform provided it at detection.
+    pub stream_title: Option<String>,
 }
 
 impl LiveSignal {
@@ -120,6 +122,7 @@ impl LiveSignal {
             stream_id: None,
             thumbnail_url: None,
             broadcaster_id: None,
+            stream_title: None,
         }
     }
 
@@ -136,6 +139,11 @@ impl LiveSignal {
 
     pub fn with_broadcaster_id(mut self, broadcaster_id: Option<String>) -> LiveSignal {
         self.broadcaster_id = broadcaster_id;
+        self
+    }
+
+    pub fn with_stream_title(mut self, stream_title: Option<String>) -> LiveSignal {
+        self.stream_title = stream_title;
         self
     }
 }

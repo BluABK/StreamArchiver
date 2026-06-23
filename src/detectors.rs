@@ -62,6 +62,8 @@ pub struct DetectOutcome {
     /// Platform user/channel identifier for asset fetching: Twitch numeric user_id,
     /// YouTube UC… channel ID, or Kick slug. `None` for id-less detection paths.
     pub broadcaster_id: Option<String>,
+    /// Stream title at detection time, when the platform provides it.
+    pub stream_title: Option<String>,
 }
 
 impl DetectOutcome {
@@ -75,6 +77,7 @@ impl DetectOutcome {
             stream_id: None,
             thumbnail_url: None,
             broadcaster_id: None,
+            stream_title: None,
         }
     }
     fn live_at(
@@ -100,6 +103,10 @@ impl DetectOutcome {
         self.broadcaster_id = broadcaster_id;
         self
     }
+    fn with_stream_title(mut self, stream_title: Option<String>) -> DetectOutcome {
+        self.stream_title = stream_title;
+        self
+    }
     fn offline(monitor_id: i64) -> DetectOutcome {
         DetectOutcome {
             monitor_id,
@@ -110,6 +117,7 @@ impl DetectOutcome {
             stream_id: None,
             thumbnail_url: None,
             broadcaster_id: None,
+            stream_title: None,
         }
     }
     fn err(monitor_id: i64, detail: impl Into<String>) -> DetectOutcome {
@@ -122,6 +130,7 @@ impl DetectOutcome {
             stream_id: None,
             thumbnail_url: None,
             broadcaster_id: None,
+            stream_title: None,
         }
     }
 }
@@ -1116,10 +1125,16 @@ impl DetectContext {
                         .as_str()
                         .or_else(|| stream["thumbnail"].as_str())
                         .map(str::to_string);
+                    let title = stream["session_title"]
+                        .as_str()
+                        .or_else(|| stream["title"].as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
                     DetectOutcome::live_at(item.monitor_id, "live", went)
                         .with_stream_id(id)
                         .with_broadcaster_id(kick_slug(&item.url).map(|s| s.to_string()))
                         .with_thumbnail_url(thumb)
+                        .with_stream_title(title)
                 } else {
                     DetectOutcome::offline(item.monitor_id)
                 }

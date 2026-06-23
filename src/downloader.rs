@@ -225,6 +225,35 @@ fn push_track_args(args: &mut Vec<String>, tool: Tool, audio: &str, subs: &str, 
 }
 
 /// Returns the URL yt-dlp should receive for a live YouTube recording.
+/// Extract a YouTube video ID from a URL (`watch?v=`, `youtu.be/`, `/live/ID`).
+/// Returns `None` for channel or handle URLs that don't embed a specific video ID.
+fn extract_yt_video_id(url: &str) -> Option<String> {
+    for marker in &["?v=", "&v="] {
+        if let Some(pos) = url.find(marker) {
+            let rest = &url[pos + marker.len()..];
+            let id: String = rest.chars().take_while(|c| *c != '&' && *c != '#').collect();
+            if !id.is_empty() {
+                return Some(id);
+            }
+        }
+    }
+    if let Some(pos) = url.find("youtu.be/") {
+        let rest = &url[pos + "youtu.be/".len()..];
+        let id: String = rest.chars().take_while(|c| *c != '?' && *c != '#' && *c != '/').collect();
+        if !id.is_empty() {
+            return Some(id);
+        }
+    }
+    if let Some(pos) = url.find("/live/") {
+        let rest = &url[pos + "/live/".len()..];
+        let id: String = rest.chars().take_while(|c| *c != '?' && *c != '#' && *c != '/').collect();
+        if !id.is_empty() {
+            return Some(id);
+        }
+    }
+    None
+}
+
 /// Channel URLs (/@handle, /channel/UC…, /c/name, /user/name) are resolved to
 /// their /live variant so yt-dlp goes straight to the active stream instead of
 /// enumerating the whole channel. Specific-video URLs (watch?v=, youtu.be/,
@@ -292,6 +321,7 @@ pub fn build_plan(
     auth: &AuthSource,
     ytdlp_global_args: &[String],
     stream_id: Option<&str>,
+    stream_title: &str,
     media: Option<&MediaInfo>,
 ) -> DownloadPlan {
     let m = &row.monitor;
@@ -303,7 +333,7 @@ pub fn build_plan(
     // avoid clobbering an existing finished file of the same name.
     // `{games}` isn't known until the stream ends; it's filled at the post-rename.
     let stem = monitor_stem(
-        m, &ch.name, started_at, stream_id, row.recording_count, &quality, media, "",
+        m, &ch.name, started_at, stream_id, stream_title, row.recording_count, &quality, media, "",
     );
     let extra = split_args(&m.extra_args);
     let final_ext = match m.container {
@@ -644,7 +674,7 @@ impl Supervisor {
                     if self.shutdown.load(Ordering::SeqCst) {
                         continue; // draining: don't start new recordings
                     }
-                    self.try_begin(signal.monitor_id, signal.went_live_at, signal.approximate, signal.stream_id, signal.thumbnail_url, signal.broadcaster_id, false);
+                    self.try_begin(signal.monitor_id, signal.went_live_at, signal.approximate, signal.stream_id, signal.thumbnail_url, signal.broadcaster_id, signal.stream_title, false);
                 }
                 Some(cmd) = manual_rx.recv() => match cmd {
                     ManualCommand::Start(id) => {
@@ -676,6 +706,7 @@ impl Supervisor {
         stream_id: Option<String>,
         thumbnail_url: Option<String>,
         broadcaster_id: Option<String>,
+        stream_title: Option<String>,
         bypass_backoff: bool,
     ) -> bool {
         {
@@ -701,7 +732,7 @@ impl Supervisor {
         };
         let this = self.clone();
         tokio::spawn(async move {
-            this.record(row, went_live_at, approximate, stream_id, thumbnail_url, broadcaster_id).await;
+            this.record(row, went_live_at, approximate, stream_id, thumbnail_url, broadcaster_id, stream_title).await;
         });
         true
     }
@@ -722,7 +753,7 @@ impl Supervisor {
                 Some(t) => (Some(t), false),
                 None => (Some(now_unix()), true),
             };
-            self.try_begin(monitor_id, went, approx, outcome.stream_id, outcome.thumbnail_url, outcome.broadcaster_id, true);
+            self.try_begin(monitor_id, went, approx, outcome.stream_id, outcome.thumbnail_url, outcome.broadcaster_id, outcome.stream_title, true);
         } else {
             let message = if outcome.error && !outcome.detail.is_empty() {
                 format!("{name}: {}", outcome.detail)
@@ -954,11 +985,16 @@ impl Supervisor {
         );
         // Optionally resolve the real title + channel + id (for
         // {title}/{channel}/{video_id}/{name} and the list display).
-        let (title, channel, video_id) = if video.auto_title {
+        let (title, channel, mut video_id) = if video.auto_title {
             resolve_meta(&video, &auth).await
         } else {
             (String::new(), String::new(), String::new())
         };
+        // Fall back to URL-extracted video ID so {video_id} is always filled when
+        // the URL contains an explicit ID (YouTube watch?v=, youtu.be/, /live/ID).
+        if video_id.is_empty() {
+            video_id = extract_yt_video_id(&video.url).unwrap_or_default();
+        }
         if !title.is_empty() && video.title.trim().is_empty() {
             let _ = self.store.set_video_title(id, &title);
         }
@@ -1080,6 +1116,7 @@ impl Supervisor {
                     stream_id: None,
                     thumbnail_url: None,
                     broadcaster_id: None,
+                    stream_title: None,
                 }),
             DetectionMethod::GenericProbe => self.ctx.detect_generic(&item).await,
             DetectionMethod::YouTubeApi => self.ctx.detect_youtube_api(&item).await,
@@ -1126,6 +1163,7 @@ impl Supervisor {
         stream_id: Option<String>,
         thumbnail_url: Option<String>,
         broadcaster_id: Option<String>,
+        stream_title: Option<String>,
     ) {
         let monitor_id = row.monitor.id;
         let global_method = self
@@ -1168,7 +1206,7 @@ impl Supervisor {
             .unwrap_or_default();
         let ytdlp_global_args = split_args(&ytdlp_global_raw);
         let started_at = now_unix();
-        let plan = build_plan(&row, started_at, &auth, &ytdlp_global_args, stream_id.as_deref(), pre_media.as_ref());
+        let plan = build_plan(&row, started_at, &auth, &ytdlp_global_args, stream_id.as_deref(), stream_title.as_deref().unwrap_or(""), pre_media.as_ref());
         if let Some(parent) = plan.capture_path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
@@ -1460,12 +1498,13 @@ impl Supervisor {
 
         // Post-capture: fill in the filename bits that are only known now and
         // rename. `{resolution}/{fps}/…` come from probing the finished file (the
-        // post-rename media modes); `{games}` is the list of categories played,
-        // and triggers a rename even when media probing is off.
+        // post-rename media modes); `{games}` and `{title}` are only fully known
+        // after the stream ends, and also trigger a rename even when probing is off.
         let want_games = template_wants_games(&row.monitor.filename_template);
+        let want_title = template_wants_title(&row.monitor.filename_template);
         let final_size = file_len(&final_path).await;
         let do_post_media = want_media && media_mode.post() && final_size > 0;
-        if do_post_media || want_games {
+        if do_post_media || want_games || want_title {
             let mi = if do_post_media {
                 probe_media(&final_path.to_string_lossy()).await
             } else {
@@ -1476,9 +1515,14 @@ impl Supervisor {
             } else {
                 String::new()
             };
-            // Only rename when we actually resolved something to substitute in,
-            // and only when the capture exists (no-op on failed/0-byte recordings).
-            if (mi.is_some() || !games.is_empty()) && final_size > 0 {
+            let title = if want_title {
+                title_for_recording(&self.store, rec_id)
+            } else {
+                String::new()
+            };
+            // Always rename when a post-fill variable was used (even if the value
+            // is empty — that removes the "tba" placeholder left by monitor_stem).
+            if final_size > 0 {
                 let quality = resolved_quality(&row.monitor.quality);
                 // Prefer the post-probe; fall back to the pre-probe so a {games}
                 // rename in pre-probe mode doesn't drop already-resolved media vars.
@@ -1487,6 +1531,7 @@ impl Supervisor {
                     &row.channel.name,
                     started_at,
                     stream_id.as_deref(),
+                    &title,
                     row.recording_count,
                     &quality,
                     mi.as_ref().or(pre_media.as_ref()),
@@ -2032,6 +2077,26 @@ fn template_wants_games(template: &str) -> bool {
     template.contains("{games}")
 }
 
+/// True if `template` uses `{title}` (may not be known at recording start for
+/// all platforms, so it also triggers a post-capture rename to fill the real value).
+fn template_wants_title(template: &str) -> bool {
+    template.contains("{title}")
+}
+
+/// The stream title for a finished recording: the first `title` change logged
+/// by the meta-watcher (which is the baseline/initial value, i.e. the title at
+/// recording start). Returns empty when no title was polled (generic URLs, etc.).
+fn title_for_recording(store: &Store, rec_id: i64) -> String {
+    store
+        .meta_changes_for_recording(rec_id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| c.kind == "title")
+        .map(|c| c.new_value.clone())
+        .next()
+        .unwrap_or_default()
+}
+
 /// Max length of the expanded `{games}` value, to keep paths sane.
 const GAMES_MAX_LEN: usize = 100;
 
@@ -2325,6 +2390,7 @@ fn monitor_stem(
     ch_name: &str,
     started_at: i64,
     stream_id: Option<&str>,
+    stream_title: &str,
     recording_count: i64,
     quality: &str,
     media: Option<&MediaInfo>,
@@ -2332,14 +2398,27 @@ fn monitor_stem(
 ) -> String {
     let take = (recording_count + 1).to_string();
     let mi = media.cloned().unwrap_or_default();
+    // Use "tba" as placeholder for title/games that will be filled in at the
+    // post-recording rename, so the in-progress filename isn't silently empty.
+    let title_val = if stream_title.is_empty() && template_wants_title(&m.filename_template) {
+        "tba"
+    } else {
+        stream_title
+    };
+    let games_val = if games.is_empty() && template_wants_games(&m.filename_template) {
+        "tba"
+    } else {
+        games
+    };
     expand_template(
         &m.filename_template,
         &TemplateVars {
             name: ch_name,
+            title: title_val,
             video_id: stream_id.unwrap_or(""),
             quality,
             take: &take,
-            games,
+            games: games_val,
             resolution: &mi.resolution,
             height: &mi.height,
             width: &mi.width,
@@ -3019,6 +3098,7 @@ mod tests {
             &AuthSource::None,
             &[],
             None,
+            "",
             None,
         );
         assert_eq!(plan.program, "streamlink");
@@ -3041,6 +3121,7 @@ mod tests {
             &AuthSource::None,
             &[],
             None,
+            "",
             None,
         );
         assert_eq!(plan.program, "yt-dlp");
@@ -3059,6 +3140,7 @@ mod tests {
             &AuthSource::Token("abc123".into()),
             &[],
             None,
+            "",
             None,
         );
         assert!(
@@ -3076,6 +3158,7 @@ mod tests {
             &AuthSource::CookiesBrowser("firefox".into()),
             &[],
             None,
+            "",
             None,
         );
         let joined = browser.args.join(" ");
@@ -3087,6 +3170,7 @@ mod tests {
             &AuthSource::CookiesFile("C:/c.txt".into()),
             &[],
             None,
+            "",
             None,
         );
         assert!(file.args.join(" ").contains("--cookies C:/c.txt"));
@@ -3098,13 +3182,13 @@ mod tests {
         let mut r = row(Tool::Streamlink, Container::Mkv, Platform::Twitch);
         r.monitor.audio_tracks = "all".into();
         r.monitor.subtitle_tracks = "all".into(); // ignored by streamlink
-        let plan = build_plan(&r, 1_700_000_000, &AuthSource::None, &[], None, None);
+        let plan = build_plan(&r, 1_700_000_000, &AuthSource::None, &[], None, "", None);
         assert!(plan.args.iter().any(|a| a == "--hls-audio-select=*"));
         assert!(!plan.args.iter().any(|a| a == "--sub-langs"));
 
         let mut r2 = row(Tool::Streamlink, Container::Mkv, Platform::Twitch);
         r2.monitor.audio_tracks = "en,de".into();
-        let plan2 = build_plan(&r2, 1_700_000_000, &AuthSource::None, &[], None, None);
+        let plan2 = build_plan(&r2, 1_700_000_000, &AuthSource::None, &[], None, "", None);
         assert!(plan2.args.iter().any(|a| a == "--hls-audio-select=en,de"));
 
         // yt-dlp: "all" subs -> --sub-langs=all --write-subs; audio ignored. The
@@ -3112,7 +3196,7 @@ mod tests {
         let mut y = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
         y.monitor.subtitle_tracks = "all".into();
         y.monitor.audio_tracks = "all".into(); // ignored by yt-dlp
-        let yplan = build_plan(&y, 1_700_000_000, &AuthSource::None, &[], None, None);
+        let yplan = build_plan(&y, 1_700_000_000, &AuthSource::None, &[], None, "", None);
         // live_chat is excluded from the main process via negation so "all"
         // doesn't pull in the chat stream and block the video download.
         assert!(yplan.args.iter().any(|a| a == "--sub-langs=all,-live_chat"));
@@ -3122,13 +3206,13 @@ mod tests {
         // "*" is normalized to "all,-live_chat" for subtitles too.
         let mut y2 = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
         y2.monitor.subtitle_tracks = "*".into();
-        let yplan2 = build_plan(&y2, 1_700_000_000, &AuthSource::None, &[], None, None);
+        let yplan2 = build_plan(&y2, 1_700_000_000, &AuthSource::None, &[], None, "", None);
         assert!(yplan2.args.iter().any(|a| a == "--sub-langs=all,-live_chat"));
 
         // A language list passes through verbatim (joined form).
         let mut y3 = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
         y3.monitor.subtitle_tracks = "en,de".into();
-        let yplan3 = build_plan(&y3, 1_700_000_000, &AuthSource::None, &[], None, None);
+        let yplan3 = build_plan(&y3, 1_700_000_000, &AuthSource::None, &[], None, "", None);
         assert!(yplan3.args.iter().any(|a| a == "--sub-langs=en,de"));
 
         // Empty (existing-monitor default) adds no track flags at all.
@@ -3138,6 +3222,7 @@ mod tests {
             &AuthSource::None,
             &[],
             None,
+            "",
             None,
         );
         assert!(
@@ -3156,7 +3241,7 @@ mod tests {
         let mut y = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
         y.monitor.chat_log = true;
         y.monitor.subtitle_tracks = String::new();
-        let plan = build_plan(&y, 1_700_000_000, &AuthSource::None, &[], None, None);
+        let plan = build_plan(&y, 1_700_000_000, &AuthSource::None, &[], None, "", None);
         assert!(!plan.args.iter().any(|a| a.contains("live_chat")));
         assert!(!plan.args.iter().any(|a| a == "--write-subs"));
 
@@ -3164,7 +3249,7 @@ mod tests {
         let mut y2 = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
         y2.monitor.chat_log = true;
         y2.monitor.subtitle_tracks = "en".into();
-        let plan2 = build_plan(&y2, 1_700_000_000, &AuthSource::None, &[], None, None);
+        let plan2 = build_plan(&y2, 1_700_000_000, &AuthSource::None, &[], None, "", None);
         assert!(!plan2.args.iter().any(|a| a.contains("live_chat")));
         assert!(plan2.args.iter().any(|a| a == "--sub-langs=en"));
 
@@ -3173,7 +3258,7 @@ mod tests {
         let mut t = row(Tool::YtDlp, Container::Mkv, Platform::Twitch);
         t.monitor.chat_log = true;
         t.monitor.subtitle_tracks = String::new();
-        let plant = build_plan(&t, 1_700_000_000, &AuthSource::None, &[], None, None);
+        let plant = build_plan(&t, 1_700_000_000, &AuthSource::None, &[], None, "", None);
         assert!(!plant.args.iter().any(|a| a.contains("live_chat")));
     }
 
@@ -3205,6 +3290,7 @@ mod tests {
             &AuthSource::None,
             &[],
             None,
+            "",
             None,
         );
         assert!(plan.final_path.to_string_lossy().ends_with(".ts"));
