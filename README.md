@@ -24,6 +24,9 @@ small.
 - **Runtime tools** on `PATH`: [`streamlink`](https://streamlink.github.io/),
   [`yt-dlp`](https://github.com/yt-dlp/yt-dlp), [`ffmpeg`](https://ffmpeg.org/).
 - **To build**: Rust (stable) + the MSVC toolchain on Windows.
+- **Optional, for YouTube live capture-from-start:** a SABR-capable `yt-dlp` dev
+  build, a JS runtime (Node), and a GVS PO-token provider (bgutil). See
+  [YouTube live capture-from-start (SABR)](#youtube-live-capture-from-start-sabr).
 
 ## Build & run
 
@@ -247,7 +250,8 @@ manages the hub subscriptions.
 
 > Tool tip: use **streamlink for Twitch** (reaches 1440p/2K HEVC) and **yt-dlp for
 > YouTube** (`--live-from-start`; streamlink hits YouTube segment 403s). The app
-> defaults accordingly.
+> defaults accordingly. **Note:** YouTube `--live-from-start` now requires the SABR
+> setup — see [YouTube live capture-from-start (SABR)](#youtube-live-capture-from-start-sabr).
 
 ### Output
 
@@ -549,6 +553,100 @@ per channel in the add/edit form (a per-channel value always wins):
 
 > Note: streamlink (Twitch) authenticates via the token header; yt-dlp uses
 > cookies. The form offers each tool the form it actually supports.
+
+### YouTube live capture-from-start (SABR)
+
+YouTube has moved live streaming to **SABR** (Server Adaptive Bit Rate). Stable
+`yt-dlp` only sees the legacy HTTP-adaptive/DASH formats, which lack the metadata to
+rewind reliably — so plain `yt-dlp --live-from-start` on a YouTube live now fails
+(the formats show `MISSING POT` and the stream returns `ATTESTATION_REQUIRED`).
+Capturing a YouTube stream **from its start** therefore needs three things working
+together:
+
+1. **A SABR-capable yt-dlp.** SABR support currently lives only in bashonly's
+   [`feat/youtube/sabr`](https://github.com/yt-dlp/yt-dlp/pull/13515) dev fork, not
+   in stable yt-dlp. Build/obtain that binary and keep it **separate** from your
+   normal yt-dlp — the fork doesn't track yt-dlp master and will drift, so the app
+   uses it *only* for the SABR capture (everything else stays on the system yt-dlp).
+2. **A JavaScript runtime** (e.g. [Node](https://nodejs.org)). SABR extraction
+   solves JS challenges; add `--js-runtimes node` to **Settings → yt-dlp default
+   arguments** and keep `node` on `PATH`.
+3. **A GVS PO-token provider.** SABR refuses to serve media without a per-request PO
+   token. The standard provider is
+   [`bgutil-ytdlp-pot-provider`](https://github.com/Brainicism/bgutil-ytdlp-pot-provider):
+   run its token server (HTTP, default port **4416**) **and** install its yt-dlp
+   plugin *for the SABR binary*.
+
+#### Settings → "YouTube SABR (live-from-start)"
+
+| Field | Purpose |
+|---|---|
+| **System yt-dlp path** | Your normal yt-dlp (chat, VODs, DASH). Empty = `yt-dlp` on `PATH`. |
+| **SABR build path** | The SABR dev-build binary. **Empty disables SABR** — capture-from-start falls back to the normal path. |
+| **Use SABR for capture-from-start** | Master toggle. |
+| **SABR format** | Format selector. Default `ba[protocol=sabr]+bv[protocol=sabr]`. |
+| **SABR extractor-args** | Default `youtube:formats=duplicate,missing_pot;player-client=web;webpage-client=web`. |
+| **PO token extractor-args** | A *separate* `--extractor-args` entry for the token provider. Default `youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416`. Empty = rely on the plugin's own auto-detection. |
+| **SABR manual args** | When set, **replaces** the SABR format + extractor-args preset entirely (put your own `-f` / `--extractor-args` here). The PO-token args still apply. |
+| **DASH companion format** | Format selector for the DASH companion of *dual capture* (below). |
+
+The SABR binary is used **only** when a monitor is **YouTube**, its tool is
+**yt-dlp**, and **Capture from start** is ticked. Everything else — live-chat
+sidecars, channel/chat assets, thumbnails, and on-demand **Videos**/VOD downloads —
+deliberately stays on the **system** yt-dlp, so the stale fork can't break them.
+SABR captures write the final **MKV directly** (SABR merges separate audio+video,
+which the `.ts` intermediate can't hold).
+
+#### Installing the bgutil PO-token provider
+
+bgutil has two parts — a **token server** and a **yt-dlp plugin** — and *both* must
+be reachable by the **SABR binary**:
+
+1. **Run the server** on `127.0.0.1:4416` (the Docker image, or the Node server from
+   the bgutil repo). The **PO token extractor-args** field already points here.
+2. **Install the plugin for the SABR binary.** This is the easy step to get wrong:
+
+> ⚠ **A standalone/frozen `yt-dlp.exe` does NOT load plugins from Python
+> `site-packages`.** A `pip install bgutil-ytdlp-pot-provider` is only visible to a
+> *pip* yt-dlp, not to a PyInstaller-built SABR exe — which then logs
+> `Plugin directories: none` / `PO Token Providers: none` and still fails with
+> `requires a GVS PO Token`. Install the plugin into a directory the binary scans,
+> **with the required nesting**:
+>
+> ```
+> %APPDATA%\yt-dlp\plugins\bgutil-ytdlp-pot-provider\yt_dlp_plugins\extractor\
+>     getpot_bgutil.py
+>     getpot_bgutil_http.py
+>     getpot_bgutil_script.py
+> ```
+>
+> (or a `yt-dlp-plugins\<package>\yt_dlp_plugins\…` folder next to the exe). The
+> `<package>\yt_dlp_plugins\` wrapper is required — pointing a `yt-dlp-plugins`
+> folder *straight at* a `yt_dlp_plugins` directory doesn't load.
+
+**Verify out-of-band** before recording in the app:
+
+```sh
+"<SABR build>\yt-dlp.exe" --verbose -F "https://www.youtube.com/@<channel>/live"
+```
+
+You want to see `Plugin directories: …\bgutil…`,
+`PO Token Providers: bgutil:http-… (external)`, and `Retrieved a gvs PO Token`.
+Once that lists formats, StreamArchiver will capture too.
+
+> A separate error — `n challenge solving failed … No video formats found` — is the
+> **n-sig (EJS) challenge solver**, not PO tokens: ensure a JS runtime + the
+> `yt_dlp_ejs` distribution are present (see yt-dlp's EJS wiki).
+
+#### Dual capture (SABR + DASH)
+
+Live **DASH** and live **SABR/HTTP** formats can't be downloaded in one yt-dlp
+process, so a per-monitor **Dual capture (SABR + DASH)** checkbox (YouTube only)
+runs a **second** concurrent capture — the **system** yt-dlp grabbing the DASH-only
+formats (configurable via *DASH companion format*) from the live edge — alongside
+the SABR capture. The two produce **two recordings** that belong to the **same
+take** (labelled `· SABR` / `· DASH` in the history tree); a single **Stop** ends
+both. Use it only when the formats you want are split across both protocols.
 
 ## Data & locations
 
