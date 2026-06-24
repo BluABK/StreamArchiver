@@ -8034,16 +8034,25 @@ fn prop_read_manifest_count(path: &std::path::Path) -> usize {
 // ── Chat viewer helpers ──────────────────────────────────────────────────────
 
 /// Derive the chat sidecar path from a recording's output path.
-/// Tries `.live_chat.json` (yt-dlp YouTube) then `.chat.jsonl` (Twitch).
+/// Locate a recording's chat sidecar. yt-dlp's `live_chat` writer **appends** to the
+/// `-o` value (keeping the video extension), so the YouTube sidecar is
+/// `<output_path>.live_chat.json` (e.g. `clip.mkv.live_chat.json`) — not a simple
+/// extension swap. The Twitch native logger instead **replaces** the extension
+/// (`clip.chat.jsonl`). We try both forms, plus the legacy pre-`.cache` YouTube name
+/// (`clip.ts.live_chat.json`).
 fn chat_file_for_recording(rec: &Recording) -> Option<std::path::PathBuf> {
     let base = Path::new(&rec.output_path);
-    for ext in &["live_chat.json", "chat.jsonl"] {
-        let p = base.with_extension(ext);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    None
+    let candidates = [
+        // YouTube (yt-dlp append form): `<output_path>.live_chat.json`.
+        std::path::PathBuf::from(format!("{}.live_chat.json", rec.output_path)),
+        // Twitch native logger (extension replace): `<stem>.chat.jsonl`.
+        base.with_extension("chat.jsonl"),
+        // Extension-replace live_chat form, just in case.
+        base.with_extension("live_chat.json"),
+        // Legacy pre-`.cache` YouTube name: `<stem>.ts.live_chat.json`.
+        base.with_extension("ts.live_chat.json"),
+    ];
+    candidates.into_iter().find(|p| p.exists())
 }
 
 fn fmt_recording_label(rec: &Recording) -> String {
@@ -8295,9 +8304,55 @@ fn parse_twitch_chat(path: &Path, start_unix_secs: i64) -> anyhow::Result<Vec<Ch
 mod tests {
     use super::{
         DateFmt, StreamMetaChange, active_date_fmt, aggregate_stream_changes,
-        compose_browser_profile, fmt_polled, meta_change_lines, set_active_date_fmt,
-        split_browser_profile,
+        chat_file_for_recording, compose_browser_profile, fmt_polled, meta_change_lines,
+        set_active_date_fmt, split_browser_profile,
     };
+
+    fn rec_with_output(path: &str) -> crate::models::Recording {
+        crate::models::Recording {
+            id: 1,
+            monitor_id: 1,
+            started_at: 0,
+            ended_at: None,
+            status: "recording".into(),
+            bytes: 0,
+            exit_code: None,
+            output_path: path.into(),
+            went_live_at: None,
+            went_live_approx: false,
+            lost_secs: None,
+            stream_id: None,
+            take_group: None,
+            ad_count: 0,
+            ad_secs: 0,
+            meta_change_count: 0,
+            title: String::new(),
+            category: String::new(),
+            log_excerpt: String::new(),
+        }
+    }
+
+    #[test]
+    fn finds_youtube_live_chat_append_form() {
+        // yt-dlp appends `.live_chat.json` to the -o value, so the sidecar keeps the
+        // video extension: `<output_path>.live_chat.json`.
+        let dir = std::env::temp_dir().join(format!("sa-chat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("clip.mkv");
+        std::fs::write(format!("{}.live_chat.json", out.to_string_lossy()), "{}").unwrap();
+
+        let found = chat_file_for_recording(&rec_with_output(&out.to_string_lossy()));
+        assert_eq!(found.as_deref(), Some(out.with_extension("mkv.live_chat.json").as_path()));
+
+        // Twitch native logger uses the extension-replace form.
+        let tout = dir.join("vod.mkv");
+        std::fs::write(tout.with_extension("chat.jsonl"), "{}").unwrap();
+        let tfound = chat_file_for_recording(&rec_with_output(&tout.to_string_lossy()));
+        assert_eq!(tfound.as_deref(), Some(tout.with_extension("chat.jsonl").as_path()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn actions_col_index_is_actions() {
