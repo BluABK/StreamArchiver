@@ -1361,10 +1361,12 @@ pub async fn refresh_ad_free(
         // resolve subs at all; legacy connections without it do no work until a
         // reconnect. The pass itself only spends a Helix call on stale/unchecked
         // monitors, so an idle tick is just one local DB query.
-        if crate::oauth::connected_user_id(ctx.store.as_ref()).is_some() {
-            refresh_ad_free_once(&ctx, &events, &shutdown, STALE_AFTER_SECS).await;
+        if ctx.store.job_enabled("job_ad_free_refresh") {
+            if crate::oauth::connected_user_id(ctx.store.as_ref()).is_some() {
+                refresh_ad_free_once(&ctx, &events, &shutdown, STALE_AFTER_SECS).await;
+            }
+            crate::events::mark_job(&jobs, "Ad-free / sub refresh", TICK_SECS as i64);
         }
-        crate::events::mark_job(&jobs, "Ad-free / sub refresh", TICK_SECS as i64);
         sleep_cancellable(Duration::from_secs(TICK_SECS), &shutdown).await;
     }
 }
@@ -1461,17 +1463,19 @@ pub async fn refresh_schedules(
         if shutdown.load(Ordering::SeqCst) {
             return;
         }
-        refresh_schedules_once(
-            &ctx,
-            &events,
-            &shutdown,
-            &mut last_fetched,
-            &mut discord_last,
-            &yt_video_id_refetch,
-            REFRESH_SECS,
-        )
-        .await;
-        crate::events::mark_job(&jobs, "Schedule refresh", TICK_SECS as i64);
+        if ctx.store.job_enabled("job_schedule_refresh") {
+            refresh_schedules_once(
+                &ctx,
+                &events,
+                &shutdown,
+                &mut last_fetched,
+                &mut discord_last,
+                &yt_video_id_refetch,
+                REFRESH_SECS,
+            )
+            .await;
+            crate::events::mark_job(&jobs, "Schedule refresh", TICK_SECS as i64);
+        }
         // Wake on either the periodic tick or a UI-requested reload; the latter
         // forces a full re-fetch immediately (staleness window 0 = refresh all).
         tokio::select! {

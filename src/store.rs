@@ -399,6 +399,16 @@ impl Store {
         Ok(())
     }
 
+    /// Whether a periodic background job (see `events::TOGGLEABLE_JOBS`) is enabled.
+    /// Default `true`; only an explicit `"0"` disables it.
+    pub fn job_enabled(&self, key: &str) -> bool {
+        self.get_setting(key)
+            .ok()
+            .flatten()
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    }
+
     // ----- channels -----
 
     pub fn find_channel_by_url(&self, url: &str) -> Result<Option<Channel>> {

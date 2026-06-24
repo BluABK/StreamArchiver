@@ -470,6 +470,9 @@ pub struct StreamArchiverApp {
     /// Completed/failed background tasks (task, outcome, finished-at unix), newest
     /// first; capped at 100.
     finished_tasks: Vec<(crate::events::BackgroundTask, crate::events::TaskOutcome, i64)>,
+    /// Enable/disable state for the periodic jobs (`events::TOGGLEABLE_JOBS`),
+    /// mirrored from settings; edited via the Background "Scheduled" checkboxes.
+    job_toggles: std::collections::HashMap<String, bool>,
 }
 
 impl StreamArchiverApp {
@@ -606,6 +609,13 @@ impl StreamArchiverApp {
             .and_then(|s| serde_json::from_str::<MonitorDefaults>(&s).ok())
             .unwrap_or_default();
 
+        // Snapshot job enable/disable state before `core` is moved into the struct.
+        let job_toggles: std::collections::HashMap<String, bool> =
+            crate::events::TOGGLEABLE_JOBS
+                .iter()
+                .map(|(_, key)| (key.to_string(), core.store.job_enabled(key)))
+                .collect();
+
         let mut app = StreamArchiverApp {
             core,
             _tray: tray,
@@ -659,6 +669,7 @@ impl StreamArchiverApp {
             show_actions,
             background_tasks: Vec::new(),
             finished_tasks: Vec::new(),
+            job_toggles,
         };
         app.reload_rows();
         app.reload_videos();
@@ -6288,48 +6299,57 @@ impl StreamArchiverApp {
     fn background_view(&mut self, ui: &mut egui::Ui) {
         use egui_extras::{Column, TableBuilder};
         let now = now_unix();
+        // Next-run estimates, plus the editable enable/disable state for each job.
+        let reg = self.core.jobs.lock().unwrap().clone();
+        let mut toggles: Vec<(&'static str, &'static str, bool)> = crate::events::TOGGLEABLE_JOBS
+            .iter()
+            .map(|(name, key)| (*name, *key, self.job_toggles.get(*key).copied().unwrap_or(true)))
+            .collect();
+        let before: Vec<bool> = toggles.iter().map(|t| t.2).collect();
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add_space(8.0);
 
-            // ── Scheduled (periodic refreshers) ──────────────────────────
+            // ── Scheduled (periodic jobs) ────────────────────────────────
             ui.strong("Scheduled");
             ui.label(
-                egui::RichText::new("Recurring background jobs and their next estimated run.")
-                    .small()
-                    .weak(),
+                egui::RichText::new(
+                    "Recurring background jobs. Untick to disable — turning off Live poll \
+                     pauses all detection/recording.",
+                )
+                .small()
+                .weak(),
             );
             ui.add_space(4.0);
-            let mut jobs = self.core.jobs.lock().unwrap().clone();
-            jobs.sort_by_key(|j| j.next_run_at);
-            if jobs.is_empty() {
-                ui.weak("No periodic jobs running.");
-            } else {
-                ui.push_id("bg_scheduled", |ui| {
-                    TableBuilder::new(ui)
-                        .striped(true)
-                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                        .column(Column::remainder().clip(true))
-                        .column(Column::auto())
-                        .column(Column::auto())
-                        .header(20.0, |mut h| {
-                            h.col(|ui| { ui.strong("Job"); });
-                            h.col(|ui| { ui.strong("Every"); });
-                            h.col(|ui| { ui.strong("Next run"); });
-                        })
-                        .body(|mut body| {
-                            for j in &jobs {
-                                body.row(20.0, |mut row| {
-                                    row.col(|ui| { ui.label(&j.name); });
-                                    row.col(|ui| { ui.label(fmt_duration_secs(j.interval_secs)); });
-                                    row.col(|ui| {
-                                        ui.label(fmt_relative_future(j.next_run_at - now));
-                                    });
-                                });
-                            }
-                        });
+            egui::Grid::new("bg_scheduled_grid")
+                .num_columns(4)
+                .striped(true)
+                .spacing([16.0, 6.0])
+                .show(ui, |ui| {
+                    ui.strong("On");
+                    ui.strong("Job");
+                    ui.strong("Every");
+                    ui.strong("Next run");
+                    ui.end_row();
+                    for (name, _key, en) in toggles.iter_mut() {
+                        ui.checkbox(en, "");
+                        ui.label(*name);
+                        let r = reg.iter().find(|j| j.name == *name);
+                        ui.label(
+                            r.map(|j| fmt_duration_secs(j.interval_secs))
+                                .unwrap_or_else(|| "—".into()),
+                        );
+                        if !*en {
+                            ui.weak("disabled");
+                        } else {
+                            ui.label(
+                                r.map(|j| fmt_relative_future(j.next_run_at - now))
+                                    .unwrap_or_else(|| "pending".into()),
+                            );
+                        }
+                        ui.end_row();
+                    }
                 });
-            }
 
             ui.add_space(12.0);
 
@@ -6419,6 +6439,14 @@ impl StreamArchiverApp {
 
             ui.add_space(8.0);
         });
+
+        // Persist any toggle changes (after the closure releases its borrows).
+        for ((_, key, en), was) in toggles.iter().zip(before.iter()) {
+            if en != was {
+                self.job_toggles.insert((*key).to_string(), *en);
+                let _ = self.core.store.set_setting(key, if *en { "1" } else { "0" });
+            }
+        }
     }
 
     fn settings_view(&mut self, ui: &mut egui::Ui) {

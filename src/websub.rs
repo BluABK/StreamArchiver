@@ -89,6 +89,11 @@ pub async fn run(
     let mut video_last_checked: HashMap<(i64, String), Instant> = HashMap::new();
 
     while !shutdown.load(Ordering::SeqCst) {
+        // Toggleable from the Background view; idle-check for re-enable when off.
+        if !store.job_enabled("job_websub_poll") {
+            sleep_cancellable(IDLE, &shutdown).await;
+            continue;
+        }
         let monitors = load_websub_monitors(&store);
 
         let Some((base, token)) = config(&store) else {

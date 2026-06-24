@@ -44,6 +44,12 @@ pub async fn run(
     jobs: crate::events::JobRegistry,
 ) {
     while !shutdown.load(Ordering::SeqCst) {
+        // Live poll can be disabled from the Background view (a global pause of
+        // detection/recording); idle-check for re-enable without polling.
+        if !ctx.store.job_enabled("job_live_poll") {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            continue;
+        }
         let wait = tick(&ctx, &events, &live_tx, &active).await;
         crate::events::mark_job(&jobs, "Live poll", wait as i64);
         tokio::time::sleep(Duration::from_secs(wait)).await;

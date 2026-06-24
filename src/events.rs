@@ -67,6 +67,18 @@ pub struct ScheduledJob {
 
 pub type JobRegistry = Arc<Mutex<Vec<ScheduledJob>>>;
 
+/// Periodic jobs that can be enabled/disabled from the Background view, as
+/// `(display name, settings key)`. The display name matches the [`mark_job`] name
+/// so the UI can join a toggle with its next-run estimate. Default: enabled
+/// (`get_setting(key) != "0"`); each loop skips its work when disabled.
+pub const TOGGLEABLE_JOBS: &[(&str, &str)] = &[
+    ("Live poll", "job_live_poll"),
+    ("Schedule refresh", "job_schedule_refresh"),
+    ("Ad-free / sub refresh", "job_ad_free_refresh"),
+    ("YouTube WebSub poll", "job_websub_poll"),
+    ("Channel asset refresh", "job_asset_refresh"),
+];
+
 pub fn job_registry() -> JobRegistry {
     Arc::new(Mutex::new(Vec::new()))
 }

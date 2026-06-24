@@ -1150,8 +1150,10 @@ impl Supervisor {
             if shutdown.load(Ordering::SeqCst) {
                 return;
             }
-            self.refresh_stale_assets_once();
-            crate::events::mark_job(&jobs, "Channel asset refresh", TICK_SECS as i64);
+            if self.store.job_enabled("job_asset_refresh") {
+                self.refresh_stale_assets_once();
+                crate::events::mark_job(&jobs, "Channel asset refresh", TICK_SECS as i64);
+            }
             crate::app_core::sleep_cancellable(Duration::from_secs(TICK_SECS), &shutdown).await;
         }
     }
