@@ -208,6 +208,15 @@ impl AppCore {
         self.rt
             .spawn(async move { sweep_sup.sweep_caches(skip_stems).await });
 
+        // Periodic channel-asset refresh (keeps icons/badges/emotes current for
+        // channels that rarely record).
+        let asset_sup = supervisor.clone();
+        let asset_shutdown = self.shutdown.clone();
+        let asset_jobs = self.jobs.clone();
+        self.rt.spawn(async move {
+            asset_sup.asset_refresh_loop(asset_shutdown, asset_jobs).await;
+        });
+
         self.rt.spawn(async move {
             supervisor.run(live_rx, manual_rx).await;
         });

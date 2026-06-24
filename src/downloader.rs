@@ -1132,6 +1132,72 @@ impl Supervisor {
         });
     }
 
+    /// Periodically refresh stale channel assets for enabled monitors that have
+    /// asset fetching on, so channels that rarely (or never) record still keep a
+    /// current icon/banner/badges/emotes. Cheap: a fresh channel is a no-op
+    /// (`fetch_channel_assets` returns early when not stale), so only channels past
+    /// the 24h window actually fetch.
+    pub async fn asset_refresh_loop(
+        &self,
+        shutdown: Arc<AtomicBool>,
+        jobs: crate::events::JobRegistry,
+    ) {
+        const INITIAL_DELAY_SECS: u64 = 45;
+        const TICK_SECS: u64 = 3600; // re-scan hourly; per-channel staleness is 24h
+
+        crate::app_core::sleep_cancellable(Duration::from_secs(INITIAL_DELAY_SECS), &shutdown).await;
+        loop {
+            if shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            self.refresh_stale_assets_once();
+            crate::events::mark_job(&jobs, "Channel asset refresh", TICK_SECS as i64);
+            crate::app_core::sleep_cancellable(Duration::from_secs(TICK_SECS), &shutdown).await;
+        }
+    }
+
+    /// One asset-refresh pass: trigger a (staleness-gated) fetch for each eligible
+    /// channel, de-duplicated across instances that share an asset dir.
+    fn refresh_stale_assets_once(&self) {
+        let rows = match self.store.list_monitors_with_channels() {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("asset refresh: failed to load monitors: {e:#}");
+                return;
+            }
+        };
+        // YouTube asset fetch needs the Data API; skip it without a key rather than
+        // failing every pass (the manual Refetch button still surfaces the reason).
+        let yt_key_set = !self
+            .store
+            .get_setting("youtube_api_key")
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .is_empty();
+        let recording: std::collections::HashSet<i64> =
+            self.active.lock().unwrap().keys().copied().collect();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for row in &rows {
+            if !row.monitor.enabled || !row.monitor.fetch_chat_assets {
+                continue;
+            }
+            // A recording channel's record() path already handles its assets.
+            if recording.contains(&row.monitor.id) {
+                continue;
+            }
+            if row.monitor.platform() == Platform::YouTube && !yt_key_set {
+                continue;
+            }
+            // Instances of one channel share an asset dir — fetch it once per pass.
+            if !seen.insert(sanitize_filename(&row.channel.name)) {
+                continue;
+            }
+            // force=false: a no-op when the channel's assets are still fresh.
+            self.fetch_channel_assets(row, None, false);
+        }
+    }
+
     /// Reserve the monitor and spawn its recording task. Returns false if it was
     /// skipped (already active, or in backoff when not bypassing).
     fn try_begin(
