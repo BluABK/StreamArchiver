@@ -317,7 +317,7 @@ impl DetectContext {
     }
 
     /// Resolve a Twitch login to its numeric user id (Helix Get Users).
-    async fn twitch_user_id(&self, client_id: &str, token: &str, login: &str) -> Option<String> {
+    pub(crate) async fn twitch_user_id(&self, client_id: &str, token: &str, login: &str) -> Option<String> {
         let resp = self
             .http
             .get("https://api.twitch.tv/helix/users")
@@ -1342,7 +1342,12 @@ impl DetectContext {
 /// at most one Helix lookup per unique broadcaster, no more than every few hours,
 /// and nothing at all when no account is connected. A short poll tick means a
 /// just-connected account is picked up within ~`TICK_SECS`, not a refresh period.
-pub async fn refresh_ad_free(ctx: Arc<DetectContext>, events: EventTx, shutdown: Arc<AtomicBool>) {
+pub async fn refresh_ad_free(
+    ctx: Arc<DetectContext>,
+    events: EventTx,
+    shutdown: Arc<AtomicBool>,
+    jobs: crate::events::JobRegistry,
+) {
     const INITIAL_DELAY_SECS: u64 = 20;
     const TICK_SECS: u64 = 60;
     const STALE_AFTER_SECS: i64 = 6 * 3600;
@@ -1359,6 +1364,7 @@ pub async fn refresh_ad_free(ctx: Arc<DetectContext>, events: EventTx, shutdown:
         if crate::oauth::connected_user_id(ctx.store.as_ref()).is_some() {
             refresh_ad_free_once(&ctx, &events, &shutdown, STALE_AFTER_SECS).await;
         }
+        crate::events::mark_job(&jobs, "Ad-free / sub refresh", TICK_SECS as i64);
         sleep_cancellable(Duration::from_secs(TICK_SECS), &shutdown).await;
     }
 }
@@ -1442,6 +1448,7 @@ pub async fn refresh_schedules(
     shutdown: Arc<AtomicBool>,
     refresh_now: Arc<tokio::sync::Notify>,
     yt_video_id_refetch: Arc<AtomicBool>,
+    jobs: crate::events::JobRegistry,
 ) {
     const INITIAL_DELAY_SECS: u64 = 30;
     const TICK_SECS: u64 = 60;
@@ -1464,6 +1471,7 @@ pub async fn refresh_schedules(
             REFRESH_SECS,
         )
         .await;
+        crate::events::mark_job(&jobs, "Schedule refresh", TICK_SECS as i64);
         // Wake on either the periodic tick or a UI-requested reload; the latter
         // forces a full re-fetch immediately (staleness window 0 = refresh all).
         tokio::select! {
@@ -1681,7 +1689,7 @@ pub(crate) fn twitch_login(url: &str) -> Option<String> {
 }
 
 /// Extract the Kick channel slug from a URL (`kick.com/<slug>`).
-fn kick_slug(url: &str) -> Option<String> {
+pub(crate) fn kick_slug(url: &str) -> Option<String> {
     let trimmed = url.trim().trim_end_matches('/');
     let lower = trimmed.to_lowercase();
     let pos = lower.find("kick.com/")?;

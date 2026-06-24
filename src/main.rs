@@ -10,6 +10,7 @@ mod detectors;
 mod downloader;
 mod events;
 mod eventsub;
+mod fonts;
 mod models;
 mod notifications;
 mod oauth;
@@ -85,12 +86,10 @@ fn main() -> Result<()> {
     };
 
     let store = Store::open(&app_paths::db_path()).context("opening data store")?;
-    // Crash recovery: any recording/download left mid-flight by a previous run is stale.
-    match store.mark_orphaned_recordings(models::now_unix()) {
-        Ok(n) if n > 0 => info!("marked {n} orphaned recording(s) from a previous run"),
-        Ok(_) => {}
-        Err(e) => tracing::warn!("orphan recovery failed: {e:#}"),
-    }
+    // Crash recovery for on-demand downloads: any left mid-flight is stale.
+    // (In-flight live recordings are handled in `core.start()` →
+    // `Supervisor::resume_inflight`, which resumes SABR-resumable captures and
+    // orphans the rest, then sweeps stale `.cache\` working files.)
     match store.mark_orphaned_videos(models::now_unix()) {
         Ok(n) if n > 0 => info!("marked {n} orphaned video download(s) from a previous run"),
         Ok(_) => {}
@@ -129,6 +128,9 @@ fn main() -> Result<()> {
         "StreamArchiver",
         native_options,
         Box::new(move |cc| {
+            // Add OS CJK/Unicode fallback fonts so non-Latin channel names (e.g.
+            // Japanese VTuber names, fullwidth 【】) render instead of tofu boxes.
+            fonts::install_unicode_fonts(&cc.egui_ctx);
             let (tray, ui_rx) = build_tray(cc.egui_ctx.clone())
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
             Ok(Box::new(ui::StreamArchiverApp::new(

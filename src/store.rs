@@ -982,6 +982,17 @@ impl Store {
         Ok(n)
     }
 
+    /// Mark a single in-flight recording 'orphaned' (used at startup for crash
+    /// leftovers that aren't being resumed). No-op if it's no longer 'recording'.
+    pub fn mark_recording_orphaned(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE recording SET status='orphaned', ended_at=?2 WHERE id=?1 AND status='recording'",
+            params![id, now_unix()],
+        )?;
+        Ok(())
+    }
+
     /// All monitors joined with their channel, ordered by channel name.
     pub fn list_monitors_with_channels(&self) -> Result<Vec<MonitorWithChannel>> {
         let conn = self.conn.lock().unwrap();
@@ -1125,6 +1136,56 @@ impl Store {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// In-flight recordings (status `recording`) — crash/quit leftovers seen at
+    /// startup. Only the core fields needed for resume/orphan handling are
+    /// populated; the per-take aggregates default.
+    pub fn inflight_recordings(&self) -> Result<Vec<crate::models::Recording>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, monitor_id, started_at, ended_at, COALESCE(output_path, ''),
+                    went_live_at, went_live_approx, stream_id, take_group
+             FROM recording WHERE status = 'recording' ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(crate::models::Recording {
+                    id: r.get(0)?,
+                    monitor_id: r.get(1)?,
+                    started_at: r.get(2)?,
+                    ended_at: r.get(3)?,
+                    status: "recording".into(),
+                    bytes: 0,
+                    exit_code: None,
+                    output_path: r.get(4)?,
+                    went_live_at: r.get(5)?,
+                    went_live_approx: r.get::<_, Option<i64>>(6)?.unwrap_or(0) != 0,
+                    lost_secs: None,
+                    stream_id: r.get(7)?,
+                    take_group: r.get(8)?,
+                    ad_count: 0,
+                    ad_secs: 0,
+                    meta_change_count: 0,
+                    title: String::new(),
+                    category: String::new(),
+                    log_excerpt: String::new(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Distinct output directories across all monitors and videos — used to locate
+    /// `.cache\` working dirs for the startup sweep.
+    pub fn all_output_dirs(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT output_dir FROM monitor UNION SELECT output_dir FROM video")?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.into_iter().filter(|s| !s.trim().is_empty()).collect())
     }
 
     /// Recent recordings, newest first.

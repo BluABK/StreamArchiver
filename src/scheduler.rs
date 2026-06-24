@@ -41,9 +41,11 @@ pub async fn run(
     live_tx: mpsc::UnboundedSender<LiveSignal>,
     active: ActiveSet,
     shutdown: Arc<AtomicBool>,
+    jobs: crate::events::JobRegistry,
 ) {
     while !shutdown.load(Ordering::SeqCst) {
         let wait = tick(&ctx, &events, &live_tx, &active).await;
+        crate::events::mark_job(&jobs, "Live poll", wait as i64);
         tokio::time::sleep(Duration::from_secs(wait)).await;
     }
 }

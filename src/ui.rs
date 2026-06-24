@@ -467,8 +467,9 @@ pub struct StreamArchiverApp {
     show_actions: bool,
     /// Currently running background tasks (asset fetches, thumbnail downloads).
     background_tasks: Vec<crate::events::BackgroundTask>,
-    /// Completed/failed background tasks, newest first; capped at 100.
-    finished_tasks: Vec<(crate::events::BackgroundTask, crate::events::TaskOutcome)>,
+    /// Completed/failed background tasks (task, outcome, finished-at unix), newest
+    /// first; capped at 100.
+    finished_tasks: Vec<(crate::events::BackgroundTask, crate::events::TaskOutcome, i64)>,
 }
 
 impl StreamArchiverApp {
@@ -783,7 +784,7 @@ impl StreamArchiverApp {
                 Ok(crate::events::AppEvent::BackgroundTaskFinished { id, outcome }) => {
                     if let Some(pos) = self.background_tasks.iter().position(|t| t.id == id) {
                         let task = self.background_tasks.remove(pos);
-                        self.finished_tasks.insert(0, (task, outcome));
+                        self.finished_tasks.insert(0, (task, outcome, now_unix()));
                         self.finished_tasks.truncate(100);
                     }
                     dirty = true;
@@ -941,6 +942,29 @@ fn setting_or_empty(core: &AppCore, key: &str) -> String {
         .ok()
         .flatten()
         .unwrap_or_default()
+}
+
+/// Coarse human duration: `45s` / `5m` / `6h` / `2d`.
+fn fmt_duration_secs(secs: i64) -> String {
+    let s = secs.max(0);
+    if s < 90 {
+        format!("{s}s")
+    } else if s < 90 * 60 {
+        format!("{}m", (s + 30) / 60)
+    } else if s < 36 * 3600 {
+        format!("{}h", (s + 1800) / 3600)
+    } else {
+        format!("{}d", (s + 12 * 3600) / 86_400)
+    }
+}
+
+/// `now` / `in 3m` for a future delta in seconds.
+fn fmt_relative_future(delta: i64) -> String {
+    if delta <= 0 {
+        "now".to_string()
+    } else {
+        format!("in {}", fmt_duration_secs(delta))
+    }
 }
 
 /// Label a take as "SABR"/"DASH" when it's part of a dual capture (two recordings
@@ -6263,9 +6287,51 @@ impl StreamArchiverApp {
 
     fn background_view(&mut self, ui: &mut egui::Ui) {
         use egui_extras::{Column, TableBuilder};
+        let now = now_unix();
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add_space(8.0);
+
+            // ── Scheduled (periodic refreshers) ──────────────────────────
+            ui.strong("Scheduled");
+            ui.label(
+                egui::RichText::new("Recurring background jobs and their next estimated run.")
+                    .small()
+                    .weak(),
+            );
+            ui.add_space(4.0);
+            let mut jobs = self.core.jobs.lock().unwrap().clone();
+            jobs.sort_by_key(|j| j.next_run_at);
+            if jobs.is_empty() {
+                ui.weak("No periodic jobs running.");
+            } else {
+                ui.push_id("bg_scheduled", |ui| {
+                    TableBuilder::new(ui)
+                        .striped(true)
+                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                        .column(Column::remainder().clip(true))
+                        .column(Column::auto())
+                        .column(Column::auto())
+                        .header(20.0, |mut h| {
+                            h.col(|ui| { ui.strong("Job"); });
+                            h.col(|ui| { ui.strong("Every"); });
+                            h.col(|ui| { ui.strong("Next run"); });
+                        })
+                        .body(|mut body| {
+                            for j in &jobs {
+                                body.row(20.0, |mut row| {
+                                    row.col(|ui| { ui.label(&j.name); });
+                                    row.col(|ui| { ui.label(fmt_duration_secs(j.interval_secs)); });
+                                    row.col(|ui| {
+                                        ui.label(fmt_relative_future(j.next_run_at - now));
+                                    });
+                                });
+                            }
+                        });
+                });
+            }
+
+            ui.add_space(12.0);
 
             // ── Active tasks ─────────────────────────────────────────────
             ui.strong("Active");
@@ -6274,39 +6340,36 @@ impl StreamArchiverApp {
             if self.background_tasks.is_empty() {
                 ui.weak("No tasks running.");
             } else {
-                let table = TableBuilder::new(ui)
-                    .striped(true)
-                    .resizable(false)
-                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                    .column(Column::remainder().clip(true))  // Label
-                    .column(Column::auto())                  // Kind
-                    .column(Column::auto())                  // Started
-                    .column(Column::auto());                 // Status
-
-                table
-                    .header(20.0, |mut h| {
-                        h.col(|ui| { ui.strong("Channel / Label"); });
-                        h.col(|ui| { ui.strong("Task"); });
-                        h.col(|ui| { ui.strong("Started"); });
-                        h.col(|ui| { ui.strong("Status"); });
-                    })
-                    .body(|mut body| {
-                        for task in &self.background_tasks {
-                            let started = chrono::DateTime::from_timestamp(task.started_at, 0)
-                                .map(|dt| {
-                                    dt.with_timezone(&chrono::Local)
-                                        .format("%H:%M:%S")
-                                        .to_string()
-                                })
-                                .unwrap_or_default();
-                            body.row(20.0, |mut row| {
-                                row.col(|ui| { ui.label(&task.label); });
-                                row.col(|ui| { ui.label(task.kind.label()); });
-                                row.col(|ui| { ui.label(&started); });
-                                row.col(|ui| { ui.label("⏳ Running"); });
-                            });
-                        }
-                    });
+                ui.push_id("bg_active", |ui| {
+                    TableBuilder::new(ui)
+                        .striped(true)
+                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                        .column(Column::auto())                  // Channel
+                        .column(Column::auto())                  // Task
+                        .column(Column::remainder().clip(true))  // Detail
+                        .column(Column::auto())                  // Elapsed
+                        .header(20.0, |mut h| {
+                            h.col(|ui| { ui.strong("Channel / Label"); });
+                            h.col(|ui| { ui.strong("Task"); });
+                            h.col(|ui| { ui.strong("Detail"); });
+                            h.col(|ui| { ui.strong("Elapsed"); });
+                        })
+                        .body(|mut body| {
+                            for task in &self.background_tasks {
+                                body.row(20.0, |mut row| {
+                                    row.col(|ui| { ui.label(&task.label); });
+                                    row.col(|ui| { ui.label(task.kind.label()); });
+                                    row.col(|ui| { ui.label(&task.detail); });
+                                    row.col(|ui| {
+                                        ui.label(format!(
+                                            "⏳ {}",
+                                            fmt_duration_secs(now - task.started_at)
+                                        ));
+                                    });
+                                });
+                            }
+                        });
+                });
             }
 
             ui.add_space(12.0);
@@ -6318,45 +6381,40 @@ impl StreamArchiverApp {
             if self.finished_tasks.is_empty() {
                 ui.weak("No completed tasks yet.");
             } else {
-                let table = TableBuilder::new(ui)
-                    .striped(true)
-                    .resizable(false)
-                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                    .column(Column::remainder().clip(true))
-                    .column(Column::auto())
-                    .column(Column::auto())
-                    .column(Column::remainder().clip(true));
-
-                table
-                    .header(20.0, |mut h| {
-                        h.col(|ui| { ui.strong("Channel / Label"); });
-                        h.col(|ui| { ui.strong("Task"); });
-                        h.col(|ui| { ui.strong("Started"); });
-                        h.col(|ui| { ui.strong("Outcome"); });
-                    })
-                    .body(|mut body| {
-                        for (task, outcome) in &self.finished_tasks {
-                            let started = chrono::DateTime::from_timestamp(task.started_at, 0)
-                                .map(|dt| {
-                                    dt.with_timezone(&chrono::Local)
-                                        .format("%H:%M:%S")
-                                        .to_string()
-                                })
-                                .unwrap_or_default();
-                            let outcome_str = match outcome {
-                                crate::events::TaskOutcome::Completed => "✔ Completed".to_string(),
-                                crate::events::TaskOutcome::Failed(e) => {
-                                    format!("✘ Failed: {e}")
-                                }
-                            };
-                            body.row(20.0, |mut row| {
-                                row.col(|ui| { ui.label(&task.label); });
-                                row.col(|ui| { ui.label(task.kind.label()); });
-                                row.col(|ui| { ui.label(&started); });
-                                row.col(|ui| { ui.label(&outcome_str); });
-                            });
-                        }
-                    });
+                ui.push_id("bg_recent", |ui| {
+                    TableBuilder::new(ui)
+                        .striped(true)
+                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                        .column(Column::auto())
+                        .column(Column::auto())
+                        .column(Column::remainder().clip(true))
+                        .column(Column::auto())
+                        .header(20.0, |mut h| {
+                            h.col(|ui| { ui.strong("Channel / Label"); });
+                            h.col(|ui| { ui.strong("Task"); });
+                            h.col(|ui| { ui.strong("Detail"); });
+                            h.col(|ui| { ui.strong("Outcome"); });
+                        })
+                        .body(|mut body| {
+                            for (task, outcome, finished_at) in &self.finished_tasks {
+                                let dur = fmt_duration_secs(finished_at - task.started_at);
+                                let outcome_str = match outcome {
+                                    crate::events::TaskOutcome::Completed => {
+                                        format!("✔ Completed ({dur})")
+                                    }
+                                    crate::events::TaskOutcome::Failed(e) => {
+                                        format!("✘ Failed: {e}")
+                                    }
+                                };
+                                body.row(20.0, |mut row| {
+                                    row.col(|ui| { ui.label(&task.label); });
+                                    row.col(|ui| { ui.label(task.kind.label()); });
+                                    row.col(|ui| { ui.label(&task.detail); });
+                                    row.col(|ui| { ui.label(&outcome_str); });
+                                });
+                            }
+                        });
+                });
             }
 
             ui.add_space(8.0);
@@ -7735,9 +7793,32 @@ impl StreamArchiverApp {
                     });
 
                 // ── Assets ───────────────────────────────────────────────
-                if m.fetch_chat_assets {
+                {
                     ui.add_space(6.0);
-                    ui.strong("Fetched assets");
+                    ui.horizontal(|ui| {
+                        ui.strong("Channel assets");
+                        if ui
+                            .button("⟳ Refetch")
+                            .on_hover_text(
+                                "Fetch channel icon / banner / badges / emotes now — ignores \
+                                 the 24h cache and the per-monitor Fetch-assets toggle.",
+                            )
+                            .clicked()
+                        {
+                            self.core.manual(ManualCommand::RefetchAssets(m.id));
+                            self.channel_icons.remove(&ch.id); // reload after fetch
+                            self.status = format!("Refetching assets for {}…", ch.name);
+                        }
+                    });
+                    if !m.fetch_chat_assets {
+                        ui.label(
+                            egui::RichText::new(
+                                "Auto-fetch is off for this monitor; Refetch pulls them on demand.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                    }
 
                     let stamp_path = asset_dir.join(".assets_fetched_at");
                     let last_fetched = std::fs::read_to_string(&stamp_path)

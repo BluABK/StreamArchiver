@@ -25,7 +25,7 @@ use crate::detectors::{DetectContext, DetectItem, DetectOutcome};
 use crate::events::{AppEvent, EventTx, LiveSignal, ManualCommand};
 use crate::models::{
     AuthKind, Container, DetectionMethod, K_FILENAME_MEDIA, MediaInfoMode, Monitor,
-    MonitorWithChannel, Platform, Tool, Video, now_unix,
+    MonitorWithChannel, Platform, Recording, Tool, Video, now_unix,
 };
 use crate::platform::ProcessJob;
 use crate::store::Store;
@@ -448,7 +448,8 @@ fn build_dash_companion_plan(
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let ts_path = dir.join(format!("{stem}.dash.ts"));
+    // Capture into the hidden `.cache\` (promoted up on finish); final lands in dir.
+    let ts_path = cache_dir(dir).join(format!("{stem}.dash.ts"));
     let mkv_path = dir.join(format!("{stem}.dash.mkv"));
     let mut args = vec![
         "--no-part".to_string(),
@@ -482,6 +483,96 @@ fn build_dash_companion_plan(
         remux_to_mkv: true,
         writes_own_thumbnail: false,
     }
+}
+
+/// The hidden working directory for in-progress captures, a `.cache` subfolder of
+/// the output dir (same volume, so promotion to the parent is a fast rename). The
+/// `.`-prefix hides it on Unix; [`crate::platform::set_hidden`] adds the Windows
+/// hidden attribute when the dir is created.
+fn cache_dir(output_dir: &Path) -> PathBuf {
+    output_dir.join(".cache")
+}
+
+/// Stale `.cache\` working files are swept after this age on startup.
+const CACHE_MAX_AGE_SECS: u64 = 24 * 3600;
+
+/// True if a recording's `.cache\` still holds SABR resume state (`.state` /
+/// `.sq0.part` / `.part`) for its stem — i.e. an interrupted SABR capture that can
+/// be continued. Derived synchronously from the recording's stored output path.
+fn sabr_state_exists(output_path: &str) -> bool {
+    let p = Path::new(output_path);
+    let (Some(dir), Some(stem)) = (
+        p.parent(),
+        p.file_stem().map(|s| s.to_string_lossy().into_owned()),
+    ) else {
+        return false;
+    };
+    let prefix = format!("{stem}.");
+    let Ok(rd) = std::fs::read_dir(cache_dir(dir)) else {
+        return false;
+    };
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&prefix)
+            && (name.ends_with(".state") || name.ends_with(".sq0.part") || name.ends_with(".part"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Build the yt-dlp SABR capture args, shared by [`build_plan`]'s SABR branch and
+/// resume. Writes the final MKV directly to `out_mkv`; forces the SABR formats +
+/// extractor-args (or the manual raw override); applies cookies, the global Settings
+/// args, and the PO-token provider args. Deterministic for a given `out_mkv`, so a
+/// resume re-runs byte-identically and yt-dlp continues from the surviving `.state`.
+fn sabr_capture_args(
+    out_mkv: &Path,
+    auth: &AuthSource,
+    ytdlp_global_args: &[String],
+    sabr: &SabrConfig,
+    extra: &[String],
+    url: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        "--no-part".to_string(),
+        "-o".into(),
+        out_mkv.to_string_lossy().into_owned(),
+        "--live-from-start".into(),
+    ];
+    match auth {
+        AuthSource::CookiesBrowser(b) => {
+            args.push("--cookies-from-browser".into());
+            args.push(b.clone());
+        }
+        AuthSource::CookiesFile(p) => {
+            args.push("--cookies".into());
+            args.push(p.clone());
+        }
+        _ => {}
+    }
+    // Global Settings args (e.g. --js-runtimes node) still apply.
+    args.extend_from_slice(ytdlp_global_args);
+    // PO-token provider args (e.g. bgutil) — a separate --extractor-args entry,
+    // applied regardless of the preset/raw choice below.
+    if !sabr.pot_args.is_empty() {
+        args.push("--extractor-args".into());
+        args.push(sabr.pot_args.clone());
+    }
+    // Manual raw args override the format + extractor-args preset entirely.
+    let raw = split_args(&sabr.raw_args);
+    if raw.is_empty() {
+        args.push("--extractor-args".into());
+        args.push(sabr.extractor_args.clone());
+        args.push("-f".into());
+        args.push(sabr.format.clone());
+    } else {
+        args.extend(raw);
+    }
+    args.extend_from_slice(extra);
+    args.push(youtube_live_url(url));
+    args
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -524,17 +615,28 @@ pub fn build_plan(
     };
     let stem = unique_stem(&dir, &stem, final_ext, None);
 
-    let ts_path = dir.join(format!("{stem}.ts"));
-    let ts_str = ts_path.to_string_lossy().into_owned();
-    let mkv_path = dir.join(format!("{stem}.mkv"));
+    // Working files capture into the hidden `.cache\` subdir; the finished file is
+    // promoted up to the output dir on a clean finalize (same-volume rename).
+    let cache = cache_dir(&dir);
     let (capture_path, final_path, remux_to_mkv) = if use_sabr {
-        (mkv_path.clone(), mkv_path.clone(), false)
+        // SABR writes the final MKV directly (no .ts intermediate); promoted via a
+        // move on finish.
+        (cache.join(format!("{stem}.mkv")), dir.join(format!("{stem}.mkv")), false)
     } else {
         match m.container {
-            Container::Mkv => (ts_path.clone(), mkv_path.clone(), true),
-            Container::Ts => (ts_path.clone(), ts_path.clone(), false),
+            Container::Mkv => (
+                cache.join(format!("{stem}.ts")),
+                dir.join(format!("{stem}.mkv")),
+                true,
+            ),
+            Container::Ts => (
+                cache.join(format!("{stem}.ts")),
+                dir.join(format!("{stem}.ts")),
+                false,
+            ),
         }
     };
+    let cap_str = capture_path.to_string_lossy().into_owned();
 
     let mut writes_own_thumbnail = false;
     let (program, args) = match m.tool {
@@ -559,55 +661,19 @@ pub fn build_plan(
             push_track_args(&mut args, Tool::Streamlink, &m.audio_tracks, &m.subtitle_tracks, false);
             args.extend(extra);
             args.push("-o".into());
-            args.push(ts_str);
+            args.push(cap_str);
             args.push(m.url.clone());
             args.push(quality);
             ("streamlink".to_string(), args)
         }
         Tool::YtDlp if use_sabr => {
-            // SABR capture via the dev build: write the final MKV directly (SABR
-            // merges separate audio+video, so no mpegts/.ts), force the SABR
-            // formats, and pass the extractor-args the protocol needs. Chat,
-            // assets, and thumbnails are handled off this process (the dev build
-            // is a stale fork — keep its surface minimal): no --write-thumbnail
-            // / --sub-langs here.
-            let mut args = vec![
-                "--no-part".to_string(),
-                "-o".into(),
-                mkv_path.to_string_lossy().into_owned(),
-                "--live-from-start".into(),
-            ];
-            match auth {
-                AuthSource::CookiesBrowser(b) => {
-                    args.push("--cookies-from-browser".into());
-                    args.push(b.clone());
-                }
-                AuthSource::CookiesFile(p) => {
-                    args.push("--cookies".into());
-                    args.push(p.clone());
-                }
-                _ => {}
-            }
-            // Global Settings args (e.g. --js-runtimes node) still apply.
-            args.extend_from_slice(ytdlp_global_args);
-            // PO-token provider args (e.g. bgutil) — a separate --extractor-args
-            // entry, applied regardless of the preset/raw choice below.
-            if !ytdlp.sabr.pot_args.is_empty() {
-                args.push("--extractor-args".into());
-                args.push(ytdlp.sabr.pot_args.clone());
-            }
-            // Manual raw args override the format + extractor-args preset entirely.
-            let raw = split_args(&ytdlp.sabr.raw_args);
-            if raw.is_empty() {
-                args.push("--extractor-args".into());
-                args.push(ytdlp.sabr.extractor_args.clone());
-                args.push("-f".into());
-                args.push(ytdlp.sabr.format.clone());
-            } else {
-                args.extend(raw);
-            }
-            args.extend(extra);
-            args.push(youtube_live_url(&m.url));
+            // SABR capture via the dev build: writes the final MKV directly (SABR
+            // merges separate audio+video, so no mpegts/.ts). Chat, assets, and
+            // thumbnails are handled off this process (the dev build is a stale fork
+            // — keep its surface minimal): no --write-thumbnail / --sub-langs here.
+            let args = sabr_capture_args(
+                &capture_path, auth, ytdlp_global_args, &ytdlp.sabr, &extra, &m.url,
+            );
             (ytdlp.sabr.binary.clone(), args)
         }
         Tool::YtDlp => {
@@ -615,7 +681,7 @@ pub fn build_plan(
                 "--no-part".to_string(),
                 "--hls-use-mpegts".into(), // progressive .ts output
                 "-o".into(),
-                ts_str,
+                cap_str,
             ];
             if m.capture_from_start {
                 args.push("--live-from-start".into());
@@ -672,7 +738,7 @@ pub fn build_plan(
                 "copy".into(),
             ];
             args.extend(extra);
-            args.push(ts_str);
+            args.push(cap_str);
             ("ffmpeg".to_string(), args)
         }
     };
@@ -710,12 +776,14 @@ pub fn build_video_plan(
     // Don't clobber an existing finished file (all video tools end at .mkv).
     let stem = unique_stem(&dir, &stem, "mkv", None);
     let final_path = dir.join(format!("{stem}.mkv"));
+    // Working files capture into the hidden `.cache\`; promoted up on finish.
+    let cache = cache_dir(&dir);
 
     match v.tool {
         Tool::YtDlp => {
             // yt-dlp downloads the complete video and remuxes to MKV. `%(ext)s`
-            // becomes `mkv` after the remux, so the final path is predictable.
-            let out_tmpl = dir
+            // becomes `mkv` after the remux, so the cache file is predictable.
+            let out_tmpl = cache
                 .join(format!("{stem}.%(ext)s"))
                 .to_string_lossy()
                 .into_owned();
@@ -764,15 +832,15 @@ pub fn build_video_plan(
             DownloadPlan {
                 program: "yt-dlp".to_string(),
                 args,
-                // yt-dlp writes the final MKV directly; no separate capture/remux.
-                capture_path: final_path.clone(),
+                // yt-dlp writes the final MKV into .cache; promoted up via a move.
+                capture_path: cache.join(format!("{stem}.mkv")),
                 final_path,
                 remux_to_mkv: false,
                 writes_own_thumbnail: false,
             }
         }
         Tool::Streamlink => {
-            let ts_path = dir.join(format!("{stem}.ts"));
+            let ts_path = cache.join(format!("{stem}.ts"));
             let mut args = Vec::new();
             if platform == Platform::Twitch {
                 args.push("--twitch-supported-codecs=h264,h265,av1".to_string());
@@ -803,7 +871,7 @@ pub fn build_video_plan(
             }
         }
         Tool::Ffmpeg => {
-            let ts_path = dir.join(format!("{stem}.ts"));
+            let ts_path = cache.join(format!("{stem}.ts"));
             let mut args = vec![
                 "-y".to_string(),
                 "-i".into(),
@@ -934,10 +1002,134 @@ impl Supervisor {
                     }
                     ManualCommand::StopVideo(id) => self.stop_video(id),
                     ManualCommand::StopChat(id) => self.stop_chat_download(id),
+                    ManualCommand::RefetchAssets(id) => {
+                        if let Ok(Some(row)) = self.store.get_monitor_with_channel(id) {
+                            // Manual: bypass the 24h stamp + the fetch_chat_assets
+                            // toggle, and resolve the platform id from the URL.
+                            self.fetch_channel_assets(&row, None, true);
+                        }
+                    }
                 },
                 else => break,
             }
         }
+    }
+
+    /// Fetch a monitor's channel assets (icon/banner/badges/emotes) as a background
+    /// task. `force` skips the 24h freshness stamp (manual refetch). `broadcaster_id`
+    /// is the platform id when detection supplied it; otherwise it's resolved from
+    /// the channel URL, so an offline channel still fetches.
+    fn fetch_channel_assets(
+        &self,
+        row: &MonitorWithChannel,
+        broadcaster_id: Option<String>,
+        force: bool,
+    ) {
+        let asset_dir = crate::app_paths::asset_cache_dir()
+            .join("channel_assets")
+            .join(sanitize_filename(&row.channel.name));
+        if !force && !crate::assets::should_refetch_assets(&asset_dir) {
+            return;
+        }
+        let platform = row.monitor.platform();
+        let http = self.ctx.http_client();
+        let ctx = self.ctx.clone();
+        let store = self.store.clone();
+        let tx = self.events.clone();
+        let url = row.monitor.url.clone();
+        let known_bid = broadcaster_id.unwrap_or_default();
+        let monitor_id = row.monitor.id;
+
+        let task_id = crate::events::next_task_id();
+        let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
+            id: task_id,
+            kind: crate::events::BackgroundTaskKind::AssetFetch,
+            label: row.channel.name.clone(),
+            detail: format!("{} · icon, banner, badges, emotes", platform.label()),
+            started_at: now_unix(),
+        }));
+
+        tokio::spawn(async move {
+            use crate::events::TaskOutcome;
+            let outcome = match platform {
+                Platform::Twitch => match ctx.twitch_helix_auth().await {
+                    Ok((client_id, token)) => {
+                        let bid = if !known_bid.is_empty() {
+                            Some(known_bid)
+                        } else if let Some(login) = crate::detectors::twitch_login(&url) {
+                            ctx.twitch_user_id(&client_id, &token, &login).await
+                        } else {
+                            None
+                        };
+                        match bid {
+                            Some(bid) => {
+                                let platform_dir = crate::app_paths::platform_assets_dir();
+                                if crate::assets::run_twitch_assets(
+                                    &http, &client_id, &token, &bid, &asset_dir, &platform_dir,
+                                )
+                                .await
+                                {
+                                    TaskOutcome::Completed
+                                } else {
+                                    TaskOutcome::Failed("channel asset fetch failed".into())
+                                }
+                            }
+                            None => TaskOutcome::Failed("could not resolve Twitch user id".into()),
+                        }
+                    }
+                    Err(e) => TaskOutcome::Failed(format!("Twitch auth: {e}")),
+                },
+                Platform::YouTube => {
+                    let api_key = store
+                        .get_setting("youtube_api_key")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    if api_key.is_empty() {
+                        TaskOutcome::Failed("no YouTube API key set".into())
+                    } else {
+                        let uc = if !known_bid.is_empty() {
+                            Some(known_bid)
+                        } else {
+                            crate::websub::resolve_channel_uc(&http, &url).await
+                        };
+                        match uc {
+                            Some(uc)
+                                if crate::assets::run_youtube_assets(
+                                    &http, &api_key, &uc, &asset_dir,
+                                )
+                                .await =>
+                            {
+                                TaskOutcome::Completed
+                            }
+                            Some(_) => TaskOutcome::Failed("channel asset fetch failed".into()),
+                            None => TaskOutcome::Failed("could not resolve channel id".into()),
+                        }
+                    }
+                }
+                Platform::Kick => {
+                    let slug = if !known_bid.is_empty() {
+                        Some(known_bid)
+                    } else {
+                        crate::detectors::kick_slug(&url)
+                    };
+                    match slug {
+                        Some(slug)
+                            if crate::assets::run_kick_assets(&http, &slug, &asset_dir).await =>
+                        {
+                            TaskOutcome::Completed
+                        }
+                        Some(_) => TaskOutcome::Failed("channel asset fetch failed".into()),
+                        None => TaskOutcome::Failed("could not resolve Kick slug".into()),
+                    }
+                }
+                _ => TaskOutcome::Failed("no asset source for this platform".into()),
+            };
+            if let TaskOutcome::Failed(ref e) = outcome {
+                tracing::warn!(monitor_id, "asset fetch failed: {e}");
+            }
+            let _ = tx.send(AppEvent::BackgroundTaskFinished { id: task_id, outcome });
+        });
     }
 
     /// Reserve the monitor and spawn its recording task. Returns false if it was
@@ -1266,6 +1458,10 @@ impl Supervisor {
             build_video_plan(&video, started_at, &title, &channel, &video_id, &auth, pre_media.as_ref());
         if let Some(parent) = plan.capture_path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
+            crate::platform::set_hidden(parent); // mark the .cache\ working dir hidden
+        }
+        if let Some(out_dir) = plan.final_path.parent() {
+            let _ = tokio::fs::create_dir_all(out_dir).await;
         }
         let label = if !video.title.trim().is_empty() {
             video.title.clone()
@@ -1287,36 +1483,61 @@ impl Supervisor {
             )
             .await;
 
-        // Remux TS -> MKV (streamlink/ffmpeg); yt-dlp already produced the MKV.
-        let mut final_path = plan.final_path.clone();
+        // Promote from .cache\ to the output dir. streamlink/ffmpeg remux .ts→.mkv;
+        // yt-dlp already produced the (M)KV in .cache — but its extension may differ
+        // from the predicted .mkv, so fall back to the newest {stem}.* in .cache\.
+        let cache = plan.capture_path.parent().map(Path::to_path_buf);
+        let capstem = plan
+            .final_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut final_path;
         if plan.remux_to_mkv {
-            if file_len(&plan.capture_path).await > 0 {
-                match remux_ts_to_mkv(&plan.capture_path, &plan.final_path).await {
-                    Ok(()) => {
-                        let _ = tokio::fs::remove_file(&plan.capture_path).await;
+            final_path = promote_capture(&plan).await;
+        } else {
+            let produced = if file_len(&plan.capture_path).await > 0 {
+                Some(plan.capture_path.clone())
+            } else {
+                newest_with_stem(&plan.capture_path).await
+            };
+            match produced {
+                Some(src) => {
+                    let dest = plan.final_path.with_file_name(
+                        src.file_name().map(|n| n.to_os_string()).unwrap_or_default(),
+                    );
+                    if let Some(p) = dest.parent() {
+                        let _ = tokio::fs::create_dir_all(p).await;
                     }
-                    Err(e) => {
-                        warn!(video = id, "remux failed, keeping .ts: {e:#}");
-                        final_path = plan.capture_path.clone();
+                    match tokio::fs::rename(&src, &dest).await {
+                        Ok(()) => final_path = dest,
+                        Err(e) => {
+                            warn!(video = id, "promote move failed, keeping in cache: {e:#}");
+                            final_path = src;
+                        }
                     }
                 }
-            } else {
-                final_path = plan.capture_path.clone();
-            }
-        } else if file_len(&final_path).await == 0 {
-            // yt-dlp may have produced a different extension than predicted.
-            if let Some(found) = newest_with_stem(&final_path).await {
-                final_path = found;
+                None => final_path = plan.capture_path.clone(),
             }
         }
-
-        // Post-capture: probe the finished file for actual media info and rename.
-        if want_media && media_mode.post() && file_len(&final_path).await > 0 {
-            if let Some(mi) = probe_media(&final_path.to_string_lossy()).await {
-                let quality = resolved_quality(&video.quality);
-                let stem =
-                    video_stem(&video, started_at, &title, &channel, &video_id, &quality, Some(&mi));
-                final_path = rename_for_media(final_path, &stem).await;
+        // Promoted iff the file now lives in the output dir (not still in .cache\).
+        let promoted = final_path.parent() == plan.final_path.parent();
+        if promoted {
+            if let (Some(cache), Some(out_dir)) = (cache.as_deref(), final_path.parent()) {
+                move_companions(cache, out_dir, &capstem).await;
+            }
+            // Post-capture: probe the finished file for actual media info and rename.
+            if want_media && media_mode.post() {
+                if let Some(mi) = probe_media(&final_path.to_string_lossy()).await {
+                    let quality = resolved_quality(&video.quality);
+                    let stem = video_stem(
+                        &video, started_at, &title, &channel, &video_id, &quality, Some(&mi),
+                    );
+                    final_path = rename_for_media(final_path, &stem).await;
+                }
+            }
+            if let Some(cache) = cache.as_deref() {
+                purge_cache(cache, &capstem).await;
             }
         }
 
@@ -1462,6 +1683,11 @@ impl Supervisor {
         let plan = build_plan(&row, started_at, &auth, &ytdlp_global_args, stream_id.as_deref(), stream_title.as_deref().unwrap_or(""), pre_media.as_ref(), &ytdlp_bins);
         if let Some(parent) = plan.capture_path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
+            crate::platform::set_hidden(parent); // mark the .cache\ working dir hidden
+        }
+        // Also ensure the output dir exists (the final file is promoted there).
+        if let Some(out_dir) = plan.final_path.parent() {
+            let _ = tokio::fs::create_dir_all(out_dir).await;
         }
 
         // A take key links the recordings of this capture attempt: the primary
@@ -1527,7 +1753,9 @@ impl Supervisor {
             if let Some(ref url) = thumbnail_url {
                 let http = self.ctx.http_client();
                 let url = url.clone();
-                let dest = plan.final_path.with_extension("thumbnail.jpg");
+                // Into the .cache\ working dir; promoted up with the recording on
+                // success (and dropped with it if the capture fails).
+                let dest = plan.capture_path.with_extension("thumbnail.jpg");
                 let task_id = crate::events::next_task_id();
                 let task_label = row.channel.name.clone();
                 let _ = self.events.send(AppEvent::BackgroundTaskStarted(
@@ -1535,6 +1763,7 @@ impl Supervisor {
                         id: task_id,
                         kind: crate::events::BackgroundTaskKind::ThumbnailFetch,
                         label: task_label,
+                        detail: "stream thumbnail".into(),
                         started_at: crate::models::now_unix(),
                     },
                 ));
@@ -1552,83 +1781,7 @@ impl Supervisor {
             }
         }
         if row.monitor.fetch_chat_assets {
-            // All channel assets live in the centralised app-data cache, not in output_dir.
-            let asset_dir = crate::app_paths::asset_cache_dir()
-                .join("channel_assets")
-                .join(sanitize_filename(&row.channel.name));
-            if crate::assets::should_refetch_assets(&asset_dir) {
-                let http = self.ctx.http_client();
-                let platform = row.monitor.platform();
-                let bid = broadcaster_id.clone().unwrap_or_default();
-                let task_id = crate::events::next_task_id();
-                let _ = self.events.send(AppEvent::BackgroundTaskStarted(
-                    crate::events::BackgroundTask {
-                        id: task_id,
-                        kind: crate::events::BackgroundTaskKind::AssetFetch,
-                        label: row.channel.name.clone(),
-                        started_at: crate::models::now_unix(),
-                    },
-                ));
-                let tx = self.events.clone();
-                match platform {
-                    Platform::Twitch => {
-                        match self.ctx.twitch_helix_auth().await {
-                            Ok((client_id, token)) => {
-                                let platform_dir = crate::app_paths::platform_assets_dir();
-                                tokio::spawn(async move {
-                                    crate::assets::run_twitch_assets(
-                                        &http, &client_id, &token, &bid,
-                                        &asset_dir, &platform_dir,
-                                    )
-                                    .await;
-                                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
-                                        id: task_id,
-                                        outcome: crate::events::TaskOutcome::Completed,
-                                    });
-                                });
-                            }
-                            Err(e) => {
-                                tracing::warn!(monitor_id, "Twitch auth for assets failed: {e}");
-                                let _ = tx.send(AppEvent::BackgroundTaskFinished {
-                                    id: task_id,
-                                    outcome: crate::events::TaskOutcome::Failed(e.to_string()),
-                                });
-                            }
-                        }
-                    }
-                    Platform::YouTube => {
-                        let api_key = self
-                            .store
-                            .get_setting("youtube_api_key")
-                            .ok()
-                            .flatten()
-                            .unwrap_or_default();
-                        tokio::spawn(async move {
-                            crate::assets::run_youtube_assets(&http, &api_key, &bid, &asset_dir)
-                                .await;
-                            let _ = tx.send(AppEvent::BackgroundTaskFinished {
-                                id: task_id,
-                                outcome: crate::events::TaskOutcome::Completed,
-                            });
-                        });
-                    }
-                    Platform::Kick => {
-                        tokio::spawn(async move {
-                            crate::assets::run_kick_assets(&http, &bid, &asset_dir).await;
-                            let _ = tx.send(AppEvent::BackgroundTaskFinished {
-                                id: task_id,
-                                outcome: crate::events::TaskOutcome::Completed,
-                            });
-                        });
-                    }
-                    _ => {
-                        let _ = tx.send(AppEvent::BackgroundTaskFinished {
-                            id: task_id,
-                            outcome: crate::events::TaskOutcome::Completed,
-                        });
-                    }
-                }
-            }
+            self.fetch_channel_assets(&row, broadcaster_id.clone(), false);
         }
 
         info!(monitor_id, program = %plan.program, "starting recording -> {}", plan.capture_path.display());
@@ -1706,12 +1859,13 @@ impl Supervisor {
         });
 
         // Twitch chat -> a native anonymous IRC-over-WebSocket logger, written as
-        // a `.chat.jsonl` sidecar next to the capture (so it follows the file's
-        // stem, incl. the media rename). Twitch only.
+        // a `.chat.jsonl` sidecar in the OUTPUT dir (next to the final file, not in
+        // .cache\) so it isn't promoted/purged from under a still-writing logger; it
+        // follows the file's stem on the post-rename. Twitch only.
         let chat_done = Arc::new(AtomicBool::new(false));
         let chat_task = (row.monitor.chat_log && row.monitor.platform() == Platform::Twitch)
             .then(|| {
-                let chat_path = plan.capture_path.with_extension("chat.jsonl");
+                let chat_path = plan.final_path.with_extension("chat.jsonl");
                 tokio::spawn(crate::chat::log_twitch_chat(
                     row.monitor.url.clone(),
                     chat_path,
@@ -1728,7 +1882,10 @@ impl Supervisor {
             && row.monitor.tool == Tool::YtDlp
             && row.monitor.platform() != Platform::Twitch
         {
-            let chat_plan = build_chat_plan(&row, &plan.capture_path, &auth, &ytdlp_global_args, &ytdlp_bins.system_program());
+            // Base the YouTube chat sidecar on the final (output-dir) path, not the
+            // .cache\ capture: this process outlives the video, so its
+            // `.live_chat.json` must not be promoted/purged mid-write.
+            let chat_plan = build_chat_plan(&row, &plan.final_path, &auth, &ytdlp_global_args, &ytdlp_bins.system_program());
             let this = self.clone();
             let mid = monitor_id;
             tokio::spawn(async move { this.run_chat_download(mid, chat_plan).await });
@@ -1765,51 +1922,48 @@ impl Supervisor {
         // span (and thus lost-time) isn't inflated by remux duration.
         let ended = now_unix();
 
-        // Remux TS -> MKV if requested and we captured something.
-        let mut final_path = plan.final_path.clone();
-        if plan.remux_to_mkv {
-            if file_len(&plan.capture_path).await > 0 {
-                match remux_ts_to_mkv(&plan.capture_path, &plan.final_path).await {
-                    Ok(()) => {
-                        let _ = tokio::fs::remove_file(&plan.capture_path).await;
-                    }
-                    Err(e) => {
-                        warn!(monitor_id, "remux failed, keeping .ts: {e:#}");
-                        final_path = plan.capture_path.clone();
-                    }
-                }
-            } else {
-                final_path = plan.capture_path.clone();
+        // Promote the finished capture from the hidden `.cache\` up to the output
+        // dir (remux .ts→.mkv, or move an already-final container); a failed/0-byte
+        // capture is left in `.cache\` for the startup sweep.
+        let mut final_path = promote_capture(&plan).await;
+        let promoted = final_path != plan.capture_path;
+        let cache = plan.capture_path.parent().map(Path::to_path_buf);
+        // The capture stem (== final stem before any post-rename) used to match this
+        // recording's files within `.cache\`.
+        let capstem = plan
+            .final_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if promoted {
+            // Promote subtitle/thumbnail companions up next to the video (chat
+            // sidecars are already written in the output dir).
+            if let (Some(cache), Some(out_dir)) = (cache.as_deref(), final_path.parent()) {
+                move_companions(cache, out_dir, &capstem).await;
             }
-        }
-
-        // Post-capture: fill in the filename bits that are only known now and
-        // rename. `{resolution}/{fps}/…` come from probing the finished file (the
-        // post-rename media modes); `{games}` and `{title}` are only fully known
-        // after the stream ends, and also trigger a rename even when probing is off.
-        let want_games = template_wants_games(&row.monitor.filename_template);
-        let want_title = template_wants_title(&row.monitor.filename_template);
-        let final_size = file_len(&final_path).await;
-        let do_post_media = want_media && media_mode.post() && final_size > 0;
-        if do_post_media || want_games || want_title {
-            let mi = if do_post_media {
-                probe_media(&final_path.to_string_lossy()).await
-            } else {
-                None
-            };
-            let games = if want_games {
-                games_for_recording(&self.store, rec_id)
-            } else {
-                String::new()
-            };
-            let title = if want_title {
-                title_for_recording(&self.store, rec_id)
-            } else {
-                String::new()
-            };
-            // Always rename when a post-fill variable was used (even if the value
-            // is empty — that removes the "tba" placeholder left by monitor_stem).
-            if final_size > 0 {
+            // Post-capture: fill in the filename bits that are only known now and
+            // rename. `{resolution}/{fps}/…` come from probing the finished file;
+            // `{games}` and `{title}` are only fully known after the stream ends, and
+            // also trigger a rename even when probing is off.
+            let want_games = template_wants_games(&row.monitor.filename_template);
+            let want_title = template_wants_title(&row.monitor.filename_template);
+            let do_post_media = want_media && media_mode.post();
+            if do_post_media || want_games || want_title {
+                let mi = if do_post_media {
+                    probe_media(&final_path.to_string_lossy()).await
+                } else {
+                    None
+                };
+                let games = if want_games {
+                    games_for_recording(&self.store, rec_id)
+                } else {
+                    String::new()
+                };
+                let title = if want_title {
+                    title_for_recording(&self.store, rec_id)
+                } else {
+                    String::new()
+                };
                 let quality = resolved_quality(&row.monitor.quality);
                 // Prefer the post-probe; fall back to the pre-probe so a {games}
                 // rename in pre-probe mode doesn't drop already-resolved media vars.
@@ -1825,6 +1979,10 @@ impl Supervisor {
                     &games,
                 );
                 final_path = rename_for_media(final_path, &stem).await;
+            }
+            // Drop this recording's working leftovers (SABR parts/state, etc.).
+            if let Some(cache) = cache.as_deref() {
+                purge_cache(cache, &capstem).await;
             }
         }
 
@@ -1914,6 +2072,10 @@ impl Supervisor {
     ) {
         if let Some(parent) = plan.capture_path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
+            crate::platform::set_hidden(parent);
+        }
+        if let Some(out_dir) = plan.final_path.parent() {
+            let _ = tokio::fs::create_dir_all(out_dir).await;
         }
         let started_at = now_unix();
         let rec_id = self
@@ -1941,20 +2103,17 @@ impl Supervisor {
                 .await
         };
 
-        let mut final_path = plan.final_path.clone();
-        if plan.remux_to_mkv {
-            if file_len(&plan.capture_path).await > 0 {
-                match remux_ts_to_mkv(&plan.capture_path, &plan.final_path).await {
-                    Ok(()) => {
-                        let _ = tokio::fs::remove_file(&plan.capture_path).await;
-                    }
-                    Err(e) => {
-                        warn!(monitor_id, "dash companion remux failed, keeping .ts: {e:#}");
-                        final_path = plan.capture_path.clone();
-                    }
-                }
-            } else {
-                final_path = plan.capture_path.clone();
+        // Promote the companion out of .cache\ (remux .ts→.mkv) on success; a failed
+        // one stays in .cache\ for the sweep.
+        let final_path = promote_capture(&plan).await;
+        if final_path != plan.capture_path {
+            if let Some(cache) = plan.capture_path.parent() {
+                let stem = plan
+                    .final_path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                purge_cache(cache, &stem).await;
             }
         }
 
@@ -1989,6 +2148,274 @@ impl Supervisor {
         });
         info!(monitor_id, bytes, status, "dash companion finished");
         self.active_secondary.lock().unwrap().remove(&monitor_id);
+    }
+
+    /// At startup, decide what to do with each in-flight (crash-leftover) recording:
+    /// resume the SABR-resumable ones (reserving their monitor so the scheduler
+    /// won't double-start them) and mark the rest `orphaned`. Synchronous so the
+    /// reservations are in place before detection can fire; returns the (recording,
+    /// row) pairs to resume (spawned by the caller on the runtime).
+    pub fn resume_inflight(&self) -> Vec<(Recording, MonitorWithChannel)> {
+        let recs = match self.store.inflight_recordings() {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("resume: failed to load in-flight recordings: {e:#}");
+                return Vec::new();
+            }
+        };
+        let ytdlp = load_ytdlp_bins(&self.store);
+        let mut to_resume = Vec::new();
+        for rec in recs {
+            let row = match self.store.get_monitor_with_channel(rec.monitor_id) {
+                Ok(Some(r)) => r,
+                _ => {
+                    let _ = self.store.mark_recording_orphaned(rec.id);
+                    continue;
+                }
+            };
+            let m = &row.monitor;
+            let resumable = m.platform() == Platform::YouTube
+                && m.tool == Tool::YtDlp
+                && m.capture_from_start
+                && ytdlp.sabr.usable()
+                && sabr_state_exists(&rec.output_path);
+            if !resumable {
+                let _ = self.store.mark_recording_orphaned(rec.id);
+                continue;
+            }
+            // Reserve the monitor (mirrors try_begin) so a concurrent poll can't
+            // start a fresh take while we resume this one.
+            {
+                let mut active = self.active.lock().unwrap();
+                if active.contains_key(&m.id) {
+                    continue;
+                }
+                active.insert(m.id, 0);
+            }
+            info!(monitor_id = m.id, rec_id = rec.id, "resuming interrupted SABR capture");
+            to_resume.push((rec, row));
+        }
+        to_resume
+    }
+
+    /// Resume an interrupted SABR capture, reusing the orphaned recording's `rec_id`
+    /// and `.cache\` stem so yt-dlp continues from the surviving `.state`/`.part`
+    /// (re-invoked with the identical `-o`). Chat and the DASH companion are not
+    /// resumed. Caller must have already reserved `active[monitor_id]`.
+    pub async fn resume_recording(&self, rec: Recording, row: MonitorWithChannel) {
+        let monitor_id = row.monitor.id;
+        let rec_id = rec.id;
+        let out_path = PathBuf::from(&rec.output_path);
+        let Some(out_dir) = out_path.parent().map(Path::to_path_buf) else {
+            self.active.lock().unwrap().remove(&monitor_id);
+            return;
+        };
+        let stem = out_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let capture = cache_dir(&out_dir).join(format!("{stem}.mkv"));
+
+        // Resolve auth + args exactly as a fresh capture would, so the command — and
+        // thus the SABR resume — matches the original (`-o` is identical).
+        let global_method = self
+            .store
+            .get_setting("download_auth_method")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let global_browser = self
+            .store
+            .get_setting("cookies_browser")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let auth = resolve_auth(&row, &global_method, &global_browser);
+        let ytdlp_global_raw = self
+            .store
+            .get_setting("ytdlp_default_args")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let ytdlp_global_args = split_args(&ytdlp_global_raw);
+        let ytdlp_bins = load_ytdlp_bins(&self.store);
+        let extra = split_args(&row.monitor.extra_args);
+        let args = sabr_capture_args(
+            &capture, &auth, &ytdlp_global_args, &ytdlp_bins.sabr, &extra, &row.monitor.url,
+        );
+        let plan = DownloadPlan {
+            program: ytdlp_bins.sabr.binary.clone(),
+            args,
+            capture_path: capture,
+            final_path: out_path,
+            remux_to_mkv: false,
+            writes_own_thumbnail: false,
+        };
+
+        let _permit = self.sem.acquire().await.expect("semaphore");
+        if self.shutdown.load(Ordering::SeqCst) {
+            self.active.lock().unwrap().remove(&monitor_id);
+            return;
+        }
+        if let Some(parent) = plan.capture_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+            crate::platform::set_hidden(parent);
+        }
+        let _ = self
+            .store
+            .set_monitor_check_result(monitor_id, "recording", now_unix());
+        let _ = self.events.send(AppEvent::MonitorState {
+            monitor_id,
+            state: "recording".into(),
+        });
+        let _ = self.events.send(AppEvent::RecordingStarted {
+            monitor_id,
+            recording_id: rec_id,
+            channel: row.channel.name.clone(),
+        });
+        info!(monitor_id, rec_id, program = %plan.program, "resuming SABR capture -> {}", plan.final_path.display());
+
+        let outcome = self
+            .run_process(&self.active, monitor_id, &plan, None, None, None)
+            .await;
+        let ended = now_unix();
+
+        // Finalize: promote .cache → output dir, move companions, post-rename, purge.
+        let mut final_path = promote_capture(&plan).await;
+        let promoted = final_path != plan.capture_path;
+        let cache = plan.capture_path.parent().map(Path::to_path_buf);
+        let capstem = plan
+            .final_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if promoted {
+            if let (Some(cache), Some(od)) = (cache.as_deref(), final_path.parent()) {
+                move_companions(cache, od, &capstem).await;
+            }
+            let want_games = template_wants_games(&row.monitor.filename_template);
+            let want_title = template_wants_title(&row.monitor.filename_template);
+            let want_media = template_wants_media(&row.monitor.filename_template);
+            let media_mode = media_info_mode(&self.store);
+            let do_post_media = want_media && media_mode.post();
+            if do_post_media || want_games || want_title {
+                let mi = if do_post_media {
+                    probe_media(&final_path.to_string_lossy()).await
+                } else {
+                    None
+                };
+                let games = if want_games {
+                    games_for_recording(&self.store, rec_id)
+                } else {
+                    String::new()
+                };
+                let title = if want_title {
+                    title_for_recording(&self.store, rec_id)
+                } else {
+                    String::new()
+                };
+                let quality = resolved_quality(&row.monitor.quality);
+                let stem = monitor_stem(
+                    &row.monitor,
+                    &row.channel.name,
+                    rec.started_at,
+                    rec.stream_id.as_deref(),
+                    &title,
+                    row.recording_count,
+                    &quality,
+                    mi.as_ref(),
+                    &games,
+                );
+                final_path = rename_for_media(final_path, &stem).await;
+            }
+            if let Some(cache) = cache.as_deref() {
+                purge_cache(cache, &capstem).await;
+            }
+        }
+
+        let bytes = file_len(&final_path).await as i64;
+        // Lost-time: a from-start capture that reached the live edge missed nothing.
+        if let (Some(wl), Some(captured)) =
+            (rec.went_live_at, media_duration_secs(&final_path).await)
+        {
+            let span = (ended - wl).max(0);
+            if captured + CATCHUP_TOLERANCE_SECS >= span {
+                let _ = self.store.set_recording_lost_secs(rec_id, 0);
+            }
+        }
+        let ok = bytes > 0;
+        let manually_stopped = self.stopping_monitors.lock().unwrap().remove(&monitor_id);
+        let shutting_down = self.shutdown.load(Ordering::SeqCst);
+        let status = if manually_stopped {
+            if ok { "completed" } else { "stopped" }
+        } else if shutting_down {
+            "aborted"
+        } else if ok {
+            "completed"
+        } else if stream_ended_or_unavailable(&outcome.log) {
+            "ended"
+        } else {
+            "failed"
+        };
+        let _ = self.store.finish_recording(
+            rec_id,
+            now_unix(),
+            bytes,
+            outcome.exit_code,
+            status,
+            &final_path.to_string_lossy(),
+            &outcome.log,
+        );
+        let _ = self
+            .store
+            .set_monitor_check_result(monitor_id, status, now_unix());
+        let _ = self.events.send(AppEvent::RecordingFinished {
+            recording_id: rec_id,
+            channel: row.channel.name.clone(),
+            status: status.into(),
+        });
+        info!(monitor_id, rec_id, bytes, status, "resumed recording finished");
+        self.active.lock().unwrap().remove(&monitor_id);
+    }
+
+    /// Delete stale working files from every output dir's `.cache\` (older than
+    /// [`CACHE_MAX_AGE_SECS`]), skipping any stem currently being resumed. Removes a
+    /// `.cache\` dir that ends up empty. Best-effort; runs once at startup.
+    pub async fn sweep_caches(&self, skip_stems: std::collections::HashSet<String>) {
+        let dirs = self.store.all_output_dirs().unwrap_or_default();
+        let now = std::time::SystemTime::now();
+        for d in dirs {
+            let cache = cache_dir(Path::new(&d));
+            let Ok(mut rd) = tokio::fs::read_dir(&cache).await else {
+                continue;
+            };
+            let mut removed = 0u32;
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if skip_stems
+                    .iter()
+                    .any(|s| name.starts_with(&format!("{s}.")))
+                {
+                    continue; // belongs to a recording being resumed
+                }
+                let Ok(meta) = entry.metadata().await else {
+                    continue;
+                };
+                let stale = meta
+                    .modified()
+                    .ok()
+                    .and_then(|m| now.duration_since(m).ok())
+                    .map(|age| age.as_secs() >= CACHE_MAX_AGE_SECS)
+                    .unwrap_or(false);
+                if stale && meta.is_file() && tokio::fs::remove_file(entry.path()).await.is_ok() {
+                    removed += 1;
+                }
+            }
+            if removed > 0 {
+                info!("swept {removed} stale .cache file(s) from {d}");
+            }
+            let _ = tokio::fs::remove_dir(&cache).await; // only if now empty
+        }
     }
 
     async fn run_process(
@@ -2698,18 +3125,104 @@ async fn rename_for_media(final_path: PathBuf, new_stem: &str) -> PathBuf {
 /// renamed (so external subs stay associated with their recording).
 const SUBTITLE_EXTS: [&str; 6] = ["vtt", "srt", "ass", "ssa", "sub", "lrc"];
 
+/// Thumbnail extensions, so a `{stem}.thumbnail.jpg` (our HTTP fetch) or a
+/// `{stem}.webp`/`.jpg`/`.png` (yt-dlp `--write-thumbnail`) is promoted/renamed
+/// alongside the recording instead of being orphaned.
+const THUMBNAIL_EXTS: [&str; 4] = ["jpg", "jpeg", "png", "webp"];
+
 /// True if `rest` (the part of a sibling filename after `{old_stem}.`) is a
-/// recognized companion: a subtitle sidecar (by final extension) or a chat log
+/// recognized companion: a subtitle sidecar, a thumbnail, or a chat log
 /// (`.chat.jsonl` from the Twitch logger, `.live_chat.json` from yt-dlp).
 fn is_companion_suffix(rest: &str) -> bool {
     if rest.ends_with("chat.jsonl") || rest.ends_with("live_chat.json") {
         return true;
     }
-    Path::new(rest)
+    let lower = rest.to_ascii_lowercase();
+    // `rest` may be a bare extension (yt-dlp's `{stem}.webp`) or a multi-part suffix
+    // (`en.vtt`, `thumbnail.jpg`) — accept either: the final extension, else `rest`.
+    let ext = Path::new(&lower)
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| SUBTITLE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
-        .unwrap_or(false)
+        .map(str::to_string)
+        .unwrap_or_else(|| lower.clone());
+    SUBTITLE_EXTS.contains(&ext.as_str()) || THUMBNAIL_EXTS.contains(&ext.as_str())
+}
+
+/// Promote a finished capture from the `.cache\` working dir up to its final path
+/// in the output dir: remux (TS→MKV) or move (already-final container), deleting the
+/// cache source on success. A 0-byte/failed capture is left in `.cache\` (returns
+/// the capture path so the caller can tell promotion didn't happen).
+async fn promote_capture(plan: &DownloadPlan) -> PathBuf {
+    if file_len(&plan.capture_path).await == 0 {
+        return plan.capture_path.clone(); // failed: leave the partial for the sweep
+    }
+    if plan.remux_to_mkv {
+        match remux_ts_to_mkv(&plan.capture_path, &plan.final_path).await {
+            Ok(()) => {
+                let _ = tokio::fs::remove_file(&plan.capture_path).await;
+                plan.final_path.clone()
+            }
+            Err(e) => {
+                warn!("remux failed, keeping {}: {e:#}", plan.capture_path.display());
+                plan.capture_path.clone()
+            }
+        }
+    } else {
+        // Already the final container — move it up to the output dir.
+        if let Some(parent) = plan.final_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        match tokio::fs::rename(&plan.capture_path, &plan.final_path).await {
+            Ok(()) => plan.final_path.clone(),
+            Err(e) => {
+                warn!("promote move failed, keeping {}: {e:#}", plan.capture_path.display());
+                plan.capture_path.clone()
+            }
+        }
+    }
+}
+
+/// Move every recognized companion (`{stem}.*` matched by [`is_companion_suffix`] —
+/// subtitles, thumbnail, in-process chat) from `from_dir` up to `to_dir`.
+/// Best-effort; never clobbers an existing target.
+async fn move_companions(from_dir: &Path, to_dir: &Path, stem: &str) {
+    let prefix = format!("{stem}.");
+    let mut rd = match tokio::fs::read_dir(from_dir).await {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if !is_companion_suffix(rest) {
+            continue;
+        }
+        let to = to_dir.join(&name);
+        if to.exists() {
+            continue;
+        }
+        if let Err(e) = tokio::fs::rename(entry.path(), &to).await {
+            warn!("companion promote failed for {name}: {e:#}");
+        }
+    }
+}
+
+/// After promotion, delete the recording's remaining working files (`{stem}.*`) from
+/// `cache` (SABR `.sq0.part`/`.state`, leftover `.ts`, chat fragments), then remove
+/// the cache dir if it is now empty. Best-effort.
+async fn purge_cache(cache: &Path, stem: &str) {
+    let prefix = format!("{stem}.");
+    if let Ok(mut rd) = tokio::fs::read_dir(cache).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&prefix) {
+                let _ = tokio::fs::remove_file(entry.path()).await;
+            }
+        }
+    }
+    let _ = tokio::fs::remove_dir(cache).await; // only if empty
 }
 
 /// When the main recording file is renamed, move its companion sidecars
@@ -3714,9 +4227,13 @@ mod tests {
             &sabr_bins(),
         );
         assert_eq!(plan.program, "C:/git/yt-dlp-dev/dist/yt-dlp.exe");
-        // SABR writes the final MKV directly — no .ts intermediate, no remux.
+        // SABR writes the final MKV directly (no .ts intermediate, no remux), but
+        // into the hidden .cache\ working dir; finalize promotes it to the output dir.
         assert!(plan.capture_path.to_string_lossy().ends_with(".mkv"));
-        assert_eq!(plan.capture_path, plan.final_path);
+        assert!(plan.capture_path.parent().unwrap().ends_with(".cache"));
+        assert!(plan.final_path.to_string_lossy().ends_with(".mkv"));
+        assert_eq!(plan.final_path.parent().unwrap(), std::path::Path::new("C:/rec"));
+        assert_ne!(plan.capture_path, plan.final_path);
         assert!(!plan.remux_to_mkv);
         assert!(!plan.writes_own_thumbnail);
         assert!(plan.args.iter().any(|a| a == "--live-from-start"));
@@ -3829,6 +4346,71 @@ mod tests {
             &bins,
         );
         assert_eq!(plan.program, "C:/tools/yt-dlp.exe");
+    }
+
+    #[test]
+    fn companion_suffix_recognizes_thumbnails_subs_and_chat() {
+        assert!(is_companion_suffix("thumbnail.jpg"));
+        assert!(is_companion_suffix("webp")); // yt-dlp --write-thumbnail
+        assert!(is_companion_suffix("png"));
+        assert!(is_companion_suffix("en.vtt"));
+        assert!(is_companion_suffix("chat.jsonl"));
+        assert!(is_companion_suffix("live_chat.json"));
+        // The video itself and SABR working files are NOT companions.
+        assert!(!is_companion_suffix("ts"));
+        assert!(!is_companion_suffix("mkv"));
+        assert!(!is_companion_suffix("f140.mkv.sq0.part"));
+        assert!(!is_companion_suffix("f303.mkv.state"));
+    }
+
+    #[test]
+    fn captures_route_into_hidden_cache_subdir() {
+        // streamlink (MKV container): capture .ts under .cache\, final .mkv in dir.
+        let plan = build_plan(
+            &row(Tool::Streamlink, Container::Mkv, Platform::Twitch),
+            1_700_000_000,
+            &AuthSource::None,
+            &[],
+            None,
+            "",
+            None,
+            &YtDlpBins::default(),
+        );
+        assert!(plan.capture_path.parent().unwrap().ends_with(".cache"));
+        assert!(plan.capture_path.to_string_lossy().ends_with(".ts"));
+        assert_eq!(plan.final_path.parent().unwrap(), std::path::Path::new("C:/rec"));
+        assert!(plan.final_path.to_string_lossy().ends_with(".mkv"));
+
+        // Video (yt-dlp) also captures into .cache\, final .mkv in the output dir.
+        let vplan = build_video_plan(
+            &video(Tool::YtDlp, "https://youtu.be/abc"),
+            1_700_000_000,
+            "",
+            "",
+            "",
+            &AuthSource::None,
+            None,
+        );
+        assert!(vplan.capture_path.parent().unwrap().ends_with(".cache"));
+        assert_eq!(vplan.final_path.parent().unwrap(), std::path::Path::new("C:/vids"));
+    }
+
+    #[test]
+    fn sabr_args_match_between_build_and_resume() {
+        // A resume rebuilds the args from the same capture path; they must be
+        // byte-identical so yt-dlp continues from the surviving `.state`.
+        let bins = sabr_bins();
+        let r = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
+        let plan = build_plan(&r, 1_700_000_000, &AuthSource::None, &[], None, "", None, &bins);
+        let resume_args = sabr_capture_args(
+            &plan.capture_path,
+            &AuthSource::None,
+            &[],
+            &bins.sabr,
+            &[],
+            &r.monitor.url,
+        );
+        assert_eq!(plan.args, resume_args);
     }
 
     fn video(tool: Tool, url: &str) -> Video {

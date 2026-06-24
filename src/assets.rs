@@ -675,6 +675,10 @@ async fn fetch_kick_channel_assets(
 /// - BTTV shared emotes → `platform_dir/bttv/emotes/` (global dedup)
 /// - FFZ emotes → `platform_dir/ffz/emotes/` + manifest `asset_dir/emotes/ffz.json`
 /// - 7TV emotes → `platform_dir/7tv/emotes/` + manifest `asset_dir/emotes/7tv.json`
+/// Returns `true` if the channel icon/banner fetch succeeded (badges/emotes are
+/// best-effort and don't affect the result). The 24h "fetched" stamp is written
+/// **only on success**, so a failed fetch (e.g. empty/invalid `broadcaster_id`,
+/// API error) is retried instead of being blocked for a day.
 pub async fn run_twitch_assets(
     client: &Client,
     client_id: &str,
@@ -682,12 +686,16 @@ pub async fn run_twitch_assets(
     broadcaster_id: &str,
     asset_dir: &Path,
     platform_dir: &Path,
-) {
-    if let Err(e) =
-        fetch_twitch_channel_assets(client, client_id, token, broadcaster_id, asset_dir).await
+) -> bool {
+    let ok = match fetch_twitch_channel_assets(client, client_id, token, broadcaster_id, asset_dir)
+        .await
     {
-        warn!("Twitch channel assets ({broadcaster_id}): {e}");
-    }
+        Ok(()) => true,
+        Err(e) => {
+            warn!("Twitch channel assets ({broadcaster_id}): {e}");
+            false
+        }
+    };
     if let Err(e) =
         fetch_twitch_badges(client, client_id, token, broadcaster_id, asset_dir, platform_dir).await
     {
@@ -707,28 +715,71 @@ pub async fn run_twitch_assets(
     if let Err(e) = fetch_7tv_emotes(client, broadcaster_id, asset_dir, platform_dir).await {
         warn!("7TV ({broadcaster_id}): {e}");
     }
-    write_fetched_stamp(asset_dir);
+    if ok {
+        write_fetched_stamp(asset_dir);
+    }
+    ok
 }
 
-/// Run YouTube channel asset fetches (icon, banner).
+/// Run YouTube channel asset fetches (icon, banner). Stamps only on success.
 pub async fn run_youtube_assets(
     client: &Client,
     api_key: &str,
     channel_id: &str,
     asset_dir: &Path,
-) {
-    if let Err(e) =
-        fetch_youtube_channel_assets(client, api_key, channel_id, asset_dir).await
-    {
-        warn!("YouTube channel assets ({channel_id}): {e}");
+) -> bool {
+    match fetch_youtube_channel_assets(client, api_key, channel_id, asset_dir).await {
+        Ok(()) => {
+            write_fetched_stamp(asset_dir);
+            true
+        }
+        Err(e) => {
+            warn!("YouTube channel assets ({channel_id}): {e}");
+            false
+        }
     }
-    write_fetched_stamp(asset_dir);
 }
 
-/// Run Kick channel asset fetches (icon, banner).
-pub async fn run_kick_assets(client: &Client, slug: &str, asset_dir: &Path) {
-    if let Err(e) = fetch_kick_channel_assets(client, slug, asset_dir).await {
-        warn!("Kick channel assets ({slug}): {e}");
+/// Run Kick channel asset fetches (icon, banner). Stamps only on success.
+pub async fn run_kick_assets(client: &Client, slug: &str, asset_dir: &Path) -> bool {
+    match fetch_kick_channel_assets(client, slug, asset_dir).await {
+        Ok(()) => {
+            write_fetched_stamp(asset_dir);
+            true
+        }
+        Err(e) => {
+            warn!("Kick channel assets ({slug}): {e}");
+            false
+        }
     }
-    write_fetched_stamp(asset_dir);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refetch_freshness_round_trip() {
+        let dir = std::env::temp_dir().join(format!("sa-assets-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // No stamp → must refetch (this is what makes a failed fetch retry, since the
+        // stamp is now only written on success).
+        assert!(should_refetch_assets(&dir));
+
+        // A fresh stamp blocks refetch for 24h.
+        write_fetched_stamp(&dir);
+        assert!(!should_refetch_assets(&dir));
+
+        // A stale (>24h) stamp refetches again.
+        std::fs::write(
+            dir.join(".assets_fetched_at"),
+            (now_unix() - 90_000).to_string(),
+        )
+        .unwrap();
+        assert!(should_refetch_assets(&dir));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

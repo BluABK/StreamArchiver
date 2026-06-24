@@ -6,8 +6,11 @@
 //! `Context::request_repaint`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::broadcast;
+
+use crate::models::now_unix;
 
 // ---------- Background task tracking ----------
 
@@ -44,8 +47,45 @@ pub struct BackgroundTask {
     pub kind: BackgroundTaskKind,
     /// Channel name or recording label shown in the Background view.
     pub label: String,
+    /// Extra context for the Background view (e.g. "Twitch · icon, badges, emotes").
+    pub detail: String,
     /// Unix timestamp when the task was started.
     pub started_at: i64,
+}
+
+// ---------- Periodic background jobs ("scheduled") ----------
+
+/// A recurring background job (poll scheduler, schedule/ad-free refreshers, WebSub
+/// poll) with its next estimated run time, for the Background view's "Scheduled"
+/// section. Kept in a shared [`JobRegistry`] the loops update before each sleep.
+#[derive(Clone, Debug)]
+pub struct ScheduledJob {
+    pub name: String,
+    pub interval_secs: i64,
+    pub next_run_at: i64,
+}
+
+pub type JobRegistry = Arc<Mutex<Vec<ScheduledJob>>>;
+
+pub fn job_registry() -> JobRegistry {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
+/// Upsert a job's next-run estimate (`now + interval_secs`). Called by each
+/// periodic loop right before it sleeps.
+pub fn mark_job(reg: &JobRegistry, name: &str, interval_secs: i64) {
+    let next_run_at = now_unix() + interval_secs.max(0);
+    let mut jobs = reg.lock().unwrap();
+    if let Some(j) = jobs.iter_mut().find(|j| j.name == name) {
+        j.interval_secs = interval_secs;
+        j.next_run_at = next_run_at;
+    } else {
+        jobs.push(ScheduledJob {
+            name: name.to_string(),
+            interval_secs,
+            next_run_at,
+        });
+    }
 }
 
 // ---------- App event bus ----------
@@ -172,4 +212,7 @@ pub enum ManualCommand {
     /// The chat download runs independently of the video recording so it needs
     /// its own stop command.
     StopChat(i64),
+    /// Force a channel-asset refetch for a monitor (by monitor id), ignoring the
+    /// 24h freshness stamp and the per-monitor `fetch_chat_assets` toggle.
+    RefetchAssets(i64),
 }

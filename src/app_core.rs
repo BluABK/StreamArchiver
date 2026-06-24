@@ -57,6 +57,9 @@ pub struct AppCore {
     /// Set to `true` by `request_yt_video_id_refetch()` so the next schedule pass
     /// re-scrapes only the YouTube monitors whose stored segments are missing video IDs.
     yt_video_id_refetch: Arc<AtomicBool>,
+    /// Periodic background jobs + their next-run estimates (the Background view's
+    /// "Scheduled" section); updated by each periodic loop before it sleeps.
+    pub jobs: crate::events::JobRegistry,
 }
 
 impl AppCore {
@@ -81,6 +84,7 @@ impl AppCore {
             manual_tx: Mutex::new(None),
             schedule_refresh: Arc::new(tokio::sync::Notify::new()),
             yt_video_id_refetch: Arc::new(AtomicBool::new(false)),
+            jobs: crate::events::job_registry(),
         }))
     }
 
@@ -106,6 +110,7 @@ impl AppCore {
         let shutdown_sched = self.shutdown.clone();
         let live_tx_sched = live_tx.clone();
         let ctx_sched = ctx.clone();
+        let jobs_sched = self.jobs.clone();
         self.rt.spawn(async move {
             crate::scheduler::run(
                 ctx_sched,
@@ -113,6 +118,7 @@ impl AppCore {
                 live_tx_sched,
                 active_sched,
                 shutdown_sched,
+                jobs_sched,
             )
             .await;
         });
@@ -129,8 +135,9 @@ impl AppCore {
         let ws_store = self.store.clone();
         let ws_shutdown = self.shutdown.clone();
         let ws_manual_tx = manual_tx.clone();
+        let ws_jobs = self.jobs.clone();
         self.rt.spawn(async move {
-            crate::websub::run(ws_store, ws_manual_tx, ws_shutdown).await;
+            crate::websub::run(ws_store, ws_manual_tx, ws_shutdown, ws_jobs).await;
         });
 
         // Periodic ad-free (Twitch sub) status refresher. Idles when no Twitch
@@ -139,8 +146,9 @@ impl AppCore {
         let af_ctx = ctx.clone();
         let af_events = self.events.clone();
         let af_shutdown = self.shutdown.clone();
+        let af_jobs = self.jobs.clone();
         self.rt.spawn(async move {
-            crate::detectors::refresh_ad_free(af_ctx, af_events, af_shutdown).await;
+            crate::detectors::refresh_ad_free(af_ctx, af_events, af_shutdown, af_jobs).await;
         });
 
         // Periodic upcoming-stream schedule refresher (Twitch Helix schedule /
@@ -150,9 +158,10 @@ impl AppCore {
         let sch_shutdown = self.shutdown.clone();
         let sch_refresh = self.schedule_refresh.clone();
         let sch_vid_refetch = self.yt_video_id_refetch.clone();
+        let sch_jobs = self.jobs.clone();
         self.rt.spawn(async move {
             crate::detectors::refresh_schedules(
-                sch_ctx, sch_events, sch_shutdown, sch_refresh, sch_vid_refetch,
+                sch_ctx, sch_events, sch_shutdown, sch_refresh, sch_vid_refetch, sch_jobs,
             )
             .await;
         });
@@ -179,6 +188,26 @@ impl AppCore {
             self.ad_active.clone(),
             max_concurrent,
         );
+        // Crash recovery: resume SABR-resumable in-flight recordings (orphan the
+        // rest), then sweep stale `.cache\` working files. resume_inflight reserves
+        // each resumed monitor synchronously so a poll can't double-start it.
+        let to_resume = supervisor.resume_inflight();
+        let skip_stems: std::collections::HashSet<String> = to_resume
+            .iter()
+            .filter_map(|(rec, _)| {
+                std::path::Path::new(&rec.output_path)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+            })
+            .collect();
+        for (rec, row) in to_resume {
+            let s = supervisor.clone();
+            self.rt.spawn(async move { s.resume_recording(rec, row).await });
+        }
+        let sweep_sup = supervisor.clone();
+        self.rt
+            .spawn(async move { sweep_sup.sweep_caches(skip_stems).await });
+
         self.rt.spawn(async move {
             supervisor.run(live_rx, manual_rx).await;
         });

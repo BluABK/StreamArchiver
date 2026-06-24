@@ -207,6 +207,29 @@ pub fn kill_process_tree(pid: u32) {
         .status();
 }
 
+/// Mark a directory (or file) hidden. On Windows this sets
+/// `FILE_ATTRIBUTE_HIDDEN`; elsewhere it's a no-op (a `.`-prefixed name already
+/// hides it by Unix convention). Best-effort: failures are ignored.
+#[cfg(windows)]
+pub fn set_hidden(path: &std::path::Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN, SetFileAttributesW};
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let _ = SetFileAttributesW(
+            windows::core::PCWSTR(wide.as_ptr()),
+            FILE_ATTRIBUTE_HIDDEN,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+pub fn set_hidden(_path: &std::path::Path) {}
+
 /// Reveal a path in the OS file manager (Explorer on Windows, Finder on macOS,
 /// the default handler via `xdg-open` elsewhere).
 ///

@@ -70,6 +70,7 @@ pub async fn run(
     store: Arc<Store>,
     manual_tx: UnboundedSender<ManualCommand>,
     shutdown: Arc<AtomicBool>,
+    jobs: crate::events::JobRegistry,
 ) {
     let http = Client::builder()
         .user_agent(UA)
@@ -248,7 +249,9 @@ pub async fn run(
             }
         }
 
-        sleep_cancellable(Duration::from_secs(poll_secs(&store)), &shutdown).await;
+        let poll = poll_secs(&store);
+        crate::events::mark_job(&jobs, "YouTube WebSub poll", poll as i64);
+        sleep_cancellable(Duration::from_secs(poll), &shutdown).await;
     }
 }
 
@@ -389,6 +392,14 @@ async fn ack(http: &Client, base: &str, token: &str, through: u64) -> Result<()>
 
 /// Resolve a YouTube channel URL to its `UC…` id (cached). Tries the URL itself
 /// (`/channel/UC…`) first, then scrapes the channel page (no API key needed).
+/// Resolve a YouTube channel URL to its `UC…` id (from the URL, else by scraping
+/// the channel page). Public wrapper for one-off callers (e.g. manual asset refetch)
+/// that don't keep a resolution cache.
+pub(crate) async fn resolve_channel_uc(http: &Client, url: &str) -> Option<String> {
+    let mut cache = HashMap::new();
+    resolve_uc(http, url, &mut cache).await
+}
+
 async fn resolve_uc(
     http: &Client,
     url: &str,
