@@ -71,7 +71,7 @@ const COOKIE_BROWSERS: [&str; 8] = [
     "firefox", "chrome", "chromium", "edge", "brave", "opera", "vivaldi", "safari",
 ];
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
     Streams,
     Videos,
@@ -3253,13 +3253,79 @@ impl eframe::App for StreamArchiverApp {
                 });
             });
 
-        egui::CentralPanel::default().show_inside(ui, |ui| match self.view {
+        let panel_resp = egui::CentralPanel::default().show_inside(ui, |ui| match self.view {
             View::Streams => self.channels_view(ui),
             View::Videos => self.videos_view(ui),
             View::Schedule => self.schedule_view(ui),
             View::Background => self.background_view(ui),
             View::Settings => self.settings_view(ui),
         });
+
+        // ── Main-panel context menu (right-click on empty space) ──
+        let view = self.view;
+        let mut ctx_add_stream = false;
+        let mut ctx_add_channel = false;
+        let mut ctx_refresh_schedule = false;
+        let mut ctx_open_proc_mgr = false;
+        let mut ctx_save_settings = false;
+        panel_resp.response.context_menu(|ui| {
+            match view {
+                View::Streams => {
+                    if ui.button("➕  Add stream").clicked() {
+                        ctx_add_stream = true;
+                        ui.close();
+                    }
+                    if ui.button("➕  Add channel").clicked() {
+                        ctx_add_channel = true;
+                        ui.close();
+                    }
+                }
+                View::Schedule => {
+                    if ui.button("⟳  Fetch now").clicked() {
+                        ctx_refresh_schedule = true;
+                        ui.close();
+                    }
+                }
+                View::Background => {
+                    if ui.button("🖥  Process manager").clicked() {
+                        ctx_open_proc_mgr = true;
+                        ui.close();
+                    }
+                }
+                View::Settings => {
+                    if ui.button("💾  Save settings").clicked() {
+                        ctx_save_settings = true;
+                        ui.close();
+                    }
+                }
+                View::Videos => {}
+            }
+        });
+        if ctx_add_stream {
+            self.form = Some(MonitorForm::new_channel(
+                &self.monitor_defaults,
+                &self.settings.default_output_dir,
+            ));
+        }
+        if ctx_add_channel {
+            self.channel_form = Some(ChannelForm {
+                id: None,
+                name: String::new(),
+                color: String::new(),
+            });
+        }
+        if ctx_refresh_schedule {
+            self.core.request_schedule_refresh();
+            self.reload_schedule();
+            self.status = "Fetching latest schedules…".into();
+        }
+        if ctx_open_proc_mgr {
+            self.show_processes = true;
+            self.processes_refreshed = None;
+        }
+        if ctx_save_settings {
+            self.save_settings();
+        }
 
         self.form_window(ui.ctx());
         self.channel_form_window(ui.ctx());
