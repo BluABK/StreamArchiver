@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use reqwest::Client;
@@ -71,6 +71,95 @@ async fn download_image(client: &Client, url: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The current canonical asset file `dir/{stem}.<ext>` (any extension), if one
+/// exists. Matches `icon.png` but never the `history/` dir or an archived
+/// `icon_<ts>.png` (those use `{stem}_`, not `{stem}.`).
+async fn current_asset(dir: &Path, stem: &str) -> Option<PathBuf> {
+    let prefix = format!("{stem}.");
+    let mut rd = tokio::fs::read_dir(dir).await.ok()?;
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            return Some(entry.path());
+        }
+    }
+    None
+}
+
+/// Download a per-channel **singular** asset (icon / banner) into `dir`,
+/// preserving history — this is an archiver, so a profile pic / banner the
+/// channel later changes must not be lost.
+///
+/// `dir/{stem}.{ext}` always holds the latest version. When the freshly fetched
+/// image differs (byte-for-byte) from the current canonical file, the old one is
+/// moved into `dir/history/{stem}_{retired_at}.{old_ext}` before being replaced;
+/// `retired_at` is the unix time it was supplanted, so the history reads as a
+/// timeline. An identical re-download is a no-op (no spurious history entry).
+async fn download_image_archival(
+    client: &Client,
+    url: &str,
+    dir: &Path,
+    stem: &str,
+    ext: &str,
+) -> Result<()> {
+    let url = if url.starts_with("//") {
+        format!("https:{url}")
+    } else {
+        url.to_string()
+    };
+    tokio::fs::create_dir_all(dir).await?;
+    let resp = client.get(&url).send().await?;
+    if !resp.status().is_success() {
+        bail!("HTTP {} for {}", resp.status(), url);
+    }
+    let bytes = resp.bytes().await?;
+    archive_and_write(dir, stem, ext, &bytes).await
+}
+
+/// Place `bytes` as the canonical `dir/{stem}.{ext}`, archiving any differing
+/// current version into `dir/history/` first. Network-free (the testable core of
+/// [`download_image_archival`]). A byte-identical current file is left untouched
+/// (no spurious history entry); a differing one is moved to
+/// `history/{stem}_{retired_at}.{old_ext}` so it is never lost.
+async fn archive_and_write(dir: &Path, stem: &str, ext: &str, bytes: &[u8]) -> Result<()> {
+    if let Some(cur_path) = current_asset(dir, stem).await {
+        match tokio::fs::read(&cur_path).await {
+            // Unchanged since last fetch — leave everything as-is.
+            Ok(cur) if cur == bytes => return Ok(()),
+            // Changed — archive the old version before it's overwritten.
+            Ok(_) => {
+                let hist = dir.join("history");
+                tokio::fs::create_dir_all(&hist).await?;
+                let cur_ext = cur_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("img");
+                // Name by retirement time, but never collide with an existing
+                // archived version (two changes in the same second, or a clock
+                // that didn't advance) — append a counter so nothing is lost.
+                let ts = now_unix();
+                let mut archived = hist.join(format!("{stem}_{ts}.{cur_ext}"));
+                let mut n = 1;
+                while tokio::fs::try_exists(&archived).await.unwrap_or(false) {
+                    n += 1;
+                    archived = hist.join(format!("{stem}_{ts}_{n}.{cur_ext}"));
+                }
+                // Move the old canonical into history (rename; fall back to
+                // copy+remove if the move fails). This also clears a stale
+                // canonical whose extension differs from the new one.
+                if tokio::fs::rename(&cur_path, &archived).await.is_err() {
+                    tokio::fs::copy(&cur_path, &archived).await?;
+                    let _ = tokio::fs::remove_file(&cur_path).await;
+                }
+            }
+            // Unreadable current file — just overwrite it.
+            Err(_) => {}
+        }
+    }
+
+    tokio::fs::write(dir.join(format!("{stem}.{ext}")), bytes).await?;
+    Ok(())
+}
+
 // ---------- Per-recording thumbnail ----------
 
 /// Download the stream thumbnail to `dest` (e.g., `{stem}.thumbnail.jpg`).
@@ -122,20 +211,16 @@ async fn fetch_twitch_channel_assets(
 
     let icon_ext = ext_from_url(&user.profile_image_url).unwrap_or("jpg");
     if let Err(e) =
-        download_image(client, &user.profile_image_url, &asset_dir.join(format!("icon.{icon_ext}")))
-            .await
+        download_image_archival(client, &user.profile_image_url, asset_dir, "icon", icon_ext).await
     {
         warn!("twitch icon: {e}");
     }
 
     if !user.offline_image_url.is_empty() {
         let banner_ext = ext_from_url(&user.offline_image_url).unwrap_or("jpg");
-        if let Err(e) = download_image(
-            client,
-            &user.offline_image_url,
-            &asset_dir.join(format!("banner.{banner_ext}")),
-        )
-        .await
+        if let Err(e) =
+            download_image_archival(client, &user.offline_image_url, asset_dir, "banner", banner_ext)
+                .await
         {
             warn!("twitch banner: {e}");
         }
@@ -603,7 +688,7 @@ async fn fetch_youtube_channel_assets(
         .or_else(|| item["snippet"]["thumbnails"]["default"]["url"].as_str());
     if let Some(url) = icon_url {
         let ext = ext_from_url(url).unwrap_or("jpg");
-        if let Err(e) = download_image(client, url, &asset_dir.join(format!("icon.{ext}"))).await {
+        if let Err(e) = download_image_archival(client, url, asset_dir, "icon", ext).await {
             warn!("YouTube icon: {e}");
         }
     }
@@ -612,8 +697,7 @@ async fn fetch_youtube_channel_assets(
     let banner_url = item["brandingSettings"]["image"]["bannerExternalUrl"].as_str();
     if let Some(url) = banner_url {
         let ext = ext_from_url(url).unwrap_or("jpg");
-        if let Err(e) = download_image(client, url, &asset_dir.join(format!("banner.{ext}"))).await
-        {
+        if let Err(e) = download_image_archival(client, url, asset_dir, "banner", ext).await {
             warn!("YouTube banner: {e}");
         }
     }
@@ -646,7 +730,7 @@ async fn fetch_kick_channel_assets(
 
     if let Some(url) = v["user"]["profile_pic"].as_str() {
         let ext = ext_from_url(url).unwrap_or("jpg");
-        if let Err(e) = download_image(client, url, &asset_dir.join(format!("icon.{ext}"))).await {
+        if let Err(e) = download_image_archival(client, url, asset_dir, "icon", ext).await {
             warn!("Kick icon: {e}");
         }
     }
@@ -656,8 +740,7 @@ async fn fetch_kick_channel_assets(
         .or_else(|| v["offline_banner_image"]["url"].as_str());
     if let Some(url) = banner_url {
         let ext = ext_from_url(url).unwrap_or("jpg");
-        if let Err(e) = download_image(client, url, &asset_dir.join(format!("banner.{ext}"))).await
-        {
+        if let Err(e) = download_image_archival(client, url, asset_dir, "banner", ext).await {
             warn!("Kick banner: {e}");
         }
     }
@@ -779,6 +862,53 @@ mod tests {
         )
         .unwrap();
         assert!(should_refetch_assets(&dir));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Helper: list the archived variant filenames for a stem under history/.
+    fn history_variants(dir: &Path, stem: &str) -> Vec<String> {
+        let prefix = format!("{stem}_");
+        std::fs::read_dir(dir.join("history"))
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .filter(|n| n.starts_with(&prefix))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn archival_write_preserves_changed_versions() {
+        let dir = std::env::temp_dir().join(format!("sa-archival-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // First fetch: no history yet, canonical written.
+        archive_and_write(&dir, "icon", "png", b"v1").await.unwrap();
+        assert_eq!(std::fs::read(dir.join("icon.png")).unwrap(), b"v1");
+        assert_eq!(history_variants(&dir, "icon").len(), 0);
+
+        // Identical re-fetch: no-op, no spurious history entry.
+        archive_and_write(&dir, "icon", "png", b"v1").await.unwrap();
+        assert_eq!(history_variants(&dir, "icon").len(), 0);
+
+        // Changed pfp: the old version is archived, the new becomes canonical.
+        archive_and_write(&dir, "icon", "png", b"v2").await.unwrap();
+        assert_eq!(std::fs::read(dir.join("icon.png")).unwrap(), b"v2");
+        let variants = history_variants(&dir, "icon");
+        assert_eq!(variants.len(), 1, "old version must be kept");
+        // The archived bytes are the previous version — no media lost.
+        let archived = dir.join("history").join(&variants[0]);
+        assert_eq!(std::fs::read(archived).unwrap(), b"v1");
+
+        // A different extension still replaces the canonical and archives the old
+        // one (no leftover icon.png alongside the new icon.jpg).
+        archive_and_write(&dir, "icon", "jpg", b"v3").await.unwrap();
+        assert_eq!(std::fs::read(dir.join("icon.jpg")).unwrap(), b"v3");
+        assert!(!dir.join("icon.png").exists(), "stale extension must be cleared");
+        assert_eq!(history_variants(&dir, "icon").len(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

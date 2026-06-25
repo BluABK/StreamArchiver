@@ -8823,6 +8823,19 @@ impl StreamArchiverApp {
                             self.channel_icons.remove(&ch.id); // reload after fetch
                             self.status = format!("Refetching assets for {}…", ch.name);
                         }
+                        if ui
+                            .button("📂")
+                            .on_hover_text(
+                                "Open the channel's asset folder (per-platform icons, banners, \
+                                 and the history/ archive of older versions).",
+                            )
+                            .clicked()
+                        {
+                            let root = crate::app_paths::asset_cache_dir()
+                                .join("channel_assets")
+                                .join(crate::downloader::sanitize_filename(&ch.name));
+                            crate::platform::open_path(&root);
+                        }
                     });
                     if !m.fetch_chat_assets {
                         ui.label(
@@ -8896,9 +8909,16 @@ impl StreamArchiverApp {
                                     }
                                     ui.label(p.label());
                                 });
-                                let mark = |ok: bool| if ok { "✔" } else { "—" };
-                                ui.label(mark(prop_find_first(&pdir, "icon.").is_some()));
-                                ui.label(mark(prop_find_first(&pdir, "banner.").is_some()));
+                                asset_status_cell(
+                                    ui,
+                                    prop_find_first(&pdir, "icon.").is_some(),
+                                    prop_variant_count(&pdir, "icon"),
+                                );
+                                asset_status_cell(
+                                    ui,
+                                    prop_find_first(&pdir, "banner.").is_some(),
+                                    prop_variant_count(&pdir, "banner"),
+                                );
                                 // Badges + emotes are Twitch-only concepts.
                                 let badges = prop_count_nested_dirs(&pdir.join("badges"), 2);
                                 ui.label(if badges > 0 {
@@ -8987,6 +9007,37 @@ fn resolve_channel_icon(
             .join(crate::downloader::sanitize_filename(&channel.name));
         load_channel_icon(&flat, ctx, &key)
     })
+}
+
+/// Count archived historical variants of a singular asset (`history/{stem}_*`).
+/// These are the older profile pics / banners kept when the channel changed them.
+fn prop_variant_count(asset_dir: &std::path::Path, stem: &str) -> usize {
+    let prefix = format!("{stem}_");
+    std::fs::read_dir(asset_dir.join("history"))
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// One asset-status cell: `—` (absent), `✔` (present), or `✔ +N` when `N` older
+/// versions are archived. Hovering a `+N` cell explains the kept history.
+fn asset_status_cell(ui: &mut egui::Ui, present: bool, variants: usize) {
+    let text = if !present {
+        "—".to_string()
+    } else if variants > 0 {
+        format!("✔ +{variants}")
+    } else {
+        "✔".to_string()
+    };
+    let resp = ui.label(text);
+    if variants > 0 {
+        resp.on_hover_text(format!(
+            "{variants} older version(s) archived under history/ — kept, never overwritten."
+        ));
+    }
 }
 
 /// Short "last fetched" label for an asset dir's `.assets_fetched_at` stamp.
