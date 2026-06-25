@@ -443,6 +443,7 @@ impl AppCore {
             .list_detached()
             .unwrap_or_default()
             .into_iter()
+            .filter(|r| crate::platform::pid_alive(r.pid))
             .map(|r| {
                 let (name, tool) = match r.kind {
                     DetachedKind::Recording | DetachedKind::Chat => self

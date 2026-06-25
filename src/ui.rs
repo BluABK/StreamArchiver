@@ -514,6 +514,8 @@ pub struct StreamArchiverApp {
     job_toggles: std::collections::HashMap<String, bool>,
     /// Format Designer: an interactive template preview/editor window.
     format_designer: Option<FormatDesignerState>,
+    /// Pending "Stop recordings & quit" confirmation (triggered by the tray item).
+    confirm_quit_stop: bool,
 }
 
 impl StreamArchiverApp {
@@ -724,6 +726,7 @@ impl StreamArchiverApp {
             finished_tasks: Vec::new(),
             job_toggles,
             format_designer: None,
+            confirm_quit_stop: false,
         };
         app.reload_rows();
         app.reload_videos();
@@ -837,12 +840,11 @@ impl StreamArchiverApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 UiCommand::QuitAndStop => {
-                    // Force the exit path to stop (not detach) the tool trees.
-                    self.core
-                        .force_stop_on_quit
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                    self.quitting = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    // Show confirmation before stopping active recordings.
+                    self.confirm_quit_stop = true;
+                    // Bring the window to the foreground so the dialog is visible.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
             }
         }
@@ -3272,6 +3274,7 @@ impl eframe::App for StreamArchiverApp {
         self.properties_window(ui.ctx());
         self.processes_window(ui.ctx());
         self.format_designer_window(ui.ctx());
+        self.confirm_quit_stop_window(ui.ctx());
     }
 }
 
@@ -3457,6 +3460,56 @@ impl StreamArchiverApp {
             self.reload_rows();
         } else if do_cancel || !open {
             self.confirm_delete_channel = None;
+        }
+    }
+
+    /// Confirmation dialog for "Quit & stop recordings" tray action.
+    #[allow(deprecated)]
+    fn confirm_quit_stop_window(&mut self, ctx: &egui::Context) {
+        if !self.confirm_quit_stop {
+            return;
+        }
+        let mut open = true;
+        let mut confirmed = false;
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("confirm_quit_stop_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("Stop recordings and quit?")
+                .with_inner_size([380.0, 130.0])
+                .with_resizable(false),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.add_space(4.0);
+                    ui.label("This will terminate all active recordings immediately.");
+                    ui.label("In-progress captures will be finalized from whatever was written.");
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        let stop_btn = egui::Button::new("Stop & Quit")
+                            .fill(egui::Color32::from_rgb(180, 40, 40));
+                        if ui.add(stop_btn).clicked() {
+                            confirmed = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            open = false;
+                        }
+                    });
+                });
+            },
+        );
+
+        if confirmed {
+            self.core
+                .force_stop_on_quit
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.quitting = true;
+            self.confirm_quit_stop = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if !open {
+            self.confirm_quit_stop = false;
         }
     }
 
@@ -5739,6 +5792,7 @@ impl StreamArchiverApp {
         let mut toggle_channel_enabled: Option<(i64, bool)> = None; // set all instances
         let mut rename_channel: Option<i64> = None;
         let mut delete_channel: Option<(i64, String)> = None;
+        let mut clear_channel_err: Option<i64> = None;
 
         let selected_monitor = self.selected_monitor;
         let now = crate::models::now_unix();
@@ -6172,6 +6226,13 @@ impl StreamArchiverApp {
                                         if ui.button("✏  Rename channel").clicked() {
                                             rename_channel = Some(cid);
                                             ui.close();
+                                        }
+                                        if any_err {
+                                            ui.separator();
+                                            if ui.button("✖  Clear error").clicked() {
+                                                clear_channel_err = Some(cid);
+                                                ui.close();
+                                            }
                                         }
                                         ui.separator();
                                         if ui.button("🗑  Delete channel").clicked() {
@@ -6706,6 +6767,13 @@ impl StreamArchiverApp {
         }
         if let Some((cid, name)) = delete_channel {
             self.confirm_delete_channel = Some((cid, name));
+        }
+        if let Some(cid) = clear_channel_err {
+            if let Err(e) = self.core.store.clear_channel_errors(cid) {
+                self.status = format!("Error: {e}");
+            } else {
+                self.reload_rows();
+            }
         }
         if let Some(id) = acts.start {
             self.core.manual(ManualCommand::Start(id));
@@ -7799,12 +7867,7 @@ impl StreamArchiverApp {
                                     });
                                     row.col(|ui| { ui.label(&p.tool); });
                                     row.col(|ui| {
-                                        if !p.alive {
-                                            ui.colored_label(
-                                                egui::Color32::from_rgb(0xe0, 0x6c, 0x6c),
-                                                "✘ dead",
-                                            );
-                                        } else if p.reattached {
+                                        if p.reattached {
                                             ui.colored_label(
                                                 egui::Color32::from_rgb(0x6c, 0xb0, 0xe0),
                                                 "⛓ re-attached",

@@ -632,6 +632,15 @@ impl Store {
         Ok(())
     }
 
+    pub fn clear_channel_errors(&self, channel_id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE monitor SET last_state = 'idle' WHERE channel_id = ?1 AND last_state IN ('error', 'failed')",
+            params![channel_id],
+        )?;
+        Ok(())
+    }
+
     pub fn set_monitor_enabled(&self, id: i64, enabled: bool) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
