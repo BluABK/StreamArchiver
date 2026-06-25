@@ -123,6 +123,8 @@ pub struct DownloadPlan {
     /// `--write-thumbnail`). When false and a thumbnail is wanted, the supervisor
     /// fetches it over HTTP instead (streamlink, ffmpeg, and SABR captures).
     pub writes_own_thumbnail: bool,
+    /// Download mode string, e.g. "live", "sabr", "dash", "hybrid", "hybrid-dash", "direct", "vod", "chat".
+    pub mode: String,
 }
 
 /// Default SABR format selector when the setting is unset/empty.
@@ -445,6 +447,7 @@ pub fn build_chat_plan(
         final_path: capture_path.to_path_buf(),
         remux_to_mkv: false,
         writes_own_thumbnail: false,
+        mode: "chat".into(),
     }
 }
 
@@ -500,6 +503,7 @@ fn build_dash_companion_plan(
         final_path: mkv_path,
         remux_to_mkv: true,
         writes_own_thumbnail: false,
+        mode: "hybrid-dash".into(),
     }
 }
 
@@ -593,6 +597,25 @@ fn sabr_capture_args(
     args
 }
 
+/// Compute the download mode string for a monitor recording.
+fn recording_mode(m: &Monitor, use_sabr: bool, secondary: bool) -> String {
+    match m.tool {
+        Tool::Streamlink => "live".into(),
+        Tool::Ffmpeg => "direct".into(),
+        Tool::YtDlp => {
+            if use_sabr {
+                if m.dual_capture {
+                    if secondary { "hybrid-dash".into() } else { "hybrid".into() }
+                } else {
+                    "sabr".into()
+                }
+            } else {
+                "dash".into()
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_plan(
     row: &MonitorWithChannel,
@@ -602,27 +625,32 @@ pub fn build_plan(
     stream_id: Option<&str>,
     stream_title: &str,
     media: Option<&MediaInfo>,
+    went_live_at: i64,
     ytdlp: &YtDlpBins,
 ) -> DownloadPlan {
     let m = &row.monitor;
     let ch = &row.channel;
     let dir = PathBuf::from(&m.output_dir);
     let quality = resolved_quality(&m.quality);
+    let use_sabr = m.tool == Tool::YtDlp
+        && m.platform() == Platform::YouTube
+        && m.capture_from_start
+        && ytdlp.sabr.usable();
+    let mode = recording_mode(m, use_sabr, false);
+    let platform = m.platform().as_str().to_string();
+    let tool_label = m.tool.label();
     // `{video_id}` (platform id when known), `{take}` (attempt number), and the
     // media vars (filled only when `media` is provided, i.e. pre-probe). Then
     // avoid clobbering an existing finished file of the same name.
     // `{games}` isn't known until the stream ends; it's filled at the post-rename.
     let stem = monitor_stem(
         m, &ch.name, started_at, stream_id, stream_title, row.recording_count, &quality, media, "",
+        tool_label, &mode, &platform, went_live_at,
     );
     let extra = split_args(&m.extra_args);
     // SABR (YouTube capture-from-start via the dev build) writes the final MKV
     // directly — it merges separate SABR audio+video through ffmpeg, which the
     // mpegts/.ts intermediate can't hold. Everything else captures to .ts first.
-    let use_sabr = m.tool == Tool::YtDlp
-        && m.platform() == Platform::YouTube
-        && m.capture_from_start
-        && ytdlp.sabr.usable();
     let final_ext = if use_sabr {
         "mkv"
     } else {
@@ -768,6 +796,7 @@ pub fn build_plan(
         final_path,
         remux_to_mkv,
         writes_own_thumbnail,
+        mode,
     }
 }
 
@@ -788,7 +817,7 @@ pub fn build_video_plan(
 ) -> DownloadPlan {
     let dir = PathBuf::from(&v.output_dir);
     let quality = resolved_quality(&v.quality);
-    let stem = video_stem(v, started_at, title, channel, video_id, &quality, media);
+    let stem = video_stem(v, started_at, title, channel, video_id, &quality, media, v.tool.label(), Platform::detect(&v.url).as_str());
     let extra = split_args(&v.extra_args);
     let platform = Platform::detect(&v.url);
     // Don't clobber an existing finished file (all video tools end at .mkv).
@@ -855,6 +884,7 @@ pub fn build_video_plan(
                 final_path,
                 remux_to_mkv: false,
                 writes_own_thumbnail: false,
+                mode: "vod".into(),
             }
         }
         Tool::Streamlink => {
@@ -886,6 +916,7 @@ pub fn build_video_plan(
                 final_path,
                 remux_to_mkv: true,
                 writes_own_thumbnail: false,
+                mode: "vod".into(),
             }
         }
         Tool::Ffmpeg => {
@@ -912,6 +943,7 @@ pub fn build_video_plan(
                 final_path,
                 remux_to_mkv: true,
                 writes_own_thumbnail: false,
+                mode: "vod".into(),
             }
         }
     }
@@ -1650,6 +1682,7 @@ impl Supervisor {
                     let quality = resolved_quality(&video.quality);
                     let stem = video_stem(
                         &video, started_at, &title, &channel, &video_id, &quality, Some(&mi),
+                        video.tool.label(), Platform::detect(&video.url).as_str(),
                     );
                     final_path = rename_for_media(final_path, &stem).await;
                 }
@@ -1798,7 +1831,7 @@ impl Supervisor {
         let ytdlp_global_args = split_args(&ytdlp_global_raw);
         let ytdlp_bins = load_ytdlp_bins(&self.store);
         let started_at = now_unix();
-        let plan = build_plan(&row, started_at, &auth, &ytdlp_global_args, stream_id.as_deref(), stream_title.as_deref().unwrap_or(""), pre_media.as_ref(), &ytdlp_bins);
+        let plan = build_plan(&row, started_at, &auth, &ytdlp_global_args, stream_id.as_deref(), stream_title.as_deref().unwrap_or(""), pre_media.as_ref(), went_live_at.unwrap_or(0), &ytdlp_bins);
         if let Some(parent) = plan.capture_path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
             crate::platform::set_hidden(parent); // mark the .cache\ working dir hidden
@@ -2082,8 +2115,9 @@ impl Supervisor {
             // also trigger a rename even when probing is off.
             let want_games = template_wants_games(&row.monitor.filename_template);
             let want_title = template_wants_title(&row.monitor.filename_template);
+            let want_went_live = template_wants_went_live(&row.monitor.filename_template);
             let do_post_media = want_media && media_mode.post();
-            if do_post_media || want_games || want_title {
+            if do_post_media || want_games || want_title || want_went_live {
                 let mi = if do_post_media {
                     probe_media(&final_path.to_string_lossy()).await
                 } else {
@@ -2112,6 +2146,10 @@ impl Supervisor {
                     &quality,
                     mi.as_ref().or(pre_media.as_ref()),
                     &games,
+                    row.monitor.tool.label(),
+                    &plan.mode,
+                    row.monitor.platform().as_str(),
+                    went_live_at.unwrap_or(0),
                 );
                 final_path = rename_for_media(final_path, &stem).await;
             }
@@ -2720,6 +2758,7 @@ impl Supervisor {
                 final_path: final_pred.clone(),
                 remux_to_mkv: true,
                 writes_own_thumbnail: false,
+                mode: String::new(),
             })
             .await
         } else {
@@ -2761,9 +2800,10 @@ impl Supervisor {
         if let Some(mrow) = &mrow {
             let want_games = template_wants_games(&mrow.monitor.filename_template);
             let want_title = template_wants_title(&mrow.monitor.filename_template);
+            let want_went_live = template_wants_went_live(&mrow.monitor.filename_template);
             let do_post_media =
                 template_wants_media(&mrow.monitor.filename_template) && media_info_mode(&self.store).post();
-            if want_games || want_title || do_post_media {
+            if want_games || want_title || do_post_media || want_went_live {
                 let mi = if do_post_media {
                     probe_media(&final_path.to_string_lossy()).await
                 } else {
@@ -2780,6 +2820,12 @@ impl Supervisor {
                     String::new()
                 };
                 let quality = resolved_quality(&mrow.monitor.quality);
+                let ytdlp_bins_fa = load_ytdlp_bins(&self.store);
+                let use_sabr_fa = mrow.monitor.tool == Tool::YtDlp
+                    && mrow.monitor.platform() == Platform::YouTube
+                    && mrow.monitor.capture_from_start
+                    && ytdlp_bins_fa.sabr.usable();
+                let mode_fa = recording_mode(&mrow.monitor, use_sabr_fa, row.secondary);
                 let stem = monitor_stem(
                     &mrow.monitor,
                     &mrow.channel.name,
@@ -2790,6 +2836,10 @@ impl Supervisor {
                     &quality,
                     mi.as_ref(),
                     &games,
+                    mrow.monitor.tool.label(),
+                    &mode_fa,
+                    mrow.monitor.platform().as_str(),
+                    row.went_live_at.unwrap_or(0),
                 );
                 final_path = rename_for_media(final_path, &stem).await;
             }
@@ -2937,6 +2987,8 @@ impl Supervisor {
         let args = sabr_capture_args(
             &capture, &auth, &ytdlp_global_args, &ytdlp_bins.sabr, &extra, &row.monitor.url,
         );
+        let use_sabr_resume = true; // resume is always SABR
+        let mode_resume = recording_mode(&row.monitor, use_sabr_resume, false);
         let plan = DownloadPlan {
             program: ytdlp_bins.sabr.binary.clone(),
             args,
@@ -2944,6 +2996,7 @@ impl Supervisor {
             final_path: out_path,
             remux_to_mkv: false,
             writes_own_thumbnail: false,
+            mode: mode_resume,
         };
 
         let _permit = self.sem.acquire().await.expect("semaphore");
@@ -3006,10 +3059,11 @@ impl Supervisor {
             }
             let want_games = template_wants_games(&row.monitor.filename_template);
             let want_title = template_wants_title(&row.monitor.filename_template);
+            let want_went_live = template_wants_went_live(&row.monitor.filename_template);
             let want_media = template_wants_media(&row.monitor.filename_template);
             let media_mode = media_info_mode(&self.store);
             let do_post_media = want_media && media_mode.post();
-            if do_post_media || want_games || want_title {
+            if do_post_media || want_games || want_title || want_went_live {
                 let mi = if do_post_media {
                     probe_media(&final_path.to_string_lossy()).await
                 } else {
@@ -3026,6 +3080,11 @@ impl Supervisor {
                     String::new()
                 };
                 let quality = resolved_quality(&row.monitor.quality);
+                let use_sabr_res = row.monitor.tool == Tool::YtDlp
+                    && row.monitor.platform() == Platform::YouTube
+                    && row.monitor.capture_from_start
+                    && ytdlp_bins.sabr.usable();
+                let mode_res = recording_mode(&row.monitor, use_sabr_res, false);
                 let stem = monitor_stem(
                     &row.monitor,
                     &row.channel.name,
@@ -3036,6 +3095,10 @@ impl Supervisor {
                     &quality,
                     mi.as_ref(),
                     &games,
+                    row.monitor.tool.label(),
+                    &mode_res,
+                    row.monitor.platform().as_str(),
+                    rec.went_live_at.unwrap_or(0),
                 );
                 final_path = rename_for_media(final_path, &stem).await;
             }
@@ -3776,11 +3839,12 @@ pub struct MediaInfo {
     pub height: String,
     pub fps: String,    // rounded whole number, e.g. "60"
     pub vcodec: String, // e.g. "h264"
+    pub acodec: String, // e.g. "aac", "opus"
 }
 
 /// True if `template` uses any media-info variable (so we only probe when needed).
 fn template_wants_media(template: &str) -> bool {
-    ["{resolution}", "{height}", "{width}", "{fps}", "{vcodec}"]
+    ["{resolution}", "{height}", "{width}", "{fps}", "{vcodec}", "{acodec}"]
         .iter()
         .any(|k| template.contains(k))
 }
@@ -3795,6 +3859,12 @@ fn template_wants_games(template: &str) -> bool {
 /// all platforms, so it also triggers a post-capture rename to fill the real value).
 fn template_wants_title(template: &str) -> bool {
     template.contains("{title}")
+}
+
+/// True if `template` uses `{went_live_date}` or `{went_live_time}` (only known
+/// at the end of the recording, so it triggers a post-capture rename).
+fn template_wants_went_live(template: &str) -> bool {
+    template.contains("{went_live_date}") || template.contains("{went_live_time}")
 }
 
 /// The stream title for a finished recording: the first `title` change logged
@@ -3861,15 +3931,15 @@ fn fmt_fps(rate: &str) -> String {
     }
 }
 
-/// ffprobe the first video stream of a file path or stream URL into [`MediaInfo`].
+/// ffprobe all streams of a file path or stream URL into [`MediaInfo`].
+/// Extracts video codec, dimensions, fps and audio codec.
 /// `None` if ffprobe fails / there's no readable video stream.
 async fn probe_media(target: &str) -> Option<MediaInfo> {
     let mut cmd = Command::new("ffprobe");
     cmd.args([
         "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,r_frame_rate,codec_name",
-        "-of", "default=noprint_wrappers=1:nokey=0",
+        "-show_entries", "stream=codec_type,codec_name,width,height,r_frame_rate",
+        "-of", "json",
     ])
     .arg(target)
     .stdin(Stdio::null())
@@ -3886,17 +3956,30 @@ async fn probe_media(target: &str) -> Option<MediaInfo> {
         return None;
     }
     let text = String::from_utf8_lossy(&out.stdout);
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let streams = json["streams"].as_array()?;
     let mut info = MediaInfo::default();
-    for line in text.lines() {
-        if let Some((k, v)) = line.split_once('=') {
-            let v = v.trim();
-            match k.trim() {
-                "width" => info.width = v.to_string(),
-                "height" => info.height = v.to_string(),
-                "codec_name" => info.vcodec = v.to_string(),
-                "r_frame_rate" => info.fps = fmt_fps(v),
-                _ => {}
+    for stream in streams {
+        let codec_type = stream["codec_type"].as_str().unwrap_or("");
+        let codec_name = stream["codec_name"].as_str().unwrap_or("").to_string();
+        match codec_type {
+            "video" if info.vcodec.is_empty() => {
+                info.vcodec = codec_name;
+                if let (Some(w), Some(h)) = (
+                    stream["width"].as_u64(),
+                    stream["height"].as_u64(),
+                ) {
+                    info.width = w.to_string();
+                    info.height = h.to_string();
+                }
+                if let Some(rate) = stream["r_frame_rate"].as_str() {
+                    info.fps = fmt_fps(rate);
+                }
             }
+            "audio" if info.acodec.is_empty() => {
+                info.acodec = codec_name;
+            }
+            _ => {}
         }
     }
     // Require real pixel dimensions (ffprobe can report "N/A" for odd inputs).
@@ -4195,6 +4278,10 @@ fn monitor_stem(
     quality: &str,
     media: Option<&MediaInfo>,
     games: &str,
+    tool: &str,
+    mode: &str,
+    platform: &str,
+    went_live: i64,
 ) -> String {
     let take = (recording_count + 1).to_string();
     let mi = media.cloned().unwrap_or_default();
@@ -4224,7 +4311,12 @@ fn monitor_stem(
             width: &mi.width,
             fps: &mi.fps,
             vcodec: &mi.vcodec,
+            acodec: &mi.acodec,
+            tool,
+            mode,
+            platform,
             secs: started_at,
+            went_live,
             ..Default::default()
         },
     )
@@ -4254,6 +4346,8 @@ fn video_stem(
     video_id: &str,
     quality: &str,
     media: Option<&MediaInfo>,
+    tool: &str,
+    platform: &str,
 ) -> String {
     let resolved = title.trim();
     let mi = media.cloned().unwrap_or_default();
@@ -4270,6 +4364,10 @@ fn video_stem(
             width: &mi.width,
             fps: &mi.fps,
             vcodec: &mi.vcodec,
+            acodec: &mi.acodec,
+            tool,
+            mode: "vod",
+            platform,
             secs: started_at,
             ..Default::default()
         },
@@ -4484,14 +4582,24 @@ pub struct TemplateVars<'a> {
     pub width: &'a str,
     pub fps: &'a str,
     pub vcodec: &'a str,
+    /// Audio codec, e.g. "aac", "opus" (empty when not probed or unknown).
+    pub acodec: &'a str,
     /// Attempt number (per-monitor take count); empty for on-demand videos.
     pub take: &'a str,
     /// Distinct game/category names played during the recording, joined + length-
     /// capped. Only known after the stream ends, so it's filled at the post-rename
     /// (empty for the initial capture name and for on-demand videos).
     pub games: &'a str,
+    /// Capture tool: "streamlink", "yt-dlp", "ffmpeg" (empty renders empty).
+    pub tool: &'a str,
+    /// Download mode: "live", "sabr", "dash", "hybrid", "hybrid-dash", "direct", "vod", "chat".
+    pub mode: &'a str,
+    /// Stream platform: "twitch", "youtube", "kick", "generic" (empty renders empty).
+    pub platform: &'a str,
     /// Capture-start time (unix secs) for `{date}`/`{time}`/`{timestamp}`.
     pub secs: i64,
+    /// When the broadcast went live (unix secs); 0 means unknown → {went_live_date}/{went_live_time} render empty.
+    pub went_live: i64,
 }
 
 /// Expand a filename template using our own (tool-agnostic) variables so the
@@ -4502,6 +4610,12 @@ fn expand_template(template: &str, v: &TemplateVars) -> String {
     let (y, mo, d, h, mi, s) = civil_from_unix_utc(v.secs);
     let date = format!("{y:04}{mo:02}{d:02}");
     let time = format!("{h:02}{mi:02}{s:02}");
+    let (wl_date, wl_time) = if v.went_live > 0 {
+        let (wy, wmo, wd, wh, wmi, ws) = civil_from_unix_utc(v.went_live);
+        (format!("{wy:04}{wmo:02}{wd:02}"), format!("{wh:02}{wmi:02}{ws:02}"))
+    } else {
+        (String::new(), String::new())
+    };
     let tmpl = if template.trim().is_empty() {
         "{name}_{date}_{time}"
     } else {
@@ -4518,11 +4632,23 @@ fn expand_template(template: &str, v: &TemplateVars) -> String {
         .replace("{width}", v.width)
         .replace("{fps}", v.fps)
         .replace("{vcodec}", v.vcodec)
+        .replace("{acodec}", v.acodec)
+        .replace("{tool}", v.tool)
+        .replace("{mode}", v.mode)
+        .replace("{platform}", v.platform)
         .replace("{take}", v.take)
         .replace("{games}", v.games)
         .replace("{date}", &date)
         .replace("{time}", &time)
         .replace("{timestamp}", &v.secs.to_string())
+        .replace("{year}", &format!("{y:04}"))
+        .replace("{month}", &format!("{mo:02}"))
+        .replace("{day}", &format!("{d:02}"))
+        .replace("{hour}", &format!("{h:02}"))
+        .replace("{minute}", &format!("{mi:02}"))
+        .replace("{second}", &format!("{s:02}"))
+        .replace("{went_live_date}", &wl_date)
+        .replace("{went_live_time}", &wl_time)
         // backward-compat aliases for tokens listed in the old tooltip
         .replace("{id}", v.video_id)
         .replace("{ts}", &v.secs.to_string())
@@ -4905,6 +5031,7 @@ mod tests {
             None,
             "",
             None,
+            0,
             &YtDlpBins::default(),
         );
         assert_eq!(plan.program, "streamlink");
@@ -4929,6 +5056,7 @@ mod tests {
             None,
             "",
             None,
+            0,
             &YtDlpBins::default(),
         );
         assert_eq!(plan.program, "yt-dlp");
@@ -4949,6 +5077,7 @@ mod tests {
             None,
             "",
             None,
+            0,
             &YtDlpBins::default(),
         );
         assert!(
@@ -4968,6 +5097,7 @@ mod tests {
             None,
             "",
             None,
+            0,
             &YtDlpBins::default(),
         );
         let joined = browser.args.join(" ");
@@ -4981,6 +5111,7 @@ mod tests {
             None,
             "",
             None,
+            0,
             &YtDlpBins::default(),
         );
         assert!(file.args.join(" ").contains("--cookies C:/c.txt"));
@@ -4992,13 +5123,13 @@ mod tests {
         let mut r = row(Tool::Streamlink, Container::Mkv, Platform::Twitch);
         r.monitor.audio_tracks = "all".into();
         r.monitor.subtitle_tracks = "all".into(); // ignored by streamlink
-        let plan = build_plan(&r, 1_700_000_000, &AuthSource::None, &[], None, "", None, &YtDlpBins::default());
+        let plan = build_plan(&r, 1_700_000_000, &AuthSource::None, &[], None, "", None, 0, &YtDlpBins::default());
         assert!(plan.args.iter().any(|a| a == "--hls-audio-select=*"));
         assert!(!plan.args.iter().any(|a| a == "--sub-langs"));
 
         let mut r2 = row(Tool::Streamlink, Container::Mkv, Platform::Twitch);
         r2.monitor.audio_tracks = "en,de".into();
-        let plan2 = build_plan(&r2, 1_700_000_000, &AuthSource::None, &[], None, "", None, &YtDlpBins::default());
+        let plan2 = build_plan(&r2, 1_700_000_000, &AuthSource::None, &[], None, "", None, 0, &YtDlpBins::default());
         assert!(plan2.args.iter().any(|a| a == "--hls-audio-select=en,de"));
 
         // yt-dlp: "all" subs -> --sub-langs=all --write-subs; audio ignored. The
@@ -5006,7 +5137,7 @@ mod tests {
         let mut y = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
         y.monitor.subtitle_tracks = "all".into();
         y.monitor.audio_tracks = "all".into(); // ignored by yt-dlp
-        let yplan = build_plan(&y, 1_700_000_000, &AuthSource::None, &[], None, "", None, &YtDlpBins::default());
+        let yplan = build_plan(&y, 1_700_000_000, &AuthSource::None, &[], None, "", None, 0, &YtDlpBins::default());
         // live_chat is excluded from the main process via negation so "all"
         // doesn't pull in the chat stream and block the video download.
         assert!(yplan.args.iter().any(|a| a == "--sub-langs=all,-live_chat"));
@@ -5016,13 +5147,13 @@ mod tests {
         // "*" is normalized to "all,-live_chat" for subtitles too.
         let mut y2 = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
         y2.monitor.subtitle_tracks = "*".into();
-        let yplan2 = build_plan(&y2, 1_700_000_000, &AuthSource::None, &[], None, "", None, &YtDlpBins::default());
+        let yplan2 = build_plan(&y2, 1_700_000_000, &AuthSource::None, &[], None, "", None, 0, &YtDlpBins::default());
         assert!(yplan2.args.iter().any(|a| a == "--sub-langs=all,-live_chat"));
 
         // A language list passes through verbatim (joined form).
         let mut y3 = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
         y3.monitor.subtitle_tracks = "en,de".into();
-        let yplan3 = build_plan(&y3, 1_700_000_000, &AuthSource::None, &[], None, "", None, &YtDlpBins::default());
+        let yplan3 = build_plan(&y3, 1_700_000_000, &AuthSource::None, &[], None, "", None, 0, &YtDlpBins::default());
         assert!(yplan3.args.iter().any(|a| a == "--sub-langs=en,de"));
 
         // Empty (existing-monitor default) adds no track flags at all.
@@ -5034,6 +5165,7 @@ mod tests {
             None,
             "",
             None,
+            0,
             &YtDlpBins::default(),
         );
         assert!(
@@ -5052,7 +5184,7 @@ mod tests {
         let mut y = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
         y.monitor.chat_log = true;
         y.monitor.subtitle_tracks = String::new();
-        let plan = build_plan(&y, 1_700_000_000, &AuthSource::None, &[], None, "", None, &YtDlpBins::default());
+        let plan = build_plan(&y, 1_700_000_000, &AuthSource::None, &[], None, "", None, 0, &YtDlpBins::default());
         assert!(!plan.args.iter().any(|a| a.contains("live_chat")));
         assert!(!plan.args.iter().any(|a| a == "--write-subs"));
 
@@ -5060,7 +5192,7 @@ mod tests {
         let mut y2 = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
         y2.monitor.chat_log = true;
         y2.monitor.subtitle_tracks = "en".into();
-        let plan2 = build_plan(&y2, 1_700_000_000, &AuthSource::None, &[], None, "", None, &YtDlpBins::default());
+        let plan2 = build_plan(&y2, 1_700_000_000, &AuthSource::None, &[], None, "", None, 0, &YtDlpBins::default());
         assert!(!plan2.args.iter().any(|a| a.contains("live_chat")));
         assert!(plan2.args.iter().any(|a| a == "--sub-langs=en"));
 
@@ -5069,7 +5201,7 @@ mod tests {
         let mut t = row(Tool::YtDlp, Container::Mkv, Platform::Twitch);
         t.monitor.chat_log = true;
         t.monitor.subtitle_tracks = String::new();
-        let plant = build_plan(&t, 1_700_000_000, &AuthSource::None, &[], None, "", None, &YtDlpBins::default());
+        let plant = build_plan(&t, 1_700_000_000, &AuthSource::None, &[], None, "", None, 0, &YtDlpBins::default());
         assert!(!plant.args.iter().any(|a| a.contains("live_chat")));
     }
 
@@ -5103,6 +5235,7 @@ mod tests {
             None,
             "",
             None,
+            0,
             &YtDlpBins::default(),
         );
         assert!(plan.final_path.to_string_lossy().ends_with(".ts"));
@@ -5133,6 +5266,7 @@ mod tests {
             None,
             "",
             None,
+            0,
             &sabr_bins(),
         );
         assert_eq!(plan.program, "C:/git/yt-dlp-dev/dist/yt-dlp.exe");
@@ -5163,6 +5297,7 @@ mod tests {
             None,
             "",
             None,
+            0,
             &sabr_bins(),
         );
         // The PO-token provider args ride on their own --extractor-args entry,
@@ -5183,6 +5318,7 @@ mod tests {
             None,
             "",
             None,
+            0,
             &bins,
         );
         assert_eq!(plan2.args.iter().filter(|a| *a == "--extractor-args").count(), 1);
@@ -5200,6 +5336,7 @@ mod tests {
             None,
             "",
             None,
+            0,
             &bins,
         );
         assert!(plan.args.iter().any(|a| a == "custom+best"));
@@ -5222,6 +5359,7 @@ mod tests {
             None,
             "",
             None,
+            0,
             &bins,
         );
         assert_eq!(plan.program, "yt-dlp");
@@ -5231,7 +5369,7 @@ mod tests {
         let mut r = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
         r.monitor.capture_from_start = false;
         let plan2 = build_plan(
-            &r, 1_700_000_000, &AuthSource::None, &[], None, "", None, &sabr_bins(),
+            &r, 1_700_000_000, &AuthSource::None, &[], None, "", None, 0, &sabr_bins(),
         );
         assert_eq!(plan2.program, "yt-dlp");
         assert!(plan2.args.iter().any(|a| a == "--no-live-from-start"));
@@ -5252,6 +5390,7 @@ mod tests {
             None,
             "",
             None,
+            0,
             &bins,
         );
         assert_eq!(plan.program, "C:/tools/yt-dlp.exe");
@@ -5283,6 +5422,7 @@ mod tests {
             None,
             "",
             None,
+            0,
             &YtDlpBins::default(),
         );
         assert!(plan.capture_path.parent().unwrap().ends_with(".cache"));
@@ -5310,7 +5450,7 @@ mod tests {
         // byte-identical so yt-dlp continues from the surviving `.state`.
         let bins = sabr_bins();
         let r = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
-        let plan = build_plan(&r, 1_700_000_000, &AuthSource::None, &[], None, "", None, &bins);
+        let plan = build_plan(&r, 1_700_000_000, &AuthSource::None, &[], None, "", None, 0, &bins);
         let resume_args = sabr_capture_args(
             &plan.capture_path,
             &AuthSource::None,

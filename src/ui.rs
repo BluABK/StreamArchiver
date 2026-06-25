@@ -4158,7 +4158,7 @@ impl StreamArchiverApp {
                             }
                         }
                     });
-                    let tmpl_hint = "Variables: {name} {title} {channel} {date} {time} {timestamp}";
+                    let tmpl_hint = "Variables: {name} {title} {channel} {date} {time} {timestamp} {year} {month} {day} {hour} {minute} {second} {tool} {mode} {platform} {video_id} {quality} {resolution} {height} {width} {fps} {vcodec} {acodec} {take} {games} {went_live_date} {went_live_time}";
                     ui.label("Filename template").on_hover_text(tmpl_hint);
                     ui.text_edit_singleline(&mut vf.filename_template)
                         .on_hover_text(tmpl_hint);
@@ -7224,7 +7224,7 @@ impl StreamArchiverApp {
                                         .hint_text(ft_hint)
                                         .desired_width(200.0),
                                 ).on_hover_text(
-                                    "Tokens: {name} {date} {time} {timestamp} {title} {games} {video_id} {quality} {resolution} {fps} {vcodec} {take}",
+                                    "Tokens: {name} {date} {time} {timestamp} {year} {month} {day} {hour} {minute} {second} {title} {games} {video_id} {quality} {resolution} {height} {width} {fps} {vcodec} {acodec} {take} {tool} {mode} {platform} {went_live_date} {went_live_time}",
                                 );
                                 ui.label("");
                                 ui.label("");
@@ -7756,8 +7756,9 @@ impl StreamArchiverApp {
                         });
                         ui.end_row();
 
-                        ui.label("Filename template");
-                        ui.text_edit_singleline(&mut form.filename_template);
+                        let fn_tmpl_hint = "{name} {date} {time} {year} {month} {day} {hour} {minute} {second} {title} {games} {video_id} {quality} {resolution} {height} {width} {fps} {vcodec} {acodec} {take} {tool} {mode} {platform} {went_live_date} {went_live_time} {timestamp}";
+                        ui.label("Filename template").on_hover_text(fn_tmpl_hint);
+                        ui.text_edit_singleline(&mut form.filename_template).on_hover_text(fn_tmpl_hint);
                         ui.end_row();
 
                         ui.label("Extra args");

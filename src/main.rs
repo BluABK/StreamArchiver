@@ -390,6 +390,7 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
         None,
         "",
         None,
+        0,
         &downloader::YtDlpBins::default(),
     );
     println!("plan: {} {:?}", plan.program, plan.args);
