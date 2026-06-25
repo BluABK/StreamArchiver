@@ -41,6 +41,16 @@ fn write_global_badges_stamp(platform_dir: &Path) {
 
 // ---------- Core utility ----------
 
+/// Per-platform channel asset directory: `…/channel_assets/{name}/{platform}/`.
+/// The single source of truth for the layout — shared by the asset fetcher, the
+/// UI (avatars / status grid), and desktop notifications, so they never drift.
+pub fn channel_asset_dir(name: &str, platform: crate::models::Platform) -> PathBuf {
+    crate::app_paths::asset_cache_dir()
+        .join("channel_assets")
+        .join(crate::downloader::sanitize_filename(name))
+        .join(platform.as_str())
+}
+
 /// Derive a file extension from a URL path (before `?` query string).
 fn ext_from_url(url: &str) -> Option<&str> {
     let path = url.split('?').next()?;

@@ -1080,10 +1080,7 @@ impl Supervisor {
         // Twitch + YouTube + Kick, each with its own icon/banner/badges/emotes —
         // namespacing by platform keeps them from overwriting each other (and the
         // 24h freshness stamp becomes per-(channel, platform) for free).
-        let asset_dir = crate::app_paths::asset_cache_dir()
-            .join("channel_assets")
-            .join(sanitize_filename(&row.channel.name))
-            .join(platform.as_str());
+        let asset_dir = crate::assets::channel_asset_dir(&row.channel.name, platform);
         if !force && !crate::assets::should_refetch_assets(&asset_dir) {
             return;
         }

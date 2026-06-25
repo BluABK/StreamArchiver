@@ -9009,13 +9009,9 @@ impl StreamArchiverApp {
 // ── Properties window helpers ────────────────────────────────────────────────
 
 /// Per-platform channel asset directory: `…/channel_assets/{name}/{platform}/`.
-/// One container can hold the same creator on several platforms, each with its
-/// own icon/banner/badges/emotes — so assets are namespaced by platform.
+/// Thin alias for the shared definition in [`crate::assets::channel_asset_dir`].
 fn channel_asset_dir(name: &str, platform: Platform) -> std::path::PathBuf {
-    crate::app_paths::asset_cache_dir()
-        .join("channel_assets")
-        .join(crate::downloader::sanitize_filename(name))
-        .join(platform.as_str())
+    crate::assets::channel_asset_dir(name, platform)
 }
 
 /// Resolve a container's avatar — the chosen-platform profile pic. An explicit

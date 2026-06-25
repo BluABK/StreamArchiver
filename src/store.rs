@@ -749,6 +749,20 @@ impl Store {
             .find(|r| r.monitor.id == id))
     }
 
+    /// The monitor a recording belongs to (so a `RecordingFinished` event, which
+    /// only carries the recording id, can resolve the channel for a rich toast).
+    pub fn monitor_id_for_recording(&self, recording_id: i64) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let id = conn
+            .query_row(
+                "SELECT monitor_id FROM recording WHERE id = ?1",
+                params![recording_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?;
+        Ok(id)
+    }
+
     // ----- recordings -----
 
     #[allow(clippy::too_many_arguments)]
