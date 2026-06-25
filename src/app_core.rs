@@ -46,8 +46,6 @@ pub struct ProcInfo {
     pub tool: String,
     /// True for the DASH companion leg of a dual capture.
     pub secondary: bool,
-    /// Whether the OS process is still running right now.
-    pub alive: bool,
     pub started_at: i64,
     pub spawn_build: String,
     /// Started by a different build than the running one — i.e. it survived a
@@ -466,7 +464,6 @@ impl AppCore {
                 };
                 ProcInfo {
                     reattached: r.spawn_build != build,
-                    alive: crate::platform::pid_alive(r.pid),
                     kind: r.kind,
                     ref_id: r.ref_id,
                     monitor_id: r.monitor_id,
