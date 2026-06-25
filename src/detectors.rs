@@ -387,6 +387,7 @@ impl DetectContext {
             #[serde(rename = "type")]
             kind: String,
             started_at: Option<String>,
+            title: Option<String>,
         }
         #[derive(Deserialize)]
         struct StreamsResp {
@@ -411,9 +412,8 @@ impl DetectContext {
 
                 match resp {
                     Ok(r) if r.status().is_success() => {
-                        // login -> (go-live time, stream id) for currently-live channels.
-                        // login -> (go-live time, stream id, user_id, thumbnail_url)
-                        let live: HashMap<String, (Option<i64>, Option<String>, String, String)> =
+                        // login -> (went_live, stream_id, user_id, thumbnail_url, title)
+                        let live: HashMap<String, (Option<i64>, Option<String>, String, String, Option<String>)> =
                             match r.json::<StreamsResp>().await
                         {
                             Ok(sr) => sr
@@ -424,7 +424,7 @@ impl DetectContext {
                                     let when = s.started_at.as_deref().and_then(parse_rfc3339);
                                     (
                                         s.user_login.to_lowercase(),
-                                        (when, Some(s.id), s.user_id, s.thumbnail_url),
+                                        (when, Some(s.id), s.user_id, s.thumbnail_url, s.title),
                                     )
                                 })
                                 .collect(),
@@ -444,11 +444,12 @@ impl DetectContext {
                             let key = l.to_lowercase();
                             for mid in &login_to_mons[l] {
                                 outcomes.push(match live.get(&key) {
-                                    Some((went, id, uid, thumb)) => {
+                                    Some((went, id, uid, thumb, title)) => {
                                         DetectOutcome::live_at(*mid, "live", *went)
                                             .with_stream_id(id.clone())
                                             .with_broadcaster_id(Some(uid.clone()))
                                             .with_thumbnail_url(Some(thumb.clone()))
+                                            .with_stream_title(title.clone())
                                     }
                                     None => DetectOutcome::offline(*mid),
                                 });

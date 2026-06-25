@@ -4285,15 +4285,15 @@ fn monitor_stem(
 ) -> String {
     let take = (recording_count + 1).to_string();
     let mi = media.cloned().unwrap_or_default();
-    // Use "tba" as placeholder for title/games that will be filled in at the
-    // post-recording rename, so the in-progress filename isn't silently empty.
+    // Use token-labelled placeholders for title/games not yet known at recording
+    // start, filled in at the post-recording rename.
     let title_val = if stream_title.is_empty() && template_wants_title(&m.filename_template) {
-        "tba"
+        "title-tba"
     } else {
         stream_title
     };
     let games_val = if games.is_empty() && template_wants_games(&m.filename_template) {
-        "tba"
+        "games-tba"
     } else {
         games
     };
