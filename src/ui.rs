@@ -1530,9 +1530,19 @@ fn schedule_time_grid(
     open_day: &mut Option<chrono::NaiveDate>,
 ) {
     use chrono::Timelike;
-    // Scroll to show the current local hour when the view first appears.
-    let now_hour = chrono::Local::now().hour() as f32;
-    let initial_offset = (now_hour * SCHED_HOUR_PX - 120.0).max(0.0);
+    // Scroll to show the current local hour, but only the first time the view
+    // appears so subsequent frames don't fight the user's manual scroll position.
+    let init_id = egui::Id::new(id).with("scroll_init");
+    let already_init: bool = ui.ctx().data(|d| d.get_temp(init_id).unwrap_or(false));
+    let mut scroll = egui::ScrollArea::vertical()
+        .id_salt(id)
+        .auto_shrink([false, false]);
+    if !already_init {
+        let now_hour = chrono::Local::now().hour() as f32;
+        let initial_offset = (now_hour * SCHED_HOUR_PX - 120.0).max(0.0);
+        scroll = scroll.vertical_scroll_offset(initial_offset);
+        ui.ctx().data_mut(|d| d.insert_temp(init_id, true));
+    }
 
     let grid_w = SCHED_TIME_COL_W + days.len() as f32 * (col_w + SCHED_COL_GAP);
 
@@ -1540,11 +1550,7 @@ fn schedule_time_grid(
     let mut clicked_day: Option<chrono::NaiveDate> = None;
     let mut ctx_stream: Option<usize> = None; // stream idx for context menu
 
-    egui::ScrollArea::vertical()
-        .id_salt(id)
-        .auto_shrink([false, false])
-        .vertical_scroll_offset(initial_offset)
-        .show(ui, |ui| {
+    scroll.show(ui, |ui| {
             let (response, painter) = ui.allocate_painter(
                 egui::vec2(grid_w, SCHED_TOTAL_H),
                 egui::Sense::click(),
@@ -7695,17 +7701,17 @@ impl StreamArchiverApp {
                     if let Some(tex) = &icon_tex {
                         ui.add(
                             egui::Image::from_texture(tex)
-                                .max_size(egui::vec2(64.0, 64.0))
-                                .corner_radius(egui::CornerRadius::same(6)),
+                                .max_size(egui::vec2(96.0, 96.0))
+                                .corner_radius(egui::CornerRadius::same(8)),
                         );
                     } else {
                         let (rect, _) = ui.allocate_exact_size(
-                            egui::vec2(64.0, 64.0),
+                            egui::vec2(96.0, 96.0),
                             egui::Sense::hover(),
                         );
                         ui.painter().rect_filled(
                             rect,
-                            6.0,
+                            8.0,
                             ui.visuals().weak_text_color(),
                         );
                     }
@@ -7917,14 +7923,6 @@ impl StreamArchiverApp {
                             }
                         });
 
-                    if let Some(tex) = &icon_tex {
-                        ui.add_space(4.0);
-                        ui.add(
-                            egui::Image::from_texture(tex)
-                                .max_size(egui::vec2(96.0, 96.0))
-                                .corner_radius(egui::CornerRadius::same(8)),
-                        );
-                    }
                 }
             });
 
