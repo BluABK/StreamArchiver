@@ -375,6 +375,15 @@ pub struct StreamArchiverApp {
     events_rx: crate::events::EventRx,
     autostart: AutoStart,
     autostart_on: bool,
+    /// When false (the default), quitting detaches downloads so they keep running
+    /// across a restart/rebuild; when true, quitting stops them. Persisted as the
+    /// `stop_downloads_on_quit` setting (stored inverted).
+    keep_downloads_on_quit: bool,
+    /// The process-manager dialog: whether it's open, its last snapshot, and when
+    /// that snapshot was taken (throttles the per-row `pid_alive`/DB queries).
+    show_processes: bool,
+    processes: Vec<crate::app_core::ProcInfo>,
+    processes_refreshed: Option<std::time::Instant>,
     quitting: bool,
 
     view: View,
@@ -484,6 +493,14 @@ impl StreamArchiverApp {
         let events_rx = core.subscribe();
         let autostart = AutoStart::new();
         let autostart_on = autostart.is_enabled();
+        // Detach-on-quit is the default; only `=="1"` opts into stopping downloads.
+        let keep_downloads_on_quit = core
+            .store
+            .get_setting("stop_downloads_on_quit")
+            .ok()
+            .flatten()
+            .as_deref()
+            != Some("1");
 
         let default_out = core
             .store
@@ -623,6 +640,10 @@ impl StreamArchiverApp {
             events_rx,
             autostart,
             autostart_on,
+            keep_downloads_on_quit,
+            show_processes: false,
+            processes: Vec::new(),
+            processes_refreshed: None,
             quitting: false,
             view: View::Streams,
             rows: Vec::new(),
@@ -768,6 +789,10 @@ impl StreamArchiverApp {
 
     /// Handle tray commands and bus events; returns true if a repaint is needed.
     fn pump_messages(&mut self, ctx: &egui::Context) {
+        // One-shot startup notice (e.g. detached downloads recovered on launch).
+        if let Some(msg) = self.core.startup_notice.lock().unwrap().take() {
+            self.status = msg;
+        }
         while let Ok(cmd) = self.ui_rx.try_recv() {
             match cmd {
                 UiCommand::ShowWindow => {
@@ -775,6 +800,14 @@ impl StreamArchiverApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 UiCommand::Quit => {
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                UiCommand::QuitAndStop => {
+                    // Force the exit path to stop (not detach) the tool trees.
+                    self.core
+                        .force_stop_on_quit
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
                     self.quitting = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -3136,6 +3169,7 @@ impl eframe::App for StreamArchiverApp {
         self.schedule_day_window(ui.ctx());
         self.chat_popup_window(ui.ctx());
         self.properties_window(ui.ctx());
+        self.processes_window(ui.ctx());
     }
 }
 
@@ -5814,8 +5848,18 @@ impl StreamArchiverApp {
                                         ui.label(fmt_datetime_short(g.started_at()));
                                     });
                                     tr.col(|ui| {
-                                        if let Some(l) = g.lost_secs() {
-                                            ui.label(fmt_duration(l));
+                                        // Resolved lost time when known; else the
+                                        // provisional started - went_live (so the stream
+                                        // row matches the monitor row instead of going
+                                        // blank while a capture is still catching up).
+                                        let lost = match g.lost_secs() {
+                                            Some(l) => Some(fmt_duration(l.max(0))),
+                                            None => g
+                                                .went_live_at
+                                                .map(|w| fmt_duration((g.started_at() - w).max(0))),
+                                        };
+                                        if let Some(s) = lost {
+                                            ui.label(s);
                                         }
                                     });
                                     tr.col(|ui| {
@@ -6005,8 +6049,18 @@ impl StreamArchiverApp {
                                         ui.label(fmt_datetime_short(t.started_at));
                                     });
                                     tr.col(|ui| {
-                                        if let Some(l) = t.lost_secs {
-                                            ui.label(fmt_duration(l));
+                                        // Resolved lost time when known; else the
+                                        // provisional started - went_live (matches the
+                                        // monitor row, so a re-attached/in-progress take
+                                        // isn't blank while it's still catching up).
+                                        let lost = match t.lost_secs {
+                                            Some(l) => Some(fmt_duration(l.max(0))),
+                                            None => t
+                                                .went_live_at
+                                                .map(|w| fmt_duration((t.started_at - w).max(0))),
+                                        };
+                                        if let Some(s) = lost {
+                                            ui.label(s);
                                         }
                                     });
                                     tr.col(|ui| {
@@ -6314,6 +6368,21 @@ impl StreamArchiverApp {
         let before: Vec<bool> = toggles.iter().map(|t| t.2).collect();
 
         egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.add_space(8.0);
+
+            ui.horizontal(|ui| {
+                if ui
+                    .button("🖥 Process manager")
+                    .on_hover_text(
+                        "All spawned download tool processes (recordings, videos, chat) — \
+                         PIDs, status, and manual Stop / Kill.",
+                    )
+                    .clicked()
+                {
+                    self.show_processes = true;
+                    self.processes_refreshed = None; // force an immediate refresh
+                }
+            });
             ui.add_space(8.0);
 
             // ── Scheduled (periodic jobs) ────────────────────────────────
@@ -7134,11 +7203,217 @@ impl StreamArchiverApp {
                 }
             }
 
+            ui.add_space(12.0);
+            ui.heading("Shutdown");
+            let mut keep = self.keep_downloads_on_quit;
+            if ui
+                .checkbox(&mut keep, "Keep downloads running when the app closes")
+                .on_hover_text(
+                    "Default. Quitting detaches the recording tools so they keep running and \
+                     writing — the app re-attaches to them on the next launch, so you can \
+                     restart or rebuild without stopping a recording. Uncheck to stop all \
+                     downloads on quit instead. (The tray's \"Quit & stop recordings\" always \
+                     stops them, regardless of this.)",
+                )
+                .changed()
+            {
+                self.keep_downloads_on_quit = keep;
+                // Stored inverted: the setting names the opt-IN to stopping.
+                let _ = self
+                    .core
+                    .store
+                    .set_setting("stop_downloads_on_quit", if keep { "0" } else { "1" });
+                self.status = if keep {
+                    "Downloads will keep running when the app closes.".into()
+                } else {
+                    "Downloads will stop when the app closes.".into()
+                };
+            }
+
             ui.add_space(16.0);
             if ui.button("💾 Save settings").clicked() {
                 self.save_settings();
             }
         });
+    }
+
+    /// Task-manager-style dialog listing every spawned download tool process with
+    /// its PID, status, and uptime, plus per-process Stop (graceful) / Kill (force)
+    /// and reveal-log/folder actions. Doubles as a live list of spawned processes.
+    fn processes_window(&mut self, ctx: &egui::Context) {
+        use crate::models::DetachedKind;
+        use egui_extras::{Column, TableBuilder};
+        use std::time::{Duration, Instant};
+        if !self.show_processes {
+            return;
+        }
+        // Throttle the snapshot (each row does a pid_alive + a couple DB reads).
+        let stale = self
+            .processes_refreshed
+            .map(|t| t.elapsed() >= Duration::from_millis(1500))
+            .unwrap_or(true);
+        if stale {
+            self.processes = self.core.list_processes();
+            self.processes_refreshed = Some(Instant::now());
+        }
+        ctx.request_repaint_after(Duration::from_millis(1500));
+
+        let now = now_unix();
+        let mut open = true;
+        enum Act {
+            Refresh,
+            Stop(usize),
+            Kill(usize),
+            RevealLog(usize),
+            RevealDir(usize),
+        }
+        let mut act: Option<Act> = None;
+
+        egui::Window::new("🖥 Processes")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(760.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{} spawned process(es)", self.processes.len()));
+                    if ui.button("⟳ Refresh").clicked() {
+                        act = Some(Act::Refresh);
+                    }
+                    ui.weak("Stop = graceful (file finalized) · Kill = force-terminate the tree");
+                });
+                ui.separator();
+                if self.processes.is_empty() {
+                    ui.weak("No download tool processes are running.");
+                    return;
+                }
+                TableBuilder::new(ui)
+                    .striped(true)
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .column(Column::auto()) // PID
+                    .column(Column::auto()) // Type
+                    .column(Column::remainder().clip(true)) // Name
+                    .column(Column::auto()) // Tool
+                    .column(Column::auto()) // Status
+                    .column(Column::auto()) // Uptime
+                    .column(Column::auto()) // Actions
+                    .header(20.0, |mut h| {
+                        h.col(|ui| { ui.strong("PID"); });
+                        h.col(|ui| { ui.strong("Type"); });
+                        h.col(|ui| { ui.strong("Name"); });
+                        h.col(|ui| { ui.strong("Tool"); });
+                        h.col(|ui| { ui.strong("Status"); });
+                        h.col(|ui| { ui.strong("Uptime"); });
+                        h.col(|ui| { ui.strong("Actions"); });
+                    })
+                    .body(|mut body| {
+                        for (i, p) in self.processes.iter().enumerate() {
+                            body.row(22.0, |mut row| {
+                                row.col(|ui| { ui.monospace(p.pid.to_string()); });
+                                row.col(|ui| {
+                                    let t = match p.kind {
+                                        DetachedKind::Recording => {
+                                            if p.secondary { "rec · dash" } else { "recording" }
+                                        }
+                                        DetachedKind::Video => "video",
+                                        DetachedKind::Chat => "chat",
+                                    };
+                                    ui.label(t);
+                                });
+                                row.col(|ui| {
+                                    ui.label(&p.name).on_hover_text(&p.capture_path);
+                                });
+                                row.col(|ui| { ui.label(&p.tool); });
+                                row.col(|ui| {
+                                    if !p.alive {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(0xe0, 0x6c, 0x6c),
+                                            "✘ dead",
+                                        );
+                                    } else if p.reattached {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(0x6c, 0xb0, 0xe0),
+                                            "⛓ re-attached",
+                                        )
+                                        .on_hover_text(format!(
+                                            "running under a prior build: {}",
+                                            p.spawn_build
+                                        ));
+                                    } else {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(0x6c, 0xe0, 0x8c),
+                                            "● running",
+                                        );
+                                    }
+                                });
+                                row.col(|ui| {
+                                    ui.label(fmt_duration_secs((now - p.started_at).max(0)));
+                                });
+                                row.col(|ui| {
+                                    if ui
+                                        .small_button("Stop")
+                                        .on_hover_text(
+                                            "Graceful: stop the tool and let the app finalize \
+                                             (remux + mark the take stopped).",
+                                        )
+                                        .clicked()
+                                    {
+                                        act = Some(Act::Stop(i));
+                                    }
+                                    if ui
+                                        .small_button("Kill")
+                                        .on_hover_text(
+                                            "Force-terminate the whole process tree now — the \
+                                             capture may be left un-finalized.",
+                                        )
+                                        .clicked()
+                                    {
+                                        act = Some(Act::Kill(i));
+                                    }
+                                    if ui.small_button("Log").on_hover_text(&p.log_path).clicked() {
+                                        act = Some(Act::RevealLog(i));
+                                    }
+                                    if ui.small_button("Folder").clicked() {
+                                        act = Some(Act::RevealDir(i));
+                                    }
+                                });
+                            });
+                        }
+                    });
+            });
+
+        if !open {
+            self.show_processes = false;
+        }
+        match act {
+            Some(Act::Refresh) => self.processes_refreshed = None,
+            Some(Act::Stop(i)) => {
+                if let Some(p) = self.processes.get(i) {
+                    self.core.stop_process(p);
+                    self.status = format!("Stopping pid {} ({})…", p.pid, p.name);
+                    self.processes_refreshed = None;
+                }
+            }
+            Some(Act::Kill(i)) => {
+                if let Some(p) = self.processes.get(i) {
+                    self.core.force_kill(p.pid, &p.job_name);
+                    self.status = format!("Killed pid {} ({}).", p.pid, p.name);
+                    self.processes_refreshed = None;
+                }
+            }
+            Some(Act::RevealLog(i)) => {
+                if let Some(p) = self.processes.get(i) {
+                    crate::platform::open_path(std::path::Path::new(&p.log_path));
+                }
+            }
+            Some(Act::RevealDir(i)) => {
+                if let Some(p) = self.processes.get(i) {
+                    if let Some(dir) = std::path::Path::new(&p.capture_path).parent() {
+                        crate::platform::open_path(dir);
+                    }
+                }
+            }
+            None => {}
+        }
     }
 
     fn form_window(&mut self, ctx: &egui::Context) {

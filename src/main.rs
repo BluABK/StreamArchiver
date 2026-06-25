@@ -6,6 +6,7 @@ mod app_core;
 mod app_paths;
 mod assets;
 mod chat;
+mod compat;
 mod detectors;
 mod downloader;
 mod events;
@@ -18,6 +19,7 @@ mod platform;
 mod scheduler;
 mod store;
 mod ui;
+mod version;
 mod websub;
 
 use std::sync::Arc;
@@ -142,10 +144,11 @@ fn main() -> Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("eframe failed: {e}"))?;
 
-    // The UI loop has exited (Quit) — tear down any active recording trees so we
-    // don't orphan streamlink/yt-dlp/ffmpeg processes.
-    info!("shutting down; stopping active recordings");
-    core.stop_all_recordings();
+    // The UI loop has exited (Quit). By default we DETACH: leave the tool process
+    // trees running so the app can restart/rebuild without stopping downloads (the
+    // next launch re-attaches). Only stop them when the user asked to (the
+    // "Quit & stop recordings" tray item or the stop_downloads_on_quit setting).
+    core.shutdown_on_exit();
 
     Ok(())
 }
@@ -155,10 +158,13 @@ fn main() -> Result<()> {
 fn build_tray(ctx: egui::Context) -> Result<(TrayIcon, Receiver<UiCommand>)> {
     let menu = Menu::new();
     let open_item = MenuItem::new("Open StreamArchiver", true, None);
-    let quit_item = MenuItem::new("Quit", true, None);
+    // Default Quit detaches (downloads keep running); the second item force-stops.
+    let quit_item = MenuItem::new("Quit (keep recording)", true, None);
+    let quit_stop_item = MenuItem::new("Quit & stop recordings", true, None);
     menu.append(&open_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&quit_item)?;
+    menu.append(&quit_stop_item)?;
 
     let tray = tray_icon::TrayIconBuilder::new()
         .with_menu(Box::new(menu))
@@ -175,6 +181,7 @@ fn build_tray(ctx: egui::Context) -> Result<(TrayIcon, Receiver<UiCommand>)> {
     let (tx, rx) = std::sync::mpsc::channel::<UiCommand>();
     let open_id = open_item.id().clone();
     let quit_id = quit_item.id().clone();
+    let quit_stop_id = quit_stop_item.id().clone();
     let menu_rx = MenuEvent::receiver().clone();
 
     std::thread::Builder::new()
@@ -187,6 +194,8 @@ fn build_tray(ctx: egui::Context) -> Result<(TrayIcon, Receiver<UiCommand>)> {
                     Some(UiCommand::ShowWindow)
                 } else if event.id == quit_id {
                     Some(UiCommand::Quit)
+                } else if event.id == quit_stop_id {
+                    Some(UiCommand::QuitAndStop)
                 } else {
                     None
                 };

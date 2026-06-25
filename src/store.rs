@@ -12,12 +12,13 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::models::{
-    AdBreak, AuthKind, Channel, Container, DetectionMethod, Monitor, MonitorWithChannel, Platform,
-    ScheduleSegment, StreamMetaChange, Tool, UpcomingStream, Video, now_unix,
+    AdBreak, AuthKind, Channel, Container, DetachedKind, DetachedRow, DetectionMethod, Monitor,
+    MonitorWithChannel, Platform, ScheduleSegment, StreamMetaChange, Tool, UpcomingStream, Video,
+    now_unix,
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 23;
+const SCHEMA_VERSION: i64 = 24;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -371,7 +372,55 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 23)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 23);
+        if version < 24 {
+            // Detached downloads: a persistent registry of running tool processes
+            // (recordings / on-demand videos / chat sidecars) so a relaunch can
+            // re-attach to ones that outlived the app instead of orphaning them.
+            // Written right after a tool spawns (so a hard crash is recoverable too)
+            // and deleted at finalize/stop. `proc_start` + `job_name` make the PID
+            // re-use-safe; `spawn_build` records which app build started it so a
+            // newer build can apply per-build compat fixups on re-attach.
+            //
+            // Also make ad_break re-scan idempotent: dedupe any existing
+            // (recording_id, at_secs) pairs, then enforce uniqueness so a
+            // re-attach can't double-insert a break it already persisted.
+            conn.execute_batch(
+                r#"
+                CREATE TABLE detached_process (
+                    id            INTEGER PRIMARY KEY,
+                    kind          TEXT NOT NULL,
+                    ref_id        INTEGER NOT NULL,
+                    monitor_id    INTEGER,
+                    pid           INTEGER NOT NULL,
+                    proc_start    INTEGER NOT NULL,
+                    job_name      TEXT NOT NULL DEFAULT '',
+                    log_path      TEXT NOT NULL DEFAULT '',
+                    capture_path  TEXT NOT NULL DEFAULT '',
+                    final_path    TEXT NOT NULL DEFAULT '',
+                    remux_to_mkv  INTEGER NOT NULL DEFAULT 0,
+                    take_group    TEXT,
+                    spawn_build   TEXT NOT NULL DEFAULT '',
+                    started_at    INTEGER NOT NULL,
+                    -- 1 for the DASH companion leg of a dual capture (occupies the
+                    -- secondary active map); 0 for the primary / videos / chat.
+                    secondary     INTEGER NOT NULL DEFAULT 0,
+                    -- Carried so a re-attach can finalize exactly like the in-session
+                    -- path: stream_id for the {video_id} filename var, went_live_at
+                    -- for the ad-cut anchor and lost-time accounting.
+                    stream_id     TEXT,
+                    went_live_at  INTEGER
+                );
+                CREATE INDEX idx_detached_kind_ref ON detached_process(kind, ref_id);
+
+                DELETE FROM ad_break WHERE id NOT IN (
+                    SELECT MIN(id) FROM ad_break GROUP BY recording_id, at_secs
+                );
+                CREATE UNIQUE INDEX idx_ad_break_unique ON ad_break(recording_id, at_secs);
+                "#,
+            )?;
+            conn.pragma_update(None, "user_version", 24)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 24);
         Ok(())
     }
 
@@ -737,8 +786,10 @@ impl Store {
         duration_secs: i64,
     ) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
+        // OR IGNORE + the UNIQUE(recording_id, at_secs) index makes this a no-op
+        // when re-attach re-observes a break already persisted before a restart.
         conn.execute(
-            "INSERT INTO ad_break(recording_id, at_secs, duration_secs) VALUES(?1, ?2, ?3)",
+            "INSERT OR IGNORE INTO ad_break(recording_id, at_secs, duration_secs) VALUES(?1, ?2, ?3)",
             params![recording_id, at_secs, duration_secs],
         )?;
         Ok(conn.last_insert_rowid())
@@ -759,6 +810,92 @@ impl Store {
                     recording_id: r.get(1)?,
                     at_secs: r.get(2)?,
                     duration_secs: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    // ----- detached download registry (re-attach across app restarts) -----
+
+    /// Register a freshly-spawned tool process so a later launch can re-attach to
+    /// it if it outlives the app. Replaces any prior row for the same
+    /// (kind, ref_id) so a restarted take doesn't leave a stale entry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_detached(&self, row: &DetachedRow) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM detached_process WHERE kind=?1 AND ref_id=?2",
+            params![row.kind.as_str(), row.ref_id],
+        )?;
+        conn.execute(
+            "INSERT INTO detached_process(
+                 kind, ref_id, monitor_id, pid, proc_start, job_name, log_path,
+                 capture_path, final_path, remux_to_mkv, take_group, spawn_build, started_at,
+                 secondary, stream_id, went_live_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+            params![
+                row.kind.as_str(),
+                row.ref_id,
+                row.monitor_id,
+                row.pid as i64,
+                row.proc_start as i64,
+                row.job_name,
+                row.log_path,
+                row.capture_path,
+                row.final_path,
+                row.remux_to_mkv as i64,
+                row.take_group,
+                row.spawn_build,
+                row.started_at,
+                row.secondary as i64,
+                row.stream_id,
+                row.went_live_at,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Drop a registry row once its download has been finalized or stopped.
+    pub fn clear_detached(&self, kind: DetachedKind, ref_id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM detached_process WHERE kind=?1 AND ref_id=?2",
+            params![kind.as_str(), ref_id],
+        )?;
+        Ok(())
+    }
+
+    /// All registry rows — the startup reconcile reads this to decide what to
+    /// re-attach, finalize, or orphan.
+    pub fn list_detached(&self) -> Result<Vec<DetachedRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT kind, ref_id, monitor_id, pid, proc_start, job_name, log_path,
+                    capture_path, final_path, remux_to_mkv, take_group, spawn_build, started_at,
+                    secondary, stream_id, went_live_at
+             FROM detached_process ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                let kind: String = r.get(0)?;
+                Ok(DetachedRow {
+                    kind: DetachedKind::from_str(&kind).unwrap_or(DetachedKind::Recording),
+                    ref_id: r.get(1)?,
+                    monitor_id: r.get(2)?,
+                    pid: r.get::<_, i64>(3)? as u32,
+                    proc_start: r.get::<_, i64>(4)? as u64,
+                    job_name: r.get(5)?,
+                    log_path: r.get(6)?,
+                    capture_path: r.get(7)?,
+                    final_path: r.get(8)?,
+                    remux_to_mkv: r.get::<_, i64>(9)? != 0,
+                    take_group: r.get(10)?,
+                    spawn_build: r.get(11)?,
+                    started_at: r.get(12)?,
+                    secondary: r.get::<_, i64>(13)? != 0,
+                    stream_id: r.get(14)?,
+                    went_live_at: r.get(15)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1149,14 +1286,18 @@ impl Store {
     }
 
     /// In-flight recordings (status `recording`) — crash/quit leftovers seen at
-    /// startup. Only the core fields needed for resume/orphan handling are
-    /// populated; the per-take aggregates default.
+    /// startup. Excludes rows with a `detached_process` registry entry: those are
+    /// owned by the detach reconcile (`reconcile_detached`), not the legacy
+    /// resume/orphan path. Only the core fields needed for handling are populated.
     pub fn inflight_recordings(&self) -> Result<Vec<crate::models::Recording>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, monitor_id, started_at, ended_at, COALESCE(output_path, ''),
                     went_live_at, went_live_approx, stream_id, take_group
-             FROM recording WHERE status = 'recording' ORDER BY id",
+             FROM recording
+             WHERE status = 'recording'
+               AND id NOT IN (SELECT ref_id FROM detached_process WHERE kind = 'recording')
+             ORDER BY id",
         )?;
         let rows = stmt
             .query_map([], |r| {
@@ -1339,10 +1480,14 @@ impl Store {
     }
 
     /// Mark videos still flagged `downloading` (crash leftovers) as `orphaned`.
+    /// Excludes videos with a `detached_process` registry entry — those outlived
+    /// the app and are reconciled (re-attached or finalized) by the detach path.
     pub fn mark_orphaned_videos(&self, ended_at: i64) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
-            "UPDATE video SET status='orphaned', ended_at=?1 WHERE status IN ('downloading','queued')",
+            "UPDATE video SET status='orphaned', ended_at=?1
+             WHERE status IN ('downloading','queued')
+               AND id NOT IN (SELECT ref_id FROM detached_process WHERE kind = 'video')",
             params![ended_at],
         )?;
         Ok(n)
@@ -1692,6 +1837,96 @@ mod tests {
         store.finish_recording(rid, 2_000, 1, Some(0), "completed", "C:/rec/out.mkv", "").unwrap();
         store.delete_recording(rid).unwrap();
         assert!(store.ad_breaks_for_recording(rid).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ad_break_insert_is_idempotent() {
+        // A re-attach after a restart may re-observe a break already persisted; the
+        // UNIQUE(recording_id, at_secs) index + INSERT OR IGNORE makes that a no-op.
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+        let rid = store
+            .insert_recording(mid, 1_000, "C:/rec/out.mkv", Some(1_000), false, Some("s1"), None)
+            .unwrap();
+
+        store.insert_ad_break(rid, 120, 15).unwrap();
+        store.insert_ad_break(rid, 120, 15).unwrap(); // duplicate — ignored
+        store.insert_ad_break(rid, 600, 30).unwrap(); // distinct offset — kept
+
+        let breaks = store.ad_breaks_for_recording(rid).unwrap();
+        assert_eq!(breaks.len(), 2);
+    }
+
+    #[test]
+    fn detached_registry_roundtrip() {
+        let store = Store::open_in_memory().unwrap();
+        let rec = DetachedRow {
+            kind: DetachedKind::Recording,
+            ref_id: 7,
+            monitor_id: Some(3),
+            pid: 4321,
+            proc_start: 999,
+            job_name: "Local\\SA_rec_7".into(),
+            log_path: "C:/c/.cache/x.log".into(),
+            capture_path: "C:/c/.cache/x.ts".into(),
+            final_path: "C:/c/x.mkv".into(),
+            remux_to_mkv: true,
+            take_group: Some("3:1000".into()),
+            spawn_build: "0.1.1/abc-dirty".into(),
+            started_at: 1_000,
+            secondary: false,
+            stream_id: Some("s1".into()),
+            went_live_at: Some(990),
+        };
+        store.register_detached(&rec).unwrap();
+        // Re-registering the same (kind, ref_id) replaces rather than duplicates.
+        let mut rec2 = rec.clone();
+        rec2.pid = 8888;
+        store.register_detached(&rec2).unwrap();
+
+        let video = DetachedRow {
+            kind: DetachedKind::Video,
+            ref_id: 42,
+            monitor_id: None,
+            pid: 11,
+            proc_start: 0,
+            job_name: "Local\\SA_video_42".into(),
+            log_path: "l".into(),
+            capture_path: "c".into(),
+            final_path: "f".into(),
+            remux_to_mkv: false,
+            take_group: None,
+            spawn_build: "0.1.1/abc-dirty".into(),
+            started_at: 5,
+            secondary: false,
+            stream_id: None,
+            went_live_at: None,
+        };
+        store.register_detached(&video).unwrap();
+
+        let rows = store.list_detached().unwrap();
+        assert_eq!(rows.len(), 2);
+        let got = rows
+            .iter()
+            .find(|r| r.kind == DetachedKind::Recording)
+            .unwrap();
+        assert_eq!(got.ref_id, 7);
+        assert_eq!(got.pid, 8888); // the replacement won
+        assert_eq!(got.monitor_id, Some(3));
+        assert!(got.remux_to_mkv);
+        assert_eq!(got.proc_start, 999);
+        assert_eq!(got.take_group.as_deref(), Some("3:1000"));
+        assert!(!got.secondary);
+        assert_eq!(got.stream_id.as_deref(), Some("s1"));
+        assert_eq!(got.went_live_at, Some(990));
+
+        store.clear_detached(DetachedKind::Recording, 7).unwrap();
+        let rows = store.list_detached().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, DetachedKind::Video);
     }
 
     #[test]

@@ -30,6 +30,33 @@ pub async fn sleep_cancellable(dur: Duration, shutdown: &Arc<AtomicBool>) {
     }
 }
 
+/// A snapshot row for the process-manager dialog: one spawned download tool,
+/// taken from the persistent detached-process registry (which holds a row for
+/// every live recording / on-demand video / chat sidecar) and enriched with its
+/// channel/video name and tool.
+pub struct ProcInfo {
+    pub kind: crate::models::DetachedKind,
+    pub ref_id: i64,
+    pub monitor_id: Option<i64>,
+    pub pid: u32,
+    pub job_name: String,
+    /// Channel name (recording/chat) or video title.
+    pub name: String,
+    /// Tool label (streamlink / yt-dlp / ffmpeg).
+    pub tool: String,
+    /// True for the DASH companion leg of a dual capture.
+    pub secondary: bool,
+    /// Whether the OS process is still running right now.
+    pub alive: bool,
+    pub started_at: i64,
+    pub spawn_build: String,
+    /// Started by a different build than the running one — i.e. it survived a
+    /// restart/rebuild and was re-attached this session.
+    pub reattached: bool,
+    pub capture_path: String,
+    pub log_path: String,
+}
+
 pub struct AppCore {
     pub store: Arc<Store>,
     pub events: EventTx,
@@ -53,6 +80,10 @@ pub struct AppCore {
     pub ad_active: crate::downloader::AdActive,
     /// Set during shutdown so the scheduler/supervisor stop starting new work.
     pub shutdown: Arc<AtomicBool>,
+    /// Set by a "Quit & stop recordings" action so the exit path kills the tool
+    /// trees instead of detaching them (overrides the `stop_downloads_on_quit`
+    /// setting for this one quit).
+    pub force_stop_on_quit: AtomicBool,
     /// Sends on-demand Start/Stop commands to the supervisor (set in `start`).
     manual_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::events::ManualCommand>>>,
     /// Notified to make the schedule refresher do an immediate forced pass (the
@@ -64,6 +95,9 @@ pub struct AppCore {
     /// Periodic background jobs + their next-run estimates (the Background view's
     /// "Scheduled" section); updated by each periodic loop before it sleeps.
     pub jobs: crate::events::JobRegistry,
+    /// A one-shot message the UI shows once on first frame (e.g. how many detached
+    /// downloads were recovered from a previous session). Taken by the UI.
+    pub startup_notice: Mutex<Option<String>>,
 }
 
 impl AppCore {
@@ -87,10 +121,12 @@ impl AppCore {
             video_speed: Arc::new(Mutex::new(HashMap::new())),
             ad_active: Arc::new(Mutex::new(HashMap::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
+            force_stop_on_quit: AtomicBool::new(false),
             manual_tx: Mutex::new(None),
             schedule_refresh: Arc::new(tokio::sync::Notify::new()),
             yt_video_id_refetch: Arc::new(AtomicBool::new(false)),
             jobs: crate::events::job_registry(),
+            startup_notice: Mutex::new(None),
         }))
     }
 
@@ -194,18 +230,52 @@ impl AppCore {
             self.ad_active.clone(),
             max_concurrent,
         );
-        // Crash recovery: resume SABR-resumable in-flight recordings (orphan the
-        // rest), then sweep stale `.cache\` working files. resume_inflight reserves
-        // each resumed monitor synchronously so a poll can't double-start it.
-        let to_resume = supervisor.resume_inflight();
-        let skip_stems: std::collections::HashSet<String> = to_resume
+        // Crash/restart recovery, in two synchronous passes so reservations land
+        // before detection can fire:
+        //   1) reconcile the detached-process registry — re-attach to downloads that
+        //      outlived the app, finalize ones that finished while it was down, and
+        //      hand SABR-resumable ones to the resume path;
+        //   2) resume_inflight for any legacy in-flight recording WITHOUT a registry
+        //      row (registry-backed ones are excluded so they aren't double-handled).
+        // Then sweep stale `.cache\` working files, protecting every still-needed stem.
+        let (reattach_items, mut skip_stems) = supervisor.reconcile_detached();
+        // Surface what we recovered: name the PIDs we're re-attaching to (still
+        // running from a previous session); fall back to a count for ones that only
+        // need finalizing/resuming.
+        let adopt_pids: Vec<u32> = reattach_items
             .iter()
-            .filter_map(|(rec, _)| {
-                std::path::Path::new(&rec.output_path)
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-            })
+            .filter(|i| i.is_adopt())
+            .map(|i| i.pid())
             .collect();
+        if !adopt_pids.is_empty() {
+            let shown = adopt_pids
+                .iter()
+                .take(4)
+                .map(|p| format!("pid {p}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let more = adopt_pids.len().saturating_sub(4);
+            let suffix = if more > 0 { format!(", +{more} more") } else { String::new() };
+            *self.startup_notice.lock().unwrap() = Some(format!(
+                "Re-attaching to {} running download(s): {shown}{suffix}",
+                adopt_pids.len()
+            ));
+        } else if !reattach_items.is_empty() {
+            *self.startup_notice.lock().unwrap() = Some(format!(
+                "Recovering {} download(s) from a previous session.",
+                reattach_items.len()
+            ));
+        }
+        for item in reattach_items {
+            let s = supervisor.clone();
+            self.rt.spawn(async move { s.reattach_one(item).await });
+        }
+        let to_resume = supervisor.resume_inflight();
+        skip_stems.extend(to_resume.iter().filter_map(|(rec, _)| {
+            std::path::Path::new(&rec.output_path)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+        }));
         for (rec, row) in to_resume {
             let s = supervisor.clone();
             self.rt.spawn(async move { s.resume_recording(rec, row).await });
@@ -300,6 +370,15 @@ impl AppCore {
                 std::thread::sleep(Duration::from_millis(200));
             }
         }
+        // Belt-and-suspenders: terminate any detached job tree by name (catches a
+        // grandchild that escaped the PID-tree walk) and drop its registry row so the
+        // next launch doesn't try to re-attach to a download we just stopped.
+        for row in self.store.list_detached().unwrap_or_default() {
+            if let Some(job) = crate::platform::DetachedJob::open(&row.job_name) {
+                job.kill();
+            }
+            let _ = self.store.clear_detached(row.kind, row.ref_id);
+        }
         // Shut down the runtime explicitly with a timeout so a stuck background task
         // (e.g. an eventsub WebSocket mid-keepalive, a spawn_blocking notification)
         // never causes the process to hang indefinitely after the UI exits.
@@ -307,6 +386,127 @@ impl AppCore {
             info!("shutting down async runtime (timeout 30s)");
             rt.shutdown_timeout(Duration::from_secs(30));
             info!("runtime shut down");
+        }
+    }
+
+    /// Quit **without** stopping downloads: signal the background loops to stop and
+    /// shut the runtime down, but leave the tool process trees running. Because the
+    /// tools are spawned detached (no `kill_on_drop`, into a job without
+    /// kill-on-close) and each one persisted a `detached_process` registry row at
+    /// spawn, dropping the supervisor tasks leaves them recording; the next launch
+    /// re-attaches via [`crate::downloader::Supervisor::reattach_inflight`].
+    pub fn detach_all(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        let n = self.active.lock().unwrap().len()
+            + self.active_videos.lock().unwrap().len()
+            + self.active_chats.lock().unwrap().len();
+        if n > 0 {
+            info!("detaching {n} running download(s) — they keep running after exit");
+        }
+        if let Some(rt) = self.rt_owned.lock().unwrap().take() {
+            info!("shutting down async runtime (timeout 30s); downloads left running");
+            rt.shutdown_timeout(Duration::from_secs(30));
+            info!("runtime shut down");
+        }
+    }
+
+    /// The app is exiting: stop the tool trees only when the user asked to (a
+    /// "Quit & stop recordings" action, or the `stop_downloads_on_quit` setting);
+    /// otherwise detach so downloads survive the restart/rebuild.
+    pub fn shutdown_on_exit(&self) {
+        let stop = self.force_stop_on_quit.load(Ordering::SeqCst)
+            || self
+                .store
+                .get_setting("stop_downloads_on_quit")
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some("1");
+        if stop {
+            info!("shutting down; stopping active recordings");
+            self.stop_all_recordings();
+        } else {
+            info!("shutting down; detaching active recordings (they keep running)");
+            self.detach_all();
+        }
+    }
+
+    /// Snapshot every spawned download tool process for the process-manager dialog.
+    /// Sourced from the detached-process registry (a row exists for each live
+    /// download), enriched with the channel/video name + tool, and a live
+    /// `pid_alive` check. Does a few synchronous DB reads — call on a refresh tick,
+    /// not every frame.
+    pub fn list_processes(&self) -> Vec<ProcInfo> {
+        use crate::models::DetachedKind;
+        let build = crate::version::build_id();
+        self.store
+            .list_detached()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| {
+                let (name, tool) = match r.kind {
+                    DetachedKind::Recording | DetachedKind::Chat => self
+                        .store
+                        .get_monitor_with_channel(r.monitor_id.unwrap_or(0))
+                        .ok()
+                        .flatten()
+                        .map(|m| (m.channel.name, m.monitor.tool.label().to_string()))
+                        .unwrap_or_default(),
+                    DetachedKind::Video => self
+                        .store
+                        .get_video(r.ref_id)
+                        .ok()
+                        .flatten()
+                        .map(|v| {
+                            let name = if v.title.trim().is_empty() { v.url } else { v.title };
+                            (name, v.tool.label().to_string())
+                        })
+                        .unwrap_or_default(),
+                };
+                ProcInfo {
+                    reattached: r.spawn_build != build,
+                    alive: crate::platform::pid_alive(r.pid),
+                    kind: r.kind,
+                    ref_id: r.ref_id,
+                    monitor_id: r.monitor_id,
+                    pid: r.pid,
+                    job_name: r.job_name,
+                    name,
+                    tool,
+                    secondary: r.secondary,
+                    started_at: r.started_at,
+                    spawn_build: r.spawn_build,
+                    capture_path: r.capture_path,
+                    log_path: r.log_path,
+                }
+            })
+            .collect()
+    }
+
+    /// Force-terminate a spawned process tree (its named job + a Toolhelp tree
+    /// walk by PID). A hard kill — the recording is finalized by the supervisor
+    /// task's normal exit handling (or the next-launch reconcile), not here.
+    pub fn force_kill(&self, pid: u32, job_name: &str) {
+        if let Some(job) = crate::platform::DetachedJob::open(job_name) {
+            job.kill();
+        }
+        crate::platform::kill_process_tree(pid);
+    }
+
+    /// Gracefully stop a spawned download through the supervisor's coordinated
+    /// path so the take is finalized (remuxed, marked `stopped`). The DASH
+    /// companion has no dedicated command, so it falls back to a tree kill (its
+    /// own task still finalizes on the resulting process exit).
+    pub fn stop_process(&self, p: &ProcInfo) {
+        use crate::events::ManualCommand;
+        use crate::models::DetachedKind;
+        match (p.kind, p.secondary) {
+            (DetachedKind::Recording, false) => {
+                self.manual(ManualCommand::Stop(p.monitor_id.unwrap_or(0)))
+            }
+            (DetachedKind::Video, _) => self.manual(ManualCommand::StopVideo(p.ref_id)),
+            (DetachedKind::Chat, _) => self.manual(ManualCommand::StopChat(p.monitor_id.unwrap_or(0))),
+            (DetachedKind::Recording, true) => self.force_kill(p.pid, &p.job_name),
         }
     }
 }

@@ -47,46 +47,65 @@ pub fn tray_icon_image() -> Result<tray_icon::Icon> {
     Ok(tray_icon::Icon::from_rgba(rgba, w, h)?)
 }
 
-/// A Win32 Job Object that kills the entire child process tree when dropped or
-/// explicitly terminated — required because killing a tool (e.g. yt-dlp) would
-/// otherwise orphan the ffmpeg child it spawned.
+// ===== Detached downloads: jobs that OUTLIVE the app, re-attachable on relaunch =====
+
 #[cfg(windows)]
-pub struct ProcessJob {
+fn to_wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// A **named** Win32 Job Object **without** `KILL_ON_JOB_CLOSE`.
+/// Closing our handle (app exit) does **not** terminate members,
+/// so an assigned download tool keeps running after we quit; the kernel keeps the
+/// named job alive while any member runs, so a later launch can [`open`](Self::open)
+/// it by name to terminate the whole tree. Identity/liveness of the individual
+/// process is tracked separately via [`process_start_time`] + [`pid_alive`].
+///
+/// Note: we deliberately do **not** spawn members with `CREATE_BREAKAWAY_FROM_JOB`.
+/// A normally-launched GUI app isn't inside a kill-on-close job, and on Win8+ our
+/// no-kill-on-close job nests fine inside any ambient job; the breakaway flag would
+/// risk a spawn failure if an ambient job disallowed breakaway, for no real gain.
+#[cfg(windows)]
+pub struct DetachedJob {
     handle: windows::Win32::Foundation::HANDLE,
 }
 
-// A job-object HANDLE is process-global and safe to use from any thread; the
-// supervisor holds one across `.await` points inside a spawned task.
 #[cfg(windows)]
-unsafe impl Send for ProcessJob {}
+unsafe impl Send for DetachedJob {}
 #[cfg(windows)]
-unsafe impl Sync for ProcessJob {}
+unsafe impl Sync for DetachedJob {}
 
 #[cfg(windows)]
-impl ProcessJob {
-    pub fn new() -> Result<ProcessJob> {
-        use std::ffi::c_void;
-        use std::mem::size_of;
-        use windows::Win32::System::JobObjects::{
-            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-            SetInformationJobObject,
-        };
+impl DetachedJob {
+    /// Create a named job with no limit flags (so app exit leaves members running).
+    pub fn create(name: &str) -> Result<DetachedJob> {
+        use windows::Win32::System::JobObjects::CreateJobObjectW;
+        let wide = to_wide(name);
         unsafe {
-            let handle = CreateJobObjectW(None, windows::core::PCWSTR::null())?;
-            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            SetInformationJobObject(
-                handle,
-                JobObjectExtendedLimitInformation,
-                &info as *const _ as *const c_void,
-                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )?;
-            Ok(ProcessJob { handle })
+            let handle = CreateJobObjectW(None, windows::core::PCWSTR(wide.as_ptr()))?;
+            Ok(DetachedJob { handle })
         }
     }
 
-    /// Assign a spawned child (and thus its future descendants) to this job.
+    /// Re-open an existing named job after a restart (for [`kill`](Self::kill)).
+    /// `None` if it no longer exists (no member is running).
+    pub fn open(name: &str) -> Option<DetachedJob> {
+        use windows::Win32::System::JobObjects::OpenJobObjectW;
+        // JOB_OBJECT_ALL_ACCESS — enough to terminate.
+        const JOB_OBJECT_ALL_ACCESS: u32 = 0x001F_001F;
+        let wide = to_wide(name);
+        unsafe {
+            OpenJobObjectW(
+                JOB_OBJECT_ALL_ACCESS,
+                false,
+                windows::core::PCWSTR(wide.as_ptr()),
+            )
+            .ok()
+            .map(|handle| DetachedJob { handle })
+        }
+    }
+
+    /// Assign a spawned child (and its future descendants) to this job.
     pub fn assign_child(&self, child: &tokio::process::Child) -> Result<()> {
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::System::JobObjects::AssignProcessToJobObject;
@@ -106,9 +125,10 @@ impl ProcessJob {
 }
 
 #[cfg(windows)]
-impl Drop for ProcessJob {
+impl Drop for DetachedJob {
     fn drop(&mut self) {
-        // KILL_ON_JOB_CLOSE terminates the whole tree when the last handle closes.
+        // No kill-on-close: closing our handle must NOT terminate the tree — that
+        // is the whole point of detaching. The job persists while a member runs.
         use windows::Win32::Foundation::CloseHandle;
         unsafe {
             let _ = CloseHandle(self.handle);
@@ -116,20 +136,142 @@ impl Drop for ProcessJob {
     }
 }
 
-/// Non-Windows stub: relies on `kill_on_drop` for the direct child. (Process
-/// groups for full-tree kill on Unix are a later enhancement.)
-#[cfg(not(windows))]
-pub struct ProcessJob;
+/// The OS creation time of `pid` (FILETIME 100ns ticks), or `None` if it can't be
+/// opened. Stored alongside the PID so a re-attach can reject a recycled PID
+/// (a different process now wearing the same number).
+#[cfg(windows)]
+pub fn process_start_time(pid: u32) -> Option<u64> {
+    use windows::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid == 0 {
+        return None;
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        let res = GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user);
+        let _ = CloseHandle(handle);
+        res.ok()?;
+        Some(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64)
+    }
+}
+
+/// Whether `pid` names a process that's still running.
+#[cfg(windows)]
+pub fn pid_alive(pid: u32) -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    const STILL_ACTIVE: u32 = 259;
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return false;
+        };
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(handle, &mut code).is_ok();
+        let _ = CloseHandle(handle);
+        ok && code == STILL_ACTIVE
+    }
+}
+
+/// Block until `pid` exits (polling every 200ms so `shutdown` can interrupt) and
+/// return its exit code; `None` if `shutdown` fired first or the handle is
+/// unusable. Run on a blocking thread (`spawn_blocking`) — it parks on a handle.
+#[cfg(windows)]
+pub fn wait_pid(pid: u32, shutdown: &std::sync::atomic::AtomicBool) -> Option<i64> {
+    use std::sync::atomic::Ordering;
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_ACCESS_RIGHTS,
+        PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
+    };
+    const STILL_ACTIVE: u32 = 259;
+    // SYNCHRONIZE (0x0010_0000) for the wait + query rights for the exit code.
+    let access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_ACCESS_RIGHTS(0x0010_0000);
+    if pid == 0 {
+        return None;
+    }
+    unsafe {
+        let Ok(handle) = OpenProcess(access, false, pid) else {
+            return None;
+        };
+        let read_exit = |h| {
+            let mut code: u32 = 0;
+            GetExitCodeProcess(h, &mut code).ok().map(|_| code as i64)
+        };
+        loop {
+            if shutdown.load(Ordering::SeqCst) {
+                let _ = CloseHandle(handle);
+                return None;
+            }
+            let w = WaitForSingleObject(handle, 200);
+            if w == WAIT_OBJECT_0 {
+                let code = read_exit(handle);
+                let _ = CloseHandle(handle);
+                return code;
+            }
+            if w == WAIT_TIMEOUT {
+                continue;
+            }
+            // WAIT_FAILED/abandoned: confirm via exit code, else give up.
+            if let Some(code) = read_exit(handle) {
+                if code != STILL_ACTIVE as i64 {
+                    let _ = CloseHandle(handle);
+                    return Some(code);
+                }
+            }
+            let _ = CloseHandle(handle);
+            return None;
+        }
+    }
+}
 
 #[cfg(not(windows))]
-impl ProcessJob {
-    pub fn new() -> Result<ProcessJob> {
-        Ok(ProcessJob)
+pub struct DetachedJob;
+
+#[cfg(not(windows))]
+impl DetachedJob {
+    pub fn create(_name: &str) -> Result<DetachedJob> {
+        Ok(DetachedJob)
+    }
+    pub fn open(_name: &str) -> Option<DetachedJob> {
+        None
     }
     pub fn assign_child(&self, _child: &tokio::process::Child) -> Result<()> {
         Ok(())
     }
     pub fn kill(&self) {}
+}
+
+#[cfg(not(windows))]
+pub fn process_start_time(_pid: u32) -> Option<u64> {
+    None
+}
+
+#[cfg(not(windows))]
+pub fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+pub fn wait_pid(_pid: u32, _shutdown: &std::sync::atomic::AtomicBool) -> Option<i64> {
+    None
 }
 
 /// Forcefully kill a process and its entire child tree by PID.

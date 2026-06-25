@@ -205,8 +205,10 @@ impl LiveSignal {
 pub enum UiCommand {
     /// Show and focus the main window.
     ShowWindow,
-    /// Begin application shutdown.
+    /// Begin application shutdown, leaving downloads running (the default).
     Quit,
+    /// Begin shutdown and stop all active downloads (don't detach them).
+    QuitAndStop,
 }
 
 /// On-demand recording commands from the UI to the download supervisor.

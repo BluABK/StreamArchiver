@@ -629,6 +629,76 @@ pub struct AdBreak {
     pub duration_secs: i64,
 }
 
+/// Which kind of download a [`DetachedRow`] tracks. The registry is shared across
+/// the three process types the supervisor spawns so one startup sweep can
+/// reconcile them all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DetachedKind {
+    /// A live stream capture (`recording` row).
+    Recording,
+    /// An on-demand video download (`video` row).
+    Video,
+    /// A live-chat sidecar (keyed by `monitor_id`, no own row).
+    Chat,
+}
+
+impl DetachedKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DetachedKind::Recording => "recording",
+            DetachedKind::Video => "video",
+            DetachedKind::Chat => "chat",
+        }
+    }
+    pub fn from_str(s: &str) -> Option<DetachedKind> {
+        match s {
+            "recording" => Some(DetachedKind::Recording),
+            "video" => Some(DetachedKind::Video),
+            "chat" => Some(DetachedKind::Chat),
+            _ => None,
+        }
+    }
+}
+
+/// A persisted record of a still-running download tool process, written right
+/// after the tool spawns and deleted at finalize/stop. On the next launch the
+/// supervisor reconciles every row: re-attach to the live ones (wait + tail the
+/// log), finalize ones that finished while the app was down, or orphan the rest.
+/// `pid` + `proc_start` (process creation time) make adoption PID-reuse-safe.
+#[derive(Clone, Debug)]
+pub struct DetachedRow {
+    pub kind: DetachedKind,
+    /// `recording.id` / `video.id` / `monitor_id` (chat).
+    pub ref_id: i64,
+    pub monitor_id: Option<i64>,
+    pub pid: u32,
+    /// OS process creation time (FILETIME 100ns ticks); guards against PID reuse.
+    pub proc_start: u64,
+    /// Named Win32 job object the tool was assigned to (re-openable by name).
+    pub job_name: String,
+    /// The tool's combined stdout/stderr log, tailed for progress/ads/log-tail.
+    pub log_path: String,
+    /// The working capture file under `.cache\`.
+    pub capture_path: String,
+    /// The final promoted path in the output dir.
+    pub final_path: String,
+    pub remux_to_mkv: bool,
+    pub take_group: Option<String>,
+    /// [`crate::version::build_id`] of the build that spawned the tool.
+    pub spawn_build: String,
+    /// The recording's/video's start time (unix secs) — the take timeline anchor,
+    /// not the registration time.
+    pub started_at: i64,
+    /// True only for the DASH companion leg of a dual capture (it occupies the
+    /// secondary active map). Lets re-attach assign the right slot deterministically
+    /// instead of guessing from registry row order.
+    pub secondary: bool,
+    /// Platform stream/video id (for the `{video_id}` filename var on re-attach).
+    pub stream_id: Option<String>,
+    /// Broadcast go-live time, if known (ad-cut anchor + lost-time accounting).
+    pub went_live_at: Option<i64>,
+}
+
 /// One title or game/category change observed during a recording take.
 ///
 /// `at_secs` is the offset from the take's start (wall clock) when the change was

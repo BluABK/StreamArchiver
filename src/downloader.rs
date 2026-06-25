@@ -9,14 +9,13 @@
 //! Default container is MKV (never MP4): streamlink records to `.ts` then remuxes
 //! losslessly to `.mkv`; yt-dlp merges straight to `.mkv`.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{info, warn};
@@ -24,14 +23,33 @@ use tracing::{info, warn};
 use crate::detectors::{DetectContext, DetectItem, DetectOutcome};
 use crate::events::{AppEvent, EventTx, LiveSignal, ManualCommand};
 use crate::models::{
-    AuthKind, Container, DetectionMethod, K_FILENAME_MEDIA, MediaInfoMode, Monitor,
-    MonitorWithChannel, Platform, Recording, Tool, Video, now_unix,
+    AuthKind, Container, DetachedKind, DetachedRow, DetectionMethod, K_FILENAME_MEDIA,
+    MediaInfoMode, Monitor, MonitorWithChannel, Platform, Recording, Tool, Video, now_unix,
 };
-use crate::platform::ProcessJob;
+use crate::platform::DetachedJob;
 use crate::store::Store;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// How a [`Supervisor::run_process`] call registers itself in the persistent
+/// detached-process registry, so a later launch can re-attach if the tool
+/// outlives the app. `ref_id == 0` (e.g. a recording row that failed to insert)
+/// disables registration — there'd be nothing to reconcile against.
+#[derive(Clone)]
+struct DetachReg {
+    kind: DetachedKind,
+    ref_id: i64,
+    monitor_id: Option<i64>,
+    take_group: Option<String>,
+    /// The take's start time (recording/video started_at), not the spawn time —
+    /// the timeline anchor a re-attach finalize needs for the stem + lost-time.
+    started_at: i64,
+    /// True only for the DASH companion (occupies the secondary active map).
+    secondary: bool,
+    stream_id: Option<String>,
+    went_live_at: Option<i64>,
+}
 
 /// Monitors currently being recorded, mapped to their child PID (0 until the
 /// process has spawned). Shared with the scheduler (so it doesn't re-trigger an
@@ -1319,19 +1337,26 @@ impl Supervisor {
         if self.shutdown.load(Ordering::SeqCst) {
             return;
         }
-        let job = match ProcessJob::new() {
-            Ok(j) => Some(j),
+        // Detached like every other download: a named job without kill-on-close,
+        // no kill_on_drop, and output to a log file so the sidecar survives an app
+        // restart and a relaunch can re-attach. yt-dlp writes the `.live_chat.json`
+        // directly; this log only captures its diagnostics.
+        let log_path = plan.capture_path.with_extension("chat.log");
+        let (out_h, err_h) = match open_log_pair(&log_path) {
+            Ok(p) => p,
             Err(e) => {
-                warn!(monitor_id, "chat job object create failed: {e:#}");
-                None
+                warn!(monitor_id, "chat log open failed: {e}");
+                return;
             }
         };
+        let job_name = format!("Local\\StreamArchiver_chat_{monitor_id}");
+        let job = DetachedJob::create(&job_name).ok();
+
         let mut cmd = Command::new(&plan.program);
         cmd.args(&plan.args)
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .stdout(Stdio::from(out_h))
+            .stderr(Stdio::from(err_h));
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
 
@@ -1347,25 +1372,30 @@ impl Supervisor {
                 warn!(monitor_id, "chat job assign failed: {e:#}");
             }
         }
-        if let Some(pid) = child.id() {
+        let pid = child.id().unwrap_or(0);
+        if pid != 0 {
             self.active_chats.lock().unwrap().insert(monitor_id, pid);
-        }
-        // Drain stdout so the pipe buffer never fills and blocks the child.
-        if let Some(stdout) = child.stdout.take() {
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stdout).lines();
-                while lines.next_line().await.ok().flatten().is_some() {}
-            });
-        }
-        // Log stderr so yt-dlp errors (auth failures, format unavailable, etc.) are visible.
-        if let Some(stderr) = child.stderr.take() {
-            let mid = monitor_id;
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Some(line) = lines.next_line().await.ok().flatten() {
-                    warn!(monitor_id = mid, "chat yt-dlp: {line}");
-                }
-            });
+            let row = DetachedRow {
+                kind: DetachedKind::Chat,
+                ref_id: monitor_id,
+                monitor_id: Some(monitor_id),
+                pid,
+                proc_start: crate::platform::process_start_time(pid).unwrap_or(0),
+                job_name: job_name.clone(),
+                log_path: log_path.to_string_lossy().into_owned(),
+                capture_path: plan.capture_path.to_string_lossy().into_owned(),
+                final_path: plan.final_path.to_string_lossy().into_owned(),
+                remux_to_mkv: false,
+                take_group: None,
+                spawn_build: crate::version::build_id().to_string(),
+                started_at: now_unix(),
+                secondary: false,
+                stream_id: None,
+                went_live_at: None,
+            };
+            if let Err(e) = self.store.register_detached(&row) {
+                warn!(monitor_id, "register chat detached failed: {e:#}");
+            }
         }
         info!(monitor_id, "chat download started");
         // Fire any event so the UI repaints and shows the chat-active indicator.
@@ -1375,8 +1405,18 @@ impl Supervisor {
         });
 
         let _ = child.wait().await;
+        if let Some(j) = &job {
+            j.kill(); // clean up any straggler before we drop the handle
+        }
+        drop(job);
+        let _ = self.store.clear_detached(DetachedKind::Chat, monitor_id);
         let stopped = self.stopping_chats.lock().unwrap().remove(&monitor_id);
         self.active_chats.lock().unwrap().remove(&monitor_id);
+        // Surface any yt-dlp diagnostics (auth failure, format unavailable, …).
+        let tail = read_log_tail(&log_path, 12).await;
+        if !tail.trim().is_empty() {
+            warn!(monitor_id, "chat yt-dlp log tail:\n{tail}");
+        }
         if stopped {
             info!(monitor_id, "chat download stopped by user");
         } else {
@@ -1548,6 +1588,16 @@ impl Supervisor {
                 Some(self.video_progress.clone()),
                 Some(self.video_speed.clone()),
                 None, // on-demand downloads don't track ad breaks
+                DetachReg {
+                    kind: DetachedKind::Video,
+                    ref_id: id,
+                    monitor_id: None,
+                    take_group: None,
+                    started_at,
+                    secondary: false,
+                    stream_id: None,
+                    went_live_at: None,
+                },
             )
             .await;
 
@@ -1964,8 +2014,25 @@ impl Supervisor {
         let outcome = if self.stopping_monitors.lock().unwrap().contains(&monitor_id) {
             ProcessOutcome { exit_code: None, log: String::new() }
         } else {
-            self.run_process(&self.active, monitor_id, &plan, None, None, ad_sink)
-                .await
+            self.run_process(
+                &self.active,
+                monitor_id,
+                &plan,
+                None,
+                None,
+                ad_sink,
+                DetachReg {
+                    kind: DetachedKind::Recording,
+                    ref_id: rec_id,
+                    monitor_id: Some(monitor_id),
+                    take_group: Some(take_group.clone()),
+                    started_at,
+                    secondary: false,
+                    stream_id: stream_id.clone(),
+                    went_live_at,
+                },
+            )
+            .await
         };
 
         // Stop the catch-up watcher before we touch the capture file (so it can't
@@ -2167,8 +2234,25 @@ impl Supervisor {
         let outcome = if self.stopping_monitors.lock().unwrap().contains(&monitor_id) {
             ProcessOutcome { exit_code: None, log: String::new() }
         } else {
-            self.run_process(&self.active_secondary, monitor_id, &plan, None, None, None)
-                .await
+            self.run_process(
+                &self.active_secondary,
+                monitor_id,
+                &plan,
+                None,
+                None,
+                None,
+                DetachReg {
+                    kind: DetachedKind::Recording,
+                    ref_id: rec_id,
+                    monitor_id: Some(monitor_id),
+                    take_group: Some(take_group.clone()),
+                    started_at,
+                    secondary: true,
+                    stream_id: stream_id.clone(),
+                    went_live_at,
+                },
+            )
+            .await
         };
 
         // Promote the companion out of .cache\ (remux .ts→.mkv) on success; a failed
@@ -2266,6 +2350,548 @@ impl Supervisor {
         to_resume
     }
 
+    /// Reconcile the persistent detached-process registry at startup (synchronously,
+    /// so reservations land before detection can fire). For each row: re-attach to a
+    /// still-running download, finalize one that finished while the app was down, or
+    /// hand a SABR-resumable one to the resume path; orphan the rest. Registry-backed
+    /// recordings are owned here — `resume_inflight` is fed a registry-excluded set.
+    /// Returns the items to drive on the runtime plus the capture stems to protect
+    /// from the cache sweep. The caller spawns `reattach_one` for each item.
+    pub fn reconcile_detached(&self) -> (Vec<ReattachItem>, std::collections::HashSet<String>) {
+        let rows = match self.store.list_detached() {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("reattach: failed to load detached registry: {e:#}");
+                return (Vec::new(), HashSet::new());
+            }
+        };
+        let ytdlp = load_ytdlp_bins(&self.store);
+        let build = crate::version::build_id();
+        let mut items = Vec::new();
+        let mut skip = HashSet::new();
+        for mut row in rows {
+            let spawn_build = row.spawn_build.clone();
+            if spawn_build != build {
+                crate::compat::reattach_fixups(&spawn_build, &mut row);
+            }
+            if let Some(stem) = Path::new(&row.capture_path).file_stem() {
+                skip.insert(stem.to_string_lossy().into_owned());
+            }
+            // PID-reuse-safe liveness: the PID must still be running *and* have the
+            // creation time we recorded. If we couldn't read the creation time at
+            // spawn (proc_start == 0), the identity is unverifiable — don't adopt a
+            // possibly-recycled PID; fall through to finalize-from-file / resume / orphan.
+            let alive = row.proc_start != 0
+                && crate::platform::pid_alive(row.pid)
+                && crate::platform::process_start_time(row.pid) == Some(row.proc_start);
+
+            // The DASH companion of a dual capture occupies the secondary map; the
+            // primary / videos / chat occupy their own. This is recorded explicitly
+            // (`secondary`), not guessed from registry order (the two legs race to
+            // register), so a re-attach can never swap their roles.
+            let active = match (row.kind, row.secondary) {
+                (DetachedKind::Video, _) => self.active_videos.clone(),
+                (DetachedKind::Chat, _) => self.active_chats.clone(),
+                (DetachedKind::Recording, true) => self.active_secondary.clone(),
+                (DetachedKind::Recording, false) => self.active.clone(),
+            };
+            let key = match row.kind {
+                DetachedKind::Video => row.ref_id,
+                _ => row.monitor_id.unwrap_or(row.ref_id),
+            };
+
+            if alive {
+                active.lock().unwrap().insert(key, row.pid);
+                info!(
+                    kind = row.kind.as_str(),
+                    ref_id = row.ref_id,
+                    pid = row.pid,
+                    spawn_build = %row.spawn_build,
+                    "re-attaching to detached download"
+                );
+                items.push(ReattachItem {
+                    row,
+                    active,
+                    action: ReAction::Adopt,
+                });
+                continue;
+            }
+
+            // Process gone. A SABR-resumable recording is recovered FIRST — SABR
+            // writes its media directly (`--no-part`), so it always has a non-empty
+            // capture; checking `has_capture` before resumability would wrongly
+            // finalize an interrupted SABR take and purge its `.state`.
+            let resumable = row.kind == DetachedKind::Recording
+                && !row.secondary
+                && ytdlp.sabr.usable()
+                && sabr_state_exists(&row.final_path)
+                && self
+                    .store
+                    .get_monitor_with_channel(row.monitor_id.unwrap_or(0))
+                    .ok()
+                    .flatten()
+                    .map(|r| {
+                        r.monitor.platform() == Platform::YouTube
+                            && r.monitor.tool == Tool::YtDlp
+                            && r.monitor.capture_from_start
+                    })
+                    .unwrap_or(false);
+            if resumable {
+                let mid = row.monitor_id.unwrap_or(0);
+                let reserve = {
+                    let mut a = self.active.lock().unwrap();
+                    if a.contains_key(&mid) {
+                        false
+                    } else {
+                        a.insert(mid, 0);
+                        true
+                    }
+                };
+                if reserve {
+                    // Make sure no straggler (e.g. a broken-away ffmpeg grandchild)
+                    // still holds the `.state`/`.part` files before we re-run.
+                    if let Some(job) = crate::platform::DetachedJob::open(&row.job_name) {
+                        job.kill();
+                    }
+                    crate::platform::kill_process_tree(row.pid);
+                    info!(
+                        monitor_id = mid,
+                        rec_id = row.ref_id,
+                        "resuming detached SABR capture"
+                    );
+                    items.push(ReattachItem {
+                        row,
+                        active: self.active.clone(),
+                        action: ReAction::Resume,
+                    });
+                    continue;
+                }
+            }
+
+            // Otherwise finalize when there's a usable capture on disk…
+            let has_capture = std::fs::metadata(&row.capture_path)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+                || std::fs::metadata(&row.final_path)
+                    .map(|m| m.len() > 0)
+                    .unwrap_or(false);
+            if has_capture {
+                info!(
+                    kind = row.kind.as_str(),
+                    ref_id = row.ref_id,
+                    "detached download finished while app was down; finalizing"
+                );
+                items.push(ReattachItem {
+                    row,
+                    active,
+                    action: ReAction::Finalize,
+                });
+                continue;
+            }
+
+            // …otherwise nothing to recover: orphan the row and drop the registry entry.
+            match row.kind {
+                DetachedKind::Recording => {
+                    let _ = self.store.mark_recording_orphaned(row.ref_id);
+                }
+                DetachedKind::Video => {
+                    let _ = self.store.set_video_status(row.ref_id, "orphaned");
+                }
+                DetachedKind::Chat => {}
+            }
+            let _ = self.store.clear_detached(row.kind, row.ref_id);
+        }
+        (items, skip)
+    }
+
+    /// Drive one reconciled detached download to completion on the runtime.
+    pub async fn reattach_one(&self, item: ReattachItem) {
+        let ReattachItem { row, active, action } = item;
+        match action {
+            ReAction::Resume => {
+                let mid = row.monitor_id.unwrap_or(0);
+                match self.store.get_monitor_with_channel(mid).ok().flatten() {
+                    Some(mrow) => self.resume_recording(recording_from_detached(&row), mrow).await,
+                    None => {
+                        self.active.lock().unwrap().remove(&mid);
+                        let _ = self.store.mark_recording_orphaned(row.ref_id);
+                        let _ = self.store.clear_detached(row.kind, row.ref_id);
+                    }
+                }
+            }
+            ReAction::Finalize => self.finalize_reattached(&row, &active).await,
+            ReAction::Adopt => self.adopt_detached(row, active).await,
+        }
+    }
+
+    /// Re-attached to a still-running download: repaint the UI, resume full live
+    /// detail by tailing the log from its current end (pre-restart ad breaks are
+    /// already persisted), wait for the process, then finalize — unless we're
+    /// quitting again (then leave the registry row for the next launch).
+    async fn adopt_detached(&self, row: DetachedRow, active: ActiveSet) {
+        let key = match row.kind {
+            DetachedKind::Video => row.ref_id,
+            _ => row.monitor_id.unwrap_or(row.ref_id),
+        };
+        if let Some(mid) = row.monitor_id {
+            let state = if row.kind == DetachedKind::Chat {
+                "chat_active"
+            } else {
+                "recording"
+            };
+            let _ = self.events.send(AppEvent::MonitorState {
+                monitor_id: mid,
+                state: state.into(),
+            });
+        }
+
+        // Chat sidecars carry no live state to reconstruct — just wait and clear.
+        if row.kind == DetachedKind::Chat {
+            let exited = self.wait_for_exit(row.pid).await;
+            // Free the slot either way: on a real exit it's done; on shutdown,
+            // leaving it would block stop_all_recordings' drain loop for 120s.
+            active.lock().unwrap().remove(&key);
+            if !exited {
+                return; // re-detaching on quit — keep the registry row
+            }
+            let _ = self.store.clear_detached(DetachedKind::Chat, row.ref_id);
+            if let Some(mid) = row.monitor_id {
+                let _ = self.events.send(AppEvent::MonitorState {
+                    monitor_id: mid,
+                    state: "idle".into(),
+                });
+            }
+            return;
+        }
+
+        // Fetch the monitor row once (recordings only) to rebuild the ad pipeline
+        // and the live watchers.
+        let mrow = if row.kind == DetachedKind::Recording {
+            row.monitor_id
+                .and_then(|mid| self.store.get_monitor_with_channel(mid).ok().flatten())
+        } else {
+            None
+        };
+
+        let log_path = PathBuf::from(&row.log_path);
+        // Start tailing at a line boundary so a partial line at the seek point
+        // (e.g. an ad-break marker being written at the restart instant) isn't
+        // split and lost; re-reading that single line is safe (ad inserts are
+        // idempotent, progress is overwrite).
+        let start_offset = line_aligned_tail_offset(&log_path).await;
+        let done = Arc::new(AtomicBool::new(false));
+        let (progress, speed) = if row.kind == DetachedKind::Video {
+            (Some(self.video_progress.clone()), Some(self.video_speed.clone()))
+        } else {
+            (None, None)
+        };
+        // Rebuild the ad pipeline for a re-attached Twitch+streamlink recording so
+        // new breaks keep being recorded (historical ones are already persisted).
+        let ad_sink = mrow
+            .as_ref()
+            .filter(|m| m.monitor.tool == Tool::Streamlink && m.monitor.platform() == Platform::Twitch)
+            .map(|m| AdSink {
+                store: self.store.clone(),
+                events: self.events.clone(),
+                monitor_id: row.monitor_id.unwrap_or(0),
+                recording_id: row.ref_id,
+                started_at: row.started_at,
+                went_live_at: row.went_live_at,
+                from_start: m.monitor.capture_from_start,
+                capture_path: PathBuf::from(&row.capture_path),
+                ad_active: self.ad_active.clone(),
+            });
+        let (ad_tx, ad_task) = match ad_sink {
+            Some(sink) => {
+                let (tx, jh) = spawn_ad_processor(sink);
+                (Some(tx), Some(jh))
+            }
+            None => (None, None),
+        };
+
+        // Re-spawn the live watchers exactly as the in-session record() path does —
+        // otherwise a re-attached take's Lost-time never resolves (catch-up watcher)
+        // and its Game/Title freeze (meta watcher) at the pre-restart values.
+        let watcher_done = Arc::new(AtomicBool::new(false));
+        let mut watchers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        if let Some(m) = &mrow {
+            let from_start = m.monitor.capture_from_start
+                && matches!(m.monitor.tool, Tool::Streamlink | Tool::YtDlp);
+            if from_start && row.went_live_at.is_some() {
+                watchers.push(tokio::spawn(catch_up_watcher(
+                    self.store.clone(),
+                    self.events.clone(),
+                    row.monitor_id.unwrap_or(0),
+                    row.ref_id,
+                    PathBuf::from(&row.capture_path),
+                    row.went_live_at.unwrap_or(0),
+                    watcher_done.clone(),
+                )));
+            }
+            if m.monitor.platform() != Platform::Generic {
+                watchers.push(tokio::spawn(meta_watcher(
+                    self.ctx.clone(),
+                    self.store.clone(),
+                    self.events.clone(),
+                    row.monitor_id.unwrap_or(0),
+                    row.ref_id,
+                    row.started_at,
+                    m.monitor.url.clone(),
+                    m.monitor.platform(),
+                    watcher_done.clone(),
+                    self.shutdown.clone(),
+                )));
+            }
+            // Twitch chat logger is a native in-process task (not a tracked
+            // process), so re-attach must restart it to keep appending to the
+            // `.chat.jsonl` sidecar. (YouTube chat is a yt-dlp process and
+            // re-attaches via its own registry row.)
+            if m.monitor.chat_log && m.monitor.platform() == Platform::Twitch {
+                let chat_path = PathBuf::from(&row.final_path).with_extension("chat.jsonl");
+                watchers.push(tokio::spawn(crate::chat::log_twitch_chat(
+                    m.monitor.url.clone(),
+                    chat_path,
+                    watcher_done.clone(),
+                    self.shutdown.clone(),
+                )));
+            }
+        }
+
+        let tail = tokio::spawn(tail_log(
+            log_path,
+            start_offset,
+            progress,
+            speed,
+            key,
+            ad_tx,
+            done.clone(),
+        ));
+
+        let exited = self.wait_for_exit(row.pid).await;
+        done.store(true, Ordering::SeqCst);
+        watcher_done.store(true, Ordering::SeqCst);
+        let _ = tail.await;
+        if let Some(t) = ad_task {
+            let _ = t.await;
+        }
+        for w in watchers {
+            let _ = w.await;
+        }
+        if !exited {
+            // Quitting again: keep the registry row for the next launch, but free
+            // the in-memory slot so a concurrent stop_all drain loop terminates.
+            active.lock().unwrap().remove(&key);
+            return;
+        }
+        self.finalize_reattached(&row, &active).await;
+    }
+
+    /// Block until `pid` truly exits, returning false if shutdown was requested
+    /// first. Re-checks liveness after each wait so a spurious `WaitForSingleObject`
+    /// failure can't trigger a premature finalize while the tool is still writing.
+    async fn wait_for_exit(&self, pid: u32) -> bool {
+        loop {
+            let shutdown = self.shutdown.clone();
+            let _ = tokio::task::spawn_blocking(move || crate::platform::wait_pid(pid, &shutdown))
+                .await;
+            if self.shutdown.load(Ordering::SeqCst) {
+                return false;
+            }
+            if !crate::platform::pid_alive(pid) {
+                return true;
+            }
+            // wait_pid returned while the process is still alive (spurious) — retry.
+            crate::app_core::sleep_cancellable(Duration::from_millis(500), &self.shutdown).await;
+        }
+    }
+
+    /// Promote and record a re-attached download once its process is gone: move/remux
+    /// the capture into the output dir, do the same post-capture `{games}`/`{title}`/
+    /// `{resolution}` rename + lost-time accounting the in-session path does, finalize
+    /// the recording/video row, drop the registry entry, and free the active-map slot.
+    async fn finalize_reattached(&self, row: &DetachedRow, active: &ActiveSet) {
+        let capture_path = PathBuf::from(&row.capture_path);
+        let final_pred = PathBuf::from(&row.final_path);
+        let mut final_path = if row.remux_to_mkv {
+            promote_capture(&DownloadPlan {
+                program: String::new(),
+                args: Vec::new(),
+                capture_path: capture_path.clone(),
+                final_path: final_pred.clone(),
+                remux_to_mkv: true,
+                writes_own_thumbnail: false,
+            })
+            .await
+        } else {
+            // Already-final container: move the predicted file, or the newest
+            // `{stem}.*` the tool actually produced (yt-dlp may differ in extension).
+            let produced = if file_len(&capture_path).await > 0 {
+                Some(capture_path.clone())
+            } else {
+                newest_with_stem(&capture_path).await
+            };
+            match produced {
+                Some(src) => {
+                    let dest = final_pred.with_file_name(
+                        src.file_name().map(|n| n.to_os_string()).unwrap_or_default(),
+                    );
+                    if let Some(p) = dest.parent() {
+                        let _ = tokio::fs::create_dir_all(p).await;
+                    }
+                    match tokio::fs::rename(&src, &dest).await {
+                        Ok(()) => dest,
+                        Err(_) => src,
+                    }
+                }
+                None => final_pred.clone(),
+            }
+        };
+
+        // For a recording, fetch the monitor row and apply the in-session post-capture
+        // rename (fill {games}/{title}/{resolution}) so a re-attached take isn't named
+        // differently from one finalized in-session (no leftover "tba" placeholders).
+        let mrow = if row.kind == DetachedKind::Recording {
+            self.store
+                .get_monitor_with_channel(row.monitor_id.unwrap_or(0))
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        if let Some(mrow) = &mrow {
+            let want_games = template_wants_games(&mrow.monitor.filename_template);
+            let want_title = template_wants_title(&mrow.monitor.filename_template);
+            let do_post_media =
+                template_wants_media(&mrow.monitor.filename_template) && media_info_mode(&self.store).post();
+            if want_games || want_title || do_post_media {
+                let mi = if do_post_media {
+                    probe_media(&final_path.to_string_lossy()).await
+                } else {
+                    None
+                };
+                let games = if want_games {
+                    games_for_recording(&self.store, row.ref_id)
+                } else {
+                    String::new()
+                };
+                let title = if want_title {
+                    title_for_recording(&self.store, row.ref_id)
+                } else {
+                    String::new()
+                };
+                let quality = resolved_quality(&mrow.monitor.quality);
+                let stem = monitor_stem(
+                    &mrow.monitor,
+                    &mrow.channel.name,
+                    row.started_at,
+                    row.stream_id.as_deref(),
+                    &title,
+                    mrow.recording_count,
+                    &quality,
+                    mi.as_ref(),
+                    &games,
+                );
+                final_path = rename_for_media(final_path, &stem).await;
+            }
+        }
+
+        let ended = now_unix();
+        // Lost-time: zero it only when the capture spans the whole broadcast (same
+        // rule as the in-session finalize); else leave it for the provisional estimate.
+        if row.kind == DetachedKind::Recording {
+            if let (Some(wl), Some(captured)) =
+                (row.went_live_at, media_duration_secs(&final_path).await)
+            {
+                if captured + CATCHUP_TOLERANCE_SECS >= (ended - wl).max(0) {
+                    let _ = self.store.set_recording_lost_secs(row.ref_id, 0);
+                }
+            }
+        }
+
+        let bytes = file_len(&final_path).await as i64;
+        let log = read_log_tail(&PathBuf::from(&row.log_path), RING_MAX_LINES).await;
+        let key = match row.kind {
+            DetachedKind::Video => row.ref_id,
+            _ => row.monitor_id.unwrap_or(row.ref_id),
+        };
+
+        match row.kind {
+            DetachedKind::Recording => {
+                // Honour a manual stop that raced the re-attach so the take shows
+                // 'stopped', not 'failed', when it ended empty.
+                let manually_stopped = row
+                    .monitor_id
+                    .map(|mid| self.stopping_monitors.lock().unwrap().remove(&mid))
+                    .unwrap_or(false);
+                let status = if manually_stopped {
+                    if bytes > 0 { "completed" } else { "stopped" }
+                } else if bytes > 0 {
+                    "completed"
+                } else if stream_ended_or_unavailable(&log) {
+                    "ended"
+                } else {
+                    "failed"
+                };
+                let _ = self.store.finish_recording(
+                    row.ref_id,
+                    ended,
+                    bytes,
+                    None,
+                    status,
+                    &final_path.to_string_lossy(),
+                    &log,
+                );
+                active.lock().unwrap().remove(&key);
+                let channel = mrow.map(|r| r.channel.name).unwrap_or_default();
+                let _ = self.events.send(AppEvent::RecordingFinished {
+                    recording_id: row.ref_id,
+                    channel,
+                    status: status.into(),
+                });
+                if let Some(mid) = row.monitor_id {
+                    let _ = self.events.send(AppEvent::MonitorState {
+                        monitor_id: mid,
+                        state: "offline".into(),
+                    });
+                }
+                info!(rec_id = row.ref_id, bytes, status, "re-attached recording finalized");
+            }
+            DetachedKind::Video => {
+                let stopped = self.stopping_videos.lock().unwrap().remove(&row.ref_id);
+                let status = if stopped {
+                    "stopped"
+                } else if bytes > 0 {
+                    "completed"
+                } else {
+                    "failed"
+                };
+                let _ = self.store.finish_video(
+                    row.ref_id,
+                    ended,
+                    bytes,
+                    None,
+                    status,
+                    &final_path.to_string_lossy(),
+                    &log,
+                );
+                active.lock().unwrap().remove(&key);
+                self.video_progress.lock().unwrap().remove(&key);
+                self.video_speed.lock().unwrap().remove(&key);
+                info!(video = row.ref_id, bytes, status, "re-attached video finalized");
+            }
+            DetachedKind::Chat => {
+                active.lock().unwrap().remove(&key);
+            }
+        }
+        let _ = self.store.clear_detached(row.kind, row.ref_id);
+        // Drop this download's `.cache\` working leftovers.
+        if let Some(cache) = capture_path.parent() {
+            if let Some(stem) = final_pred.file_stem().map(|s| s.to_string_lossy().into_owned()) {
+                purge_cache(cache, &stem).await;
+            }
+        }
+    }
+
     /// Resume an interrupted SABR capture, reusing the orphaned recording's `rec_id`
     /// and `.cache\` stem so yt-dlp continues from the surviving `.state`/`.part`
     /// (re-invoked with the identical `-o`). Chat and the DASH companion are not
@@ -2344,7 +2970,24 @@ impl Supervisor {
         info!(monitor_id, rec_id, program = %plan.program, "resuming SABR capture -> {}", plan.final_path.display());
 
         let outcome = self
-            .run_process(&self.active, monitor_id, &plan, None, None, None)
+            .run_process(
+                &self.active,
+                monitor_id,
+                &plan,
+                None,
+                None,
+                None,
+                DetachReg {
+                    kind: DetachedKind::Recording,
+                    ref_id: rec_id,
+                    monitor_id: Some(monitor_id),
+                    take_group: rec.take_group.clone(),
+                    started_at: rec.started_at,
+                    secondary: false,
+                    stream_id: rec.stream_id.clone(),
+                    went_live_at: rec.went_live_at,
+                },
+            )
             .await;
         let ended = now_unix();
 
@@ -2494,25 +3137,40 @@ impl Supervisor {
         progress: Option<VideoProgress>,
         speed: Option<VideoSpeed>,
         ads: Option<AdSink>,
+        detach: DetachReg,
     ) -> ProcessOutcome {
-        let job = match ProcessJob::new() {
-            Ok(j) => Some(j),
+        // The tool's combined stdout+stderr go to a log file the app TAILS rather
+        // than a pipe it reads: a pipe dies with the parent, but a file the child
+        // owns keeps growing after the app detaches/quits — and a later launch can
+        // re-open and re-tail it. Lives next to the capture under `.cache\`.
+        let log_path = plan.capture_path.with_extension("log");
+        let (out_h, err_h) = match open_log_pair(&log_path) {
+            Ok(p) => p,
             Err(e) => {
-                warn!("job object create failed: {e:#}");
-                None
+                return ProcessOutcome {
+                    exit_code: None,
+                    log: format!("failed to open log {}: {e}", log_path.display()),
+                };
             }
         };
+
+        // A *named* job WITHOUT kill-on-close: the tool stays alive when we exit,
+        // and a relaunch can re-open the job by name to stop the whole tree.
+        let job_name = format!(
+            "Local\\StreamArchiver_{}_{}",
+            detach.kind.as_str(),
+            detach.ref_id
+        );
+        let job = DetachedJob::create(&job_name).ok();
+
         let mut cmd = Command::new(&plan.program);
+        // No kill_on_drop: the child must survive this task being dropped (detach).
+        // A regular file handle (like a pipe) reads as isatty()=False, so yt-dlp
+        // skips the console-width probe that crashes on a NUL handle.
         cmd.args(&plan.args)
             .stdin(Stdio::null())
-            // Always pipe stdout. Passing Stdio::null() on Windows gives child
-            // processes a NUL device handle; yt-dlp calls GetConsoleScreenBufferInfo
-            // on it (to detect terminal width), gets ERROR_INVALID_HANDLE (0x6), and
-            // crashes before writing a byte. A pipe handle causes Python to see
-            // isatty()=False and skip the console-width call entirely.
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .stdout(Stdio::from(out_h))
+            .stderr(Stdio::from(err_h));
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
 
@@ -2532,153 +3190,72 @@ impl Supervisor {
         }
         // Register the real PID so the scheduler skips this work and shutdown
         // can kill the whole process tree.
-        if let Some(pid) = child.id() {
+        let pid = child.id().unwrap_or(0);
+        if pid != 0 {
             active.lock().unwrap().insert(id, pid);
         }
 
-        // Parse progress + speed lines from stdout (yt-dlp `--progress-template`).
-        // When not tracking progress/speed, drain the pipe anyway so the 64 KB
-        // pipe buffer never fills and blocks the child process.
-        if let Some(stdout) = child.stdout.take() {
-            let prog = progress.clone();
-            let spd = speed.clone();
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let (f, s) = parse_progress_fields(&line);
-                    if let (Some(f), Some(m)) = (f, prog.as_ref()) {
-                        m.lock().unwrap().insert(id, f);
-                    }
-                    if let (Some(s), Some(m)) = (s, spd.as_ref()) {
-                        m.lock().unwrap().insert(id, s);
-                    }
-                }
-            });
+        // Persist a registry row right after the spawn — synchronously, before the
+        // first `.await` (child.wait below) — so a clean detach always has a row, and
+        // only a crash in this sub-millisecond window could miss one. Deleted when
+        // this download finalizes in-session below.
+        if detach.ref_id != 0 && pid != 0 {
+            let row = DetachedRow {
+                kind: detach.kind,
+                ref_id: detach.ref_id,
+                monitor_id: detach.monitor_id,
+                pid,
+                proc_start: crate::platform::process_start_time(pid).unwrap_or(0),
+                job_name: job_name.clone(),
+                log_path: log_path.to_string_lossy().into_owned(),
+                capture_path: plan.capture_path.to_string_lossy().into_owned(),
+                final_path: plan.final_path.to_string_lossy().into_owned(),
+                remux_to_mkv: plan.remux_to_mkv,
+                take_group: detach.take_group.clone(),
+                spawn_build: crate::version::build_id().to_string(),
+                started_at: detach.started_at,
+                secondary: detach.secondary,
+                stream_id: detach.stream_id.clone(),
+                went_live_at: detach.went_live_at,
+            };
+            if let Err(e) = self.store.register_detached(&row) {
+                warn!("register detached process failed: {e:#}");
+            }
         }
 
-        // Ad breaks are handled off the stderr-drain path: the drain loop just
-        // forwards `(detected_at, duration)` over this channel, and a dedicated
-        // task does the (potentially slow) ffprobe + DB insert. This keeps stderr
-        // consumption from stalling — a blocked drain can backpressure the capture
-        // process's own stderr writes.
-        let (ad_tx, ad_rx) = if ads.is_some() {
-            let (tx, rx) = mpsc::unbounded_channel::<(i64, i64)>();
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
+        // Ad-break processor (Twitch+streamlink only): the tailer forwards each
+        // `(detected_at, duration)` over a channel; a dedicated task does the
+        // (potentially slow) ffprobe + DB insert. Same helper drives re-attach.
+        let (ad_tx, ad_task) = match ads {
+            Some(sink) => {
+                let (tx, jh) = spawn_ad_processor(sink);
+                (Some(tx), Some(jh))
+            }
+            None => (None, None),
         };
 
-        let ring: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
-        let stderr_task = if let Some(stderr) = child.stderr.take() {
-            let ring = ring.clone();
-            let program = plan.program.clone();
-            let prog = progress.clone();
-            let spd = speed.clone();
-            // Move the sole ad-break sender in; the channel closes when the drain
-            // loop ends (EOF on child exit), ending the processor task.
-            let ad_tx = ad_tx;
-            Some(tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    // Some tools emit progress on stderr; catch it there too.
-                    if prog.is_some() || spd.is_some() {
-                        let (f, s) = parse_progress_fields(&line);
-                        if let (Some(f), Some(m)) = (f, prog.as_ref()) {
-                            m.lock().unwrap().insert(id, f);
-                        }
-                        if let (Some(s), Some(m)) = (s, spd.as_ref()) {
-                            m.lock().unwrap().insert(id, s);
-                        }
-                    }
-                    // Forward streamlink ad breaks without blocking the drain
-                    // (streamlink de-dups, so each matching line is one break).
-                    if let Some(tx) = &ad_tx {
-                        if let Some(dur) = parse_ad_break_secs(&line) {
-                            let _ = tx.send((now_unix(), dur));
-                        }
-                    }
-                    tracing::trace!(target: "streamarchiver::recproc", "[{program}] {line}");
-                    let mut r = ring.lock().unwrap();
-                    if r.len() >= RING_MAX_LINES {
-                        r.pop_front();
-                    }
-                    r.push_back(line);
-                }
-            }))
-        } else {
-            drop(ad_tx); // no stderr piped: close the channel so the processor ends
-            None
-        };
-
-        // Ad-break processor: for each break, the cut lands at the content captured
-        // so far. Ad segments are filtered out, so the capture's media duration is
-        // that position — correct for both live-edge and capture-from-start/DVR.
-        // Falls back to wall clock minus already-skipped ad time if ffprobe can't
-        // read the still-growing file yet.
-        let ad_task = match (ads, ad_rx) {
-            (Some(sink), Some(mut rx)) => Some(tokio::spawn(async move {
-                let mut prior_ad_secs: i64 = 0;
-                let mut last_at: i64 = 0;
-                while let Some((detected_at, dur)) = rx.recv().await {
-                    // Prefer the actual captured-content position (one quick retry,
-                    // since a just-written .ts can momentarily lack a readable
-                    // duration). Fall back to wall clock minus already-skipped ad
-                    // time, anchored at go-live for DVR takes (whose file timeline
-                    // starts at go-live) and at recording start at the live edge.
-                    let mut probed = media_duration_secs(&sink.capture_path).await;
-                    if probed.is_none() {
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                        probed = media_duration_secs(&sink.capture_path).await;
-                    }
-                    let at = match probed {
-                        Some(d) => d,
-                        None => {
-                            let anchor = match (sink.from_start, sink.went_live_at) {
-                                (true, Some(wl)) => wl,
-                                _ => sink.started_at,
-                            };
-                            (detected_at - anchor - prior_ad_secs).max(0)
-                        }
-                    };
-                    // Cut positions only move forward; guard against a probe that
-                    // momentarily reports a smaller duration.
-                    let at = at.max(last_at);
-                    last_at = at;
-                    prior_ad_secs += dur;
-                    // Mark the ad window so the UI can tint the row while it plays.
-                    sink.ad_active
-                        .lock()
-                        .unwrap()
-                        .insert(sink.monitor_id, detected_at + dur);
-                    match sink.store.insert_ad_break(sink.recording_id, at, dur) {
-                        Ok(_) => {
-                            info!(
-                                monitor_id = sink.monitor_id,
-                                rec_id = sink.recording_id,
-                                at,
-                                secs = dur,
-                                "ad break detected"
-                            );
-                            // Wake the UI so an expanded history tree refreshes its
-                            // Ads / Ad time columns.
-                            let _ = sink.events.send(AppEvent::MonitorState {
-                                monitor_id: sink.monitor_id,
-                                state: "recording".into(),
-                            });
-                        }
-                        Err(e) => warn!("insert ad_break failed: {e:#}"),
-                    }
-                }
-            })),
-            _ => None,
-        };
+        // One tailer reads the growing log file and does everything the two pipe
+        // readers used to: parse progress/speed (yt-dlp `--progress-template`) and
+        // streamlink ad-break lines. It stops once the process has exited (`done`)
+        // and it has drained to EOF. Tailing a file (not a pipe) is what lets a
+        // re-attach after restart reconstruct live state from the same code path.
+        let done = Arc::new(AtomicBool::new(false));
+        let tail = tokio::spawn(tail_log(
+            log_path.clone(),
+            0,
+            progress.clone(),
+            speed.clone(),
+            id,
+            ad_tx,
+            done.clone(),
+        ));
 
         let status = child.wait().await;
-        // Drain both reader tasks fully before returning, so every log line and ad
-        // break is recorded before the caller remuxes/removes the capture file.
-        if let Some(t) = stderr_task {
-            let _ = t.await;
-        }
+        // The process exited *within this session* (we weren't dropped/detached):
+        // let the tailer drain the log to EOF, then the ad processor finish, so
+        // every line and ad break is recorded before the caller touches the file.
+        done.store(true, Ordering::SeqCst);
+        let _ = tail.await;
         if let Some(t) = ad_task {
             let _ = t.await;
         }
@@ -2688,11 +3265,17 @@ impl Supervisor {
         }
         drop(job);
 
+        // Finalized in-session, so drop the registry row (nothing to re-attach).
+        if detach.ref_id != 0 {
+            if let Err(e) = self.store.clear_detached(detach.kind, detach.ref_id) {
+                warn!("clear detached process failed: {e:#}");
+            }
+        }
+
         let exit_code = status.ok().and_then(|s| s.code()).map(|c| c as i64);
-        let log = {
-            let r = ring.lock().unwrap();
-            r.iter().cloned().collect::<Vec<_>>().join("\n")
-        };
+        // The failure-reason excerpt is the tail of the on-disk log (replaces the
+        // old in-memory ring, and works identically after a re-attach).
+        let log = read_log_tail(&log_path, RING_MAX_LINES).await;
         ProcessOutcome { exit_code, log }
     }
 }
@@ -2700,6 +3283,260 @@ impl Supervisor {
 struct ProcessOutcome {
     exit_code: Option<i64>,
     log: String,
+}
+
+/// What the startup reconcile decided to do with one persisted detached download.
+pub enum ReAction {
+    /// Process still running — wait on it, tail its log, then finalize.
+    Adopt,
+    /// Process already exited (finished while the app was down) — finalize now.
+    Finalize,
+    /// Process gone but the capture is SABR-resumable — re-run from its `.state`.
+    Resume,
+}
+
+/// One detached download to drive on the runtime after [`Supervisor::reconcile_detached`].
+pub struct ReattachItem {
+    row: DetachedRow,
+    /// The active map this download occupies while in flight (so the UI shows it
+    /// and the scheduler won't double-start its monitor).
+    active: ActiveSet,
+    action: ReAction,
+}
+
+impl ReattachItem {
+    /// The OS PID of the detached tool this item drives.
+    pub fn pid(&self) -> u32 {
+        self.row.pid
+    }
+    /// Whether this item re-attaches to a *still-running* process (vs. finalizing
+    /// one that already exited, or resuming a SABR capture).
+    pub fn is_adopt(&self) -> bool {
+        matches!(self.action, ReAction::Adopt)
+    }
+}
+
+/// Open `path` for the child's combined stdout+stderr: truncate any prior log,
+/// then return two **append** handles onto the one file (one for stdout, one for
+/// stderr). Append mode lets both streams interleave into a single growing file
+/// without clobbering each other, and the child keeps writing after we detach.
+fn open_log_pair(path: &Path) -> std::io::Result<(std::fs::File, std::fs::File)> {
+    use std::fs::OpenOptions;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::File::create(path)?; // truncate any leftover
+    let out = OpenOptions::new().create(true).append(true).open(path)?;
+    let err = out.try_clone()?;
+    Ok((out, err))
+}
+
+/// Tail a tool's log file, parsing progress/speed and streamlink ad-break lines
+/// exactly as the old pipe readers did. Starts at `start_offset` (0 for a fresh
+/// spawn; end-of-file for a re-attach so already-persisted breaks aren't redone),
+/// and returns once `done` is set and the file is drained to EOF.
+async fn tail_log(
+    path: PathBuf,
+    start_offset: u64,
+    progress: Option<VideoProgress>,
+    speed: Option<VideoSpeed>,
+    id: i64,
+    ad_tx: Option<mpsc::UnboundedSender<(i64, i64)>>,
+    done: Arc<AtomicBool>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    // The log is created before the spawn, but tolerate a brief absence.
+    let mut file = loop {
+        match tokio::fs::File::open(&path).await {
+            Ok(f) => break f,
+            Err(_) => {
+                if done.load(Ordering::SeqCst) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+    if start_offset > 0 {
+        let _ = file.seek(std::io::SeekFrom::Start(start_offset)).await;
+    }
+    let mut pending: Vec<u8> = Vec::new();
+    let mut buf = vec![0u8; 16 * 1024];
+    let emit = |line: &str| {
+        let (f, s) = parse_progress_fields(line);
+        if let (Some(f), Some(m)) = (f, progress.as_ref()) {
+            m.lock().unwrap().insert(id, f);
+        }
+        if let (Some(s), Some(m)) = (s, speed.as_ref()) {
+            m.lock().unwrap().insert(id, s);
+        }
+        if let Some(tx) = &ad_tx {
+            if let Some(dur) = parse_ad_break_secs(line) {
+                let _ = tx.send((now_unix(), dur));
+            }
+        }
+        tracing::trace!(target: "streamarchiver::recproc", "{line}");
+    };
+    loop {
+        let n = file.read(&mut buf).await.unwrap_or(0);
+        if n == 0 {
+            if done.load(Ordering::SeqCst) {
+                // Process exited and we've drained to EOF: flush any trailing
+                // partial line, then stop (dropping ad_tx ends the ad processor).
+                let tail = String::from_utf8_lossy(&pending);
+                let tail = tail.trim_end_matches('\r');
+                if !tail.trim().is_empty() {
+                    emit(tail);
+                }
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            continue;
+        }
+        pending.extend_from_slice(&buf[..n]);
+        while let Some(idx) = pending.iter().position(|&b| b == b'\n') {
+            let raw: Vec<u8> = pending.drain(..=idx).collect();
+            let line = String::from_utf8_lossy(&raw[..raw.len().saturating_sub(1)]);
+            emit(line.trim_end_matches('\r'));
+        }
+    }
+}
+
+/// Build the minimal [`Recording`] the SABR resume path needs from a detached
+/// registry row (it reads `id`, `output_path`, and `take_group`).
+fn recording_from_detached(row: &DetachedRow) -> Recording {
+    Recording {
+        id: row.ref_id,
+        monitor_id: row.monitor_id.unwrap_or(0),
+        started_at: row.started_at,
+        ended_at: None,
+        status: "recording".into(),
+        bytes: 0,
+        exit_code: None,
+        output_path: row.final_path.clone(),
+        went_live_at: row.went_live_at,
+        went_live_approx: false,
+        lost_secs: None,
+        stream_id: row.stream_id.clone(),
+        take_group: row.take_group.clone(),
+        ad_count: 0,
+        ad_secs: 0,
+        meta_change_count: 0,
+        title: String::new(),
+        category: String::new(),
+        log_excerpt: String::new(),
+    }
+}
+
+/// The byte offset of the start of the final (possibly partial) line of `path`,
+/// so a re-attach tail begins on a line boundary and never splits a marker. If the
+/// file ends exactly on a newline (nothing partial) or on any error, returns its
+/// length. Only the trailing line is re-read, which is safe: ad inserts are
+/// idempotent and progress parsing is overwrite-only.
+async fn line_aligned_tail_offset(path: &Path) -> u64 {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let len = match tokio::fs::metadata(path).await {
+        Ok(m) => m.len(),
+        Err(_) => return 0,
+    };
+    if len == 0 {
+        return 0;
+    }
+    let window = len.min(64 * 1024);
+    let start = len - window;
+    let Ok(mut f) = tokio::fs::File::open(path).await else {
+        return len;
+    };
+    if f.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+        return len;
+    }
+    let mut buf = vec![0u8; window as usize];
+    if f.read_exact(&mut buf).await.is_err() {
+        return len;
+    }
+    if buf.last() == Some(&b'\n') {
+        return len; // ends on a newline — no partial trailing line
+    }
+    match buf.iter().rposition(|&b| b == b'\n') {
+        Some(idx) => start + idx as u64 + 1, // first byte after the last newline
+        None => start,                       // no newline in window
+    }
+}
+
+/// Read the last `max_lines` lines of a tool log — the failure-reason excerpt
+/// stored on the finished recording/video row.
+async fn read_log_tail(path: &Path, max_lines: usize) -> String {
+    let data = tokio::fs::read(path).await.unwrap_or_default();
+    let text = String::from_utf8_lossy(&data);
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
+}
+
+/// Spawn the ad-break processor for an [`AdSink`], returning the channel the log
+/// tailer pushes `(detected_at, duration)` pairs onto plus the task handle. For
+/// each break, the cut lands at the content captured so far — ad segments are
+/// filtered out, so the capture's media duration is that position (correct for
+/// live-edge and capture-from-start/DVR). Falls back to wall clock minus
+/// already-skipped ad time when ffprobe can't read the still-growing file yet.
+/// Shared by the in-session spawn and the re-attach path.
+fn spawn_ad_processor(
+    sink: AdSink,
+) -> (
+    mpsc::UnboundedSender<(i64, i64)>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (tx, mut rx) = mpsc::unbounded_channel::<(i64, i64)>();
+    let jh = tokio::spawn(async move {
+        let mut prior_ad_secs: i64 = 0;
+        let mut last_at: i64 = 0;
+        while let Some((detected_at, dur)) = rx.recv().await {
+            let mut probed = media_duration_secs(&sink.capture_path).await;
+            if probed.is_none() {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                probed = media_duration_secs(&sink.capture_path).await;
+            }
+            let at = match probed {
+                Some(d) => d,
+                None => {
+                    let anchor = match (sink.from_start, sink.went_live_at) {
+                        (true, Some(wl)) => wl,
+                        _ => sink.started_at,
+                    };
+                    (detected_at - anchor - prior_ad_secs).max(0)
+                }
+            };
+            // Cut positions only move forward; guard against a probe that
+            // momentarily reports a smaller duration.
+            let at = at.max(last_at);
+            last_at = at;
+            prior_ad_secs += dur;
+            // Mark the ad window so the UI can tint the row while it plays.
+            sink.ad_active
+                .lock()
+                .unwrap()
+                .insert(sink.monitor_id, detected_at + dur);
+            match sink.store.insert_ad_break(sink.recording_id, at, dur) {
+                Ok(_) => {
+                    info!(
+                        monitor_id = sink.monitor_id,
+                        rec_id = sink.recording_id,
+                        at,
+                        secs = dur,
+                        "ad break detected"
+                    );
+                    // Wake the UI so an expanded history tree refreshes its
+                    // Ads / Ad time columns.
+                    let _ = sink.events.send(AppEvent::MonitorState {
+                        monitor_id: sink.monitor_id,
+                        state: "recording".into(),
+                    });
+                }
+                Err(e) => warn!("insert ad_break failed: {e:#}"),
+            }
+        }
+    });
+    (tx, jh)
 }
 
 /// Parse a yt-dlp progress line
