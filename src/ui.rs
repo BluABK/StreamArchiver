@@ -1,4 +1,4 @@
-//! The on-demand egui window: channel table, add/edit form, and settings.
+﻿//! The on-demand egui window: channel table, add/edit form, and settings.
 //!
 //! Runs reactive (repaints only on input/events). The tray thread wakes it via
 //! `Context::request_repaint`. Closing the window hides it to the tray; the
@@ -1443,6 +1443,17 @@ fn schedule_copy_menu(ui: &mut egui::Ui, s: &UpcomingStream) {
         .clicked()
     {
         ui.ctx().open_url(egui::OpenUrl::new_tab(s.url.clone()));
+        ui.close();
+    }
+    ui.separator();
+    if ui.button("📺  Go to channel").clicked() {
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(egui::Id::new("sched_jump"), s.monitor_id));
+        ui.close();
+    }
+    if ui.button("▶  Start recording").clicked() {
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(egui::Id::new("sched_start"), s.monitor_id));
         ui.close();
     }
 }
@@ -3239,6 +3250,7 @@ impl StreamArchiverApp {
     }
 
     /// Modal confirmation for deleting a monitor (the only destructive action).
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
     fn confirm_delete_window(&mut self, ctx: &egui::Context) {
         let Some((id, name)) = self.confirm_delete.clone() else {
             return;
@@ -3247,24 +3259,31 @@ impl StreamArchiverApp {
         let mut do_delete = false;
         let mut do_cancel = false;
 
-        egui::Window::new("Delete monitor")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.label(format!("Delete this capture instance for “{name}”?"));
-                ui.label("Removes the monitor and its settings. Recorded files are kept.");
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Delete").clicked() {
-                        do_delete = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        do_cancel = true;
-                    }
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("del_monitor_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("Delete monitor")
+                .with_inner_size([380.0, 130.0])
+                .with_resizable(false),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label(format!("Delete this capture instance for “{name}”?"));
+                    ui.label("Removes the monitor and its settings. Recorded files are kept.");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Delete").clicked() {
+                            do_delete = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
                 });
-            });
+            },
+        );
 
         if do_delete {
             // Stop a running capture first so the process isn't orphaned when its
@@ -3290,6 +3309,7 @@ impl StreamArchiverApp {
 
     /// Modal confirmation for deleting a whole channel (and all its instances +
     /// their history rows; recorded files are kept).
+    #[allow(deprecated)]
     fn confirm_delete_channel_window(&mut self, ctx: &egui::Context) {
         let Some((id, name)) = self.confirm_delete_channel.clone() else {
             return;
@@ -3298,24 +3318,31 @@ impl StreamArchiverApp {
         let mut do_delete = false;
         let mut do_cancel = false;
 
-        egui::Window::new("Delete channel")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.label(format!("Delete the channel “{name}” and all its instances?"));
-                ui.label("Removes every instance and its history. Recorded files are kept.");
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Delete").clicked() {
-                        do_delete = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        do_cancel = true;
-                    }
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("del_channel_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("Delete channel")
+                .with_inner_size([400.0, 130.0])
+                .with_resizable(false),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label(format!("Delete the channel “{name}” and all its instances?"));
+                    ui.label("Removes every instance and its history. Recorded files are kept.");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Delete").clicked() {
+                            do_delete = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
                 });
-            });
+            },
+        );
 
         if do_delete {
             // Stop any of this channel's instances that are recording, so no
@@ -3343,6 +3370,7 @@ impl StreamArchiverApp {
     }
 
     /// Modal for creating a new channel container or renaming an existing one.
+    #[allow(deprecated)]
     fn channel_form_window(&mut self, ctx: &egui::Context) {
         if self.channel_form.is_none() {
             return;
@@ -3353,71 +3381,78 @@ impl StreamArchiverApp {
         let mut do_save = false;
         let mut do_cancel = false;
 
-        egui::Window::new(title)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .open(&mut open)
-            .show(ctx, |ui| {
-                let f = self.channel_form.as_mut().unwrap();
-                egui::Grid::new("channel_form_grid")
-                    .num_columns(2)
-                    .spacing([8.0, 6.0])
-                    .show(ui, |ui| {
-                        ui.label("Name");
-                        ui.text_edit_singleline(&mut f.name);
-                        ui.end_row();
-
-                        ui.label("Color");
-                        ui.horizontal(|ui| {
-                            // Colored swatch preview
-                            let swatch_color = if f.color.is_empty() {
-                                egui::Color32::from_gray(0x60)
-                            } else {
-                                parse_hex_color(&f.color)
-                                    .unwrap_or(egui::Color32::from_gray(0x60))
-                            };
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(20.0, 20.0),
-                                egui::Sense::hover(),
-                            );
-                            ui.painter().rect_filled(rect, 4.0, swatch_color);
-                            ui.painter().rect_stroke(
-                                rect,
-                                4.0,
-                                egui::Stroke::new(1.0, egui::Color32::from_gray(0x80)),
-                                egui::StrokeKind::Inside,
-                            );
-                            ui.add(
-                                egui::TextEdit::singleline(&mut f.color)
-                                    .hint_text("#rrggbb")
-                                    .desired_width(80.0),
-                            );
-                            if !f.color.is_empty() && ui.small_button("✕").clicked() {
-                                f.color.clear();
-                            }
-                        });
-                        ui.end_row();
-                    });
-                if !renaming {
-                    ui.label(
-                        egui::RichText::new(
-                            "A channel is a container — add instances (URLs to record) to it with ➕.",
-                        )
-                        .small()
-                        .color(egui::Color32::from_gray(0x90)),
-                    );
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("channel_form_vp"),
+            egui::ViewportBuilder::default()
+                .with_title(title.to_string())
+                .with_inner_size([380.0, 220.0])
+                .with_resizable(false),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
                 }
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Save").clicked() {
-                        do_save = true;
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let f = self.channel_form.as_mut().unwrap();
+                    egui::Grid::new("channel_form_grid")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Name");
+                            ui.text_edit_singleline(&mut f.name);
+                            ui.end_row();
+
+                            ui.label("Color");
+                            ui.horizontal(|ui| {
+                                // Colored swatch preview
+                                let swatch_color = if f.color.is_empty() {
+                                    egui::Color32::from_gray(0x60)
+                                } else {
+                                    parse_hex_color(&f.color)
+                                        .unwrap_or(egui::Color32::from_gray(0x60))
+                                };
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(20.0, 20.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().rect_filled(rect, 4.0, swatch_color);
+                                ui.painter().rect_stroke(
+                                    rect,
+                                    4.0,
+                                    egui::Stroke::new(1.0, egui::Color32::from_gray(0x80)),
+                                    egui::StrokeKind::Inside,
+                                );
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut f.color)
+                                        .hint_text("#rrggbb")
+                                        .desired_width(80.0),
+                                );
+                                if !f.color.is_empty() && ui.small_button("✕").clicked() {
+                                    f.color.clear();
+                                }
+                            });
+                            ui.end_row();
+                        });
+                    if !renaming {
+                        ui.label(
+                            egui::RichText::new(
+                                "A channel is a container — add instances (URLs to record) to it with ➕.",
+                            )
+                            .small()
+                            .color(egui::Color32::from_gray(0x90)),
+                        );
                     }
-                    if ui.button("Cancel").clicked() {
-                        do_cancel = true;
-                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            do_save = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
                 });
-            });
+            },
+        );
 
         if do_save {
             let f = self.channel_form.as_ref().unwrap();
@@ -4282,6 +4317,7 @@ impl StreamArchiverApp {
     }
 
     /// Window showing the result of a "List formats" probe.
+    #[allow(deprecated)]
     fn format_probe_window(&mut self, ctx: &egui::Context) {
         let probe = self.format_probe.lock().unwrap().clone();
         let (title, body, done) = match &probe {
@@ -4291,25 +4327,31 @@ impl StreamArchiverApp {
             FormatProbe::Failed(e) => ("Format probe failed", e.clone(), true),
         };
         let mut open = true;
-        egui::Window::new(title)
-            .collapsible(true)
-            .resizable(true)
-            .default_size([680.0, 460.0])
-            .open(&mut open)
-            .show(ctx, |ui| {
-                if done && ui.button("📋  Copy").clicked() {
-                    ui.ctx().copy_text(body.clone());
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("format_probe_vp"),
+            egui::ViewportBuilder::default()
+                .with_title(title.to_string())
+                .with_inner_size([680.0, 460.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
                 }
-                ui.add_space(4.0);
-                egui::ScrollArea::both()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(&body).monospace())
-                                .selectable(true),
-                        );
-                    });
-            });
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if done && ui.button("📋  Copy").clicked() {
+                        ui.ctx().copy_text(body.clone());
+                    }
+                    ui.add_space(4.0);
+                    egui::ScrollArea::both()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(&body).monospace())
+                                    .selectable(true),
+                            );
+                        });
+                });
+            },
+        );
         if !open {
             *self.format_probe.lock().unwrap() = FormatProbe::Idle;
         }
@@ -4317,6 +4359,7 @@ impl StreamArchiverApp {
 
     /// Window listing where ad breaks cause hard cuts in a take's finished file.
     /// Opened by double-clicking an Ads / Ad time cell.
+    #[allow(deprecated)]
     fn ad_popup_window(&mut self, ctx: &egui::Context) {
         let Some(rid) = self.ad_popup else {
             return;
@@ -4334,36 +4377,42 @@ impl StreamArchiverApp {
         let breaks = self.ad_break_cache.get(&rid).cloned().unwrap_or_default();
         let total: i64 = breaks.iter().map(|b| b.duration_secs).sum();
         let mut open = true;
-        egui::Window::new("Ad breaks — cut points")
-            .collapsible(false)
-            .resizable(true)
-            .default_size([360.0, 240.0])
-            .open(&mut open)
-            .show(ctx, |ui| {
-                if breaks.is_empty() {
-                    ui.label("No ad breaks recorded for this take.");
-                    return;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("ad_breaks_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("Ad breaks — cut points")
+                .with_inner_size([360.0, 260.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
                 }
-                ui.label(format!(
-                    "{} ad break(s), {} total. Each is a hard cut in the recorded file \
-                     (streamlink filters ad segments out).",
-                    breaks.len(),
-                    fmt_duration(total),
-                ));
-                ui.add_space(6.0);
-                let lines = ad_cut_lines(&breaks);
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        for line in &lines {
-                            ui.label(egui::RichText::new(line).monospace());
-                        }
-                    });
-                ui.add_space(6.0);
-                if ui.button("📋  Copy").clicked() {
-                    ui.ctx().copy_text(lines.join("\n"));
-                }
-            });
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if breaks.is_empty() {
+                        ui.label("No ad breaks recorded for this take.");
+                        return;
+                    }
+                    ui.label(format!(
+                        "{} ad break(s), {} total. Each is a hard cut in the recorded file \
+                         (streamlink filters ad segments out).",
+                        breaks.len(),
+                        fmt_duration(total),
+                    ));
+                    ui.add_space(6.0);
+                    let lines = ad_cut_lines(&breaks);
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for line in &lines {
+                                ui.label(egui::RichText::new(line).monospace());
+                            }
+                        });
+                    ui.add_space(6.0);
+                    if ui.button("📋  Copy").clicked() {
+                        ui.ctx().copy_text(lines.join("\n"));
+                    }
+                });
+            },
+        );
         if !open {
             self.ad_popup = None;
         }
@@ -4381,6 +4430,7 @@ impl StreamArchiverApp {
         }
     }
 
+    #[allow(deprecated)]
     fn meta_popup_window(&mut self, ctx: &egui::Context) {
         let Some(popup) = self.meta_popup.clone() else {
             return;
@@ -4406,42 +4456,48 @@ impl StreamArchiverApp {
             }
         };
         let mut open = true;
-        egui::Window::new("Title & category changes")
-            .collapsible(false)
-            .resizable(true)
-            .default_size([460.0, 260.0])
-            .open(&mut open)
-            .show(ctx, |ui| {
-                // Only actual changes (the initial value of each field is the
-                // starting state, not a change); shown as `old → new`.
-                let lines = meta_change_lines(&changes);
-                if lines.is_empty() {
-                    ui.label("No title or category changes recorded.");
-                    return;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("title_changes_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("Title & category changes")
+                .with_inner_size([460.0, 280.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
                 }
-                let scope = if multi {
-                    "across this stream's takes"
-                } else {
-                    "during this recording"
-                };
-                ui.label(format!(
-                    "{} change(s) {scope} (offset from the start; each shows the \
-                     value before → after).",
-                    lines.len(),
-                ));
-                ui.add_space(6.0);
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        for line in &lines {
-                            ui.label(egui::RichText::new(line).monospace());
-                        }
-                    });
-                ui.add_space(6.0);
-                if ui.button("📋  Copy").clicked() {
-                    ui.ctx().copy_text(lines.join("\n"));
-                }
-            });
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    // Only actual changes (the initial value of each field is the
+                    // starting state, not a change); shown as `old → new`.
+                    let lines = meta_change_lines(&changes);
+                    if lines.is_empty() {
+                        ui.label("No title or category changes recorded.");
+                        return;
+                    }
+                    let scope = if multi {
+                        "across this stream's takes"
+                    } else {
+                        "during this recording"
+                    };
+                    ui.label(format!(
+                        "{} change(s) {scope} (offset from the start; each shows the \
+                         value before → after).",
+                        lines.len(),
+                    ));
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for line in &lines {
+                                ui.label(egui::RichText::new(line).monospace());
+                            }
+                        });
+                    ui.add_space(6.0);
+                    if ui.button("📋  Copy").clicked() {
+                        ui.ctx().copy_text(lines.join("\n"));
+                    }
+                });
+            },
+        );
         if !open {
             self.meta_popup = None;
         }
@@ -4449,6 +4505,7 @@ impl StreamArchiverApp {
 
     /// Window listing a monitor's upcoming scheduled streams (datetime — title).
     /// Opened by double-clicking a Next stream cell.
+    #[allow(deprecated)]
     fn schedule_popup_window(&mut self, ctx: &egui::Context) {
         let Some(mid) = self.schedule_popup else {
             return;
@@ -4463,41 +4520,47 @@ impl StreamArchiverApp {
         }
         let segs = self.schedule_cache.get(&mid).cloned().unwrap_or_default();
         let mut open = true;
-        egui::Window::new("Upcoming streams")
-            .collapsible(false)
-            .resizable(true)
-            .default_size([460.0, 260.0])
-            .open(&mut open)
-            .show(ctx, |ui| {
-                if segs.is_empty() {
-                    ui.label("No upcoming scheduled streams.");
-                    return;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("upcoming_streams_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("Upcoming streams")
+                .with_inner_size([460.0, 280.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
                 }
-                ui.label(format!("{} upcoming scheduled stream(s).", segs.len()));
-                ui.add_space(6.0);
-                let lines: Vec<String> = segs
-                    .iter()
-                    .map(|s| {
-                        let when = fmt_datetime_short(s.start_time);
-                        if s.category.is_empty() {
-                            format!("{when}  —  {}", s.title)
-                        } else {
-                            format!("{when}  —  {}  ({})", s.title, s.category)
-                        }
-                    })
-                    .collect();
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        for l in &lines {
-                            ui.label(egui::RichText::new(l).monospace());
-                        }
-                    });
-                ui.add_space(6.0);
-                if ui.button("📋  Copy").clicked() {
-                    ui.ctx().copy_text(lines.join("\n"));
-                }
-            });
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if segs.is_empty() {
+                        ui.label("No upcoming scheduled streams.");
+                        return;
+                    }
+                    ui.label(format!("{} upcoming scheduled stream(s).", segs.len()));
+                    ui.add_space(6.0);
+                    let lines: Vec<String> = segs
+                        .iter()
+                        .map(|s| {
+                            let when = fmt_datetime_short(s.start_time);
+                            if s.category.is_empty() {
+                                format!("{when}  —  {}", s.title)
+                            } else {
+                                format!("{when}  —  {}  ({})", s.title, s.category)
+                            }
+                        })
+                        .collect();
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for l in &lines {
+                                ui.label(egui::RichText::new(l).monospace());
+                            }
+                        });
+                    ui.add_space(6.0);
+                    if ui.button("📋  Copy").clicked() {
+                        ui.ctx().copy_text(lines.join("\n"));
+                    }
+                });
+            },
+        );
         if !open {
             self.schedule_popup = None;
         }
@@ -4784,6 +4847,22 @@ impl StreamArchiverApp {
             self.core.request_schedule_refresh();
             self.reload_schedule();
             self.status = "Fetching latest schedules…".into();
+        }
+        // Context-menu actions written into egui temp storage by schedule_copy_menu
+        // (closures can't borrow `self` directly when deep inside panel closures).
+        if let Some(mid) = ui
+            .ctx()
+            .data_mut(|d| d.remove_temp::<i64>(egui::Id::new("sched_jump")))
+        {
+            self.view = View::Streams;
+            self.selected_monitor = Some(mid);
+        }
+        if let Some(mid) = ui
+            .ctx()
+            .data_mut(|d| d.remove_temp::<i64>(egui::Id::new("sched_start")))
+        {
+            self.core.manual(ManualCommand::Start(mid));
+            self.status = "Checking channel… will record if live.".into();
         }
     }
 
@@ -5185,6 +5264,7 @@ impl StreamArchiverApp {
 
     /// Popup listing every (visible) stream on one calendar day, with the same
     /// per-entry copy menu as the calendar chips.
+    #[allow(deprecated)]
     fn schedule_day_window(&mut self, ctx: &egui::Context) {
         let Some(date) = self.schedule_day_popup else {
             return;
@@ -5207,38 +5287,44 @@ impl StreamArchiverApp {
 
         let mut open = true;
         let mut copy_all: Option<String> = None;
-        egui::Window::new(format!("Streams · {heading}"))
-            .collapsible(false)
-            .resizable(true)
-            .default_size([480.0, 340.0])
-            .open(&mut open)
-            .show(ctx, |ui| {
-                if entries.is_empty() {
-                    ui.label("No streams scheduled this day.");
-                    return;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("schedule_day_vp"),
+            egui::ViewportBuilder::default()
+                .with_title(format!("Streams · {heading}"))
+                .with_inner_size([480.0, 360.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
                 }
-                ui.label(format!("{} scheduled stream(s).", entries.len()));
-                ui.add_space(6.0);
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        for s in &entries {
-                            // The popup doesn't carry the collision set; the calendar
-                            // surfaces ⚠ markers, so rows here are shown unmarked.
-                            schedule_detail_row(ui, s, false, &ptex);
-                        }
-                    });
-                ui.add_space(6.0);
-                if ui.button("📋  Copy all").clicked() {
-                    copy_all = Some(
-                        entries
-                            .iter()
-                            .map(|s| schedule_detail_line(s))
-                            .collect::<Vec<_>>()
-                            .join("\n\n"),
-                    );
-                }
-            });
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if entries.is_empty() {
+                        ui.label("No streams scheduled this day.");
+                        return;
+                    }
+                    ui.label(format!("{} scheduled stream(s).", entries.len()));
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for s in &entries {
+                                // The popup doesn't carry the collision set; the calendar
+                                // surfaces ⚠ markers, so rows here are shown unmarked.
+                                schedule_detail_row(ui, s, false, &ptex);
+                            }
+                        });
+                    ui.add_space(6.0);
+                    if ui.button("📋  Copy all").clicked() {
+                        copy_all = Some(
+                            entries
+                                .iter()
+                                .map(|s| schedule_detail_line(s))
+                                .collect::<Vec<_>>()
+                                .join("\n\n"),
+                        );
+                    }
+                });
+            },
+        );
         if let Some(t) = copy_all {
             ctx.copy_text(t);
         }
@@ -7240,6 +7326,7 @@ impl StreamArchiverApp {
     /// Task-manager-style dialog listing every spawned download tool process with
     /// its PID, status, and uptime, plus per-process Stop (graceful) / Kill (force)
     /// and reveal-log/folder actions. Doubles as a live list of spawned processes.
+    #[allow(deprecated)]
     fn processes_window(&mut self, ctx: &egui::Context) {
         use crate::models::DetachedKind;
         use egui_extras::{Column, TableBuilder};
@@ -7269,117 +7356,124 @@ impl StreamArchiverApp {
         }
         let mut act: Option<Act> = None;
 
-        egui::Window::new("🖥 Processes")
-            .open(&mut open)
-            .resizable(true)
-            .default_width(760.0)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(format!("{} spawned process(es)", self.processes.len()));
-                    if ui.button("⟳ Refresh").clicked() {
-                        act = Some(Act::Refresh);
-                    }
-                    ui.weak("Stop = graceful (file finalized) · Kill = force-terminate the tree");
-                });
-                ui.separator();
-                if self.processes.is_empty() {
-                    ui.weak("No download tool processes are running.");
-                    return;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("processes_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("🖥 Processes")
+                .with_inner_size([800.0, 440.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
                 }
-                TableBuilder::new(ui)
-                    .striped(true)
-                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                    .column(Column::auto()) // PID
-                    .column(Column::auto()) // Type
-                    .column(Column::remainder().clip(true)) // Name
-                    .column(Column::auto()) // Tool
-                    .column(Column::auto()) // Status
-                    .column(Column::auto()) // Uptime
-                    .column(Column::auto()) // Actions
-                    .header(20.0, |mut h| {
-                        h.col(|ui| { ui.strong("PID"); });
-                        h.col(|ui| { ui.strong("Type"); });
-                        h.col(|ui| { ui.strong("Name"); });
-                        h.col(|ui| { ui.strong("Tool"); });
-                        h.col(|ui| { ui.strong("Status"); });
-                        h.col(|ui| { ui.strong("Uptime"); });
-                        h.col(|ui| { ui.strong("Actions"); });
-                    })
-                    .body(|mut body| {
-                        for (i, p) in self.processes.iter().enumerate() {
-                            body.row(22.0, |mut row| {
-                                row.col(|ui| { ui.monospace(p.pid.to_string()); });
-                                row.col(|ui| {
-                                    let t = match p.kind {
-                                        DetachedKind::Recording => {
-                                            if p.secondary { "rec · dash" } else { "recording" }
-                                        }
-                                        DetachedKind::Video => "video",
-                                        DetachedKind::Chat => "chat",
-                                    };
-                                    ui.label(t);
-                                });
-                                row.col(|ui| {
-                                    ui.label(&p.name).on_hover_text(&p.capture_path);
-                                });
-                                row.col(|ui| { ui.label(&p.tool); });
-                                row.col(|ui| {
-                                    if !p.alive {
-                                        ui.colored_label(
-                                            egui::Color32::from_rgb(0xe0, 0x6c, 0x6c),
-                                            "✘ dead",
-                                        );
-                                    } else if p.reattached {
-                                        ui.colored_label(
-                                            egui::Color32::from_rgb(0x6c, 0xb0, 0xe0),
-                                            "⛓ re-attached",
-                                        )
-                                        .on_hover_text(format!(
-                                            "running under a prior build: {}",
-                                            p.spawn_build
-                                        ));
-                                    } else {
-                                        ui.colored_label(
-                                            egui::Color32::from_rgb(0x6c, 0xe0, 0x8c),
-                                            "● running",
-                                        );
-                                    }
-                                });
-                                row.col(|ui| {
-                                    ui.label(fmt_duration_secs((now - p.started_at).max(0)));
-                                });
-                                row.col(|ui| {
-                                    if ui
-                                        .small_button("Stop")
-                                        .on_hover_text(
-                                            "Graceful: stop the tool and let the app finalize \
-                                             (remux + mark the take stopped).",
-                                        )
-                                        .clicked()
-                                    {
-                                        act = Some(Act::Stop(i));
-                                    }
-                                    if ui
-                                        .small_button("Kill")
-                                        .on_hover_text(
-                                            "Force-terminate the whole process tree now — the \
-                                             capture may be left un-finalized.",
-                                        )
-                                        .clicked()
-                                    {
-                                        act = Some(Act::Kill(i));
-                                    }
-                                    if ui.small_button("Log").on_hover_text(&p.log_path).clicked() {
-                                        act = Some(Act::RevealLog(i));
-                                    }
-                                    if ui.small_button("Folder").clicked() {
-                                        act = Some(Act::RevealDir(i));
-                                    }
-                                });
-                            });
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{} spawned process(es)", self.processes.len()));
+                        if ui.button("⟳ Refresh").clicked() {
+                            act = Some(Act::Refresh);
                         }
+                        ui.weak("Stop = graceful (file finalized) · Kill = force-terminate the tree");
                     });
-            });
+                    ui.separator();
+                    if self.processes.is_empty() {
+                        ui.weak("No download tool processes are running.");
+                        return;
+                    }
+                    TableBuilder::new(ui)
+                        .striped(true)
+                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                        .column(Column::auto()) // PID
+                        .column(Column::auto()) // Type
+                        .column(Column::remainder().clip(true)) // Name
+                        .column(Column::auto()) // Tool
+                        .column(Column::auto()) // Status
+                        .column(Column::auto()) // Uptime
+                        .column(Column::auto()) // Actions
+                        .header(20.0, |mut h| {
+                            h.col(|ui| { ui.strong("PID"); });
+                            h.col(|ui| { ui.strong("Type"); });
+                            h.col(|ui| { ui.strong("Name"); });
+                            h.col(|ui| { ui.strong("Tool"); });
+                            h.col(|ui| { ui.strong("Status"); });
+                            h.col(|ui| { ui.strong("Uptime"); });
+                            h.col(|ui| { ui.strong("Actions"); });
+                        })
+                        .body(|mut body| {
+                            for (i, p) in self.processes.iter().enumerate() {
+                                body.row(22.0, |mut row| {
+                                    row.col(|ui| { ui.monospace(p.pid.to_string()); });
+                                    row.col(|ui| {
+                                        let t = match p.kind {
+                                            DetachedKind::Recording => {
+                                                if p.secondary { "rec · dash" } else { "recording" }
+                                            }
+                                            DetachedKind::Video => "video",
+                                            DetachedKind::Chat => "chat",
+                                        };
+                                        ui.label(t);
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(&p.name).on_hover_text(&p.capture_path);
+                                    });
+                                    row.col(|ui| { ui.label(&p.tool); });
+                                    row.col(|ui| {
+                                        if !p.alive {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(0xe0, 0x6c, 0x6c),
+                                                "✘ dead",
+                                            );
+                                        } else if p.reattached {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(0x6c, 0xb0, 0xe0),
+                                                "⛓ re-attached",
+                                            )
+                                            .on_hover_text(format!(
+                                                "running under a prior build: {}",
+                                                p.spawn_build
+                                            ));
+                                        } else {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(0x6c, 0xe0, 0x8c),
+                                                "● running",
+                                            );
+                                        }
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(fmt_duration_secs((now - p.started_at).max(0)));
+                                    });
+                                    row.col(|ui| {
+                                        if ui
+                                            .small_button("Stop")
+                                            .on_hover_text(
+                                                "Graceful: stop the tool and let the app finalize \
+                                                 (remux + mark the take stopped).",
+                                            )
+                                            .clicked()
+                                        {
+                                            act = Some(Act::Stop(i));
+                                        }
+                                        if ui
+                                            .small_button("Kill")
+                                            .on_hover_text(
+                                                "Force-terminate the whole process tree now — the \
+                                                 capture may be left un-finalized.",
+                                            )
+                                            .clicked()
+                                        {
+                                            act = Some(Act::Kill(i));
+                                        }
+                                        if ui.small_button("Log").on_hover_text(&p.log_path).clicked() {
+                                            act = Some(Act::RevealLog(i));
+                                        }
+                                        if ui.small_button("Folder").clicked() {
+                                            act = Some(Act::RevealDir(i));
+                                        }
+                                    });
+                                });
+                            }
+                        });
+                });
+            },
+        );
 
         if !open {
             self.show_processes = false;
@@ -7416,6 +7510,7 @@ impl StreamArchiverApp {
         }
     }
 
+    #[allow(deprecated)]
     fn form_window(&mut self, ctx: &egui::Context) {
         if self.form.is_none() {
             return;
@@ -7433,12 +7528,16 @@ impl StreamArchiverApp {
             "Add stream (new channel)"
         };
 
-        egui::Window::new(title)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .open(&mut open)
-            .show(ctx, |ui| {
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("monitor_form_vp"),
+            egui::ViewportBuilder::default()
+                .with_title(title.to_string())
+                .with_inner_size([700.0, 600.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
                 let form = self.form.as_mut().unwrap();
                 let platform = Platform::detect(&form.url);
                 // When the URL's platform changes, re-apply that platform's
@@ -7675,7 +7774,9 @@ impl StreamArchiverApp {
                         do_cancel = true;
                     }
                 });
-            });
+                });
+            },
+        );
 
         if do_save {
             self.save_form();
@@ -7736,6 +7837,7 @@ impl StreamArchiverApp {
         });
     }
 
+    #[allow(deprecated)]
     fn chat_popup_window(&mut self, ctx: &egui::Context) {
         const CHAT_RELOAD_SECS: u64 = 3;
         let Some(popup) = &mut self.chat_popup else {
@@ -7766,152 +7868,159 @@ impl StreamArchiverApp {
                 None
             };
 
-        egui::Window::new(&title)
-            .open(&mut open)
-            .default_size([480.0, 600.0])
-            .resizable(true)
-            .show(ctx, |ui| {
-                // ── Toolbar ──────────────────────────────────────────────
-                ui.horizontal(|ui| {
-                    // Recording picker: only if >1 recording has a chat file.
-                    let recs_with_chat: Vec<_> = popup
-                        .all_recordings
-                        .iter()
-                        .filter(|r| chat_file_for_recording(r).is_some())
-                        .collect();
-                    if recs_with_chat.len() > 1 {
-                        let cur_label = popup
-                            .recording
-                            .as_ref()
-                            .map(fmt_recording_label)
-                            .unwrap_or_default();
-                        egui::ComboBox::from_id_salt("chat_rec_pick")
-                            .selected_text(cur_label)
-                            .show_ui(ui, |ui| {
-                                for rec in &recs_with_chat {
-                                    let label = fmt_recording_label(rec);
-                                    let selected = popup
-                                        .recording
-                                        .as_ref()
-                                        .map(|r| r.id == rec.id)
-                                        .unwrap_or(false);
-                                    if ui.selectable_label(selected, &label).clicked() {
-                                        let new_rec = (*rec).clone();
-                                        let state = Arc::new(Mutex::new(ChatLoadState::Loading));
-                                        let state2 = state.clone();
-                                        let path_opt = chat_file_for_recording(&new_rec);
-                                        let start_ts =
-                                            new_rec.went_live_at.unwrap_or(new_rec.started_at);
-                                        popup.load_state = state;
-                                        popup.recording = Some(new_rec);
-                                        popup.last_reload = std::time::Instant::now();
-                                        self.core.rt.spawn(async move {
-                                            let r = tokio::task::spawn_blocking(move || {
-                                                match path_opt {
-                                                    None => ChatLoadState::NoFile,
-                                                    Some(p) => {
-                                                        match parse_chat_file(&p, start_ts) {
-                                                            Ok(m) => ChatLoadState::Loaded(m),
-                                                            Err(e) => {
-                                                                ChatLoadState::Error(e.to_string())
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("chat_popup_vp"),
+            egui::ViewportBuilder::default()
+                .with_title(title.clone())
+                .with_inner_size([480.0, 600.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    // ── Toolbar ──────────────────────────────────────────────
+                    ui.horizontal(|ui| {
+                        // Recording picker: only if >1 recording has a chat file.
+                        let recs_with_chat: Vec<_> = popup
+                            .all_recordings
+                            .iter()
+                            .filter(|r| chat_file_for_recording(r).is_some())
+                            .collect();
+                        if recs_with_chat.len() > 1 {
+                            let cur_label = popup
+                                .recording
+                                .as_ref()
+                                .map(fmt_recording_label)
+                                .unwrap_or_default();
+                            egui::ComboBox::from_id_salt("chat_rec_pick")
+                                .selected_text(cur_label)
+                                .show_ui(ui, |ui| {
+                                    for rec in &recs_with_chat {
+                                        let label = fmt_recording_label(rec);
+                                        let selected = popup
+                                            .recording
+                                            .as_ref()
+                                            .map(|r| r.id == rec.id)
+                                            .unwrap_or(false);
+                                        if ui.selectable_label(selected, &label).clicked() {
+                                            let new_rec = (*rec).clone();
+                                            let state = Arc::new(Mutex::new(ChatLoadState::Loading));
+                                            let state2 = state.clone();
+                                            let path_opt = chat_file_for_recording(&new_rec);
+                                            let start_ts =
+                                                new_rec.went_live_at.unwrap_or(new_rec.started_at);
+                                            popup.load_state = state;
+                                            popup.recording = Some(new_rec);
+                                            popup.last_reload = std::time::Instant::now();
+                                            self.core.rt.spawn(async move {
+                                                let r = tokio::task::spawn_blocking(move || {
+                                                    match path_opt {
+                                                        None => ChatLoadState::NoFile,
+                                                        Some(p) => {
+                                                            match parse_chat_file(&p, start_ts) {
+                                                                Ok(m) => ChatLoadState::Loaded(m),
+                                                                Err(e) => {
+                                                                    ChatLoadState::Error(e.to_string())
+                                                                }
                                                             }
                                                         }
                                                     }
-                                                }
-                                            })
-                                            .await
-                                            .unwrap_or_else(|e| {
-                                                ChatLoadState::Error(e.to_string())
+                                                })
+                                                .await
+                                                .unwrap_or_else(|e| {
+                                                    ChatLoadState::Error(e.to_string())
+                                                });
+                                                *state2.lock().unwrap() = r;
                                             });
-                                            *state2.lock().unwrap() = r;
-                                        });
+                                        }
                                     }
-                                }
-                            });
-                        ui.separator();
-                    }
-
-                    // Search filter
-                    ui.label("🔍");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut popup.search)
-                            .hint_text("Filter…")
-                            .desired_width(150.0),
-                    );
-                    if !popup.search.is_empty() && ui.small_button("✕").clicked() {
-                        popup.search.clear();
-                    }
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.toggle_value(&mut popup.full_view, "View full");
-                    });
-                });
-                ui.separator();
-
-                // ── Content ──────────────────────────────────────────────
-                let state = popup.load_state.lock().unwrap().clone();
-                match state {
-                    ChatLoadState::Loading => {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label("Loading chat…");
-                        });
-                        ctx.request_repaint();
-                    }
-                    ChatLoadState::NoFile => {
-                        ui.add_space(8.0);
-                        ui.label("No chat file found for this recording.");
-                        ui.weak("Chat logging must be enabled and a recording must exist.");
-                    }
-                    ChatLoadState::Error(ref e) => {
-                        ui.colored_label(egui::Color32::RED, format!("Failed to load: {e}"));
-                    }
-                    ChatLoadState::Loaded(ref msgs) => {
-                        let q = popup.search.to_lowercase();
-                        let all_filtered: Vec<&ChatMessage> = msgs
-                            .iter()
-                            .filter(|m| {
-                                q.is_empty()
-                                    || m.text.to_lowercase().contains(&q)
-                                    || m.author.to_lowercase().contains(&q)
-                            })
-                            .collect();
-
-                        const DEFAULT_CAP: usize = 500;
-                        let (visible, capped) =
-                            if popup.full_view || all_filtered.len() <= DEFAULT_CAP {
-                                (all_filtered.as_slice(), false)
-                            } else {
-                                (&all_filtered[all_filtered.len() - DEFAULT_CAP..], true)
-                            };
-
-                        if capped {
-                            ui.horizontal(|ui| {
-                                ui.weak(format!(
-                                    "Showing last {DEFAULT_CAP} of {} messages",
-                                    all_filtered.len()
-                                ));
-                                if ui.small_button("View full").clicked() {
-                                    popup.full_view = true;
-                                }
-                            });
-                        } else {
-                            ui.weak(format!("{} messages", all_filtered.len()));
+                                });
+                            ui.separator();
                         }
 
-                        let stick = q.is_empty() && !popup.full_view;
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .stick_to_bottom(stick)
-                            .show(ui, |ui| {
-                                ui.spacing_mut().item_spacing.y = 2.0;
-                                for msg in visible {
-                                    render_chat_message(ui, msg);
-                                }
+                        // Search filter
+                        ui.label("🔍");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut popup.search)
+                                .hint_text("Filter…")
+                                .desired_width(150.0),
+                        );
+                        if !popup.search.is_empty() && ui.small_button("✕").clicked() {
+                            popup.search.clear();
+                        }
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.toggle_value(&mut popup.full_view, "View full");
+                        });
+                    });
+                    ui.separator();
+
+                    // ── Content ──────────────────────────────────────────────
+                    let state = popup.load_state.lock().unwrap().clone();
+                    match state {
+                        ChatLoadState::Loading => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Loading chat…");
                             });
+                            ctx.request_repaint();
+                        }
+                        ChatLoadState::NoFile => {
+                            ui.add_space(8.0);
+                            ui.label("No chat file found for this recording.");
+                            ui.weak("Chat logging must be enabled and a recording must exist.");
+                        }
+                        ChatLoadState::Error(ref e) => {
+                            ui.colored_label(egui::Color32::RED, format!("Failed to load: {e}"));
+                        }
+                        ChatLoadState::Loaded(ref msgs) => {
+                            let q = popup.search.to_lowercase();
+                            let all_filtered: Vec<&ChatMessage> = msgs
+                                .iter()
+                                .filter(|m| {
+                                    q.is_empty()
+                                        || m.text.to_lowercase().contains(&q)
+                                        || m.author.to_lowercase().contains(&q)
+                                })
+                                .collect();
+
+                            const DEFAULT_CAP: usize = 500;
+                            let (visible, capped) =
+                                if popup.full_view || all_filtered.len() <= DEFAULT_CAP {
+                                    (all_filtered.as_slice(), false)
+                                } else {
+                                    (&all_filtered[all_filtered.len() - DEFAULT_CAP..], true)
+                                };
+
+                            if capped {
+                                ui.horizontal(|ui| {
+                                    ui.weak(format!(
+                                        "Showing last {DEFAULT_CAP} of {} messages",
+                                        all_filtered.len()
+                                    ));
+                                    if ui.small_button("View full").clicked() {
+                                        popup.full_view = true;
+                                    }
+                                });
+                            } else {
+                                ui.weak(format!("{} messages", all_filtered.len()));
+                            }
+
+                            let stick = q.is_empty() && !popup.full_view;
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .stick_to_bottom(stick)
+                                .show(ui, |ui| {
+                                    ui.spacing_mut().item_spacing.y = 2.0;
+                                    for msg in visible {
+                                        render_chat_message(ui, msg);
+                                    }
+                                });
+                        }
                     }
-                }
-            });
+                });
+            },
+        );
 
         // Tail-reload: re-parse the chat file in the background while the
         // recording is still live so new messages appear without re-opening.
@@ -7942,6 +8051,7 @@ impl StreamArchiverApp {
         }
     }
 
+    #[allow(deprecated)]
     fn properties_window(&mut self, ctx: &egui::Context) {
         let Some(mid) = self.properties_popup else { return };
         let Some(row) = self.rows.iter().find(|r| r.monitor.id == mid).cloned() else {
@@ -7964,13 +8074,16 @@ impl StreamArchiverApp {
             .clone();
 
         let mut open = true;
-        egui::Window::new(format!("Properties — {}", ch.name))
-            .id(egui::Id::new("properties_popup"))
-            .collapsible(false)
-            .resizable(true)
-            .default_width(420.0)
-            .open(&mut open)
-            .show(ctx, |ui| {
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("properties_vp"),
+            egui::ViewportBuilder::default()
+                .with_title(format!("Properties — {}", ch.name))
+                .with_inner_size([480.0, 600.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
                 // ── Header ──────────────────────────────────────────────
                 ui.horizontal(|ui| {
                     if let Some(tex) = &icon_tex {
@@ -8199,7 +8312,9 @@ impl StreamArchiverApp {
                         });
 
                 }
-            });
+                });
+            },
+        );
 
         if !open {
             self.properties_popup = None;
