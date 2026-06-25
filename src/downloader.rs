@@ -1075,13 +1075,18 @@ impl Supervisor {
         broadcaster_id: Option<String>,
         force: bool,
     ) {
+        let platform = row.monitor.platform();
+        // Per-platform asset dir: one container can hold the same creator on
+        // Twitch + YouTube + Kick, each with its own icon/banner/badges/emotes —
+        // namespacing by platform keeps them from overwriting each other (and the
+        // 24h freshness stamp becomes per-(channel, platform) for free).
         let asset_dir = crate::app_paths::asset_cache_dir()
             .join("channel_assets")
-            .join(sanitize_filename(&row.channel.name));
+            .join(sanitize_filename(&row.channel.name))
+            .join(platform.as_str());
         if !force && !crate::assets::should_refetch_assets(&asset_dir) {
             return;
         }
-        let platform = row.monitor.platform();
         let http = self.ctx.http_client();
         let ctx = self.ctx.clone();
         let store = self.store.clone();
@@ -1229,7 +1234,8 @@ impl Supervisor {
             .is_empty();
         let recording: std::collections::HashSet<i64> =
             self.active.lock().unwrap().keys().copied().collect();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<(String, Platform)> =
+            std::collections::HashSet::new();
         for row in &rows {
             if !row.monitor.enabled || !row.monitor.fetch_chat_assets {
                 continue;
@@ -1241,8 +1247,10 @@ impl Supervisor {
             if row.monitor.platform() == Platform::YouTube && !yt_key_set {
                 continue;
             }
-            // Instances of one channel share an asset dir — fetch it once per pass.
-            if !seen.insert(sanitize_filename(&row.channel.name)) {
+            // Instances of one (channel, platform) share an asset dir — fetch it
+            // once per pass. Keyed by platform too so a container that spans
+            // Twitch + YouTube refreshes BOTH (not just the first one seen).
+            if !seen.insert((sanitize_filename(&row.channel.name), row.monitor.platform())) {
                 continue;
             }
             // force=false: a no-op when the channel's assets are still fresh.
@@ -4749,6 +4757,7 @@ mod tests {
                 platform,
                 created_at: 0,
                 color: String::new(),
+                preferred_platform: None,
             },
             monitor: Monitor {
                 id: 7,

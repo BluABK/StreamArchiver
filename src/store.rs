@@ -18,7 +18,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 24;
+const SCHEMA_VERSION: i64 = 25;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -420,7 +420,17 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 24)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 24);
+        if version < 25 {
+            // Per-channel "preferred asset platform": which platform's profile
+            // pic / banner represents the container (it can hold the same creator
+            // on Twitch + YouTube + Kick, each with its own assets, now stored in
+            // per-platform asset subdirs). Empty = auto (first available).
+            conn.execute_batch(
+                "ALTER TABLE channel ADD COLUMN preferred_platform TEXT NOT NULL DEFAULT '';",
+            )?;
+            conn.pragma_update(None, "user_version", 25)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 25);
         Ok(())
     }
 
@@ -464,7 +474,8 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let ch = conn
             .query_row(
-                "SELECT id, name, url, platform, created_at, color FROM channel WHERE url = ?1",
+                "SELECT id, name, url, platform, created_at, color, preferred_platform \
+                 FROM channel WHERE url = ?1",
                 params![url],
                 Self::map_channel,
             )
@@ -500,7 +511,7 @@ impl Store {
     pub fn list_channels(&self) -> Result<Vec<Channel>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, url, platform, created_at, color FROM channel
+            "SELECT id, name, url, platform, created_at, color, preferred_platform FROM channel
              ORDER BY name COLLATE NOCASE, id",
         )?;
         let rows = stmt
@@ -532,6 +543,22 @@ impl Store {
         conn.execute(
             "UPDATE channel SET color = ?2 WHERE id = ?1",
             params![id, color],
+        )?;
+        Ok(())
+    }
+
+    /// Set (or clear) the preferred asset platform for a channel container — the
+    /// platform whose profile pic / banner represents it. `None` reverts to auto
+    /// (the first instance-platform that has a fetched icon).
+    pub fn set_channel_preferred_platform(
+        &self,
+        id: i64,
+        platform: Option<Platform>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE channel SET preferred_platform = ?2 WHERE id = ?1",
+            params![id, platform.map(|p| p.as_str()).unwrap_or("")],
         )?;
         Ok(())
     }
@@ -1176,7 +1203,8 @@ impl Store {
                           WHERE smc.recording_id = r.id AND smc.kind = 'category'
                           ORDER BY smc.at_secs DESC, smc.id DESC LIMIT 1), ''),
                 c.color,
-                m.dual_capture
+                m.dual_capture,
+                c.preferred_platform
              FROM monitor m
              JOIN channel c ON c.id = m.channel_id
              LEFT JOIN recording r
@@ -1192,6 +1220,7 @@ impl Store {
                     platform: Platform::parse(&r.get::<_, String>(3)?),
                     created_at: r.get(4)?,
                     color: r.get(43)?,
+                    preferred_platform: Platform::parse_opt(&r.get::<_, String>(45)?),
                 };
                 let monitor = Monitor {
                     id: r.get(5)?,
@@ -1571,6 +1600,7 @@ impl Store {
             platform: Platform::parse(&r.get::<_, String>(3)?),
             created_at: r.get(4)?,
             color: r.get(5)?,
+            preferred_platform: Platform::parse_opt(&r.get::<_, String>(6)?),
         })
     }
 }

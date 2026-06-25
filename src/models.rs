@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Streaming platform a channel belongs to. Drives default detection/tool choice.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Platform {
     Twitch,
     YouTube,
@@ -47,6 +47,18 @@ impl Platform {
             "youtube" => Platform::YouTube,
             "kick" => Platform::Kick,
             _ => Platform::Generic,
+        }
+    }
+
+    /// Parse a stored "preferred asset platform": an empty/unknown string means
+    /// `None` ("auto — first available"). `Generic` is not an asset source, so it
+    /// is never a valid preference and also maps to `None`.
+    pub fn parse_opt(s: &str) -> Option<Platform> {
+        match s {
+            "twitch" => Some(Platform::Twitch),
+            "youtube" => Some(Platform::YouTube),
+            "kick" => Some(Platform::Kick),
+            _ => None,
         }
     }
 
@@ -488,6 +500,11 @@ pub struct Channel {
     /// Optional custom hex color for this channel (e.g. `"#ff9800"`).
     /// Empty string means "use the automatic palette color".
     pub color: String,
+    /// Which platform's profile pic / banner represents this container (a
+    /// container can hold the same creator on Twitch + YouTube + Kick, each with
+    /// its own assets). `None` = auto: the first instance-platform that has a
+    /// fetched icon. Set explicitly via the channel's Properties → icon source.
+    pub preferred_platform: Option<Platform>,
 }
 
 /// One capture instance for a channel (source URL + tool + quality + detection +

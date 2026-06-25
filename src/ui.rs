@@ -863,6 +863,11 @@ impl StreamArchiverApp {
                 Ok(crate::events::AppEvent::BackgroundTaskFinished { id, outcome }) => {
                     if let Some(pos) = self.background_tasks.iter().position(|t| t.id == id) {
                         let task = self.background_tasks.remove(pos);
+                        // A finished asset fetch may have produced a new channel
+                        // icon — drop the avatar cache so it reloads from disk.
+                        if task.kind == crate::events::BackgroundTaskKind::AssetFetch {
+                            self.channel_icons.clear();
+                        }
                         self.finished_tasks.insert(0, (task, outcome, now_unix()));
                         self.finished_tasks.truncate(100);
                     }
@@ -5886,6 +5891,26 @@ impl StreamArchiverApp {
             })
             .collect();
 
+        // Resolve each container's avatar (its chosen-platform profile pic) up
+        // front — it needs `&mut self` (texture cache), so the read-only table
+        // closure below can just look it up by channel id.
+        let mut channel_avatars: HashMap<i64, egui::TextureHandle> = HashMap::new();
+        for e in &chan_entries {
+            let platforms = {
+                let mons: Vec<&MonitorWithChannel> =
+                    e.rows.iter().map(|&i| &self.rows[i]).collect();
+                channel_platforms(&mons)
+            };
+            let tex = self
+                .channel_icons
+                .entry(e.channel.id)
+                .or_insert_with(|| resolve_channel_icon(&e.channel, &platforms, ui.ctx()))
+                .clone();
+            if let Some(t) = tex {
+                channel_avatars.insert(e.channel.id, t);
+            }
+        }
+
         // Lazily load + cache recordings for currently-expanded monitors, then
         // group each monitor's takes into streams.
         // A channel always shows its instances when expanded; an instance shows
@@ -6198,12 +6223,35 @@ impl StreamArchiverApp {
                                         platform_icons(ui, &ptex, &platforms);
                                     });
                                     tr.col(|ui| {
-                                        disc = tree_name(
-                                            ui, 0, ninst > 0, expanded,
+                                        // Disclosure triangle, then the chosen-platform
+                                        // avatar, then the channel name.
+                                        let mut clicked = false;
+                                        if ninst > 0 {
+                                            let tri = if expanded { "▼" } else { "▶" };
+                                            if ui
+                                                .add(egui::Button::new(tri).small().frame(false))
+                                                .on_hover_text("Expand / collapse")
+                                                .clicked()
+                                            {
+                                                clicked = true;
+                                            }
+                                        } else {
+                                            ui.add_space(16.0);
+                                        }
+                                        if let Some(tex) = channel_avatars.get(&cid) {
+                                            ui.add(
+                                                egui::Image::from_texture(tex)
+                                                    .fit_to_exact_size(egui::vec2(18.0, 18.0))
+                                                    .corner_radius(egui::CornerRadius::same(3)),
+                                            );
+                                            ui.add_space(3.0);
+                                        }
+                                        ui.label(
                                             egui::RichText::new(&ch.name)
                                                 .strong()
                                                 .color(channel_event_color(cid, &ch.color)),
                                         );
+                                        disc = clicked;
                                     });
                                     tr.col(|ui| {
                                         ui.weak(if ninst == 1 {
@@ -8585,17 +8633,27 @@ impl StreamArchiverApp {
         let ch = &row.channel;
         let m = &row.monitor;
 
-        let safe_name = crate::downloader::sanitize_filename(&ch.name);
-        let asset_dir = crate::app_paths::asset_cache_dir()
-            .join("channel_assets")
-            .join(&safe_name);
+        // Every platform this container spans (first-seen order) — drives the
+        // chosen-platform avatar and the per-platform asset status below.
+        let platforms: Vec<Platform> = {
+            let mons: Vec<&MonitorWithChannel> =
+                self.rows.iter().filter(|r| r.channel.id == ch.id).collect();
+            channel_platforms(&mons)
+        };
+        // Platforms that actually have an asset source (Generic has none) — used
+        // for the icon-source picker and the per-platform status grid.
+        let asset_platforms: Vec<Platform> =
+            platforms.iter().copied().filter(|p| *p != Platform::Generic).collect();
 
-        // Lazy-load (or serve cached) channel icon texture.
+        // Lazy-load (or serve cached) the chosen-platform channel avatar.
         let icon_tex = self
             .channel_icons
             .entry(ch.id)
-            .or_insert_with(|| load_channel_icon(&asset_dir, ctx, &ch.id.to_string()))
+            .or_insert_with(|| resolve_channel_icon(ch, &platforms, ctx))
             .clone();
+
+        // Set inside the icon-source combo, applied after the panel renders.
+        let mut pref_change: Option<Option<Platform>> = None;
 
         let mut open = true;
         ctx.show_viewport_immediate(
@@ -8635,13 +8693,21 @@ impl StreamArchiverApp {
                             let ptex = self
                                 .platform_tex
                                 .get_or_insert_with(|| PlatformTextures::load(ui.ctx()));
-                            if let Some(t) = ptex.get(ch.platform) {
-                                ui.add(
-                                    egui::Image::from_texture(t)
-                                        .max_size(egui::vec2(14.0, 14.0)),
-                                );
+                            for &p in &platforms {
+                                if let Some(t) = ptex.get(p) {
+                                    ui.add(
+                                        egui::Image::from_texture(t)
+                                            .max_size(egui::vec2(14.0, 14.0)),
+                                    );
+                                }
                             }
-                            ui.label(ch.platform.as_str());
+                            let names: Vec<&str> =
+                                platforms.iter().map(|p| p.label()).collect();
+                            ui.label(if names.is_empty() {
+                                "—".to_string()
+                            } else {
+                                names.join(" · ")
+                            });
                         });
                     });
                 });
@@ -8745,10 +8811,12 @@ impl StreamArchiverApp {
                         ui.strong("Channel assets");
                         if ui
                             .button("⟳ Refetch")
-                            .on_hover_text(
-                                "Fetch channel icon / banner / badges / emotes now — ignores \
-                                 the 24h cache and the per-monitor Fetch-assets toggle.",
-                            )
+                            .on_hover_text(format!(
+                                "Fetch icon / banner / badges / emotes for this instance's \
+                                 platform ({}) now — ignores the 24h cache and the per-monitor \
+                                 Fetch-assets toggle.",
+                                m.platform().label(),
+                            ))
                             .clicked()
                         {
                             self.core.manual(ManualCommand::RefetchAssets(m.id));
@@ -8766,75 +8834,108 @@ impl StreamArchiverApp {
                         );
                     }
 
-                    let stamp_path = asset_dir.join(".assets_fetched_at");
-                    let last_fetched = std::fs::read_to_string(&stamp_path)
-                        .ok()
-                        .and_then(|s| s.trim().parse::<i64>().ok())
-                        .map(|t| {
-                            chrono::DateTime::from_timestamp(t, 0)
-                                .map(|dt| {
-                                    dt.with_timezone(&chrono::Local)
-                                        .format("%Y-%m-%d %H:%M")
-                                        .to_string()
-                                })
-                                .unwrap_or_default()
-                        })
-                        .unwrap_or_else(|| "never".into());
-                    ui.label(format!("Last fetched: {last_fetched}"));
+                    // Icon source: which platform's profile pic represents this
+                    // container in the Streams list and in this window's header.
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Icon source:");
+                        let cur = ch.preferred_platform;
+                        egui::ComboBox::from_id_salt("pref_plat_cb")
+                            .selected_text(match cur {
+                                Some(p) => p.label(),
+                                None => "Auto (first available)",
+                            })
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(cur.is_none(), "Auto (first available)")
+                                    .clicked()
+                                {
+                                    pref_change = Some(None);
+                                }
+                                for &p in &asset_platforms {
+                                    if ui
+                                        .selectable_label(cur == Some(p), p.label())
+                                        .clicked()
+                                    {
+                                        pref_change = Some(Some(p));
+                                    }
+                                }
+                            })
+                            .response
+                            .on_hover_text(
+                                "Which platform's profile pic represents this channel. \
+                                 Auto uses the first platform that has a fetched icon.",
+                            );
+                    });
 
+                    // Per-platform asset status (each platform has its own dir).
+                    ui.add_space(4.0);
                     egui::Grid::new("props_assets")
-                        .num_columns(2)
+                        .num_columns(6)
                         .spacing([12.0, 4.0])
+                        .striped(true)
                         .show(ui, |ui| {
-                            let icon_ok = prop_find_first(&asset_dir, "icon.").is_some();
-                            let banner_ok = prop_find_first(&asset_dir, "banner.").is_some();
-                            ui.label("Icon");
-                            ui.label(if icon_ok { "✔" } else { "—" });
+                            ui.strong("Platform");
+                            ui.strong("Icon");
+                            ui.strong("Banner");
+                            ui.strong("Badges");
+                            ui.strong("Emotes");
+                            ui.strong("Updated");
                             ui.end_row();
-                            ui.label("Banner");
-                            ui.label(if banner_ok { "✔" } else { "—" });
-                            ui.end_row();
-
-                            // Channel-specific badges
-                            let ch_badges =
-                                prop_count_nested_dirs(&asset_dir.join("badges"), 2);
-                            ui.label("Badges (channel)");
-                            ui.label(format!("{ch_badges} versions"));
-                            ui.end_row();
-
-                            // Global Twitch badges (shared across all channels)
-                            let platform_dir = crate::app_paths::platform_assets_dir();
-                            let global_badges = prop_count_nested_dirs(
-                                &platform_dir.join("twitch").join("global_badges"),
-                                2,
-                            );
-                            ui.label("Badges (global)");
-                            ui.label(format!("{global_badges} versions"));
-                            ui.end_row();
-
-                            // Twitch channel emotes (still per-channel)
-                            let n_twitch = prop_count_dir_files(
-                                &asset_dir.join("emotes").join("twitch"),
-                            );
-                            if n_twitch > 0 {
-                                ui.label("Emotes (twitch)");
-                                ui.label(n_twitch.to_string());
+                            for &p in &asset_platforms {
+                                let pdir = channel_asset_dir(&ch.name, p);
+                                ui.horizontal(|ui| {
+                                    let ptex = self.platform_tex.get_or_insert_with(|| {
+                                        PlatformTextures::load(ui.ctx())
+                                    });
+                                    if let Some(t) = ptex.get(p) {
+                                        ui.add(
+                                            egui::Image::from_texture(t)
+                                                .max_size(egui::vec2(13.0, 13.0)),
+                                        );
+                                    }
+                                    ui.label(p.label());
+                                });
+                                let mark = |ok: bool| if ok { "✔" } else { "—" };
+                                ui.label(mark(prop_find_first(&pdir, "icon.").is_some()));
+                                ui.label(mark(prop_find_first(&pdir, "banner.").is_some()));
+                                // Badges + emotes are Twitch-only concepts.
+                                let badges = prop_count_nested_dirs(&pdir.join("badges"), 2);
+                                ui.label(if badges > 0 {
+                                    badges.to_string()
+                                } else {
+                                    "—".into()
+                                });
+                                let mut emotes = prop_count_dir_files(
+                                    &pdir.join("emotes").join("twitch"),
+                                );
+                                for src in &["bttv", "ffz", "7tv"] {
+                                    emotes += prop_read_manifest_count(
+                                        &pdir.join("emotes").join(format!("{src}.json")),
+                                    );
+                                }
+                                ui.label(if emotes > 0 {
+                                    emotes.to_string()
+                                } else {
+                                    "—".into()
+                                });
+                                ui.label(fmt_asset_stamp(&pdir));
                                 ui.end_row();
                             }
-
-                            // BTTV/FFZ/7TV: read per-channel manifests for count
-                            for src in &["bttv", "ffz", "7tv"] {
-                                let n = prop_read_manifest_count(
-                                    &asset_dir.join("emotes").join(format!("{src}.json")),
-                                );
-                                if n > 0 {
-                                    ui.label(format!("Emotes ({src})"));
-                                    ui.label(n.to_string());
-                                    ui.end_row();
-                                }
-                            }
                         });
+                }
 
+                // Apply an icon-source change picked in the combo above.
+                if let Some(newp) = pref_change {
+                    if let Err(e) =
+                        self.core.store.set_channel_preferred_platform(ch.id, newp)
+                    {
+                        self.status = format!("Error: {e}");
+                    } else {
+                        // Reload so the avatar + container row reflect the choice.
+                        self.channel_icons.remove(&ch.id);
+                        self.reload_rows();
+                    }
                 }
                 });
             },
@@ -8847,6 +8948,61 @@ impl StreamArchiverApp {
 }
 
 // ── Properties window helpers ────────────────────────────────────────────────
+
+/// Per-platform channel asset directory: `…/channel_assets/{name}/{platform}/`.
+/// One container can hold the same creator on several platforms, each with its
+/// own icon/banner/badges/emotes — so assets are namespaced by platform.
+fn channel_asset_dir(name: &str, platform: Platform) -> std::path::PathBuf {
+    crate::app_paths::asset_cache_dir()
+        .join("channel_assets")
+        .join(crate::downloader::sanitize_filename(name))
+        .join(platform.as_str())
+}
+
+/// Resolve a container's avatar — the chosen-platform profile pic. An explicit
+/// `preferred_platform` wins when it's one of the container's instance platforms
+/// (showing a placeholder until that platform's icon is fetched); otherwise auto:
+/// the first instance-platform (first-seen order) whose icon loads. `None` when
+/// no platform has a fetched icon yet.
+fn resolve_channel_icon(
+    channel: &Channel,
+    platforms: &[Platform],
+    ctx: &egui::Context,
+) -> Option<egui::TextureHandle> {
+    let key = channel.id.to_string();
+    let load =
+        |p: Platform| load_channel_icon(&channel_asset_dir(&channel.name, p), ctx, &key);
+    if let Some(p) = channel.preferred_platform {
+        if platforms.contains(&p) {
+            return load(p);
+        }
+    }
+    platforms.iter().copied().find_map(load).or_else(|| {
+        // Legacy fallback (auto mode only): assets fetched before per-platform
+        // namespacing lived in the flat channel_assets/{name}/ dir. Show that
+        // icon until a per-platform refetch repopulates the namespaced dir, so an
+        // existing container's avatar doesn't go blank on upgrade.
+        let flat = crate::app_paths::asset_cache_dir()
+            .join("channel_assets")
+            .join(crate::downloader::sanitize_filename(&channel.name));
+        load_channel_icon(&flat, ctx, &key)
+    })
+}
+
+/// Short "last fetched" label for an asset dir's `.assets_fetched_at` stamp.
+/// Returns `"never"` when the stamp is missing/unparseable.
+fn fmt_asset_stamp(asset_dir: &std::path::Path) -> String {
+    std::fs::read_to_string(asset_dir.join(".assets_fetched_at"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| "never".into())
+}
 
 /// Load a channel icon from `asset_dir/icon.*` into an egui texture.
 /// Returns `None` when no icon file is found or decoding fails.
