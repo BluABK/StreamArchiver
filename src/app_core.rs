@@ -295,10 +295,12 @@ impl AppCore {
             supervisor.run(live_rx, manual_rx).await;
         });
 
-        // Desktop notifications for recording lifecycle events.
+        // Desktop notifications for recording lifecycle events (gated on the
+        // `notifications_enabled` setting, read live).
         let notif_rx = self.events.subscribe();
+        let notif_store = self.store.clone();
         self.rt.spawn(async move {
-            crate::notifications::run(notif_rx).await;
+            crate::notifications::run(notif_rx, notif_store).await;
         });
     }
 

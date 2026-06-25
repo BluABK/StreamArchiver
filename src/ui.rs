@@ -409,6 +409,9 @@ pub struct StreamArchiverApp {
     /// across a restart/rebuild; when true, quitting stops them. Persisted as the
     /// `stop_downloads_on_quit` setting (stored inverted).
     keep_downloads_on_quit: bool,
+    /// Show desktop notifications (toasts) on recording start/finish/error.
+    /// Persisted as the `notifications_enabled` setting; default on.
+    notifications_enabled: bool,
     /// The process-manager dialog: whether it's open, its last snapshot, and when
     /// that snapshot was taken (throttles the per-row `pid_alive`/DB queries).
     show_processes: bool,
@@ -535,6 +538,14 @@ impl StreamArchiverApp {
             .flatten()
             .as_deref()
             != Some("1");
+        // Desktop notifications default on; only `=="0"` disables them.
+        let notifications_enabled = core
+            .store
+            .get_setting(crate::notifications::K_NOTIFICATIONS)
+            .ok()
+            .flatten()
+            .as_deref()
+            != Some("0");
 
         let default_out = core
             .store
@@ -675,6 +686,7 @@ impl StreamArchiverApp {
             autostart,
             autostart_on,
             keep_downloads_on_quit,
+            notifications_enabled,
             show_processes: false,
             processes: Vec::new(),
             processes_refreshed: None,
@@ -7852,6 +7864,33 @@ impl StreamArchiverApp {
                     }
                     Err(e) => self.status = format!("Autostart error: {e}"),
                 }
+            }
+
+            ui.add_space(12.0);
+            ui.heading("Notifications");
+            let mut notify_on = self.notifications_enabled;
+            if ui
+                .checkbox(&mut notify_on, "Show desktop notifications")
+                .on_hover_text(
+                    "Show a desktop toast when a recording starts, finishes, or errors. \
+                     Uncheck to silence all pop-up alerts (the in-app status line and \
+                     Background view still update). Takes effect immediately.",
+                )
+                .changed()
+            {
+                self.notifications_enabled = notify_on;
+                let _ = self
+                    .core
+                    .store
+                    .set_setting(
+                        crate::notifications::K_NOTIFICATIONS,
+                        if notify_on { "1" } else { "0" },
+                    );
+                self.status = if notify_on {
+                    "Desktop notifications enabled.".into()
+                } else {
+                    "Desktop notifications disabled.".into()
+                };
             }
 
             ui.add_space(12.0);
