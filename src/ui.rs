@@ -368,6 +368,36 @@ struct SettingsForm {
     discord_schedule: bool,
 }
 
+/// Which field the Format Designer was opened from (for "Apply").
+#[derive(Clone, PartialEq)]
+enum FormatDesignerTarget {
+    MonitorForm,
+    VideoForm,
+}
+
+/// State for the floating Format Designer window.
+struct FormatDesignerState {
+    template: String,
+    selected_monitor_idx: usize,
+    /// Recordings for the currently selected monitor (oldest-first from the store).
+    recordings: Vec<Recording>,
+    selected_recording_idx: usize,
+    /// Which field opened the designer (None = standalone / no write-back).
+    target: Option<FormatDesignerTarget>,
+}
+
+impl FormatDesignerState {
+    fn new(template: String, target: Option<FormatDesignerTarget>) -> Self {
+        Self {
+            template,
+            selected_monitor_idx: 0,
+            recordings: Vec::new(),
+            selected_recording_idx: 0,
+            target,
+        }
+    }
+}
+
 pub struct StreamArchiverApp {
     core: Arc<AppCore>,
     _tray: TrayIcon,
@@ -482,6 +512,8 @@ pub struct StreamArchiverApp {
     /// Enable/disable state for the periodic jobs (`events::TOGGLEABLE_JOBS`),
     /// mirrored from settings; edited via the Background "Scheduled" checkboxes.
     job_toggles: std::collections::HashMap<String, bool>,
+    /// Format Designer: an interactive template preview/editor window.
+    format_designer: Option<FormatDesignerState>,
 }
 
 impl StreamArchiverApp {
@@ -691,6 +723,7 @@ impl StreamArchiverApp {
             background_tasks: Vec::new(),
             finished_tasks: Vec::new(),
             job_toggles,
+            format_designer: None,
         };
         app.reload_rows();
         app.reload_videos();
@@ -1224,6 +1257,63 @@ fn fmt_time_short(secs: i64) -> String {
 /// entries into calendar cells).
 fn local_date(secs: i64) -> Option<chrono::NaiveDate> {
     chrono::DateTime::from_timestamp(secs, 0).map(|dt| dt.with_timezone(&chrono::Local).date_naive())
+}
+
+/// Build a filename preview for the Format Designer using real monitor/recording
+/// data. Media info is synthetic (1920×1080/60fps/h264/aac) since probing requires
+/// async work the UI thread doesn't do. Extension is NOT included.
+fn build_preview_filename(
+    monitor: &MonitorWithChannel,
+    recording: Option<&Recording>,
+    template: &str,
+) -> String {
+    let ch_name = monitor.channel.name.as_str();
+    let platform_s = monitor.monitor.platform().as_str().to_string();
+    let tool_s = monitor.monitor.tool.label().to_string();
+    let quality_s = monitor.monitor.quality.clone();
+    let take_s = (monitor.recording_count + 1).to_string();
+    let mode_s = match monitor.monitor.tool {
+        Tool::Streamlink => "live".to_string(),
+        Tool::Ffmpeg => "direct".to_string(),
+        Tool::YtDlp => {
+            if monitor.monitor.platform() == Platform::YouTube {
+                if monitor.monitor.capture_from_start { "sabr".to_string() } else { "dash".to_string() }
+            } else {
+                "live".to_string()
+            }
+        }
+    };
+    let (started_at, went_live, stream_id_s, title_s, games_s) = match recording {
+        Some(r) => (
+            r.started_at,
+            r.went_live_at.unwrap_or(0),
+            r.stream_id.clone().unwrap_or_default(),
+            r.title.clone(),
+            r.category.clone(),
+        ),
+        None => (now_unix(), 0i64, String::new(), "Stream Title".to_string(), "Sample Game".to_string()),
+    };
+    let vars = crate::downloader::TemplateVars {
+        name: ch_name,
+        title: &title_s,
+        channel: ch_name,
+        video_id: &stream_id_s,
+        quality: &quality_s,
+        resolution: "1920x1080",
+        height: "1080",
+        width: "1920",
+        fps: "60",
+        vcodec: "h264",
+        acodec: "aac",
+        tool: &tool_s,
+        mode: &mode_s,
+        platform: &platform_s,
+        take: &take_s,
+        games: &games_s,
+        secs: started_at,
+        went_live,
+    };
+    crate::downloader::preview_filename(template, &vars)
 }
 
 /// Unix seconds at the start (00:00 local) of today. Used to load schedule
@@ -3181,6 +3271,7 @@ impl eframe::App for StreamArchiverApp {
         self.chat_popup_window(ui.ctx());
         self.properties_window(ui.ctx());
         self.processes_window(ui.ctx());
+        self.format_designer_window(ui.ctx());
     }
 }
 
@@ -4034,6 +4125,7 @@ impl StreamArchiverApp {
 
         let mut do_download = false;
         let mut do_list_formats = false;
+        let mut open_vf_designer = false;
 
         {
             let vf = &mut self.video_form;
@@ -4160,8 +4252,12 @@ impl StreamArchiverApp {
                     });
                     let tmpl_hint = "Variables: {name} {title} {channel} {date} {time} {timestamp} {year} {month} {day} {hour} {minute} {second} {tool} {mode} {platform} {video_id} {quality} {resolution} {height} {width} {fps} {vcodec} {acodec} {take} {games} {went_live_date} {went_live_time}";
                     ui.label("Filename template").on_hover_text(tmpl_hint);
-                    ui.text_edit_singleline(&mut vf.filename_template)
-                        .on_hover_text(tmpl_hint);
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut vf.filename_template).on_hover_text(tmpl_hint);
+                        if ui.button("Design…").on_hover_text("Open the Format Designer").clicked() {
+                            open_vf_designer = true;
+                        }
+                    });
                     ui.end_row();
 
                     // Extra args + Audio tracks.
@@ -4219,6 +4315,10 @@ impl StreamArchiverApp {
         }
         if do_list_formats {
             self.start_format_probe(ui.ctx().clone());
+        }
+        if open_vf_designer {
+            let tmpl = self.video_form.filename_template.clone();
+            self.open_format_designer(tmpl, Some(FormatDesignerTarget::VideoForm));
         }
     }
 
@@ -4354,6 +4454,289 @@ impl StreamArchiverApp {
         );
         if !open {
             *self.format_probe.lock().unwrap() = FormatProbe::Idle;
+        }
+    }
+
+    // ── Format Designer ──────────────────────────────────────────────────────
+
+    /// Open (or replace) the Format Designer window, pre-loading recordings for
+    /// the first monitor in the list.
+    fn open_format_designer(&mut self, template: String, target: Option<FormatDesignerTarget>) {
+        let mut state = FormatDesignerState::new(template, target);
+        // Default to the first monitor and pre-load its recordings.
+        if let Some(m) = self.rows.first() {
+            state.selected_recording_idx = 0;
+            state.recordings = self.core.store.recordings_for_monitor(m.monitor.id).unwrap_or_default();
+            // Default to the most recent recording (last in oldest-first list).
+            if !state.recordings.is_empty() {
+                state.selected_recording_idx = state.recordings.len() - 1;
+            }
+        }
+        self.format_designer = Some(state);
+    }
+
+    /// The floating Format Designer window: token reference, live preview, and
+    /// optional write-back to the field that opened it.
+    #[allow(deprecated)]
+    fn format_designer_window(&mut self, ctx: &egui::Context) {
+        if self.format_designer.is_none() {
+            return;
+        }
+
+        // Token catalogue: (category label, &[(token, tooltip)])
+        const TOKENS: &[(&str, &[(&str, &str)])] = &[
+            ("Identity", &[
+                ("{name}", "Channel / stream name"),
+                ("{channel}", "Channel name (VOD downloads)"),
+                ("{video_id}", "Stream or video ID"),
+                ("{take}", "Recording attempt number"),
+            ]),
+            ("Capture time", &[
+                ("{date}", "Date YYYYMMDD"),
+                ("{time}", "Time HHMMSS"),
+                ("{year}", "4-digit year"),
+                ("{month}", "2-digit month"),
+                ("{day}", "2-digit day"),
+                ("{hour}", "2-digit hour (UTC)"),
+                ("{minute}", "2-digit minute"),
+                ("{second}", "2-digit second"),
+                ("{timestamp}", "Unix timestamp"),
+            ]),
+            ("Live timing", &[
+                ("{went_live_date}", "Broadcast go-live date YYYYMMDD"),
+                ("{went_live_time}", "Broadcast go-live time HHMMSS"),
+            ]),
+            ("Stream info", &[
+                ("{title}", "Stream title"),
+                ("{games}", "Games / categories played"),
+                ("{quality}", "Configured quality selector"),
+                ("{platform}", "twitch · youtube · kick · generic"),
+                ("{mode}", "live · sabr · dash · hybrid · direct · vod"),
+                ("{tool}", "streamlink · yt-dlp · ffmpeg"),
+            ]),
+            ("Media (post-probe)", &[
+                ("{resolution}", "e.g. 1920x1080"),
+                ("{height}", "e.g. 1080"),
+                ("{width}", "e.g. 1920"),
+                ("{fps}", "e.g. 60"),
+                ("{vcodec}", "Video codec e.g. h264 · hevc · av1"),
+                ("{acodec}", "Audio codec e.g. aac · opus"),
+            ]),
+        ];
+
+        // ── Snapshot state before closure (avoids borrow conflicts) ──────────
+        let template = self.format_designer.as_ref().unwrap().template.clone();
+        let selected_monitor_idx = self.format_designer.as_ref().unwrap().selected_monitor_idx;
+        let selected_recording_idx = self.format_designer.as_ref().unwrap().selected_recording_idx;
+        let recordings = self.format_designer.as_ref().unwrap().recordings.clone();
+        let target = self.format_designer.as_ref().unwrap().target.clone();
+
+        let monitor_names: Vec<String> = self.rows.iter()
+            .map(|r| r.channel.name.clone())
+            .collect();
+        let selected_monitor = self.rows.get(selected_monitor_idx).cloned();
+        let selected_recording = recordings.get(selected_recording_idx).cloned();
+
+        // Pre-compute preview (stale by one frame on fast typing — acceptable).
+        let preview = selected_monitor.as_ref()
+            .map(|m| build_preview_filename(m, selected_recording.as_ref(), &template))
+            .unwrap_or_default();
+
+        // ── Mutable locals for the closure to write into ─────────────────────
+        let mut new_template = template.clone();
+        let mut new_monitor_idx = selected_monitor_idx;
+        let mut new_recording_idx = selected_recording_idx;
+        let mut close = false;
+        let mut apply = false;
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("format_designer_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("Format Designer")
+                .with_inner_size([820.0, 600.0])
+                .with_resizable(true),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    close = true;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.add_space(2.0);
+                    ui.label("Listing of all possible {formatter} options — highlighted when in use in the template below.");
+                    ui.add_space(6.0);
+
+                    // ── Channel + Recording dropdowns ────────────────────────
+                    ui.horizontal(|ui| {
+                        ui.label("Channel:");
+                        let ch_label = monitor_names.get(new_monitor_idx)
+                            .cloned()
+                            .unwrap_or_else(|| "— none —".to_string());
+                        egui::ComboBox::from_id_salt("fd_channel_cb")
+                            .selected_text(&ch_label)
+                            .width(180.0)
+                            .show_ui(ui, |ui| {
+                                for (i, name) in monitor_names.iter().enumerate() {
+                                    if ui.selectable_value(&mut new_monitor_idx, i, name).clicked() {
+                                        new_recording_idx = usize::MAX; // sentinel → reload
+                                    }
+                                }
+                            });
+
+                        ui.add_space(12.0);
+                        ui.label("Recording:");
+                        let rec_label = recordings.get(new_recording_idx)
+                            .map(|r| {
+                                chrono::DateTime::from_timestamp(r.started_at, 0)
+                                    .map(|dt| dt.with_timezone(&chrono::Local)
+                                        .format("%Y-%m-%d %H:%M").to_string())
+                                    .unwrap_or_else(|| r.started_at.to_string())
+                            })
+                            .unwrap_or_else(|| "— sample data —".to_string());
+                        egui::ComboBox::from_id_salt("fd_recording_cb")
+                            .selected_text(&rec_label)
+                            .width(200.0)
+                            .show_ui(ui, |ui| {
+                                // "— sample data —" option (no real recording)
+                                let no_rec_label = "— sample data —";
+                                if ui.selectable_label(new_recording_idx == usize::MAX, no_rec_label).clicked() {
+                                    new_recording_idx = usize::MAX;
+                                }
+                                // Recordings newest-first
+                                for (i, r) in recordings.iter().enumerate().rev() {
+                                    let label = chrono::DateTime::from_timestamp(r.started_at, 0)
+                                        .map(|dt| dt.with_timezone(&chrono::Local)
+                                            .format("%Y-%m-%d %H:%M").to_string())
+                                        .unwrap_or_else(|| r.started_at.to_string());
+                                    let label = format!("{label}  ({})", r.status);
+                                    if ui.selectable_value(&mut new_recording_idx, i, &label).clicked() {}
+                                }
+                            });
+                    });
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    // ── Token grid ───────────────────────────────────────────
+                    let accent = ui.style().visuals.selection.bg_fill;
+                    let dim = egui::Color32::from_gray(45);
+                    let text_col = ui.style().visuals.text_color();
+
+                    for (category, tokens) in TOKENS {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.strong(*category);
+                            ui.label("  ");
+                            for (tok, desc) in *tokens {
+                                let in_use = new_template.contains(tok);
+                                let fill = if in_use { accent } else { dim };
+                                let label_text = egui::RichText::new(*tok)
+                                    .monospace()
+                                    .small()
+                                    .color(text_col);
+                                let btn = egui::Button::new(label_text)
+                                    .fill(fill)
+                                    .corner_radius(3.0);
+                                if ui.add(btn).on_hover_text(*desc).clicked() {
+                                    new_template.push_str(tok);
+                                }
+                            }
+                        });
+                    }
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    // ── Template input ───────────────────────────────────────
+                    ui.horizontal(|ui| {
+                        ui.label("Template:");
+                        ui.add_sized(
+                            [ui.available_width(), 20.0],
+                            egui::TextEdit::singleline(&mut new_template)
+                                .font(egui::TextStyle::Monospace)
+                                .hint_text("{name}_{date}_{time}"),
+                        );
+                    });
+
+                    ui.add_space(6.0);
+
+                    // ── Preview ──────────────────────────────────────────────
+                    ui.horizontal(|ui| {
+                        ui.label("Preview:");
+                        let ext = ".mkv";
+                        let preview_str = if preview.is_empty() {
+                            format!("(no channel selected){ext}")
+                        } else {
+                            format!("{preview}{ext}")
+                        };
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_gray(28))
+                            .corner_radius(4.0)
+                            .inner_margin(egui::Margin::symmetric(8, 4))
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width() - 4.0);
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&preview_str)
+                                            .monospace()
+                                    ).selectable(true),
+                                );
+                            });
+                    });
+
+                    ui.add_space(10.0);
+
+                    // ── Action buttons ───────────────────────────────────────
+                    ui.horizontal(|ui| {
+                        if target.is_some() && ui.button("Apply").on_hover_text("Write this template back to the field that opened the designer").clicked() {
+                            apply = true;
+                        }
+                        if ui.button("Close").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            },
+        );
+
+        // ── Apply closure results back to state ──────────────────────────────
+        let monitor_changed = new_monitor_idx != selected_monitor_idx;
+        let new_recordings = if monitor_changed {
+            self.rows.get(new_monitor_idx).map(|m| {
+                let recs = self.core.store.recordings_for_monitor(m.monitor.id).unwrap_or_default();
+                // Default to the most recent recording.
+                let default_idx = recs.len().saturating_sub(1);
+                (recs, default_idx)
+            })
+        } else {
+            None
+        };
+
+        if let Some(fd) = self.format_designer.as_mut() {
+            fd.template = new_template.clone();
+            fd.selected_monitor_idx = new_monitor_idx;
+            if let Some((recs, default_idx)) = new_recordings {
+                fd.recordings = recs;
+                fd.selected_recording_idx = default_idx;
+            } else {
+                fd.selected_recording_idx = new_recording_idx;
+            }
+        }
+
+        if apply {
+            match &target {
+                Some(FormatDesignerTarget::MonitorForm) => {
+                    if let Some(form) = self.form.as_mut() {
+                        form.filename_template = new_template.clone();
+                    }
+                }
+                Some(FormatDesignerTarget::VideoForm) => {
+                    self.video_form.filename_template = new_template.clone();
+                }
+                None => {}
+            }
+            self.format_designer = None;
+        } else if close {
+            self.format_designer = None;
         }
     }
 
@@ -7518,6 +7901,7 @@ impl StreamArchiverApp {
         let mut open = true;
         let mut do_save = false;
         let mut do_cancel = false;
+        let mut open_format_designer = false;
 
         let f = self.form.as_ref().unwrap();
         let title = if f.monitor_id.is_some() {
@@ -7758,7 +8142,12 @@ impl StreamArchiverApp {
 
                         let fn_tmpl_hint = "{name} {date} {time} {year} {month} {day} {hour} {minute} {second} {title} {games} {video_id} {quality} {resolution} {height} {width} {fps} {vcodec} {acodec} {take} {tool} {mode} {platform} {went_live_date} {went_live_time} {timestamp}";
                         ui.label("Filename template").on_hover_text(fn_tmpl_hint);
-                        ui.text_edit_singleline(&mut form.filename_template).on_hover_text(fn_tmpl_hint);
+                        ui.horizontal(|ui| {
+                            ui.text_edit_singleline(&mut form.filename_template).on_hover_text(fn_tmpl_hint);
+                            if ui.button("Design…").on_hover_text("Open the Format Designer to preview and compose the template").clicked() {
+                                open_format_designer = true;
+                            }
+                        });
                         ui.end_row();
 
                         ui.label("Extra args");
@@ -7783,6 +8172,11 @@ impl StreamArchiverApp {
             self.save_form();
         } else if do_cancel || !open {
             self.form = None;
+        }
+
+        if open_format_designer {
+            let tmpl = self.form.as_ref().map(|f| f.filename_template.clone()).unwrap_or_default();
+            self.open_format_designer(tmpl, Some(FormatDesignerTarget::MonitorForm));
         }
     }
 

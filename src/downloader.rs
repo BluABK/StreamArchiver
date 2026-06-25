@@ -4602,6 +4602,12 @@ pub struct TemplateVars<'a> {
     pub went_live: i64,
 }
 
+/// Preview a filename template with the given variable set. Extension not included.
+/// Sanitizes and guarantees a non-empty result (falls back to `{name}_{date}_{time}`).
+pub fn preview_filename(template: &str, vars: &TemplateVars<'_>) -> String {
+    expand_template(template, vars)
+}
+
 /// Expand a filename template using our own (tool-agnostic) variables so the
 /// output path is known in advance: `{name} {title} {channel} {video_id}
 /// {quality} {resolution} {height} {width} {fps} {vcodec} {take} {games} {date}
