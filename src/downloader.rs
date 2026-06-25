@@ -3685,7 +3685,11 @@ fn expand_template(template: &str, v: &TemplateVars) -> String {
         .replace("{games}", v.games)
         .replace("{date}", &date)
         .replace("{time}", &time)
-        .replace("{timestamp}", &v.secs.to_string());
+        .replace("{timestamp}", &v.secs.to_string())
+        // backward-compat aliases for tokens listed in the old tooltip
+        .replace("{id}", v.video_id)
+        .replace("{ts}", &v.secs.to_string())
+        .replace("{category}", v.games);
     let cleaned = sanitize_filename(&expanded);
     if cleaned.is_empty() {
         format!("{}_{date}_{time}", sanitize_filename(v.name))

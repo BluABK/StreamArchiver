@@ -7063,7 +7063,7 @@ impl StreamArchiverApp {
                                         .hint_text(ft_hint)
                                         .desired_width(200.0),
                                 ).on_hover_text(
-                                    "Tokens: {name} {date} {time} {ts} {title} {category} {id}",
+                                    "Tokens: {name} {date} {time} {timestamp} {title} {games} {video_id} {quality} {resolution} {fps} {vcodec} {take}",
                                 );
                                 ui.label("");
                                 ui.label("");
