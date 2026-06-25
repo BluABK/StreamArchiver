@@ -47,12 +47,12 @@ pub async fn run(
         // Live poll can be disabled from the Background view (a global pause of
         // detection/recording); idle-check for re-enable without polling.
         if !ctx.store.job_enabled("job_live_poll") {
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            crate::app_core::sleep_cancellable(Duration::from_secs(10), &shutdown).await;
             continue;
         }
         let wait = tick(&ctx, &events, &live_tx, &active).await;
         crate::events::mark_job(&jobs, "Live poll", wait as i64);
-        tokio::time::sleep(Duration::from_secs(wait)).await;
+        crate::app_core::sleep_cancellable(Duration::from_secs(wait), &shutdown).await;
     }
 }
 

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tokio::runtime::Runtime;
+use tokio::runtime::{Handle, Runtime};
 use tracing::{info, warn};
 
 use crate::downloader::ActiveSet;
@@ -33,8 +33,12 @@ pub async fn sleep_cancellable(dur: Duration, shutdown: &Arc<AtomicBool>) {
 pub struct AppCore {
     pub store: Arc<Store>,
     pub events: EventTx,
-    /// Background async runtime. Tuned for low idle footprint (2 worker threads).
-    pub rt: Runtime,
+    /// Handle to the async runtime — used to spawn background tasks. `rt_owned`
+    /// holds the actual runtime; taking it out allows an explicit bounded shutdown.
+    pub rt: Handle,
+    /// The runtime itself, taken out during explicit shutdown so `stop_all_recordings`
+    /// can call `shutdown_timeout` rather than blocking forever in `Drop`.
+    rt_owned: Mutex<Option<Runtime>>,
     /// monitor_id -> child PID of in-flight recordings.
     pub active: ActiveSet,
     /// video_id -> child PID of in-flight on-demand video downloads.
@@ -69,11 +73,13 @@ impl AppCore {
             .enable_all()
             .thread_name("streamarchiver-core")
             .build()?;
+        let rt_handle = rt.handle().clone();
         let (events, _rx) = bus();
         Ok(Arc::new(AppCore {
             store,
             events,
-            rt,
+            rt: rt_handle,
+            rt_owned: Mutex::new(Some(rt)),
             active: Arc::new(Mutex::new(HashMap::new())),
             active_videos: Arc::new(Mutex::new(HashMap::new())),
             active_chats: Arc::new(Mutex::new(HashMap::new())),
@@ -253,45 +259,54 @@ impl AppCore {
     /// Gracefully stop all recordings and on-demand video downloads: signal
     /// shutdown, kill the tool process trees (so each task's child exits), then
     /// wait for those tasks to remux `.ts` -> `.mkv` and finalize before returning.
+    /// Finally shuts down the async runtime with a bounded timeout so the process
+    /// never hangs indefinitely waiting for a stuck background task or blocking thread.
     pub fn stop_all_recordings(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
         let initial = self.active.lock().unwrap().len()
             + self.active_videos.lock().unwrap().len()
             + self.active_chats.lock().unwrap().len();
-        if initial == 0 {
-            return;
+        if initial > 0 {
+            info!("stopping {initial} active download(s); waiting for finalize...");
+            let start = Instant::now();
+            loop {
+                let pids: Vec<u32> = self
+                    .active
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .chain(self.active_videos.lock().unwrap().values())
+                    .chain(self.active_chats.lock().unwrap().values())
+                    .copied()
+                    .filter(|p| *p > 0)
+                    .collect();
+                for pid in pids {
+                    crate::platform::kill_process_tree(pid);
+                }
+                if self.active.lock().unwrap().is_empty()
+                    && self.active_videos.lock().unwrap().is_empty()
+                    && self.active_chats.lock().unwrap().is_empty()
+                {
+                    info!("all downloads finalized");
+                    break;
+                }
+                if start.elapsed() > SHUTDOWN_DRAIN_TIMEOUT {
+                    let n = self.active.lock().unwrap().len()
+                        + self.active_videos.lock().unwrap().len()
+                        + self.active_chats.lock().unwrap().len();
+                    warn!("timed out waiting for {n} download(s) to finalize");
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
         }
-        info!("stopping {initial} active download(s); waiting for finalize...");
-        let start = Instant::now();
-        loop {
-            let pids: Vec<u32> = self
-                .active
-                .lock()
-                .unwrap()
-                .values()
-                .chain(self.active_videos.lock().unwrap().values())
-                .chain(self.active_chats.lock().unwrap().values())
-                .copied()
-                .filter(|p| *p > 0)
-                .collect();
-            for pid in pids {
-                crate::platform::kill_process_tree(pid);
-            }
-            if self.active.lock().unwrap().is_empty()
-                && self.active_videos.lock().unwrap().is_empty()
-                && self.active_chats.lock().unwrap().is_empty()
-            {
-                info!("all downloads finalized");
-                break;
-            }
-            if start.elapsed() > SHUTDOWN_DRAIN_TIMEOUT {
-                let n = self.active.lock().unwrap().len()
-                    + self.active_videos.lock().unwrap().len()
-                    + self.active_chats.lock().unwrap().len();
-                warn!("timed out waiting for {n} download(s) to finalize");
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(200));
+        // Shut down the runtime explicitly with a timeout so a stuck background task
+        // (e.g. an eventsub WebSocket mid-keepalive, a spawn_blocking notification)
+        // never causes the process to hang indefinitely after the UI exits.
+        if let Some(rt) = self.rt_owned.lock().unwrap().take() {
+            info!("shutting down async runtime (timeout 30s)");
+            rt.shutdown_timeout(Duration::from_secs(30));
+            info!("runtime shut down");
         }
     }
 }
