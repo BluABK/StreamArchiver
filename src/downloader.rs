@@ -981,6 +981,11 @@ pub struct Supervisor {
     ad_active: AdActive,
     sem: Arc<Semaphore>,
     backoff: Arc<Mutex<HashMap<i64, BackoffEntry>>>,
+    /// Monitors where SABR live-from-start hit the DVR window limit ("not near
+    /// live head"). The next attempt falls back to live-edge so we at least
+    /// capture the ongoing stream instead of looping forever. Cleared on a
+    /// successful capture (bytes > 0); in-memory only (resets on app restart).
+    sabr_dvr_exceeded: Arc<Mutex<HashSet<i64>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1021,6 +1026,7 @@ impl Supervisor {
             ad_active,
             sem: Arc::new(Semaphore::new(max_concurrent.max(1))),
             backoff: Arc::new(Mutex::new(HashMap::new())),
+            sabr_dvr_exceeded: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -1812,6 +1818,17 @@ impl Supervisor {
         stream_title: Option<String>,
     ) {
         let monitor_id = row.monitor.id;
+        // SABR DVR fallback: a prior attempt hit YouTube's ~4-hour DVR window
+        // limit ("not near live head"). Override capture_from_start so we fall
+        // back to live-edge this time instead of stalling from the beginning
+        // again. The flag is cleared when a capture succeeds (bytes > 0).
+        let mut row = row;
+        if row.monitor.capture_from_start
+            && self.sabr_dvr_exceeded.lock().unwrap().contains(&monitor_id)
+        {
+            row.monitor.capture_from_start = false;
+            info!(monitor_id, "SABR DVR window exceeded; switching to live-edge capture");
+        }
         let global_method = self
             .store
             .get_setting("download_auth_method")
@@ -2096,15 +2113,23 @@ impl Supervisor {
         };
 
         // Stop the catch-up watcher before we touch the capture file (so it can't
-        // race finalize's authoritative lost-time write).
+        // race finalize's authoritative lost-time write). Abort rather than wait:
+        // the watcher only checks its done flag at the start of each sleep tick, so
+        // a mid-ffprobe call would otherwise block here for several seconds.
         watcher_done.store(true, Ordering::SeqCst);
         if let Some(w) = watcher {
+            w.abort();
             let _ = w.await;
         }
-        // Stop the metadata watcher too (it only writes its own table, but join it
-        // so a final in-flight poll can't insert after the recording is finalized).
+        // Same for the metadata watcher: it only checks `done` between API poll
+        // cycles, so if it's mid-request (youtube_stream_meta scrapes a full page,
+        // twitch_stream_meta hits Helix) we'd stall here for up to 30 s — keeping
+        // the monitor in `active` and the UI stuck on "Stop recording" even though
+        // the process has already exited. Abort cancels the in-flight request
+        // immediately; no finalized insert can race because the task is gone.
         meta_done.store(true, Ordering::SeqCst);
         if let Some(t) = meta_task {
+            t.abort();
             let _ = t.await;
         }
         // Stop the chat logger and let it flush/close its sidecar before we touch
@@ -2209,6 +2234,20 @@ impl Supervisor {
         let ok = bytes > 0;
         let manually_stopped = self.stopping_monitors.lock().unwrap().remove(&monitor_id);
         let shutting_down = self.shutdown.load(Ordering::SeqCst);
+        // SABR DVR window exceeded: YouTube only serves the last ~4 hours of a
+        // live stream via SABR; once the stream is older than that, each attempt
+        // stalls shortly after starting ("not near live head"). Record this so the
+        // next attempt falls back to live-edge capture (see override at top of fn).
+        let sabr_dvr = !ok
+            && !manually_stopped
+            && !shutting_down
+            && sabr_dvr_window_exceeded(&outcome.log);
+        if sabr_dvr {
+            self.sabr_dvr_exceeded.lock().unwrap().insert(monitor_id);
+            warn!(monitor_id, "SABR hit DVR window limit; next attempt will use live-edge");
+        } else if ok {
+            self.sabr_dvr_exceeded.lock().unwrap().remove(&monitor_id);
+        }
         // A 0-byte capture isn't always a failure: a livestream that had already
         // ended (or hadn't started, or exposed no live video formats) leaves
         // nothing to capture but isn't an error. Classify those as `ended` so they
@@ -2222,7 +2261,7 @@ impl Supervisor {
             "aborted"
         } else if ok {
             "completed"
-        } else if stream_ended_or_unavailable(&outcome.log) {
+        } else if sabr_dvr || stream_ended_or_unavailable(&outcome.log) {
             "ended"
         } else {
             "failed"
@@ -4570,6 +4609,15 @@ fn stream_ended_or_unavailable(log: &str) -> bool {
         "No playable streams found",
     ];
     PATTERNS.iter().any(|p| log.contains(p))
+}
+
+/// True when SABR live-from-start failed because YouTube's DVR window (~4h)
+/// no longer covers the beginning of a long-running stream. The tool downloads
+/// a few dozen initial segments then the server goes silent and raises
+/// `StreamStallError: … not near live head`. Retrying from-start will always
+/// hit the same wall; the next attempt should capture the live edge instead.
+fn sabr_dvr_window_exceeded(log: &str) -> bool {
+    log.contains("not near live head")
 }
 
 /// Minimal whitespace arg splitter (double-quoted segments kept together).
