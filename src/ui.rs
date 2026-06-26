@@ -509,6 +509,10 @@ pub struct StreamArchiverApp {
     /// decoder is built in). Accumulates the union of every chat viewed this
     /// session; cleared alongside [`Self::channel_icons`] when assets re-fetch.
     emote_textures: HashMap<std::path::PathBuf, Option<egui::TextureHandle>>,
+    /// Per-channel Twitch broadcaster name colour (from `name_color.txt`, fetched
+    /// via Helix). `None` = looked up but the streamer set no colour / not Twitch.
+    /// Tints the channel name in the Streams list; cleared with `channel_icons`.
+    channel_twitch_colors: HashMap<i64, Option<egui::Color32>>,
     /// Sort + per-column filters for the Videos table.
     videos_sort: SortState,
     videos_filters: Vec<String>,
@@ -761,6 +765,7 @@ impl StreamArchiverApp {
             properties_popup: None,
             channel_icons: HashMap::new(),
             emote_textures: HashMap::new(),
+            channel_twitch_colors: HashMap::new(),
             videos_sort: SortState::default(),
             videos_filters: vec![String::new(); VIDEO_COLS],
             twitch_flow,
@@ -917,6 +922,7 @@ impl StreamArchiverApp {
                         if task.kind == crate::events::BackgroundTaskKind::AssetFetch {
                             self.channel_icons.clear();
                             self.emote_textures.clear();
+                            self.channel_twitch_colors.clear();
                         }
                         self.finished_tasks.insert(0, (task, outcome, now_unix()));
                         self.finished_tasks.truncate(100);
@@ -3803,6 +3809,12 @@ impl StreamArchiverApp {
                     Ok(()) => {
                         self.status = "Saved.".into();
                         self.channel_form = None;
+                        // A rename changes the asset-dir path these name-derived
+                        // caches read from, so drop them for this channel.
+                        if let Some(id) = id_opt {
+                            self.channel_icons.remove(&id);
+                            self.channel_twitch_colors.remove(&id);
+                        }
                         self.reload_rows();
                     }
                     Err(e) => self.status = format!("Error: {e}"),
@@ -6012,11 +6024,17 @@ impl StreamArchiverApp {
             })
             .collect();
 
-        // Resolve each container's avatar (its chosen-platform profile pic) up
-        // front — it needs `&mut self` (texture cache), so the read-only table
-        // closure below can just look it up by channel id.
+        // Resolve each container's avatar (its chosen-platform profile pic) and its
+        // name colour up front — both need `&mut self` (caches), so the read-only
+        // table closure below can just look them up by channel id.
         let mut channel_avatars: HashMap<i64, egui::TextureHandle> = HashMap::new();
+        // Per-container name colour as (base, adjust): `adjust` marks a fetched
+        // Twitch broadcaster colour that should be made readable against the row's
+        // *effective* background at render time (rows tint when recording/ad/error).
+        // Manual + auto-palette colours are used as-is (already curated).
+        let mut channel_name_colors: HashMap<i64, (egui::Color32, bool)> = HashMap::new();
         for e in &chan_entries {
+            let cid = e.channel.id;
             let platforms = {
                 let mons: Vec<&MonitorWithChannel> =
                     e.rows.iter().map(|&i| &self.rows[i]).collect();
@@ -6024,12 +6042,30 @@ impl StreamArchiverApp {
             };
             let tex = self
                 .channel_icons
-                .entry(e.channel.id)
+                .entry(cid)
                 .or_insert_with(|| resolve_channel_icon(&e.channel, &platforms, ui.ctx()))
                 .clone();
             if let Some(t) = tex {
-                channel_avatars.insert(e.channel.id, t);
+                channel_avatars.insert(cid, t);
             }
+            // Name colour: a manual custom colour wins; otherwise tint Twitch
+            // channels with the streamer's own (cached) name colour; otherwise the
+            // automatic palette.
+            let name_color = if !e.channel.color.is_empty() {
+                (channel_event_color(cid, &e.channel.color), false)
+            } else if platforms.contains(&Platform::Twitch) {
+                match *self
+                    .channel_twitch_colors
+                    .entry(cid)
+                    .or_insert_with(|| load_twitch_name_color(&e.channel.name))
+                {
+                    Some(c) => (c, true), // raw broadcaster colour → readability at render
+                    None => (channel_event_color(cid, ""), false),
+                }
+            } else {
+                (channel_event_color(cid, ""), false)
+            };
+            channel_name_colors.insert(cid, name_color);
         }
 
         // Lazily load + cache recordings for currently-expanded monitors, then
@@ -6365,10 +6401,26 @@ impl StreamArchiverApp {
                                             );
                                             ui.add_space(3.0);
                                         }
+                                        let (base, adjust) = channel_name_colors
+                                            .get(&cid)
+                                            .copied()
+                                            .unwrap_or_else(|| {
+                                                (channel_event_color(cid, &ch.color), false)
+                                            });
+                                        // Make a fetched Twitch colour readable
+                                        // against the row's actual background (the
+                                        // tint when highlighted, else the panel).
+                                        let name_color = if adjust {
+                                            let bg =
+                                                tint.unwrap_or_else(|| ui.visuals().panel_fill);
+                                            readable_color(base, bg)
+                                        } else {
+                                            base
+                                        };
                                         ui.label(
                                             egui::RichText::new(&ch.name)
                                                 .strong()
-                                                .color(channel_event_color(cid, &ch.color)),
+                                                .color(name_color),
                                         );
                                         disc = clicked;
                                     });
@@ -6958,6 +7010,7 @@ impl StreamArchiverApp {
             // Invalidate cached icon so it reloads (assets may have been fetched since last open).
             if let Some(r) = self.rows.iter().find(|r| r.monitor.id == mid) {
                 self.channel_icons.remove(&r.channel.id);
+                self.channel_twitch_colors.remove(&r.channel.id);
             }
         }
         if let Some(cid) = acts.add_instance {
@@ -9229,6 +9282,7 @@ impl StreamArchiverApp {
                         {
                             self.core.manual(ManualCommand::RefetchAssets(m.id));
                             self.channel_icons.remove(&ch.id); // reload after fetch
+                            self.channel_twitch_colors.remove(&ch.id);
                             self.status = format!("Refetching assets for {}…", ch.name);
                         }
                         if ui
@@ -9381,6 +9435,15 @@ impl StreamArchiverApp {
 /// Thin alias for the shared definition in [`crate::assets::channel_asset_dir`].
 fn channel_asset_dir(name: &str, platform: Platform) -> std::path::PathBuf {
     crate::assets::channel_asset_dir(name, platform)
+}
+
+/// The Twitch broadcaster's chosen chat name colour for `name`, if the asset fetch
+/// cached one (`…/{name}/twitch/name_color.txt`, e.g. `#9146FF`). `None` when the
+/// streamer set no colour or assets haven't been fetched.
+fn load_twitch_name_color(name: &str) -> Option<egui::Color32> {
+    let path = channel_asset_dir(name, Platform::Twitch).join("name_color.txt");
+    let s = std::fs::read_to_string(path).ok()?;
+    parse_chat_hex_color(s.trim())
 }
 
 /// Build a Twitch channel's third-party emote lookup: case-sensitive emote code →
@@ -9864,8 +9927,9 @@ fn render_chat_message(
             let (sym, color) = badge_display(badge, &msg.platform);
             ui.label(egui::RichText::new(sym).small().color(color));
         }
-        // Username — bold, platform/user colour
-        let name_color = chat_username_color(msg);
+        // Username — bold, platform/user colour, adjusted for contrast on the
+        // chat panel's background so dark colours stay legible.
+        let name_color = chat_username_color(msg, ui.visuals().panel_fill);
         ui.label(
             egui::RichText::new(format!("{}:", msg.author))
                 .strong()
@@ -9940,27 +10004,156 @@ fn badge_display(badge: &str, platform: &ChatPlatform) -> (&'static str, egui::C
     }
 }
 
-fn chat_username_color(msg: &ChatMessage) -> egui::Color32 {
-    if let Some(c) = msg.color_override {
-        return c;
-    }
-    match msg.platform {
-        ChatPlatform::YouTube => egui::Color32::from_rgb(0x4a, 0xc2, 0xff),
-        ChatPlatform::Twitch => twitch_username_color(&msg.author),
-    }
+/// The display colour for a chat author's name, adjusted to stay legible on the
+/// chat panel's background `bg`. The base colour mirrors each platform: a Twitch
+/// user's chosen USERCOLOR (or their deterministic default from Twitch's 15-colour
+/// palette), and YouTube's role-based name colours (mod/member/owner/regular).
+fn chat_username_color(msg: &ChatMessage, bg: egui::Color32) -> egui::Color32 {
+    let base = match (msg.color_override, &msg.platform) {
+        // Twitch USERCOLOR (IRC `color` tag), used as-is by both platforms when set.
+        (Some(c), _) => c,
+        (None, ChatPlatform::Twitch) => twitch_username_color(&msg.author),
+        (None, ChatPlatform::YouTube) => youtube_username_color(&msg.badges),
+    };
+    readable_color(base, bg)
 }
 
+/// Twitch's 15 default name colours, assigned to users who never picked one.
+/// Twitch keys this off the name (first + last char), so the same user is always
+/// the same colour — we reproduce that exactly for ASCII names.
 fn twitch_username_color(name: &str) -> egui::Color32 {
-    const DEFAULTS: &[&str] = &[
-        "#FF0000", "#0000FF", "#00FF00", "#B22222", "#FF7F50", "#9ACD32", "#FF4500", "#2E8B57",
-        "#DAA520", "#D2691E", "#5F9EA0", "#1E90FF", "#FF69B4", "#8A2BE2", "#00FF7F",
+    const DEFAULTS: [egui::Color32; 15] = [
+        egui::Color32::from_rgb(0xFF, 0x00, 0x00), // Red
+        egui::Color32::from_rgb(0x00, 0x00, 0xFF), // Blue
+        egui::Color32::from_rgb(0x00, 0x80, 0x00), // Green
+        egui::Color32::from_rgb(0xB2, 0x22, 0x22), // FireBrick
+        egui::Color32::from_rgb(0xFF, 0x7F, 0x50), // Coral
+        egui::Color32::from_rgb(0x9A, 0xCD, 0x32), // YellowGreen
+        egui::Color32::from_rgb(0xFF, 0x45, 0x00), // OrangeRed
+        egui::Color32::from_rgb(0x2E, 0x8B, 0x57), // SeaGreen
+        egui::Color32::from_rgb(0xDA, 0xA5, 0x20), // GoldenRod
+        egui::Color32::from_rgb(0xD2, 0x69, 0x1E), // Chocolate
+        egui::Color32::from_rgb(0x5F, 0x9E, 0xA0), // CadetBlue
+        egui::Color32::from_rgb(0x1E, 0x90, 0xFF), // DodgerBlue
+        egui::Color32::from_rgb(0xFF, 0x69, 0xB4), // HotPink
+        egui::Color32::from_rgb(0x8A, 0x2B, 0xE2), // BlueViolet
+        egui::Color32::from_rgb(0x00, 0xFF, 0x7F), // SpringGreen
     ];
     let b = name.as_bytes();
     if b.is_empty() {
-        return egui::Color32::WHITE;
+        return egui::Color32::GRAY;
     }
     let n = (b[0] as usize + b[b.len() - 1] as usize) % DEFAULTS.len();
-    parse_chat_hex_color(DEFAULTS[n]).unwrap_or(egui::Color32::WHITE)
+    DEFAULTS[n]
+}
+
+/// YouTube live-chat name colours by role (derived from the author's badges):
+/// moderator blue, member green, owner gold, and a neutral grey for everyone else
+/// (YouTube doesn't per-user colour regular names). Readability is applied later.
+fn youtube_username_color(badges: &[String]) -> egui::Color32 {
+    let has = |needle: &str| badges.iter().any(|b| b.to_lowercase().contains(needle));
+    if has("owner") {
+        egui::Color32::from_rgb(0xFF, 0xD6, 0x00) // channel owner — gold
+    } else if has("moderator") {
+        egui::Color32::from_rgb(0x5E, 0x84, 0xF1) // YouTube moderator blue
+    } else if has("member") {
+        egui::Color32::from_rgb(0x2B, 0xA6, 0x40) // YouTube member green
+    } else {
+        egui::Color32::from_rgb(0xB0, 0xB0, 0xB0) // regular — neutral grey
+    }
+}
+
+/// WCAG relative luminance of a colour (sRGB → linear, then the standard weights).
+fn relative_luminance(c: egui::Color32) -> f32 {
+    let lin = |v: u8| {
+        let s = v as f32 / 255.0;
+        if s <= 0.03928 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+}
+
+/// WCAG contrast ratio between two colours (1.0 = identical, 21.0 = black/white).
+fn contrast_ratio(a: egui::Color32, b: egui::Color32) -> f32 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// Nudge `fg`'s lightness away from the background (lighter on a dark bg, darker on
+/// a light bg) until it clears a contrast floor, preserving hue — the way Twitch
+/// lightens dark name colours in dark mode so e.g. pure blue stays legible. Returns
+/// `fg` unchanged when it's already comfortable.
+fn readable_color(fg: egui::Color32, bg: egui::Color32) -> egui::Color32 {
+    // Slightly under WCAG AA (4.5): names are bold, and staying closer keeps the
+    // colour vivid rather than washing it toward white/black.
+    const TARGET: f32 = 4.0;
+    if contrast_ratio(fg, bg) >= TARGET {
+        return fg;
+    }
+    // Push toward whichever extreme can actually out-contrast the background, not a
+    // flat luminance midpoint — for a mid-tone background, lightening toward white
+    // may never reach the target while darkening toward black does (and vice-versa).
+    let lighten = contrast_ratio(egui::Color32::WHITE, bg) >= contrast_ratio(egui::Color32::BLACK, bg);
+    let (h, s, mut l) = rgb_to_hsl(fg);
+    let mut out = fg;
+    for _ in 0..50 {
+        l = if lighten { (l + 0.02).min(1.0) } else { (l - 0.02).max(0.0) };
+        out = hsl_to_rgb(h, s, l);
+        if contrast_ratio(out, bg) >= TARGET {
+            return out;
+        }
+        if l <= 0.0 || l >= 1.0 {
+            break; // can't push further; return the best we reached
+        }
+    }
+    out
+}
+
+/// sRGB → HSL (hue degrees 0–360, saturation/lightness 0–1).
+fn rgb_to_hsl(c: egui::Color32) -> (f32, f32, f32) {
+    let (r, g, b) = (
+        c.r() as f32 / 255.0,
+        c.g() as f32 / 255.0,
+        c.b() as f32 / 255.0,
+    );
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) / 2.0;
+    let d = max - min;
+    if d < 1e-6 {
+        return (0.0, 0.0, l); // achromatic (grey)
+    }
+    let s = d / (1.0 - (2.0 * l - 1.0).abs());
+    let h = if max == r {
+        ((g - b) / d).rem_euclid(6.0)
+    } else if max == g {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    };
+    ((h * 60.0).rem_euclid(360.0), s, l)
+}
+
+/// HSL → sRGB (inverse of [`rgb_to_hsl`]).
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> egui::Color32 {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let hp = h / 60.0;
+    let x = c * (1.0 - (hp.rem_euclid(2.0) - 1.0).abs());
+    let (r1, g1, b1) = match hp as i32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    let to = |v: f32| (((v + m) * 255.0).round()).clamp(0.0, 255.0) as u8;
+    egui::Color32::from_rgb(to(r1), to(g1), to(b1))
 }
 
 fn parse_chat_hex_color(s: &str) -> Option<egui::Color32> {
@@ -10157,10 +10350,12 @@ fn parse_twitch_chat(
 mod tests {
     use super::{
         ChatSegment, DateFmt, StreamMetaChange, active_date_fmt, aggregate_stream_changes,
-        build_twitch_segments, chat_file_for_recording, compose_browser_profile, fmt_polled,
-        meta_change_lines, parse_first_party_spans, set_active_date_fmt, split_browser_profile,
-        strip_ctcp_action, word_match_segments,
+        build_twitch_segments, chat_file_for_recording, compose_browser_profile, contrast_ratio,
+        fmt_polled, hsl_to_rgb, meta_change_lines, parse_first_party_spans, readable_color,
+        rgb_to_hsl, set_active_date_fmt, split_browser_profile, strip_ctcp_action,
+        twitch_username_color, word_match_segments,
     };
+    use eframe::egui;
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -10284,6 +10479,69 @@ mod tests {
         let map = HashMap::new();
         let segs = build_twitch_segments(stripped, "25:0-4", &map, None);
         assert!(matches!(&segs[0], ChatSegment::Emote { name, .. } if name == "Kappa"));
+    }
+
+    // ----- username colour readability -----
+
+    #[test]
+    fn hsl_round_trips_within_one_step() {
+        for c in [
+            egui::Color32::from_rgb(0xFF, 0x00, 0x00),
+            egui::Color32::from_rgb(0x00, 0x00, 0xFF),
+            egui::Color32::from_rgb(0x8A, 0x2B, 0xE2),
+            egui::Color32::from_rgb(0x12, 0x34, 0x56),
+            egui::Color32::from_rgb(0x80, 0x80, 0x80),
+        ] {
+            let (h, s, l) = rgb_to_hsl(c);
+            let back = hsl_to_rgb(h, s, l);
+            // Allow ±1 per channel for rounding.
+            assert!((c.r() as i32 - back.r() as i32).abs() <= 1);
+            assert!((c.g() as i32 - back.g() as i32).abs() <= 1);
+            assert!((c.b() as i32 - back.b() as i32).abs() <= 1);
+        }
+    }
+
+    #[test]
+    fn readable_color_lightens_dark_color_on_dark_bg() {
+        let bg = egui::Color32::from_rgb(0x1e, 0x1e, 0x1e); // egui dark panel-ish
+        let blue = egui::Color32::from_rgb(0x00, 0x00, 0xFF); // unreadable on dark
+        assert!(contrast_ratio(blue, bg) < 4.0);
+        let fixed = readable_color(blue, bg);
+        assert!(contrast_ratio(fixed, bg) >= 4.0);
+        // Hue stays blue-ish: blue channel remains the dominant one.
+        assert!(fixed.b() > fixed.r() && fixed.b() > fixed.g());
+    }
+
+    #[test]
+    fn readable_color_picks_reachable_direction_on_midtone_bg() {
+        // On a mid-grey bg, lightening blue toward white never clears 4.0, but
+        // darkening does — the direction must be chosen by reachable contrast.
+        let bg = egui::Color32::from_gray(128);
+        let blue = egui::Color32::from_rgb(0x00, 0x00, 0xFF);
+        let fixed = readable_color(blue, bg);
+        assert!(contrast_ratio(fixed, bg) >= 4.0);
+    }
+
+    #[test]
+    fn readable_color_keeps_already_legible_color() {
+        let bg = egui::Color32::from_rgb(0x1e, 0x1e, 0x1e);
+        let coral = egui::Color32::from_rgb(0xFF, 0x7F, 0x50); // already high-contrast
+        assert_eq!(readable_color(coral, bg), coral);
+    }
+
+    #[test]
+    fn readable_color_darkens_pale_color_on_light_bg() {
+        let bg = egui::Color32::WHITE;
+        let pale = egui::Color32::from_rgb(0xFF, 0xFF, 0x00); // yellow: invisible on white
+        assert!(contrast_ratio(pale, bg) < 4.0);
+        let fixed = readable_color(pale, bg);
+        assert!(contrast_ratio(fixed, bg) > contrast_ratio(pale, bg));
+    }
+
+    #[test]
+    fn twitch_default_color_is_deterministic_per_name() {
+        // Same name → same colour every time (Twitch's stable default assignment).
+        assert_eq!(twitch_username_color("Kappa"), twitch_username_color("Kappa"));
     }
 
     #[test]

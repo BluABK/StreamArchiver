@@ -809,8 +809,9 @@ async fn fetch_kick_channel_assets(
 /// - BTTV shared emotes → `platform_dir/bttv/emotes/` (global dedup)
 /// - FFZ emotes → `platform_dir/ffz/emotes/` + manifest `asset_dir/emotes/ffz.json`
 /// - 7TV emotes → `platform_dir/7tv/emotes/` + manifest `asset_dir/emotes/7tv.json`
-/// Returns `true` if the channel icon/banner fetch succeeded (badges/emotes are
-/// best-effort and don't affect the result). The 24h "fetched" stamp is written
+/// - Broadcaster name colour → `asset_dir/name_color.txt` (Helix `chat/color`)
+/// Returns `true` if the channel icon/banner fetch succeeded (badges/emotes/colour
+/// are best-effort and don't affect the result). The 24h "fetched" stamp is written
 /// **only on success**, so a failed fetch (e.g. empty/invalid `broadcaster_id`,
 /// API error) is retried instead of being blocked for a day.
 pub async fn run_twitch_assets(
@@ -849,10 +850,55 @@ pub async fn run_twitch_assets(
     if let Err(e) = fetch_7tv_emotes(client, broadcaster_id, asset_dir, platform_dir).await {
         warn!("7TV ({broadcaster_id}): {e}");
     }
+    if let Err(e) =
+        fetch_twitch_name_color(client, client_id, token, broadcaster_id, asset_dir).await
+    {
+        warn!("Twitch name color ({broadcaster_id}): {e}");
+    }
     if ok {
         write_fetched_stamp(asset_dir);
     }
     ok
+}
+
+/// Fetch the broadcaster's chosen Twitch chat name colour (Helix `chat/color`) and
+/// cache it as `asset_dir/name_color.txt` (e.g. `#9146FF`). The chat replay uses
+/// the IRC `color` tag directly, but this lets the Streams list tint a Twitch
+/// channel's name with the streamer's own colour. No file is written when the user
+/// hasn't set a colour (Helix returns an empty string), so the UI falls back to its
+/// automatic palette.
+async fn fetch_twitch_name_color(
+    client: &Client,
+    client_id: &str,
+    token: &str,
+    broadcaster_id: &str,
+    asset_dir: &Path,
+) -> Result<()> {
+    if broadcaster_id.is_empty() {
+        return Ok(());
+    }
+    let url = format!("https://api.twitch.tv/helix/chat/color?user_id={broadcaster_id}");
+    let resp = client
+        .get(&url)
+        .header("Client-Id", client_id)
+        .bearer_auth(token)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        bail!("Helix chat color: {}", resp.status());
+    }
+    let v: serde_json::Value = resp.json().await?;
+    let color = v["data"][0]["color"].as_str().unwrap_or("").trim().to_string();
+    let dest = asset_dir.join("name_color.txt");
+    if color.is_empty() {
+        // Broadcaster cleared their colour — drop any stale cache so the UI reverts
+        // to the automatic palette instead of tinting with a colour no longer used.
+        let _ = tokio::fs::remove_file(&dest).await;
+    } else {
+        tokio::fs::create_dir_all(asset_dir).await?;
+        let _ = tokio::fs::write(&dest, color).await;
+    }
+    Ok(())
 }
 
 /// Run YouTube channel asset fetches (icon, banner). Stamps only on success.
