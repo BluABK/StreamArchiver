@@ -1,12 +1,20 @@
 //! Install OS fonts that cover non-Latin glyphs (CJK, Hangul, fullwidth `【】`,
-//! etc.) as *fallbacks* behind egui's bundled default.
+//! emoji, etc.) as *fallbacks* behind egui's bundled default.
 //!
 //! egui's default font is Latin-only, so channel names like Japanese VTuber names
-//! (or `Nimi Nightmare【Phase Connect】`) otherwise render as tofu boxes. We read a
-//! few fonts already present on the system and append them after the defaults, so
-//! Latin text + the UI icon glyphs keep the default look and only the missing
-//! glyphs fall through to these. Nothing is bundled into the binary (keeps it lean);
-//! if none of the candidates exist we simply leave the defaults untouched.
+//! (or `Nimi Nightmare【Phase Connect】`) — and the emoji chat viewers spam — otherwise
+//! render as tofu boxes. We read a few fonts already present on the system and append
+//! them after the defaults, so Latin text + the UI icon glyphs keep the default look
+//! and only the missing glyphs fall through to these. Nothing is bundled into the
+//! binary (keeps it lean); if none of the candidates exist we leave the defaults
+//! untouched.
+//!
+//! Emoji caveat: egui's renderer rasterizes glyph *outlines* only — it ignores the
+//! colour tables (COLR/CPAL, sbix, CBDT) in colour-emoji fonts. So emoji render
+//! **monochrome** (the base outline) where the chosen font provides one, and stay
+//! tofu where it only has a colour bitmap. Segoe UI Emoji (Windows) and Noto Emoji
+//! (Linux) carry outlines and render mono; Apple Color Emoji does not, so macOS
+//! falls back to the symbol fonts (partial coverage).
 
 use std::sync::Arc;
 
@@ -28,6 +36,12 @@ const FONT_GROUPS: &[&[&str]] = &[
     &[r"C:\Windows\Fonts\malgun.ttf"],
     // Simplified Chinese (Han).
     &[r"C:\Windows\Fonts\msyh.ttc"],
+    // Emoji — Segoe UI Emoji's base glyphs are monochrome outlines the renderer can
+    // rasterize (the COLR colour layers are ignored), so modern emoji show as B&W
+    // silhouettes instead of tofu.
+    &[r"C:\Windows\Fonts\seguiemj.ttf"],
+    // Older emoji + dingbats/symbols Segoe UI Emoji may not cover.
+    &[r"C:\Windows\Fonts\seguisym.ttf"],
 ];
 
 #[cfg(target_os = "macos")]
@@ -38,14 +52,33 @@ const FONT_GROUPS: &[&[&str]] = &[
     ],
     &["/System/Library/Fonts/AppleSDGothicNeo.ttc"],
     &["/Library/Fonts/Arial Unicode.ttf"],
+    // Emoji/symbols. Apple Color Emoji is an sbix colour bitmap with no outlines, so
+    // the renderer draws nothing from it — use the outline symbol fonts instead
+    // (monochrome, partial emoji coverage; better than tofu).
+    &["/System/Library/Fonts/Apple Symbols.ttf"],
+    &["/System/Library/Fonts/ZapfDingbats.ttf"],
 ];
 
 #[cfg(all(unix, not(target_os = "macos")))]
-const FONT_GROUPS: &[&[&str]] = &[&[
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-]];
+const FONT_GROUPS: &[&[&str]] = &[
+    &[
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    ],
+    // Emoji — Noto Color Emoji is a CBDT colour bitmap (renders blank), so prefer the
+    // monochrome-outline Noto Emoji, which the renderer rasterizes.
+    &[
+        "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",
+        "/usr/share/fonts/noto/NotoEmoji-Regular.ttf",
+        "/usr/share/fonts/google-noto/NotoEmoji-Regular.ttf",
+    ],
+    // Extra symbol/dingbat blocks.
+    &[
+        "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
+    ],
+];
 
 /// Append available system CJK/Unicode fonts as fallbacks. No-op (keeps the egui
 /// defaults) when none of the candidates are present.

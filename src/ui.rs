@@ -548,9 +548,9 @@ pub struct StreamArchiverApp {
     /// A `None` value means the lookup was attempted but no icon file was found.
     channel_icons: HashMap<i64, Option<egui::TextureHandle>>,
     /// Decoded chat-emote textures, keyed by absolute image path. `None` = load
-    /// attempted but the file is missing/empty/undecodable (e.g. a `.gif` — no gif
-    /// decoder is built in). Accumulates the union of every chat viewed this
-    /// session; cleared alongside [`Self::channel_icons`] when assets re-fetch.
+    /// attempted but the file is missing/empty/undecodable. Animated emotes render
+    /// their first frame (gif/webp). Accumulates the union of every chat viewed
+    /// this session; cleared alongside [`Self::channel_icons`] when assets re-fetch.
     emote_textures: HashMap<std::path::PathBuf, Option<egui::TextureHandle>>,
     /// Per-channel Twitch broadcaster name colour (from `name_color.txt`, fetched
     /// via Helix). `None` = looked up but the streamer set no colour / not Twitch.
@@ -10108,11 +10108,9 @@ fn build_twitch_segments(
             }
         }
         let name = text.get(b0..b1).unwrap_or("").to_string();
-        // First-party files are saved as `{id}.png` (animated as `{id}.gif`, which
-        // has no decoder → file probe misses → text fallback). Probe png only.
-        let file = twitch_dir
-            .map(|d| d.join(format!("{id}.png")))
-            .filter(|p| p.exists());
+        // First-party files are `{id}.png` (static) or `{id}.gif` (animated — we
+        // render its first frame). Probe both so animated channel emotes show too.
+        let file = twitch_dir.and_then(|d| find_emote_file(d, &id));
         out.push(ChatSegment::Emote { name, file });
         cursor = b1;
     }
@@ -10346,9 +10344,9 @@ fn load_channel_icon(
 }
 
 /// Decode an emote image file into an egui texture (same pipeline as
-/// [`load_channel_icon`]). Returns `None` when the file is missing/empty or its
-/// format has no decoder (`.gif` — image crate has no gif feature; animated
-/// `.webp` decodes its first frame). Callers cache the `Option` so a failed decode
+/// [`load_channel_icon`]). Returns `None` when the file is missing/empty or
+/// undecodable. Animated emotes (`.gif` / `.webp`) decode to their first frame —
+/// egui's renderer is static-only. Callers cache the `Option` so a failed decode
 /// isn't retried every frame and falls back to the emote's code text.
 fn load_emote_texture(path: &Path, ctx: &egui::Context) -> Option<egui::TextureHandle> {
     let bytes = std::fs::read(path).ok()?;
@@ -10735,6 +10733,15 @@ fn parse_chat_hex_color(s: &str) -> Option<egui::Color32> {
     let g = u8::from_str_radix(&s[2..4], 16).ok()?;
     let b = u8::from_str_radix(&s[4..6], 16).ok()?;
     Some(egui::Color32::from_rgb(r, g, b))
+}
+
+/// First existing emote image for `{stem}` in `dir`, trying the formats Twitch
+/// uses (static `.png`, animated `.gif`) plus `.webp`. `None` when none exist.
+fn find_emote_file(dir: &Path, stem: &str) -> Option<std::path::PathBuf> {
+    ["png", "gif", "webp"]
+        .iter()
+        .map(|ext| dir.join(format!("{stem}.{ext}")))
+        .find(|p| p.exists())
 }
 
 fn parse_chat_file(
