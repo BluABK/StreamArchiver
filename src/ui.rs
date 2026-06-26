@@ -150,6 +150,9 @@ struct MonitorForm {
     /// Download stream thumbnail at recording start (yt-dlp: --write-thumbnail;
     /// Twitch/Kick/YouTube: fetch URL from detection metadata).
     fetch_thumbnail: bool,
+    /// Use the stream thumbnail (when fetched) as the hero image in the
+    /// recording-started notification instead of the channel's static banner.
+    thumbnail_in_toast: bool,
     /// Download channel icon, banner, badges, and emotes (Twitch: BTTV/FFZ/7TV too)
     /// into channel_assets/ alongside recordings.
     fetch_chat_assets: bool,
@@ -189,6 +192,7 @@ impl MonitorForm {
             subtitle_tracks: "all".into(),
             chat_log: true,
             fetch_thumbnail: true,
+            thumbnail_in_toast: false,
             fetch_chat_assets: true,
             extra_args: String::new(),
             last_platform: None,
@@ -219,6 +223,7 @@ impl MonitorForm {
             subtitle_tracks: m.subtitle_tracks.clone(),
             chat_log: m.chat_log,
             fetch_thumbnail: m.fetch_thumbnail,
+            thumbnail_in_toast: m.thumbnail_in_toast,
             fetch_chat_assets: m.fetch_chat_assets,
             extra_args: m.extra_args.clone(),
             // Don't override the saved tool/detection just because the form opened.
@@ -254,6 +259,7 @@ impl MonitorForm {
             subtitle_tracks: "all".into(),
             chat_log: true,
             fetch_thumbnail: true,
+            thumbnail_in_toast: false,
             fetch_chat_assets: true,
             extra_args: String::new(),
             last_platform: None,
@@ -961,6 +967,7 @@ impl StreamArchiverApp {
             subtitle_tracks: form.subtitle_tracks.trim().to_string(),
             chat_log: form.chat_log,
             fetch_thumbnail: form.fetch_thumbnail,
+            thumbnail_in_toast: form.thumbnail_in_toast,
             fetch_chat_assets: form.fetch_chat_assets,
             extra_args: form.extra_args.clone(),
             max_concurrent: 1,
@@ -2405,7 +2412,7 @@ struct StreamCol {
 /// floors — `Column::auto` shrinks tight columns to their content — except the
 /// `initial`-width columns, which start narrow and truncate (full value on hover).
 const STREAM_COLUMNS: [StreamCol; 20] = [
-    StreamCol { title: "Auto", tooltip: "Enable/disable monitoring. A channel's checkbox toggles all its instances at once.", min_width: 36.0, initial: 0.0, sortable: true },
+    StreamCol { title: "Auto", tooltip: "Enable/disable monitoring. The channel checkbox and each instance checkbox are independent.", min_width: 36.0, initial: 0.0, sortable: true },
     StreamCol { title: "Actions", tooltip: "Per-row actions: start/stop recording, edit, add instance, open folder, delete.", min_width: 126.0, initial: 0.0, sortable: false },
     StreamCol { title: "Plat", tooltip: "Source platform (icon): Twitch, YouTube, Kick, or a generic URL. A channel shows every platform among its instances.", min_width: 52.0, initial: 0.0, sortable: true },
     StreamCol { title: "Name", tooltip: "Channel (container) name. Expand it to see its instances and recording history.", min_width: 130.0, initial: 0.0, sortable: true },
@@ -2734,7 +2741,6 @@ fn channel_cells(channel: &Channel, monitors: &[&MonitorWithChannel], now: i64) 
         cells[STREAM_COLS - 1] = Cell::num(channel.created_at as f64, fmt_date(channel.created_at));
         return cells;
     }
-    let all_enabled = monitors.iter().all(|m| m.monitor.enabled);
     let any_recording = monitors
         .iter()
         .any(|m| m.last_recording_status.as_deref() == Some("recording"));
@@ -2757,8 +2763,8 @@ fn channel_cells(channel: &Channel, monitors: &[&MonitorWithChannel], now: i64) 
     // Duration, Ads, Ad time, Ad-free, Changes, Added.
     vec![
         Cell::num(
-            if all_enabled { 1.0 } else { 0.0 },
-            if all_enabled { "on" } else { "off" },
+            if channel.enabled { 1.0 } else { 0.0 },
+            if channel.enabled { "on" } else { "off" },
         ),
         Cell::text(String::new()), // actions (not sortable/filterable)
         Cell::text(
@@ -6199,8 +6205,6 @@ impl StreamArchiverApp {
                                 let any_rec = mons.iter().any(|m| {
                                     self.core.active.lock().unwrap().contains_key(&m.monitor.id)
                                 });
-                                let all_enabled =
-                                    ninst > 0 && mons.iter().all(|m| m.monitor.enabled);
                                 let expanded = exp_channels.contains(&cid);
                                 let platforms = channel_platforms(&mons);
                                 let last_poll = mons
@@ -6249,10 +6253,10 @@ impl StreamArchiverApp {
                                     tr.set_selected(tint.is_some());
                                     let mut disc = false;
                                     tr.col(|ui| {
-                                        let mut on = all_enabled;
+                                        let mut on = ch.enabled;
                                         let cb = ui
                                             .add_enabled(ninst > 0, egui::Checkbox::new(&mut on, ""))
-                                            .on_hover_text("Enable/disable all of this channel's instances");
+                                            .on_hover_text("Enable/disable this channel. Independent from each instance's own toggle.");
                                         if cb.changed() {
                                             toggle_channel_enabled = Some((cid, on));
                                         }
@@ -7729,6 +7733,7 @@ impl StreamArchiverApp {
                                 DetectionMethod::EventSubHelix,
                                 DetectionMethod::YouTubeApi,
                                 DetectionMethod::WebSub,
+                                DetectionMethod::WebSubOnly,
                                 DetectionMethod::Scrape,
                                 DetectionMethod::KickApi,
                                 DetectionMethod::GenericProbe,
@@ -8509,6 +8514,18 @@ impl StreamArchiverApp {
                             "Download the stream thumbnail alongside the recording \
                              ({stem}.thumbnail.jpg). For yt-dlp, passes --write-thumbnail; \
                              for Twitch/Kick/YouTube, fetches the URL from detection metadata.",
+                        );
+                        ui.end_row();
+
+                        ui.label("Thumbnail in notification");
+                        ui.add_enabled(
+                            form.fetch_thumbnail,
+                            egui::Checkbox::new(&mut form.thumbnail_in_toast, ""),
+                        ).on_hover_text(
+                            "Use the stream thumbnail as the hero image in the \
+                             recording-started notification (instead of the channel's \
+                             static banner). Most useful for YouTube, where each stream \
+                             has a unique thumbnail. Requires \"Fetch thumbnail\" to be on.",
                         );
                         ui.end_row();
 

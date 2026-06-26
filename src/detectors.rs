@@ -843,7 +843,7 @@ impl DetectContext {
         // URL needles per enabled monitor (skip monitors we can't match by URL).
         let needles: Vec<(i64, Vec<String>)> = rows
             .iter()
-            .filter(|r| r.monitor.enabled)
+            .filter(|r| r.channel.enabled && r.monitor.enabled)
             .map(|r| (r.monitor.id, monitor_needles(&r.monitor.url)))
             .filter(|(_, n)| !n.is_empty())
             .collect();
@@ -1550,7 +1550,7 @@ async fn refresh_schedules_once(
         if shutdown.load(Ordering::SeqCst) {
             return;
         }
-        if !row.monitor.enabled {
+        if !row.channel.enabled || !row.monitor.enabled {
             continue;
         }
         let platform = row.monitor.platform();

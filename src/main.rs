@@ -286,6 +286,7 @@ fn run_add(args: &[String], pos: usize) -> Result<()> {
         subtitle_tracks: "all".into(),
         chat_log: true,
         fetch_thumbnail: true,
+        thumbnail_in_toast: false,
         fetch_chat_assets: true,
         extra_args: String::new(),
         max_concurrent: 1,
@@ -338,6 +339,7 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
             created_at: 0,
             color: String::new(),
             preferred_platform: None,
+            enabled: true,
         },
         monitor: models::Monitor {
             id: 0,
@@ -360,6 +362,7 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
             subtitle_tracks: String::new(),
             chat_log: false,
             fetch_thumbnail: false,
+            thumbnail_in_toast: false,
             fetch_chat_assets: false,
             extra_args: String::new(),
             max_concurrent: 1,

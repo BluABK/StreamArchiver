@@ -120,6 +120,10 @@ pub enum AppEvent {
         monitor_id: i64,
         recording_id: i64,
         channel: String,
+        /// Expected path of the stream thumbnail (`{capture_path}.thumbnail.jpg`).
+        /// The file is fetched concurrently after the event fires, so it may not
+        /// exist yet when the notification handler runs; check with `Path::exists`.
+        thumbnail_path: Option<std::path::PathBuf>,
     },
     RecordingFinished {
         recording_id: i64,

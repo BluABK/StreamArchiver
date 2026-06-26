@@ -1289,6 +1289,13 @@ impl Supervisor {
                 return false;
             }
         };
+        if !row.channel.enabled || !row.monitor.enabled {
+            // A push notification arrived for a disabled channel/monitor. Don't
+            // record, but update last_state so the UI can show it as "live".
+            self.active.lock().unwrap().remove(&monitor_id);
+            let _ = self.store.set_monitor_check_result(monitor_id, "live", now_unix());
+            return false;
+        }
         let this = self.clone();
         tokio::spawn(async move {
             this.record(row, went_live_at, approximate, stream_id, thumbnail_url, broadcaster_id, stream_title).await;
@@ -1305,15 +1312,22 @@ impl Supervisor {
             Ok(Some(r)) => r,
             _ => return,
         };
+        let enabled = row.channel.enabled && row.monitor.enabled;
         let name = row.channel.name.clone();
         let outcome = self.check_one(&row).await;
         if outcome.live {
-            let (went, approx) = match outcome.went_live_at {
-                Some(t) => (Some(t), false),
-                None => (Some(now_unix()), true),
-            };
-            self.try_begin(monitor_id, went, approx, outcome.stream_id, outcome.thumbnail_url, outcome.broadcaster_id, outcome.stream_title, true);
-        } else {
+            if enabled {
+                let (went, approx) = match outcome.went_live_at {
+                    Some(t) => (Some(t), false),
+                    None => (Some(now_unix()), true),
+                };
+                self.try_begin(monitor_id, went, approx, outcome.stream_id, outcome.thumbnail_url, outcome.broadcaster_id, outcome.stream_title, true);
+            } else {
+                // Disabled: just update the state so the UI can show "live" for
+                // channels we're monitoring passively via push notifications.
+                let _ = self.store.set_monitor_check_result(monitor_id, "live", now_unix());
+            }
+        } else if enabled {
             let message = if outcome.error && !outcome.detail.is_empty() {
                 format!("{name}: {}", outcome.detail)
             } else {
@@ -1323,6 +1337,9 @@ impl Supervisor {
                 context: "Start".into(),
                 message,
             });
+        } else {
+            // Disabled and offline: update state silently.
+            let _ = self.store.set_monitor_check_result(monitor_id, "offline", now_unix());
         }
     }
 
@@ -1868,10 +1885,15 @@ impl Supervisor {
             monitor_id,
             state: "recording".into(),
         });
+        // Compute the expected thumbnail path before the fire-and-forget fetch below
+        // so the notification handler can find it (file may not exist yet).
+        let toast_thumbnail = (row.monitor.fetch_thumbnail && !plan.writes_own_thumbnail)
+            .then(|| plan.capture_path.with_extension("thumbnail.jpg"));
         let _ = self.events.send(AppEvent::RecordingStarted {
             monitor_id,
             recording_id: rec_id,
             channel: row.channel.name.clone(),
+            thumbnail_path: toast_thumbnail,
         });
 
         // Dual capture: also run a DASH companion via the system yt-dlp for formats
@@ -2272,6 +2294,7 @@ impl Supervisor {
             monitor_id,
             recording_id: rec_id,
             channel: channel_name.clone(),
+            thumbnail_path: None,
         });
 
         let outcome = if self.stopping_monitors.lock().unwrap().contains(&monitor_id) {
@@ -3024,6 +3047,7 @@ impl Supervisor {
             monitor_id,
             recording_id: rec_id,
             channel: row.channel.name.clone(),
+            thumbnail_path: None,
         });
         info!(monitor_id, rec_id, program = %plan.program, "resuming SABR capture -> {}", plan.final_path.display());
 
@@ -4755,6 +4779,7 @@ mod tests {
                 created_at: 0,
                 color: String::new(),
                 preferred_platform: None,
+                enabled: true,
             },
             monitor: Monitor {
                 id: 7,
@@ -4777,6 +4802,7 @@ mod tests {
                 subtitle_tracks: String::new(),
                 chat_log: false,
                 fetch_thumbnail: false,
+                thumbnail_in_toast: false,
                 fetch_chat_assets: false,
                 extra_args: String::new(),
                 max_concurrent: 1,

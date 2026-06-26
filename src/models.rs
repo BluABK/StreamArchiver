@@ -111,6 +111,7 @@ impl Platform {
             Platform::YouTube => &[
                 DetectionMethod::Scrape,
                 DetectionMethod::WebSub,
+                DetectionMethod::WebSubOnly,
                 DetectionMethod::YouTubeApi,
                 DetectionMethod::GenericProbe,
             ],
@@ -199,6 +200,11 @@ pub enum DetectionMethod {
     /// notification triggers an immediate liveness check. Polls (scrape) as a
     /// fallback. Needs the `yt-websub` server URL + token in Settings.
     WebSub,
+    /// Like `WebSub` but with **no polling fallback**: only push notifications
+    /// trigger recording. Zero scheduled polls — ideal for monitoring channels
+    /// with auto=off, or for any YouTube channel where push reliability is
+    /// trusted and reducing HTTP traffic is a priority.
+    WebSubOnly,
 }
 
 impl DetectionMethod {
@@ -213,6 +219,7 @@ impl DetectionMethod {
             DetectionMethod::EventSubHelix => "eventsub_helix",
             DetectionMethod::KickApi => "kick_api",
             DetectionMethod::WebSub => "websub",
+            DetectionMethod::WebSubOnly => "websub_only",
         }
     }
 
@@ -227,6 +234,7 @@ impl DetectionMethod {
             DetectionMethod::EventSubHelix => "Twitch EventSub + Helix",
             DetectionMethod::KickApi => "Kick official API",
             DetectionMethod::WebSub => "YouTube WebSub (VPS push)",
+            DetectionMethod::WebSubOnly => "YouTube WebSub (push only)",
         }
     }
 
@@ -242,6 +250,7 @@ impl DetectionMethod {
             DetectionMethod::EventSubHelix => "ES+Helix",
             DetectionMethod::KickApi => "Kick API",
             DetectionMethod::WebSub => "WebSub",
+            DetectionMethod::WebSubOnly => "WebSub!",
         }
     }
 
@@ -255,6 +264,7 @@ impl DetectionMethod {
             "eventsub_helix" => DetectionMethod::EventSubHelix,
             "kick_api" => DetectionMethod::KickApi,
             "websub" => DetectionMethod::WebSub,
+            "websub_only" => DetectionMethod::WebSubOnly,
             _ => DetectionMethod::GenericProbe,
         }
     }
@@ -295,6 +305,12 @@ impl DetectionMethod {
                  triggers an immediate liveness check (records only if actually live), with \
                  scrape polling as a safety-net fallback. Set the VPS URL + token in Settings; \
                  a longer poll interval is fine."
+            }
+            DetectionMethod::WebSubOnly => {
+                "Like WebSub but with zero polling: only push notifications from the yt-websub \
+                 VPS relay trigger recording. No scheduled HTTP polls at all — good for channels \
+                 with Auto off (info-only) or when push reliability is trusted and you want to \
+                 reduce traffic. Set the VPS URL + token in Settings."
             }
             DetectionMethod::GenericProbe => {
                 "Probes the URL with streamlink (--stream-url) each interval. No credentials; works \
@@ -505,6 +521,9 @@ pub struct Channel {
     /// its own assets). `None` = auto: the first instance-platform that has a
     /// fetched icon. Set explicitly via the channel's Properties → icon source.
     pub preferred_platform: Option<Platform>,
+    /// Channel-level enabled flag. Independent from each instance's `Monitor::enabled`;
+    /// a monitor runs only when both this AND `monitor.enabled` are true.
+    pub enabled: bool,
 }
 
 /// One capture instance for a channel (source URL + tool + quality + detection +
@@ -559,6 +578,10 @@ pub struct Monitor {
     /// For yt-dlp, passes `--write-thumbnail`; for other tools fetches the URL
     /// reported by the platform API.
     pub fetch_thumbnail: bool,
+    /// Use the stream thumbnail (when fetched) as the hero image in the
+    /// recording-started desktop notification, instead of the channel's static
+    /// banner. Useful for YouTube where each stream has a unique thumbnail.
+    pub thumbnail_in_toast: bool,
     /// Download channel icon, banner, badges, and emotes (BTTV/FFZ/7TV for Twitch)
     /// into `{output_dir}/channel_assets/{name}/`. Refreshed at most once per 24h.
     pub fetch_chat_assets: bool,

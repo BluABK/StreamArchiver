@@ -260,14 +260,18 @@ pub async fn run(
     }
 }
 
-/// Enabled YouTube monitors using the WebSub method, as `(channel_url, monitor_id)`.
+/// YouTube monitors using the WebSub or WebSubOnly method, as `(channel_url, monitor_id)`.
+/// Includes disabled monitors so we still receive push notifications and can show live status
+/// in the UI even for channels with Auto off.
 fn load_websub_monitors(store: &Store) -> Vec<(String, i64)> {
     let mut out = Vec::new();
     if let Ok(rows) = store.list_monitors_with_channels() {
         for row in rows {
-            if row.monitor.enabled
-                && row.monitor.platform() == Platform::YouTube
-                && row.monitor.detection_method == DetectionMethod::WebSub
+            if row.monitor.platform() == Platform::YouTube
+                && matches!(
+                    row.monitor.detection_method,
+                    DetectionMethod::WebSub | DetectionMethod::WebSubOnly
+                )
             {
                 out.push((row.monitor.url.clone(), row.monitor.id));
             }

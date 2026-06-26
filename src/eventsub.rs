@@ -248,8 +248,7 @@ async fn user_credentials(http: &Client, store: &Store) -> Option<(String, Strin
 fn load_eventsub_monitors(store: &Store) -> Result<HashMap<String, Vec<i64>>> {
     let mut map: HashMap<String, Vec<i64>> = HashMap::new();
     for row in store.list_monitors_with_channels()? {
-        if row.monitor.enabled
-            && row.monitor.platform() == Platform::Twitch
+        if row.monitor.platform() == Platform::Twitch
             && matches!(
                 row.monitor.detection_method,
                 DetectionMethod::EventSub | DetectionMethod::EventSubHelix

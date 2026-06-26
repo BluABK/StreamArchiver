@@ -18,7 +18,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 25;
+const SCHEMA_VERSION: i64 = 27;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -430,7 +430,26 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 25)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 25);
+        if version < 26 {
+            // Per-monitor option to prefer the stream thumbnail (fetched at
+            // recording start) over the channel's static banner in the
+            // recording-started desktop notification. Off by default; most useful
+            // for YouTube where each stream has a unique, informative thumbnail.
+            conn.execute_batch(
+                "ALTER TABLE monitor ADD COLUMN thumbnail_in_toast INTEGER NOT NULL DEFAULT 0;",
+            )?;
+            conn.pragma_update(None, "user_version", 26)?;
+        }
+        if version < 27 {
+            // Independent channel-level enabled flag: the channel checkbox now
+            // reads/writes channel.enabled rather than cascading to all instances.
+            // Existing channels default to enabled so nothing changes on upgrade.
+            conn.execute_batch(
+                "ALTER TABLE channel ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;",
+            )?;
+            conn.pragma_update(None, "user_version", 27)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 27);
         Ok(())
     }
 
@@ -474,7 +493,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let ch = conn
             .query_row(
-                "SELECT id, name, url, platform, created_at, color, preferred_platform \
+                "SELECT id, name, url, platform, created_at, color, preferred_platform, enabled \
                  FROM channel WHERE url = ?1",
                 params![url],
                 Self::map_channel,
@@ -511,7 +530,7 @@ impl Store {
     pub fn list_channels(&self) -> Result<Vec<Channel>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, url, platform, created_at, color, preferred_platform FROM channel
+            "SELECT id, name, url, platform, created_at, color, preferred_platform, enabled FROM channel
              ORDER BY name COLLATE NOCASE, id",
         )?;
         let rows = stmt
@@ -563,11 +582,12 @@ impl Store {
         Ok(())
     }
 
-    /// Enable/disable every instance of a channel at once (the channel-level On).
+    /// Enable/disable a channel container's own flag. Does NOT touch individual
+    /// instance (monitor) enabled states — those are independent.
     pub fn set_channel_enabled(&self, channel_id: i64, enabled: bool) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE monitor SET enabled = ?2 WHERE channel_id = ?1",
+            "UPDATE channel SET enabled = ?2 WHERE id = ?1",
             params![channel_id, enabled as i64],
         )?;
         Ok(())
@@ -582,8 +602,8 @@ impl Store {
             "INSERT INTO monitor(channel_id, url, enabled, tool, detection_method, poll_interval_secs,
                 quality, output_dir, filename_template, container, capture_from_start, auth_kind,
                 auth_value, extra_args, max_concurrent, last_state, ad_free, audio_tracks, subtitle_tracks,
-                chat_log, fetch_thumbnail, fetch_chat_assets, dual_capture)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                chat_log, fetch_thumbnail, fetch_chat_assets, dual_capture, thumbnail_in_toast)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
             params![
                 m.channel_id,
                 m.url,
@@ -608,6 +628,7 @@ impl Store {
                 m.fetch_thumbnail as i64,
                 m.fetch_chat_assets as i64,
                 m.dual_capture as i64,
+                m.thumbnail_in_toast as i64,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -620,7 +641,8 @@ impl Store {
                 quality=?7, output_dir=?8, filename_template=?9, container=?10, capture_from_start=?11,
                 auth_kind=?12, auth_value=?13, extra_args=?14, max_concurrent=?15, ad_free=?16,
                 audio_tracks=?17, subtitle_tracks=?18, chat_log=?19,
-                fetch_thumbnail=?20, fetch_chat_assets=?21, dual_capture=?22 WHERE id=?1",
+                fetch_thumbnail=?20, fetch_chat_assets=?21, dual_capture=?22,
+                thumbnail_in_toast=?23 WHERE id=?1",
             params![
                 m.id,
                 m.url,
@@ -644,6 +666,7 @@ impl Store {
                 m.fetch_thumbnail as i64,
                 m.fetch_chat_assets as i64,
                 m.dual_capture as i64,
+                m.thumbnail_in_toast as i64,
             ],
         )?;
         Ok(())
@@ -1218,7 +1241,9 @@ impl Store {
                           ORDER BY smc.at_secs DESC, smc.id DESC LIMIT 1), ''),
                 c.color,
                 m.dual_capture,
-                c.preferred_platform
+                c.preferred_platform,
+                m.thumbnail_in_toast,
+                c.enabled
              FROM monitor m
              JOIN channel c ON c.id = m.channel_id
              LEFT JOIN recording r
@@ -1235,6 +1260,7 @@ impl Store {
                     created_at: r.get(4)?,
                     color: r.get(43)?,
                     preferred_platform: Platform::parse_opt(&r.get::<_, String>(45)?),
+                    enabled: r.get::<_, i64>(47)? != 0,
                 };
                 let monitor = Monitor {
                     id: r.get(5)?,
@@ -1257,6 +1283,7 @@ impl Store {
                     subtitle_tracks: r.get(35)?,
                     chat_log: r.get::<_, i64>(37)? != 0,
                     fetch_thumbnail: r.get::<_, i64>(39)? != 0,
+                    thumbnail_in_toast: r.get::<_, i64>(46)? != 0,
                     fetch_chat_assets: r.get::<_, i64>(40)? != 0,
                     extra_args: r.get(18)?,
                     max_concurrent: r.get(19)?,
@@ -1615,6 +1642,7 @@ impl Store {
             created_at: r.get(4)?,
             color: r.get(5)?,
             preferred_platform: Platform::parse_opt(&r.get::<_, String>(6)?),
+            enabled: r.get::<_, i64>(7)? != 0,
         })
     }
 }
@@ -1645,6 +1673,7 @@ mod tests {
             subtitle_tracks: String::new(),
             chat_log: false,
             fetch_thumbnail: false,
+            thumbnail_in_toast: false,
             fetch_chat_assets: false,
             extra_args: String::new(),
             max_concurrent: 1,

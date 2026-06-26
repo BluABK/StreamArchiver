@@ -87,7 +87,7 @@ async fn tick(
     for row in &rows {
         let m = &row.monitor;
         prev_state.insert(m.id, m.last_state.clone());
-        if !m.enabled {
+        if !row.channel.enabled || !m.enabled {
             continue;
         }
         // Don't poll a monitor that's currently being recorded — the supervisor
@@ -101,6 +101,7 @@ async fn tick(
         // whichever sees live first wins (the supervisor dedupes). WebSub is the
         // same idea for YouTube: scrape-polled here as a fallback, and pushed by
         // the websub task (which triggers an on-demand liveness check).
+        // WebSubOnly is push-only — no poll fallback, so it is not in this list.
         let handled = matches!(
             m.detection_method,
             DetectionMethod::TwitchApi

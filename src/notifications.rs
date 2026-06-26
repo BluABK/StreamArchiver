@@ -133,12 +133,21 @@ fn handle(store: &Store, ev: AppEvent) {
         return;
     }
     let content = match ev {
-        AppEvent::RecordingStarted { monitor_id, .. } => {
+        AppEvent::RecordingStarted { monitor_id, thumbnail_path, .. } => {
             let Some(row) = store.get_monitor_with_channel(monitor_id).ok().flatten() else {
                 return;
             };
             let heading = format!("{} is live", row.channel.name);
-            content_for(&row, heading)
+            let mut content = content_for(&row, heading, "Watch stream");
+            // Prefer the stream thumbnail as the hero image when the monitor
+            // opts in and the file has been fetched. The fetch is concurrent so
+            // check existence here rather than assuming it's ready.
+            if row.monitor.thumbnail_in_toast {
+                if let Some(path) = thumbnail_path.as_ref().filter(|p| p.exists()) {
+                    content.hero = Some(path.clone());
+                }
+            }
+            content
         }
         AppEvent::RecordingFinished {
             recording_id,
@@ -158,7 +167,7 @@ fn handle(store: &Store, ev: AppEvent) {
             match row {
                 Some(row) => {
                     let heading = format!("{} — {status}", row.channel.name);
-                    content_for(&row, heading)
+                    content_for(&row, heading, "Watch VOD")
                 }
                 None => ToastContent::text(
                     "Recording finished".to_string(),
@@ -176,9 +185,9 @@ fn handle(store: &Store, ev: AppEvent) {
 }
 
 /// Enrich a toast from a monitor+channel row: the channel's profile pic / banner
-/// (from the per-platform asset dir), its current stream title + game, and a
-/// "Watch stream" button to the source URL.
-fn content_for(row: &MonitorWithChannel, heading: String) -> ToastContent {
+/// (from the per-platform asset dir), its current stream title + game, and an
+/// action button to the source URL labelled `action_label`.
+fn content_for(row: &MonitorWithChannel, heading: String, action_label: &str) -> ToastContent {
     let dir = crate::assets::channel_asset_dir(&row.channel.name, row.monitor.platform());
     let mut lines = Vec::new();
     if !row.last_recording_title.is_empty() {
@@ -188,7 +197,7 @@ fn content_for(row: &MonitorWithChannel, heading: String) -> ToastContent {
         lines.push(row.last_recording_category.clone());
     }
     let action = (!row.monitor.url.trim().is_empty()).then(|| ToastAction {
-        label: "Watch stream".to_string(),
+        label: action_label.to_string(),
         url: row.monitor.url.clone(),
     });
     ToastContent {
