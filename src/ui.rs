@@ -9,7 +9,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::sync::mpsc::Receiver;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
@@ -551,11 +551,15 @@ pub struct StreamArchiverApp {
     /// Per-channel cached icon textures loaded from disk for the Properties window.
     /// A `None` value means the lookup was attempted but no icon file was found.
     channel_icons: HashMap<i64, Option<egui::TextureHandle>>,
-    /// Decoded chat-emote textures, keyed by absolute image path. `None` = load
-    /// attempted but the file is missing/empty/undecodable. Animated emotes render
-    /// their first frame (gif/webp). Accumulates the union of every chat viewed
-    /// this session; cleared alongside [`Self::channel_icons`] when assets re-fetch.
-    emote_textures: HashMap<std::path::PathBuf, Option<egui::TextureHandle>>,
+    /// Decoded + downscaled chat-emote frames, keyed by absolute image path. Shared
+    /// with background decode tasks (`Arc<Mutex<…>>`). Animated GIF/WebP cycle; the
+    /// frames are downscaled to render size to bound RAM, and the map is LRU-evicted
+    /// against [`EMOTE_BUDGET_BYTES`] + cleared on asset refetch / popup close.
+    emote_anim: Arc<Mutex<HashMap<std::path::PathBuf, crate::emote_anim::EmoteLoad>>>,
+    /// Bumped whenever `emote_anim` is cleared; in-flight decode tasks capture it at
+    /// spawn and skip their insert if it changed, so a decode finishing after a
+    /// popup-close / asset-refetch can't resurrect a stale (leaked) cache entry.
+    emote_epoch: Arc<AtomicU64>,
     /// Per-channel Twitch broadcaster name colour (from `name_color.txt`, fetched
     /// via Helix). `None` = looked up but the streamer set no colour / not Twitch.
     /// Tints the channel name in the Streams list; cleared with `channel_icons`.
@@ -835,7 +839,8 @@ impl StreamArchiverApp {
             platform_tex: None,
             properties_popup: None,
             channel_icons: HashMap::new(),
-            emote_textures: HashMap::new(),
+            emote_anim: Arc::new(Mutex::new(HashMap::new())),
+            emote_epoch: Arc::new(AtomicU64::new(0)),
             channel_twitch_colors: HashMap::new(),
             videos_sort: SortState::default(),
             videos_filters: vec![String::new(); VIDEO_COLS],
@@ -995,11 +1000,10 @@ impl StreamArchiverApp {
                         // reload from disk (emote files can change at a stable path).
                         if task.kind == crate::events::BackgroundTaskKind::AssetFetch {
                             self.channel_icons.clear();
-                            self.emote_textures.clear();
                             self.channel_twitch_colors.clear();
-                            // Drop egui's image-loader cache too so refreshed emote
-                            // images reload from disk at their stable paths.
-                            ctx.forget_all_images();
+                            // Drop decoded emote frames so refreshed images re-decode
+                            // from disk at their stable paths.
+                            self.clear_emote_cache();
                         }
                         self.finished_tasks.insert(0, (task, outcome, now_unix()));
                         self.finished_tasks.truncate(100);
@@ -9475,12 +9479,14 @@ impl StreamArchiverApp {
                 None
             };
 
-        // Move the emote-texture cache and the render toggle out of `self` so the
-        // viewport closure (which borrows `self.core`) and the popup borrow above
-        // don't double-borrow `self`. Restored right after the closure returns.
-        let mut emote_cache = std::mem::take(&mut self.emote_textures);
+        // The emote cache is shared (Arc<Mutex>), so the closure can use a clone
+        // without borrowing `self`. Copy the render toggles out too. `now` is the
+        // global animation clock — all instances of an emote animate in lockstep.
+        let anim_cache = self.emote_anim.clone();
         let render_emotes = self.render_emotes;
         let animate_emotes = self.animate_emotes;
+        let now = ctx.input(|i| i.time);
+        let mut decode_misses: Vec<std::path::PathBuf> = Vec::new();
 
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("chat_popup_vp"),
@@ -9621,9 +9627,11 @@ impl StreamArchiverApp {
                                         render_chat_message(
                                             ui,
                                             msg,
-                                            &mut emote_cache,
+                                            &anim_cache,
                                             render_emotes,
                                             animate_emotes,
+                                            now,
+                                            &mut decode_misses,
                                             ctx,
                                         );
                                     }
@@ -9633,8 +9641,41 @@ impl StreamArchiverApp {
                 });
             },
         );
-        // Put the (now-populated) emote-texture cache back on `self`.
-        self.emote_textures = emote_cache;
+        // Decode any newly-seen emotes off the UI thread, then enforce the LRU
+        // memory budget on the (now drawn) cache. Bound how many decodes start per
+        // frame so opening a chat with hundreds of distinct emotes doesn't spawn a
+        // blocking-thread storm; the over-cap ones revert to "unseen" and retry next
+        // frame.
+        const MAX_DECODE_PER_FRAME: usize = 64;
+        if decode_misses.len() > MAX_DECODE_PER_FRAME {
+            let mut g = self.emote_anim.lock().unwrap_or_else(|e| e.into_inner());
+            for path in &decode_misses[MAX_DECODE_PER_FRAME..] {
+                g.remove(path);
+            }
+            decode_misses.truncate(MAX_DECODE_PER_FRAME);
+        }
+        let epoch = self.emote_epoch.load(Ordering::SeqCst);
+        for path in decode_misses {
+            let cache = self.emote_anim.clone();
+            let epoch_at = self.emote_epoch.clone();
+            let ctx2 = ctx.clone();
+            self.core.rt.spawn_blocking(move || {
+                let decoded = std::fs::read(&path).ok().and_then(|b| crate::emote_anim::decode(&b));
+                let entry = match decoded {
+                    Some((imgs, delays)) => crate::emote_anim::EmoteLoad::Decoded(imgs, delays),
+                    None => crate::emote_anim::EmoteLoad::Failed,
+                };
+                let mut g = cache.lock().unwrap_or_else(|e| e.into_inner());
+                // Skip if the cache was cleared (popup closed / assets refetched)
+                // since this decode started — don't resurrect a stale entry.
+                if epoch_at.load(Ordering::SeqCst) == epoch {
+                    g.insert(path, entry);
+                    drop(g);
+                    ctx2.request_repaint();
+                }
+            });
+        }
+        evict_emote_cache(&self.emote_anim, now);
 
         // Tail-reload: re-parse the chat file in the background while the
         // recording is still live so new messages appear without re-opening.
@@ -9661,10 +9702,19 @@ impl StreamArchiverApp {
 
         if !open {
             self.chat_popup = None;
-            // Release the egui image-loader cache (all decoded emote/emoji frames)
-            // now the popup is closed, since the loaders never auto-evict.
-            ctx.forget_all_images();
+            // Free all decoded emote frame textures now the popup is closed.
+            self.clear_emote_cache();
         }
+    }
+
+    /// Drop all decoded emote frames and bump the epoch so any in-flight decode
+    /// task skips its insert (poison-safe).
+    fn clear_emote_cache(&self) {
+        self.emote_epoch.fetch_add(1, Ordering::SeqCst);
+        self.emote_anim
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     #[allow(deprecated)]
@@ -10385,23 +10435,6 @@ fn load_channel_icon(
     ))
 }
 
-/// Decode an emote image file into an egui texture (same pipeline as
-/// [`load_channel_icon`]). Returns `None` when the file is missing/empty or
-/// undecodable. Animated emotes (`.gif` / `.webp`) decode to their first frame —
-/// egui's renderer is static-only. Callers cache the `Option` so a failed decode
-/// isn't retried every frame and falls back to the emote's code text.
-fn load_emote_texture(path: &Path, ctx: &egui::Context) -> Option<egui::TextureHandle> {
-    let bytes = std::fs::read(path).ok()?;
-    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
-    let size = [img.width() as usize, img.height() as usize];
-    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &img.into_raw());
-    Some(ctx.load_texture(
-        format!("emote_{}", path.display()),
-        color_image,
-        egui::TextureOptions::LINEAR,
-    ))
-}
-
 /// Try to extract a YouTube UC… channel ID from a channel URL.
 fn extract_yt_channel_id(url: &str) -> Option<String> {
     // Matches "/channel/UCxxxxxxxxx" style URLs.
@@ -10516,12 +10549,18 @@ fn fmt_chat_ts(secs: f64) -> String {
     format!("[{:02}:{:02}:{:02}]", s / 3600, (s % 3600) / 60, s % 60)
 }
 
+/// Soft cap on decoded emote-frame GPU memory; the cache is LRU-evicted past this.
+const EMOTE_BUDGET_BYTES: usize = 192 * 1024 * 1024;
+
+#[allow(clippy::too_many_arguments)]
 fn render_chat_message(
     ui: &mut egui::Ui,
     msg: &ChatMessage,
-    emote_cache: &mut HashMap<std::path::PathBuf, Option<egui::TextureHandle>>,
+    cache: &Mutex<HashMap<std::path::PathBuf, crate::emote_anim::EmoteLoad>>,
     render_emotes: bool,
     animate: bool,
+    now: f64,
+    misses: &mut Vec<std::path::PathBuf>,
     ctx: &egui::Context,
 ) {
     ui.horizontal_wrapped(|ui| {
@@ -10559,51 +10598,118 @@ fn render_chat_message(
                 ChatSegment::Emote { name, file, fallback_text } => {
                     let drawn = render_emotes
                         && file.as_ref().is_some_and(|f| {
-                            if animate {
-                                // egui's image loaders: animate GIF/WebP (Twitch,
-                                // BTTV/FFZ, 7TV) and draw static PNG/emoji; sizing is
-                                // bounded (≤112×emote_h) and aspect-preserving. On a
-                                // decode failure egui paints "⚠"; alt_text appends the
-                                // glyph/code so it stays readable.
-                                ui.add(
-                                    egui::Image::from_uri(file_uri(f))
-                                        .fit_to_original_size(1.0)
-                                        .max_size(egui::vec2(112.0, emote_h))
-                                        .alt_text(fallback_text.as_deref().unwrap_or(name))
-                                        .show_loading_spinner(false),
-                                )
-                                .on_hover_text(name);
-                                true
-                            } else {
-                                // Static first frame via the manual texture cache.
-                                let tex = emote_cache
-                                    .entry(f.clone())
-                                    .or_insert_with(|| load_emote_texture(f, ctx))
-                                    .clone();
-                                match tex {
-                                    Some(tex) => {
-                                        let s = tex.size_vec2();
-                                        let w = (emote_h * (s.x / s.y).max(0.1)).min(112.0);
-                                        ui.add(
-                                            egui::Image::from_texture(&tex)
-                                                .fit_to_exact_size(egui::vec2(w, emote_h)),
-                                        )
-                                        .on_hover_text(name);
-                                        true
-                                    }
-                                    None => false, // missing / undecodable → text fallback
+                            match draw_cached_emote(ui, cache, f, animate, emote_h, now, misses, ctx)
+                            {
+                                Some(resp) => {
+                                    resp.on_hover_text(name);
+                                    true
                                 }
+                                None => false,
                             }
                         });
                     if !drawn {
-                        // No image (off / not on disk / undecodable): show the emoji
-                        // glyph if we have one, else the emote code.
+                        // No image (off / loading / not on disk / undecodable): show
+                        // the emoji glyph if we have one, else the emote code.
                         ui.label(fallback_text.as_deref().unwrap_or(name));
                     }
                 }
             }
         }
     });
+}
+
+/// Draw an emote from the decode cache. Returns the image `Response` when drawn, or
+/// `None` (caller shows the text fallback) when the emote is still loading / failed.
+/// Promotes a freshly-decoded entry to GPU textures (UI-thread upload), advances
+/// the animation against the global clock `now`, and records `last_drawn` for LRU.
+fn draw_cached_emote(
+    ui: &mut egui::Ui,
+    cache: &Mutex<HashMap<std::path::PathBuf, crate::emote_anim::EmoteLoad>>,
+    path: &Path,
+    animate: bool,
+    emote_h: f32,
+    now: f64,
+    misses: &mut Vec<std::path::PathBuf>,
+    ctx: &egui::Context,
+) -> Option<egui::Response> {
+    use crate::emote_anim::EmoteLoad;
+    let mut g = cache.lock().unwrap_or_else(|e| e.into_inner());
+    // Promote Decoded → Ready by uploading the frames to GPU textures here (must be
+    // on the UI thread / with a live `ctx`).
+    if matches!(g.get(path), Some(EmoteLoad::Decoded(..))) {
+        if let Some(EmoteLoad::Decoded(imgs, delays)) = g.remove(path) {
+            let anim = crate::emote_anim::upload(imgs, delays, ctx, &path.to_string_lossy());
+            g.insert(path.to_path_buf(), EmoteLoad::Ready(anim));
+        }
+    }
+    match g.get_mut(path) {
+        None => {
+            g.insert(path.to_path_buf(), EmoteLoad::Loading);
+            misses.push(path.to_path_buf());
+            None
+        }
+        Some(EmoteLoad::Loading) | Some(EmoteLoad::Failed) | Some(EmoteLoad::Decoded(..)) => None,
+        Some(EmoteLoad::Ready(anim)) => {
+            anim.last_drawn = now;
+            let s = anim.size();
+            // Height ≤ emote_h, width capped at 112, aspect preserved. Never upscale
+            // (`.min(1.0)`) — a small emote keeps its native size, matching the prior
+            // loader behaviour. `s` is already downscaled to ≤56px at decode time.
+            let scale = (emote_h / s.y.max(1.0)).min(112.0 / s.x.max(1.0)).min(1.0);
+            let size = egui::vec2(s.x * scale, s.y * scale);
+            if animate && anim.is_animated() {
+                let (tex, remaining) = anim.frame_at(now);
+                let resp = ui.add(egui::Image::from_texture(tex).fit_to_exact_size(size));
+                // Only schedule the next frame for emotes actually on screen, so a
+                // scrolled-away animation doesn't keep waking the UI.
+                if ui.is_rect_visible(resp.rect) {
+                    ctx.request_repaint_after(std::time::Duration::from_secs_f32(
+                        remaining.min(1.0),
+                    ));
+                }
+                Some(resp)
+            } else {
+                let (tex, _) = anim.frame_at(0.0);
+                Some(ui.add(egui::Image::from_texture(tex).fit_to_exact_size(size)))
+            }
+        }
+    }
+}
+
+/// Evict the least-recently-drawn ready emotes once the decoded-frame cache exceeds
+/// [`EMOTE_BUDGET_BYTES`]. Emotes drawn this frame (`last_drawn == now`) are kept.
+fn evict_emote_cache(
+    cache: &Mutex<HashMap<std::path::PathBuf, crate::emote_anim::EmoteLoad>>,
+    now: f64,
+) {
+    use crate::emote_anim::EmoteLoad;
+    let mut g = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let total: usize = g
+        .values()
+        .map(|v| if let EmoteLoad::Ready(a) = v { a.bytes } else { 0 })
+        .sum();
+    if total <= EMOTE_BUDGET_BYTES {
+        return;
+    }
+    let mut ready: Vec<(std::path::PathBuf, f64, usize)> = g
+        .iter()
+        .filter_map(|(k, v)| match v {
+            EmoteLoad::Ready(a) => Some((k.clone(), a.last_drawn, a.bytes)),
+            _ => None,
+        })
+        .collect();
+    ready.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut cur = total;
+    for (k, last_drawn, bytes) in ready {
+        if cur <= EMOTE_BUDGET_BYTES {
+            break;
+        }
+        if last_drawn >= now {
+            continue; // visible this frame — keep
+        }
+        g.remove(&k);
+        cur -= bytes;
+    }
 }
 
 fn badge_display(badge: &str, platform: &ChatPlatform) -> (&'static str, egui::Color32) {
@@ -10805,18 +10911,6 @@ fn find_emote_file(dir: &Path, stem: &str) -> Option<std::path::PathBuf> {
         .iter()
         .map(|ext| dir.join(format!("{stem}.{ext}")))
         .find(|p| p.exists())
-}
-
-/// Build a `file://` URI for egui's image loader. egui_extras' `FileLoader` does
-/// NOT percent-decode — it strips `file://`, trims the leading slash, and hands the
-/// raw remainder to `std::fs::read` — so we must pass the path UNENCODED (spaces,
-/// non-ASCII, etc. all work as-is via `fs::read`). Backslashes become forward
-/// slashes and the leading slash is trimmed so `file:///C:/…` resolves on Windows.
-/// Caveat: a `#` in the path can't be represented (egui parses `uri#N` as a frame
-/// index); our sanitized id/codepoint asset filenames never contain one.
-fn file_uri(path: &Path) -> String {
-    let s = path.to_string_lossy().replace('\\', "/");
-    format!("file:///{}", s.trim_start_matches('/'))
 }
 
 /// An emoji image not yet on disk that the renderer would otherwise show as a

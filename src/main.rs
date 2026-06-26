@@ -10,6 +10,7 @@ mod compat;
 mod detectors;
 mod downloader;
 mod emoji;
+mod emote_anim;
 mod events;
 mod eventsub;
 mod fonts;
@@ -136,9 +137,6 @@ fn main() -> Result<()> {
             // Add OS CJK/Unicode fallback fonts so non-Latin channel names (e.g.
             // Japanese VTuber names, fullwidth 【】) render instead of tofu boxes.
             fonts::install_unicode_fonts(&cc.egui_ctx);
-            // Image loaders for the chat replay: animated GIF/WebP emotes + color
-            // emoji PNGs render through egui::Image::from_uri.
-            egui_extras::install_image_loaders(&cc.egui_ctx);
             let (tray, ui_rx) = build_tray(cc.egui_ctx.clone())
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
             Ok(Box::new(ui::StreamArchiverApp::new(
