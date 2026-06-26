@@ -54,6 +54,12 @@ struct ChatLine<'a> {
     /// Raw `badges` tag (e.g. `subscriber/12,moderator/1`), omitted when empty.
     #[serde(skip_serializing_if = "str::is_empty")]
     badges: &'a str,
+    /// Raw IRCv3 `emotes` tag (e.g. `25:0-4,12-16/1902:6-10`) — first-party emote
+    /// ID + inclusive code-point ranges into `text`. Stored verbatim (the value is
+    /// only digits/`:`/`-`/`,`/`/`, so no IRCv3 unescaping applies). Omitted when
+    /// empty; old logs without it simply render emote words as plain text.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    emotes: &'a str,
 }
 
 /// Capture `url`'s Twitch chat to `path` until `done` (recording ended) or
@@ -199,7 +205,7 @@ fn parse_privmsg(line: &str) -> Option<String> {
     let text = after.find(" :").map(|i| &after[i + 2..]).unwrap_or("");
     let login = prefix.split('!').next().unwrap_or(prefix);
 
-    let (mut display, mut color, mut badges, mut ts_ms) = ("", "", "", 0i64);
+    let (mut display, mut color, mut badges, mut emotes, mut ts_ms) = ("", "", "", "", 0i64);
     for kv in tags.split(';') {
         let mut it = kv.splitn(2, '=');
         let (k, v) = (it.next().unwrap_or(""), it.next().unwrap_or(""));
@@ -207,6 +213,7 @@ fn parse_privmsg(line: &str) -> Option<String> {
             "display-name" => display = v,
             "color" => color = v,
             "badges" => badges = v,
+            "emotes" => emotes = v,
             "tmi-sent-ts" => ts_ms = v.parse().unwrap_or(0),
             _ => {}
         }
@@ -222,6 +229,7 @@ fn parse_privmsg(line: &str) -> Option<String> {
         text,
         color,
         badges,
+        emotes,
     })
     .ok()
 }
@@ -233,6 +241,7 @@ mod tests {
     #[test]
     fn parses_tagged_privmsg() {
         let line = "@badges=subscriber/12;color=#FF0000;display-name=CoolViewer;\
+                    emotes=25:0-4,12-16/1902:6-10;\
                     tmi-sent-ts=1700000000123 :coolviewer!coolviewer@coolviewer.tmi.twitch.tv \
                     PRIVMSG #streamer :hello there : world";
         let json = parse_privmsg(line).expect("should parse");
@@ -244,6 +253,19 @@ mod tests {
         assert_eq!(v["color"], "#FF0000");
         assert_eq!(v["ts"], 1700000000123i64);
         assert_eq!(v["badges"], "subscriber/12");
+        // The raw emotes tag is captured verbatim for first-party emote replay.
+        assert_eq!(v["emotes"], "25:0-4,12-16/1902:6-10");
+    }
+
+    #[test]
+    fn omits_empty_emotes_tag() {
+        // A plain message has `emotes=` (empty); the field is skipped, like badges.
+        let line = "@badges=;color=;display-name=Bob;emotes=;tmi-sent-ts=1700000000000 \
+                    :bob!bob@bob.tmi.twitch.tv PRIVMSG #streamer :hi";
+        let json = parse_privmsg(line).expect("should parse");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["text"], "hi");
+        assert!(v.get("emotes").is_none());
     }
 
     #[test]

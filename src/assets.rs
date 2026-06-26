@@ -402,7 +402,7 @@ async fn fetch_twitch_emotes(
             (emote.images.url_4x.clone(), "png")
         };
         let dest = emote_dir.join(format!("{}.{ext}", emote.id));
-        if dest.exists() {
+        if asset_present(&dest) {
             continue;
         }
         if let Err(e) = download_image(client, &src_url, &dest).await {
@@ -414,11 +414,31 @@ async fn fetch_twitch_emotes(
 
 // ---------- BTTV ----------
 
-/// Manifest entry written to `asset_dir/emotes/bttv.json`.
-#[derive(serde::Serialize)]
-struct EmoteManifestEntry {
-    id: String,
-    ext: String,
+/// Manifest entry written to `asset_dir/emotes/{bttv,ffz,7tv}.json`. The chat
+/// replay reads these back to map a typed emote word → its on-disk image, so the
+/// `name` (emote code) is required. `#[serde(default)]` keeps pre-name manifests
+/// loadable (empty name → simply unmatchable until the channel's assets refetch).
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct EmoteManifestEntry {
+    /// Emote CODE, case-sensitive as typed in chat: BTTV `code`, FFZ `name`,
+    /// 7TV top-level `name` (the channel alias).
+    #[serde(default)]
+    pub name: String,
+    pub id: String,
+    pub ext: String,
+    /// BTTV only: `true` ⇒ image is in the shared global cache
+    /// (`platform_assets/bttv/emotes/`); `false` ⇒ per-channel
+    /// (`asset_dir/emotes/bttv/`). Ignored for FFZ/7TV (always global).
+    #[serde(default)]
+    pub shared: bool,
+}
+
+/// A previously-downloaded asset is "present" only if it exists AND is non-empty.
+/// `download_image` writes non-atomically (truncate-then-write), so an interrupted
+/// fetch can leave a 0-byte file; treating that as absent lets a later pass repair
+/// it instead of the `exists()` guard pinning the corrupt file forever.
+fn asset_present(path: &Path) -> bool {
+    std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
 }
 
 /// Download BTTV emotes:
@@ -437,6 +457,11 @@ async fn fetch_bttv_emotes(
     #[derive(Deserialize)]
     struct BttvEmote {
         id: String,
+        /// The emote word as typed in chat (e.g. `modCheck`). `#[serde(default)]`
+        /// so one malformed emote can't abort the whole channel's BTTV fetch; an
+        /// empty code just yields an unmatchable manifest entry (reader skips it).
+        #[serde(default)]
+        code: String,
         #[serde(rename = "imageType")]
         image_type: String,
     }
@@ -469,11 +494,13 @@ async fn fetch_bttv_emotes(
         tokio::fs::create_dir_all(&dir).await?;
         for emote in &r.channel_emotes {
             manifest.push(EmoteManifestEntry {
+                name: emote.code.clone(),
                 id: emote.id.clone(),
                 ext: emote.image_type.clone(),
+                shared: false,
             });
             let dest = dir.join(format!("{}.{}", emote.id, emote.image_type));
-            if dest.exists() {
+            if asset_present(&dest) {
                 continue;
             }
             let url = format!(
@@ -492,11 +519,13 @@ async fn fetch_bttv_emotes(
         tokio::fs::create_dir_all(&global_dir).await?;
         for emote in &r.shared_emotes {
             manifest.push(EmoteManifestEntry {
+                name: emote.code.clone(),
                 id: emote.id.clone(),
                 ext: emote.image_type.clone(),
+                shared: true,
             });
             let dest = global_dir.join(format!("{}.{}", emote.id, emote.image_type));
-            if dest.exists() {
+            if asset_present(&dest) {
                 continue;
             }
             let url = format!(
@@ -563,6 +592,9 @@ async fn fetch_ffz_emotes(
                 Some(i) => i.to_string(),
                 None => continue,
             };
+            let Some(name) = emote["name"].as_str() else {
+                continue;
+            };
             // Best available scale: 4 > 2 > 1
             let url_raw = emote["urls"]["4"]
                 .as_str()
@@ -578,11 +610,13 @@ async fn fetch_ffz_emotes(
             };
             let ext = ext_from_url(&full_url).unwrap_or("png");
             manifest.push(EmoteManifestEntry {
+                name: name.to_string(),
                 id: id.clone(),
                 ext: ext.to_string(),
+                shared: false,
             });
             let dest = global_dir.join(format!("{id}.{ext}"));
-            if dest.exists() {
+            if asset_present(&dest) {
                 continue;
             }
             if let Err(e) = download_image(client, &full_url, &dest).await {
@@ -638,12 +672,19 @@ async fn fetch_7tv_emotes(
         let Some(id) = emote["id"].as_str() else {
             continue;
         };
+        // Top-level `name` is this channel's alias (what viewers actually type);
+        // `data.name` is the original. Match on the alias.
+        let Some(name) = emote["name"].as_str() else {
+            continue;
+        };
         manifest.push(EmoteManifestEntry {
+            name: name.to_string(),
             id: id.to_string(),
             ext: "webp".to_string(),
+            shared: false,
         });
         let dest = global_dir.join(format!("{id}.webp"));
-        if dest.exists() {
+        if asset_present(&dest) {
             continue;
         }
         // Prefer animated WebP; fall back to static
