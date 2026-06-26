@@ -78,6 +78,7 @@ enum View {
     Schedule,
     Background,
     Settings,
+    Debug,
 }
 
 /// The Schedule tab's calendar granularity.
@@ -515,6 +516,11 @@ pub struct StreamArchiverApp {
     /// Enable/disable state for the periodic jobs (`events::TOGGLEABLE_JOBS`),
     /// mirrored from settings; edited via the Background "Scheduled" checkboxes.
     job_toggles: std::collections::HashMap<String, bool>,
+    /// Debug view state — persisted across frames; fields are always present but
+    /// only rendered when `cfg!(debug_assertions)`.
+    debug_monitor_idx: usize,
+    debug_test_title: String,
+    debug_test_game: String,
     /// Format Designer: an interactive template preview/editor window.
     format_designer: Option<FormatDesignerState>,
     /// Pending "Stop recordings & quit" confirmation (triggered by the tray item).
@@ -739,6 +745,9 @@ impl StreamArchiverApp {
             job_toggles,
             format_designer: None,
             confirm_quit_stop: false,
+            debug_monitor_idx: 0,
+            debug_test_title: "Test Stream Title".into(),
+            debug_test_game: "Just Chatting".into(),
         };
         app.reload_rows();
         app.reload_videos();
@@ -1038,6 +1047,39 @@ fn setting_or_empty(core: &AppCore, key: &str) -> String {
         .ok()
         .flatten()
         .unwrap_or_default()
+}
+
+/// Predefined filename-template presets shown in the preset dropdowns.
+/// `(display_label, template_string)`
+const FILENAME_PRESETS: &[(&str, &str)] = &[
+    ("Name + date",                "{name}_{date}_{time}"),
+    ("Name + title + date",        "{name}_{title}_{date}_{time}"),
+    ("Name + date + title",        "{name}_{date}_{time}_{title}"),
+    ("Name + date + title + game", "{name}_{date}_{time}_{title}_{games}"),
+    ("Date + name",                "{date}_{time}_{name}"),
+    ("Date + name + title",        "{date}_{time}_{name}_{title}"),
+    ("Date + name + title + game", "{date}_{time}_{name}_{title}_{games}"),
+];
+
+/// Render a filename-template preset ComboBox. Selecting a preset writes its
+/// template into `template`; editing the textbox elsewhere automatically shows
+/// "Manual" (no extra state required — the label is derived each frame).
+fn filename_preset_combo(ui: &mut egui::Ui, id_salt: &str, template: &mut String) {
+    let current = FILENAME_PRESETS
+        .iter()
+        .find(|(_, t)| *t == template.as_str())
+        .map(|(l, _)| *l)
+        .unwrap_or("Manual");
+    egui::ComboBox::from_id_salt(id_salt)
+        .selected_text(current)
+        .width(160.0)
+        .show_ui(ui, |ui| {
+            for &(label, tmpl) in FILENAME_PRESETS {
+                if ui.selectable_label(template == tmpl, label).clicked() {
+                    *template = tmpl.to_string();
+                }
+            }
+        });
 }
 
 /// Coarse human duration: `45s` / `5m` / `6h` / `2d`.
@@ -3216,6 +3258,9 @@ impl eframe::App for StreamArchiverApp {
                     ui.selectable_value(&mut self.view, View::Schedule, "Schedule");
                     ui.selectable_value(&mut self.view, View::Background, "Background");
                     ui.selectable_value(&mut self.view, View::Settings, "Settings");
+                    if cfg!(debug_assertions) {
+                        ui.selectable_value(&mut self.view, View::Debug, "Debug");
+                    }
                     ui.separator();
                     if ui
                         .checkbox(&mut self.status_bgcolor, "Status bgcolor")
@@ -3276,6 +3321,7 @@ impl eframe::App for StreamArchiverApp {
             View::Schedule => self.schedule_view(ui),
             View::Background => self.background_view(ui),
             View::Settings => self.settings_view(ui),
+            View::Debug => self.debug_view(ui),
         });
 
         // ── Main-panel context menu (right-click on empty space) ──
@@ -3315,7 +3361,7 @@ impl eframe::App for StreamArchiverApp {
                         ui.close();
                     }
                 }
-                View::Videos => {}
+                View::Videos | View::Debug => {}
             }
         });
         if ctx_add_stream {
@@ -3866,9 +3912,15 @@ impl StreamArchiverApp {
                             ui.end_row();
 
                             ui.label("Filename template");
-                            if ui.text_edit_singleline(&mut d.filename_template).changed() {
-                                dirty = true;
-                            }
+                            ui.horizontal(|ui| {
+                                let before = d.filename_template.clone();
+                                filename_preset_combo(ui, &format!("vdef_tmpl_{}", platform.as_str()), &mut d.filename_template);
+                                if ui.text_edit_singleline(&mut d.filename_template).changed()
+                                    || d.filename_template != before
+                                {
+                                    dirty = true;
+                                }
+                            });
                             ui.end_row();
 
                             ui.label("Extra args");
@@ -4389,6 +4441,7 @@ impl StreamArchiverApp {
                     let tmpl_hint = "Variables: {name} {title} {channel} {date} {time} {timestamp} {year} {month} {day} {hour} {minute} {second} {tool} {mode} {platform} {video_id} {quality} {resolution} {height} {width} {fps} {vcodec} {acodec} {take} {games} {went_live_date} {went_live_time}";
                     ui.label("Filename template").on_hover_text(tmpl_hint);
                     ui.horizontal(|ui| {
+                        filename_preset_combo(ui, "video_form_tmpl", &mut vf.filename_template);
                         ui.text_edit_singleline(&mut vf.filename_template).on_hover_text(tmpl_hint);
                         if ui.button("Design…").on_hover_text("Open the Format Designer").clicked() {
                             open_vf_designer = true;
@@ -7796,13 +7849,16 @@ impl StreamArchiverApp {
                                 // Row 4: Filename template
                                 ui.label("Filename");
                                 let ft_ref = d.filename_template.get_or_insert_with(String::new);
-                                ui.add(
-                                    egui::TextEdit::singleline(ft_ref)
-                                        .hint_text(ft_hint)
-                                        .desired_width(200.0),
-                                ).on_hover_text(
-                                    "Tokens: {name} {date} {time} {timestamp} {year} {month} {day} {hour} {minute} {second} {title} {games} {video_id} {quality} {resolution} {height} {width} {fps} {vcodec} {acodec} {take} {tool} {mode} {platform} {went_live_date} {went_live_time}",
-                                );
+                                ui.horizontal(|ui| {
+                                    filename_preset_combo(ui, &format!("mdef_tmpl_{label}"), ft_ref);
+                                    ui.add(
+                                        egui::TextEdit::singleline(ft_ref)
+                                            .hint_text(&ft_hint)
+                                            .desired_width(150.0),
+                                    ).on_hover_text(
+                                        "Tokens: {name} {date} {time} {timestamp} {year} {month} {day} {hour} {minute} {second} {title} {games} {video_id} {quality} {resolution} {height} {width} {fps} {vcodec} {acodec} {take} {tool} {mode} {platform} {went_live_date} {went_live_time}",
+                                    );
+                                });
                                 ui.label("");
                                 ui.label("");
                                 ui.end_row();
@@ -7923,6 +7979,198 @@ impl StreamArchiverApp {
             ui.add_space(16.0);
             if ui.button("💾 Save settings").clicked() {
                 self.save_settings();
+            }
+        });
+    }
+
+    /// Debug view (debug builds only). Shows a toast tester, build identity,
+    /// data counts, filesystem paths, and the live process list.
+    fn debug_view(&mut self, ui: &mut egui::Ui) {
+        if !cfg!(debug_assertions) {
+            ui.label("Debug view is only available in debug builds.");
+            return;
+        }
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            // ── Toast tester ─────────────────────────────────────────────────
+            ui.heading("Toast tester");
+            ui.separator();
+
+            let monitor_labels: Vec<String> = self
+                .rows
+                .iter()
+                .map(|r| format!("{} [{}]", r.channel.name, r.monitor.platform().label()))
+                .collect();
+
+            ui.horizontal(|ui| {
+                ui.label("Monitor:");
+                let label = monitor_labels
+                    .get(self.debug_monitor_idx)
+                    .cloned()
+                    .unwrap_or_else(|| "— none —".into());
+                egui::ComboBox::from_id_salt("dbg_monitor_cb")
+                    .selected_text(label)
+                    .width(280.0)
+                    .show_ui(ui, |ui| {
+                        for (i, name) in monitor_labels.iter().enumerate() {
+                            ui.selectable_value(&mut self.debug_monitor_idx, i, name);
+                        }
+                    });
+            });
+            ui.horizontal(|ui| {
+                ui.label("Title:").on_hover_text("Simulated stream title");
+                ui.add(egui::TextEdit::singleline(&mut self.debug_test_title).desired_width(280.0));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Game: ").on_hover_text("Simulated game / category");
+                ui.add(egui::TextEdit::singleline(&mut self.debug_test_game).desired_width(280.0));
+            });
+            ui.add_space(4.0);
+            if ui.button("Send test toast").clicked() {
+                if let Some(row) = self.rows.get(self.debug_monitor_idx) {
+                    let platform = row.monitor.platform();
+                    crate::notifications::send_test_toast(
+                        &row.channel.name,
+                        &row.monitor.url,
+                        platform,
+                        &self.debug_test_title.clone(),
+                        &self.debug_test_game.clone(),
+                    );
+                } else {
+                    self.status = "No monitor selected for test toast.".into();
+                }
+            }
+
+            ui.add_space(16.0);
+
+            // ── Build identity ───────────────────────────────────────────────
+            ui.heading("Build");
+            ui.separator();
+            egui::Grid::new("dbg_build_grid")
+                .num_columns(2)
+                .spacing([12.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label("Build ID:");
+                    ui.monospace(crate::version::build_id());
+                    ui.end_row();
+                    ui.label("Schema version:");
+                    ui.monospace("25");
+                    ui.end_row();
+                    ui.label("Debug assertions:");
+                    ui.monospace("on");
+                    ui.end_row();
+                });
+
+            ui.add_space(16.0);
+
+            // ── In-memory data counts ────────────────────────────────────────
+            ui.heading("Data");
+            ui.separator();
+            let active_count = {
+                let a = self.core.active.lock().unwrap_or_else(|e| e.into_inner());
+                a.len()
+            };
+            let active_video_count = {
+                let a = self.core.active_videos.lock().unwrap_or_else(|e| e.into_inner());
+                a.len()
+            };
+            egui::Grid::new("dbg_data_grid")
+                .num_columns(2)
+                .spacing([12.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label("Channel containers:");
+                    ui.monospace(self.channels.len().to_string());
+                    ui.end_row();
+                    ui.label("Monitors:");
+                    ui.monospace(self.rows.len().to_string());
+                    ui.end_row();
+                    ui.label("Video downloads:");
+                    ui.monospace(self.videos.len().to_string());
+                    ui.end_row();
+                    ui.label("Active recordings:");
+                    ui.monospace(active_count.to_string());
+                    ui.end_row();
+                    ui.label("Active video DLs:");
+                    ui.monospace(active_video_count.to_string());
+                    ui.end_row();
+                    ui.label("Background tasks:");
+                    ui.monospace(self.background_tasks.len().to_string());
+                    ui.end_row();
+                });
+
+            ui.add_space(16.0);
+
+            // ── Filesystem paths ─────────────────────────────────────────────
+            ui.heading("Paths");
+            ui.separator();
+            let db_path = crate::app_paths::db_path();
+            let asset_dir = crate::app_paths::asset_cache_dir();
+            egui::Grid::new("dbg_paths_grid")
+                .num_columns(2)
+                .spacing([12.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label("Database:");
+                    ui.horizontal(|ui| {
+                        ui.monospace(db_path.display().to_string());
+                        if ui
+                            .small_button("📂")
+                            .on_hover_text("Open folder in explorer")
+                            .clicked()
+                        {
+                            if let Some(parent) = db_path.parent() {
+                                crate::platform::open_path(parent);
+                            }
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("Asset cache:");
+                    ui.horizontal(|ui| {
+                        ui.monospace(asset_dir.display().to_string());
+                        if ui
+                            .small_button("📂")
+                            .on_hover_text("Open folder in explorer")
+                            .clicked()
+                        {
+                            crate::platform::open_path(&asset_dir);
+                        }
+                    });
+                    ui.end_row();
+                });
+
+            ui.add_space(16.0);
+
+            // ── Live process list ────────────────────────────────────────────
+            ui.heading("Active processes");
+            ui.separator();
+            let procs = self.core.list_processes();
+            if procs.is_empty() {
+                ui.label("— none —");
+            } else {
+                egui::Grid::new("dbg_procs_grid")
+                    .num_columns(5)
+                    .spacing([12.0, 4.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("PID");
+                        ui.strong("Kind");
+                        ui.strong("Name");
+                        ui.strong("Tool");
+                        ui.strong("Build");
+                        ui.end_row();
+                        for p in &procs {
+                            ui.monospace(p.pid.to_string());
+                            ui.label(format!("{:?}", p.kind));
+                            ui.label(&p.name);
+                            ui.label(&p.tool);
+                            let build_label = if p.reattached {
+                                format!("{} [re-attached]", p.spawn_build)
+                            } else {
+                                p.spawn_build.clone()
+                            };
+                            ui.label(build_label);
+                            ui.end_row();
+                        }
+                    });
             }
         });
     }
@@ -8359,6 +8607,7 @@ impl StreamArchiverApp {
                         let fn_tmpl_hint = "{name} {date} {time} {year} {month} {day} {hour} {minute} {second} {title} {games} {video_id} {quality} {resolution} {height} {width} {fps} {vcodec} {acodec} {take} {tool} {mode} {platform} {went_live_date} {went_live_time} {timestamp}";
                         ui.label("Filename template").on_hover_text(fn_tmpl_hint);
                         ui.horizontal(|ui| {
+                            filename_preset_combo(ui, "monitor_form_tmpl", &mut form.filename_template);
                             ui.text_edit_singleline(&mut form.filename_template).on_hover_text(fn_tmpl_hint);
                             if ui.button("Design…").on_hover_text("Open the Format Designer to preview and compose the template").clicked() {
                                 open_format_designer = true;

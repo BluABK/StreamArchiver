@@ -80,6 +80,38 @@ impl ToastContent {
     }
 }
 
+/// Fire a test toast for the given channel/monitor parameters. Constructs a rich
+/// toast (with profile pic + banner from disk if available, a "Watch stream"
+/// button, and the supplied title/game) and shows it immediately on the calling
+/// thread. Intended for the debug view's "Send test toast" button.
+pub fn send_test_toast(
+    channel_name: &str,
+    channel_url: &str,
+    platform: crate::models::Platform,
+    title: &str,
+    game: &str,
+) {
+    let dir = crate::assets::channel_asset_dir(channel_name, platform);
+    let mut lines = Vec::new();
+    if !title.is_empty() {
+        lines.push(title.to_string());
+    }
+    if !game.is_empty() {
+        lines.push(game.to_string());
+    }
+    let action = (!channel_url.trim().is_empty()).then(|| ToastAction {
+        label: "Watch stream".to_string(),
+        url: channel_url.to_string(),
+    });
+    show_toast(ToastContent {
+        heading: format!("{channel_name} is live"),
+        lines,
+        logo: find_asset(&dir, "icon."),
+        hero: find_asset(&dir, "banner."),
+        action,
+    });
+}
+
 /// Run the notification loop until the event bus closes. Each event is handled on
 /// a blocking thread (store reads + the OS toast call) so the async loop stays
 /// responsive.
