@@ -56,6 +56,9 @@ const K_SABR_RAW_ARGS: &str = "ytdlp_sabr_raw_args";
 /// PO-token-provider `--extractor-args` (e.g. bgutil), a separate `--extractor-args`
 /// entry on the SABR command. Absent ⇒ bgutil default; explicit empty ⇒ disabled.
 const K_SABR_POT_ARGS: &str = "ytdlp_sabr_pot_args";
+/// Experimental: append `enable_live_deep_rewind=true` to the SABR extractor-args
+/// (rewinds past the normal DVR window; dev-build-only). Absent ⇒ off.
+const K_SABR_DEEP_REWIND: &str = "ytdlp_sabr_deep_rewind";
 /// DASH-companion format selector for dual capture.
 const K_DASH_FORMAT: &str = "ytdlp_dash_format";
 const K_WEBSUB_URL: &str = "websub_vps_url";
@@ -376,6 +379,8 @@ struct SettingsForm {
     /// SABR format selector + extractor-args preset.
     sabr_format: String,
     sabr_extractor_args: String,
+    /// Experimental deep-rewind toggle (appends enable_live_deep_rewind=true).
+    sabr_deep_rewind: bool,
     /// Manual raw SABR args; non-empty overrides the format+extractor-args preset.
     sabr_raw_args: String,
     /// PO-token-provider `--extractor-args` (e.g. bgutil) for the SABR command.
@@ -699,6 +704,8 @@ impl StreamArchiverApp {
                     v
                 }
             },
+            // Absent ⇒ off; an explicit "1" enables it.
+            sabr_deep_rewind: setting_or_empty(&core, K_SABR_DEEP_REWIND) == "1",
             sabr_raw_args: setting_or_empty(&core, K_SABR_RAW_ARGS),
             // Absent ⇒ bgutil default; present (even empty) ⇒ honor it verbatim so
             // the user can disable it and rely on the plugin's auto-detection.
@@ -1130,6 +1137,7 @@ impl StreamArchiverApp {
             (K_SABR_ENABLED, if s.sabr_enabled { "1" } else { "0" }),
             (K_SABR_FORMAT, s.sabr_format.trim()),
             (K_SABR_EXTRACTOR_ARGS, s.sabr_extractor_args.trim()),
+            (K_SABR_DEEP_REWIND, if s.sabr_deep_rewind { "1" } else { "0" }),
             (K_SABR_RAW_ARGS, s.sabr_raw_args.trim()),
             (K_SABR_POT_ARGS, s.sabr_pot_args.trim()),
             (K_DASH_FORMAT, s.dash_format.trim()),
@@ -8376,6 +8384,18 @@ impl StreamArchiverApp {
                     );
                     ui.end_row();
 
+                    ui.label("Deep rewind (experimental)");
+                    ui.checkbox(&mut self.settings.sabr_deep_rewind, "")
+                        .on_hover_text(
+                            "Appends enable_live_deep_rewind=true to the SABR extractor-args, \
+                             letting capture-from-start rewind past YouTube's normal ~4h DVR \
+                             window (so it can reach the start of a long-running stream instead \
+                             of stalling). Requires a SABR dev build that supports it; a stock \
+                             yt-dlp ignores it. Experimental and may be unstable. Has no effect \
+                             when SABR manual args are set below.",
+                        );
+                    ui.end_row();
+
                     ui.label("SABR manual args");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.settings.sabr_raw_args)
@@ -8900,7 +8920,7 @@ impl StreamArchiverApp {
     /// and reveal-log/folder actions. Doubles as a live list of spawned processes.
     #[allow(deprecated)]
     fn processes_window(&mut self, ctx: &egui::Context) {
-        use crate::models::DetachedKind;
+        use crate::models::{ContentType, DetachedKind};
         use egui_extras::{Column, TableBuilder};
         use std::time::{Duration, Instant};
         if !self.show_processes {
@@ -8974,12 +8994,21 @@ impl StreamArchiverApp {
                                 body.row(22.0, |mut row| {
                                     row.col(|ui| { ui.monospace(p.pid.to_string()); });
                                     row.col(|ui| {
+                                        // Map the process role to a content-type icon + label.
+                                        // A live capture is "🎥 video"; its DASH companion leg
+                                        // gets a "· dash" suffix. An on-demand download is the
+                                        // "📼 VOD" so the two video kinds stay distinguishable.
                                         let t = match p.kind {
                                             DetachedKind::Recording => {
-                                                if p.secondary { "rec · dash" } else { "recording" }
+                                                let base = ContentType::Video.tag();
+                                                if p.secondary {
+                                                    format!("{base} · dash")
+                                                } else {
+                                                    base
+                                                }
                                             }
-                                            DetachedKind::Video => "video",
-                                            DetachedKind::Chat => "chat",
+                                            DetachedKind::Video => ContentType::Vod.tag(),
+                                            DetachedKind::Chat => ContentType::Chat.tag(),
                                         };
                                         ui.label(t);
                                     });

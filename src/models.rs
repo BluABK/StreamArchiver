@@ -700,6 +700,75 @@ impl DetachedKind {
     }
 }
 
+/// The kind of media/content an artifact represents, used to pick a UI icon +
+/// label (currently the Processes window's Type column). Kept separate from
+/// [`DetachedKind`] — which is the *process* role and drives DB serialization —
+/// so the icon vocabulary can grow to cover content we don't yet spawn a
+/// dedicated process for (audio-only tracks, subtitle sidecars, thumbnails…)
+/// without touching the registry schema.
+///
+/// IMPORTANT — glyph constraint: egui draws only the monochrome glyph OUTLINES
+/// from its bundled font subset (NotoEmoji-Regular.ttf, an 887-glyph subset). An
+/// emoji absent from that subset renders as a blank "tofu" box. Every glyph
+/// below was verified present in the subset. Notably 🖼 (U+1F5BC framed picture)
+/// is NOT in it — `Image` uses 📷 (camera) instead. When adding a variant, pick a
+/// glyph confirmed in the subset (e.g. via fontTools) or it will render as tofu.
+///
+/// `Audio`/`Subtitles`/`Image`/`Metadata` aren't wired to a process role yet —
+/// they're the "all sorts of possible types" the Type column should be ready to
+/// show, hence `#[allow(dead_code)]` until something constructs them.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentType {
+    /// A live stream capture / video stream in progress.
+    Video,
+    /// An on-demand (already-finished) video download.
+    Vod,
+    /// An audio-only stream or extracted audio track.
+    Audio,
+    /// A live-chat sidecar / chat log.
+    Chat,
+    /// A subtitle / caption track.
+    Subtitles,
+    /// A thumbnail, poster, or other still image.
+    Image,
+    /// A metadata sidecar (info JSON, description, etc.).
+    Metadata,
+}
+
+impl ContentType {
+    /// Font-safe emoji glyph (verified present in egui's NotoEmoji subset).
+    pub fn icon(self) -> &'static str {
+        match self {
+            ContentType::Video => "🎥",
+            ContentType::Vod => "📼",
+            ContentType::Audio => "🎵",
+            ContentType::Chat => "💬",
+            ContentType::Subtitles => "🔤",
+            ContentType::Image => "📷",
+            ContentType::Metadata => "📄",
+        }
+    }
+
+    /// Short human-readable label.
+    pub fn label(self) -> &'static str {
+        match self {
+            ContentType::Video => "video",
+            ContentType::Vod => "VOD",
+            ContentType::Audio => "audio",
+            ContentType::Chat => "chat",
+            ContentType::Subtitles => "subtitles",
+            ContentType::Image => "image",
+            ContentType::Metadata => "metadata",
+        }
+    }
+
+    /// `"🎥 video"` — icon + space + label, ready to hand to `ui.label`.
+    pub fn tag(self) -> String {
+        format!("{} {}", self.icon(), self.label())
+    }
+}
+
 /// A persisted record of a still-running download tool process, written right
 /// after the tool spawns and deleted at finalize/stop. On the next launch the
 /// supervisor reconciles every row: re-attach to the live ones (wait + tail the

@@ -207,6 +207,18 @@ fn load_ytdlp_bins(store: &Store) -> YtDlpBins {
         .unwrap_or(true);
     let fmt = setting_str(store, "ytdlp_sabr_format");
     let xargs = setting_str(store, "ytdlp_sabr_extractor_args");
+    // Experimental deep-rewind: when on, append `enable_live_deep_rewind=true` to
+    // the youtube extractor-args so SABR can rewind past YouTube's normal ~4h DVR
+    // window (lets capture-from-start reach the start of a long stream instead of
+    // stalling with "not near live head"). Dev-build-only feature; the upstream
+    // code reads only the literal lowercase `true`. Off by default — a stock
+    // yt-dlp would silently ignore it, and the upstream author marks it unstable.
+    let deep_rewind = store
+        .get_setting("ytdlp_sabr_deep_rewind")
+        .ok()
+        .flatten()
+        .map(|v| v == "1")
+        .unwrap_or(false);
     // PO-token args: absent (never written) ⇒ the bgutil default; present (even
     // empty) ⇒ honor it verbatim, so the user can deliberately disable it.
     let pot_args = match store.get_setting("ytdlp_sabr_pot_args") {
@@ -219,10 +231,20 @@ fn load_ytdlp_bins(store: &Store) -> YtDlpBins {
             enabled,
             binary: setting_str(store, "ytdlp_sabr_binary_path"),
             format: if fmt.is_empty() { SABR_DEFAULT_FORMAT.to_string() } else { fmt },
-            extractor_args: if xargs.is_empty() {
-                SABR_DEFAULT_EXTRACTOR_ARGS.to_string()
-            } else {
-                xargs
+            extractor_args: {
+                let base = if xargs.is_empty() {
+                    SABR_DEFAULT_EXTRACTOR_ARGS.to_string()
+                } else {
+                    xargs
+                };
+                // Append under the same `youtube:` namespace (`;`-separated).
+                // Guard against a double-append if the user already added it to
+                // the extractor-args field by hand.
+                if deep_rewind && !base.contains("enable_live_deep_rewind") {
+                    format!("{base};enable_live_deep_rewind=true")
+                } else {
+                    base
+                }
             },
             raw_args: setting_str(store, "ytdlp_sabr_raw_args"),
             pot_args,
@@ -5340,6 +5362,43 @@ mod tests {
                 pot_args: SABR_DEFAULT_POT_ARGS.into(),
             },
         }
+    }
+
+    #[test]
+    fn deep_rewind_toggle_appends_extractor_arg() {
+        let store = Store::open_in_memory().unwrap();
+        // Off by default: the extractor-args are the plain preset.
+        let off = load_ytdlp_bins(&store).sabr.extractor_args;
+        assert_eq!(off, SABR_DEFAULT_EXTRACTOR_ARGS);
+        assert!(!off.contains("enable_live_deep_rewind"));
+
+        // Enabled: the deep-rewind key is appended under the youtube: namespace.
+        store.set_setting("ytdlp_sabr_deep_rewind", "1").unwrap();
+        let on = load_ytdlp_bins(&store).sabr.extractor_args;
+        assert_eq!(
+            on,
+            format!("{SABR_DEFAULT_EXTRACTOR_ARGS};enable_live_deep_rewind=true")
+        );
+
+        // Explicit "0" is off again.
+        store.set_setting("ytdlp_sabr_deep_rewind", "0").unwrap();
+        assert!(
+            !load_ytdlp_bins(&store)
+                .sabr
+                .extractor_args
+                .contains("enable_live_deep_rewind")
+        );
+
+        // No double-append when the user already put it in the args field by hand.
+        store.set_setting("ytdlp_sabr_deep_rewind", "1").unwrap();
+        store
+            .set_setting(
+                "ytdlp_sabr_extractor_args",
+                "youtube:formats=duplicate;enable_live_deep_rewind=true",
+            )
+            .unwrap();
+        let manual = load_ytdlp_bins(&store).sabr.extractor_args;
+        assert_eq!(manual.matches("enable_live_deep_rewind").count(), 1);
     }
 
     #[test]
