@@ -2,3 +2,9 @@
 .claude
 # Local, per-machine build counter (the patch z of the displayed version).
 /.build-counter
+# Local scratch: debug logs / ad-hoc test captures.
+/.local
+# Ad-hoc sample screenshots.
+/assets/samples/
+# Personal VS Code workspace (machine-specific folder paths).
+/streamarchiver.code-workspace
