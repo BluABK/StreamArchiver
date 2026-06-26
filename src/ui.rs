@@ -25,6 +25,8 @@ use crate::models::{
     Recording, ScheduleSegment, StreamGroup, StreamMetaChange, Tool, UpcomingStream, Video,
     group_recordings, now_unix,
 };
+use crate::google_oauth;
+use crate::imports::{self, ImportCandidate};
 use crate::oauth::{self, AuthFlow};
 use crate::platform::AutoStart;
 
@@ -330,6 +332,10 @@ impl VideoForm {
 struct SettingsForm {
     twitch_client_id: String,
     twitch_client_secret: String,
+    /// Google OAuth client (TV/device type) for "Connect YouTube" → subscriptions
+    /// import. Separate from the YouTube Data API key (which can't read user data).
+    google_client_id: String,
+    google_client_secret: String,
     youtube_api_key: String,
     /// Per-operation opt-ins to use the YouTube Data API key instead of scraping
     /// (each costs quota — see the Settings section).
@@ -376,6 +382,43 @@ struct SettingsForm {
     /// (opt-in; automating a user token is against Discord's ToS).
     discord_token: String,
     discord_schedule: bool,
+}
+
+/// Background load state of an import fetch (followed/subscriptions).
+enum ImportLoadState {
+    Loading,
+    Loaded(Vec<ImportCandidate>),
+    Error(String),
+}
+
+/// One row in the import confirmation dialog: a candidate plus its per-row choices.
+struct ImportRow {
+    cand: ImportCandidate,
+    /// Whether to import this entry.
+    selected: bool,
+    /// "Auto" — sets `monitor.enabled` (scheduler auto-records). Default off.
+    auto: bool,
+    /// "Disabled" — imports the container with `channel.enabled = false`.
+    disabled: bool,
+    /// Already present in the app (matched an existing monitor by id/login) — shown
+    /// greyed and not selectable, so an import can't create duplicates.
+    already: bool,
+    /// A channel with the same name already exists, but identities couldn't be
+    /// matched (e.g. an existing YouTube monitor added by @handle vs. a candidate's
+    /// channel id). Flagged + left unselected, but still selectable to override.
+    maybe_dup: bool,
+}
+
+/// The "Import followed/subscriptions" confirmation dialog.
+struct ImportDialog {
+    title: String,
+    /// Background fetch result; moved into `rows` once loaded.
+    load: Arc<Mutex<ImportLoadState>>,
+    /// Editable rows (populated from `load` on the first frame after it completes).
+    rows: Vec<ImportRow>,
+    loaded: bool,
+    search: String,
+    status: String,
 }
 
 /// Which field the Format Designer was opened from (for "Apply").
@@ -518,6 +561,10 @@ pub struct StreamArchiverApp {
     videos_filters: Vec<String>,
     /// Shared state of the interactive "Connect Twitch" device-code flow.
     twitch_flow: Arc<Mutex<AuthFlow>>,
+    /// Shared state of the interactive "Connect YouTube" (Google) device-code flow.
+    google_flow: Arc<Mutex<AuthFlow>>,
+    /// Open "Import followed/subscriptions" confirmation dialog, if any.
+    import_dialog: Option<ImportDialog>,
     /// Whether Streams rows show a status background tint (recording / ad / error).
     /// Toggled from the top bar; persisted under [`K_STATUS_BGCOLOR`]. Keyboard
     /// row selection is still highlighted regardless.
@@ -588,6 +635,8 @@ impl StreamArchiverApp {
         let settings = SettingsForm {
             twitch_client_id: setting_or_empty(&core, K_TWITCH_ID),
             twitch_client_secret: setting_or_empty(&core, K_TWITCH_SECRET),
+            google_client_id: setting_or_empty(&core, google_oauth::K_CLIENT_ID),
+            google_client_secret: setting_or_empty(&core, google_oauth::K_CLIENT_SECRET),
             youtube_api_key: setting_or_empty(&core, K_YT_KEY),
             youtube_api_detect: setting_or_empty(&core, K_YT_API_DETECT) == "1",
             youtube_api_schedule: setting_or_empty(&core, K_YT_API_SCHEDULE) == "1",
@@ -663,6 +712,13 @@ impl StreamArchiverApp {
         let twitch_flow = Arc::new(Mutex::new(match oauth::connected_login(&core.store) {
             Some(login) => AuthFlow::Connected { login },
             None => AuthFlow::Idle,
+        }));
+        let google_flow = Arc::new(Mutex::new(if google_oauth::is_connected(&core.store) {
+            AuthFlow::Connected {
+                login: google_oauth::connected_identity(&core.store).unwrap_or_default(),
+            }
+        } else {
+            AuthFlow::Idle
         }));
 
         // Status row tint defaults on; only an explicit "0" disables it.
@@ -769,6 +825,8 @@ impl StreamArchiverApp {
             videos_sort: SortState::default(),
             videos_filters: vec![String::new(); VIDEO_COLS],
             twitch_flow,
+            google_flow,
+            import_dialog: None,
             status_bgcolor,
             show_actions,
             render_emotes,
@@ -1027,6 +1085,8 @@ impl StreamArchiverApp {
         let pairs = [
             (K_TWITCH_ID, s.twitch_client_id.trim()),
             (K_TWITCH_SECRET, s.twitch_client_secret.trim()),
+            (google_oauth::K_CLIENT_ID, s.google_client_id.trim()),
+            (google_oauth::K_CLIENT_SECRET, s.google_client_secret.trim()),
             (K_YT_KEY, s.youtube_api_key.trim()),
             (K_KICK_ID, s.kick_client_id.trim()),
             (K_KICK_SECRET, s.kick_client_secret.trim()),
@@ -3338,6 +3398,19 @@ impl eframe::App for StreamArchiverApp {
                         );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Pinned far-right and shown on every view — the process
+                        // manager is a global utility, not Background-specific.
+                        if ui
+                            .button("🖥 Process manager")
+                            .on_hover_text(
+                                "All spawned download tool processes (recordings, videos, \
+                                 chat) — PIDs, status, and manual Stop / Kill.",
+                            )
+                            .clicked()
+                        {
+                            self.show_processes = true;
+                            self.processes_refreshed = None; // force an immediate refresh
+                        }
                         if self.view == View::Streams {
                             if ui
                                 .button("➕ Add stream")
@@ -3466,6 +3539,7 @@ impl eframe::App for StreamArchiverApp {
         self.processes_window(ui.ctx());
         self.format_designer_window(ui.ctx());
         self.confirm_quit_stop_window(ui.ctx());
+        self.import_window(ui.ctx());
     }
 }
 
@@ -7179,6 +7253,406 @@ impl StreamArchiverApp {
         });
     }
 
+    /// Kick off the Google device-code flow (for YouTube subscriptions import),
+    /// updating the shared `google_flow` state as it progresses.
+    fn start_google_connect(&mut self, ctx: egui::Context) {
+        let client_id = self.settings.google_client_id.trim().to_string();
+        let client_secret = self.settings.google_client_secret.trim().to_string();
+        if client_id.is_empty() || client_secret.is_empty() {
+            self.status = "Enter and save a Google Client ID and Secret first.".into();
+            return;
+        }
+        let _ = self.core.store.set_setting(google_oauth::K_CLIENT_ID, &client_id);
+        let _ = self
+            .core
+            .store
+            .set_setting(google_oauth::K_CLIENT_SECRET, &client_secret);
+
+        let flow = self.google_flow.clone();
+        let store = self.core.store.clone();
+        *flow.lock().unwrap() = AuthFlow::Pending {
+            user_code: String::new(),
+            url: String::new(),
+        };
+        self.core.rt.spawn(async move {
+            let http = match reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(20))
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    *flow.lock().unwrap() = AuthFlow::Failed { message: e.to_string() };
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+            let dc = match google_oauth::start_device(&http, &client_id).await {
+                Ok(dc) => dc,
+                Err(e) => {
+                    *flow.lock().unwrap() = AuthFlow::Failed { message: e.to_string() };
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+            *flow.lock().unwrap() = AuthFlow::Pending {
+                user_code: dc.user_code.clone(),
+                url: dc.verification_uri.clone(),
+            };
+            ctx.request_repaint();
+            match google_oauth::poll_token(&http, &client_id, &client_secret, &dc).await {
+                Ok(tokens) => {
+                    let _ = google_oauth::store_tokens(&store, &tokens);
+                    let identity = google_oauth::fetch_identity(&http, &tokens.access)
+                        .await
+                        .unwrap_or_default();
+                    let _ = store.set_setting(google_oauth::K_IDENTITY, &identity);
+                    *flow.lock().unwrap() = AuthFlow::Connected { login: identity };
+                }
+                Err(e) => {
+                    *flow.lock().unwrap() = AuthFlow::Failed { message: e.to_string() };
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// Open the import dialog for `platform` and kick off the background fetch of
+    /// the user's followed channels / subscriptions.
+    fn open_import(&mut self, platform: Platform, ctx: egui::Context) {
+        let load = Arc::new(Mutex::new(ImportLoadState::Loading));
+        let load2 = load.clone();
+        let store = self.core.store.clone();
+        self.core.rt.spawn(async move {
+            let result = match reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+            {
+                Err(e) => ImportLoadState::Error(e.to_string()),
+                Ok(http) => {
+                    let fetched = match platform {
+                        Platform::Twitch => imports::twitch_followed(&http, &store).await,
+                        Platform::YouTube => imports::youtube_subscriptions(&http, &store).await,
+                        _ => Err(anyhow::anyhow!("unsupported platform")),
+                    };
+                    match fetched {
+                        Ok(c) => ImportLoadState::Loaded(c),
+                        Err(e) => ImportLoadState::Error(e.to_string()),
+                    }
+                }
+            };
+            *load2.lock().unwrap() = result;
+            ctx.request_repaint();
+        });
+        let title = match platform {
+            Platform::Twitch => "Import followed Twitch channels",
+            Platform::YouTube => "Import YouTube subscriptions",
+            _ => "Import channels",
+        }
+        .to_string();
+        self.import_dialog = Some(ImportDialog {
+            title,
+            load,
+            rows: Vec::new(),
+            loaded: false,
+            search: String::new(),
+            status: String::new(),
+        });
+    }
+
+    #[allow(deprecated)]
+    fn import_window(&mut self, ctx: &egui::Context) {
+        if self.import_dialog.is_none() {
+            return;
+        }
+        // Promote a completed background fetch into editable rows once — this needs
+        // `self.rows` to mark channels already added, so it happens before the
+        // viewport closure borrows the dialog.
+        let promote = {
+            let d = self.import_dialog.as_ref().unwrap();
+            !d.loaded && matches!(&*d.load.lock().unwrap(), ImportLoadState::Loaded(_))
+        };
+        if promote {
+            // Confident dedup: per-platform identity (Twitch login / YouTube UC id).
+            let existing_ids: HashSet<(Platform, String)> = self
+                .rows
+                .iter()
+                .map(|r| (r.monitor.platform(), monitor_import_identity(&r.monitor.url)))
+                .collect();
+            // Fuzzy dedup: existing container names (catches a channel added under a
+            // URL form whose identity can't be matched, e.g. a YouTube @handle).
+            let existing_names: HashSet<String> =
+                self.rows.iter().map(|r| r.channel.name.to_lowercase()).collect();
+            let d = self.import_dialog.as_mut().unwrap();
+            // Take the guard once (a second .lock() on the same thread would deadlock).
+            let cands = {
+                let mut g = d.load.lock().unwrap();
+                match std::mem::replace(&mut *g, ImportLoadState::Loading) {
+                    ImportLoadState::Loaded(c) => c,
+                    other => {
+                        *g = other;
+                        Vec::new()
+                    }
+                }
+            };
+            d.rows = cands
+                .into_iter()
+                .map(|c| {
+                    let already = existing_ids.contains(&(c.platform, c.identity.clone()));
+                    let maybe_dup = !already && existing_names.contains(&c.name.to_lowercase());
+                    ImportRow {
+                        cand: c,
+                        selected: !already && !maybe_dup,
+                        auto: false,
+                        disabled: false,
+                        already,
+                        maybe_dup,
+                    }
+                })
+                .collect();
+            d.loaded = true;
+        }
+
+        let Some(dialog) = &mut self.import_dialog else {
+            return;
+        };
+        let mut open = true;
+        let mut do_import = false;
+        let mut do_close = false;
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("import_vp"),
+            egui::ViewportBuilder::default()
+                .with_title(dialog.title.clone())
+                .with_inner_size([620.0, 560.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if !dialog.loaded {
+                        match &*dialog.load.lock().unwrap() {
+                            ImportLoadState::Loading => {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label("Loading…");
+                                });
+                                ctx.request_repaint();
+                            }
+                            ImportLoadState::Error(e) => {
+                                ui.add_space(8.0);
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(0xE0, 0x6C, 0x6C),
+                                    format!("Couldn't load: {e}"),
+                                );
+                            }
+                            ImportLoadState::Loaded(_) => {
+                                ctx.request_repaint(); // will promote next frame
+                            }
+                        }
+                        ui.add_space(8.0);
+                        if ui.button("Close").clicked() {
+                            do_close = true;
+                        }
+                        return;
+                    }
+
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{} channels found.", dialog.rows.len()));
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut dialog.search)
+                                        .hint_text("Filter…")
+                                        .desired_width(160.0),
+                                );
+                                ui.label("🔍");
+                            },
+                        );
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "Tick the channels to import. \"Auto\" lets the scheduler \
+                             auto-record (off = monitor only); \"Disabled\" imports the \
+                             channel turned off. Already-added channels are greyed out.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.separator();
+
+                    let q = dialog.search.to_lowercase();
+                    let visible: Vec<usize> = (0..dialog.rows.len())
+                        .filter(|&i| import_row_matches(&dialog.rows[i], &q))
+                        .collect();
+                    let selectable: Vec<usize> =
+                        visible.iter().copied().filter(|&i| !dialog.rows[i].already).collect();
+
+                    // Master controls.
+                    ui.horizontal(|ui| {
+                        let mut all = !selectable.is_empty()
+                            && selectable.iter().all(|&i| dialog.rows[i].selected);
+                        if ui
+                            .checkbox(&mut all, "All")
+                            .on_hover_text("Select/deselect every (not-already-added) channel")
+                            .changed()
+                        {
+                            for &i in &selectable {
+                                dialog.rows[i].selected = all;
+                            }
+                        }
+                        ui.separator();
+                        if ui.small_button("Auto: all").clicked() {
+                            for &i in &selectable {
+                                if dialog.rows[i].selected {
+                                    dialog.rows[i].auto = true;
+                                }
+                            }
+                        }
+                        if ui.small_button("Auto: none").clicked() {
+                            for &i in &selectable {
+                                dialog.rows[i].auto = false;
+                            }
+                        }
+                    });
+                    ui.add_space(4.0);
+
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .max_height(380.0)
+                        .show(ui, |ui| {
+                            egui::Grid::new("import_grid")
+                                .num_columns(6)
+                                .striped(true)
+                                .spacing([10.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.strong("Import");
+                                    ui.strong("Auto");
+                                    ui.strong("Disabled");
+                                    ui.strong("Channel");
+                                    ui.strong("ID");
+                                    ui.strong("Info");
+                                    ui.end_row();
+                                    for &i in &visible {
+                                        let row = &mut dialog.rows[i];
+                                        let on = row.selected && !row.already;
+                                        ui.add_enabled(
+                                            !row.already,
+                                            egui::Checkbox::new(&mut row.selected, ""),
+                                        );
+                                        ui.add_enabled(
+                                            on,
+                                            egui::Checkbox::new(&mut row.auto, ""),
+                                        );
+                                        ui.add_enabled(
+                                            on,
+                                            egui::Checkbox::new(&mut row.disabled, ""),
+                                        );
+                                        if row.already {
+                                            ui.weak(format!("{} (added)", row.cand.name));
+                                        } else if row.maybe_dup {
+                                            ui.horizontal(|ui| {
+                                                ui.label(&row.cand.name);
+                                                ui.weak("(maybe added)").on_hover_text(
+                                                    "A channel with this name is already in your \
+                                                     list — tick to import anyway.",
+                                                );
+                                            });
+                                        } else {
+                                            ui.label(&row.cand.name);
+                                        }
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&row.cand.id).monospace().small(),
+                                            )
+                                            .truncate(),
+                                        );
+                                        ui.weak(&row.cand.detail);
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+
+                    ui.separator();
+                    let n = dialog
+                        .rows
+                        .iter()
+                        .filter(|r| r.selected && !r.already)
+                        .count();
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                n > 0,
+                                egui::Button::new(format!("Import {n} selected")),
+                            )
+                            .clicked()
+                        {
+                            do_import = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_close = true;
+                        }
+                        if !dialog.status.is_empty() {
+                            ui.label(&dialog.status);
+                        }
+                    });
+                });
+            },
+        );
+
+        // Collect the chosen rows before the dialog borrow ends (the create + reload
+        // below need `&mut self`).
+        let to_create: Vec<(String, String, bool, bool)> = if do_import {
+            dialog
+                .rows
+                .iter()
+                .filter(|r| r.selected && !r.already)
+                .map(|r| (r.cand.name.clone(), r.cand.url.clone(), r.auto, r.disabled))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let close = do_close || !open;
+
+        if do_import {
+            let out = self.settings.default_output_dir.clone();
+            let mut ok = 0usize;
+            let mut failed = 0usize;
+            let mut last_err: Option<String> = None;
+            // Continue past a per-row failure so one bad channel can't drop the rest
+            // of the batch.
+            for (name, url, auto, disabled) in &to_create {
+                match imports::create_monitor(
+                    &self.core.store,
+                    &self.monitor_defaults,
+                    &out,
+                    name,
+                    url,
+                    *auto,
+                    !*disabled,
+                ) {
+                    Ok(_) => ok += 1,
+                    Err(e) => {
+                        failed += 1;
+                        last_err = Some(e.to_string());
+                    }
+                }
+            }
+            self.reload_rows();
+            self.status = if failed == 0 {
+                format!("Imported {ok} channel(s).")
+            } else {
+                format!(
+                    "Imported {ok} channel(s); {failed} failed{}.",
+                    last_err.map(|e| format!(" (last: {e})")).unwrap_or_default()
+                )
+            };
+            self.import_dialog = None;
+        } else if close {
+            self.import_dialog = None;
+        }
+    }
+
     fn background_view(&mut self, ui: &mut egui::Ui) {
         use egui_extras::{Column, TableBuilder};
         let now = now_unix();
@@ -7191,21 +7665,6 @@ impl StreamArchiverApp {
         let before: Vec<bool> = toggles.iter().map(|t| t.2).collect();
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.add_space(8.0);
-
-            ui.horizontal(|ui| {
-                if ui
-                    .button("🖥 Process manager")
-                    .on_hover_text(
-                        "All spawned download tool processes (recordings, videos, chat) — \
-                         PIDs, status, and manual Stop / Kill.",
-                    )
-                    .clicked()
-                {
-                    self.show_processes = true;
-                    self.processes_refreshed = None; // force an immediate refresh
-                }
-            });
             ui.add_space(8.0);
 
             // ── Scheduled (periodic jobs) ────────────────────────────────
@@ -7493,9 +7952,20 @@ impl StreamArchiverApp {
                         }
                     });
                     ui.small(
-                        "Tip: if you connected before the Ad-free feature, reconnect to grant \
-                         the subscriptions scope so ad-free (sub) detection works.",
+                        "Tip: if you connected before the Ad-free / Import features, reconnect to \
+                         grant the subscriptions + follows scopes.",
                     );
+                    if ui
+                        .button("📥 Import followed channels")
+                        .on_hover_text(
+                            "Add the channels this Twitch account follows as new streams \
+                             (Auto off by default). Needs the 'follows' scope — reconnect if it \
+                             was granted before this feature.",
+                        )
+                        .clicked()
+                    {
+                        self.open_import(Platform::Twitch, ui.ctx().clone());
+                    }
                 }
                 AuthFlow::Pending { user_code, url } => {
                     ui.label("Authorize in your browser, then wait:");
@@ -7515,6 +7985,78 @@ impl StreamArchiverApp {
                 AuthFlow::Idle => {
                     if ui.button("🔗 Connect Twitch").clicked() {
                         self.start_twitch_connect(ui.ctx().clone());
+                    }
+                }
+            }
+
+            ui.add_space(12.0);
+            ui.heading("YouTube account (Google OAuth)");
+            ui.label(
+                "Connect a Google account to import your YouTube subscriptions. Needs a Google \
+                 Cloud OAuth client of type \"TV and Limited Input devices\" with the YouTube \
+                 Data API enabled.",
+            );
+            egui::Grid::new("google_creds_grid")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("Google Client ID");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.google_client_id)
+                            .desired_width(320.0)
+                            .hint_text("xxxxx.apps.googleusercontent.com"),
+                    );
+                    ui.end_row();
+                    ui.label("Google Client Secret");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.google_client_secret)
+                            .password(true),
+                    );
+                    ui.end_row();
+                });
+            let gflow = self.google_flow.lock().unwrap().clone();
+            match gflow {
+                AuthFlow::Connected { login } => {
+                    ui.horizontal(|ui| {
+                        if login.is_empty() {
+                            ui.label("✅ Connected");
+                        } else {
+                            ui.label(format!("✅ Connected as {login}"));
+                        }
+                        if ui.button("Disconnect").clicked() {
+                            let _ = google_oauth::disconnect(&self.core.store);
+                            *self.google_flow.lock().unwrap() = AuthFlow::Idle;
+                        }
+                    });
+                    if ui
+                        .button("📥 Import subscriptions")
+                        .on_hover_text(
+                            "Add the channels this YouTube account subscribes to as new streams \
+                             (Auto off by default).",
+                        )
+                        .clicked()
+                    {
+                        self.open_import(Platform::YouTube, ui.ctx().clone());
+                    }
+                }
+                AuthFlow::Pending { user_code, url } => {
+                    ui.label("Authorize in your browser, then wait:");
+                    if url.is_empty() {
+                        ui.label("Requesting code…");
+                    } else {
+                        ui.hyperlink(&url);
+                        ui.label(format!("Enter code: {user_code}"));
+                    }
+                }
+                AuthFlow::Failed { message } => {
+                    ui.colored_label(egui::Color32::from_rgb(0xE0, 0x6C, 0x6C), &message);
+                    if ui.button("🔗 Connect YouTube").clicked() {
+                        self.start_google_connect(ui.ctx().clone());
+                    }
+                }
+                AuthFlow::Idle => {
+                    if ui.button("🔗 Connect YouTube").clicked() {
+                        self.start_google_connect(ui.ctx().clone());
                     }
                 }
             }
@@ -9437,6 +9979,34 @@ fn channel_asset_dir(name: &str, platform: Platform) -> std::path::PathBuf {
     crate::assets::channel_asset_dir(name, platform)
 }
 
+/// Stable per-platform identity of a monitor's source URL, used to detect whether
+/// an import candidate is already added (matches [`ImportCandidate::identity`]).
+fn monitor_import_identity(url: &str) -> String {
+    match Platform::detect(url) {
+        Platform::Twitch => crate::detectors::twitch_login(url).unwrap_or_default().to_lowercase(),
+        Platform::Kick => crate::detectors::kick_slug(url).unwrap_or_default().to_lowercase(),
+        Platform::YouTube => yt_channel_id(url).unwrap_or_else(|| url.to_lowercase()),
+        Platform::Generic => url.to_lowercase(),
+    }
+}
+
+/// Extract a lowercased YouTube `UC…` channel id from a `/channel/UC…` URL.
+fn yt_channel_id(url: &str) -> Option<String> {
+    let lower = url.to_lowercase();
+    let idx = lower.find("/channel/")?;
+    let rest = &lower[idx + "/channel/".len()..];
+    let id = rest.split(['/', '?', '#']).next()?;
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// Whether an import row matches the dialog's (already-lowercased) filter query.
+fn import_row_matches(row: &ImportRow, q: &str) -> bool {
+    q.is_empty()
+        || row.cand.name.to_lowercase().contains(q)
+        || row.cand.identity.contains(q)
+        || row.cand.id.to_lowercase().contains(q)
+}
+
 /// The Twitch broadcaster's chosen chat name colour for `name`, if the asset fetch
 /// cached one (`…/{name}/twitch/name_color.txt`, e.g. `#9146FF`). `None` when the
 /// streamer set no colour or assets haven't been fetched.
@@ -10351,9 +10921,9 @@ mod tests {
     use super::{
         ChatSegment, DateFmt, StreamMetaChange, active_date_fmt, aggregate_stream_changes,
         build_twitch_segments, chat_file_for_recording, compose_browser_profile, contrast_ratio,
-        fmt_polled, hsl_to_rgb, meta_change_lines, parse_first_party_spans, readable_color,
-        rgb_to_hsl, set_active_date_fmt, split_browser_profile, strip_ctcp_action,
-        twitch_username_color, word_match_segments,
+        fmt_polled, hsl_to_rgb, meta_change_lines, monitor_import_identity, parse_first_party_spans,
+        readable_color, rgb_to_hsl, set_active_date_fmt, split_browser_profile, strip_ctcp_action,
+        twitch_username_color, word_match_segments, yt_channel_id,
     };
     use eframe::egui;
     use std::collections::HashMap;
@@ -10542,6 +11112,22 @@ mod tests {
     fn twitch_default_color_is_deterministic_per_name() {
         // Same name → same colour every time (Twitch's stable default assignment).
         assert_eq!(twitch_username_color("Kappa"), twitch_username_color("Kappa"));
+    }
+
+    #[test]
+    fn import_identity_matches_candidate_identity() {
+        // Dedup keys must equal what the importer produces (lowercased login / UC id).
+        assert_eq!(monitor_import_identity("https://twitch.tv/CoolStreamer"), "coolstreamer");
+        assert_eq!(
+            monitor_import_identity("https://www.youtube.com/channel/UCabcDEF"),
+            "ucabcdef"
+        );
+        assert_eq!(
+            yt_channel_id("https://youtube.com/channel/UCxyz/live"),
+            Some("ucxyz".to_string())
+        );
+        // A handle URL has no /channel/UC… id → None (won't false-match a sub).
+        assert_eq!(yt_channel_id("https://youtube.com/@handle"), None);
     }
 
     #[test]
