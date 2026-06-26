@@ -63,7 +63,7 @@ fn ext_from_url(url: &str) -> Option<&str> {
 }
 
 /// Download a URL to a file path; creates parent directories as needed.
-async fn download_image(client: &Client, url: &str, dest: &Path) -> Result<()> {
+pub(crate) async fn download_image(client: &Client, url: &str, dest: &Path) -> Result<()> {
     let url = if url.starts_with("//") {
         format!("https:{url}")
     } else {

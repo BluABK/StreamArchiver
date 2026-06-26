@@ -9,6 +9,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::sync::mpsc::Receiver;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
@@ -70,6 +71,9 @@ const K_SHOW_ACTIONS: &str = "show_actions";
 /// Whether chat-replay emote codes render as inline images (off ⇒ show the code
 /// text). Default on; only an explicit `"0"` disables. Needs "Fetch chat assets".
 const K_RENDER_EMOTES: &str = "render_emotes_in_chat";
+/// Whether animated emotes play (off ⇒ a static first frame). Default on; only an
+/// explicit `"0"` disables. Off is the perf/RAM escape hatch for heavy channels.
+const K_ANIMATE_EMOTES: &str = "animate_emotes_in_chat";
 
 /// Browsers yt-dlp can read cookies from (for the Settings dropdown).
 const COOKIE_BROWSERS: [&str; 8] = [
@@ -576,6 +580,9 @@ pub struct StreamArchiverApp {
     /// Render chat emotes as inline images in the chat replay (off ⇒ show the
     /// emote code as text). Default on. Persisted under [`K_RENDER_EMOTES`].
     render_emotes: bool,
+    /// Play animated emotes (off ⇒ static first frame). Default on. Persisted under
+    /// [`K_ANIMATE_EMOTES`].
+    animate_emotes: bool,
     /// Currently running background tasks (asset fetches, thumbnail downloads).
     background_tasks: Vec<crate::events::BackgroundTask>,
     /// Completed/failed background tasks (task, outcome, finished-at unix), newest
@@ -745,6 +752,14 @@ impl StreamArchiverApp {
             .flatten()
             .map(|v| v != "0")
             .unwrap_or(true);
+        // Animated emotes default on; only an explicit "0" disables.
+        let animate_emotes = core
+            .store
+            .get_setting(K_ANIMATE_EMOTES)
+            .ok()
+            .flatten()
+            .map(|v| v != "0")
+            .unwrap_or(true);
 
         let download_defaults = core
             .store
@@ -830,6 +845,7 @@ impl StreamArchiverApp {
             status_bgcolor,
             show_actions,
             render_emotes,
+            animate_emotes,
             background_tasks: Vec::new(),
             finished_tasks: Vec::new(),
             job_toggles,
@@ -981,6 +997,9 @@ impl StreamArchiverApp {
                             self.channel_icons.clear();
                             self.emote_textures.clear();
                             self.channel_twitch_colors.clear();
+                            // Drop egui's image-loader cache too so refreshed emote
+                            // images reload from disk at their stable paths.
+                            ctx.forget_all_images();
                         }
                         self.finished_tasks.insert(0, (task, outcome, now_unix()));
                         self.finished_tasks.truncate(100);
@@ -2308,14 +2327,18 @@ enum ChatPlatform {
 
 /// One renderable piece of a chat message body. Built once at parse time;
 /// [`render_chat_message`] just walks it. `file: None` means "no local image"
-/// (offline / not downloaded / undecodable / unknown id) → the renderer falls
-/// back to drawing `name` as text. A `Text` segment may contain spaces.
+/// (offline / not downloaded / undecodable / unknown id) → the renderer falls back
+/// to drawing `fallback_text` (the emoji glyph) if set, else `name` (the emote
+/// code). A `Text` segment may contain spaces.
 #[derive(Clone)]
 enum ChatSegment {
     Text(String),
     Emote {
         name: String,
         file: Option<std::path::PathBuf>,
+        /// For emoji: the Unicode glyph to show when there's no image, so it
+        /// degrades to a (mono) glyph rather than a code. `None` for code emotes.
+        fallback_text: Option<String>,
     },
 }
 
@@ -2370,6 +2393,9 @@ struct ChatPopup {
     /// `…/{channel}/twitch/emotes/twitch/` — Twitch first-party emotes are
     /// id-keyed (resolved as `{id}.png` at parse time). `None` for YouTube.
     twitch_emote_dir: Option<std::path::PathBuf>,
+    /// True while a background emoji-download pass is running, so the 3s tail-reload
+    /// doesn't pile up overlapping download passes for the same chat.
+    loading: Arc<AtomicBool>,
 }
 
 /// Merge a stream's takes into one chronological change list. Each take's offsets
@@ -7148,7 +7174,7 @@ impl StreamArchiverApp {
             self.status = "Stopping chat download…".into();
         }
         if let Some(mid) = acts.view_chat {
-            self.open_chat_popup(mid);
+            self.open_chat_popup(mid, ui.ctx());
         }
         if let Some(p) = open_path {
             crate::platform::open_path(&p);
@@ -8162,10 +8188,10 @@ impl StreamArchiverApp {
             if ui
                 .checkbox(&mut self.render_emotes, "Render emotes in chat")
                 .on_hover_text(
-                    "Show Twitch / BTTV / FFZ / 7TV emotes as inline images in the chat \
-                     replay. Off shows the emote code as plain text. Requires \"Fetch chat \
-                     assets\" so the images are on disk; animated emotes show a static \
-                     frame (or the code, for formats without a decoder). Applies immediately.",
+                    "Show Twitch / BTTV / FFZ / 7TV emotes (and color emoji) as inline \
+                     images in the chat replay. Off shows the emote code as plain text. \
+                     Requires \"Fetch chat assets\" so the images are on disk. Applies \
+                     immediately.",
                 )
                 .changed()
             {
@@ -8174,6 +8200,31 @@ impl StreamArchiverApp {
                     if self.render_emotes { "1" } else { "0" },
                 );
             }
+            if ui
+                .add_enabled(
+                    self.render_emotes,
+                    egui::Checkbox::new(&mut self.animate_emotes, "Animate emotes"),
+                )
+                .on_hover_text(
+                    "Play animated GIF / WebP emotes (Twitch, BTTV/FFZ, 7TV) and animated \
+                     emoji. Off shows a static first frame — turn it off if a busy channel's \
+                     animations use too much memory or CPU. Applies immediately.",
+                )
+                .changed()
+            {
+                let _ = self.core.store.set_setting(
+                    K_ANIMATE_EMOTES,
+                    if self.animate_emotes { "1" } else { "0" },
+                );
+            }
+            ui.label(
+                egui::RichText::new(
+                    "Color emoji use Twemoji (© Twitter/jdecked, CC-BY 4.0), downloaded on \
+                     demand and cached for offline replay.",
+                )
+                .small()
+                .weak(),
+            );
 
             ui.add_space(12.0);
             ui.heading("Download authentication");
@@ -9324,7 +9375,7 @@ impl StreamArchiverApp {
 
     // ── Chat log viewer ──────────────────────────────────────────────────────
 
-    fn open_chat_popup(&mut self, monitor_id: i64) {
+    fn open_chat_popup(&mut self, monitor_id: i64, ctx: &egui::Context) {
         let row = self.rows.iter().find(|r| r.monitor.id == monitor_id);
         let monitor_name = row.map(|r| r.channel.name.clone()).unwrap_or_default();
         let platform = row.map(|r| r.monitor.platform());
@@ -9353,24 +9404,18 @@ impl StreamArchiverApp {
             .cloned();
 
         let state = Arc::new(Mutex::new(ChatLoadState::Loading));
+        let loading = Arc::new(AtomicBool::new(false));
         if let Some(r) = &rec {
-            let state2 = state.clone();
-            let path_opt = chat_file_for_recording(r);
-            let start_ts = r.went_live_at.unwrap_or(r.started_at);
-            let emap = emote_map.clone();
-            let tdir = twitch_emote_dir.clone();
-            self.core.rt.spawn(async move {
-                let result = tokio::task::spawn_blocking(move || match path_opt {
-                    None => ChatLoadState::NoFile,
-                    Some(p) => match parse_chat_file(&p, start_ts, &emap, tdir.as_deref()) {
-                        Ok(msgs) => ChatLoadState::Loaded(msgs),
-                        Err(e) => ChatLoadState::Error(e.to_string()),
-                    },
-                })
-                .await
-                .unwrap_or_else(|e| ChatLoadState::Error(e.to_string()));
-                *state2.lock().unwrap() = result;
-            });
+            self.core.rt.spawn(load_chat(
+                state.clone(),
+                loading.clone(),
+                chat_file_for_recording(r),
+                r.went_live_at.unwrap_or(r.started_at),
+                emote_map.clone(),
+                twitch_emote_dir.clone(),
+                self.render_emotes,
+                ctx.clone(),
+            ));
         } else {
             *state.lock().unwrap() = ChatLoadState::NoFile;
         }
@@ -9384,6 +9429,7 @@ impl StreamArchiverApp {
             last_reload: std::time::Instant::now(),
             emote_map,
             twitch_emote_dir,
+            loading,
         });
     }
 
@@ -9406,6 +9452,7 @@ impl StreamArchiverApp {
             Arc<Mutex<ChatLoadState>>,
             Arc<HashMap<String, std::path::PathBuf>>,
             Option<std::path::PathBuf>,
+            Arc<AtomicBool>,
         );
         let reload_info: Option<ReloadInfo> =
             if rec_active
@@ -9420,6 +9467,7 @@ impl StreamArchiverApp {
                             popup.load_state.clone(),
                             popup.emote_map.clone(),
                             popup.twitch_emote_dir.clone(),
+                            popup.loading.clone(),
                         )
                     })
                 })
@@ -9432,6 +9480,7 @@ impl StreamArchiverApp {
         // don't double-borrow `self`. Restored right after the closure returns.
         let mut emote_cache = std::mem::take(&mut self.emote_textures);
         let render_emotes = self.render_emotes;
+        let animate_emotes = self.animate_emotes;
 
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("chat_popup_vp"),
@@ -9470,35 +9519,24 @@ impl StreamArchiverApp {
                                         if ui.selectable_label(selected, &label).clicked() {
                                             let new_rec = (*rec).clone();
                                             let state = Arc::new(Mutex::new(ChatLoadState::Loading));
-                                            let state2 = state.clone();
-                                            let path_opt = chat_file_for_recording(&new_rec);
+                                            let path = chat_file_for_recording(&new_rec);
                                             let start_ts =
                                                 new_rec.went_live_at.unwrap_or(new_rec.started_at);
                                             let emap = popup.emote_map.clone();
                                             let tdir = popup.twitch_emote_dir.clone();
-                                            popup.load_state = state;
+                                            popup.load_state = state.clone();
                                             popup.recording = Some(new_rec);
                                             popup.last_reload = std::time::Instant::now();
-                                            self.core.rt.spawn(async move {
-                                                let r = tokio::task::spawn_blocking(move || {
-                                                    match path_opt {
-                                                        None => ChatLoadState::NoFile,
-                                                        Some(p) => {
-                                                            match parse_chat_file(&p, start_ts, &emap, tdir.as_deref()) {
-                                                                Ok(m) => ChatLoadState::Loaded(m),
-                                                                Err(e) => {
-                                                                    ChatLoadState::Error(e.to_string())
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                })
-                                                .await
-                                                .unwrap_or_else(|e| {
-                                                    ChatLoadState::Error(e.to_string())
-                                                });
-                                                *state2.lock().unwrap() = r;
-                                            });
+                                            self.core.rt.spawn(load_chat(
+                                                state,
+                                                popup.loading.clone(),
+                                                path,
+                                                start_ts,
+                                                emap,
+                                                tdir,
+                                                render_emotes,
+                                                ctx.clone(),
+                                            ));
                                         }
                                     }
                                 });
@@ -9585,6 +9623,7 @@ impl StreamArchiverApp {
                                             msg,
                                             &mut emote_cache,
                                             render_emotes,
+                                            animate_emotes,
                                             ctx,
                                         );
                                     }
@@ -9599,21 +9638,20 @@ impl StreamArchiverApp {
 
         // Tail-reload: re-parse the chat file in the background while the
         // recording is still live so new messages appear without re-opening.
-        if let Some((path, start_ts, state, emap, tdir)) = reload_info {
+        if let Some((path, start_ts, state, emap, tdir, loading)) = reload_info {
             if let Some(p) = &mut self.chat_popup {
                 p.last_reload = std::time::Instant::now();
             }
-            self.core.rt.spawn(async move {
-                let result = tokio::task::spawn_blocking(move || {
-                    match parse_chat_file(&path, start_ts, &emap, tdir.as_deref()) {
-                        Ok(msgs) => ChatLoadState::Loaded(msgs),
-                        Err(e) => ChatLoadState::Error(e.to_string()),
-                    }
-                })
-                .await
-                .unwrap_or_else(|e| ChatLoadState::Error(e.to_string()));
-                *state.lock().unwrap() = result;
-            });
+            self.core.rt.spawn(load_chat(
+                state,
+                loading,
+                Some(path),
+                start_ts,
+                emap,
+                tdir,
+                render_emotes,
+                ctx.clone(),
+            ));
         }
         // Keep the UI alive while a live recording is open so the next
         // interval check fires automatically.
@@ -9623,6 +9661,9 @@ impl StreamArchiverApp {
 
         if !open {
             self.chat_popup = None;
+            // Release the egui image-loader cache (all decoded emote/emoji frames)
+            // now the popup is closed, since the loaders never auto-evict.
+            ctx.forget_all_images();
         }
     }
 
@@ -10111,7 +10152,7 @@ fn build_twitch_segments(
         // First-party files are `{id}.png` (static) or `{id}.gif` (animated — we
         // render its first frame). Probe both so animated channel emotes show too.
         let file = twitch_dir.and_then(|d| find_emote_file(d, &id));
-        out.push(ChatSegment::Emote { name, file });
+        out.push(ChatSegment::Emote { name, file, fallback_text: None });
         cursor = b1;
     }
     if cursor < text.len() {
@@ -10235,6 +10276,7 @@ fn word_match_segments(
             out.push(ChatSegment::Emote {
                 name: token.to_string(),
                 file: Some(path.clone()),
+                fallback_text: None,
             });
         } else {
             pending.push_str(token);
@@ -10479,6 +10521,7 @@ fn render_chat_message(
     msg: &ChatMessage,
     emote_cache: &mut HashMap<std::path::PathBuf, Option<egui::TextureHandle>>,
     render_emotes: bool,
+    animate: bool,
     ctx: &egui::Context,
 ) {
     ui.horizontal_wrapped(|ui| {
@@ -10513,29 +10556,49 @@ fn render_chat_message(
                     // internal/leading/trailing whitespace verbatim.
                     ui.label(t);
                 }
-                ChatSegment::Emote { name, file } => {
+                ChatSegment::Emote { name, file, fallback_text } => {
                     let drawn = render_emotes
                         && file.as_ref().is_some_and(|f| {
-                            let tex = emote_cache
-                                .entry(f.clone())
-                                .or_insert_with(|| load_emote_texture(f, ctx))
-                                .clone();
-                            match tex {
-                                Some(tex) => {
-                                    let s = tex.size_vec2();
-                                    let w = (emote_h * (s.x / s.y).max(0.1)).min(112.0);
-                                    ui.add(
-                                        egui::Image::from_texture(&tex)
-                                            .fit_to_exact_size(egui::vec2(w, emote_h)),
-                                    )
-                                    .on_hover_text(name);
-                                    true
+                            if animate {
+                                // egui's image loaders: animate GIF/WebP (Twitch,
+                                // BTTV/FFZ, 7TV) and draw static PNG/emoji; sizing is
+                                // bounded (≤112×emote_h) and aspect-preserving. On a
+                                // decode failure egui paints "⚠"; alt_text appends the
+                                // glyph/code so it stays readable.
+                                ui.add(
+                                    egui::Image::from_uri(file_uri(f))
+                                        .fit_to_original_size(1.0)
+                                        .max_size(egui::vec2(112.0, emote_h))
+                                        .alt_text(fallback_text.as_deref().unwrap_or(name))
+                                        .show_loading_spinner(false),
+                                )
+                                .on_hover_text(name);
+                                true
+                            } else {
+                                // Static first frame via the manual texture cache.
+                                let tex = emote_cache
+                                    .entry(f.clone())
+                                    .or_insert_with(|| load_emote_texture(f, ctx))
+                                    .clone();
+                                match tex {
+                                    Some(tex) => {
+                                        let s = tex.size_vec2();
+                                        let w = (emote_h * (s.x / s.y).max(0.1)).min(112.0);
+                                        ui.add(
+                                            egui::Image::from_texture(&tex)
+                                                .fit_to_exact_size(egui::vec2(w, emote_h)),
+                                        )
+                                        .on_hover_text(name);
+                                        true
+                                    }
+                                    None => false, // missing / undecodable → text fallback
                                 }
-                                None => false, // missing / undecodable → text fallback
                             }
                         });
                     if !drawn {
-                        ui.label(name);
+                        // No image (off / not on disk / undecodable): show the emoji
+                        // glyph if we have one, else the emote code.
+                        ui.label(fallback_text.as_deref().unwrap_or(name));
                     }
                 }
             }
@@ -10744,21 +10807,238 @@ fn find_emote_file(dir: &Path, stem: &str) -> Option<std::path::PathBuf> {
         .find(|p| p.exists())
 }
 
+/// Build a `file://` URI for egui's image loader. egui_extras' `FileLoader` does
+/// NOT percent-decode — it strips `file://`, trims the leading slash, and hands the
+/// raw remainder to `std::fs::read` — so we must pass the path UNENCODED (spaces,
+/// non-ASCII, etc. all work as-is via `fs::read`). Backslashes become forward
+/// slashes and the leading slash is trimmed so `file:///C:/…` resolves on Windows.
+/// Caveat: a `#` in the path can't be represented (egui parses `uri#N` as a frame
+/// index); our sanitized id/codepoint asset filenames never contain one.
+fn file_uri(path: &Path) -> String {
+    let s = path.to_string_lossy().replace('\\', "/");
+    format!("file:///{}", s.trim_start_matches('/'))
+}
+
+/// An emoji image not yet on disk that the renderer would otherwise show as a
+/// glyph. Collected during parse; the popup tries each `url` in order (Twemoji's
+/// FE0F naming is irregular) and writes the first that succeeds to `dest`.
+#[derive(Clone, PartialEq, Eq)]
+struct EmojiFetch {
+    dest: std::path::PathBuf,
+    urls: Vec<String>,
+}
+
+/// Result of parsing a chat file: the messages plus the emoji images to fetch.
+struct ParsedChat {
+    messages: Vec<ChatMessage>,
+    fetches: Vec<EmojiFetch>,
+}
+
+/// Split a text run into [`ChatSegment`]s, turning each Unicode-emoji cluster into
+/// an `Emote` that resolves to a cached Twemoji image (with the glyph as fallback),
+/// and recording any not-yet-downloaded image in `fetches`. Plain text passes
+/// through unchanged (fast path).
+fn emoji_split(text: &str, fetches: &mut Vec<EmojiFetch>) -> Vec<ChatSegment> {
+    let runs = crate::emoji::segment(text);
+    if runs.iter().all(|(_, is_emoji)| !is_emoji) {
+        return vec![ChatSegment::Text(text.to_string())];
+    }
+    let emoji_dir = emoji_cache_dir();
+    let mut out = Vec::with_capacity(runs.len());
+    for (slice, is_emoji) in runs {
+        if is_emoji {
+            let key = crate::emoji::cache_key(slice);
+            let dest = emoji_dir.join(format!("{key}.png"));
+            let file = dest.exists().then(|| dest.clone());
+            // Skip re-fetching emoji we've already failed to download (a `.404`
+            // marker), so a liberal false-positive / missing asset isn't re-requested
+            // on every live tail-reload.
+            if file.is_none() && !emoji_dir.join(format!("{key}.404")).exists() {
+                fetches.push(EmojiFetch {
+                    dest,
+                    urls: crate::emoji::twemoji_url_candidates(slice),
+                });
+            }
+            out.push(ChatSegment::Emote {
+                name: slice.to_string(),
+                file,
+                fallback_text: Some(slice.to_string()),
+            });
+        } else if !slice.is_empty() {
+            out.push(ChatSegment::Text(slice.to_string()));
+        }
+    }
+    out
+}
+
+/// The shared emoji image cache directory (`asset-cache/emotes/emoji/`).
+fn emoji_cache_dir() -> std::path::PathBuf {
+    crate::app_paths::asset_cache_dir()
+        .join("emotes")
+        .join("emoji")
+}
+
+/// Expand the `Text` segments of an already-built segment list, splitting out any
+/// Unicode emoji into image segments. Emote segments are left untouched.
+fn expand_emoji(segments: Vec<ChatSegment>, fetches: &mut Vec<EmojiFetch>) -> Vec<ChatSegment> {
+    let mut out = Vec::with_capacity(segments.len());
+    for seg in segments {
+        match seg {
+            ChatSegment::Text(t) => out.extend(emoji_split(&t, fetches)),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// File extension to use for a downloaded image, from the URL path (png/gif/webp),
+/// defaulting to `png`.
+fn url_ext(url: &str) -> &str {
+    url.split(['?', '#'])
+        .next()
+        .and_then(|p| p.rsplit('.').next())
+        .filter(|e| matches!(*e, "png" | "gif" | "webp" | "jpg" | "jpeg"))
+        .unwrap_or("png")
+}
+
 fn parse_chat_file(
     path: &Path,
     start_unix_secs: i64,
     emote_map: &HashMap<String, std::path::PathBuf>,
     twitch_dir: Option<&Path>,
-) -> anyhow::Result<Vec<ChatMessage>> {
+) -> anyhow::Result<ParsedChat> {
     let s = path.to_string_lossy();
-    if s.ends_with("live_chat.json") {
-        parse_yt_live_chat(path)
+    let mut fetches: Vec<EmojiFetch> = Vec::new();
+    let messages = if s.ends_with("live_chat.json") {
+        parse_yt_live_chat(path, &mut fetches)?
     } else {
-        parse_twitch_chat(path, start_unix_secs, emote_map, twitch_dir)
+        parse_twitch_chat(path, start_unix_secs, emote_map, twitch_dir, &mut fetches)?
+    };
+    // De-duplicate so the same emoji isn't downloaded once per occurrence.
+    fetches.sort_by(|a, b| a.dest.cmp(&b.dest));
+    fetches.dedup();
+    Ok(ParsedChat { messages, fetches })
+}
+
+/// Parse a chat file off the UI thread, mapping both join and parse errors to a
+/// string for [`ChatLoadState::Error`].
+async fn parse_chat_blocking(
+    path: std::path::PathBuf,
+    start_ts: i64,
+    emote_map: Arc<HashMap<String, std::path::PathBuf>>,
+    twitch_dir: Option<std::path::PathBuf>,
+) -> Result<ParsedChat, String> {
+    tokio::task::spawn_blocking(move || {
+        parse_chat_file(&path, start_ts, &emote_map, twitch_dir.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
+}
+
+/// Download missing emoji/emoji-emote images (sequential, best-effort; 404s for a
+/// liberally-detected non-emoji just leave the glyph). Capped so a pathological
+/// message can't trigger thousands of requests.
+async fn download_emoji_images(fetches: &[EmojiFetch]) {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    else {
+        return;
+    };
+    for f in fetches.iter().take(300) {
+        if f.dest.exists() {
+            continue;
+        }
+        let mut got = false;
+        let mut network_error = false; // a transient failure → don't negative-cache
+        for url in &f.urls {
+            match client.get(url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(bytes) = resp.bytes().await {
+                        if let Some(parent) = f.dest.parent() {
+                            let _ = tokio::fs::create_dir_all(parent).await;
+                        }
+                        if tokio::fs::write(&f.dest, &bytes).await.is_ok() {
+                            got = true;
+                            break;
+                        }
+                    }
+                }
+                // 404 = this candidate name doesn't exist → try the next candidate.
+                Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {}
+                // Any other HTTP status or a transport error is transient-ish.
+                Ok(_) | Err(_) => network_error = true,
+            }
+        }
+        // Negative-cache ONLY a definitive miss (every candidate 404'd, no network
+        // error), so a transient offline failure can't permanently block a real
+        // emoji. `dest` is `{key}.png` → marker `{key}.404`.
+        if !got && !network_error {
+            let marker = f.dest.with_extension("404");
+            if let Some(parent) = marker.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            let _ = tokio::fs::write(&marker, b"").await;
+        }
     }
 }
 
-fn parse_yt_live_chat(path: &Path) -> anyhow::Result<Vec<ChatMessage>> {
+/// Load a chat file into `state`: parse + show immediately (emoji may still be
+/// glyphs), then — when `fetch_emoji` — download any missing emoji images and
+/// re-parse once so they upgrade to colour images. Runs entirely off the UI thread.
+async fn load_chat(
+    state: Arc<Mutex<ChatLoadState>>,
+    loading: Arc<AtomicBool>,
+    path: Option<std::path::PathBuf>,
+    start_ts: i64,
+    emote_map: Arc<HashMap<String, std::path::PathBuf>>,
+    twitch_dir: Option<std::path::PathBuf>,
+    fetch_emoji: bool,
+    ctx: egui::Context,
+) {
+    let Some(path) = path else {
+        *state.lock().unwrap() = ChatLoadState::NoFile;
+        ctx.request_repaint();
+        return;
+    };
+    let fetches = match parse_chat_blocking(
+        path.clone(),
+        start_ts,
+        emote_map.clone(),
+        twitch_dir.clone(),
+    )
+    .await
+    {
+        Ok(parsed) => {
+            let fetches = parsed.fetches;
+            *state.lock().unwrap() = ChatLoadState::Loaded(parsed.messages);
+            ctx.request_repaint();
+            fetches
+        }
+        Err(e) => {
+            *state.lock().unwrap() = ChatLoadState::Error(e);
+            ctx.request_repaint();
+            return;
+        }
+    };
+    // Messages are already shown; only one download+upgrade pass runs at a time
+    // (a concurrent tail-reload still shows new messages via the parse above, it
+    // just skips kicking off a second overlapping download).
+    if fetch_emoji && !fetches.is_empty() && !loading.swap(true, Ordering::SeqCst) {
+        download_emoji_images(&fetches).await;
+        loading.store(false, Ordering::SeqCst);
+        if let Ok(parsed) = parse_chat_blocking(path, start_ts, emote_map, twitch_dir).await {
+            *state.lock().unwrap() = ChatLoadState::Loaded(parsed.messages);
+            ctx.request_repaint();
+        }
+    }
+}
+
+fn parse_yt_live_chat(
+    path: &Path,
+    fetches: &mut Vec<EmojiFetch>,
+) -> anyhow::Result<Vec<ChatMessage>> {
     let mut out = Vec::new();
     let reader = BufReader::new(File::open(path)?);
     for line in reader.lines() {
@@ -10777,12 +11057,12 @@ fn parse_yt_live_chat(path: &Path) -> anyhow::Result<Vec<ChatMessage>> {
                 .and_then(|x| x.as_str().and_then(|s| s.parse::<i64>().ok()).or_else(|| x.as_i64()));
             if let Some(actions) = replay.get("actions").and_then(|a| a.as_array()) {
                 for action in actions {
-                    if let Some(msg) = yt_action_to_msg(action, offset_ms) {
+                    if let Some(msg) = yt_action_to_msg(action, offset_ms, fetches) {
                         out.push(msg);
                     }
                 }
             }
-        } else if let Some(msg) = yt_action_to_msg(&v, None) {
+        } else if let Some(msg) = yt_action_to_msg(&v, None, fetches) {
             // Live format: addChatItemAction directly at the top level of each line.
             out.push(msg);
         }
@@ -10790,7 +11070,11 @@ fn parse_yt_live_chat(path: &Path) -> anyhow::Result<Vec<ChatMessage>> {
     Ok(out)
 }
 
-fn yt_action_to_msg(action: &serde_json::Value, offset_ms: Option<i64>) -> Option<ChatMessage> {
+fn yt_action_to_msg(
+    action: &serde_json::Value,
+    offset_ms: Option<i64>,
+    fetches: &mut Vec<EmojiFetch>,
+) -> Option<ChatMessage> {
     let r = action.pointer("/addChatItemAction/item/liveChatTextMessageRenderer")?;
     let ts_secs = if let Some(ms) = offset_ms {
         ms as f64 / 1000.0
@@ -10816,7 +11100,8 @@ fn yt_action_to_msg(action: &serde_json::Value, offset_ms: Option<i64>) -> Optio
         for run in runs {
             if let Some(t) = run["text"].as_str() {
                 text.push_str(t);
-                segments.push(ChatSegment::Text(t.to_string()));
+                // Text runs can themselves contain literal unicode emoji.
+                segments.extend(emoji_split(t, fetches));
             } else if let Some(emoji) = run.get("emoji") {
                 let shortcut = emoji["shortcuts"]
                     .as_array()
@@ -10826,25 +11111,40 @@ fn yt_action_to_msg(action: &serde_json::Value, offset_ms: Option<i64>) -> Optio
                 let label = shortcut.or(emoji_id).unwrap_or("[emoji]");
                 text.push_str(label);
                 if emoji["isCustomEmoji"].as_bool() == Some(true) {
-                    // Custom emoji: image-only. yt-dlp doesn't download these, so a
-                    // future assets pass would cache them under emotes/youtube/ keyed
-                    // by emojiId; until then `file` is None → renders as `label`.
-                    let file = emoji_id.and_then(|id| {
+                    // Custom channel emoji: image-only. Download YouTube's own PNG
+                    // (largest thumbnail) into the cache; until present, fall back to
+                    // the shortcut text.
+                    let url = emoji
+                        .pointer("/image/thumbnails")
+                        .and_then(|t| t.as_array())
+                        .and_then(|a| a.last())
+                        .and_then(|t| t["url"].as_str());
+                    let file = emoji_id.zip(url).and_then(|(id, url)| {
                         let dest = crate::app_paths::asset_cache_dir()
                             .join("emotes")
                             .join("youtube")
-                            .join(format!("{}.png", crate::downloader::sanitize_filename(id)));
-                        dest.exists().then_some(dest)
+                            .join(format!(
+                                "{}.{}",
+                                crate::downloader::sanitize_filename(id),
+                                url_ext(url)
+                            ));
+                        if dest.exists() {
+                            Some(dest)
+                        } else {
+                            fetches.push(EmojiFetch { dest, urls: vec![url.to_string()] });
+                            None
+                        }
                     });
                     segments.push(ChatSegment::Emote {
                         name: label.to_string(),
                         file,
+                        fallback_text: None,
                     });
                 } else {
-                    // Standard unicode emoji: the `emojiId` is the actual char(s);
-                    // render via the font (no image needed).
+                    // Standard unicode emoji: `emojiId` is the actual char(s) → route
+                    // through the shared Twemoji emoji pipeline for colour.
                     let glyph = emoji_id.or(shortcut).unwrap_or("[emoji]");
-                    segments.push(ChatSegment::Text(glyph.to_string()));
+                    segments.extend(emoji_split(glyph, fetches));
                 }
             }
         }
@@ -10877,6 +11177,7 @@ fn parse_twitch_chat(
     start_unix_secs: i64,
     emote_map: &HashMap<String, std::path::PathBuf>,
     twitch_dir: Option<&Path>,
+    fetches: &mut Vec<EmojiFetch>,
 ) -> anyhow::Result<Vec<ChatMessage>> {
     let start_ms = start_unix_secs as f64 * 1000.0;
     let mut out = Vec::new();
@@ -10910,6 +11211,8 @@ fn parse_twitch_chat(
         // simply don't render (third-party word-matching still applies).
         let emotes_tag = v["emotes"].as_str().unwrap_or("");
         let segments = build_twitch_segments(&text, emotes_tag, emote_map, twitch_dir);
+        // Split literal unicode emoji out of the text segments into colour images.
+        let segments = expand_emoji(segments, fetches);
         out.push(ChatMessage {
             timestamp_secs: (ts_ms - start_ms) / 1000.0,
             author,
@@ -10994,7 +11297,7 @@ mod tests {
     // ----- third-party word matching -----
 
     fn emote(name: &str, file: &Option<PathBuf>) -> ChatSegment {
-        ChatSegment::Emote { name: name.into(), file: file.clone() }
+        ChatSegment::Emote { name: name.into(), file: file.clone(), fallback_text: None }
     }
 
     #[test]
@@ -11147,8 +11450,8 @@ mod tests {
         // "Kappa POGGERS": Kappa at cp 0-4; POGGERS is the gap word.
         let segs = build_twitch_segments("Kappa POGGERS", "25:0-4", &map, None);
         // Expect: Emote(Kappa, None) then Text(" ") then Emote(POGGERS, Some).
-        assert!(matches!(&segs[0], ChatSegment::Emote { name, file } if name == "Kappa" && file.is_none()));
-        assert!(segs.iter().any(|s| matches!(s, ChatSegment::Emote { name, file } if name == "POGGERS" && file.as_ref() == Some(&pog))));
+        assert!(matches!(&segs[0], ChatSegment::Emote { name, file, .. } if name == "Kappa" && file.is_none()));
+        assert!(segs.iter().any(|s| matches!(s, ChatSegment::Emote { name, file, .. } if name == "POGGERS" && file.as_ref() == Some(&pog))));
     }
 
     fn rec_with_output(path: &str) -> crate::models::Recording {
