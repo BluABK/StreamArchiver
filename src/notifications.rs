@@ -106,8 +106,8 @@ pub fn send_test_toast(
     show_toast(ToastContent {
         heading: format!("{channel_name} is live"),
         lines,
-        logo: find_asset(&dir, "icon."),
-        hero: find_asset(&dir, "banner."),
+        logo: crate::assets::find_asset(&dir, "icon."),
+        hero: crate::assets::find_asset(&dir, "banner."),
         action,
     });
 }
@@ -203,23 +203,10 @@ fn content_for(row: &MonitorWithChannel, heading: String, action_label: &str) ->
     ToastContent {
         heading,
         lines,
-        logo: find_asset(&dir, "icon."),
-        hero: find_asset(&dir, "banner."),
+        logo: crate::assets::find_asset(&dir, "icon."),
+        hero: crate::assets::find_asset(&dir, "banner."),
         action,
     }
-}
-
-/// First file in `dir` whose name starts with `prefix` (e.g. `"icon."`).
-fn find_asset(dir: &Path, prefix: &str) -> Option<PathBuf> {
-    std::fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .find(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(prefix))
-        })
 }
 
 // ---------- Windows: rich WinRT toast ----------

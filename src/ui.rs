@@ -21,7 +21,8 @@ use crate::app_core::AppCore;
 use crate::events::{ManualCommand, UiCommand};
 use crate::models::{
     AdBreak, AuthKind, Channel, Container, DetectionMethod, DownloadDefaults, K_DISCORD_SCHEDULE,
-    K_DISCORD_TOKEN, K_FILENAME_MEDIA, K_MONITOR_DEFAULTS, K_YT_API_DETECT, K_YT_API_SCHEDULE,
+    K_DISCORD_TOKEN, K_FILENAME_MEDIA, K_MONITOR_DEFAULTS, K_OCR_COMMAND, K_OCR_FALLBACK_MODEL,
+    K_OCR_MODEL, K_OCR_OFFSET, K_OCR_TIMEZONE, K_YT_API_DETECT, K_YT_API_SCHEDULE,
     MediaInfoMode, Monitor, MonitorDefaults, MonitorWithChannel, Platform,
     Recording, ScheduleSegment, StreamGroup, StreamMetaChange, Tool, UpcomingStream, Video,
     group_recordings, now_unix,
@@ -30,6 +31,10 @@ use crate::google_oauth;
 use crate::imports::{self, ImportCandidate};
 use crate::oauth::{self, AuthFlow};
 use crate::platform::AutoStart;
+use crate::schedule_source::{
+    ScheduleSourceKind, SourceEntry, load_channel_cfg, load_source_order, save_channel_cfg,
+    save_source_order,
+};
 
 const K_TWITCH_ID: &str = "twitch_client_id";
 const K_TWITCH_SECRET: &str = "twitch_client_secret";
@@ -391,6 +396,15 @@ struct SettingsForm {
     /// (opt-in; automating a user token is against Discord's ToS).
     discord_token: String,
     discord_schedule: bool,
+    /// Image→schedule OCR pipeline (shells out to an LLM CLI). `ocr_command` is the
+    /// executable; `ocr_model`/`ocr_fallback_model` the primary + retry models;
+    /// `ocr_timezone`/`ocr_offset` the timezone/UTC offset to assume for banner
+    /// times. Empty fields fall back to the built-in defaults.
+    ocr_command: String,
+    ocr_model: String,
+    ocr_fallback_model: String,
+    ocr_timezone: String,
+    ocr_offset: String,
 }
 
 /// Background load state of an import fetch (followed/subscriptions).
@@ -547,6 +561,16 @@ pub struct StreamArchiverApp {
     schedule_collisions: bool,
     /// The day whose full stream list is shown in a popup (local date; None = closed).
     schedule_day_popup: Option<chrono::NaiveDate>,
+    /// Whether the "Schedule sources" dialog is open.
+    show_schedule_sources: bool,
+    /// Editable draft of the ordered source list, shown in the dialog. Loaded from
+    /// settings when the dialog opens; saved (+ refresh requested) on every change.
+    schedule_sources_draft: Vec<SourceEntry>,
+    /// The source id selected in the dialog (drives the →/← / ▲/▼ buttons).
+    schedule_sources_selected: Option<String>,
+    /// Editable per-channel schedule-source config shown in the Properties window,
+    /// tagged with its channel id. Loaded when Properties opens; saved on edit.
+    channel_cfg_draft: Option<(i64, crate::schedule_source::ChannelSourceConfig)>,
     /// Chat log viewer popup (None = closed).
     chat_popup: Option<ChatPopup>,
     /// Platform favicons, uploaded to the GPU on first use (None until then).
@@ -723,6 +747,11 @@ impl StreamArchiverApp {
             },
             discord_token: setting_or_empty(&core, K_DISCORD_TOKEN),
             discord_schedule: setting_or_empty(&core, K_DISCORD_SCHEDULE) == "1",
+            ocr_command: setting_or_empty(&core, K_OCR_COMMAND),
+            ocr_model: setting_or_empty(&core, K_OCR_MODEL),
+            ocr_fallback_model: setting_or_empty(&core, K_OCR_FALLBACK_MODEL),
+            ocr_timezone: setting_or_empty(&core, K_OCR_TIMEZONE),
+            ocr_offset: setting_or_empty(&core, K_OCR_OFFSET),
         };
         // Apply the loaded date format before the first render.
         set_active_date_fmt(settings.date_fmt);
@@ -842,6 +871,10 @@ impl StreamArchiverApp {
             schedule_hidden: HashSet::new(),
             schedule_collisions: true,
             schedule_day_popup: None,
+            show_schedule_sources: false,
+            schedule_sources_draft: Vec::new(),
+            schedule_sources_selected: None,
+            channel_cfg_draft: None,
             chat_popup: None,
             platform_tex: None,
             properties_popup: None,
@@ -1148,6 +1181,11 @@ impl StreamArchiverApp {
                 K_DISCORD_SCHEDULE,
                 if discord_on { "1" } else { "0" },
             ),
+            (K_OCR_COMMAND, s.ocr_command.trim()),
+            (K_OCR_MODEL, s.ocr_model.trim()),
+            (K_OCR_FALLBACK_MODEL, s.ocr_fallback_model.trim()),
+            (K_OCR_TIMEZONE, s.ocr_timezone.trim()),
+            (K_OCR_OFFSET, s.ocr_offset.trim()),
         ];
         for (k, v) in pairs {
             if let Err(e) = self.core.store.set_setting(k, v) {
@@ -1395,6 +1433,33 @@ fn fmt_date(secs: i64) -> String {
 
 /// Local timestamp in the active [`DateFmt`] (empty if unset). Used for the
 /// Polled / Went Live / Started On columns and the history tree.
+/// A clickable row in the "Schedule sources" dialog's Available column: the
+/// source label plus a `⚠` badge for risky sources. Returns the click response.
+fn source_row(ui: &mut egui::Ui, kind: ScheduleSourceKind, selected: bool) -> egui::Response {
+    let mut text = kind.label().to_string();
+    if kind.risky() {
+        text.push_str("  ⚠");
+    }
+    ui.selectable_label(selected, text)
+        .on_hover_text(kind.description())
+}
+
+/// Like [`source_row`] but prefixed with the 1-based priority rank, for the
+/// Enabled column.
+fn source_row_ranked(
+    ui: &mut egui::Ui,
+    rank: usize,
+    kind: ScheduleSourceKind,
+    selected: bool,
+) -> egui::Response {
+    let mut text = format!("{rank}.  {}", kind.label());
+    if kind.risky() {
+        text.push_str("  ⚠");
+    }
+    ui.selectable_label(selected, text)
+        .on_hover_text(kind.description())
+}
+
 fn fmt_datetime_short(secs: i64) -> String {
     if secs <= 0 {
         return String::new();
@@ -3571,6 +3636,7 @@ impl eframe::App for StreamArchiverApp {
         self.ad_popup_window(ui.ctx());
         self.meta_popup_window(ui.ctx());
         self.schedule_popup_window(ui.ctx());
+        self.schedule_sources_window(ui.ctx());
         self.schedule_day_window(ui.ctx());
         self.chat_popup_window(ui.ctx());
         self.properties_window(ui.ctx());
@@ -5318,6 +5384,234 @@ impl StreamArchiverApp {
         }
     }
 
+    /// Load the persisted source order into the draft and open the dialog.
+    fn open_schedule_sources(&mut self) {
+        self.schedule_sources_draft = load_source_order(&self.core.store);
+        self.schedule_sources_selected = None;
+        self.show_schedule_sources = true;
+    }
+
+    /// The "Schedule sources" dialog: two columns (Available / Enabled) with →/←
+    /// transfer and ▲/▼ priority reordering, mirroring the user's mockup. Every
+    /// change persists the order and asks the refresher to re-walk the sources.
+    fn schedule_sources_window(&mut self, ctx: &egui::Context) {
+        if !self.show_schedule_sources {
+            return;
+        }
+        let mut open = true;
+        // Actions collected during the (borrowing) render, applied afterwards.
+        let mut enable_id: Option<String> = None;
+        let mut disable_id: Option<String> = None;
+        let mut move_up_id: Option<String> = None;
+        let mut move_down_id: Option<String> = None;
+        let mut select_id: Option<String> = None;
+
+        // Filtered, draft-ordered views of the two columns: (draft index, kind).
+        let enabled: Vec<(usize, ScheduleSourceKind)> = self
+            .schedule_sources_draft
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.enabled)
+            .filter_map(|(i, e)| e.kind().map(|k| (i, k)))
+            .collect();
+        let available: Vec<(usize, ScheduleSourceKind)> = self
+            .schedule_sources_draft
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| !e.enabled)
+            .filter_map(|(i, e)| e.kind().map(|k| (i, k)))
+            .collect();
+        let selected = self.schedule_sources_selected.clone();
+        let sel_in_enabled = enabled
+            .iter()
+            .any(|(i, _)| Some(&self.schedule_sources_draft[*i].id) == selected.as_ref());
+        let sel_in_available = available
+            .iter()
+            .any(|(i, _)| Some(&self.schedule_sources_draft[*i].id) == selected.as_ref());
+        let sel_pos = enabled
+            .iter()
+            .position(|(i, _)| Some(&self.schedule_sources_draft[*i].id) == selected.as_ref());
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("schedule_sources_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("Schedule sources")
+                .with_inner_size([600.0, 440.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label(
+                        "Sources are tried top-to-bottom per channel; the first one to resolve \
+                         an actual schedule wins. Move sources between the columns and order the \
+                         enabled ones by priority.",
+                    );
+                    ui.add_space(8.0);
+
+                    ui.horizontal_top(|ui| {
+                        // ── Available column ──
+                        ui.vertical(|ui| {
+                            ui.set_width(240.0);
+                            ui.strong("Available sources");
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                ui.set_width(228.0);
+                                ui.set_min_height(300.0);
+                                if available.is_empty() {
+                                    ui.weak("(all sources enabled)");
+                                }
+                                for (i, kind) in &available {
+                                    let id = &self.schedule_sources_draft[*i].id;
+                                    let resp = source_row(ui, *kind, selected.as_deref() == Some(id));
+                                    if resp.clicked() {
+                                        select_id = Some(id.clone());
+                                    }
+                                    if resp.double_clicked() {
+                                        enable_id = Some(id.clone());
+                                    }
+                                }
+                            });
+                        });
+
+                        // ── Transfer / reorder buttons ──
+                        ui.vertical(|ui| {
+                            ui.add_space(48.0);
+                            if ui
+                                .add_enabled(sel_in_available, egui::Button::new("→"))
+                                .on_hover_text("Enable the selected source")
+                                .clicked()
+                            {
+                                enable_id = selected.clone();
+                            }
+                            if ui
+                                .add_enabled(sel_in_enabled, egui::Button::new("←"))
+                                .on_hover_text("Disable the selected source")
+                                .clicked()
+                            {
+                                disable_id = selected.clone();
+                            }
+                            ui.add_space(16.0);
+                            if ui
+                                .add_enabled(
+                                    sel_pos.is_some_and(|p| p > 0),
+                                    egui::Button::new("▲"),
+                                )
+                                .on_hover_text("Higher priority")
+                                .clicked()
+                            {
+                                move_up_id = selected.clone();
+                            }
+                            if ui
+                                .add_enabled(
+                                    sel_pos.is_some_and(|p| p + 1 < enabled.len()),
+                                    egui::Button::new("▼"),
+                                )
+                                .on_hover_text("Lower priority")
+                                .clicked()
+                            {
+                                move_down_id = selected.clone();
+                            }
+                        });
+
+                        // ── Enabled column (priority order) ──
+                        ui.vertical(|ui| {
+                            ui.set_width(260.0);
+                            ui.strong("Enabled sources (priority order)");
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                ui.set_width(248.0);
+                                ui.set_min_height(300.0);
+                                if enabled.is_empty() {
+                                    ui.weak("(no sources enabled — schedules won't update)");
+                                }
+                                for (rank, (i, kind)) in enabled.iter().enumerate() {
+                                    let id = &self.schedule_sources_draft[*i].id;
+                                    let resp = source_row_ranked(
+                                        ui,
+                                        rank + 1,
+                                        *kind,
+                                        selected.as_deref() == Some(id),
+                                    );
+                                    if resp.clicked() {
+                                        select_id = Some(id.clone());
+                                    }
+                                    if resp.double_clicked() {
+                                        disable_id = Some(id.clone());
+                                    }
+                                }
+                            });
+                        });
+                    });
+
+                    ui.add_space(8.0);
+                    // Description / risk note for the current selection.
+                    if let Some(kind) = selected.as_deref().and_then(ScheduleSourceKind::from_id) {
+                        ui.label(kind.description());
+                        if kind.risky() {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(0xe0, 0x6c, 0x6c),
+                                "⚠ Risky source — may violate a platform's Terms of Service. \
+                                 Use at your own risk.",
+                            );
+                        }
+                    } else {
+                        ui.weak("Select a source to see what it does.");
+                    }
+
+                    ui.add_space(8.0);
+                    if ui.button("Close").clicked() {
+                        open = false;
+                    }
+                });
+            },
+        );
+
+        // ── Apply collected actions (mutating the draft). ──
+        let mut changed = false;
+        if let Some(id) = &select_id {
+            self.schedule_sources_selected = Some(id.clone());
+        }
+        if let Some(id) = &enable_id {
+            if let Some(e) = self.schedule_sources_draft.iter_mut().find(|e| &e.id == id) {
+                e.enabled = true;
+                changed = true;
+            }
+            self.schedule_sources_selected = Some(id.clone());
+        }
+        if let Some(id) = &disable_id {
+            if let Some(e) = self.schedule_sources_draft.iter_mut().find(|e| &e.id == id) {
+                e.enabled = false;
+                changed = true;
+            }
+            self.schedule_sources_selected = Some(id.clone());
+        }
+        // Reorder swaps the selected enabled entry with its enabled neighbour, by
+        // swapping their draft slots (disabled entries in between are unaffected).
+        if let (Some(id), Some(p)) = (&move_up_id, sel_pos) {
+            if p > 0 {
+                self.schedule_sources_draft.swap(enabled[p].0, enabled[p - 1].0);
+                changed = true;
+            }
+            self.schedule_sources_selected = Some(id.clone());
+        }
+        if let (Some(id), Some(p)) = (&move_down_id, sel_pos) {
+            if p + 1 < enabled.len() {
+                self.schedule_sources_draft.swap(enabled[p].0, enabled[p + 1].0);
+                changed = true;
+            }
+            self.schedule_sources_selected = Some(id.clone());
+        }
+        if changed {
+            if let Err(e) = save_source_order(&self.core.store, &self.schedule_sources_draft) {
+                self.status = format!("Error saving schedule sources: {e}");
+            } else {
+                self.core.request_schedule_refresh();
+            }
+        }
+        if !open {
+            self.show_schedule_sources = false;
+        }
+    }
+
     /// The Schedule tab: a month/week/day calendar of all upcoming scheduled
     /// streams, with a left sidebar to filter channels and a collision highlight.
     fn schedule_view(&mut self, ui: &mut egui::Ui) {
@@ -5379,6 +5673,7 @@ impl StreamArchiverApp {
         let mut nav_anchor: Option<chrono::NaiveDate> = None;
         let mut set_mode: Option<ScheduleMode> = None;
         let mut do_refresh = false;
+        let mut open_sources = false;
         let mut clear_hidden = false;
         let mut hide_all = false;
         let mut toggle_channel: Option<i64> = None;
@@ -5532,6 +5827,15 @@ impl StreamArchiverApp {
                     {
                         do_refresh = true;
                     }
+                    if ui
+                        .button("⛭ Sources")
+                        .on_hover_text(
+                            "Choose which schedule sources to use and their priority order",
+                        )
+                        .clicked()
+                    {
+                        open_sources = true;
+                    }
                     let mut hc = self.schedule_collisions;
                     if ui
                         .checkbox(&mut hc, "Highlight collisions")
@@ -5599,6 +5903,9 @@ impl StreamArchiverApp {
             self.core.request_schedule_refresh();
             self.reload_schedule();
             self.status = "Fetching latest schedules…".into();
+        }
+        if open_sources {
+            self.open_schedule_sources();
         }
         // Context-menu actions written into egui temp storage by schedule_copy_menu
         // (closures can't borrow `self` directly when deep inside panel closures).
@@ -7970,6 +8277,84 @@ impl StreamArchiverApp {
             });
 
             ui.add_space(12.0);
+            ui.heading("Schedule sources");
+            ui.label(
+                "Schedules are fetched from several sources, tried in priority order per channel \
+                 until one resolves. Some sources read the week off an image (a Twitch offline \
+                 banner, a YouTube community post, a pinned tweet) via OCR — done by shelling out \
+                 to an LLM CLI (the `claude` CLI by default; no API key needed).",
+            );
+            if ui
+                .button("Configure source order…")
+                .on_hover_text(
+                    "Choose which sources to use and their priority. The first source that \
+                     resolves an actual schedule for a channel wins.",
+                )
+                .clicked()
+            {
+                self.open_schedule_sources();
+            }
+            ui.add_space(6.0);
+            ui.label("Image OCR (for banner / community / tweet sources)");
+            egui::Grid::new("ocr_grid")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("OCR CLI command");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.ocr_command)
+                            .hint_text("claude")
+                            .desired_width(220.0),
+                    )
+                    .on_hover_text(
+                        "Executable to shell out to for image OCR. Must be on PATH (or an absolute \
+                         path) and accept `--model <m> --add-dir <dir> -p <prompt>`. Default: claude.",
+                    );
+                    ui.end_row();
+                    ui.label("Model");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.ocr_model)
+                            .hint_text("haiku")
+                            .desired_width(220.0),
+                    )
+                    .on_hover_text("Primary model passed to the CLI. Default: haiku.");
+                    ui.end_row();
+                    ui.label("Fallback model");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.ocr_fallback_model)
+                            .hint_text("sonnet")
+                            .desired_width(220.0),
+                    )
+                    .on_hover_text(
+                        "Stronger model retried once if the primary returns invalid JSON. \
+                         Default: sonnet.",
+                    );
+                    ui.end_row();
+                    ui.label("Assume timezone");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.ocr_timezone)
+                            .hint_text("(machine local)")
+                            .desired_width(220.0),
+                    )
+                    .on_hover_text(
+                        "IANA timezone to assume for banner times (e.g. Europe/Oslo). Banners \
+                         rarely show one; leave empty to use the machine's local timezone.",
+                    );
+                    ui.end_row();
+                    ui.label("UTC offset");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.ocr_offset)
+                            .hint_text("(machine local)")
+                            .desired_width(220.0),
+                    )
+                    .on_hover_text(
+                        "UTC offset matching the timezone/season, e.g. +02:00. Leave empty to use \
+                         the machine's current local offset.",
+                    );
+                    ui.end_row();
+                });
+
+            ui.add_space(12.0);
             ui.heading("Twitch account (OAuth)");
             ui.label("Connect to use a user token for detection (Client Secret then optional).");
             let flow = self.twitch_flow.lock().unwrap().clone();
@@ -9778,6 +10163,14 @@ impl StreamArchiverApp {
         // Set inside the icon-source combo, applied after the panel renders.
         let mut pref_change: Option<Option<Platform>> = None;
 
+        // Load this channel's schedule-source config into the editable draft (once
+        // per channel — keep edits while the window stays open on the same channel).
+        if self.channel_cfg_draft.as_ref().map(|(id, _)| *id) != Some(ch.id) {
+            self.channel_cfg_draft = Some((ch.id, load_channel_cfg(&self.core.store, ch.id)));
+        }
+        // Set when a per-channel config field is edited; persisted after the panel.
+        let mut cfg_dirty = false;
+
         let mut open = true;
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("properties_vp"),
@@ -10069,6 +10462,98 @@ impl StreamArchiverApp {
                         });
                 }
 
+                // ── Schedule sources (per-channel) ───────────────────────
+                if let Some((_, cfg)) = self.channel_cfg_draft.as_mut() {
+                    ui.add_space(6.0);
+                    ui.strong("Schedule sources (this channel)");
+                    ui.label(
+                        egui::RichText::new(
+                            "Used by the image/scrape sources you enable in Settings → Schedule \
+                             sources. Changes apply on the next schedule refresh (or click ⟳ in \
+                             the Schedule tab).",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    egui::Grid::new("props_sched_src")
+                        .num_columns(2)
+                        .spacing([12.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.label("Twitter/X handle");
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut cfg.twitter_handle)
+                                        .hint_text("without @")
+                                        .desired_width(240.0),
+                                )
+                                .on_hover_text(
+                                    "Used by the 'Twitter/X pinned' source to read the schedule \
+                                     off the pinned tweet's image.",
+                                )
+                                .changed()
+                            {
+                                cfg_dirty = true;
+                            }
+                            ui.end_row();
+
+                            ui.label("Other image (path/URL)");
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut cfg.other_image)
+                                        .hint_text("local path or https://…")
+                                        .desired_width(240.0),
+                                )
+                                .on_hover_text(
+                                    "Used by the 'Other image (OCR)' source — point it at any \
+                                     schedule image (a saved screenshot or a direct image URL).",
+                                )
+                                .changed()
+                            {
+                                cfg_dirty = true;
+                            }
+                            ui.end_row();
+
+                            ui.label("OCR model override");
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut cfg.ocr_model)
+                                        .hint_text("(global default)")
+                                        .desired_width(240.0),
+                                )
+                                .changed()
+                            {
+                                cfg_dirty = true;
+                            }
+                            ui.end_row();
+
+                            ui.label("OCR timezone override");
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut cfg.ocr_timezone)
+                                        .hint_text("(global default)")
+                                        .desired_width(240.0),
+                                )
+                                .changed()
+                            {
+                                cfg_dirty = true;
+                            }
+                            ui.end_row();
+
+                            ui.label("OCR UTC offset override");
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut cfg.ocr_offset)
+                                        .hint_text("(global default, e.g. +02:00)")
+                                        .desired_width(240.0),
+                                )
+                                .changed()
+                            {
+                                cfg_dirty = true;
+                            }
+                            ui.end_row();
+                        });
+                }
+
                 // Apply an icon-source change picked in the combo above.
                 if let Some(newp) = pref_change {
                     if let Err(e) =
@@ -10085,8 +10570,18 @@ impl StreamArchiverApp {
             },
         );
 
+        // Persist edited per-channel schedule-source config (cheap; small JSON).
+        if cfg_dirty {
+            if let Some((cid, cfg)) = &self.channel_cfg_draft {
+                if let Err(e) = save_channel_cfg(&self.core.store, *cid, cfg) {
+                    self.status = format!("Error saving channel config: {e}");
+                }
+            }
+        }
+
         if !open {
             self.properties_popup = None;
+            self.channel_cfg_draft = None;
         }
     }
 }

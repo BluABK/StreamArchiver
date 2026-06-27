@@ -11,6 +11,7 @@
 //! without trait objects.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,6 +29,10 @@ use crate::events::{AppEvent, EventTx};
 use crate::models::{
     K_DISCORD_SCHEDULE, K_DISCORD_TOKEN, K_YT_API_DETECT, K_YT_API_SCHEDULE, MonitorWithChannel,
     Platform, ScheduleSegment, now_unix,
+};
+use crate::schedule_ocr::{ocr_opts_from_settings, ocr_schedule_image};
+use crate::schedule_source::{
+    ChannelSourceConfig, ScheduleSourceKind, SourceEntry, load_channel_cfg, load_source_order,
 };
 use crate::store::Store;
 
@@ -181,6 +186,10 @@ pub struct DetectContext {
     /// Serializes user-token refresh: Twitch device-code refresh tokens are
     /// one-time-use, so concurrent detection passes must not double-spend one.
     twitch_refresh: Mutex<()>,
+    /// Byte-hash → last OCR result per `(monitor_id, source_id)`. Skips a
+    /// (multi-second, token-spending) re-OCR when the source image is unchanged
+    /// since the previous pass — banners/community images rarely change.
+    ocr_cache: Mutex<HashMap<(i64, String), (u64, Vec<ScheduleSegment>)>>,
 }
 
 impl DetectContext {
@@ -196,6 +205,7 @@ impl DetectContext {
             twitch_token: Mutex::new(None),
             kick_token: Mutex::new(None),
             twitch_refresh: Mutex::new(()),
+            ocr_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -695,6 +705,13 @@ impl DetectContext {
         let resp = self
             .http
             .get(&streams_url)
+            // Force English + US locale. YouTube geo-localizes the server-rendered
+            // schedule strings to the viewer's IP, so a non-US IP yields e.g. the
+            // Norwegian "Planlagt for 18.06.2026, 20:00" instead of the
+            // "Scheduled for 6/18/26, 8:00 PM" that `parse_yt_scheduled_text`
+            // expects — every segment was silently dropped. The `hl`/`gl` query
+            // params override that more reliably than `Accept-Language` alone.
+            .query(&[("hl", "en"), ("gl", "US")])
             .header("Accept-Language", "en-US,en;q=0.9")
             .header("Cookie", "CONSENT=YES+1; SOCS=CAI")
             .send()
@@ -704,7 +721,302 @@ impl DetectContext {
             return None;
         }
         let body = resp.text().await.ok()?;
-        Some(parse_youtube_schedule(&body))
+        let mut segs = parse_youtube_schedule(&body);
+        // Shape-independent fallback: if the structured `ytInitialData` walk found
+        // nothing (Polymer markup drift), scan the raw page for scheduled-start
+        // markers so a layout change doesn't silently zero out the schedule.
+        if segs.is_empty() {
+            collect_upcoming_fallback(&body, &mut segs);
+        }
+        Some(segs)
+    }
+
+    /// A YouTube channel's upcoming streams via the Data API (source `YouTubeApi`):
+    /// resolve the channel id, `search.list?eventType=upcoming` for the upcoming
+    /// video ids (~100 quota units), then `videos.list` for each one's exact
+    /// `scheduledStartTime` + title (~1 unit). `Some(vec)` on success (possibly
+    /// empty); `None` on error / missing key, so a transient failure won't wipe a
+    /// stored schedule. Gated by the caller on `youtube_api_enabled(K_YT_API_SCHEDULE)`.
+    pub async fn youtube_schedule_api(&self, url: &str) -> Option<Vec<ScheduleSegment>> {
+        let key = self
+            .store
+            .get_setting("youtube_api_key")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if key.is_empty() {
+            return None;
+        }
+        let channel_id = self.youtube_channel_id(url, &key).await.ok()?;
+        // search.list for upcoming live broadcasts on this channel.
+        let resp = self
+            .http
+            .get("https://www.googleapis.com/youtube/v3/search")
+            .query(&[
+                ("part", "id"),
+                ("channelId", channel_id.as_str()),
+                ("eventType", "upcoming"),
+                ("type", "video"),
+                ("maxResults", "50"),
+                ("key", key.as_str()),
+            ])
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let v: Value = resp.json().await.ok()?;
+        let ids: Vec<String> = v["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|it| it["id"]["videoId"].as_str().map(str::to_string))
+            .collect();
+        if ids.is_empty() {
+            // The API definitively reports no upcoming streams.
+            return Some(Vec::new());
+        }
+        // videos.list for exact scheduled start + title (one batched call).
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let starts = self.youtube_videos_list(&id_refs).await?;
+        let titles = self.youtube_video_titles(&id_refs, &key).await.unwrap_or_default();
+        let mut out: Vec<ScheduleSegment> = ids
+            .iter()
+            .filter_map(|id| {
+                let start = *starts.get(id)?;
+                Some(ScheduleSegment {
+                    id: 0,
+                    monitor_id: 0,
+                    start_time: start,
+                    end_time: None,
+                    title: titles.get(id).cloned().unwrap_or_default(),
+                    category: String::new(),
+                    canceled: false,
+                    video_id: Some(id.clone()),
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| a.start_time.cmp(&b.start_time).then_with(|| a.title.cmp(&b.title)));
+        out.dedup_by(|a, b| a.start_time == b.start_time && a.title == b.title);
+        Some(out)
+    }
+
+    /// Batch `videos.list?part=snippet` to fetch each video's title. Returns a map
+    /// of `video_id → title` (~1 quota unit per 50 ids). `None` on error.
+    async fn youtube_video_titles(
+        &self,
+        video_ids: &[&str],
+        key: &str,
+    ) -> Option<HashMap<String, String>> {
+        if key.is_empty() || video_ids.is_empty() {
+            return None;
+        }
+        let mut result: HashMap<String, String> = HashMap::new();
+        for chunk in video_ids.chunks(50) {
+            let ids_str = chunk.join(",");
+            let resp = self
+                .http
+                .get("https://www.googleapis.com/youtube/v3/videos")
+                .query(&[("part", "snippet"), ("id", ids_str.as_str()), ("key", key)])
+                .send()
+                .await
+                .ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            let v: Value = resp.json().await.ok()?;
+            for item in v["items"].as_array().into_iter().flatten() {
+                if let (Some(id), Some(title)) =
+                    (item["id"].as_str(), item["snippet"]["title"].as_str())
+                {
+                    result.insert(id.to_string(), title.to_string());
+                }
+            }
+        }
+        Some(result)
+    }
+
+    // ----- Multi-source schedule resolution -----
+
+    /// Resolve a single schedule source for one monitor. `Some(v)` = the source
+    /// produced an authoritative answer (possibly empty, meaning "definitively
+    /// nothing scheduled"); `None` = a transient failure / not-configured, so the
+    /// caller leaves any stored rows untouched. `Discord` is resolved by the batch
+    /// sweep in [`refresh_schedules_once`], not here, so it returns `None`.
+    pub async fn resolve_source(
+        &self,
+        kind: ScheduleSourceKind,
+        row: &MonitorWithChannel,
+        cfg: &ChannelSourceConfig,
+    ) -> Option<Vec<ScheduleSegment>> {
+        let url = row.monitor.url.as_str();
+        match kind {
+            ScheduleSourceKind::TwitchSchedule => self.twitch_schedule(url).await,
+            ScheduleSourceKind::YouTubeScrape => self.youtube_schedule(url).await,
+            ScheduleSourceKind::YouTubeApi => self.youtube_schedule_api(url).await,
+            ScheduleSourceKind::TwitchBannerOcr => self.ocr_twitch_banner(row, cfg).await,
+            ScheduleSourceKind::YouTubeCommunityOcr => self.ocr_youtube_community(row, cfg).await,
+            ScheduleSourceKind::TwitterPinned => self.ocr_twitter_pinned(row, cfg).await,
+            ScheduleSourceKind::OtherImageOcr => self.ocr_other_image(row, cfg).await,
+            ScheduleSourceKind::Discord => None,
+        }
+    }
+
+    /// OCR an on-disk image into schedule segments, skipping the (multi-second,
+    /// token-spending) CLI call when the image bytes are unchanged since the last
+    /// pass for this `(monitor, source)`. Returns the cached result on a hash hit.
+    async fn ocr_image_cached(
+        &self,
+        monitor_id: i64,
+        source_id: &str,
+        path: &Path,
+        cfg: &ChannelSourceConfig,
+    ) -> Option<Vec<ScheduleSegment>> {
+        let bytes = tokio::fs::read(path).await.ok()?;
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            bytes.hash(&mut h);
+            h.finish()
+        };
+        let key = (monitor_id, source_id.to_string());
+        if let Some((cached, segs)) = self.ocr_cache.lock().await.get(&key) {
+            if *cached == hash {
+                debug!("OCR cache hit (monitor {monitor_id}, source {source_id})");
+                return Some(segs.clone());
+            }
+        }
+        let opts = ocr_opts_from_settings(self.store.as_ref(), cfg);
+        let segs = ocr_schedule_image(path, &opts).await?;
+        self.ocr_cache.lock().await.insert(key, (hash, segs.clone()));
+        Some(segs)
+    }
+
+    /// Destination for a downloaded schedule-source image, kept in a `schedule_src/`
+    /// subdir of the channel asset dir so it never collides with archival assets.
+    fn schedule_src_path(&self, row: &MonitorWithChannel, stem: &str, ext: &str) -> PathBuf {
+        crate::assets::channel_asset_dir(&row.channel.name, row.monitor.platform())
+            .join("schedule_src")
+            .join(format!("{stem}.{ext}"))
+    }
+
+    /// OCR the channel's already-downloaded Twitch offline banner (`banner.<ext>`
+    /// in the asset dir — fetched by the asset pipeline, no re-fetch here).
+    async fn ocr_twitch_banner(
+        &self,
+        row: &MonitorWithChannel,
+        cfg: &ChannelSourceConfig,
+    ) -> Option<Vec<ScheduleSegment>> {
+        let dir = crate::assets::channel_asset_dir(&row.channel.name, Platform::Twitch);
+        let banner = crate::assets::find_asset(&dir, "banner.")?;
+        self.ocr_image_cached(
+            row.monitor.id,
+            ScheduleSourceKind::TwitchBannerOcr.id(),
+            &banner,
+            cfg,
+        )
+        .await
+    }
+
+    /// OCR a user-supplied schedule image (`cfg.other_image`): a local path is read
+    /// directly; a URL is downloaded first. Returns `None` when unset.
+    async fn ocr_other_image(
+        &self,
+        row: &MonitorWithChannel,
+        cfg: &ChannelSourceConfig,
+    ) -> Option<Vec<ScheduleSegment>> {
+        let src = cfg.other_image.trim();
+        if src.is_empty() {
+            return None;
+        }
+        let path = if is_url(src) {
+            let dest = self.schedule_src_path(row, "other", url_image_ext(src));
+            crate::assets::download_image(&self.http, src, &dest).await.ok()?;
+            dest
+        } else {
+            PathBuf::from(src)
+        };
+        self.ocr_image_cached(
+            row.monitor.id,
+            ScheduleSourceKind::OtherImageOcr.id(),
+            &path,
+            cfg,
+        )
+        .await
+    }
+
+    /// OCR the image on the channel's latest YouTube community post. Best-effort:
+    /// scrapes `/community?hl=en&gl=US`, pulls a backstage post image from
+    /// `ytInitialData`, downloads it, then OCRs. `None` on any miss.
+    async fn ocr_youtube_community(
+        &self,
+        row: &MonitorWithChannel,
+        cfg: &ChannelSourceConfig,
+    ) -> Option<Vec<ScheduleSegment>> {
+        let community_url = youtube_community_url(&row.monitor.url);
+        let resp = self
+            .http
+            .get(&community_url)
+            .query(&[("hl", "en"), ("gl", "US")])
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Cookie", "CONSENT=YES+1; SOCS=CAI")
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body = resp.text().await.ok()?;
+        let data = extract_json_after(&body, "ytInitialData")?;
+        let img = first_community_image(&data)?;
+        let dest = self.schedule_src_path(row, "community", url_image_ext(&img));
+        crate::assets::download_image(&self.http, &img, &dest).await.ok()?;
+        self.ocr_image_cached(
+            row.monitor.id,
+            ScheduleSourceKind::YouTubeCommunityOcr.id(),
+            &dest,
+            cfg,
+        )
+        .await
+    }
+
+    /// OCR the image on the channel's pinned tweet. Best-effort: hits the public
+    /// syndication timeline endpoint (no auth), grabs the first `pbs.twimg.com`
+    /// media image (the pinned tweet renders first), downloads it, then OCRs. X
+    /// actively fights this, so any miss returns `None` and falls through.
+    async fn ocr_twitter_pinned(
+        &self,
+        row: &MonitorWithChannel,
+        cfg: &ChannelSourceConfig,
+    ) -> Option<Vec<ScheduleSegment>> {
+        let handle = cfg.twitter_handle.trim().trim_start_matches('@');
+        if handle.is_empty() {
+            return None;
+        }
+        let url =
+            format!("https://syndication.twitter.com/srv/timeline-profile/screen-name/{handle}");
+        let resp = self
+            .http
+            .get(&url)
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body = resp.text().await.ok()?;
+        let img = first_twimg_media(&body)?;
+        let dest = self.schedule_src_path(row, "twitter", url_image_ext(&img));
+        crate::assets::download_image(&self.http, &img, &dest).await.ok()?;
+        self.ocr_image_cached(
+            row.monitor.id,
+            ScheduleSourceKind::TwitterPinned.id(),
+            &dest,
+            cfg,
+        )
+        .await
     }
 
     // ----- YouTube Data API (API key) -----
@@ -1495,15 +1807,19 @@ pub async fn refresh_schedules(
     }
 }
 
-/// One schedule-refresh pass: fetch + store the schedule for each enabled
-/// Twitch/YouTube monitor due for a refresh. A failed fetch (`None`) is left
-/// alone (so a transient error doesn't wipe a previously-stored schedule), and
-/// retried next tick.
+/// One schedule-refresh pass over the user's ordered schedule sources.
 ///
-/// YouTube is always scraped first (free); if `K_YT_API_SCHEDULE` is enabled
-/// and an API key is set, all YouTube segments across **all** channels are batched
-/// into one `videos.list` call (~1 quota unit) to get exact `scheduledStartTime`
-/// values that supersede the approximate local-time parse from the scrape.
+/// For each enabled monitor due for a refresh, the enabled *per-monitor* sources
+/// are tried in priority order and the first to return a **non-empty** schedule
+/// wins: its rows are stored under the source's id and every other source's rows
+/// for that monitor are cleared, so exactly one source owns each monitor's
+/// schedule. A source returning `None` is a transient failure (stored rows left
+/// alone, retried soon); `Some(empty)` is an authoritative "nothing scheduled".
+///
+/// YouTube `/streams` scrape winners are deferred so all their video IDs can be
+/// refined in one batched `videos.list` call (exact `scheduledStartTime`) before
+/// being stored under `"youtube"`. Discord runs last as a debounced batch sweep,
+/// filling only monitors that no higher-priority source already resolved.
 async fn refresh_schedules_once(
     ctx: &Arc<DetectContext>,
     events: &EventTx,
@@ -1536,15 +1852,30 @@ async fn refresh_schedules_once(
         last_fetched.retain(|id, _| !missing_ids.contains(id));
     }
 
-    // Whether to refine YouTube timestamps with a batched videos.list call.
+    // The user's ordered sources: per-monitor ones (walked here, in priority order)
+    // and whether Discord (a separate batch sweep) is enabled.
+    let order = load_source_order(ctx.store.as_ref());
+    let per_monitor: Vec<ScheduleSourceKind> = order
+        .iter()
+        .filter(|e| e.enabled)
+        .filter_map(SourceEntry::kind)
+        .filter(|k| k.is_per_monitor())
+        .collect();
+    let discord_in_order = order
+        .iter()
+        .any(|e| e.enabled && e.kind() == Some(ScheduleSourceKind::Discord));
+
+    // Whether to refine scraped YouTube timestamps with a batched videos.list call.
     let yt_api_enabled = ctx.youtube_api_enabled(K_YT_API_SCHEDULE);
-    // Per-URL fetch cache: the same channel URL shared across multiple monitors
-    // is fetched once. `None` = fetch failed (don't overwrite stored schedule).
-    let mut fetched: HashMap<String, Option<Vec<ScheduleSegment>>> = HashMap::new();
-    // YouTube results are deferred so we can batch all video IDs in one API call
-    // before storing. Twitch is stored immediately (no API refinement step).
+    // Per-(source, URL) fetch cache: a URL shared across monitors is fetched once
+    // per source. `None` = transient failure (don't overwrite stored rows).
+    let mut fetched: HashMap<(&'static str, String), Option<Vec<ScheduleSegment>>> = HashMap::new();
+    // YouTube scrape winners are deferred so all video IDs batch into one API call.
     let mut yt_pending: Vec<(i64, Vec<ScheduleSegment>)> = Vec::new();
     let mut changed = false;
+    // On a pure transient failure, retry sooner than the full interval (but not
+    // every 60s tick — that would hammer the source).
+    const TRANSIENT_RETRY_SECS: u64 = 300;
 
     for row in &rows {
         if shutdown.load(Ordering::SeqCst) {
@@ -1553,47 +1884,87 @@ async fn refresh_schedules_once(
         if !row.channel.enabled || !row.monitor.enabled {
             continue;
         }
-        let platform = row.monitor.platform();
-        if !matches!(platform, Platform::Twitch | Platform::YouTube) {
-            continue;
-        }
         // Re-fetch each monitor at most every `refresh_secs`.
         if let Some(t) = last_fetched.get(&row.monitor.id) {
             if now.duration_since(*t).as_secs() < refresh_secs {
                 continue;
             }
         }
-        let url = row.monitor.url.clone();
-        let segs_opt = match fetched.get(&url) {
-            Some(s) => s.clone(),
-            None => {
-                let s = match platform {
-                    Platform::Twitch => ctx.twitch_schedule(&url).await,
-                    Platform::YouTube => ctx.youtube_schedule(&url).await,
-                    _ => None,
-                };
-                fetched.insert(url.clone(), s.clone());
-                s
+        let platform = row.monitor.platform();
+        let cfg = load_channel_cfg(ctx.store.as_ref(), row.channel.id);
+
+        // Walk the enabled per-monitor sources in priority order; first non-empty
+        // result wins. Track whether any source was authoritative (returned `Some`).
+        let mut any_authoritative = false;
+        let mut won: Option<(ScheduleSourceKind, Vec<ScheduleSegment>)> = None;
+        for &kind in &per_monitor {
+            if !kind.applies_to(platform, &cfg) {
+                continue;
             }
+            let key = (kind.id(), row.monitor.url.clone());
+            let segs_opt = match fetched.get(&key) {
+                Some(s) => s.clone(),
+                None => {
+                    let s = ctx.resolve_source(kind, row, &cfg).await;
+                    fetched.insert(key, s.clone());
+                    s
+                }
+            };
+            if let Some(segs) = segs_opt {
+                any_authoritative = true;
+                if !segs.is_empty() {
+                    won = Some((kind, segs));
+                    break;
+                }
+            }
+        }
+
+        // Stamp staleness: full interval on success/authoritative-empty; sooner on a
+        // pure transient failure (every applicable source returned `None`).
+        let stamp = if any_authoritative {
+            now
+        } else {
+            now.checked_sub(Duration::from_secs(
+                refresh_secs.saturating_sub(TRANSIENT_RETRY_SECS),
+            ))
+            .unwrap_or(now)
         };
-        if let Some(segs) = segs_opt {
-            last_fetched.insert(row.monitor.id, now);
-            match platform {
-                Platform::Twitch => {
-                    if ctx.store.replace_schedule(row.monitor.id, &segs).is_ok() {
-                        changed = true;
-                    }
+        last_fetched.insert(row.monitor.id, stamp);
+
+        match won {
+            // Defer scrape winners for the batched videos.list refinement below.
+            Some((ScheduleSourceKind::YouTubeScrape, segs)) => {
+                yt_pending.push((row.monitor.id, segs));
+            }
+            Some((kind, segs)) => {
+                if ctx
+                    .store
+                    .replace_schedule_source(row.monitor.id, kind.id(), &segs)
+                    .is_ok()
+                {
+                    let _ = ctx.store.clear_other_schedule_sources(row.monitor.id, kind.id());
+                    changed = true;
                 }
-                Platform::YouTube => {
-                    yt_pending.push((row.monitor.id, segs));
+            }
+            None => {
+                // No source won. If at least one was authoritative (returned
+                // `Some(empty)` — definitively nothing), drop stale per-monitor rows
+                // but keep Discord (managed by its own sweep). If every source was
+                // transient (`None`), leave the stored schedule untouched.
+                if any_authoritative
+                    && ctx
+                        .store
+                        .clear_other_schedule_sources(row.monitor.id, "discord")
+                        .is_ok()
+                {
+                    changed = true;
                 }
-                _ => {}
             }
         }
     }
 
-    // Batch videos.list for all pending YouTube segments (one call, ~1 quota unit).
-    // API timestamps supersede the approximate local-time parse from the scrape.
+    // Batch videos.list for all pending YouTube scrape winners (one call, ~1 quota
+    // unit). API timestamps supersede the approximate local-time parse from scrape.
     if yt_api_enabled && !yt_pending.is_empty() {
         let all_ids: Vec<&str> = yt_pending
             .iter()
@@ -1617,40 +1988,43 @@ async fn refresh_schedules_once(
         }
     }
 
-    // Store YouTube results (after optional API refinement).
+    // Store YouTube scrape results (after optional API refinement) under "youtube".
     for (monitor_id, segs) in &yt_pending {
-        if ctx.store.replace_schedule(*monitor_id, segs).is_ok() {
+        if ctx.store.replace_schedule_source(*monitor_id, "youtube", segs).is_ok() {
+            let _ = ctx.store.clear_other_schedule_sources(*monitor_id, "youtube");
             changed = true;
         }
     }
 
-    // Discord scheduled-events import (opt-in; uses the user's Discord token).
-    // Runs on the platform cadence, but never more often than DISCORD_MIN_SECS even
-    // on a forced reload (refresh_secs == 0) — a sweep hits the user-token endpoints
-    // for every guild, so we debounce it to avoid bursty, ban-flaggable traffic.
+    // Discord scheduled-events import — only when enabled in the source list AND a
+    // token is configured. Runs on the platform cadence, but never more often than
+    // DISCORD_MIN_SECS even on a forced reload (refresh_secs == 0) — a sweep hits the
+    // user-token endpoints for every guild, so we debounce it to avoid bursty,
+    // ban-flaggable traffic.
     const DISCORD_MIN_SECS: u64 = 60;
     let discord_interval = refresh_secs.max(DISCORD_MIN_SECS);
-    let discord_due = ctx.discord_enabled()
+    let discord_due = discord_in_order
+        && ctx.discord_enabled()
         && discord_last.is_none_or(|t| now.duration_since(t).as_secs() >= discord_interval);
     if discord_due {
         // Stamp the attempt up front so a failing token / outage retries on the
         // interval, not every 60s tick (which would hammer Discord's auth endpoint).
         *discord_last = Some(now);
         if let Some((matched, complete)) = ctx.discord_sweep(&rows, shutdown).await {
-            // Don't attach a Discord event to a monitor that already has a platform
-            // schedule, so the two sources never duplicate. Use the start-of-today
-            // floor the calendar uses, so an in-progress block (started earlier
-            // today) still counts as a platform schedule.
-            let platform_mons = ctx
+            // Don't attach a Discord event to a monitor that already resolved a
+            // schedule from a higher-priority source, so the two never duplicate.
+            // Use the start-of-today floor the calendar uses, so an in-progress block
+            // (started earlier today) still counts as a resolved schedule.
+            let resolved = ctx
                 .store
-                .monitors_with_upcoming_platform(local_day_start())
+                .monitors_with_upcoming_non_discord(local_day_start())
                 .unwrap_or_default();
             if complete {
                 // Full sweep: authoritative — reconcile every monitor (clear ones
                 // with no matched event).
                 for row in &rows {
                     let mid = row.monitor.id;
-                    let segs = if platform_mons.contains(&mid) {
+                    let segs = if resolved.contains(&mid) {
                         Vec::new()
                     } else {
                         matched.get(&mid).cloned().unwrap_or_default()
@@ -1662,7 +2036,7 @@ async fn refresh_schedules_once(
                 // a streamer whose guild failed this pass keeps their stored events.
                 for (mid, found) in &matched {
                     let segs: &[ScheduleSegment] =
-                        if platform_mons.contains(mid) { &[] } else { found };
+                        if resolved.contains(mid) { &[] } else { found };
                     let _ = ctx.store.replace_schedule_source(*mid, "discord", segs);
                 }
             }
@@ -1810,6 +2184,77 @@ fn youtube_streams_url(url: &str) -> String {
     format!("{t}/streams")
 }
 
+/// Build the YouTube `/community` (posts tab) URL for a channel URL.
+fn youtube_community_url(url: &str) -> String {
+    let t = url.trim().trim_end_matches('/');
+    let t = t
+        .strip_suffix("/live")
+        .or_else(|| t.strip_suffix("/streams"))
+        .or_else(|| t.strip_suffix("/community"))
+        .unwrap_or(t);
+    format!("{t}/community")
+}
+
+/// Whether `s` looks like an http(s) URL (vs. a local filesystem path).
+fn is_url(s: &str) -> bool {
+    let s = s.trim();
+    s.starts_with("http://") || s.starts_with("https://") || s.starts_with("//")
+}
+
+/// A short image extension from a URL path (before `?`), defaulting to `jpg` —
+/// the OCR CLI needs a real image extension to recognize the file type.
+fn url_image_ext(url: &str) -> &str {
+    let path = url.split('?').next().unwrap_or(url);
+    match path.rsplit('.').next() {
+        Some(e) if (1..=5).contains(&e.len()) && e.chars().all(|c| c.is_ascii_alphanumeric()) => e,
+        _ => "jpg",
+    }
+}
+
+/// Find the first community-post image URL in `ytInitialData` — a
+/// `backstageImageRenderer`'s largest thumbnail. Best-effort: serde_json sorts
+/// object keys (no `preserve_order`), so "first" is not strictly the newest post;
+/// most channels pin their schedule post, and OCR of the wrong image just yields
+/// nothing and falls through to the next source.
+fn first_community_image(v: &Value) -> Option<String> {
+    match v {
+        Value::Object(map) => {
+            if let Some(url) = map
+                .get("backstageImageRenderer")
+                .and_then(|img| largest_thumbnail(img.get("image")))
+            {
+                return Some(url);
+            }
+            map.values().find_map(first_community_image)
+        }
+        Value::Array(arr) => arr.iter().find_map(first_community_image),
+        _ => None,
+    }
+}
+
+/// The largest (last) thumbnail URL from an `image.thumbnails[]` node.
+fn largest_thumbnail(image: Option<&Value>) -> Option<String> {
+    image?
+        .get("thumbnails")?
+        .as_array()?
+        .last()?
+        .get("url")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// First `pbs.twimg.com/media/…` image URL in a Twitter syndication response,
+/// handling both raw and JSON-escaped (`\/`, `/`) slashes. Best-effort.
+fn first_twimg_media(body: &str) -> Option<String> {
+    let host_pos = body.find("pbs.twimg.com")?;
+    // Back up to this URL's scheme.
+    let scheme_pos = body[..host_pos].rfind("http")?;
+    let rest = &body[scheme_pos..];
+    let end = rest.find('"').unwrap_or(rest.len());
+    let url = rest[..end].replace("\\/", "/").replace("\\u002F", "/");
+    (url.starts_with("http") && url.contains("pbs.twimg.com/media/")).then_some(url)
+}
+
 /// Extract upcoming scheduled streams from a YouTube `/streams` page. Each
 /// upcoming entry's `videoRenderer` carries `upcomingEventData.startTime` (unix
 /// seconds) plus the title; we walk `ytInitialData` for those. Best-effort —
@@ -1824,6 +2269,168 @@ fn parse_youtube_schedule(body: &str) -> Vec<ScheduleSegment> {
     out.sort_by(|a, b| a.start_time.cmp(&b.start_time).then_with(|| a.title.cmp(&b.title)));
     out.dedup_by(|a, b| a.start_time == b.start_time && a.title == b.title);
     out
+}
+
+/// Shape-independent fallback: scan the raw `/streams` page for upcoming-stream
+/// start markers when the structured `ytInitialData` walk yields nothing (Polymer
+/// markup drift). Two markers are recognized:
+///   - `"upcomingEventData":{"startTime":"<unix seconds>"`  (classic renderer)
+///   - `"scheduledStartTime":"<rfc3339>"`                   (microformat / player)
+/// For each, the nearest `"videoId"` and title are pulled from a bounded window so
+/// a layout change doesn't silently zero out the schedule. Best-effort: a segment
+/// is pushed only when a start time parses; the title falls back to a placeholder.
+fn collect_upcoming_fallback(body: &str, out: &mut Vec<ScheduleSegment>) {
+    const WINDOW: usize = 4000;
+    // 1) upcomingEventData.startTime — unix seconds in a quoted string.
+    let marker = "\"upcomingEventData\":{\"startTime\":\"";
+    let mut from = 0;
+    while let Some(rel) = body[from..].find(marker) {
+        let i = from + rel;
+        from = i + marker.len();
+        if let Some(start) =
+            read_until_quote(body, i + marker.len()).and_then(|s| s.parse::<i64>().ok())
+        {
+            out.push(fallback_seg(body, i, WINDOW, start));
+        }
+    }
+    // 2) scheduledStartTime — rfc3339 in a quoted string.
+    let marker = "\"scheduledStartTime\":\"";
+    let mut from = 0;
+    while let Some(rel) = body[from..].find(marker) {
+        let i = from + rel;
+        from = i + marker.len();
+        if let Some(start) = read_until_quote(body, i + marker.len()).and_then(parse_rfc3339) {
+            out.push(fallback_seg(body, i, WINDOW, start));
+        }
+    }
+    out.sort_by(|a, b| a.start_time.cmp(&b.start_time).then_with(|| a.title.cmp(&b.title)));
+    out.dedup_by(|a, b| a.start_time == b.start_time && a.title == b.title);
+}
+
+/// Build a fallback `ScheduleSegment` for a start marker at byte `center`, pulling
+/// the nearest video id and title from the surrounding `window`.
+fn fallback_seg(body: &str, center: usize, window: usize, start: i64) -> ScheduleSegment {
+    let (lo, hi) = clamp_window(body, center, window);
+    let slice = &body[lo..hi];
+    let rel = center - lo;
+    ScheduleSegment {
+        id: 0,
+        monitor_id: 0,
+        start_time: start,
+        end_time: None,
+        title: nearest_title(slice, rel).unwrap_or_else(|| "Upcoming stream".to_string()),
+        category: String::new(),
+        canceled: false,
+        video_id: nearest_video_id(slice, rel),
+    }
+}
+
+/// Read a JSON string value's content starting at byte `start` (the first char
+/// after the opening quote), up to the next unescaped `"`. Returns the raw
+/// (still-escaped) slice.
+fn read_until_quote(s: &str, start: usize) -> Option<&str> {
+    let bytes = s.as_bytes();
+    if start > bytes.len() {
+        return None;
+    }
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return s.get(start..i),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Clamp `[center-window, center+window]` to valid UTF-8 char boundaries within `body`.
+fn clamp_window(body: &str, center: usize, window: usize) -> (usize, usize) {
+    let mut lo = center.saturating_sub(window);
+    while lo > 0 && !body.is_char_boundary(lo) {
+        lo -= 1;
+    }
+    let mut hi = (center + window).min(body.len());
+    while hi < body.len() && !body.is_char_boundary(hi) {
+        hi += 1;
+    }
+    (lo, hi)
+}
+
+/// Unescape a raw JSON string body by wrapping it back in quotes and letting
+/// serde do the work (handles `\"`, `\\`, `\uXXXX`, …). Falls back to the raw text.
+fn unescape_json_str(raw: &str) -> String {
+    serde_json::from_str::<String>(&format!("\"{raw}\"")).unwrap_or_else(|_| raw.to_string())
+}
+
+/// The `"title"` value in `slice` whose key sits closest to byte offset `center`,
+/// decoded from whichever YouTube text shape follows it. Center-aware so that with
+/// several events in one window each marker keeps its own title.
+fn nearest_title(slice: &str, center: usize) -> Option<String> {
+    let key = "\"title\":";
+    let mut best: Option<usize> = None;
+    let mut from = 0;
+    while let Some(r) = slice[from..].find(key) {
+        let at = from + r;
+        from = at + key.len();
+        if best.is_none_or(|b: usize| at.abs_diff(center) < b.abs_diff(center)) {
+            best = Some(at);
+        }
+    }
+    let at = best?;
+    title_from_value(slice[at + key.len()..].trim_start())
+}
+
+/// Decode a YouTube title from the value text that follows a `"title":` key:
+/// `{"runs":[{"text":…}]}` (concatenated), `{"simpleText":…}`, `{"content":…}`,
+/// or a plain `"…"` string.
+fn title_from_value(rest: &str) -> Option<String> {
+    if let Some(after) = rest.strip_prefix("{\"runs\":[") {
+        let end = after.find(']').unwrap_or(after.len());
+        let runs = &after[..end];
+        let mut title = String::new();
+        let text_key = "\"text\":\"";
+        let mut from = 0;
+        while let Some(r) = runs[from..].find(text_key) {
+            let at = from + r;
+            from = at + text_key.len();
+            if let Some(raw) = read_until_quote(runs, at + text_key.len()) {
+                title.push_str(&unescape_json_str(raw));
+            }
+        }
+        return (!title.trim().is_empty()).then_some(title);
+    }
+    for prefix in ["{\"simpleText\":\"", "{\"content\":\"", "\""] {
+        if let Some(after) = rest.strip_prefix(prefix) {
+            if let Some(raw) = read_until_quote(after, 0) {
+                let t = unescape_json_str(raw);
+                if !t.trim().is_empty() {
+                    return Some(t);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The 11-char `videoId` in `slice` closest to byte offset `center`.
+fn nearest_video_id(slice: &str, center: usize) -> Option<String> {
+    let key = "\"videoId\":\"";
+    let mut best: Option<(usize, String)> = None;
+    let mut from = 0;
+    while let Some(r) = slice[from..].find(key) {
+        let at = from + r;
+        from = at + key.len();
+        if let Some(id) = read_until_quote(slice, at + key.len()) {
+            if id.len() == 11 {
+                let dist = at.abs_diff(center);
+                if best.as_ref().is_none_or(|(d, _)| dist < *d) {
+                    best = Some((dist, id.to_string()));
+                }
+            }
+        }
+    }
+    best.map(|(_, id)| id)
 }
 
 /// Recursively collect upcoming-stream entries from `ytInitialData`:
@@ -2349,5 +2956,35 @@ mod tests {
         let ampm = parse_yt_scheduled_text("Scheduled for 23/06/2026, 9:00 PM").unwrap();
         let h24 = parse_yt_scheduled_text("Scheduled for 23/06/2026, 21:00").unwrap();
         assert_eq!(ampm, h24, "12h and 24h formats should parse to the same timestamp");
+    }
+
+    #[test]
+    fn fallback_scan_finds_upcoming_when_structured_misses() {
+        // A body whose markers exist but NOT under a recognized renderer shape, so
+        // `parse_youtube_schedule` (structured walk) returns nothing.
+        let body = r#"junk {"videoId":"vid01234567","title":{"runs":[{"text":"Late "},{"text":"Night"}]},"foo":{"upcomingEventData":{"startTime":"1700000000"}}} more
+            {"scheduledStartTime":"2026-06-18T18:00:00Z","videoId":"vidABCDEFGH","title":{"simpleText":"Morning Show"}}"#;
+        // Structured parse misses (no videoRenderer / lockup wrapper).
+        assert!(parse_youtube_schedule(body).is_empty());
+        // Fallback recovers both, sorted by start.
+        let mut out = Vec::new();
+        collect_upcoming_fallback(body, &mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].start_time, 1_700_000_000);
+        assert_eq!(out[0].title, "Late Night");
+        assert_eq!(out[0].video_id.as_deref(), Some("vid01234567"));
+        assert_eq!(out[1].start_time, 1_781_805_600); // 2026-06-18T18:00:00Z
+        assert_eq!(out[1].title, "Morning Show");
+        assert_eq!(out[1].video_id.as_deref(), Some("vidABCDEFGH"));
+    }
+
+    #[test]
+    fn fallback_scan_uses_placeholder_title_when_none_nearby() {
+        let body = r#"{"upcomingEventData":{"startTime":"1700000000"}}"#;
+        let mut out = Vec::new();
+        collect_upcoming_fallback(body, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].title, "Upcoming stream");
+        assert_eq!(out[0].video_id, None);
     }
 }

@@ -1017,12 +1017,6 @@ impl Store {
 
     // ----- schedule (upcoming streams) -----
 
-    /// Replace a monitor's *platform-sourced* schedule wholesale with a
-    /// freshly-fetched set. Called by the Twitch/YouTube schedule refresher.
-    pub fn replace_schedule(&self, monitor_id: i64, segs: &[ScheduleSegment]) -> Result<()> {
-        self.replace_schedule_source(monitor_id, "platform", segs)
-    }
-
     /// Replace one monitor's schedule for a single `source` (`"platform"` or
     /// `"discord"`), leaving its other sources intact (delete-then-insert in one
     /// transaction). Lets the platform schedule and Discord events coexist without
@@ -1061,6 +1055,19 @@ impl Store {
         Ok(())
     }
 
+    /// Delete a monitor's schedule segments from every source EXCEPT `keep`. The
+    /// ordered-source refresh calls this after a source resolves a schedule, so
+    /// exactly one source's rows remain per monitor (the highest-priority one that
+    /// resolved) — a lower-priority source can't leave stale rows behind.
+    pub fn clear_other_schedule_sources(&self, monitor_id: i64, keep: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM schedule_segment WHERE monitor_id = ?1 AND source <> ?2",
+            params![monitor_id, keep],
+        )?;
+        Ok(())
+    }
+
     /// Delete every schedule segment from one `source` across all monitors. Used to
     /// purge imported Discord events when that import is turned off.
     pub fn clear_schedule_source(&self, source: &str) -> Result<()> {
@@ -1072,18 +1079,19 @@ impl Store {
         Ok(())
     }
 
-    /// Monitor ids that currently have at least one upcoming (non-canceled,
-    /// start ≥ `after`) *platform*-sourced schedule segment. The Discord sweep uses
-    /// this to avoid attaching Discord events to a channel whose platform already
-    /// publishes a schedule (so the two sources never duplicate).
-    pub fn monitors_with_upcoming_platform(
+    /// Monitor ids with at least one upcoming (non-canceled, start ≥ `after`)
+    /// schedule segment from any source OTHER than `discord`. The Discord sweep
+    /// uses this so it never attaches an event to a channel that already resolved a
+    /// schedule from a higher-priority source (the two would otherwise duplicate) —
+    /// the winning source may be `platform`, `youtube`, an OCR source, etc.
+    pub fn monitors_with_upcoming_non_discord(
         &self,
         after: i64,
     ) -> Result<std::collections::HashSet<i64>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT DISTINCT monitor_id FROM schedule_segment
-             WHERE source = 'platform' AND canceled = 0 AND start_time >= ?1",
+             WHERE source <> 'discord' AND canceled = 0 AND start_time >= ?1",
         )?;
         let ids = stmt
             .query_map(params![after], |r| r.get::<_, i64>(0))?
@@ -2082,8 +2090,9 @@ mod tests {
         };
         // Out of order; a past one, a canceled one, and two future.
         store
-            .replace_schedule(
+            .replace_schedule_source(
                 mid,
+                "platform",
                 &[
                     seg(5_000, "Later", false),
                     seg(500, "Past", false),
@@ -2104,7 +2113,9 @@ mod tests {
         assert_eq!(next, vec![(mid, 2_000, "Next up".to_string())]);
 
         // Replace wipes the old set.
-        store.replace_schedule(mid, &[seg(9_000, "Fresh", false)]).unwrap();
+        store
+            .replace_schedule_source(mid, "platform", &[seg(9_000, "Fresh", false)])
+            .unwrap();
         let next = store.next_scheduled_streams(1_000).unwrap();
         assert_eq!(next, vec![(mid, 9_000, "Fresh".to_string())]);
 
@@ -2137,14 +2148,16 @@ mod tests {
             video_id: None,
         };
         store
-            .replace_schedule(
+            .replace_schedule_source(
                 mid1,
+                "platform",
                 &[seg(500, "Past", false), seg(2_000, "TW soon", false)],
             )
             .unwrap();
         store
-            .replace_schedule(
+            .replace_schedule_source(
                 mid2,
+                "platform",
                 &[seg(3_000, "Canceled", true), seg(1_500, "YT soon", false)],
             )
             .unwrap();
@@ -2184,7 +2197,9 @@ mod tests {
         };
 
         // A platform segment and a Discord segment for the same monitor coexist.
-        store.replace_schedule(mid, &[seg(2_000, "Platform")]).unwrap();
+        store
+            .replace_schedule_source(mid, "platform", &[seg(2_000, "Platform")])
+            .unwrap();
         store
             .replace_schedule_source(mid, "discord", &[seg(3_000, "Discord")])
             .unwrap();
@@ -2195,17 +2210,18 @@ mod tests {
         assert!(all.iter().any(|s| s.title == "Discord" && s.is_discord()));
         assert!(all.iter().any(|s| s.title == "Platform" && !s.is_discord()));
 
-        // The monitor counts as having an upcoming platform schedule.
-        assert!(store.monitors_with_upcoming_platform(1_000).unwrap().contains(&mid));
+        // The monitor counts as having an upcoming non-Discord schedule (the
+        // platform segment), which suppresses the Discord sweep for it.
+        assert!(store.monitors_with_upcoming_non_discord(1_000).unwrap().contains(&mid));
 
         // Replacing one source leaves the other intact.
         store.replace_schedule_source(mid, "discord", &[]).unwrap();
         let all = store.all_upcoming_schedule(1_000).unwrap();
         assert_eq!(all.iter().map(|s| s.title.as_str()).collect::<Vec<_>>(), vec!["Platform"]);
 
-        // Clearing the platform source drops it from the platform-presence set.
-        store.replace_schedule(mid, &[]).unwrap();
-        assert!(!store.monitors_with_upcoming_platform(1_000).unwrap().contains(&mid));
+        // Clearing the platform source drops it from the non-Discord presence set.
+        store.replace_schedule_source(mid, "platform", &[]).unwrap();
+        assert!(!store.monitors_with_upcoming_non_discord(1_000).unwrap().contains(&mid));
     }
 
     #[test]

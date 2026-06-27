@@ -51,6 +51,22 @@ pub fn channel_asset_dir(name: &str, platform: crate::models::Platform) -> PathB
         .join(platform.as_str())
 }
 
+/// First file in `dir` whose name starts with `prefix` (e.g. `"banner."`). Used to
+/// locate a canonical channel asset (`icon.png`, `banner.jpg`) without knowing its
+/// extension. Skips the `history/` subdir and archived `{stem}_{ts}.ext` variants
+/// since those don't start with `{stem}.`.
+pub(crate) fn find_asset(dir: &Path, prefix: &str) -> Option<PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(prefix))
+        })
+}
+
 /// Derive a file extension from a URL path (before `?` query string).
 fn ext_from_url(url: &str) -> Option<&str> {
     let path = url.split('?').next()?;

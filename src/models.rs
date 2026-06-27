@@ -1176,6 +1176,28 @@ pub const K_YT_API_SCHEDULE: &str = "youtube_api_schedule";
 pub const K_DISCORD_TOKEN: &str = "discord_user_token";
 pub const K_DISCORD_SCHEDULE: &str = "discord_schedule";
 
+/// `app_settings` key for the ordered list of schedule sources (JSON
+/// `Vec<SourceEntry>`); see [`crate::schedule_source`]. Each entry is a stable
+/// source id + an enabled flag; the schedule refresh walks enabled entries
+/// top-to-bottom per channel and the first to resolve a non-empty schedule wins.
+pub const K_SCHEDULE_SOURCES: &str = "schedule_sources";
+
+/// `app_settings` key for per-channel schedule-source config (JSON map
+/// `{channel_id -> ChannelSourceConfig}`): Twitter/X handle, a manual schedule
+/// image path/URL, and per-channel OCR overrides. See [`crate::schedule_source`].
+pub const K_CHANNEL_SOURCE_CFG: &str = "channel_source_config";
+
+/// `app_settings` keys for the image→schedule OCR pipeline ([`crate::schedule_ocr`]),
+/// which shells out to an LLM CLI (default the `claude` CLI). `K_OCR_COMMAND` is
+/// the executable; `K_OCR_MODEL`/`K_OCR_FALLBACK_MODEL` are the primary + retry
+/// models; `K_OCR_TIMEZONE`/`K_OCR_OFFSET` are the IANA timezone + UTC offset to
+/// assume for banner times (banners rarely show either). Empty = built-in default.
+pub const K_OCR_COMMAND: &str = "ocr_command";
+pub const K_OCR_MODEL: &str = "ocr_model";
+pub const K_OCR_FALLBACK_MODEL: &str = "ocr_fallback_model";
+pub const K_OCR_TIMEZONE: &str = "ocr_timezone";
+pub const K_OCR_OFFSET: &str = "ocr_offset";
+
 /// Current unix timestamp in seconds.
 pub fn now_unix() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
