@@ -33,7 +33,7 @@ use crate::oauth::{self, AuthFlow};
 use crate::platform::AutoStart;
 use crate::schedule_source::{
     ScheduleSourceKind, SourceEntry, load_channel_cfg, load_source_order, save_channel_cfg,
-    save_source_order,
+    save_source_order, source_badge,
 };
 
 const K_TWITCH_ID: &str = "twitch_client_id";
@@ -571,6 +571,9 @@ pub struct StreamArchiverApp {
     /// Editable per-channel schedule-source config shown in the Properties window,
     /// tagged with its channel id. Loaded when Properties opens; saved on edit.
     channel_cfg_draft: Option<(i64, crate::schedule_source::ChannelSourceConfig)>,
+    /// Draft for the "Edit schedule item" dialog (None = closed). Saving converts
+    /// the row to a protected `"manual"` source so refreshes don't overwrite it.
+    edit_schedule: Option<EditScheduleDraft>,
     /// Chat log viewer popup (None = closed).
     chat_popup: Option<ChatPopup>,
     /// Platform favicons, uploaded to the GPU on first use (None until then).
@@ -875,6 +878,7 @@ impl StreamArchiverApp {
             schedule_sources_draft: Vec::new(),
             schedule_sources_selected: None,
             channel_cfg_draft: None,
+            edit_schedule: None,
             chat_popup: None,
             platform_tex: None,
             properties_popup: None,
@@ -956,6 +960,9 @@ impl StreamArchiverApp {
     /// (Re)load every upcoming scheduled stream for the Schedule calendar. Loaded
     /// from the start of today (local) so today's full day shows even past streams.
     fn reload_schedule(&mut self) {
+        // The Properties "Upcoming streams" popup caches per-monitor segments
+        // separately; drop it so an edit/delete here isn't shown stale there.
+        self.schedule_cache.clear();
         match self.core.store.all_upcoming_schedule(today_start_unix()) {
             Ok(v) => {
                 self.schedule_all = v;
@@ -1512,6 +1519,36 @@ fn local_date(secs: i64) -> Option<chrono::NaiveDate> {
     chrono::DateTime::from_timestamp(secs, 0).map(|dt| dt.with_timezone(&chrono::Local).date_naive())
 }
 
+/// Split a unix timestamp into local `("YYYY-MM-DD", "HH:MM")` for the
+/// Edit-schedule dialog fields. Empty pair on an out-of-range timestamp.
+fn split_local_datetime(unix: i64) -> (String, String) {
+    match chrono::DateTime::from_timestamp(unix, 0) {
+        Some(dt) => {
+            let local = dt.with_timezone(&chrono::Local);
+            (
+                local.format("%Y-%m-%d").to_string(),
+                local.format("%H:%M").to_string(),
+            )
+        }
+        None => (String::new(), String::new()),
+    }
+}
+
+/// Parse local `YYYY-MM-DD` + `HH:MM` (or `HH:MM:SS`) into unix seconds in the
+/// machine's local timezone. `None` on malformed input or a nonexistent/ambiguous
+/// local time (a DST gap/overlap), so the Edit dialog can show a validation error.
+fn parse_local_datetime(date: &str, time: &str) -> Option<i64> {
+    use chrono::{NaiveDate, NaiveTime, TimeZone};
+    let d = NaiveDate::parse_from_str(date.trim(), "%Y-%m-%d").ok()?;
+    let t = NaiveTime::parse_from_str(time.trim(), "%H:%M")
+        .or_else(|_| NaiveTime::parse_from_str(time.trim(), "%H:%M:%S"))
+        .ok()?;
+    chrono::Local
+        .from_local_datetime(&d.and_time(t))
+        .single()
+        .map(|dt| dt.timestamp())
+}
+
 /// Build a filename preview for the Format Designer using real monitor/recording
 /// data. Media info is synthetic (1920×1080/60fps/h264/aac) since probing requires
 /// async work the UI thread doesn't do. Extension is NOT included.
@@ -1743,10 +1780,22 @@ fn schedule_detail_line(s: &UpcomingStream) -> String {
     if !s.url.is_empty() {
         parts.push(s.url.clone());
     }
-    if s.is_discord() {
-        parts.push("Source: Discord event".to_string());
-    }
+    // Always name the source (badge + label) so the hover/copy text says where the
+    // schedule came from — published platform schedule, an OCR'd image, Discord, or
+    // a manual correction.
+    let (badge, label) = source_badge(&s.source);
+    parts.push(format!("Source: {badge} {label}"));
     parts.join("\n")
+}
+
+/// Render the compact source-indicator badge for an upcoming-stream entry next to
+/// the platform icon (`📡` published schedule · `📺` YouTube · `📷` OCR'd image ·
+/// `💬` Discord · `✏` manually edited), with a hover naming the source. Shared by
+/// every calendar render site so the origin is always visible at a glance.
+fn schedule_source_badge(ui: &mut egui::Ui, source: &str) {
+    let (icon, label) = source_badge(source);
+    ui.add(egui::Label::new(egui::RichText::new(icon).small().weak()))
+        .on_hover_text(format!("Source: {label}"));
 }
 
 /// Right-click menu for an upcoming-stream entry (calendar chip + day popup): copy
@@ -1789,6 +1838,27 @@ fn schedule_copy_menu(ui: &mut egui::Ui, s: &UpcomingStream) {
         ui.close();
     }
     ui.separator();
+    if ui.button("✏  Edit…").clicked() {
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(egui::Id::new("sched_edit"), s.segment_id));
+        ui.close();
+    }
+    // "Open source" goes to where the item came from (platform schedule page or
+    // the source image); disabled for manual edits and Discord events, which have
+    // no external origin to open.
+    let open_src_enabled = !s.is_manual()
+        && ScheduleSourceKind::from_id(&s.source).is_some_and(|k| k.has_open_target());
+    if ui
+        .add_enabled(open_src_enabled, egui::Button::new("🔗  Open source"))
+        .on_hover_text("Open where this schedule item came from (the platform schedule page or the source image).")
+        .on_disabled_hover_text("No external source to open (manually edited or a Discord event).")
+        .clicked()
+    {
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(egui::Id::new("sched_open_src"), s.segment_id));
+        ui.close();
+    }
+    ui.separator();
     if ui.button("📺  Go to channel").clicked() {
         ui.ctx()
             .data_mut(|d| d.insert_temp(egui::Id::new("sched_jump"), s.monitor_id));
@@ -1825,6 +1895,7 @@ fn schedule_detail_row(
             }
             ui.label(egui::RichText::new(fmt_time_range(s.start_time, s.end_time)).monospace());
             platform_icon(ui, ptex, s.platform());
+            schedule_source_badge(ui, &s.source);
             let mut line = s.channel_name.clone();
             if !s.title.is_empty() {
                 line.push_str(" — ");
@@ -2085,11 +2156,12 @@ fn schedule_time_grid(
                         let time_font = egui::FontId::proportional(10.0);
                         let white = egui::Color32::WHITE;
                         let text_y = text_rect.top();
-                        // Channel name
+                        // Source badge glyph + channel name (the dense grid has no
+                        // room for a separate widget, so prefix the channel name).
                         painter.text(
                             egui::pos2(text_rect.left(), text_y),
                             egui::Align2::LEFT_TOP,
-                            &s.channel_name,
+                            format!("{} {}", source_badge(&s.source).0, s.channel_name),
                             name_font,
                             white,
                         );
@@ -2178,6 +2250,9 @@ const SUCCESS_GREEN: egui::Color32 = egui::Color32::from_rgb(0x57, 0xc7, 0x57);
 /// (red). Recording + keyboard-selected rows reuse the theme's selection accent.
 const HL_AD: egui::Color32 = egui::Color32::from_rgb(0x7a, 0x5a, 0x12);
 const HL_ERROR: egui::Color32 = egui::Color32::from_rgb(0x6e, 0x2f, 0x2f);
+/// Readable red for inline error/validation *text* (the row tint [`HL_ERROR`] is
+/// too dark to read as a foreground colour).
+const HL_ERROR_TEXT: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x6c, 0x6c);
 
 /// Background tint for a Streams row, by state (highest priority first): an ad is
 /// playing > recording > last poll/recording errored > keyboard-selected.
@@ -2393,6 +2468,31 @@ enum MetaPopup {
     /// A whole stream's takes — `(recording id, started_at)`, oldest-first —
     /// aggregated chronologically with the per-take re-baselines omitted.
     Stream(Vec<(i64, i64)>),
+}
+
+/// Draft state for the "Edit schedule item" dialog. Times are edited as local
+/// `YYYY-MM-DD` / `HH:MM` strings; on save they're parsed back to unix seconds and
+/// written via [`Store::update_schedule_segment_manual`](crate::store::Store::update_schedule_segment_manual),
+/// which flips the row to the protected `"manual"` source so later automatic
+/// refreshes don't overwrite the correction.
+struct EditScheduleDraft {
+    /// `schedule_segment.id` of the row being edited.
+    segment_id: i64,
+    /// For the dialog heading.
+    channel_name: String,
+    /// Original source id — shown in the heading so the user sees what they're
+    /// overriding (e.g. an OCR'd banner).
+    source: String,
+    title: String,
+    category: String,
+    /// Local `YYYY-MM-DD` / `HH:MM` of the start.
+    date: String,
+    time: String,
+    /// Optional local end — empty strings mean "no end time".
+    end_date: String,
+    end_time: String,
+    /// Validation message shown in red (empty = none).
+    error: String,
 }
 
 /// Source platform of a captured chat message (drives username colouring).
@@ -3638,6 +3738,7 @@ impl eframe::App for StreamArchiverApp {
         self.schedule_popup_window(ui.ctx());
         self.schedule_sources_window(ui.ctx());
         self.schedule_day_window(ui.ctx());
+        self.edit_schedule_window(ui.ctx());
         self.chat_popup_window(ui.ctx());
         self.properties_window(ui.ctx());
         self.processes_window(ui.ctx());
@@ -5394,6 +5495,7 @@ impl StreamArchiverApp {
     /// The "Schedule sources" dialog: two columns (Available / Enabled) with →/←
     /// transfer and ▲/▼ priority reordering, mirroring the user's mockup. Every
     /// change persists the order and asks the refresher to re-walk the sources.
+    #[allow(deprecated)]
     fn schedule_sources_window(&mut self, ctx: &egui::Context) {
         if !self.show_schedule_sources {
             return;
@@ -5923,6 +6025,19 @@ impl StreamArchiverApp {
             self.core.manual(ManualCommand::Start(mid));
             self.status = "Checking channel… will record if live.".into();
         }
+        if let Some(sid) = ui
+            .ctx()
+            .data_mut(|d| d.remove_temp::<i64>(egui::Id::new("sched_edit")))
+        {
+            self.open_edit_schedule(sid);
+        }
+        if let Some(sid) = ui
+            .ctx()
+            .data_mut(|d| d.remove_temp::<i64>(egui::Id::new("sched_open_src")))
+        {
+            let ctx = ui.ctx().clone();
+            self.open_schedule_source(sid, &ctx);
+        }
     }
 
     /// One compact calendar chip (colored stripe · ⚠ · platform icon · time range · channel)
@@ -5950,6 +6065,7 @@ impl StreamArchiverApp {
                     ui.colored_label(HL_COLLISION, "⚠");
                 }
                 platform_icon(ui, ptex, s.platform());
+                schedule_source_badge(ui, &s.source);
                 ui.add(
                     egui::Label::new(format!(
                         "{}  {}",
@@ -6277,8 +6393,9 @@ impl StreamArchiverApp {
                                     .size(12.0),
                             ));
 
-                            // Platform icon
+                            // Platform icon + source badge
                             platform_icon(ui, ptex, s.platform());
+                            schedule_source_badge(ui, &s.source);
 
                             // Channel name (bold)
                             ui.strong(&s.channel_name);
@@ -6389,6 +6506,303 @@ impl StreamArchiverApp {
         }
         if !open {
             self.schedule_day_popup = None;
+        }
+    }
+
+    /// Open the "Edit schedule item" dialog for a calendar occurrence (by segment
+    /// id), seeding the draft from its current stored values. No-op if the segment
+    /// is no longer in the loaded calendar (e.g. a refresh dropped it).
+    fn open_edit_schedule(&mut self, segment_id: i64) {
+        let Some(s) = self
+            .schedule_all
+            .iter()
+            .find(|s| s.segment_id == segment_id)
+        else {
+            return;
+        };
+        let (date, time) = split_local_datetime(s.start_time);
+        let (end_date, end_time) = match s.end_time {
+            Some(e) => split_local_datetime(e),
+            None => (String::new(), String::new()),
+        };
+        self.edit_schedule = Some(EditScheduleDraft {
+            segment_id,
+            channel_name: s.channel_name.clone(),
+            source: s.source.clone(),
+            title: s.title.clone(),
+            category: s.category.clone(),
+            date,
+            time,
+            end_date,
+            end_time,
+            error: String::new(),
+        });
+    }
+
+    /// Open where a calendar item's schedule came from: the platform schedule page,
+    /// the community/profile page, or the source image. No-op for manual rows and
+    /// Discord events (the context item is disabled for those).
+    fn open_schedule_source(&mut self, segment_id: i64, ctx: &egui::Context) {
+        enum Target {
+            Url(String),
+            Path(std::path::PathBuf),
+        }
+        let Some(s) = self
+            .schedule_all
+            .iter()
+            .find(|s| s.segment_id == segment_id)
+        else {
+            return;
+        };
+        let Some(kind) = ScheduleSourceKind::from_id(&s.source) else {
+            self.status = "No external source to open for this item.".into();
+            return;
+        };
+        let target = match kind {
+            ScheduleSourceKind::TwitchSchedule => crate::detectors::twitch_login(&s.url)
+                .map(|login| Target::Url(format!("https://www.twitch.tv/{login}/schedule"))),
+            ScheduleSourceKind::YouTubeScrape | ScheduleSourceKind::YouTubeApi => {
+                Some(Target::Url(crate::detectors::youtube_streams_url(&s.url)))
+            }
+            ScheduleSourceKind::YouTubeCommunityOcr => {
+                Some(Target::Url(crate::detectors::youtube_community_url(&s.url)))
+            }
+            ScheduleSourceKind::TwitchBannerOcr => {
+                // Prefer the OCR'd offline-banner image on disk; fall back to the
+                // channel page (which shows the banner when offline).
+                let dir = crate::assets::channel_asset_dir(&s.channel_name, Platform::Twitch);
+                crate::assets::find_asset(&dir, "banner.")
+                    .map(Target::Path)
+                    .or_else(|| {
+                        crate::detectors::twitch_login(&s.url)
+                            .map(|login| Target::Url(format!("https://www.twitch.tv/{login}")))
+                    })
+            }
+            ScheduleSourceKind::TwitterPinned => {
+                let handle = load_channel_cfg(&self.core.store, s.channel_id).twitter_handle;
+                let handle = handle.trim().trim_start_matches('@');
+                (!handle.is_empty()).then(|| Target::Url(format!("https://x.com/{handle}")))
+            }
+            ScheduleSourceKind::OtherImageOcr => {
+                let img = load_channel_cfg(&self.core.store, s.channel_id).other_image;
+                let img = img.trim().to_string();
+                if img.is_empty() {
+                    None
+                } else if img.starts_with("http://") || img.starts_with("https://") {
+                    Some(Target::Url(img))
+                } else {
+                    Some(Target::Path(std::path::PathBuf::from(img)))
+                }
+            }
+            ScheduleSourceKind::Discord => None,
+        };
+        match target {
+            Some(Target::Url(url)) => ctx.open_url(egui::OpenUrl::new_tab(url)),
+            Some(Target::Path(path)) => crate::platform::open_path(&path),
+            None => self.status = "Couldn't resolve this item's source to open.".into(),
+        }
+    }
+
+    /// The "Edit schedule item" dialog (None = closed). Lets the user correct an
+    /// occurrence's time/title/category or delete it; saving marks the row
+    /// `"manual"` so a later automatic refresh leaves the correction intact.
+    #[allow(deprecated)] // CentralPanel::show inside a viewport (matches the other dialogs)
+    fn edit_schedule_window(&mut self, ctx: &egui::Context) {
+        if self.edit_schedule.is_none() {
+            return;
+        }
+        let mut open = true;
+        // Actions collected inside the closure, applied after it (the closure
+        // borrows the draft mutably; these touch the store / reload).
+        let mut do_save = false;
+        let mut do_delete = false;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("edit_schedule_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("Edit schedule item")
+                .with_inner_size([440.0, 320.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                let Some(d) = self.edit_schedule.as_mut() else {
+                    return;
+                };
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let (badge, label) = source_badge(&d.source);
+                    ui.horizontal(|ui| {
+                        ui.strong(&d.channel_name);
+                        ui.weak(format!("· source: {badge} {label}"));
+                    });
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Times are in your local timezone. Saving marks this item as manually \
+                             edited so automatic refreshes won't overwrite it.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.add_space(8.0);
+                    egui::Grid::new("edit_sched_grid")
+                        .num_columns(2)
+                        .spacing([12.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Title");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut d.title).desired_width(300.0),
+                            );
+                            ui.end_row();
+
+                            ui.label("Category");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut d.category)
+                                    .hint_text("optional")
+                                    .desired_width(300.0),
+                            );
+                            ui.end_row();
+
+                            ui.label("Start");
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut d.date)
+                                        .hint_text("YYYY-MM-DD")
+                                        .desired_width(110.0),
+                                );
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut d.time)
+                                        .hint_text("HH:MM")
+                                        .desired_width(70.0),
+                                );
+                            });
+                            ui.end_row();
+
+                            ui.label("End");
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut d.end_date)
+                                        .hint_text("YYYY-MM-DD")
+                                        .desired_width(110.0),
+                                );
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut d.end_time)
+                                        .hint_text("HH:MM")
+                                        .desired_width(70.0),
+                                );
+                                ui.weak("(optional)");
+                            });
+                            ui.end_row();
+                        });
+
+                    if !d.error.is_empty() {
+                        ui.add_space(4.0);
+                        ui.colored_label(HL_ERROR_TEXT, &d.error);
+                    }
+
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("💾  Save").clicked() {
+                            do_save = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            open = false;
+                        }
+                        ui.add_space(16.0);
+                        if ui
+                            .button(egui::RichText::new("🗑  Delete").color(HL_ERROR_TEXT))
+                            .on_hover_text("Remove this occurrence from the calendar.")
+                            .clicked()
+                        {
+                            do_delete = true;
+                        }
+                    });
+                });
+            },
+        );
+
+        if do_delete {
+            if let Some(d) = self.edit_schedule.take() {
+                match self.core.store.delete_schedule_segment(d.segment_id) {
+                    Err(e) => self.status = format!("Error deleting item: {e}"),
+                    Ok(0) => {
+                        self.reload_schedule();
+                        self.status = "Schedule item was already gone.".into();
+                    }
+                    Ok(_) => {
+                        self.reload_schedule();
+                        self.status = "Schedule item deleted.".into();
+                    }
+                }
+            }
+            return;
+        }
+
+        if do_save {
+            // Validate against the draft, writing the error back into it on failure
+            // (so the dialog stays open and shows why).
+            let parsed = self.edit_schedule.as_ref().and_then(|d| {
+                let start = parse_local_datetime(&d.date, &d.time)?;
+                // End is optional; when both fields are blank there's no end. When
+                // partially filled or unparseable, treat as an error below. A start
+                // before today's local midnight is rejected up front: the calendar
+                // only loads start ≥ today, so saving a past time would silently
+                // drop the row from every view despite a "success" message.
+                let end = if start < today_start_unix() {
+                    Err("Start must be today or later.")
+                } else if d.end_date.trim().is_empty() && d.end_time.trim().is_empty() {
+                    Ok(None)
+                } else {
+                    match parse_local_datetime(&d.end_date, &d.end_time) {
+                        Some(e) if e > start => Ok(Some(e)),
+                        Some(_) => Err("End must be after start."),
+                        None => Err("End date/time is invalid."),
+                    }
+                };
+                Some((d.segment_id, start, end, d.title.trim().to_string(), d.category.trim().to_string()))
+            });
+            match parsed {
+                None => {
+                    if let Some(d) = self.edit_schedule.as_mut() {
+                        d.error = "Start date/time is invalid (use YYYY-MM-DD and HH:MM).".into();
+                    }
+                }
+                Some((_, _, Err(msg), _, _)) => {
+                    if let Some(d) = self.edit_schedule.as_mut() {
+                        d.error = msg.into();
+                    }
+                }
+                Some((id, start, Ok(end), title, category)) if !title.is_empty() => {
+                    match self.core.store.update_schedule_segment_manual(
+                        id, start, end, &title, &category,
+                    ) {
+                        Ok(0) => {
+                            if let Some(d) = self.edit_schedule.as_mut() {
+                                d.error =
+                                    "This item no longer exists (a refresh may have cleared it).".into();
+                            }
+                        }
+                        Ok(_) => {
+                            self.edit_schedule = None;
+                            self.reload_schedule();
+                            self.status = "Schedule item updated (marked manual).".into();
+                        }
+                        Err(e) => {
+                            if let Some(d) = self.edit_schedule.as_mut() {
+                                d.error = format!("Error saving: {e}");
+                            }
+                        }
+                    }
+                }
+                Some(_) => {
+                    if let Some(d) = self.edit_schedule.as_mut() {
+                        d.error = "Title can't be empty.".into();
+                    }
+                }
+            }
+        }
+
+        if !open {
+            self.edit_schedule = None;
         }
     }
 
@@ -8330,15 +8744,18 @@ impl StreamArchiverApp {
                          Default: sonnet.",
                     );
                     ui.end_row();
-                    ui.label("Assume timezone");
+                    ui.label("Primary timezone");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.settings.ocr_timezone)
                             .hint_text("(machine local)")
                             .desired_width(220.0),
                     )
                     .on_hover_text(
-                        "IANA timezone to assume for banner times (e.g. Europe/Oslo). Banners \
-                         rarely show one; leave empty to use the machine's local timezone.",
+                        "The primary IANA timezone a schedule's day/date headers are written in \
+                         (e.g. America/Los_Angeles). When an image lists several timezones for one \
+                         stream, this anchors the date and is preferred for the conversion. Leave \
+                         empty to use the machine's local timezone. Override per channel in \
+                         Properties.",
                     );
                     ui.end_row();
                     ui.label("UTC offset");
@@ -10526,12 +10943,17 @@ impl StreamArchiverApp {
                             }
                             ui.end_row();
 
-                            ui.label("OCR timezone override");
+                            ui.label("OCR primary timezone");
                             if ui
                                 .add(
                                     egui::TextEdit::singleline(&mut cfg.ocr_timezone)
                                         .hint_text("(global default)")
                                         .desired_width(240.0),
+                                )
+                                .on_hover_text(
+                                    "Primary IANA timezone this channel's schedule images are \
+                                     written in (e.g. America/Los_Angeles). Anchors the date when \
+                                     an image lists multiple timezones for one stream.",
                                 )
                                 .changed()
                             {

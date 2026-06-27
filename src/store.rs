@@ -1029,16 +1029,51 @@ impl Store {
     ) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        // Drop stale tombstones (canceled rows well past their instant): an
+        // automatic source only re-emits UPCOMING streams, so an old tombstone can
+        // no longer collide with a fetched segment and would otherwise accumulate
+        // forever (see the suppression set below). Keep a 24h grace so a deleted
+        // event still showing in today's calendar window (which spans back to local
+        // midnight) stays suppressed even after its start time passes.
         tx.execute(
-            "DELETE FROM schedule_segment WHERE monitor_id = ?1 AND source = ?2",
+            "DELETE FROM schedule_segment
+             WHERE monitor_id = ?1 AND canceled = 1 AND start_time < ?2",
+            params![monitor_id, now_unix() - 86_400],
+        )?;
+        // Replace only this source's LIVE rows. Tombstones (canceled = 1) are
+        // deliberately preserved so a user's "Delete" / time-correction survives
+        // this re-fetch (see the suppression set below).
+        tx.execute(
+            "DELETE FROM schedule_segment
+             WHERE monitor_id = ?1 AND source = ?2 AND canceled = 0",
             params![monitor_id, source],
         )?;
+        // Start instants an automatic source must NOT re-create for this monitor:
+        //  • those claimed by a protected manual row (a user's correction — don't
+        //    duplicate it at the same instant), and
+        //  • those a user explicitly removed or moved away from (tombstones,
+        //    canceled = 1 — re-inserting would resurrect a deleted occurrence, or
+        //    re-add the pre-correction copy of a rescheduled one).
+        // Storing the manual source itself doesn't self-suppress on manual rows,
+        // but still honours tombstones.
+        let suppressed_starts: std::collections::HashSet<i64> = {
+            let mut stmt = tx.prepare(
+                "SELECT start_time FROM schedule_segment
+                 WHERE monitor_id = ?1
+                   AND ((source = 'manual' AND ?2 <> 'manual') OR canceled = 1)",
+            )?;
+            stmt.query_map(params![monitor_id, source], |r| r.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?
+        };
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO schedule_segment(monitor_id, start_time, end_time, title, category, canceled, source, video_id)
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
             for s in segs {
+                if suppressed_starts.contains(&s.start_time) {
+                    continue;
+                }
                 stmt.execute(params![
                     monitor_id,
                     s.start_time,
@@ -1055,17 +1090,91 @@ impl Store {
         Ok(())
     }
 
-    /// Delete a monitor's schedule segments from every source EXCEPT `keep`. The
-    /// ordered-source refresh calls this after a source resolves a schedule, so
-    /// exactly one source's rows remain per monitor (the highest-priority one that
-    /// resolved) — a lower-priority source can't leave stale rows behind.
+    /// Delete a monitor's schedule segments from every source EXCEPT `keep` (and
+    /// EXCEPT protected `"manual"` rows). The ordered-source refresh calls this
+    /// after a source resolves a schedule, so exactly one automatic source's rows
+    /// remain per monitor (the highest-priority one that resolved) — a
+    /// lower-priority source can't leave stale rows behind. User-edited `"manual"`
+    /// rows always survive so an automatic refresh never discards a correction;
+    /// tombstones (`canceled = 1`) also survive so a user's "Delete" keeps
+    /// suppressing the deleted occurrence on later refreshes.
     pub fn clear_other_schedule_sources(&self, monitor_id: i64, keep: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "DELETE FROM schedule_segment WHERE monitor_id = ?1 AND source <> ?2",
+            "DELETE FROM schedule_segment
+             WHERE monitor_id = ?1 AND source <> ?2 AND source <> 'manual'
+               AND canceled = 0",
             params![monitor_id, keep],
         )?;
         Ok(())
+    }
+
+    /// Convert one schedule segment into a protected manual entry, overwriting its
+    /// time/title/category. The row's `source` becomes `"manual"` and `canceled`
+    /// is cleared, so subsequent automatic refreshes of other sources leave it
+    /// intact (see [`Self::clear_other_schedule_sources`]). Backs the calendar's
+    /// "Edit…" dialog. Returns the number of rows updated — `0` means the segment
+    /// no longer exists (e.g. a background refresh cleared it mid-edit), so the
+    /// caller can report the edit didn't apply instead of falsely claiming success.
+    ///
+    /// When the edit MOVES an automatic event to a new instant, a tombstone
+    /// (`canceled = 1`) is left at the original instant so the next refresh of
+    /// that source doesn't re-create the stream at its old, uncorrected time
+    /// alongside the correction (see [`Self::replace_schedule_source`]).
+    pub fn update_schedule_segment_manual(
+        &self,
+        id: i64,
+        start_time: i64,
+        end_time: Option<i64>,
+        title: &str,
+        category: &str,
+    ) -> Result<usize> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        // Capture the pre-edit state so we know whether a time-move tombstone is
+        // needed and what source to attribute it to.
+        let orig: Option<(i64, i64, String)> = tx
+            .query_row(
+                "SELECT monitor_id, start_time, source FROM schedule_segment WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)),
+            )
+            .optional()?;
+        let Some((monitor_id, orig_start, orig_source)) = orig else {
+            return Ok(0);
+        };
+        let n = tx.execute(
+            "UPDATE schedule_segment
+                SET start_time = ?2, end_time = ?3, title = ?4, category = ?5,
+                    source = 'manual', canceled = 0
+              WHERE id = ?1",
+            params![id, start_time, end_time, title, category],
+        )?;
+        if n > 0 && orig_source != "manual" && orig_start != start_time {
+            tx.execute(
+                "INSERT INTO schedule_segment
+                     (monitor_id, start_time, end_time, title, category, canceled, source, video_id)
+                 VALUES (?1, ?2, NULL, '', '', 1, ?3, NULL)",
+                params![monitor_id, orig_start, orig_source],
+            )?;
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Remove one schedule segment from the calendar (the "Delete" action). For
+    /// automatic sources a hard delete wouldn't stick — the next refresh re-emits
+    /// the same occurrence — so this tombstones the row (`canceled = 1`) instead;
+    /// every read filters `canceled = 0`, and [`Self::replace_schedule_source`]
+    /// treats the tombstoned instant as suppressed, so the occurrence stays gone.
+    /// Returns the number of rows affected (`0` if it was already gone).
+    pub fn delete_schedule_segment(&self, id: i64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE schedule_segment SET canceled = 1 WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(n)
     }
 
     /// Delete every schedule segment from one `source` across all monitors. Used to
@@ -1171,7 +1280,7 @@ impl Store {
     pub fn all_upcoming_schedule(&self, after: i64) -> Result<Vec<UpcomingStream>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT s.monitor_id, m.channel_id, c.name, m.url,
+            "SELECT s.id, s.monitor_id, m.channel_id, c.name, m.url,
                     s.start_time, s.end_time, s.title, s.category, s.source,
                     c.color
              FROM schedule_segment s
@@ -1183,16 +1292,17 @@ impl Store {
         let rows = stmt
             .query_map(params![after], |r| {
                 Ok(UpcomingStream {
-                    monitor_id: r.get(0)?,
-                    channel_id: r.get(1)?,
-                    channel_name: r.get(2)?,
-                    url: r.get(3)?,
-                    start_time: r.get(4)?,
-                    end_time: r.get(5)?,
-                    title: r.get(6)?,
-                    category: r.get(7)?,
-                    source: r.get(8)?,
-                    channel_color: r.get(9)?,
+                    segment_id: r.get(0)?,
+                    monitor_id: r.get(1)?,
+                    channel_id: r.get(2)?,
+                    channel_name: r.get(3)?,
+                    url: r.get(4)?,
+                    start_time: r.get(5)?,
+                    end_time: r.get(6)?,
+                    title: r.get(7)?,
+                    category: r.get(8)?,
+                    source: r.get(9)?,
+                    channel_color: r.get(10)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2207,8 +2317,8 @@ mod tests {
         let mut titles: Vec<&str> = all.iter().map(|s| s.title.as_str()).collect();
         titles.sort_unstable();
         assert_eq!(titles, vec!["Discord", "Platform"]);
-        assert!(all.iter().any(|s| s.title == "Discord" && s.is_discord()));
-        assert!(all.iter().any(|s| s.title == "Platform" && !s.is_discord()));
+        assert!(all.iter().any(|s| s.title == "Discord" && s.source == "discord"));
+        assert!(all.iter().any(|s| s.title == "Platform" && s.source != "discord"));
 
         // The monitor counts as having an upcoming non-Discord schedule (the
         // platform segment), which suppresses the Discord sweep for it.
@@ -2222,6 +2332,88 @@ mod tests {
         // Clearing the platform source drops it from the non-Discord presence set.
         store.replace_schedule_source(mid, "platform", &[]).unwrap();
         assert!(!store.monitors_with_upcoming_non_discord(1_000).unwrap().contains(&mid));
+    }
+
+    #[test]
+    fn manual_time_edit_leaves_tombstone_that_blocks_resurrection() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        // Use upcoming instants so the past-tombstone prune never touches them.
+        let t1 = now_unix() + 100_000;
+        let t2 = t1 + 7_200; // user moves the stream +2h
+        let seg = |start: i64, title: &str| ScheduleSegment {
+            id: 0,
+            monitor_id: 0,
+            start_time: start,
+            end_time: None,
+            title: title.into(),
+            category: String::new(),
+            canceled: false,
+            video_id: None,
+        };
+
+        // Auto source publishes the stream at t1; user corrects the time to t2.
+        store.replace_schedule_source(mid, "platform", &[seg(t1, "Stream A")]).unwrap();
+        let id = store.schedule_for_monitor(mid, 0).unwrap()[0].id;
+        let n = store.update_schedule_segment_manual(id, t2, None, "Stream A", "").unwrap();
+        assert_eq!(n, 1);
+
+        // The platform source re-runs and STILL reports the stream at its old t1.
+        store.replace_schedule_source(mid, "platform", &[seg(t1, "Stream A")]).unwrap();
+        store.clear_other_schedule_sources(mid, "platform").unwrap();
+
+        // Only the corrected manual entry survives — the pre-correction copy at t1
+        // must not be resurrected.
+        let visible = store.all_upcoming_schedule(t1 - 1).unwrap();
+        let times: Vec<i64> = visible
+            .iter()
+            .filter(|s| s.monitor_id == mid)
+            .map(|s| s.start_time)
+            .collect();
+        assert_eq!(times, vec![t2], "the pre-correction t1 copy must not reappear");
+        assert!(visible.iter().any(|s| s.start_time == t2 && s.source == "manual"));
+
+        // A non-existent id reports 0 rows (so the UI won't claim false success).
+        assert_eq!(store.update_schedule_segment_manual(999_999, t2, None, "x", "").unwrap(), 0);
+    }
+
+    #[test]
+    fn delete_schedule_segment_suppresses_refresh_resurrection() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        let t1 = now_unix() + 100_000;
+        let seg = |start: i64, title: &str| ScheduleSegment {
+            id: 0,
+            monitor_id: 0,
+            start_time: start,
+            end_time: None,
+            title: title.into(),
+            category: String::new(),
+            canceled: false,
+            video_id: None,
+        };
+
+        // An OCR source emits a bogus occurrence; the user deletes it.
+        store.replace_schedule_source(mid, "twitch_banner_ocr", &[seg(t1, "Bogus")]).unwrap();
+        let id = store.schedule_for_monitor(mid, 0).unwrap()[0].id;
+        assert_eq!(store.delete_schedule_segment(id).unwrap(), 1);
+        assert!(store.schedule_for_monitor(mid, 0).unwrap().is_empty(), "hidden after delete");
+
+        // The OCR source re-runs against the unchanged image and re-emits it; the
+        // tombstone must keep it gone (a bare delete would let it reappear).
+        store.replace_schedule_source(mid, "twitch_banner_ocr", &[seg(t1, "Bogus")]).unwrap();
+        assert!(
+            store.schedule_for_monitor(mid, 0).unwrap().is_empty(),
+            "delete must stick across an automatic refresh"
+        );
     }
 
     #[test]

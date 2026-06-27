@@ -858,9 +858,11 @@ pub struct ScheduleSegment {
 /// the URL/platform on a right-click. `platform` is derived from [`Self::url`].
 #[derive(Clone, Debug)]
 pub struct UpcomingStream {
+    /// `schedule_segment.id` — the stable DB primary key of this occurrence, so
+    /// the calendar can edit / delete / open-source a specific row.
+    pub segment_id: i64,
     // Carried from the join for a future "jump to this monitor" action; the
     // calendar itself filters/derives everything from the channel + URL.
-    #[allow(dead_code)]
     pub monitor_id: i64,
     pub channel_id: i64,
     pub channel_name: String,
@@ -870,8 +872,11 @@ pub struct UpcomingStream {
     pub end_time: Option<i64>,
     pub title: String,
     pub category: String,
-    /// Where this segment came from: `"platform"` (Twitch/YouTube published
-    /// schedule) or `"discord"` (matched from a Discord scheduled event).
+    /// Where this segment came from — the stable `schedule_segment.source` id:
+    /// `"platform"` (Twitch schedule), `"youtube"`/`"youtube_api"`, an OCR source
+    /// (`"twitch_banner_ocr"`, …), `"discord"`, or `"manual"` (a user-edited row,
+    /// protected from automatic-refresh overwrites). See
+    /// [`crate::schedule_source::source_badge`] for the per-source badge.
     pub source: String,
     /// Custom hex color for this channel (mirrors `Channel::color`). Empty
     /// means "use the automatic palette color".
@@ -884,9 +889,11 @@ impl UpcomingStream {
         Platform::detect(&self.url)
     }
 
-    /// Whether this segment came from a Discord event (for the source hint).
-    pub fn is_discord(&self) -> bool {
-        self.source == "discord"
+    /// Whether this segment was manually added/corrected by the user. Manual rows
+    /// are protected from automatic-refresh overwrites (see
+    /// [`crate::store::Store::clear_other_schedule_sources`]).
+    pub fn is_manual(&self) -> bool {
+        self.source == "manual"
     }
 }
 

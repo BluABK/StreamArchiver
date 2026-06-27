@@ -2178,14 +2178,14 @@ fn youtube_live_url(url: &str) -> String {
 
 /// Build the YouTube `/streams` (live tab) URL for a channel URL, normalizing a
 /// trailing `/live` or `/streams` first.
-fn youtube_streams_url(url: &str) -> String {
+pub(crate) fn youtube_streams_url(url: &str) -> String {
     let t = url.trim().trim_end_matches('/');
     let t = t.strip_suffix("/live").or_else(|| t.strip_suffix("/streams")).unwrap_or(t);
     format!("{t}/streams")
 }
 
 /// Build the YouTube `/community` (posts tab) URL for a channel URL.
-fn youtube_community_url(url: &str) -> String {
+pub(crate) fn youtube_community_url(url: &str) -> String {
     let t = url.trim().trim_end_matches('/');
     let t = t
         .strip_suffix("/live")

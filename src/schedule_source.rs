@@ -120,6 +120,30 @@ impl ScheduleSourceKind {
         }
     }
 
+    /// Font-safe emoji badge shown on calendar items to indicate where the
+    /// schedule came from. Glyphs are restricted to ones the app already renders
+    /// in production (egui rasterizes only monochrome outlines from its bundled
+    /// NotoEmoji subset + the OS fallback; see
+    /// [`crate::models::ContentType::icon`]). `📡` broadcast schedule · `📺`
+    /// YouTube · `📷` any image/OCR source · `💬` Discord.
+    pub fn badge_icon(self) -> &'static str {
+        match self {
+            ScheduleSourceKind::TwitchSchedule => "📡",
+            ScheduleSourceKind::YouTubeScrape | ScheduleSourceKind::YouTubeApi => "📺",
+            ScheduleSourceKind::TwitchBannerOcr
+            | ScheduleSourceKind::YouTubeCommunityOcr
+            | ScheduleSourceKind::TwitterPinned
+            | ScheduleSourceKind::OtherImageOcr => "📷",
+            ScheduleSourceKind::Discord => "💬",
+        }
+    }
+
+    /// Whether "Open source" can resolve a meaningful target for this kind (the
+    /// origin page or image). Discord events have no per-event URL.
+    pub fn has_open_target(self) -> bool {
+        !matches!(self, ScheduleSourceKind::Discord)
+    }
+
     /// Whether this source carries an account-risk / ToS warning.
     pub fn risky(self) -> bool {
         matches!(
@@ -149,6 +173,22 @@ impl ScheduleSourceKind {
             // Discord matches per the sweep, regardless of platform.
             ScheduleSourceKind::Discord => true,
         }
+    }
+}
+
+/// Resolve a `schedule_segment.source` id to a `(icon, label)` pair for the
+/// calendar's source badge + hover/detail text. Special-cases `"manual"` (a
+/// user-edited row, which has no [`ScheduleSourceKind`]); an unrecognized id
+/// falls back to a neutral marker rather than panicking.
+pub fn source_badge(source: &str) -> (&'static str, &'static str) {
+    if source == "manual" {
+        // ✏ pencil — already used elsewhere in the UI, so it renders.
+        return ("✏", "Manually edited");
+    }
+    match ScheduleSourceKind::from_id(source) {
+        Some(k) => (k.badge_icon(), k.label()),
+        // U+2022 bullet from the base Latin font — guaranteed to render.
+        None => ("•", "Other source"),
     }
 }
 
@@ -303,6 +343,20 @@ mod tests {
         // The persisted youtube entry kept its order (first) and disabled flag.
         assert_eq!(order[0].id, "youtube");
         assert!(!order[0].enabled);
+    }
+
+    #[test]
+    fn source_badge_covers_manual_known_and_unknown() {
+        // Manual rows are special-cased (no ScheduleSourceKind).
+        assert_eq!(source_badge("manual"), ("✏", "Manually edited"));
+        // Every known kind resolves to its badge + label.
+        for k in ScheduleSourceKind::DEFAULT_ORDER {
+            let (icon, label) = source_badge(k.id());
+            assert_eq!(icon, k.badge_icon());
+            assert_eq!(label, k.label());
+        }
+        // An unrecognized id falls back instead of panicking.
+        assert_eq!(source_badge("totally_unknown").0, "•");
     }
 
     #[test]
