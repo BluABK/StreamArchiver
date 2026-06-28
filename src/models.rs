@@ -833,7 +833,11 @@ pub struct StreamMetaChange {
 /// seconds; `end_time` is set by Twitch (its segments are bounded) but not by
 /// YouTube. `category`/`end_time` may be empty/None depending on the source.
 /// Fetchers leave `id`/`monitor_id` at 0 (the store assigns them on insert).
-#[derive(Clone, Debug)]
+///
+/// `Serialize`/`Deserialize` let the community-post archive cache decoded events
+/// as `decoded_json`, so an unchanged post image hits the archive instead of
+/// re-running OCR. See [`crate::store`]'s `community_post_archive`.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ScheduleSegment {
     #[allow(dead_code)]
     pub id: i64,
@@ -1216,6 +1220,28 @@ pub const K_OCR_STATS: &str = "ocr_stats";
 /// Populated after every successful OCR run so a restart doesn't re-run OCR on
 /// an unchanged banner/community-post image.
 pub const K_OCR_IMAGE_HASHES: &str = "ocr_image_hashes";
+
+/// `app_settings` key for the global "go to the next schedule source when an
+/// event has no title" toggle (`"1"` = on). When on, the schedule walk keeps
+/// querying lower-priority sources after a winner is found, to fill in blank
+/// titles on the winning source's events (e.g. a Twitch schedule that publishes
+/// times but no titles gets its titles from a banner / community-post OCR source).
+/// Per-channel and per-monitor overrides live in the schedule-scope config.
+/// See [`crate::schedule_source`].
+pub const K_SCHEDULE_TITLE_FILL: &str = "schedule_title_fill";
+
+/// `app_settings` key for how many recent YouTube community posts to scan for a
+/// schedule image (the OCR backlog depth). Empty/0 = built-in default (5). A
+/// per-channel override lives in `ChannelSourceConfig.max_community_posts`.
+pub const K_YT_COMMUNITY_MAX_POSTS: &str = "youtube_community_max_posts";
+
+/// `app_settings` keys for per-channel / per-monitor schedule-source *scope*
+/// config (JSON maps `{id -> SourceScopeConfig}`): an optional source-order
+/// override (replacing the global order for that channel/monitor) and an optional
+/// title-fill override. Precedence: monitor over channel over global. See
+/// [`crate::schedule_source`].
+pub const K_CHANNEL_SCOPE_CFG: &str = "channel_schedule_scope";
+pub const K_MONITOR_SCOPE_CFG: &str = "monitor_schedule_scope";
 
 /// Cumulative statistics for all `claude` CLI OCR invocations.
 #[derive(Default, Clone, serde::Serialize, serde::Deserialize)]

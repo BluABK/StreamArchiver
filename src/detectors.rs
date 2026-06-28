@@ -32,7 +32,9 @@ use crate::models::{
 };
 use crate::schedule_ocr::{accumulate_ocr_stats, ocr_opts_from_settings, ocr_schedule_image, record_ocr_cache_hit};
 use crate::schedule_source::{
-    ChannelSourceConfig, ScheduleSourceKind, SourceEntry, load_channel_cfg, load_source_order,
+    ChannelSourceConfig, ScheduleSourceKind, SourceEntry, community_max_posts,
+    effective_order_from, effective_title_fill_from, global_title_fill, load_channel_cfg,
+    load_channel_scope_map, load_monitor_scope_map, load_source_order,
 };
 use crate::store::Store;
 
@@ -948,21 +950,44 @@ impl DetectContext {
             path.display()
         );
 
-        let task_id = crate::events::next_task_id();
-        let source_label = crate::schedule_source::ScheduleSourceKind::from_id(source_id)
+        let source_label = ScheduleSourceKind::from_id(source_id)
             .map(|k| k.label())
             .unwrap_or(source_id);
+        let detail = format!("{source_label} · {}", opts.model);
+        let result = self
+            .ocr_one_with_events(channel_name, detail, path, &opts)
+            .await;
+
+        let segs = result.segments?;
+        self.ocr_cache.lock().await.insert(key.clone(), (hash, segs.clone()));
+        // Persist the hash so this cache hit survives an app restart.
+        self.persist_ocr_hash(key.0, &key.1, hash);
+        Some(segs)
+    }
+
+    /// Run one OCR call on `path`, emitting the background-task start/finish events
+    /// and accumulating CLI stats. `detail` is the task's detail line. Returns the
+    /// raw run result so the caller decides how to cache/persist it — shared by the
+    /// single-image cache path and the multi-post community walk.
+    async fn ocr_one_with_events(
+        &self,
+        channel_name: &str,
+        detail: String,
+        path: &Path,
+        opts: &crate::schedule_ocr::OcrOpts,
+    ) -> crate::schedule_ocr::OcrRunResult {
+        let task_id = crate::events::next_task_id();
         let _ = self.events.send(crate::events::AppEvent::BackgroundTaskStarted(
             crate::events::BackgroundTask {
                 id: task_id,
                 kind: crate::events::BackgroundTaskKind::OcrCall,
                 label: channel_name.to_string(),
-                detail: format!("{source_label} · {}", opts.model),
+                detail,
                 started_at: now_unix(),
             },
         ));
 
-        let result = ocr_schedule_image(path, &opts).await;
+        let result = ocr_schedule_image(path, opts).await;
         accumulate_ocr_stats(self.store.as_ref(), &result);
 
         let outcome = match &result.segments {
@@ -981,9 +1006,10 @@ impl DetectContext {
             }
             None => {
                 if result.cli_failures > 0 && result.cli_calls.is_empty() {
-                    crate::events::TaskOutcome::Failed(
-                        format!("CLI failed — is '{}' on PATH?", opts.command),
-                    )
+                    crate::events::TaskOutcome::Failed(format!(
+                        "CLI failed — is '{}' on PATH?",
+                        opts.command
+                    ))
                 } else {
                     crate::events::TaskOutcome::Failed("Parse failed".into())
                 }
@@ -992,12 +1018,7 @@ impl DetectContext {
         let _ = self
             .events
             .send(crate::events::AppEvent::BackgroundTaskFinished { id: task_id, outcome });
-
-        let segs = result.segments?;
-        self.ocr_cache.lock().await.insert(key.clone(), (hash, segs.clone()));
-        // Persist the hash so this cache hit survives an app restart.
-        self.persist_ocr_hash(key.0, &key.1, hash);
-        Some(segs)
+        result
     }
 
     /// Destination for a downloaded schedule-source image, kept in a `schedule_src/`
@@ -1055,14 +1076,24 @@ impl DetectContext {
         .await
     }
 
-    /// OCR the image on the channel's latest YouTube community post. Best-effort:
-    /// scrapes `/community?hl=en&gl=US`, pulls a backstage post image from
-    /// `ytInitialData`, downloads it, then OCRs. `None` on any miss.
+    /// OCR images on the channel's recent YouTube community posts. Scans up to the
+    /// configured backlog depth ([`community_max_posts`]) in order, returning the
+    /// first that decodes a schedule.
+    ///
+    /// Two layers of caching keep this cheap. An in-memory combined-URL hash of the
+    /// whole post set short-circuits the entire pass when nothing changed (no
+    /// downloads, no OCR). When the set *has* changed (typically one new post
+    /// pushing the others down the feed), every pulled image is archived to a
+    /// content-addressed file + `community_post_archive` row; an image whose bytes
+    /// match an already-decoded archive entry reuses that result instead of
+    /// re-OCR'ing — so only genuinely new images spend tokens.
     async fn ocr_youtube_community(
         &self,
         row: &MonitorWithChannel,
         cfg: &ChannelSourceConfig,
     ) -> Option<Vec<ScheduleSegment>> {
+        let max_posts = community_max_posts(self.store.as_ref(), cfg);
+
         let community_url = youtube_community_url(&row.monitor.url);
         let resp = self
             .http
@@ -1078,17 +1109,161 @@ impl DetectContext {
         }
         let body = resp.text().await.ok()?;
         let data = extract_json_after(&body, "ytInitialData")?;
-        let img = first_community_image(&data)?;
-        let dest = self.schedule_src_path(row, "community", url_image_ext(&img));
-        crate::assets::download_image(&self.http, &img, &dest).await.ok()?;
-        self.ocr_image_cached(
-            row.monitor.id,
-            ScheduleSourceKind::YouTubeCommunityOcr.id(),
-            &row.channel.name,
-            &dest,
-            cfg,
-        )
-        .await
+
+        let mut imgs: Vec<String> = Vec::new();
+        community_images(&data, &mut imgs);
+        imgs.truncate(max_posts);
+        if imgs.is_empty() {
+            return None;
+        }
+
+        // Combined URL hash: stable identifier for the current set of posts.
+        // If no post URL has changed the hash matches and we skip the whole pass.
+        let url_bytes: Vec<u8> = imgs
+            .iter()
+            .flat_map(|u| u.as_bytes().iter().copied())
+            .collect();
+        let combined_hash = fnv64(&url_bytes);
+        let source_id = ScheduleSourceKind::YouTubeCommunityOcr.id();
+        let cache_key = (row.monitor.id, source_id.to_string());
+        {
+            let guard = self.ocr_cache.lock().await;
+            if let Some((cached, segs)) = guard.get(&cache_key) {
+                if *cached == combined_hash {
+                    debug!(
+                        "OCR community cache hit (monitor {}, {} posts unchanged)",
+                        row.monitor.id,
+                        imgs.len()
+                    );
+                    record_ocr_cache_hit(self.store.as_ref());
+                    return Some(segs.clone());
+                }
+            }
+        }
+
+        // Set changed: pull + archive every post image (durable record), then OCR
+        // in feed order until one decodes a schedule. Unchanged images hit the
+        // per-image archive cache below and skip OCR.
+        let now = crate::models::now_unix();
+        let mut archived: Vec<(String, PathBuf)> = Vec::new();
+        for img_url in &imgs {
+            if let Some(entry) = self.archive_community_image(row, img_url, now).await {
+                archived.push(entry);
+            }
+        }
+        if archived.is_empty() {
+            return None;
+        }
+
+        let opts = ocr_opts_from_settings(self.store.as_ref(), cfg);
+        let n = archived.len();
+        let mut winner: Option<Vec<ScheduleSegment>> = None;
+        for (i, (content_hash, path)) in archived.iter().enumerate() {
+            // Per-image archive cache: this exact image already OCR'd?
+            if let Ok(Some(ap)) = self.store.community_post_get(row.monitor.id, content_hash) {
+                if ap.ocr_attempted {
+                    record_ocr_cache_hit(self.store.as_ref());
+                    let segs: Vec<ScheduleSegment> =
+                        serde_json::from_str(&ap.decoded_json).unwrap_or_default();
+                    if !segs.is_empty() {
+                        winner = Some(segs);
+                        break;
+                    }
+                    continue;
+                }
+            }
+
+            let detail = if n > 1 {
+                format!(
+                    "{} · {} (post {}/{})",
+                    ScheduleSourceKind::YouTubeCommunityOcr.label(),
+                    opts.model,
+                    i + 1,
+                    n
+                )
+            } else {
+                format!(
+                    "{} · {}",
+                    ScheduleSourceKind::YouTubeCommunityOcr.label(),
+                    opts.model
+                )
+            };
+            let result = self
+                .ocr_one_with_events(&row.channel.name, detail, path, &opts)
+                .await;
+
+            // Persist the decode (empty included) so an unchanged image is never
+            // re-OCR'd. `None` (CLI/parse failure) is left un-attempted to retry.
+            if let Some(segs) = result.segments {
+                let json = serde_json::to_string(&segs).unwrap_or_else(|_| "[]".to_string());
+                self.store
+                    .community_post_set_decoded(
+                        row.monitor.id,
+                        content_hash,
+                        segs.len() as i64,
+                        &json,
+                    )
+                    .ok();
+                if !segs.is_empty() {
+                    winner = Some(segs);
+                    break;
+                }
+            }
+        }
+
+        // Cache the pass result (winner, or empty = "nothing found this set") under
+        // the combined hash so an unchanged feed skips everything next pass.
+        let segs = winner.unwrap_or_default();
+        self.ocr_cache
+            .lock()
+            .await
+            .insert(cache_key.clone(), (combined_hash, segs.clone()));
+        self.persist_ocr_hash(cache_key.0, source_id, combined_hash);
+        Some(segs)
+    }
+
+    /// Download a community-post image, content-hash its bytes, persist it to a
+    /// content-addressed path under `schedule_src/`, and upsert its
+    /// `community_post_archive` row. Returns `(content_hash, local_path)` for the
+    /// OCR step, or `None` on a download/read failure. Idempotent: re-seeing the
+    /// same image reuses the on-disk file and just refreshes the archive row.
+    async fn archive_community_image(
+        &self,
+        row: &MonitorWithChannel,
+        img_url: &str,
+        fetched_at: i64,
+    ) -> Option<(String, PathBuf)> {
+        let ext = url_image_ext(img_url);
+        // Download to a temp path first so we can hash the bytes before naming.
+        let tmp = self.schedule_src_path(row, "community_tmp", ext);
+        crate::assets::download_image(&self.http, img_url, &tmp)
+            .await
+            .ok()?;
+        let bytes = tokio::fs::read(&tmp).await.ok()?;
+        let content_hash = fnv64(&bytes).to_string();
+
+        // Content-addressed final path: every distinct image kept (durable archive).
+        let dest = self.schedule_src_path(row, &format!("community_{content_hash}"), ext);
+        if tokio::fs::try_exists(&dest).await.unwrap_or(false) {
+            // Already archived (identical bytes) — drop the temp, keep the original.
+            let _ = tokio::fs::remove_file(&tmp).await;
+        } else if tokio::fs::rename(&tmp, &dest).await.is_err() {
+            // Rename failed (e.g. cross-device) — fall back to a copy.
+            let _ = tokio::fs::write(&dest, &bytes).await;
+            let _ = tokio::fs::remove_file(&tmp).await;
+        }
+
+        self.store
+            .community_post_upsert(
+                row.monitor.id,
+                ScheduleSourceKind::YouTubeCommunityOcr.id(),
+                img_url,
+                &content_hash,
+                &dest.to_string_lossy(),
+                fetched_at,
+            )
+            .ok();
+        Some((content_hash, dest))
     }
 
     /// OCR the image on the channel's pinned tweet. Best-effort: hits the public
@@ -1918,6 +2093,42 @@ pub async fn refresh_schedules(
     }
 }
 
+/// Half-width (seconds) of the time window used to match a title-fill donor event
+/// to a base event: ±2h, so a base event borrows the title of the nearest donor
+/// event starting within two hours of it.
+const TITLE_FILL_WINDOW_SECS: i64 = 7200;
+
+/// Whether any non-canceled segment is missing a title (empty/whitespace) — the
+/// trigger for the title-fill donor walk.
+fn has_blank_title(segs: &[ScheduleSegment]) -> bool {
+    segs.iter().any(|s| !s.canceled && s.title.trim().is_empty())
+}
+
+/// Fill blank titles on `base` from the nearest-in-time `donor` event whose title
+/// is non-blank, within `window` seconds (±). Also copies the donor's category
+/// when `base`'s is empty. Used when a schedule source publishes times but no
+/// titles (e.g. a bare Twitch schedule) and a lower-priority source (banner /
+/// community-post OCR) carries the titles. Mutates `base` in place.
+fn fill_titles(base: &mut [ScheduleSegment], donor: &[ScheduleSegment], window: i64) {
+    for b in base.iter_mut() {
+        if b.canceled || !b.title.trim().is_empty() {
+            continue;
+        }
+        let best = donor
+            .iter()
+            .filter(|d| !d.title.trim().is_empty())
+            .map(|d| (d, (d.start_time - b.start_time).abs()))
+            .filter(|(_, dist)| *dist <= window)
+            .min_by_key(|(_, dist)| *dist);
+        if let Some((d, _)) = best {
+            b.title = d.title.clone();
+            if b.category.trim().is_empty() && !d.category.trim().is_empty() {
+                b.category = d.category.clone();
+            }
+        }
+    }
+}
+
 /// One schedule-refresh pass over the user's ordered schedule sources.
 ///
 /// For each enabled monitor due for a refresh, the enabled *per-monitor* sources
@@ -1926,6 +2137,9 @@ pub async fn refresh_schedules(
 /// for that monitor are cleared, so exactly one source owns each monitor's
 /// schedule. A source returning `None` is a transient failure (stored rows left
 /// alone, retried soon); `Some(empty)` is an authoritative "nothing scheduled".
+/// The effective per-monitor source order and title-fill toggle come from the
+/// global config plus any per-channel / per-monitor scope override (monitor over
+/// channel over global).
 ///
 /// YouTube `/streams` scrape winners are deferred so all their video IDs can be
 /// refined in one batched `videos.list` call (exact `scheduledStartTime`) before
@@ -1963,18 +2177,13 @@ async fn refresh_schedules_once(
         last_fetched.retain(|id, _| !missing_ids.contains(id));
     }
 
-    // The user's ordered sources: per-monitor ones (walked here, in priority order)
-    // and whether Discord (a separate batch sweep) is enabled.
+    // The user's global ordered sources, plus per-channel / per-monitor scope
+    // overrides (loaded once; resolved per monitor in the walk and, below, for the
+    // Discord batch sweep — so Discord honors the same per-channel/instance control).
     let order = load_source_order(ctx.store.as_ref());
-    let per_monitor: Vec<ScheduleSourceKind> = order
-        .iter()
-        .filter(|e| e.enabled)
-        .filter_map(SourceEntry::kind)
-        .filter(|k| k.is_per_monitor())
-        .collect();
-    let discord_in_order = order
-        .iter()
-        .any(|e| e.enabled && e.kind() == Some(ScheduleSourceKind::Discord));
+    let channel_scope = load_channel_scope_map(ctx.store.as_ref());
+    let monitor_scope = load_monitor_scope_map(ctx.store.as_ref());
+    let global_fill = global_title_fill(ctx.store.as_ref());
 
     // Whether to refine scraped YouTube timestamps with a batched videos.list call.
     let yt_api_enabled = ctx.youtube_api_enabled(K_YT_API_SCHEDULE);
@@ -2004,8 +2213,23 @@ async fn refresh_schedules_once(
         let platform = row.monitor.platform();
         let cfg = load_channel_cfg(ctx.store.as_ref(), row.channel.id);
 
+        // Resolve this monitor's effective source order + title-fill toggle from
+        // the global config and any channel/monitor scope override.
+        let ch_scope = channel_scope.get(&row.channel.id.to_string());
+        let mon_scope = monitor_scope.get(&row.monitor.id.to_string());
+        let eff_order = effective_order_from(&order, ch_scope, mon_scope);
+        let eff_fill = effective_title_fill_from(global_fill, ch_scope, mon_scope);
+        let per_monitor: Vec<ScheduleSourceKind> = eff_order
+            .iter()
+            .filter(|e| e.enabled)
+            .filter_map(SourceEntry::kind)
+            .filter(|k| k.is_per_monitor())
+            .collect();
+
         // Walk the enabled per-monitor sources in priority order; first non-empty
-        // result wins. Track whether any source was authoritative (returned `Some`).
+        // result wins. When title-fill is on and the winner has blank titles, keep
+        // walking lower-priority sources to borrow their titles (nearest in time)
+        // before stopping. Track whether any source was authoritative (`Some`).
         let mut any_authoritative = false;
         let mut won: Option<(ScheduleSourceKind, Vec<ScheduleSegment>)> = None;
         for &kind in &per_monitor {
@@ -2021,11 +2245,27 @@ async fn refresh_schedules_once(
                     s
                 }
             };
-            if let Some(segs) = segs_opt {
-                any_authoritative = true;
-                if !segs.is_empty() {
+            let Some(segs) = segs_opt else { continue };
+            any_authoritative = true;
+            if segs.is_empty() {
+                continue;
+            }
+            match won.as_mut() {
+                // Winner already chosen; this lower-priority source is a title donor.
+                Some((_, win_segs)) => {
+                    fill_titles(win_segs, &segs, TITLE_FILL_WINDOW_SECS);
+                    if !has_blank_title(win_segs) {
+                        break;
+                    }
+                }
+                // First non-empty source wins. Stop here unless it has blank titles
+                // and title-fill is on (then keep walking for donors).
+                None => {
+                    let need_titles = eff_fill && has_blank_title(&segs);
                     won = Some((kind, segs));
-                    break;
+                    if !need_titles {
+                        break;
+                    }
                 }
             }
         }
@@ -2114,9 +2354,27 @@ async fn refresh_schedules_once(
     // ban-flaggable traffic.
     const DISCORD_MIN_SECS: u64 = 60;
     let discord_interval = refresh_secs.max(DISCORD_MIN_SECS);
-    let discord_due = discord_in_order
-        && ctx.discord_enabled()
+    // Discord runs as one batch sweep (not per-monitor), but still honors per-channel
+    // / per-instance scope: resolve each monitor's effective order and sweep only the
+    // monitors where Discord is enabled. Built only when a sweep could actually run
+    // (token ready + debounce elapsed), so the per-monitor resolve isn't paid every tick.
+    let discord_ready = ctx.discord_enabled()
         && discord_last.is_none_or(|t| now.duration_since(t).as_secs() >= discord_interval);
+    let discord_monitors: std::collections::HashSet<i64> = if discord_ready {
+        rows.iter()
+            .filter(|row| {
+                let ch_scope = channel_scope.get(&row.channel.id.to_string());
+                let mon_scope = monitor_scope.get(&row.monitor.id.to_string());
+                effective_order_from(&order, ch_scope, mon_scope)
+                    .iter()
+                    .any(|e| e.enabled && e.kind() == Some(ScheduleSourceKind::Discord))
+            })
+            .map(|row| row.monitor.id)
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+    let discord_due = discord_ready && !discord_monitors.is_empty();
     if discord_due {
         // Stamp the attempt up front so a failing token / outage retries on the
         // interval, not every 60s tick (which would hammer Discord's auth endpoint).
@@ -2135,7 +2393,10 @@ async fn refresh_schedules_once(
                 // with no matched event).
                 for row in &rows {
                     let mid = row.monitor.id;
-                    let segs = if resolved.contains(&mid) {
+                    // Clear when Discord is disabled for this monitor's scope, when a
+                    // higher-priority source already resolved it, or when no event
+                    // matched; otherwise store the swept events.
+                    let segs = if !discord_monitors.contains(&mid) || resolved.contains(&mid) {
                         Vec::new()
                     } else {
                         matched.get(&mid).cloned().unwrap_or_default()
@@ -2146,8 +2407,15 @@ async fn refresh_schedules_once(
                 // Partial sweep: only update monitors we actually got events for, so
                 // a streamer whose guild failed this pass keeps their stored events.
                 for (mid, found) in &matched {
+                    // A monitor with Discord disabled in its scope gets cleared even on
+                    // a partial sweep, so a per-channel / per-instance opt-out takes
+                    // effect without waiting for a full reconciliation pass.
                     let segs: &[ScheduleSegment] =
-                        if resolved.contains(mid) { &[] } else { found };
+                        if !discord_monitors.contains(mid) || resolved.contains(mid) {
+                            &[]
+                        } else {
+                            found
+                        };
                     let _ = ctx.store.replace_schedule_source(*mid, "discord", segs);
                 }
             }
@@ -2322,24 +2590,29 @@ fn url_image_ext(url: &str) -> &str {
     }
 }
 
-/// Find the first community-post image URL in `ytInitialData` — a
-/// `backstageImageRenderer`'s largest thumbnail. Best-effort: serde_json sorts
-/// object keys (no `preserve_order`), so "first" is not strictly the newest post;
-/// most channels pin their schedule post, and OCR of the wrong image just yields
-/// nothing and falls through to the next source.
-fn first_community_image(v: &Value) -> Option<String> {
+/// Collect all community-post image URLs from `ytInitialData` — each
+/// `backstageImageRenderer`'s largest thumbnail, in document order (newest
+/// post first). Stops recursing into a renderer once its image is captured.
+fn community_images(v: &Value, out: &mut Vec<String>) {
     match v {
         Value::Object(map) => {
             if let Some(url) = map
                 .get("backstageImageRenderer")
                 .and_then(|img| largest_thumbnail(img.get("image")))
             {
-                return Some(url);
+                out.push(url);
+                return;
             }
-            map.values().find_map(first_community_image)
+            for val in map.values() {
+                community_images(val, out);
+            }
         }
-        Value::Array(arr) => arr.iter().find_map(first_community_image),
-        _ => None,
+        Value::Array(arr) => {
+            for val in arr {
+                community_images(val, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -3097,5 +3370,84 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].title, "Upcoming stream");
         assert_eq!(out[0].video_id, None);
+    }
+
+    fn seg(start: i64, title: &str, category: &str, canceled: bool) -> ScheduleSegment {
+        ScheduleSegment {
+            id: 0,
+            monitor_id: 0,
+            start_time: start,
+            end_time: None,
+            title: title.into(),
+            category: category.into(),
+            canceled,
+            video_id: None,
+        }
+    }
+
+    #[test]
+    fn has_blank_title_ignores_canceled() {
+        // A non-canceled blank trips it; a canceled blank does not.
+        assert!(has_blank_title(&[seg(0, "", "", false)]));
+        assert!(has_blank_title(&[seg(0, "   ", "", false)]));
+        assert!(!has_blank_title(&[seg(0, "Real", "", false)]));
+        assert!(!has_blank_title(&[seg(0, "", "", true)]));
+        // Mixed: one blank among titled segments still trips it.
+        assert!(has_blank_title(&[seg(0, "A", "", false), seg(100, "", "", false)]));
+    }
+
+    #[test]
+    fn fill_titles_borrows_nearest_in_window() {
+        // Base has two timed-but-blank events; donor carries titles + category.
+        let mut base = vec![seg(1000, "", "", false), seg(10_000, "", "", false)];
+        let donor = vec![
+            seg(1500, "Morning Stream", "Just Chatting", false), // 500s from base[0]
+            seg(9000, "Evening Stream", "Gaming", false),        // 1000s from base[1]
+        ];
+        fill_titles(&mut base, &donor, TITLE_FILL_WINDOW_SECS);
+        assert_eq!(base[0].title, "Morning Stream");
+        assert_eq!(base[0].category, "Just Chatting");
+        assert_eq!(base[1].title, "Evening Stream");
+        assert_eq!(base[1].category, "Gaming");
+    }
+
+    #[test]
+    fn fill_titles_respects_window_and_keeps_existing() {
+        // Donor too far away (beyond ±2h) -> left blank.
+        let mut base = vec![seg(0, "", "", false)];
+        let donor = vec![seg(TITLE_FILL_WINDOW_SECS + 1, "Too Far", "", false)];
+        fill_titles(&mut base, &donor, TITLE_FILL_WINDOW_SECS);
+        assert_eq!(base[0].title, "");
+
+        // An existing title is never overwritten, but a blank category is still filled.
+        let mut base = vec![seg(0, "Keep Me", "", false)];
+        let donor = vec![seg(60, "Other", "Art", false)];
+        fill_titles(&mut base, &donor, TITLE_FILL_WINDOW_SECS);
+        assert_eq!(base[0].title, "Keep Me");
+        assert_eq!(base[0].category, "");
+
+        // Canceled base events are skipped even when a donor matches.
+        let mut base = vec![seg(0, "", "", true)];
+        let donor = vec![seg(10, "Donor", "Cat", false)];
+        fill_titles(&mut base, &donor, TITLE_FILL_WINDOW_SECS);
+        assert_eq!(base[0].title, "");
+
+        // Blank donor titles are not used as fill sources.
+        let mut base = vec![seg(0, "", "", false)];
+        let donor = vec![seg(10, "  ", "", false)];
+        fill_titles(&mut base, &donor, TITLE_FILL_WINDOW_SECS);
+        assert_eq!(base[0].title, "");
+    }
+
+    #[test]
+    fn fill_titles_picks_closest_of_several_donors() {
+        // Two in-window donors: the nearer one wins.
+        let mut base = vec![seg(5000, "", "", false)];
+        let donor = vec![
+            seg(3000, "Far", "", false),  // 2000s away
+            seg(5400, "Near", "", false), // 400s away
+        ];
+        fill_titles(&mut base, &donor, TITLE_FILL_WINDOW_SECS);
+        assert_eq!(base[0].title, "Near");
     }
 }

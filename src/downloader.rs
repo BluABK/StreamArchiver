@@ -2260,9 +2260,15 @@ impl Supervisor {
         // live stream via SABR; once the stream is older than that, each attempt
         // stalls shortly after starting ("not near live head"). Record this so the
         // next attempt falls back to live-edge capture (see override at top of fn).
+        // Skip when deep-rewind is on: that flag specifically extends the DVR
+        // window, so "not near live head" with it enabled is a transient SABR
+        // error rather than a true window expiry — normal backoff handles it
+        // better than a permanent live-edge override.
+        let deep_rewind = setting_str(&self.store, "ytdlp_sabr_deep_rewind") == "1";
         let sabr_dvr = !ok
             && !manually_stopped
             && !shutting_down
+            && !deep_rewind
             && sabr_dvr_window_exceeded(&outcome.log);
         if sabr_dvr {
             self.sabr_dvr_exceeded.lock().unwrap().insert(monitor_id);

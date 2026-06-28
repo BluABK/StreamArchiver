@@ -18,10 +18,27 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 27;
+const SCHEMA_VERSION: i64 = 28;
 
 pub struct Store {
     conn: Mutex<Connection>,
+}
+
+/// One archived community-post image (schema v28 `community_post_archive`), as
+/// returned by [`Store::community_post_get`]. `decoded_json` is the cached
+/// `Vec<ScheduleSegment>` when `ocr_attempted` is set (empty string before the
+/// first OCR).
+pub struct ArchivedPost {
+    // Retained for the (future) "view archived posts" UI even though the OCR walk
+    // already knows the hash and reads the file via its own path.
+    #[allow(dead_code)]
+    pub content_hash: String,
+    #[allow(dead_code)]
+    pub local_path: String,
+    pub ocr_attempted: bool,
+    #[allow(dead_code)]
+    pub decoded_events: i64,
+    pub decoded_json: String,
 }
 
 /// Minimal monitor fields the ad-free (Twitch sub) refresher needs.
@@ -449,7 +466,35 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 27)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 27);
+        if version < 28 {
+            // Archive of every YouTube community-post image we download while
+            // scanning for a schedule. Two jobs: (1) a durable record of what was
+            // pulled (url/path/when), queryable later; (2) a per-image OCR cache —
+            // `content_hash` keys an unchanged image to its already-decoded events
+            // (`decoded_json`), so a new post pushing old ones down the feed no
+            // longer forces a full re-OCR of the unchanged images. `content_hash`
+            // is a decimal string of an fnv64 (u64) — TEXT, because SQLite INTEGER
+            // is i64 and would overflow the high-bit hashes.
+            conn.execute_batch(
+                "CREATE TABLE community_post_archive (
+                    id             INTEGER PRIMARY KEY,
+                    monitor_id     INTEGER NOT NULL,
+                    source         TEXT NOT NULL,
+                    image_url      TEXT NOT NULL,
+                    content_hash   TEXT NOT NULL,
+                    local_path     TEXT NOT NULL,
+                    fetched_at     INTEGER NOT NULL,
+                    ocr_attempted  INTEGER NOT NULL DEFAULT 0,
+                    decoded_events INTEGER NOT NULL DEFAULT 0,
+                    decoded_json   TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY(monitor_id) REFERENCES monitor(id) ON DELETE CASCADE
+                );
+                CREATE UNIQUE INDEX idx_community_post_archive_uniq
+                    ON community_post_archive(monitor_id, content_hash);",
+            )?;
+            conn.pragma_update(None, "user_version", 28)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 28);
         Ok(())
     }
 
@@ -475,6 +520,98 @@ impl Store {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    // ----- community-post archive (schema v28) -----
+
+    /// Look up an archived community-post image by its content hash for a monitor.
+    /// `Some` means we've already downloaded this exact image; if `ocr_attempted`
+    /// is set, `decoded_json` holds the events we got (possibly empty) so the
+    /// caller can skip re-OCR. The hash is the fnv64 of the image bytes, rendered
+    /// as a decimal string (see the v28 migration note on the TEXT column).
+    pub fn community_post_get(
+        &self,
+        monitor_id: i64,
+        content_hash: &str,
+    ) -> Result<Option<ArchivedPost>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT content_hash, local_path, ocr_attempted, decoded_events, decoded_json
+                 FROM community_post_archive
+                 WHERE monitor_id = ?1 AND content_hash = ?2",
+                params![monitor_id, content_hash],
+                |r| {
+                    Ok(ArchivedPost {
+                        content_hash: r.get(0)?,
+                        local_path: r.get(1)?,
+                        ocr_attempted: r.get::<_, i64>(2)? != 0,
+                        decoded_events: r.get(3)?,
+                        decoded_json: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Record (or refresh) a downloaded community-post image. Idempotent on
+    /// `(monitor_id, content_hash)`: re-downloading the same image just updates the
+    /// URL/path it was last seen at (the feed URL can change), leaving any prior
+    /// OCR result intact. Returns without touching `ocr_*`/`decoded_*`.
+    pub fn community_post_upsert(
+        &self,
+        monitor_id: i64,
+        source: &str,
+        image_url: &str,
+        content_hash: &str,
+        local_path: &str,
+        fetched_at: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO community_post_archive
+                 (monitor_id, source, image_url, content_hash, local_path, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(monitor_id, content_hash) DO UPDATE SET
+                 image_url  = excluded.image_url,
+                 local_path = excluded.local_path",
+            params![monitor_id, source, image_url, content_hash, local_path, fetched_at],
+        )?;
+        Ok(())
+    }
+
+    /// Mark an archived image as OCR'd and cache the decoded events. `events` is
+    /// the count (for cheap querying); `json` is the serialized `Vec<ScheduleSegment>`
+    /// (may be `[]` — an authoritative "this image has no schedule", which still
+    /// suppresses re-OCR).
+    pub fn community_post_set_decoded(
+        &self,
+        monitor_id: i64,
+        content_hash: &str,
+        events: i64,
+        json: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE community_post_archive
+             SET ocr_attempted = 1, decoded_events = ?3, decoded_json = ?4
+             WHERE monitor_id = ?1 AND content_hash = ?2",
+            params![monitor_id, content_hash, events, json],
+        )?;
+        Ok(())
+    }
+
+    /// Number of archived community-post images for a monitor (test/diagnostic helper).
+    #[allow(dead_code)]
+    pub fn community_post_count(&self, monitor_id: i64) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.query_row(
+            "SELECT COUNT(*) FROM community_post_archive WHERE monitor_id = ?1",
+            params![monitor_id],
+            |r| r.get(0),
+        )?;
+        Ok(n)
     }
 
     /// Aggregate counts and byte totals across the whole database for the Stats view.
@@ -2509,5 +2646,66 @@ mod tests {
             store.get_setting("twitch_client_id").unwrap().as_deref(),
             Some("xyz789")
         );
+    }
+
+    #[test]
+    fn community_post_archive_dedupes_and_preserves_ocr() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        // First download of an image.
+        store
+            .community_post_upsert(mid, "youtube_community_ocr", "https://x/a.jpg", "1111", "C:/c/1111", 100)
+            .unwrap();
+        assert_eq!(store.community_post_count(mid).unwrap(), 1);
+
+        // Cache it as OCR'd with one decoded event.
+        store
+            .community_post_set_decoded(mid, "1111", 1, r#"[{"t":"x"}]"#)
+            .unwrap();
+        let got = store.community_post_get(mid, "1111").unwrap().unwrap();
+        assert!(got.ocr_attempted);
+        assert_eq!(got.decoded_events, 1);
+        assert_eq!(got.decoded_json, r#"[{"t":"x"}]"#);
+
+        // Re-upserting the SAME (monitor, hash) with a new URL/path must not add a
+        // row and must NOT wipe the cached OCR result (idempotent on the unique key).
+        store
+            .community_post_upsert(mid, "youtube_community_ocr", "https://x/b.jpg", "1111", "C:/c/1111b", 200)
+            .unwrap();
+        assert_eq!(store.community_post_count(mid).unwrap(), 1);
+        let got = store.community_post_get(mid, "1111").unwrap().unwrap();
+        assert!(got.ocr_attempted, "re-download must not clear prior OCR");
+        assert_eq!(got.decoded_events, 1);
+        assert_eq!(got.local_path, "C:/c/1111b", "path updated to the latest download");
+
+        // A different content hash is a distinct archived image.
+        store
+            .community_post_upsert(mid, "youtube_community_ocr", "https://x/c.jpg", "2222", "C:/c/2222", 300)
+            .unwrap();
+        assert_eq!(store.community_post_count(mid).unwrap(), 2);
+        // The new image hasn't been OCR'd yet.
+        assert!(!store.community_post_get(mid, "2222").unwrap().unwrap().ocr_attempted);
+
+        // The same content hash under a DIFFERENT monitor is independent (the unique
+        // index is on the pair, and each monitor archives its own copy).
+        let mid2 = store.insert_monitor(&m).unwrap();
+        store
+            .community_post_upsert(mid2, "youtube_community_ocr", "https://x/a.jpg", "1111", "C:/c/1111", 100)
+            .unwrap();
+        assert_eq!(store.community_post_count(mid2).unwrap(), 1);
+        // mid2's copy is its own un-OCR'd row; mid's stays OCR'd.
+        assert!(!store.community_post_get(mid2, "1111").unwrap().unwrap().ocr_attempted);
+        assert!(store.community_post_get(mid, "1111").unwrap().unwrap().ocr_attempted);
+
+        // Deleting a monitor cascades to its archived posts (FK ON DELETE CASCADE).
+        store.delete_monitor(mid).unwrap();
+        assert_eq!(store.community_post_count(mid).unwrap(), 0);
+        assert!(store.community_post_get(mid, "1111").unwrap().is_none());
+        // The other monitor's archive is untouched.
+        assert_eq!(store.community_post_count(mid2).unwrap(), 1);
     }
 }

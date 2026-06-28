@@ -23,18 +23,19 @@ use crate::models::{
     AdBreak, AuthKind, Channel, Container, DetectionMethod, DownloadDefaults, GlobalStats,
     K_DISCORD_SCHEDULE, K_DISCORD_TOKEN, K_FILENAME_MEDIA, K_MONITOR_DEFAULTS, K_OCR_COMMAND,
     K_OCR_EFFORT, K_OCR_FALLBACK_MODEL, K_OCR_MAX_BUDGET, K_OCR_MODEL, K_OCR_OFFSET,
-    K_OCR_STATS, K_OCR_TIMEOUT_SECS, K_OCR_TIMEZONE,
-    K_YT_API_DETECT, K_YT_API_SCHEDULE, MediaInfoMode, Monitor, MonitorDefaults,
-    MonitorWithChannel, OcrStats, Platform, Recording, ScheduleSegment, StreamGroup,
-    StreamMetaChange, Tool, UpcomingStream, Video, group_recordings, now_unix,
+    K_OCR_STATS, K_OCR_TIMEOUT_SECS, K_OCR_TIMEZONE, K_SCHEDULE_TITLE_FILL,
+    K_YT_API_DETECT, K_YT_API_SCHEDULE, K_YT_COMMUNITY_MAX_POSTS, MediaInfoMode, Monitor,
+    MonitorDefaults, MonitorWithChannel, OcrStats, Platform, Recording, ScheduleSegment,
+    StreamGroup, StreamMetaChange, Tool, UpcomingStream, Video, group_recordings, now_unix,
 };
 use crate::google_oauth;
 use crate::imports::{self, ImportCandidate};
 use crate::oauth::{self, AuthFlow};
 use crate::platform::AutoStart;
 use crate::schedule_source::{
-    ScheduleSourceKind, SourceEntry, load_channel_cfg, load_source_order, save_channel_cfg,
-    save_source_order, source_badge,
+    ScheduleSourceKind, SourceEntry, load_channel_cfg, load_channel_scope, load_monitor_scope,
+    load_source_order, save_channel_cfg, save_channel_scope, save_monitor_scope, save_source_order,
+    source_badge,
 };
 
 const K_TWITCH_ID: &str = "twitch_client_id";
@@ -413,6 +414,14 @@ struct SettingsForm {
     ocr_timeout_secs: String,
     /// Effort level passed as `--effort` (empty = omit; low/medium/high/xhigh/max).
     ocr_effort: String,
+    /// Global "go to the next schedule source when an event has no title" toggle:
+    /// after a winner is found, keep querying lower-priority sources to fill in
+    /// blank titles (e.g. a Twitch schedule with times but no titles).
+    schedule_title_fill: bool,
+    /// How many recent YouTube community posts to scan for a schedule image
+    /// (backlog depth). Empty = built-in default (5). Per-channel override in
+    /// channel Properties.
+    youtube_community_max_posts: String,
 }
 
 /// Background load state of an import fetch (followed/subscriptions).
@@ -586,6 +595,12 @@ pub struct StreamArchiverApp {
     /// Editable per-channel schedule-source config shown in the Properties window,
     /// tagged with its channel id. Loaded when Properties opens; saved on edit.
     channel_cfg_draft: Option<(i64, crate::schedule_source::ChannelSourceConfig)>,
+    /// Editable per-channel schedule-source *scope* override (custom order +
+    /// title-fill) shown in channel Properties, tagged with its channel id.
+    channel_scope_draft: Option<(i64, crate::schedule_source::SourceScopeConfig)>,
+    /// Editable per-instance (monitor) schedule-source *scope* override shown in
+    /// instance Properties, tagged with its monitor id.
+    instance_scope_draft: Option<(i64, crate::schedule_source::SourceScopeConfig)>,
     /// Draft for the "Edit schedule item" dialog (None = closed). Saving converts
     /// the row to a protected `"manual"` source so refreshes don't overwrite it.
     edit_schedule: Option<EditScheduleDraft>,
@@ -777,6 +792,8 @@ impl StreamArchiverApp {
             ocr_max_budget: setting_or_empty(&core, K_OCR_MAX_BUDGET),
             ocr_timeout_secs: setting_or_empty(&core, K_OCR_TIMEOUT_SECS),
             ocr_effort: setting_or_empty(&core, K_OCR_EFFORT),
+            schedule_title_fill: setting_or_empty(&core, K_SCHEDULE_TITLE_FILL) == "1",
+            youtube_community_max_posts: setting_or_empty(&core, K_YT_COMMUNITY_MAX_POSTS),
         };
         // Apply the loaded date format before the first render.
         set_active_date_fmt(settings.date_fmt);
@@ -903,6 +920,8 @@ impl StreamArchiverApp {
             schedule_sources_draft: Vec::new(),
             schedule_sources_selected: None,
             channel_cfg_draft: None,
+            channel_scope_draft: None,
+            instance_scope_draft: None,
             edit_schedule: None,
             chat_popup: None,
             platform_tex: None,
@@ -1251,6 +1270,14 @@ impl StreamArchiverApp {
             (K_OCR_MAX_BUDGET, s.ocr_max_budget.trim()),
             (K_OCR_TIMEOUT_SECS, s.ocr_timeout_secs.trim()),
             (K_OCR_EFFORT, s.ocr_effort.trim()),
+            (
+                K_SCHEDULE_TITLE_FILL,
+                if s.schedule_title_fill { "1" } else { "0" },
+            ),
+            (
+                K_YT_COMMUNITY_MAX_POSTS,
+                s.youtube_community_max_posts.trim(),
+            ),
         ];
         for (k, v) in pairs {
             if let Err(e) = self.core.store.set_setting(k, v) {
@@ -1523,6 +1550,123 @@ fn source_row_ranked(
     }
     ui.selectable_label(selected, text)
         .on_hover_text(kind.description())
+}
+
+/// Compact, embeddable schedule-source list editor: one row per source in
+/// priority order with an enable checkbox and ▲/▼ reorder buttons. Used by the
+/// per-channel / per-instance scope override (the big two-column dialog stays for
+/// the global order). Returns true if `entries` changed. Unknown ids are skipped
+/// but kept in place.
+fn source_list_inline_editor(ui: &mut egui::Ui, entries: &mut [SourceEntry]) -> bool {
+    let mut changed = false;
+    let mut move_up: Option<usize> = None;
+    let mut move_down: Option<usize> = None;
+    let n = entries.len();
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        for (i, entry) in entries.iter_mut().enumerate() {
+            let Some(kind) = entry.kind() else { continue };
+            ui.horizontal(|ui| {
+                if ui.checkbox(&mut entry.enabled, "").changed() {
+                    changed = true;
+                }
+                if ui
+                    .add_enabled(i > 0, egui::Button::new("▲").small())
+                    .on_hover_text("Higher priority")
+                    .clicked()
+                {
+                    move_up = Some(i);
+                }
+                if ui
+                    .add_enabled(i + 1 < n, egui::Button::new("▼").small())
+                    .on_hover_text("Lower priority")
+                    .clicked()
+                {
+                    move_down = Some(i);
+                }
+                let mut label = egui::RichText::new(kind.label());
+                if !entry.enabled {
+                    label = label.weak();
+                }
+                ui.label(label).on_hover_text(kind.description());
+                if kind.risky() {
+                    ui.colored_label(egui::Color32::from_rgb(0xe0, 0x6c, 0x6c), "⚠");
+                }
+            });
+        }
+    });
+    if let Some(i) = move_up {
+        entries.swap(i, i - 1);
+        changed = true;
+    }
+    if let Some(i) = move_down {
+        entries.swap(i, i + 1);
+        changed = true;
+    }
+    changed
+}
+
+/// Per-channel / per-instance schedule-source scope override editor: an
+/// Inherit-vs-Custom source-order toggle (with an inline reorderable list when
+/// Custom) plus a tri-state title-fill override (Inherit / On / Off). `global_order`
+/// seeds a freshly-switched-on custom list. Returns true if `scope` changed.
+fn scope_override_editor(
+    ui: &mut egui::Ui,
+    scope: &mut crate::schedule_source::SourceScopeConfig,
+    global_order: &[SourceEntry],
+) -> bool {
+    let mut changed = false;
+
+    ui.label("Source order");
+    let custom = scope.order.is_some();
+    ui.horizontal(|ui| {
+        if ui
+            .radio(!custom, "Inherit global")
+            .on_hover_text("Use the global source order from Settings → Schedule sources.")
+            .clicked()
+            && custom
+        {
+            scope.order = None;
+            changed = true;
+        }
+        if ui
+            .radio(custom, "Custom")
+            .on_hover_text("Override the source order/enabled set just for this scope.")
+            .clicked()
+            && !custom
+        {
+            // Seed the custom list from the current global order.
+            scope.order = Some(global_order.to_vec());
+            changed = true;
+        }
+    });
+    if let Some(order) = scope.order.as_mut() {
+        if source_list_inline_editor(ui, order) {
+            changed = true;
+        }
+    }
+
+    ui.add_space(4.0);
+    ui.label("Fill blank titles from next source");
+    ui.horizontal(|ui| {
+        if ui.radio(scope.title_fill.is_none(), "Inherit").clicked() && scope.title_fill.is_some() {
+            scope.title_fill = None;
+            changed = true;
+        }
+        if ui.radio(scope.title_fill == Some(true), "On").clicked()
+            && scope.title_fill != Some(true)
+        {
+            scope.title_fill = Some(true);
+            changed = true;
+        }
+        if ui.radio(scope.title_fill == Some(false), "Off").clicked()
+            && scope.title_fill != Some(false)
+        {
+            scope.title_fill = Some(false);
+            changed = true;
+        }
+    });
+
+    changed
 }
 
 fn fmt_datetime_short(secs: i64) -> String {
@@ -9006,6 +9150,33 @@ impl StreamArchiverApp {
             {
                 self.open_schedule_sources();
             }
+
+            ui.add_space(6.0);
+            ui.checkbox(
+                &mut self.settings.schedule_title_fill,
+                "Go to next schedule source when no title found",
+            )
+            .on_hover_text(
+                "After a source resolves a schedule, if any of its events have a time but no \
+                 title, keep querying the lower-priority sources to borrow titles (matched to \
+                 the nearest event within ±2h). Useful when a Twitch schedule publishes times \
+                 but no titles and a banner / community-post OCR source has them. Override per \
+                 channel or per instance in Properties.",
+            );
+            ui.horizontal(|ui| {
+                ui.label("YouTube community post backlog");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.settings.youtube_community_max_posts)
+                        .hint_text("5")
+                        .desired_width(60.0),
+                )
+                .on_hover_text(
+                    "How many recent YouTube community posts to scan for a schedule image \
+                     (some channels post the week several posts back). Empty = 5. Clamped to \
+                     1–20. Override per channel in Properties.",
+                );
+            });
+
             ui.add_space(6.0);
             ui.label("Image OCR (for banner / community / tweet sources)");
             egui::Grid::new("ocr_grid")
@@ -11108,6 +11279,12 @@ impl StreamArchiverApp {
             .or_insert_with(|| resolve_channel_icon(ch, &platforms, ctx))
             .clone();
 
+        if self.instance_scope_draft.as_ref().map(|(id, _)| *id) != Some(m.id) {
+            self.instance_scope_draft = Some((m.id, load_monitor_scope(&self.core.store, m.id)));
+        }
+        let global_order = load_source_order(&self.core.store);
+        let mut scope_dirty = false;
+
         let mut open = true;
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("instance_props_vp"),
@@ -11218,12 +11395,41 @@ impl StreamArchiverApp {
                         ui.label(prop_bool(m.fetch_chat_assets));
                         ui.end_row();
                     });
+
+                // ── Schedule sources (this instance) ─────────────────────
+                ui.add_space(8.0);
+                ui.strong("Schedule sources (this instance)");
+                ui.label(
+                    egui::RichText::new(
+                        "Overrides the global order/title-fill for this one instance, taking \
+                         precedence over the channel's setting. Changes apply on the next \
+                         schedule refresh.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                if let Some((_, scope)) = self.instance_scope_draft.as_mut() {
+                    if scope_override_editor(ui, scope, &global_order) {
+                        scope_dirty = true;
+                    }
+                }
                 });
             },
         );
 
+        if scope_dirty {
+            if let Some((mid, scope)) = &self.instance_scope_draft {
+                if let Err(e) = save_monitor_scope(&self.core.store, *mid, scope) {
+                    self.status = format!("Error saving instance sources: {e}");
+                } else {
+                    self.core.request_schedule_refresh();
+                }
+            }
+        }
+
         if !open {
             self.properties_popup = None;
+            self.instance_scope_draft = None;
         }
     }
 
@@ -11260,7 +11466,13 @@ impl StreamArchiverApp {
         if self.channel_cfg_draft.as_ref().map(|(id, _)| *id) != Some(ch.id) {
             self.channel_cfg_draft = Some((ch.id, load_channel_cfg(&self.core.store, ch.id)));
         }
+        if self.channel_scope_draft.as_ref().map(|(id, _)| *id) != Some(ch.id) {
+            self.channel_scope_draft =
+                Some((ch.id, load_channel_scope(&self.core.store, ch.id)));
+        }
+        let global_order = load_source_order(&self.core.store);
         let mut cfg_dirty = false;
+        let mut scope_dirty = false;
 
         let mut open = true;
         ctx.show_viewport_immediate(
@@ -11579,7 +11791,33 @@ impl StreamArchiverApp {
                                 cfg_dirty = true;
                             }
                             ui.end_row();
+
+                            ui.label("YouTube community backlog");
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut cfg.max_community_posts)
+                                        .hint_text("(global default)")
+                                        .desired_width(80.0),
+                                )
+                                .on_hover_text(
+                                    "How many recent YouTube community posts to scan for this \
+                                     channel's schedule image. Empty = use the global setting. \
+                                     Clamped to 1–20.",
+                                )
+                                .changed()
+                            {
+                                cfg_dirty = true;
+                            }
+                            ui.end_row();
                         });
+
+                    // Per-channel source-order + title-fill override.
+                    ui.add_space(6.0);
+                    if let Some((_, scope)) = self.channel_scope_draft.as_mut() {
+                        if scope_override_editor(ui, scope, &global_order) {
+                            scope_dirty = true;
+                        }
+                    }
                 }
 
                 // Apply an icon-source change picked in the combo above.
@@ -11604,10 +11842,20 @@ impl StreamArchiverApp {
                 }
             }
         }
+        if scope_dirty {
+            if let Some((cid, scope)) = &self.channel_scope_draft {
+                if let Err(e) = save_channel_scope(&self.core.store, *cid, scope) {
+                    self.status = format!("Error saving channel sources: {e}");
+                } else {
+                    self.core.request_schedule_refresh();
+                }
+            }
+        }
 
         if !open {
             self.channel_properties_popup = None;
             self.channel_cfg_draft = None;
+            self.channel_scope_draft = None;
         }
     }
 }
