@@ -2086,6 +2086,7 @@ pub async fn refresh_schedules(
     shutdown: Arc<AtomicBool>,
     refresh_now: Arc<tokio::sync::Notify>,
     yt_video_id_refetch: Arc<AtomicBool>,
+    refresh_channel: Arc<std::sync::Mutex<Option<i64>>>,
     jobs: crate::events::JobRegistry,
 ) {
     const INITIAL_DELAY_SECS: u64 = 30;
@@ -2115,6 +2116,7 @@ pub async fn refresh_schedules(
                 &mut last_ocr,
                 &mut discord_last,
                 &yt_video_id_refetch,
+                &refresh_channel,
                 REFRESH_SECS,
             )
             .await;
@@ -2130,7 +2132,7 @@ pub async fn refresh_schedules(
                 }
                 refresh_schedules_once(
                     &ctx, &events, &shutdown, &mut last_fetched, &mut last_ocr,
-                    &mut discord_last, &yt_video_id_refetch, 0,
+                    &mut discord_last, &yt_video_id_refetch, &refresh_channel, 0,
                 )
                 .await;
             }
@@ -2198,6 +2200,7 @@ async fn refresh_schedules_once(
     last_ocr: &mut HashMap<(i64, String), i64>,
     discord_last: &mut Option<Instant>,
     yt_video_id_refetch: &Arc<AtomicBool>,
+    refresh_channel: &std::sync::Mutex<Option<i64>>,
     refresh_secs: u64,
 ) {
     let rows = match ctx.store.list_monitors_with_channels() {
@@ -2227,6 +2230,17 @@ async fn refresh_schedules_once(
         last_fetched.retain(|id, _| !missing_ids.contains(id));
     }
 
+    // If the UI requested a per-channel refresh, restrict this pass to monitors
+    // belonging to that channel. `last_fetched` is cleared for those monitors so
+    // they bypass the staleness gate; all other monitors are skipped entirely
+    // (their schedules stay untouched). `None` = normal full pass.
+    let only_channel: Option<i64> = refresh_channel.lock().unwrap().take();
+    if let Some(cid) = only_channel {
+        for row in rows.iter().filter(|r| r.channel.id == cid) {
+            last_fetched.remove(&row.monitor.id);
+        }
+    }
+
     // The user's global ordered sources, plus per-channel / per-monitor scope
     // overrides (loaded once; resolved per monitor in the walk and, below, for the
     // Discord batch sweep — so Discord honors the same per-channel/instance control).
@@ -2254,6 +2268,12 @@ async fn refresh_schedules_once(
     for row in &rows {
         if shutdown.load(Ordering::SeqCst) {
             return;
+        }
+        // When targeting a single channel, skip all other channels entirely.
+        if let Some(cid) = only_channel {
+            if row.channel.id != cid {
+                continue;
+            }
         }
         if !row.channel.enabled || !row.monitor.enabled {
             continue;

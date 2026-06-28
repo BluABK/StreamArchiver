@@ -6622,6 +6622,17 @@ impl StreamArchiverApp {
                                     });
                                     ui.close();
                                 }
+                                ui.separator();
+                                if ui
+                                    .button("⟳  Refetch schedule")
+                                    .on_hover_text("Re-fetch this channel's schedule now, ignoring the cache")
+                                    .clicked()
+                                {
+                                    ui.ctx().data_mut(|d| {
+                                        d.insert_temp(egui::Id::new("sched_ch_refetch"), cid)
+                                    });
+                                    ui.close();
+                                }
                             });
                         }
 
@@ -6868,6 +6879,14 @@ impl StreamArchiverApp {
             } else {
                 self.schedule_hidden.insert(cid);
             }
+        }
+        if let Some(cid) = ui
+            .ctx()
+            .data_mut(|d| d.remove_temp::<i64>(egui::Id::new("sched_ch_refetch")))
+        {
+            self.core.request_schedule_refresh_for_channel(cid);
+            self.reload_schedule();
+            self.status = "Fetching schedule…".into();
         }
         if let Some(v) = set_show_hidden {
             self.schedule_show_hidden = v;

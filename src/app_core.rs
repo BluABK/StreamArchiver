@@ -90,6 +90,9 @@ pub struct AppCore {
     /// Set to `true` by `request_yt_video_id_refetch()` so the next schedule pass
     /// re-scrapes only the YouTube monitors whose stored segments are missing video IDs.
     yt_video_id_refetch: Arc<AtomicBool>,
+    /// When `Some(channel_id)`, the next schedule pass refreshes only monitors
+    /// belonging to that channel (set by "Refetch schedule" on a single channel).
+    schedule_refresh_channel: Arc<Mutex<Option<i64>>>,
     /// Periodic background jobs + their next-run estimates (the Background view's
     /// "Scheduled" section); updated by each periodic loop before it sleeps.
     pub jobs: crate::events::JobRegistry,
@@ -123,6 +126,7 @@ impl AppCore {
             manual_tx: Mutex::new(None),
             schedule_refresh: Arc::new(tokio::sync::Notify::new()),
             yt_video_id_refetch: Arc::new(AtomicBool::new(false)),
+            schedule_refresh_channel: Arc::new(Mutex::new(None)),
             jobs: crate::events::job_registry(),
             startup_notice: Mutex::new(None),
         }))
@@ -201,10 +205,12 @@ impl AppCore {
         let sch_shutdown = self.shutdown.clone();
         let sch_refresh = self.schedule_refresh.clone();
         let sch_vid_refetch = self.yt_video_id_refetch.clone();
+        let sch_channel = self.schedule_refresh_channel.clone();
         let sch_jobs = self.jobs.clone();
         self.rt.spawn(async move {
             crate::detectors::refresh_schedules(
-                sch_ctx, sch_events, sch_shutdown, sch_refresh, sch_vid_refetch, sch_jobs,
+                sch_ctx, sch_events, sch_shutdown, sch_refresh, sch_vid_refetch, sch_channel,
+                sch_jobs,
             )
             .await;
         });
@@ -326,6 +332,14 @@ impl AppCore {
     /// Only those monitors are re-fetched; others keep their cached schedules.
     pub fn request_yt_video_id_refetch(&self) {
         self.yt_video_id_refetch.store(true, Ordering::SeqCst);
+        self.schedule_refresh.notify_one();
+    }
+
+    /// Refresh the schedule for a single channel immediately (ignoring staleness).
+    /// Only the monitors belonging to `channel_id` are re-fetched; every other
+    /// channel keeps its cached schedule.
+    pub fn request_schedule_refresh_for_channel(&self, channel_id: i64) {
+        *self.schedule_refresh_channel.lock().unwrap() = Some(channel_id);
         self.schedule_refresh.notify_one();
     }
 
