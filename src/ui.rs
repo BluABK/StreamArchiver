@@ -78,6 +78,10 @@ const K_DATE_FORMAT: &str = "date_format";
 /// Whether the per-row Actions column is shown (the row context menu has the same
 /// actions, so it can be hidden to reclaim width).
 const K_SHOW_ACTIONS: &str = "show_actions";
+/// Whether timestamp columns use the compact short format (off = full datetime).
+const K_SHORT_TIMESTAMPS: &str = "short_timestamps";
+/// chrono format pattern used for the compact timestamp display; default `%d/%m %H:%M`.
+const K_SHORT_TS_FMT: &str = "short_ts_fmt";
 /// Whether chat-replay emote codes render as inline images (off ⇒ show the code
 /// text). Default on; only an explicit `"0"` disables. Needs "Fetch chat assets".
 const K_RENDER_EMOTES: &str = "render_emotes_in_chat";
@@ -374,6 +378,8 @@ struct SettingsForm {
     filename_media_info: MediaInfoMode,
     /// How dates/timestamps are displayed throughout the UI.
     date_fmt: DateFmt,
+    /// chrono format string used for the compact timestamp mode (K_SHORT_TS_FMT).
+    short_ts_fmt: String,
     /// Global extra arguments prepended to every yt-dlp invocation (all monitors).
     /// Per-monitor extra_args are appended after these, so they take precedence.
     ytdlp_default_args: String,
@@ -650,6 +656,10 @@ pub struct StreamArchiverApp {
     /// Streams + Videos tables. Off reclaims width; every action is also on the
     /// row's right-click context menu. Persisted under [`K_SHOW_ACTIONS`].
     show_actions: bool,
+    /// Whether timestamp columns show a compact short format (e.g. `21/06 14:02`)
+    /// instead of the full datetime. The full value appears in a tooltip. Persisted
+    /// under [`K_SHORT_TIMESTAMPS`].
+    shorten_timestamps: bool,
     /// Render chat emotes as inline images in the chat replay (off ⇒ show the
     /// emote code as text). Default on. Persisted under [`K_RENDER_EMOTES`].
     render_emotes: bool,
@@ -749,6 +759,10 @@ impl StreamArchiverApp {
                 .unwrap_or_else(|| "15".into()),
             filename_media_info: MediaInfoMode::parse(&setting_or_empty(&core, K_FILENAME_MEDIA)),
             date_fmt: DateFmt::parse(&setting_or_empty(&core, K_DATE_FORMAT)),
+            short_ts_fmt: {
+                let v = setting_or_empty(&core, K_SHORT_TS_FMT);
+                if v.is_empty() { "%d/%m %H:%M".to_string() } else { v }
+            },
             ytdlp_default_args: setting_or_empty(&core, K_YTDLP_ARGS),
             ytdlp_binary_path: setting_or_empty(&core, K_YTDLP_BINARY),
             sabr_binary_path: setting_or_empty(&core, K_SABR_BINARY),
@@ -800,8 +814,9 @@ impl StreamArchiverApp {
             schedule_title_fill: setting_or_empty(&core, K_SCHEDULE_TITLE_FILL) == "1",
             youtube_community_max_posts: setting_or_empty(&core, K_YT_COMMUNITY_MAX_POSTS),
         };
-        // Apply the loaded date format before the first render.
+        // Apply the loaded date format + short-timestamp pattern before the first render.
         set_active_date_fmt(settings.date_fmt);
+        set_short_ts_pattern(&settings.short_ts_fmt);
 
         let twitch_flow = Arc::new(Mutex::new(match oauth::connected_login(&core.store) {
             Some(login) => AuthFlow::Connected { login },
@@ -831,6 +846,16 @@ impl StreamArchiverApp {
             .flatten()
             .map(|v| v != "0")
             .unwrap_or(true);
+        // Short timestamps default off; only an explicit "1" enables.
+        let shorten_timestamps = core
+            .store
+            .get_setting(K_SHORT_TIMESTAMPS)
+            .ok()
+            .flatten()
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        set_short_ts(shorten_timestamps);
+
         // Inline chat emotes default on; only an explicit "0" disables.
         let render_emotes = core
             .store
@@ -945,6 +970,7 @@ impl StreamArchiverApp {
             import_dialog: None,
             status_bgcolor,
             show_actions,
+            shorten_timestamps,
             render_emotes,
             animate_emotes,
             background_tasks: Vec::new(),
@@ -1250,6 +1276,7 @@ impl StreamArchiverApp {
             (K_WEBSUB_POLL, s.websub_poll_secs.trim()),
             (K_FILENAME_MEDIA, s.filename_media_info.as_str()),
             (K_DATE_FORMAT, s.date_fmt.as_str()),
+            (K_SHORT_TS_FMT, s.short_ts_fmt.trim()),
             (K_YT_API_DETECT, if s.youtube_api_detect { "1" } else { "0" }),
             (K_YT_API_SCHEDULE, if s.youtube_api_schedule { "1" } else { "0" }),
             (K_YTDLP_ARGS, s.ytdlp_default_args.trim()),
@@ -1298,8 +1325,9 @@ impl StreamArchiverApp {
             let _ = self.core.store.clear_schedule_source("discord");
             self.reload_schedule();
         }
-        // Apply the (possibly changed) date format to the live UI.
+        // Apply the (possibly changed) date format + short-timestamp pattern to the live UI.
         set_active_date_fmt(self.settings.date_fmt);
+        set_short_ts_pattern(&self.settings.short_ts_fmt);
         self.persist_monitor_defaults();
         self.status = "Settings saved.".into();
     }
@@ -1515,6 +1543,51 @@ fn set_active_date_fmt(f: DateFmt) {
     ACTIVE_DATE_FMT.store(i, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether the "compact timestamps" mode is active. Set at startup and when the
+/// top-bar toggle changes so formatters don't need the flag threaded through.
+static SHORT_TS_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The compact timestamp pattern (e.g. `"%d/%m %H:%M"`). Protected by a mutex so
+/// it can be changed at runtime without a full restart.
+static SHORT_TS_PAT: std::sync::OnceLock<std::sync::Mutex<String>> =
+    std::sync::OnceLock::new();
+
+fn short_ts_on() -> bool {
+    SHORT_TS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn set_short_ts(on: bool) {
+    SHORT_TS_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn short_ts_pattern() -> String {
+    SHORT_TS_PAT
+        .get_or_init(|| std::sync::Mutex::new("%d/%m %H:%M".to_string()))
+        .lock()
+        .unwrap()
+        .clone()
+}
+
+fn set_short_ts_pattern(pat: &str) {
+    *SHORT_TS_PAT
+        .get_or_init(|| std::sync::Mutex::new("%d/%m %H:%M".to_string()))
+        .lock()
+        .unwrap() = pat.to_string();
+}
+
+/// Compact variant of [`fmt_datetime_short`] — uses [`short_ts_pattern`] instead of the
+/// active [`DateFmt`]. Never checks [`short_ts_on`]; call it only when you want compact.
+fn fmt_datetime_compact(secs: i64) -> String {
+    if secs <= 0 {
+        return String::new();
+    }
+    let pat = short_ts_pattern();
+    chrono::DateTime::from_timestamp(secs, 0)
+        .map(|dt| dt.with_timezone(&chrono::Local).format(&pat).to_string())
+        .unwrap_or_default()
+}
+
 /// Format a unix timestamp as a local date in the active [`DateFmt`] (empty if
 /// unset).
 fn fmt_date(secs: i64) -> String {
@@ -1693,7 +1766,12 @@ fn fmt_datetime_short(secs: i64) -> String {
 /// parentheses, e.g. `2026-06-21 14:02:33 (60s)`. When never polled, shows just
 /// the interval `(60s)` so the configured cadence is still visible.
 fn fmt_polled(last_checked: Option<i64>, interval_secs: i64) -> String {
-    let when = fmt_datetime_short(last_checked.unwrap_or(0));
+    let secs = last_checked.unwrap_or(0);
+    let when = if short_ts_on() {
+        fmt_datetime_compact(secs)
+    } else {
+        fmt_datetime_short(secs)
+    };
     if when.is_empty() {
         format!("({interval_secs}s)")
     } else {
@@ -2555,11 +2633,6 @@ fn fmt_ad_count(n: i64) -> String {
     if n > 0 { n.to_string() } else { String::new() }
 }
 
-/// Total ad time for a cell (blank when zero).
-fn fmt_ad_time(secs: i64) -> String {
-    if secs > 0 { fmt_duration(secs) } else { String::new() }
-}
-
 /// Resolve an instance's ad-free status into a (label, tooltip) for display.
 /// Manual flag wins; otherwise the auto Twitch-sub result (`Some(true)` = sub'd,
 /// `Some(false)` = checked & not sub'd, `None` = unknown/not checked). Returns
@@ -2614,51 +2687,6 @@ fn ad_cut_lines(breaks: &[AdBreak]) -> Vec<String> {
         .collect()
 }
 
-/// Multi-line tooltip body for an ad cell: a heading plus the per-break cut list
-/// (or a fallback when the details aren't loaded yet).
-fn ad_tooltip(count: i64, secs: i64, breaks: Option<&Vec<AdBreak>>) -> String {
-    let mut s = format!(
-        "{count} ad break(s), {} total — each is a hard cut in the file.",
-        fmt_duration(secs)
-    );
-    if let Some(b) = breaks.filter(|b| !b.is_empty()) {
-        s.push('\n');
-        s.push_str(&ad_cut_lines(b).join("\n"));
-    }
-    s
-}
-
-/// Render one Ads / Ad-time table cell. Blank `text` renders nothing. The hover
-/// tooltip (the cut list) is built lazily, only when hovered. When `clickable_rec`
-/// is set the cell senses a double-click and returns that recording id (to open
-/// its cut-list popup); `detail` is the per-break list when loaded.
-fn ad_cell(
-    ui: &mut egui::Ui,
-    text: String,
-    count: i64,
-    secs: i64,
-    detail: Option<&Vec<AdBreak>>,
-    clickable_rec: Option<i64>,
-) -> Option<i64> {
-    if text.is_empty() {
-        return None;
-    }
-    let label = if clickable_rec.is_some() {
-        egui::Label::new(text).sense(egui::Sense::click())
-    } else {
-        egui::Label::new(text)
-    };
-    let resp = ui
-        .add(label)
-        .on_hover_ui(|ui| {
-            ui.label(ad_tooltip(count, secs, detail));
-        });
-    match clickable_rec {
-        Some(rec) if resp.double_clicked() => Some(rec),
-        _ => None,
-    }
-}
-
 /// Count string for a Changes cell ("" when zero, so empty cells render nothing).
 fn fmt_meta_count(n: i64) -> String {
     if n > 0 { n.to_string() } else { String::new() }
@@ -2671,12 +2699,17 @@ fn next_stream_cell(ui: &mut egui::Ui, at: Option<i64>, title: &str, clickable: 
     let Some(at) = at.filter(|&a| a > 0) else {
         return false;
     };
+    let compact = short_ts_on();
+    let display = if compact { fmt_datetime_compact(at) } else { fmt_datetime_short(at) };
     let label = if clickable {
-        egui::Label::new(fmt_datetime_short(at)).sense(egui::Sense::click())
+        egui::Label::new(&display).sense(egui::Sense::click())
     } else {
-        egui::Label::new(fmt_datetime_short(at))
+        egui::Label::new(&display)
     };
     let resp = ui.add(label).on_hover_ui(|ui| {
+        if compact {
+            ui.label(fmt_datetime_short(at));
+        }
         if title.is_empty() {
             ui.label("Next scheduled stream.");
         } else {
@@ -2856,7 +2889,7 @@ fn meta_tooltip(count: i64, changes: Option<&Vec<StreamMetaChange>>) -> String {
     s
 }
 
-/// Render one Changes table cell, mirroring [`ad_cell`]: blank when the count is
+/// Render one Changes table cell: blank when the count is
 /// zero, a lazily-built hover list, and (when `clickable`) a double-click to open
 /// the change-log popup. Returns whether it was double-clicked so the caller can
 /// open the right popup (a single take, or a whole stream's aggregated takes).
@@ -2879,6 +2912,72 @@ fn meta_cell(
         ui.label(meta_tooltip(count, detail));
     });
     clickable && resp.double_clicked()
+}
+
+/// Render the combined Ads column (📢): the ad break count as the cell text, with
+/// a tooltip showing "Ads: N (total time)" + the per-break cut list if loaded.
+/// The double-click behaviour mirrors [`combined_ads_cell`].
+fn combined_ads_cell(
+    ui: &mut egui::Ui,
+    count: i64,
+    secs: i64,
+    detail: Option<&Vec<AdBreak>>,
+    clickable_rec: Option<i64>,
+) -> Option<i64> {
+    if count == 0 {
+        return None;
+    }
+    let text = fmt_ad_count(count);
+    let label = if clickable_rec.is_some() {
+        egui::Label::new(text).sense(egui::Sense::click())
+    } else {
+        egui::Label::new(text)
+    };
+    let resp = ui.add(label).on_hover_ui(|ui| {
+        ui.label(format!("Ads: {} ({})", count, fmt_duration(secs)));
+        if let Some(b) = detail.filter(|b| !b.is_empty()) {
+            ui.label(ad_cut_lines(b).join("\n"));
+        }
+    });
+    match clickable_rec {
+        Some(rec) if resp.double_clicked() => Some(rec),
+        _ => None,
+    }
+}
+
+/// Render a timestamp cell using the compact format when short-timestamps mode is
+/// on; falls back to the normal format when off. When compact, the full timestamp
+/// is shown in a tooltip.
+fn ts_label(ui: &mut egui::Ui, secs: i64) {
+    if secs <= 0 {
+        return;
+    }
+    let compact = short_ts_on();
+    let display = if compact { fmt_datetime_compact(secs) } else { fmt_datetime_short(secs) };
+    let resp = ui.label(display);
+    if compact {
+        resp.on_hover_text(fmt_datetime_short(secs));
+    }
+}
+
+/// Like [`ts_label`] but prepends `~` for approximate times (Went Live column).
+fn ts_went_live_label(ui: &mut egui::Ui, secs: i64, approx: bool) {
+    if secs <= 0 {
+        return;
+    }
+    let compact = short_ts_on();
+    let display = {
+        let s = if compact { fmt_datetime_compact(secs) } else { fmt_datetime_short(secs) };
+        if approx { format!("~{s}") } else { s }
+    };
+    let resp = ui.label(display);
+    if compact {
+        let full = {
+            let s = fmt_datetime_short(secs);
+            if approx { format!("~{s}") } else { s }
+        };
+        resp.on_hover_text(full);
+    }
 }
 
 /// Render a current-Title / current-Game cell: blank when empty, otherwise a
@@ -2980,31 +3079,33 @@ struct StreamCol {
 /// just left of Name; the current Game/Title sit just right of State. Widths are
 /// floors — `Column::auto` shrinks tight columns to their content — except the
 /// `initial`-width columns, which start narrow and truncate (full value on hover).
-const STREAM_COLUMNS: [StreamCol; 20] = [
-    StreamCol { title: "Auto", tooltip: "Enable/disable monitoring. The channel checkbox and each instance checkbox are independent.", min_width: 36.0, initial: 0.0, sortable: true },
-    StreamCol { title: "Actions", tooltip: "Per-row actions: start/stop recording, edit, add instance, open folder, delete.", min_width: 126.0, initial: 0.0, sortable: false },
-    StreamCol { title: "Plat", tooltip: "Source platform (icon): Twitch, YouTube, Kick, or a generic URL. A channel shows every platform among its instances.", min_width: 52.0, initial: 0.0, sortable: true },
-    StreamCol { title: "Name", tooltip: "Channel (container) name. Expand it to see its instances and recording history.", min_width: 130.0, initial: 0.0, sortable: true },
-    StreamCol { title: "Tool", tooltip: "Capture tool: streamlink, yt-dlp, or ffmpeg.", min_width: 60.0, initial: 0.0, sortable: true },
-    StreamCol { title: "Detection", tooltip: "How a live stream is detected (API poll, page scrape, Twitch EventSub, or a generic probe).", min_width: 70.0, initial: 0.0, sortable: true },
-    StreamCol { title: "Polled", tooltip: "When this instance was last checked, with its poll interval in parentheses (e.g. \"2026-06-21 14:02:33 (60s)\").", min_width: 100.0, initial: 0.0, sortable: true },
-    StreamCol { title: "State", tooltip: "Current state (idle / live / recording / failed). Hover a failed row to see why it failed.", min_width: 66.0, initial: 0.0, sortable: true },
-    StreamCol { title: "Next stream", tooltip: "Next scheduled stream (Twitch schedule / YouTube upcoming; blank for Kick & generic, or when nothing is scheduled). Hover for its title; double-click for the full upcoming schedule.", min_width: 96.0, initial: 0.0, sortable: true },
-    StreamCol { title: "Game", tooltip: "Current game / category of the most recent recording (Twitch, Kick & YouTube — YouTube shows its broad content category; blank for generic URLs). Truncated — hover for the full name.", min_width: 60.0, initial: 96.0, sortable: true },
-    StreamCol { title: "Title", tooltip: "Current stream title of the most recent recording (Twitch, Kick & YouTube; blank for generic URLs). Truncated — hover for the full title. Its full change history is in the Changes column.", min_width: 80.0, initial: 170.0, sortable: true },
-    StreamCol { title: "Went Live", tooltip: "When the stream went live on the platform (a \"~\" prefix means it's our approximate time).", min_width: 96.0, initial: 0.0, sortable: true },
-    StreamCol { title: "Started On", tooltip: "When recording started.", min_width: 92.0, initial: 0.0, sortable: true },
-    StreamCol { title: "Lost time", tooltip: "How much of the start was missed. Drops to 0 once a from-start capture catches up to the live edge.", min_width: 52.0, initial: 0.0, sortable: true },
-    StreamCol { title: "Duration", tooltip: "How long we've recorded (ticks while live).", min_width: 56.0, initial: 0.0, sortable: true },
-    StreamCol { title: "Ads", tooltip: "Ad breaks detected (Twitch + streamlink); each is a hard cut. Hover or double-click for the list.", min_width: 38.0, initial: 0.0, sortable: true },
-    StreamCol { title: "Ad time", tooltip: "Total advertisement time skipped.", min_width: 52.0, initial: 0.0, sortable: true },
-    StreamCol { title: "Ad-free", tooltip: "Marked or auto-detected ad-free (sub / Turbo / Premium) — captures have no ad-break cuts.", min_width: 54.0, initial: 0.0, sortable: true },
-    StreamCol { title: "Changes", tooltip: "Title / game-category changes logged during the recording. Hover or double-click for the log.", min_width: 56.0, initial: 0.0, sortable: true },
-    StreamCol { title: "Added", tooltip: "When the channel was added.", min_width: 84.0, initial: 0.0, sortable: true },
+/// Column order: Auto · Actions · Plat · Name · Tool · Detection · Polled · State ·
+/// Next stream · Game · Title · ✏ (Changes) · 📢 (Ads) · Went Live · Started On ·
+/// Lost time · Duration · Ad-free · Added.
+const STREAM_COLUMNS: [StreamCol; 19] = [
+    StreamCol { title: "Auto",       tooltip: "Enable/disable monitoring. The channel checkbox and each instance checkbox are independent.", min_width: 36.0,  initial: 0.0,   sortable: true },
+    StreamCol { title: "Actions",    tooltip: "Per-row actions: start/stop recording, edit, add instance, open folder, delete.",            min_width: 126.0, initial: 0.0,   sortable: false },
+    StreamCol { title: "Plat",       tooltip: "Source platform (icon): Twitch, YouTube, Kick, or a generic URL. A channel shows every platform among its instances.", min_width: 52.0, initial: 0.0, sortable: true },
+    StreamCol { title: "Name",       tooltip: "Channel (container) name. Expand it to see its instances and recording history.",            min_width: 130.0, initial: 0.0,   sortable: true },
+    StreamCol { title: "Tool",       tooltip: "Capture tool: streamlink, yt-dlp, or ffmpeg.",                                              min_width: 60.0,  initial: 0.0,   sortable: true },
+    StreamCol { title: "Detection",  tooltip: "How a live stream is detected (API poll, page scrape, Twitch EventSub, or a generic probe).", min_width: 70.0, initial: 0.0,   sortable: true },
+    StreamCol { title: "Polled",     tooltip: "When this instance was last checked, with its poll interval in parentheses.",                min_width: 100.0, initial: 0.0,   sortable: true },
+    StreamCol { title: "State",      tooltip: "Current state (idle / live / recording / failed). Hover a failed row to see why it failed.", min_width: 66.0,  initial: 0.0,   sortable: true },
+    StreamCol { title: "Next stream",tooltip: "Next scheduled stream (Twitch schedule / YouTube upcoming). Hover for its title; double-click for the full schedule.", min_width: 96.0, initial: 0.0, sortable: true },
+    StreamCol { title: "Game",       tooltip: "Current game / category of the most recent recording. Truncated — hover for the full name.", min_width: 60.0,  initial: 96.0,  sortable: true },
+    StreamCol { title: "Title",      tooltip: "Current stream title of the most recent recording. Truncated — hover for the full title.",   min_width: 80.0,  initial: 170.0, sortable: true },
+    StreamCol { title: "✏",          tooltip: "Title / game-category changes logged during the recording. Hover or double-click for the log.", min_width: 24.0, initial: 0.0, sortable: true },
+    StreamCol { title: "📢",         tooltip: "Ad breaks detected (Twitch + streamlink); each is a hard cut. Hover for count + total time; double-click for the cut list.", min_width: 24.0, initial: 0.0, sortable: true },
+    StreamCol { title: "Went Live",  tooltip: "When the stream went live on the platform (a \"~\" prefix means it's our approximate time).", min_width: 96.0, initial: 0.0,  sortable: true },
+    StreamCol { title: "Started On", tooltip: "When recording started.",                                                                    min_width: 92.0,  initial: 0.0,   sortable: true },
+    StreamCol { title: "Lost time",  tooltip: "How much of the start was missed. Drops to 0 once a from-start capture catches up to the live edge.", min_width: 52.0, initial: 0.0, sortable: true },
+    StreamCol { title: "Duration",   tooltip: "How long we've recorded (ticks while live).",                                               min_width: 56.0,  initial: 0.0,   sortable: true },
+    StreamCol { title: "Ad-free",    tooltip: "Marked or auto-detected ad-free (sub / Turbo / Premium) — captures have no ad-break cuts.", min_width: 54.0,  initial: 0.0,   sortable: true },
+    StreamCol { title: "Added",      tooltip: "When the channel was added.",                                                               min_width: 84.0,  initial: 0.0,   sortable: true },
 ];
 
-/// Total Streams columns (includes the non-sortable Actions slot).
-const STREAM_COLS: usize = STREAM_COLUMNS.len();
+/// Total Streams columns (19 total, including the non-sortable Actions slot).
+const STREAM_COLS: usize = STREAM_COLUMNS.len(); // = 19
 
 /// Index of the optional Actions column in [`STREAM_COLUMNS`]. When the Actions
 /// column is hidden, this column is skipped in the builder, header, and every row
@@ -3171,29 +3272,37 @@ fn video_cells(
 struct RecordingCells {
     /// True while the take is still in progress (status == "recording").
     active: bool,
-    /// When *we* started recording.
+    /// When *we* started recording (formatted for filter/sort; render via [`ts_label`]).
     started_on: String,
+    /// Raw unix seconds for "Started On" — used by [`ts_label`] for compact tooltips.
+    started_secs: i64,
     /// How long we've recorded (ticks while active; final length otherwise).
     duration: String,
-    /// When the stream went live on the platform (`~`-prefixed if approximate).
+    /// When the stream went live on the platform (`~`-prefixed if approximate, formatted).
     went_live: String,
-    /// How much of the beginning we missed: the resolved lost time when known
-    /// (0 once a from-start capture caught up), else provisional started - went_live.
+    /// Raw unix seconds for "Went Live" — used by [`ts_went_live_label`].
+    went_live_secs: i64,
+    /// True when the went-live timestamp is our approximation, not the platform's.
+    went_live_approx: bool,
+    /// How much of the beginning we missed.
     lost: String,
 }
 
 fn recording_cells(row: &MonitorWithChannel, now: i64) -> RecordingCells {
     let active = row.last_recording_status.as_deref() == Some("recording");
     let started = row.last_recording_started;
+    let started_secs = started.unwrap_or(0);
     let dur = match (started, row.last_recording_ended, active) {
         (Some(s), _, true) => Some(now - s),
         (Some(s), Some(e), false) => Some(e - s),
         _ => None,
     };
+    let went_live_secs = row.last_recording_went_live.unwrap_or(0);
+    let went_live_approx = row.last_recording_went_live_approx;
     let went_live = match row.last_recording_went_live {
         Some(w) => {
             let s = fmt_datetime_short(w);
-            if row.last_recording_went_live_approx {
+            if went_live_approx {
                 format!("~{s}")
             } else {
                 s
@@ -3213,8 +3322,11 @@ fn recording_cells(row: &MonitorWithChannel, now: i64) -> RecordingCells {
     RecordingCells {
         active,
         started_on: started.map(fmt_datetime_short).unwrap_or_default(),
+        started_secs,
         duration: dur.map(fmt_duration).unwrap_or_default(),
         went_live,
+        went_live_secs,
+        went_live_approx,
         lost,
     }
 }
@@ -3330,9 +3442,9 @@ fn channel_cells(channel: &Channel, monitors: &[&MonitorWithChannel], now: i64) 
         .filter_map(|m| m.monitor.last_checked_at)
         .max()
         .unwrap_or(0);
-    // In STREAM_COLUMNS order: On, Actions(empty), Plat, Name, Tool, Detection,
-    // Polled, State, Next stream, Game, Title, Went Live, Started On, Lost,
-    // Duration, Ads, Ad time, Ad-free, Changes, Added.
+    // In STREAM_COLUMNS order: Auto, Actions(empty), Plat, Name, Tool, Detection,
+    // Polled, State, Next stream, Game, Title, ✏ (Changes), 📢 (Ads), Went Live,
+    // Started On, Lost, Duration, Ad-free, Added.
     vec![
         Cell::num(
             if channel.enabled { 1.0 } else { 0.0 },
@@ -3359,33 +3471,33 @@ fn channel_cells(channel: &Channel, monitors: &[&MonitorWithChannel], now: i64) 
         },
         Cell::text(if rec.active { primary.last_recording_category.clone() } else { String::new() }),
         Cell::text(if rec.active { primary.last_recording_title.clone() } else { String::new() }),
+        // ✏ Changes (index 11)
+        Cell::num(
+            primary.last_recording_meta_changes as f64,
+            fmt_meta_count(primary.last_recording_meta_changes),
+        ),
+        // 📢 Ads combined (index 12) — sort by count; ad time surfaced via tooltip
+        Cell::num(
+            primary.last_recording_ad_count as f64,
+            fmt_ad_count(primary.last_recording_ad_count),
+        ),
+        // Went Live (index 13)
         Cell::num(
             primary.last_recording_went_live.unwrap_or(0) as f64,
             rec.went_live.clone(),
         ),
+        // Started On (index 14)
         Cell::num(
             primary.last_recording_started.unwrap_or(0) as f64,
             rec.started_on.clone(),
         ),
         Cell::num(0.0, rec.lost.clone()),
         Cell::num(0.0, rec.duration.clone()),
-        Cell::num(
-            primary.last_recording_ad_count as f64,
-            fmt_ad_count(primary.last_recording_ad_count),
-        ),
-        Cell::num(
-            primary.last_recording_ad_secs as f64,
-            fmt_ad_time(primary.last_recording_ad_secs),
-        ),
         {
             let (label, key) =
                 ad_free_summary(channel_ad_free_count(monitors), monitors.len());
             Cell::num(key, label)
         },
-        Cell::num(
-            primary.last_recording_meta_changes as f64,
-            fmt_meta_count(primary.last_recording_meta_changes),
-        ),
         Cell::num(channel.created_at as f64, fmt_date(channel.created_at)),
     ]
 }
@@ -3498,8 +3610,8 @@ fn render_instance_row(
 
     let mut disclosure_clicked = false;
     // Column order: On · Actions · Platform · Name · Tool · Detection · Polled ·
-    // State · Next stream · Game · Title · Went Live · Started On · Lost · Duration
-    // · Ads · Ad time · Ad-free · Changes · Added.
+    // State · Next stream · Game · Title · ✏ (Changes) · 📢 (Ads) · Went Live ·
+    // Started On · Lost · Duration · Ad-free · Added.
     tr.col(|ui| {
         let mut on = m.enabled;
         let cb = ui.checkbox(&mut on, "");
@@ -3616,11 +3728,22 @@ fn render_instance_row(
             meta_value_cell(ui, &row.last_recording_title);
         }
     });
+    // ✏ Changes (index 11)
     tr.col(|ui| {
-        ui.label(&rec.went_live);
+        meta_cell(ui, row.last_recording_meta_changes, None, false);
     });
+    // 📢 Ads combined (index 12)
+    let (ad_c, ad_s) = (row.last_recording_ad_count, row.last_recording_ad_secs);
     tr.col(|ui| {
-        ui.label(&rec.started_on);
+        combined_ads_cell(ui, ad_c, ad_s, None, None);
+    });
+    // Went Live (index 13)
+    tr.col(|ui| {
+        ts_went_live_label(ui, rec.went_live_secs, rec.went_live_approx);
+    });
+    // Started On (index 14)
+    tr.col(|ui| {
+        ts_label(ui, rec.started_secs);
     });
     tr.col(|ui| {
         let resp = ui.label(&rec.lost);
@@ -3635,20 +3758,10 @@ fn render_instance_row(
     tr.col(|ui| {
         ui.label(&rec.duration);
     });
-    let (ad_c, ad_s) = (row.last_recording_ad_count, row.last_recording_ad_secs);
-    tr.col(|ui| {
-        ad_cell(ui, fmt_ad_count(ad_c), ad_c, ad_s, None, None);
-    });
-    tr.col(|ui| {
-        ad_cell(ui, fmt_ad_time(ad_s), ad_c, ad_s, None, None);
-    });
     tr.col(|ui| {
         if let Some((label, hover)) = ad_free_status(m.ad_free, row.ad_free_sub) {
             ui.colored_label(SUCCESS_GREEN, label).on_hover_text(hover);
         }
-    });
-    tr.col(|ui| {
-        meta_cell(ui, row.last_recording_meta_changes, None, false);
     });
     tr.col(|ui| {
         ui.label(fmt_date(row.channel.created_at));
@@ -3858,6 +3971,21 @@ impl eframe::App for StreamArchiverApp {
                         let _ = self.core.store.set_setting(
                             K_STATUS_BGCOLOR,
                             if self.status_bgcolor { "1" } else { "0" },
+                        );
+                    }
+                    if ui
+                        .checkbox(&mut self.shorten_timestamps, "Short timestamps")
+                        .on_hover_text(
+                            "Show timestamps in a compact short format (e.g. 21/06 14:02) \
+                             instead of the full datetime. Hover any timestamp for the full value. \
+                             The short format is configurable in Settings → Display.",
+                        )
+                        .changed()
+                    {
+                        set_short_ts(self.shorten_timestamps);
+                        let _ = self.core.store.set_setting(
+                            K_SHORT_TIMESTAMPS,
+                            if self.shorten_timestamps { "1" } else { "0" },
                         );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -7953,7 +8081,7 @@ impl StreamArchiverApp {
                                     });
                                     tr.col(|_ui| {}); // detection
                                     tr.col(|ui| {
-                                        ui.label(fmt_datetime_short(last_poll));
+                                        ts_label(ui, last_poll);
                                     });
                                     tr.col(|ui| {
                                         if any_rec {
@@ -7979,14 +8107,28 @@ impl StreamArchiverApp {
                                     tr.col(|ui| {
                                         meta_value_cell(ui, &cur_title);
                                     });
+                                    // ✏ Changes (index 11)
                                     tr.col(|ui| {
-                                        if let Some(r) = &rec {
-                                            ui.label(&r.went_live);
+                                        if let Some(c) = meta_changes {
+                                            meta_cell(ui, c, None, false);
                                         }
                                     });
+                                    // 📢 Ads combined (index 12)
+                                    tr.col(|ui| {
+                                        if let Some((c, s)) = ads {
+                                            combined_ads_cell(ui, c, s, None, None);
+                                        }
+                                    });
+                                    // Went Live (index 13)
                                     tr.col(|ui| {
                                         if let Some(r) = &rec {
-                                            ui.label(&r.started_on);
+                                            ts_went_live_label(ui, r.went_live_secs, r.went_live_approx);
+                                        }
+                                    });
+                                    // Started On (index 14)
+                                    tr.col(|ui| {
+                                        if let Some(r) = &rec {
+                                            ts_label(ui, r.started_secs);
                                         }
                                     });
                                     tr.col(|ui| {
@@ -8000,23 +8142,8 @@ impl StreamArchiverApp {
                                         }
                                     });
                                     tr.col(|ui| {
-                                        if let Some((c, s)) = ads {
-                                            ad_cell(ui, fmt_ad_count(c), c, s, None, None);
-                                        }
-                                    });
-                                    tr.col(|ui| {
-                                        if let Some((c, s)) = ads {
-                                            ad_cell(ui, fmt_ad_time(s), c, s, None, None);
-                                        }
-                                    });
-                                    tr.col(|ui| {
                                         if !ad_free.0.is_empty() {
                                             ui.colored_label(SUCCESS_GREEN, ad_free.0);
-                                        }
-                                    });
-                                    tr.col(|ui| {
-                                        if let Some(c) = meta_changes {
-                                            meta_cell(ui, c, None, false);
                                         }
                                     });
                                     tr.col(|ui| {
@@ -8101,8 +8228,14 @@ impl StreamArchiverApp {
                                 let has_takes = g.takes.len() > 1;
                                 let expanded = exp_streams.contains(&g.key);
                                 let when = fmt_went_live(g.went_live_at, g.went_live_approx);
+                                let ts_fn = |s| if short_ts_on() { fmt_datetime_compact(s) } else { fmt_datetime_short(s) };
                                 let label = if when.is_empty() {
-                                    format!("🎬 {}", fmt_datetime_short(g.started_at()))
+                                    format!("🎬 {}", ts_fn(g.started_at()))
+                                } else if short_ts_on() {
+                                    // Compact went-live with ~ prefix
+                                    let approx = g.went_live_approx;
+                                    let s = fmt_datetime_compact(g.went_live_at.unwrap_or(0));
+                                    format!("🎬 {}{s}", if approx { "~" } else { "" })
                                 } else {
                                     format!("🎬 {when}")
                                 };
@@ -8181,11 +8314,31 @@ impl StreamArchiverApp {
                                     tr.col(|ui| {
                                         meta_value_cell(ui, g.title());
                                     });
+                                    // ✏ Changes (index 11)
                                     tr.col(|ui| {
-                                        ui.label(fmt_went_live(g.went_live_at, g.went_live_approx));
+                                        let det = meta_rec.and_then(|id| meta_logs.get(&id));
+                                        if meta_cell(ui, meta_count, det, true) {
+                                            open_meta_popup = Some(MetaPopup::Stream(
+                                                g.takes.iter().map(|t| (t.id, t.started_at)).collect(),
+                                            ));
+                                        }
                                     });
+                                    // 📢 Ads combined (index 12)
                                     tr.col(|ui| {
-                                        ui.label(fmt_datetime_short(g.started_at()));
+                                        let det = ad_rec.and_then(|id| ad_breaks.get(&id));
+                                        if let Some(r) = combined_ads_cell(
+                                            ui, ad_count, ad_secs, det, ad_rec,
+                                        ) {
+                                            open_ad_popup = Some(r);
+                                        }
+                                    });
+                                    // Went Live (index 13)
+                                    tr.col(|ui| {
+                                        ts_went_live_label(ui, g.went_live_at.unwrap_or(0), g.went_live_approx);
+                                    });
+                                    // Started On (index 14)
+                                    tr.col(|ui| {
+                                        ts_label(ui, g.started_at());
                                     });
                                     tr.col(|ui| {
                                         // Resolved lost time when known; else the
@@ -8212,34 +8365,7 @@ impl StreamArchiverApp {
                                             ),
                                         );
                                     });
-                                    tr.col(|ui| {
-                                        let det = ad_rec.and_then(|id| ad_breaks.get(&id));
-                                        if let Some(r) = ad_cell(
-                                            ui, fmt_ad_count(ad_count), ad_count, ad_secs, det, ad_rec,
-                                        ) {
-                                            open_ad_popup = Some(r);
-                                        }
-                                    });
-                                    tr.col(|ui| {
-                                        let det = ad_rec.and_then(|id| ad_breaks.get(&id));
-                                        if let Some(r) = ad_cell(
-                                            ui, fmt_ad_time(ad_secs), ad_count, ad_secs, det, ad_rec,
-                                        ) {
-                                            open_ad_popup = Some(r);
-                                        }
-                                    });
                                     tr.col(|_ui| {}); // ad-free (n/a per stream)
-                                    tr.col(|ui| {
-                                        // Single-take streams show the change list on
-                                        // hover; double-click (any take count) opens the
-                                        // popup with all takes aggregated chronologically.
-                                        let det = meta_rec.and_then(|id| meta_logs.get(&id));
-                                        if meta_cell(ui, meta_count, det, true) {
-                                            open_meta_popup = Some(MetaPopup::Stream(
-                                                g.takes.iter().map(|t| (t.id, t.started_at)).collect(),
-                                            ));
-                                        }
-                                    });
                                     tr.col(|_ui| {}); // added
                                     tr.response().context_menu(|ui| {
                                         ui.set_min_width(180.0);
@@ -8403,9 +8529,27 @@ impl StreamArchiverApp {
                                     tr.col(|ui| {
                                         meta_value_cell(ui, &t.title);
                                     });
-                                    tr.col(|_ui| {}); // went live
+                                    // ✏ Changes (index 11)
                                     tr.col(|ui| {
-                                        ui.label(fmt_datetime_short(t.started_at));
+                                        let det = meta_logs.get(&t.id);
+                                        if meta_cell(ui, t.meta_change_count, det, true) {
+                                            open_meta_popup = Some(MetaPopup::Take(t.id));
+                                        }
+                                    });
+                                    // 📢 Ads combined (index 12)
+                                    tr.col(|ui| {
+                                        let det = ad_breaks.get(&t.id);
+                                        if let Some(r) = combined_ads_cell(
+                                            ui, t.ad_count, t.ad_secs, det, Some(t.id),
+                                        ) {
+                                            open_ad_popup = Some(r);
+                                        }
+                                    });
+                                    // Went Live (index 13 — n/a per take, blank)
+                                    tr.col(|_ui| {});
+                                    // Started On (index 14)
+                                    tr.col(|ui| {
+                                        ts_label(ui, t.started_at);
                                     });
                                     tr.col(|ui| {
                                         // Resolved lost time when known; else the
@@ -8428,31 +8572,7 @@ impl StreamArchiverApp {
                                             d.on_hover_text(fmt_bytes(t.bytes));
                                         }
                                     });
-                                    tr.col(|ui| {
-                                        let det = ad_breaks.get(&t.id);
-                                        if let Some(r) = ad_cell(
-                                            ui, fmt_ad_count(t.ad_count), t.ad_count, t.ad_secs,
-                                            det, Some(t.id),
-                                        ) {
-                                            open_ad_popup = Some(r);
-                                        }
-                                    });
-                                    tr.col(|ui| {
-                                        let det = ad_breaks.get(&t.id);
-                                        if let Some(r) = ad_cell(
-                                            ui, fmt_ad_time(t.ad_secs), t.ad_count, t.ad_secs,
-                                            det, Some(t.id),
-                                        ) {
-                                            open_ad_popup = Some(r);
-                                        }
-                                    });
                                     tr.col(|_ui| {}); // ad-free (n/a per take)
-                                    tr.col(|ui| {
-                                        let det = meta_logs.get(&t.id);
-                                        if meta_cell(ui, t.meta_change_count, det, true) {
-                                            open_meta_popup = Some(MetaPopup::Take(t.id));
-                                        }
-                                    });
                                     tr.col(|_ui| {}); // added
                                     tr.response().context_menu(|ui| {
                                         ui.set_min_width(180.0);
@@ -9823,6 +9943,14 @@ impl StreamArchiverApp {
                                 ui.selectable_value(df, f, f.label());
                             }
                         });
+                    ui.end_row();
+
+                    ui.label("Short timestamp format").on_hover_text(
+                        "chrono pattern used when \"Short timestamps\" is on (top bar). \
+                         Default: %d/%m %H:%M  (day/month + 24h time). \
+                         Applies on Save.",
+                    );
+                    ui.text_edit_singleline(&mut self.settings.short_ts_fmt);
                     ui.end_row();
                 });
 
