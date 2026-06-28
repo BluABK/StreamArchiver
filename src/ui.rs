@@ -4188,6 +4188,8 @@ impl eframe::App for StreamArchiverApp {
         self.format_designer_window(ui.ctx());
         self.confirm_quit_stop_window(ui.ctx());
         self.import_window(ui.ctx());
+
+        draw_alt_image_preview(ui.ctx());
     }
 }
 
@@ -8129,11 +8131,12 @@ impl StreamArchiverApp {
                                             ui.add_space(16.0);
                                         }
                                         if let Some(tex) = channel_avatars.get(&cid) {
-                                            ui.add(
+                                            let resp = ui.add(
                                                 egui::Image::from_texture(tex)
                                                     .fit_to_exact_size(egui::vec2(18.0, 18.0))
                                                     .corner_radius(egui::CornerRadius::same(3)),
                                             );
+                                            queue_alt_image_preview(ui.ctx(), &resp, tex);
                                             ui.add_space(3.0);
                                         }
                                         let (base, adjust) = channel_name_colors
@@ -11719,6 +11722,7 @@ impl StreamArchiverApp {
                         }
                     }
                 });
+                draw_alt_image_preview(ctx);
             },
         );
         // Decode any newly-seen emotes off the UI thread, then enforce the LRU
@@ -11840,11 +11844,12 @@ impl StreamArchiverApp {
                 // ── Header ──────────────────────────────────────────────
                 ui.horizontal(|ui| {
                     if let Some(tex) = &icon_tex {
-                        ui.add(
+                        let resp = ui.add(
                             egui::Image::from_texture(tex)
                                 .max_size(egui::vec2(96.0, 96.0))
                                 .corner_radius(egui::CornerRadius::same(8)),
                         );
+                        queue_alt_image_preview(ui.ctx(), &resp, tex);
                     } else {
                         let (rect, _) = ui.allocate_exact_size(
                             egui::vec2(96.0, 96.0),
@@ -11955,6 +11960,7 @@ impl StreamArchiverApp {
                     }
                 }
                 });
+                draw_alt_image_preview(ctx);
             },
         );
 
@@ -12029,11 +12035,12 @@ impl StreamArchiverApp {
                 // ── Header ──────────────────────────────────────────────
                 ui.horizontal(|ui| {
                     if let Some(tex) = &icon_tex {
-                        ui.add(
+                        let resp = ui.add(
                             egui::Image::from_texture(tex)
                                 .max_size(egui::vec2(96.0, 96.0))
                                 .corner_radius(egui::CornerRadius::same(8)),
                         );
+                        queue_alt_image_preview(ui.ctx(), &resp, tex);
                     } else {
                         let (rect, _) = ui.allocate_exact_size(
                             egui::vec2(96.0, 96.0),
@@ -12375,6 +12382,7 @@ impl StreamArchiverApp {
                     }
                 }
                 });
+                draw_alt_image_preview(ctx);
             },
         );
 
@@ -12821,6 +12829,80 @@ fn resolve_channel_icon_small(
     })
 }
 
+// ---------- Alt-hover full-resolution image preview ----------
+
+/// When the user holds Alt while hovering `resp`, queue `tex` for a
+/// full-resolution floating preview shown by [`draw_alt_image_preview`].
+/// Call immediately after `ui.add(egui::Image::from_texture(...))`.
+fn queue_alt_image_preview(ctx: &egui::Context, resp: &egui::Response, tex: &egui::TextureHandle) {
+    if resp.hovered() && ctx.input(|i| i.modifiers.alt) {
+        // Wrapped in Option so remove_temp (which needs T: Default) can use None as sentinel.
+        ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::new("alt_img_preview"), Some(tex.clone()))
+        });
+    }
+}
+
+/// Draw the Alt-hover image preview queued this frame by [`queue_alt_image_preview`].
+/// Call once at the end of each viewport's rendering pass so it floats on top.
+/// Destructively consumes the queued texture, so the overlay vanishes the frame
+/// the user stops hovering or releases Alt — no explicit clear needed.
+fn draw_alt_image_preview(ctx: &egui::Context) {
+    // remove_temp::<Option<T>> works because Option implements Default (= None).
+    let Some(Some(tex)) = ctx.data_mut(|d| {
+        d.remove_temp::<Option<egui::TextureHandle>>(egui::Id::new("alt_img_preview"))
+    }) else {
+        return;
+    };
+    let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) else {
+        return;
+    };
+
+    let tex_size = tex.size_vec2();
+    let screen = ctx.viewport_rect();
+    // Cap at 85% of the viewport so large banners don't overflow off-screen.
+    let max_size = screen.size() * 0.85;
+    let scale = (max_size.x / tex_size.x.max(1.0))
+        .min(max_size.y / tex_size.y.max(1.0))
+        .min(1.0);
+    let preview_size = tex_size * scale;
+
+    // Prefer bottom-right of the cursor; flip to the other side when that
+    // would go off-screen.
+    const GAP: f32 = 14.0;
+    let mut tl = pos + egui::vec2(GAP, GAP);
+    if tl.x + preview_size.x > screen.right() - GAP {
+        tl.x = (pos.x - preview_size.x - GAP).max(screen.left() + GAP);
+    }
+    if tl.y + preview_size.y > screen.bottom() - GAP {
+        tl.y = (pos.y - preview_size.y - GAP).max(screen.top() + GAP);
+    }
+
+    egui::Area::new(egui::Id::new("alt_img_preview_area"))
+        .fixed_pos(tl)
+        .order(egui::Order::Tooltip)
+        .interactable(false)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(ui.visuals().window_fill)
+                .stroke(ui.visuals().window_stroke)
+                .inner_margin(egui::Margin::same(6))
+                .corner_radius(egui::CornerRadius::same(6))
+                .show(ui, |ui| {
+                    ui.add(egui::Image::from_texture(&tex).fit_to_exact_size(preview_size));
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} × {} px",
+                            tex_size.x as u32,
+                            tex_size.y as u32
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                });
+        });
+}
+
 /// Try to extract a YouTube UC… channel ID from a channel URL.
 fn extract_yt_channel_id(url: &str) -> Option<String> {
     // Matches "/channel/UCxxxxxxxxx" style URLs.
@@ -13046,6 +13128,7 @@ fn draw_cached_emote(
             if animate && anim.is_animated() {
                 let (tex, remaining) = anim.frame_at(now);
                 let resp = ui.add(egui::Image::from_texture(tex).fit_to_exact_size(size));
+                queue_alt_image_preview(ctx, &resp, tex);
                 // Only schedule the next frame for emotes actually on screen, so a
                 // scrolled-away animation doesn't keep waking the UI.
                 if ui.is_rect_visible(resp.rect) {
@@ -13056,7 +13139,9 @@ fn draw_cached_emote(
                 Some(resp)
             } else {
                 let (tex, _) = anim.frame_at(0.0);
-                Some(ui.add(egui::Image::from_texture(tex).fit_to_exact_size(size)))
+                let resp = ui.add(egui::Image::from_texture(tex).fit_to_exact_size(size));
+                queue_alt_image_preview(ctx, &resp, tex);
+                Some(resp)
             }
         }
     }
