@@ -2633,10 +2633,12 @@ fn video_row_tint(status: &str, accent: egui::Color32, status_colors: bool) -> O
     }
 }
 
-/// Whether a monitor's last poll or recording ended in an error/failure.
+/// Whether a monitor is in an error/failure state right now. Only `last_state`
+/// is checked — recording failures are visible via the ⚠ state icon on the
+/// instance row, and a failed `last_recording_status` should not prevent
+/// "Clear error" from dismissing the channel-row tint.
 fn monitor_errored(m: &MonitorWithChannel) -> bool {
     matches!(m.monitor.last_state.as_str(), "error" | "failed")
-        || m.last_recording_status.as_deref() == Some("failed")
 }
 
 /// Ad-break count for a cell (blank when there are none, so empty rows stay clean).
