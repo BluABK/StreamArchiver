@@ -1221,6 +1221,12 @@ pub const K_OCR_STATS: &str = "ocr_stats";
 /// an unchanged banner/community-post image.
 pub const K_OCR_IMAGE_HASHES: &str = "ocr_image_hashes";
 
+/// Persistent OCR re-check cadence stamps: JSON `{"<monitor_id>:<source_id>":
+/// <unix_secs>}` recording when each OCR source was last consulted. Survives
+/// restarts so the slow OCR cadence is enforced across launches, not just within
+/// one session — a rebuild/restart can't trigger a fresh re-OCR sweep.
+pub const K_OCR_LAST_ATTEMPT: &str = "ocr_last_attempt";
+
 /// `app_settings` key for the global "go to the next schedule source when an
 /// event has no title" toggle (`"1"` = on). When on, the schedule walk keeps
 /// querying lower-priority sources after a winner is found, to fill in blank

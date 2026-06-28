@@ -269,6 +269,24 @@ impl DetectContext {
         }
     }
 
+    /// Persist the OCR re-check cadence stamp (unix seconds) for a single
+    /// `(monitor_id, source_id)` so the slow OCR cadence holds across restarts —
+    /// a rebuild/restart can't reset the timer and trigger a fresh re-OCR sweep.
+    fn persist_ocr_attempt(&self, monitor_id: i64, source_id: &str, ts: i64) {
+        let key_str = format!("{monitor_id}:{source_id}");
+        let mut stamps: HashMap<String, i64> = self
+            .store
+            .get_setting(crate::models::K_OCR_LAST_ATTEMPT)
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        stamps.insert(key_str, ts);
+        if let Ok(json) = serde_json::to_string(&stamps) {
+            let _ = self.store.set_setting(crate::models::K_OCR_LAST_ATTEMPT, &json);
+        }
+    }
+
     /// Clone of the shared HTTP client for use outside this struct (e.g. asset fetching).
     pub fn http_client(&self) -> Client {
         self.http.clone()
@@ -2039,6 +2057,25 @@ async fn refresh_ad_free_once(
     }
 }
 
+/// Load the persisted OCR re-check cadence stamps (see [`K_OCR_LAST_ATTEMPT`])
+/// into the in-memory map keyed by `(monitor_id, source_id)`. Mirrors the
+/// byte-hash cache restore so the slow OCR cadence is enforced across restarts,
+/// not just within one session.
+fn load_ocr_attempts(store: &Store) -> HashMap<(i64, String), i64> {
+    let raw: HashMap<String, i64> = store
+        .get_setting(crate::models::K_OCR_LAST_ATTEMPT)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    raw.into_iter()
+        .filter_map(|(k, ts)| {
+            let (mid, source) = k.split_once(':')?;
+            Some(((mid.parse::<i64>().ok()?, source.to_string()), ts))
+        })
+        .collect()
+}
+
 /// Background task: periodically refresh upcoming-stream schedules for enabled
 /// Twitch/YouTube monitors. A short poll tick picks up newly-added monitors
 /// quickly; each monitor is re-fetched at most every few hours (tracked
@@ -2057,10 +2094,12 @@ pub async fn refresh_schedules(
 
     let mut last_fetched: HashMap<i64, Instant> = HashMap::new();
     // Separate, slower cadence for the expensive OCR sources, keyed by
-    // (monitor, source id). A forced UI refresh resets `last_fetched` (so cheap
-    // API/scrape sources re-run at once) but NOT this map, so an image OCR'd in
-    // the last `OCR_MIN_INTERVAL_SECS` is never re-OCR'd on a config save.
-    let mut last_ocr: HashMap<(i64, &'static str), Instant> = HashMap::new();
+    // (monitor, source id) and stamped in wall-clock unix seconds. A forced UI
+    // refresh resets `last_fetched` (so cheap API/scrape sources re-run at once)
+    // but NOT this map, so an image checked in the last `OCR_MIN_INTERVAL_SECS`
+    // is not re-consulted on a config save. Restored from settings so the cadence
+    // also survives an app restart — a rebuild can't trigger a fresh OCR sweep.
+    let mut last_ocr: HashMap<(i64, String), i64> = load_ocr_attempts(ctx.store.as_ref());
     let mut discord_last: Option<Instant> = None;
     sleep_cancellable(Duration::from_secs(INITIAL_DELAY_SECS), &shutdown).await;
     loop {
@@ -2156,7 +2195,7 @@ async fn refresh_schedules_once(
     events: &EventTx,
     shutdown: &Arc<AtomicBool>,
     last_fetched: &mut HashMap<i64, Instant>,
-    last_ocr: &mut HashMap<(i64, &'static str), Instant>,
+    last_ocr: &mut HashMap<(i64, String), i64>,
     discord_last: &mut Option<Instant>,
     yt_video_id_refetch: &Arc<AtomicBool>,
     refresh_secs: u64,
@@ -2170,6 +2209,9 @@ async fn refresh_schedules_once(
     last_fetched.retain(|id, _| live.contains(id));
     last_ocr.retain(|k, _| live.contains(&k.0));
     let now = Instant::now();
+    // Wall-clock counterpart of `now`, used for the persisted OCR cadence (which
+    // must survive restarts, where monotonic `Instant`s reset).
+    let now_secs = now_unix();
 
     // If the UI requested a targeted re-scrape for YouTube monitors whose stored
     // schedule segments are missing video IDs, clear those monitors from
@@ -2257,13 +2299,16 @@ async fn refresh_schedules_once(
             // 0, fired on every config save) from re-OCR'ing already-processed
             // images. `None` = not an OCR source; `Some(true/false)` = OCR due/not.
             let ocr_due = kind.is_ocr().then(|| {
-                let okey = (row.monitor.id, kind.id());
+                let okey = (row.monitor.id, kind.id().to_string());
                 let due = last_ocr
                     .get(&okey)
-                    .map(|t| now.duration_since(*t).as_secs() >= OCR_MIN_INTERVAL_SECS)
+                    .map(|t| now_secs.saturating_sub(*t) >= OCR_MIN_INTERVAL_SECS as i64)
                     .unwrap_or(true);
                 if due {
-                    last_ocr.insert(okey, now);
+                    // Stamp at the decision point (write-through to settings) so a
+                    // crash or restart can't reset the cadence and re-OCR early.
+                    ctx.persist_ocr_attempt(row.monitor.id, kind.id(), now_secs);
+                    last_ocr.insert(okey, now_secs);
                 }
                 due
             });
@@ -3225,6 +3270,32 @@ mod tests {
         // Non-Google URLs pass through untouched.
         let other = "https://example.com/banner.png";
         assert_eq!(normalize_yt_image_url(other), other);
+    }
+
+    #[test]
+    fn ocr_attempt_stamps_roundtrip_from_settings() {
+        let store = Store::open_in_memory().unwrap();
+        // Persisted as {"<monitor_id>:<source_id>": <unix_secs>}; the loader
+        // splits the key back and drops anything malformed instead of panicking.
+        store
+            .set_setting(
+                crate::models::K_OCR_LAST_ATTEMPT,
+                r#"{"7:youtube_community_ocr":1700000000,"7:other_image_ocr":1700000600,"bad":1}"#,
+            )
+            .unwrap();
+        let map = load_ocr_attempts(&store);
+        assert_eq!(map.len(), 2);
+        assert_eq!(
+            map.get(&(7, "youtube_community_ocr".to_string())),
+            Some(&1700000000)
+        );
+        assert_eq!(
+            map.get(&(7, "other_image_ocr".to_string())),
+            Some(&1700000600)
+        );
+        // Empty/absent setting yields an empty map.
+        let empty = Store::open_in_memory().unwrap();
+        assert!(load_ocr_attempts(&empty).is_empty());
     }
 
     #[test]
