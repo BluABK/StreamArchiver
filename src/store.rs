@@ -1095,6 +1095,24 @@ impl Store {
             stmt.query_map(params![monitor_id, source], |r| r.get::<_, i64>(0))?
                 .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?
         };
+        // For each segment the winning source is about to write, evict any other
+        // automatic source's live row at that SAME instant — both past and future.
+        // This prevents cross-source duplicates from accumulating in the archive
+        // when two sources (e.g. Twitch schedule + OCR banner) previously both
+        // stored the same event (possibly with different title casing). The winning
+        // source's version is the only one that survives per (monitor, instant).
+        {
+            let mut evict = tx.prepare(
+                "DELETE FROM schedule_segment
+                 WHERE monitor_id = ?1 AND source <> ?2 AND source <> 'manual'
+                   AND start_time = ?3 AND canceled = 0",
+            )?;
+            for s in segs {
+                if !suppressed_starts.contains(&s.start_time) {
+                    evict.execute(params![monitor_id, source, s.start_time])?;
+                }
+            }
+        }
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO schedule_segment(monitor_id, start_time, end_time, title, category, canceled, source, video_id)

@@ -991,7 +991,35 @@ impl StreamArchiverApp {
         // separately; drop it so an edit/delete here isn't shown stale there.
         self.schedule_cache.clear();
         match self.core.store.all_upcoming_schedule(0) {
-            Ok(v) => {
+            Ok(mut v) => {
+                // Collapse cross-source duplicates that may have been stored before
+                // the per-timestamp eviction was in place. Two rows with the same
+                // (monitor_id, start_time) but different sources are the same event;
+                // keep the higher-priority source's version (manual → platform
+                // sources → OCR/scrape sources → discord).
+                let source_priority = |s: &str| -> u8 {
+                    match s {
+                        "manual" => 0,
+                        "platform" => 1,
+                        "youtube_api" => 2,
+                        "youtube" => 3,
+                        "twitch_banner_ocr" | "youtube_community_ocr"
+                        | "twitter_pinned" | "other_image_ocr" => 4,
+                        "discord" => 5,
+                        _ => 6,
+                    }
+                };
+                v.sort_by(|a, b| {
+                    a.monitor_id.cmp(&b.monitor_id)
+                        .then(a.start_time.cmp(&b.start_time))
+                        .then(source_priority(&a.source).cmp(&source_priority(&b.source)))
+                });
+                v.dedup_by(|a, b| a.monitor_id == b.monitor_id && a.start_time == b.start_time);
+                // Restore display order: soonest first, then channel name.
+                v.sort_by(|a, b| {
+                    a.start_time.cmp(&b.start_time)
+                        .then(a.channel_name.to_lowercase().cmp(&b.channel_name.to_lowercase()))
+                });
                 self.schedule_all = v;
                 // Drop hide choices only for channels that no longer EXIST (deleted),
                 // not ones merely without an upcoming stream right now — otherwise a
