@@ -231,7 +231,8 @@ fn run_probe(url: String) -> Result<()> {
     }
     let store = Arc::new(Store::open(&app_paths::db_path()).context("opening data store")?);
     let rt = tokio::runtime::Runtime::new()?;
-    let ctx = DetectContext::new(store);
+    let (events_tx, _) = tokio::sync::broadcast::channel(16);
+    let ctx = DetectContext::new(store, events_tx);
     let platform = Platform::detect(&url);
     let item = DetectItem {
         monitor_id: 0,

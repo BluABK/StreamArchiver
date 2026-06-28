@@ -181,6 +181,7 @@ pub struct StreamMeta {
 pub struct DetectContext {
     http: Client,
     pub store: Arc<Store>,
+    events: EventTx,
     twitch_token: Mutex<Option<TwitchToken>>,
     kick_token: Mutex<Option<TwitchToken>>,
     /// Serializes user-token refresh: Twitch device-code refresh tokens are
@@ -193,7 +194,7 @@ pub struct DetectContext {
 }
 
 impl DetectContext {
-    pub fn new(store: Arc<Store>) -> DetectContext {
+    pub fn new(store: Arc<Store>, events: EventTx) -> DetectContext {
         let http = Client::builder()
             .user_agent(UA)
             .timeout(Duration::from_secs(20))
@@ -202,6 +203,7 @@ impl DetectContext {
         DetectContext {
             http,
             store,
+            events,
             twitch_token: Mutex::new(None),
             kick_token: Mutex::new(None),
             twitch_refresh: Mutex::new(()),
@@ -870,6 +872,7 @@ impl DetectContext {
         &self,
         monitor_id: i64,
         source_id: &str,
+        channel_name: &str,
         path: &Path,
         cfg: &ChannelSourceConfig,
     ) -> Option<Vec<ScheduleSegment>> {
@@ -893,8 +896,35 @@ impl DetectContext {
             "OCR: scheduling claude call (monitor {monitor_id}, source {source_id}, image {})",
             path.display()
         );
+
+        let task_id = crate::events::next_task_id();
+        let source_label = crate::schedule_source::ScheduleSourceKind::from_id(source_id)
+            .map(|k| k.label())
+            .unwrap_or(source_id);
+        let _ = self.events.send(crate::events::AppEvent::BackgroundTaskStarted(
+            crate::events::BackgroundTask {
+                id: task_id,
+                kind: crate::events::BackgroundTaskKind::OcrCall,
+                label: channel_name.to_string(),
+                detail: format!("{source_label} · {}", opts.model),
+                started_at: now_unix(),
+            },
+        ));
+
         let result = ocr_schedule_image(path, &opts).await;
         accumulate_ocr_stats(self.store.as_ref(), &result);
+
+        let outcome = if result.cli_failures > 0 && result.cli_calls.is_empty() {
+            crate::events::TaskOutcome::Failed("CLI failed".into())
+        } else if result.parse_failures > 0 && result.segments.is_none() {
+            crate::events::TaskOutcome::Failed("Parse failed".into())
+        } else {
+            crate::events::TaskOutcome::Completed
+        };
+        let _ = self
+            .events
+            .send(crate::events::AppEvent::BackgroundTaskFinished { id: task_id, outcome });
+
         let segs = result.segments?;
         self.ocr_cache.lock().await.insert(key, (hash, segs.clone()));
         Some(segs)
@@ -920,6 +950,7 @@ impl DetectContext {
         self.ocr_image_cached(
             row.monitor.id,
             ScheduleSourceKind::TwitchBannerOcr.id(),
+            &row.channel.name,
             &banner,
             cfg,
         )
@@ -947,6 +978,7 @@ impl DetectContext {
         self.ocr_image_cached(
             row.monitor.id,
             ScheduleSourceKind::OtherImageOcr.id(),
+            &row.channel.name,
             &path,
             cfg,
         )
@@ -982,6 +1014,7 @@ impl DetectContext {
         self.ocr_image_cached(
             row.monitor.id,
             ScheduleSourceKind::YouTubeCommunityOcr.id(),
+            &row.channel.name,
             &dest,
             cfg,
         )
@@ -1020,6 +1053,7 @@ impl DetectContext {
         self.ocr_image_cached(
             row.monitor.id,
             ScheduleSourceKind::TwitterPinned.id(),
+            &row.channel.name,
             &dest,
             cfg,
         )

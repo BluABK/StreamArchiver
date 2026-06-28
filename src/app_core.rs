@@ -142,7 +142,10 @@ impl AppCore {
         *self.manual_tx.lock().unwrap() = Some(manual_tx.clone());
 
         // One shared detection context (HTTP client + cached Twitch token).
-        let ctx = Arc::new(crate::detectors::DetectContext::new(self.store.clone()));
+        let ctx = Arc::new(crate::detectors::DetectContext::new(
+            self.store.clone(),
+            self.events.clone(),
+        ));
 
         // Scheduler: detection -> live signals.
         let events = self.events.clone();

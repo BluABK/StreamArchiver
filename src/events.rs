@@ -24,6 +24,7 @@ pub fn next_task_id() -> u64 {
 pub enum BackgroundTaskKind {
     AssetFetch,
     ThumbnailFetch,
+    OcrCall,
 }
 
 impl BackgroundTaskKind {
@@ -31,6 +32,7 @@ impl BackgroundTaskKind {
         match self {
             BackgroundTaskKind::AssetFetch => "Asset fetch",
             BackgroundTaskKind::ThumbnailFetch => "Thumbnail",
+            BackgroundTaskKind::OcrCall => "Schedule OCR",
         }
     }
 }
