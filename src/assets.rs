@@ -78,6 +78,35 @@ fn ext_from_url(url: &str) -> Option<&str> {
     }
 }
 
+/// Ensure a `px × px` downscaled copy of the channel icon exists at
+/// `asset_dir/icon_{px}.png`. Generated with Lanczos3 on first call; the cached
+/// file is reused on subsequent calls unless the source icon is newer (mtime
+/// check). Returns the path to the scaled file, or `None` when no source icon
+/// is present or image processing fails. When the source is already ≤ `px` the
+/// source path is returned as-is (no unnecessary upscaling).
+pub fn ensure_scaled_icon(asset_dir: &Path, px: u32) -> Option<PathBuf> {
+    let out = asset_dir.join(format!("icon_{px}.png"));
+    let src = find_asset(asset_dir, "icon.")?;
+
+    if out.exists() {
+        // Regenerate only if the source icon was updated after the last scale.
+        let src_mtime = std::fs::metadata(&src).ok()?.modified().ok()?;
+        let out_mtime = std::fs::metadata(&out).ok()?.modified().ok()?;
+        if out_mtime >= src_mtime {
+            return Some(out);
+        }
+    }
+
+    let bytes = std::fs::read(&src).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    if img.width() <= px && img.height() <= px {
+        return Some(src);
+    }
+    let scaled = image::imageops::resize(&img, px, px, image::imageops::FilterType::Lanczos3);
+    scaled.save(&out).ok()?;
+    Some(out)
+}
+
 /// Download a URL to a file path; creates parent directories as needed.
 pub(crate) async fn download_image(client: &Client, url: &str, dest: &Path) -> Result<()> {
     let url = if url.starts_with("//") {
