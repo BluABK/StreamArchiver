@@ -524,6 +524,8 @@ pub struct StreamArchiverApp {
     confirm_delete: Option<(i64, String)>,
     /// Pending channel-delete confirmation: (channel id, name).
     confirm_delete_channel: Option<(i64, String)>,
+    /// Pending schedule-segment-delete confirmation: segment id.
+    confirm_delete_segment: Option<i64>,
     /// Backing state for the create/rename-channel dialog.
     channel_form: Option<ChannelForm>,
     /// Sort + per-column filters for the Streams table.
@@ -874,6 +876,7 @@ impl StreamArchiverApp {
             selected_monitor: None,
             confirm_delete: None,
             confirm_delete_channel: None,
+            confirm_delete_segment: None,
             channel_form: None,
             streams_sort: SortState::default(),
             streams_filters: vec![String::new(); STREAM_COLS],
@@ -3804,6 +3807,7 @@ impl eframe::App for StreamArchiverApp {
         self.channel_form_window(ui.ctx());
         self.confirm_delete_window(ui.ctx());
         self.confirm_delete_channel_window(ui.ctx());
+        self.confirm_delete_segment_window(ui.ctx());
         self.format_probe_window(ui.ctx());
         self.ad_popup_window(ui.ctx());
         self.meta_popup_window(ui.ctx());
@@ -3837,12 +3841,14 @@ impl StreamArchiverApp {
             || self.channel_form.is_some()
             || self.confirm_delete.is_some()
             || self.confirm_delete_channel.is_some()
+            || self.confirm_delete_segment.is_some()
         {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                 self.form = None;
                 self.channel_form = None;
                 self.confirm_delete = None;
                 self.confirm_delete_channel = None;
+                self.confirm_delete_segment = None;
             }
             return;
         }
@@ -4003,6 +4009,57 @@ impl StreamArchiverApp {
             self.reload_rows();
         } else if do_cancel || !open {
             self.confirm_delete_channel = None;
+        }
+    }
+
+    /// Modal confirmation for tombstoning a schedule segment (it won't reappear
+    /// on the next refresh).
+    #[allow(deprecated)]
+    fn confirm_delete_segment_window(&mut self, ctx: &egui::Context) {
+        let Some(sid) = self.confirm_delete_segment else {
+            return;
+        };
+        let mut open = true;
+        let mut do_delete = false;
+        let mut do_cancel = false;
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("del_segment_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("Delete schedule item")
+                .with_inner_size([400.0, 120.0])
+                .with_resizable(false),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label("Permanently delete this schedule item?");
+                    ui.label("It will be suppressed and won't reappear on refresh.");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Delete").clicked() {
+                            do_delete = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
+                });
+            },
+        );
+
+        if do_delete {
+            if let Err(e) = self.core.store.delete_schedule_segment(sid) {
+                self.status = format!("Error deleting schedule item: {e}");
+            } else {
+                self.schedule_hidden_segments.remove(&sid);
+                self.reload_schedule();
+                self.status = "Schedule item deleted.".into();
+            }
+            self.confirm_delete_segment = None;
+        } else if do_cancel || !open {
+            self.confirm_delete_segment = None;
         }
     }
 
@@ -6172,13 +6229,7 @@ impl StreamArchiverApp {
             .ctx()
             .data_mut(|d| d.remove_temp::<i64>(egui::Id::new("sched_delete")))
         {
-            if let Err(e) = self.core.store.delete_schedule_segment(sid) {
-                self.status = format!("Error deleting schedule item: {e}");
-            } else {
-                self.schedule_hidden_segments.remove(&sid);
-                self.reload_schedule();
-                self.status = "Schedule item deleted.".into();
-            }
+            self.confirm_delete_segment = Some(sid);
         }
         if let Some(cid) = ui
             .ctx()
@@ -7530,10 +7581,6 @@ impl StreamArchiverApp {
                                             rename_channel = Some(cid);
                                             ui.close();
                                         }
-                                        if ui.button("ℹ  Properties").clicked() {
-                                            open_channel_props = Some(cid);
-                                            ui.close();
-                                        }
                                         if any_err {
                                             ui.separator();
                                             if ui.button("✖  Clear error").clicked() {
@@ -7544,6 +7591,11 @@ impl StreamArchiverApp {
                                         ui.separator();
                                         if ui.button("🗑  Delete channel").clicked() {
                                             delete_channel = Some((cid, ch.name.clone()));
+                                            ui.close();
+                                        }
+                                        ui.separator();
+                                        if ui.button("ℹ  Properties").clicked() {
+                                            open_channel_props = Some(cid);
                                             ui.close();
                                         }
                                     });
