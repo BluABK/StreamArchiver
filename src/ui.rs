@@ -565,6 +565,11 @@ pub struct StreamArchiverApp {
     /// Channel ids hidden from the Schedule calendar (sidebar filter). Tracking
     /// *hidden* (not visible) means newly-added channels default to visible.
     schedule_hidden: HashSet<i64>,
+    /// Individual segment IDs the user has soft-hidden (not tombstoned). Reset
+    /// on app restart; use Delete for permanent suppression.
+    schedule_hidden_segments: HashSet<i64>,
+    /// When true, soft-hidden segments are shown dimmed instead of filtered out.
+    schedule_show_hidden: bool,
     /// Whether to flag overlapping streams (time collisions) in the calendar.
     schedule_collisions: bool,
     /// The day whose full stream list is shown in a popup (local date; None = closed).
@@ -887,6 +892,8 @@ impl StreamArchiverApp {
             schedule_mode: ScheduleMode::Month,
             schedule_anchor: None,
             schedule_hidden: HashSet::new(),
+            schedule_hidden_segments: HashSet::new(),
+            schedule_show_hidden: false,
             schedule_collisions: true,
             schedule_day_popup: None,
             show_schedule_sources: false,
@@ -1821,8 +1828,16 @@ fn schedule_source_badge(ui: &mut egui::Ui, source: &str) {
 /// Right-click menu for an upcoming-stream entry (calendar chip + day popup): copy
 /// its URL / platform / title / channel / full details, or open it in the browser.
 /// All actions are immediate (copy/open go straight through the egui context).
-fn schedule_copy_menu(ui: &mut egui::Ui, s: &UpcomingStream) {
-    ui.set_min_width(160.0);
+fn schedule_copy_menu(ui: &mut egui::Ui, s: &UpcomingStream, hidden: bool) {
+    ui.set_min_width(180.0);
+    // Hide / show toggle
+    let hide_label = if hidden { "👁  Show" } else { "🙈  Hide" };
+    if ui.button(hide_label).clicked() {
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(egui::Id::new("sched_hide"), s.segment_id));
+        ui.close();
+    }
+    ui.separator();
     if ui
         .add_enabled(!s.url.is_empty(), egui::Button::new("📋  Copy URL"))
         .clicked()
@@ -1889,6 +1904,16 @@ fn schedule_copy_menu(ui: &mut egui::Ui, s: &UpcomingStream) {
             .data_mut(|d| d.insert_temp(egui::Id::new("sched_start"), s.monitor_id));
         ui.close();
     }
+    ui.separator();
+    if ui
+        .button(egui::RichText::new("🗑  Delete").color(egui::Color32::from_rgb(0xe0, 0x50, 0x50)))
+        .on_hover_text("Permanently suppress this event (tombstone — won't reappear on refresh).")
+        .clicked()
+    {
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(egui::Id::new("sched_delete"), s.segment_id));
+        ui.close();
+    }
 }
 
 /// One detailed schedule row (⚠ if colliding · time · platform · channel — title
@@ -1898,6 +1923,7 @@ fn schedule_detail_row(
     ui: &mut egui::Ui,
     s: &UpcomingStream,
     colliding: bool,
+    hidden: bool,
     ptex: &PlatformTextures,
 ) {
     let color = channel_event_color(s.channel_id, &s.channel_color);
@@ -1929,7 +1955,7 @@ fn schedule_detail_row(
         .response
         .interact(egui::Sense::click());
     resp.on_hover_text(schedule_detail_line(s))
-        .context_menu(|ui| schedule_copy_menu(ui, s));
+        .context_menu(|ui| schedule_copy_menu(ui, s, hidden));
 }
 
 /// Subtle background tint for today's calendar cell (low-alpha accent, so it reads
@@ -2006,6 +2032,7 @@ fn schedule_time_grid(
     by_day: &HashMap<chrono::NaiveDate, Vec<usize>>,
     collide: &HashSet<usize>,
     open_day: &mut Option<chrono::NaiveDate>,
+    hidden_segs: &HashSet<i64>,
 ) {
     use chrono::Timelike;
     // Scroll to show the current local hour, but only the first time the view
@@ -2139,9 +2166,13 @@ fn schedule_time_grid(
                     event_rects.push((block_rect, stream_idx, day));
 
                     let color = channel_event_color(s.channel_id, &s.channel_color);
+                    let is_hidden = hidden_segs.contains(&s.segment_id);
                     let hovered = hover_pos.is_some_and(|p| block_rect.contains(p));
-                    let fill = if hovered {
-                        color // brighter on hover — stroke already provides accent
+                    let fill = if is_hidden {
+                        // Soft-hidden: keep hue but drop alpha to ~35% so it reads as "ghost"
+                        egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 85)
+                    } else if hovered {
+                        color
                     } else {
                         egui::Color32::from_rgba_unmultiplied(
                             color.r(), color.g(), color.b(), 210,
@@ -2176,35 +2207,49 @@ fn schedule_time_grid(
                         let text_painter = painter.with_clip_rect(block_rect);
                         let name_font = egui::FontId::proportional(11.0);
                         let time_font = egui::FontId::proportional(10.0);
-                        let white = egui::Color32::WHITE;
+                        let (name_color, time_color, title_color) = if is_hidden {
+                            (
+                                egui::Color32::from_white_alpha(110),
+                                egui::Color32::from_white_alpha(90),
+                                egui::Color32::from_white_alpha(70),
+                            )
+                        } else {
+                            (
+                                egui::Color32::WHITE,
+                                egui::Color32::from_white_alpha(200),
+                                egui::Color32::from_white_alpha(180),
+                            )
+                        };
                         let text_y = text_rect.top();
-                        // Source badge glyph + channel name (the dense grid has no
-                        // room for a separate widget, so prefix the channel name).
+                        let badge = source_badge(&s.source).0;
+                        let name_str = if is_hidden {
+                            format!("⊘ {} {}", badge, s.channel_name)
+                        } else {
+                            format!("{} {}", badge, s.channel_name)
+                        };
                         text_painter.text(
                             egui::pos2(text_rect.left(), text_y),
                             egui::Align2::LEFT_TOP,
-                            format!("{} {}", source_badge(&s.source).0, s.channel_name),
+                            name_str,
                             name_font,
-                            white,
+                            name_color,
                         );
-                        // Time range (below channel name if enough space)
                         if block_h >= 36.0 {
                             text_painter.text(
                                 egui::pos2(text_rect.left(), text_y + 13.0),
                                 egui::Align2::LEFT_TOP,
                                 fmt_time_range(s.start_time, s.end_time),
                                 time_font.clone(),
-                                egui::Color32::from_white_alpha(200),
+                                time_color,
                             );
                         }
-                        // Title (if enough height)
                         if block_h >= 56.0 && !s.title.is_empty() {
                             text_painter.text(
                                 egui::pos2(text_rect.left(), text_y + 26.0),
                                 egui::Align2::LEFT_TOP,
                                 &s.title,
                                 time_font,
-                                egui::Color32::from_white_alpha(180),
+                                title_color,
                             );
                         }
                     }
@@ -2256,7 +2301,8 @@ fn schedule_time_grid(
             ),
             egui::Sense::click(),
         );
-        resp.context_menu(|ui| schedule_copy_menu(ui, s));
+        let is_hidden_ctx = hidden_segs.contains(&s.segment_id);
+        resp.context_menu(|ui| schedule_copy_menu(ui, s, is_hidden_ctx));
     }
 
     if let Some(day) = clicked_day {
@@ -5791,6 +5837,12 @@ impl StreamArchiverApp {
             if self.schedule_hidden.contains(&s.channel_id) {
                 continue;
             }
+            // Skip soft-hidden segments unless the user has toggled "show hidden".
+            if !self.schedule_show_hidden
+                && self.schedule_hidden_segments.contains(&s.segment_id)
+            {
+                continue;
+            }
             if let Some(d) = local_date(s.start_time) {
                 by_day.entry(d).or_default().push(i);
             }
@@ -5807,6 +5859,7 @@ impl StreamArchiverApp {
         let mut hide_all = false;
         let mut toggle_channel: Option<i64> = None;
         let mut set_collisions: Option<bool> = None;
+        let mut set_show_hidden: Option<bool> = None;
 
         // ── Left sidebar: per-channel filter + collision toggle. ──
         egui::Panel::left("schedule_sidebar")
@@ -5846,20 +5899,23 @@ impl StreamArchiverApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for (id, name) in &chans {
+                            let cid = *id;
                             // Count + distinct platforms for this channel's upcoming streams.
                             let mut count = 0usize;
                             let mut plats: Vec<Platform> = Vec::new();
-                            for s in self.schedule_all.iter().filter(|s| s.channel_id == *id) {
+                            for s in self.schedule_all.iter().filter(|s| s.channel_id == cid) {
                                 count += 1;
                                 let p = s.platform();
                                 if !plats.contains(&p) {
                                     plats.push(p);
                                 }
                             }
-                            ui.horizontal(|ui| {
-                                let mut vis = !self.schedule_hidden.contains(id);
+                            // Pre-compute for context-menu closure (can't re-borrow self inside).
+                            let ch_is_hidden = self.schedule_hidden.contains(&cid);
+                            let row = ui.horizontal(|ui| {
+                                let mut vis = !ch_is_hidden;
                                 if ui.checkbox(&mut vis, "").changed() {
-                                    toggle_channel = Some(*id);
+                                    toggle_channel = Some(cid);
                                 }
                                 for &p in &plats {
                                     platform_icon(ui, &ptex, p).on_hover_text(p.label());
@@ -5867,7 +5923,44 @@ impl StreamArchiverApp {
                                 ui.add(
                                     egui::Label::new(format!("{name}  ({count})")).truncate(),
                                 );
+                            }).response;
+                            // Context menu — captures only Copy values, uses temp data.
+                            row.context_menu(|ui| {
+                                let label = if ch_is_hidden {
+                                    "👁  Show channel"
+                                } else {
+                                    "🙈  Hide channel"
+                                };
+                                if ui.button(label).clicked() {
+                                    ui.ctx().data_mut(|d| {
+                                        d.insert_temp(egui::Id::new("sched_ch_toggle"), cid)
+                                    });
+                                    ui.close();
+                                }
                             });
+                        }
+
+                        // Hidden-segment toggle (shown only when any exist).
+                        let hidden_n = self.schedule_hidden_segments.len();
+                        if hidden_n > 0 {
+                            ui.separator();
+                            let show_hidden = self.schedule_show_hidden;
+                            let label = if show_hidden {
+                                format!("🔒  Hide {hidden_n} hidden")
+                            } else {
+                                format!("👁  Show {hidden_n} hidden")
+                            };
+                            if ui
+                                .button(label)
+                                .on_hover_text(if show_hidden {
+                                    "Filter out soft-hidden events again"
+                                } else {
+                                    "Show soft-hidden events dimmed (⊘) — right-click to restore"
+                                })
+                                .clicked()
+                            {
+                                set_show_hidden = Some(!show_hidden);
+                            }
                         }
                     });
             });
@@ -6065,6 +6158,41 @@ impl StreamArchiverApp {
             let ctx = ui.ctx().clone();
             self.open_schedule_source(sid, &ctx);
         }
+        if let Some(sid) = ui
+            .ctx()
+            .data_mut(|d| d.remove_temp::<i64>(egui::Id::new("sched_hide")))
+        {
+            if self.schedule_hidden_segments.contains(&sid) {
+                self.schedule_hidden_segments.remove(&sid);
+            } else {
+                self.schedule_hidden_segments.insert(sid);
+            }
+        }
+        if let Some(sid) = ui
+            .ctx()
+            .data_mut(|d| d.remove_temp::<i64>(egui::Id::new("sched_delete")))
+        {
+            if let Err(e) = self.core.store.delete_schedule_segment(sid) {
+                self.status = format!("Error deleting schedule item: {e}");
+            } else {
+                self.schedule_hidden_segments.remove(&sid);
+                self.reload_schedule();
+                self.status = "Schedule item deleted.".into();
+            }
+        }
+        if let Some(cid) = ui
+            .ctx()
+            .data_mut(|d| d.remove_temp::<i64>(egui::Id::new("sched_ch_toggle")))
+        {
+            if self.schedule_hidden.contains(&cid) {
+                self.schedule_hidden.remove(&cid);
+            } else {
+                self.schedule_hidden.insert(cid);
+            }
+        }
+        if let Some(v) = set_show_hidden {
+            self.schedule_show_hidden = v;
+        }
     }
 
     /// One compact calendar chip (colored stripe · ⚠ · platform icon · time range · channel)
@@ -6078,7 +6206,13 @@ impl StreamArchiverApp {
         ptex: &PlatformTextures,
     ) -> egui::Response {
         let s = &self.schedule_all[i];
+        let is_hidden = self.schedule_hidden_segments.contains(&s.segment_id);
         let color = channel_event_color(s.channel_id, &s.channel_color);
+        let stripe_color = if is_hidden {
+            egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 85)
+        } else {
+            color
+        };
         let resp = ui
             .horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 3.0;
@@ -6087,25 +6221,31 @@ impl StreamArchiverApp {
                     egui::vec2(3.0, ui.text_style_height(&egui::TextStyle::Body)),
                     egui::Sense::hover(),
                 );
-                ui.painter().rect_filled(stripe_rect, egui::CornerRadius::same(2), color);
+                ui.painter().rect_filled(stripe_rect, egui::CornerRadius::same(2), stripe_color);
+                if is_hidden {
+                    ui.weak("⊘");
+                }
                 if colliding {
                     ui.colored_label(HL_COLLISION, "⚠");
                 }
                 platform_icon(ui, ptex, s.platform());
                 schedule_source_badge(ui, &s.source);
-                ui.add(
-                    egui::Label::new(format!(
-                        "{}  {}",
-                        fmt_time_range(s.start_time, s.end_time),
-                        s.channel_name
-                    ))
-                    .truncate(),
+                let label_text = format!(
+                    "{}  {}",
+                    fmt_time_range(s.start_time, s.end_time),
+                    s.channel_name
                 );
+                let label = if is_hidden {
+                    egui::RichText::new(label_text).weak()
+                } else {
+                    egui::RichText::new(label_text)
+                };
+                ui.add(egui::Label::new(label).truncate());
             })
             .response
             .interact(egui::Sense::click());
         let resp = resp.on_hover_text(schedule_detail_line(s));
-        resp.context_menu(|ui| schedule_copy_menu(ui, s));
+        resp.context_menu(|ui| schedule_copy_menu(ui, s, is_hidden));
         resp
     }
 
@@ -6240,6 +6380,7 @@ impl StreamArchiverApp {
             by_day,
             collide,
             open_day,
+            &self.schedule_hidden_segments,
         );
     }
 
@@ -6277,6 +6418,7 @@ impl StreamArchiverApp {
             by_day,
             collide,
             open_day,
+            &self.schedule_hidden_segments,
         );
     }
 
@@ -6397,7 +6539,13 @@ impl StreamArchiverApp {
 
                     for &i in indices {
                         let s = &self.schedule_all[i];
+                        let is_hidden = self.schedule_hidden_segments.contains(&s.segment_id);
                         let color = channel_event_color(s.channel_id, &s.channel_color);
+                        let stripe_color = if is_hidden {
+                            egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 85)
+                        } else {
+                            color
+                        };
                         let colliding = collide.contains(&i);
 
                         let row_resp = ui.horizontal(|ui| {
@@ -6408,7 +6556,10 @@ impl StreamArchiverApp {
                                 egui::vec2(4.0, ui.text_style_height(&egui::TextStyle::Body) * 1.4),
                                 egui::Sense::hover(),
                             );
-                            ui.painter().rect_filled(stripe_rect, egui::CornerRadius::same(2), color);
+                            ui.painter().rect_filled(stripe_rect, egui::CornerRadius::same(2), stripe_color);
+                            if is_hidden {
+                                ui.weak("⊘");
+                            }
 
                             // Time range
                             if colliding {
@@ -6424,8 +6575,12 @@ impl StreamArchiverApp {
                             platform_icon(ui, ptex, s.platform());
                             schedule_source_badge(ui, &s.source);
 
-                            // Channel name (bold)
-                            ui.strong(&s.channel_name);
+                            // Channel name (bold or weak if hidden)
+                            if is_hidden {
+                                ui.weak(&s.channel_name);
+                            } else {
+                                ui.strong(&s.channel_name);
+                            }
 
                             // Title (muted, truncated)
                             if !s.title.is_empty() {
@@ -6455,7 +6610,7 @@ impl StreamArchiverApp {
                         .interact(egui::Sense::click());
 
                         let row_resp = row_resp.on_hover_text(schedule_detail_line(s));
-                        row_resp.context_menu(|ui| schedule_copy_menu(ui, s));
+                        row_resp.context_menu(|ui| schedule_copy_menu(ui, s, is_hidden));
                         if row_resp.clicked() {
                             *open_day = Some(*day);
                         }
@@ -6488,6 +6643,7 @@ impl StreamArchiverApp {
             .format(&format!("%A, {}", active_date_fmt().date_pattern()))
             .to_string();
 
+        let hidden_segs = self.schedule_hidden_segments.clone();
         let mut open = true;
         let mut copy_all: Option<String> = None;
         ctx.show_viewport_immediate(
@@ -6512,7 +6668,8 @@ impl StreamArchiverApp {
                             for s in &entries {
                                 // The popup doesn't carry the collision set; the calendar
                                 // surfaces ⚠ markers, so rows here are shown unmarked.
-                                schedule_detail_row(ui, s, false, &ptex);
+                                let hidden = hidden_segs.contains(&s.segment_id);
+                                schedule_detail_row(ui, s, false, hidden, &ptex);
                             }
                         });
                     ui.add_space(6.0);
