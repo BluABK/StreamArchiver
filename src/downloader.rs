@@ -2309,6 +2309,7 @@ impl Supervisor {
             channel: row.channel.name.clone(),
             status: status.into(),
         });
+        self.schedule_vod_check(rec_id, row.monitor.platform(), status, &row.monitor.url, went_live_at);
         info!(monitor_id, bytes, status, "recording finished");
         if status == "failed" && !outcome.log.is_empty() {
             warn!(monitor_id, "recording stderr:\n{}", outcome.log);
@@ -2985,12 +2986,17 @@ impl Supervisor {
                     &log,
                 );
                 active.lock().unwrap().remove(&key);
+                let vod_platform = mrow.as_ref().map(|r| r.monitor.platform());
+                let vod_url = mrow.as_ref().map(|r| r.monitor.url.clone()).unwrap_or_default();
                 let channel = mrow.map(|r| r.channel.name).unwrap_or_default();
                 let _ = self.events.send(AppEvent::RecordingFinished {
                     recording_id: row.ref_id,
                     channel,
                     status: status.into(),
                 });
+                if let Some(platform) = vod_platform {
+                    self.schedule_vod_check(row.ref_id, platform, status, &vod_url, row.went_live_at);
+                }
                 if let Some(mid) = row.monitor_id {
                     let _ = self.events.send(AppEvent::MonitorState {
                         monitor_id: mid,
@@ -3242,6 +3248,7 @@ impl Supervisor {
             channel: row.channel.name.clone(),
             status: status.into(),
         });
+        self.schedule_vod_check(rec_id, row.monitor.platform(), status, &row.monitor.url, rec.went_live_at);
         info!(monitor_id, rec_id, bytes, status, "resumed recording finished");
         self.active.lock().unwrap().remove(&monitor_id);
     }
@@ -3284,6 +3291,34 @@ impl Supervisor {
             }
             let _ = tokio::fs::remove_dir(&cache).await; // only if now empty
         }
+    }
+
+    /// Mark a Twitch recording as VOD-pending and spawn the background poller.
+    /// No-op for non-Twitch platforms, or statuses that imply the stream had
+    /// already ended before capture began (`ended`).
+    fn schedule_vod_check(
+        &self,
+        rec_id: i64,
+        platform: Platform,
+        status: &str,
+        monitor_url: &str,
+        went_live_at: Option<i64>,
+    ) {
+        if platform != Platform::Twitch || status == "ended" {
+            return;
+        }
+        let Some(login) = crate::detectors::twitch_login(monitor_url) else {
+            return;
+        };
+        let _ = self.store.set_recording_vod_pending(rec_id);
+        tokio::spawn(check_twitch_vod(
+            Arc::clone(&self.ctx),
+            Arc::clone(&self.store),
+            self.events.clone(),
+            rec_id,
+            login,
+            went_live_at,
+        ));
     }
 
     async fn run_process(
@@ -3583,6 +3618,9 @@ fn recording_from_detached(row: &DetachedRow) -> Recording {
         category: String::new(),
         log_excerpt: String::new(),
         notes: String::new(),
+        vod_id: None,
+        vod_state: None,
+        vod_muted_secs: None,
     }
 }
 
@@ -4829,6 +4867,119 @@ fn civil_from_unix_utc(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
     let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
     let year = if month <= 2 { y + 1 } else { y };
     (year, month, day, hh, mm, ss)
+}
+
+// ---------- Twitch VOD background checker ----------
+
+/// How long to wait between polling attempts.
+const VOD_POLL_INTERVAL_SECS: u64 = 5 * 60;
+/// Maximum number of polls before giving up (5 min × 12 = 60 min total).
+const VOD_MAX_POLLS: u32 = 12;
+/// Maximum delta between a VOD's `created_at` and the broadcast's `went_live_at`
+/// for them to be considered the same stream (2 hours).
+const VOD_MATCH_WINDOW_SECS: i64 = 2 * 3600;
+
+/// Background task that polls Helix `/videos` for the Twitch VOD produced by a
+/// just-finished recording. Polls every [`VOD_POLL_INTERVAL_SECS`] for up to
+/// [`VOD_MAX_POLLS`] attempts, then marks the recording `not_published` if
+/// no matching VOD appears.
+async fn check_twitch_vod(
+    ctx: Arc<DetectContext>,
+    store: Arc<Store>,
+    events: EventTx,
+    rec_id: i64,
+    login: String,
+    went_live_at: Option<i64>,
+) {
+    // Wait before the first check — VODs take several minutes to appear.
+    tokio::time::sleep(Duration::from_secs(VOD_POLL_INTERVAL_SECS)).await;
+
+    let (client_id, token) = match ctx.twitch_helix_auth().await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(rec_id, "VOD check: Twitch auth unavailable: {e:#}");
+            return;
+        }
+    };
+    let user_id = match ctx.twitch_user_id(&client_id, &token, &login).await {
+        Some(id) => id,
+        None => {
+            warn!(rec_id, login, "VOD check: could not resolve user_id");
+            return;
+        }
+    };
+
+    for poll in 0..VOD_MAX_POLLS {
+        if poll > 0 {
+            tokio::time::sleep(Duration::from_secs(VOD_POLL_INTERVAL_SECS)).await;
+        }
+        match poll_twitch_vod(&ctx.http_client(), &client_id, &token, &user_id, went_live_at).await {
+            Ok(Some((vod_id, muted_secs))) => {
+                let _ = store.set_recording_vod_found(rec_id, &vod_id, muted_secs);
+                let _ = events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
+                info!(rec_id, vod_id, muted_secs, "Twitch VOD found");
+                return;
+            }
+            Ok(None) => {} // not yet available
+            Err(e) => warn!(rec_id, "VOD poll error: {e:#}"),
+        }
+    }
+
+    let _ = store.set_recording_vod_not_published(rec_id);
+    let _ = events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
+    info!(rec_id, login, "Twitch VOD not published after polling timeout");
+}
+
+/// Query Helix `/helix/videos` for the streamer's most recent archive VODs and
+/// find one whose `created_at` is within [`VOD_MATCH_WINDOW_SECS`] of
+/// `went_live_at`. Returns `Some((vod_id, muted_secs))` on match, `None` if
+/// no matching VOD exists yet, or an error on a transient API failure.
+async fn poll_twitch_vod(
+    client: &reqwest::Client,
+    client_id: &str,
+    token: &str,
+    user_id: &str,
+    went_live_at: Option<i64>,
+) -> anyhow::Result<Option<(String, i64)>> {
+    use anyhow::bail;
+    let resp = client
+        .get("https://api.twitch.tv/helix/videos")
+        .header("Client-Id", client_id)
+        .bearer_auth(token)
+        .query(&[("user_id", user_id), ("type", "archive"), ("first", "5")])
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        bail!("Helix /videos: {}", resp.status());
+    }
+    let v: serde_json::Value = resp.json().await?;
+    let Some(data) = v["data"].as_array() else {
+        return Ok(None);
+    };
+    for item in data {
+        let Some(vod_id) = item["id"].as_str() else {
+            continue;
+        };
+        let Some(created_at_str) = item["created_at"].as_str() else {
+            continue;
+        };
+        let Some(created_ts) = crate::detectors::parse_rfc3339(created_at_str) else {
+            continue;
+        };
+        let matches = match went_live_at {
+            Some(wl) => (created_ts - wl).abs() <= VOD_MATCH_WINDOW_SECS,
+            None => true, // no anchor — accept the most recent archive
+        };
+        if !matches {
+            continue;
+        }
+        let muted_secs: i64 = item["muted_segments"]
+            .as_array()
+            .map(|segs| segs.iter().filter_map(|s| s["duration"].as_i64()).sum())
+            .unwrap_or(0);
+        return Ok(Some((vod_id.to_string(), muted_secs)));
+    }
+    Ok(None)
 }
 
 #[cfg(test)]

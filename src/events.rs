@@ -134,6 +134,11 @@ pub enum AppEvent {
         channel: String,
         status: String,
     },
+    /// A background task updated VOD state or other derived fields on a recording
+    /// row — the UI should reload recording history to reflect the change.
+    RecordingUpdated {
+        recording_id: i64,
+    },
     Error {
         context: String,
         message: String,

@@ -5907,6 +5907,44 @@ impl StreamArchiverApp {
                                 }
                             });
 
+                        // ── VOD (Twitch only) ─────────────────────────────
+                        if rec.vod_state.is_some() {
+                            ui.add_space(8.0);
+                            ui.strong("VOD");
+                            egui::Grid::new("rp_vod")
+                                .num_columns(2)
+                                .striped(true)
+                                .min_col_width(90.0)
+                                .show(ui, |ui| {
+                                    ui.label("State");
+                                    let (label, color) = match rec.vod_state.as_deref() {
+                                        Some("pending") => ("Checking…", egui::Color32::GRAY),
+                                        Some("found") => ("Published", egui::Color32::from_rgb(80, 200, 80)),
+                                        Some("not_published") => ("Not published", egui::Color32::from_rgb(220, 80, 80)),
+                                        _ => ("Unknown", egui::Color32::GRAY),
+                                    };
+                                    ui.colored_label(color, label);
+                                    ui.end_row();
+                                    if let Some(vod_url) = rec.vod_url() {
+                                        ui.label("VOD URL");
+                                        ui.hyperlink_to(&vod_url, &vod_url);
+                                        ui.end_row();
+                                    }
+                                    if let Some(muted) = rec.vod_muted_secs {
+                                        ui.label("Muted");
+                                        if muted == 0 {
+                                            ui.colored_label(egui::Color32::from_rgb(80, 200, 80), "None (clean copy)");
+                                        } else {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(220, 160, 30),
+                                                format!("{} muted (online copy damaged)", fmt_duration(muted)),
+                                            );
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        }
+
                         if !rec.log_excerpt.is_empty() {
                             ui.add_space(8.0);
                             ui.strong("Log excerpt");
@@ -8338,6 +8376,25 @@ impl StreamArchiverApp {
                                         } else if let Some(code) = t.exit_code {
                                             resp.on_hover_text(format!("exit code {code}"));
                                         }
+                                        // VOD state badge (Twitch only)
+                                        match t.vod_state.as_deref() {
+                                            Some("not_published") => {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(220, 80, 80),
+                                                    "⚠ no VOD",
+                                                ).on_hover_text("No VOD was published — this local recording may be the only surviving copy.");
+                                            }
+                                            Some("found") if t.vod_muted_secs.unwrap_or(0) > 0 => {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(220, 160, 30),
+                                                    "✂ muted",
+                                                ).on_hover_text(format!(
+                                                    "VOD has {} of muted content (DMCA) — local recording is the authoritative archive.",
+                                                    fmt_duration(t.vod_muted_secs.unwrap_or(0))
+                                                ));
+                                            }
+                                            _ => {}
+                                        }
                                     });
                                     tr.col(|_ui| {}); // next stream (n/a per take)
                                     tr.col(|ui| {
@@ -8417,6 +8474,12 @@ impl StreamArchiverApp {
                                         {
                                             open_path = dir.clone();
                                             ui.close();
+                                        }
+                                        if let Some(vod_url) = t.vod_url() {
+                                            if ui.button("🌐  Open VOD").clicked() {
+                                                ui.ctx().open_url(egui::OpenUrl::new_tab(vod_url));
+                                                ui.close();
+                                            }
                                         }
                                         if ui
                                             .add_enabled(
@@ -13630,6 +13693,9 @@ mod tests {
             category: String::new(),
             log_excerpt: String::new(),
             notes: String::new(),
+            vod_id: None,
+            vod_state: None,
+            vod_muted_secs: None,
         }
     }
 

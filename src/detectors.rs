@@ -143,7 +143,7 @@ impl DetectOutcome {
 }
 
 /// Parse an RFC3339/ISO8601 timestamp (e.g. Twitch `started_at`) to unix seconds.
-fn parse_rfc3339(s: &str) -> Option<i64> {
+pub(crate) fn parse_rfc3339(s: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|dt| dt.timestamp())

@@ -1335,11 +1335,28 @@ pub struct Recording {
     pub log_excerpt: String,
     /// User-entered free-text notes for this take (empty by default).
     pub notes: String,
+    /// Twitch VOD ID once resolved (e.g. `"1234567890"`). `None` until the
+    /// background checker confirms it, or for non-Twitch recordings.
+    pub vod_id: Option<String>,
+    /// Twitch VOD availability state. `None` = not tracked (non-Twitch / pre-v30
+    /// row). `"pending"` = background check running; `"found"` = VOD published;
+    /// `"not_published"` = streamer did not publish a VOD (local copy may be the
+    /// only surviving record).
+    pub vod_state: Option<String>,
+    /// Total DMCA-muted seconds in the Twitch VOD. `None` = unknown (pending or
+    /// N/A). `0` = clean copy online; `> 0` = damaged — the online copy is missing
+    /// content, making the local recording the authoritative archive.
+    pub vod_muted_secs: Option<i64>,
 }
 
 impl Recording {
     pub fn is_active(&self) -> bool {
         self.status == "recording"
+    }
+
+    /// Direct URL to the Twitch VOD (`None` until `vod_state == "found"`).
+    pub fn vod_url(&self) -> Option<String> {
+        self.vod_id.as_ref().map(|id| format!("https://www.twitch.tv/videos/{id}"))
     }
     /// End time for duration math (`now` while the take is still in progress).
     pub fn duration_secs(&self, now: i64) -> i64 {
@@ -1552,6 +1569,9 @@ mod tests {
             category: String::new(),
             log_excerpt: String::new(),
             notes: String::new(),
+            vod_id: None,
+            vod_state: None,
+            vod_muted_secs: None,
         }
     }
 

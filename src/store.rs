@@ -18,7 +18,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 29;
+const SCHEMA_VERSION: i64 = 30;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -501,7 +501,19 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 29)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 29);
+        if version < 30 {
+            // VOD tracking: Twitch VOD id, availability state, and muted-segment
+            // seconds for each recording take. The background checker populates
+            // these after the stream ends; NULL columns mean "not applicable"
+            // (non-Twitch) or "legacy row created before this migration".
+            conn.execute_batch(
+                "ALTER TABLE recording ADD COLUMN vod_id TEXT;
+                 ALTER TABLE recording ADD COLUMN vod_state TEXT;
+                 ALTER TABLE recording ADD COLUMN vod_muted_secs INTEGER;",
+            )?;
+            conn.pragma_update(None, "user_version", 30)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 30);
         Ok(())
     }
 
@@ -1029,6 +1041,37 @@ impl Store {
     pub fn set_recording_notes(&self, id: i64, notes: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("UPDATE recording SET notes=?2 WHERE id=?1", params![id, notes])?;
+        Ok(())
+    }
+
+    /// Mark a recording as awaiting Twitch VOD resolution.
+    pub fn set_recording_vod_pending(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE recording SET vod_state='pending' WHERE id=?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Record a confirmed Twitch VOD: the VOD id and total muted seconds (0 = clean).
+    pub fn set_recording_vod_found(&self, id: i64, vod_id: &str, muted_secs: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE recording SET vod_id=?2, vod_state='found', vod_muted_secs=?3 WHERE id=?1",
+            params![id, vod_id, muted_secs],
+        )?;
+        Ok(())
+    }
+
+    /// Record that no Twitch VOD was published for this take (VOD-less stream —
+    /// the local recording may be the only surviving copy).
+    pub fn set_recording_vod_not_published(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE recording SET vod_state='not_published' WHERE id=?1",
+            params![id],
+        )?;
         Ok(())
     }
 
@@ -1686,7 +1729,8 @@ impl Store {
                     COALESCE((SELECT new_value FROM stream_meta_change smc
                               WHERE smc.recording_id = recording.id AND smc.kind = 'category'
                               ORDER BY smc.at_secs DESC, smc.id DESC LIMIT 1), ''),
-                    take_group, COALESCE(notes, '')
+                    take_group, COALESCE(notes, ''),
+                    vod_id, vod_state, vod_muted_secs
              FROM recording WHERE monitor_id = ?1 ORDER BY started_at, id",
         )?;
         let rows = stmt
@@ -1712,6 +1756,9 @@ impl Store {
                     category: r.get(17)?,
                     log_excerpt: r.get(15)?,
                     notes: r.get(19)?,
+                    vod_id: r.get(20)?,
+                    vod_state: r.get(21)?,
+                    vod_muted_secs: r.get(22)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1755,6 +1802,9 @@ impl Store {
                     category: String::new(),
                     log_excerpt: String::new(),
                     notes: String::new(),
+                    vod_id: None,
+                    vod_state: None,
+                    vod_muted_secs: None,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

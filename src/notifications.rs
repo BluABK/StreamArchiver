@@ -166,14 +166,20 @@ fn handle(store: &Store, ev: AppEvent) {
             match row {
                 Some(row) => {
                     let heading = format!("{} — {status}", row.channel.name);
-                    // For YouTube, prefer the specific video URL when we recorded
-                    // the stream id; the channel URL just opens the completed-stream
-                    // page rather than the VOD itself.
-                    let vod_url =
-                        resolved.as_ref().and_then(|(_, sid)| sid.as_deref()).and_then(|sid| {
-                            matches!(row.monitor.platform(), crate::models::Platform::YouTube)
-                                .then(|| format!("https://www.youtube.com/watch?v={sid}"))
-                        });
+                    let vod_url = match row.monitor.platform() {
+                        // YouTube: open the specific video when we have the stream id.
+                        crate::models::Platform::YouTube => {
+                            resolved.as_ref().and_then(|(_, sid)| sid.as_deref()).map(|sid| {
+                                format!("https://www.youtube.com/watch?v={sid}")
+                            })
+                        }
+                        // Twitch: VODs take minutes to appear; open the archive
+                        // filter page so the user can find it once it's ready.
+                        crate::models::Platform::Twitch => {
+                            Some(format!("{}/videos?filter=archives", row.monitor.url.trim_end_matches('/')))
+                        }
+                        _ => None,
+                    };
                     content_for_url(&row, heading, "Watch VOD", vod_url)
                 }
                 None => ToastContent::text(
