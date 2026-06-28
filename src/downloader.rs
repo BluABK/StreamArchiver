@@ -3584,6 +3584,7 @@ fn recording_from_detached(row: &DetachedRow) -> Recording {
         title: String::new(),
         category: String::new(),
         log_excerpt: String::new(),
+        notes: String::new(),
     }
 }
 

@@ -612,6 +612,11 @@ pub struct StreamArchiverApp {
     properties_popup: Option<i64>,
     /// Which channel's Properties window is open (None = closed).
     channel_properties_popup: Option<i64>,
+    /// The recording whose properties dialog is open (None = closed).
+    rec_props: Option<i64>,
+    /// Draft notes for the open recording properties dialog; synced from the DB
+    /// when the dialog opens and written back on every keystroke.
+    rec_props_notes: String,
     /// Per-channel cached icon textures loaded from disk for the Properties window.
     /// A `None` value means the lookup was attempted but no icon file was found.
     channel_icons: HashMap<i64, Option<egui::TextureHandle>>,
@@ -927,6 +932,8 @@ impl StreamArchiverApp {
             platform_tex: None,
             properties_popup: None,
             channel_properties_popup: None,
+            rec_props: None,
+            rec_props_notes: String::new(),
             channel_icons: HashMap::new(),
             emote_anim: Arc::new(Mutex::new(HashMap::new())),
             emote_epoch: Arc::new(AtomicU64::new(0)),
@@ -3990,6 +3997,7 @@ impl eframe::App for StreamArchiverApp {
         self.chat_popup_window(ui.ctx());
         self.instance_properties_window(ui.ctx());
         self.channel_properties_window(ui.ctx());
+        self.recording_properties_window(ui.ctx());
         self.processes_window(ui.ctx());
         self.format_designer_window(ui.ctx());
         self.confirm_quit_stop_window(ui.ctx());
@@ -5724,6 +5732,229 @@ impl StreamArchiverApp {
         }
     }
 
+    /// Properties dialog for a single recording take.
+    /// Opened via right-click → Properties on a history-tree take row.
+    #[allow(deprecated)]
+    fn recording_properties_window(&mut self, ctx: &egui::Context) {
+        let Some(rid) = self.rec_props else {
+            return;
+        };
+        // Pull the recording out of the cache; close if the take was deleted.
+        let Some(rec) = self
+            .rec_cache
+            .values()
+            .flat_map(|v| v.iter())
+            .find(|r| r.id == rid)
+            .cloned()
+        else {
+            self.rec_props = None;
+            return;
+        };
+        let now = crate::models::now_unix();
+        let mut open = true;
+        // Collect inter-frame actions so the closure doesn't borrow `self`.
+        let mut copy_path: Option<String> = None;
+        let mut notes_changed: Option<String> = None;
+        // Snapshot the draft so the TextEdit can borrow it inside the closure.
+        let mut notes_draft = self.rec_props_notes.clone();
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("recording_props_vp"),
+            egui::ViewportBuilder::default()
+                .with_title(format!("Recording properties — take #{rid}"))
+                .with_inner_size([500.0, 540.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        // ── File ──────────────────────────────────────────
+                        ui.strong("File");
+                        egui::Grid::new("rp_file")
+                            .num_columns(2)
+                            .striped(true)
+                            .min_col_width(90.0)
+                            .show(ui, |ui| {
+                                ui.label("Path");
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&rec.output_path).monospace(),
+                                        )
+                                        .truncate(),
+                                    );
+                                    if !rec.output_path.is_empty()
+                                        && ui
+                                            .small_button("📋")
+                                            .on_hover_text("Copy path")
+                                            .clicked()
+                                    {
+                                        copy_path = Some(rec.output_path.clone());
+                                    }
+                                });
+                                ui.end_row();
+                                ui.label("Size");
+                                ui.label(fmt_bytes(rec.bytes));
+                                ui.end_row();
+                                ui.label("Status");
+                                ui.label(&rec.status);
+                                ui.end_row();
+                                if let Some(code) = rec.exit_code {
+                                    ui.label("Exit code");
+                                    ui.label(code.to_string());
+                                    ui.end_row();
+                                }
+                            });
+
+                        ui.add_space(8.0);
+                        // ── Capture timing ────────────────────────────────
+                        ui.strong("Capture");
+                        egui::Grid::new("rp_timing")
+                            .num_columns(2)
+                            .striped(true)
+                            .min_col_width(90.0)
+                            .show(ui, |ui| {
+                                ui.label("Started");
+                                ui.label(fmt_datetime_short(rec.started_at));
+                                ui.end_row();
+                                if let Some(ended) = rec.ended_at {
+                                    ui.label("Ended");
+                                    ui.label(fmt_datetime_short(ended));
+                                    ui.end_row();
+                                }
+                                ui.label("Duration");
+                                ui.label(fmt_duration(rec.duration_secs(now)));
+                                ui.end_row();
+                                if let Some(live) = rec.went_live_at {
+                                    ui.label("Went live");
+                                    let approx =
+                                        if rec.went_live_approx { " (approx)" } else { "" };
+                                    ui.label(format!(
+                                        "{}{}",
+                                        fmt_datetime_short(live),
+                                        approx
+                                    ));
+                                    ui.end_row();
+                                }
+                                if let Some(lost) = rec.lost_secs {
+                                    ui.label("Lost footage");
+                                    ui.label(format!(
+                                        "{} ({})",
+                                        fmt_duration(lost),
+                                        fmt_duration_secs(lost)
+                                    ));
+                                    ui.end_row();
+                                }
+                            });
+
+                        ui.add_space(8.0);
+                        // ── Stream info ───────────────────────────────────
+                        ui.strong("Stream");
+                        egui::Grid::new("rp_stream")
+                            .num_columns(2)
+                            .striped(true)
+                            .min_col_width(90.0)
+                            .show(ui, |ui| {
+                                if !rec.title.is_empty() {
+                                    ui.label("Title");
+                                    ui.add(
+                                        egui::Label::new(&rec.title).wrap_mode(egui::TextWrapMode::Wrap),
+                                    );
+                                    ui.end_row();
+                                }
+                                if !rec.category.is_empty() {
+                                    ui.label("Category");
+                                    ui.label(&rec.category);
+                                    ui.end_row();
+                                }
+                                if rec.ad_count > 0 {
+                                    ui.label("Ad breaks");
+                                    ui.label(format!(
+                                        "{} break(s), {} total",
+                                        rec.ad_count,
+                                        fmt_duration(rec.ad_secs)
+                                    ));
+                                    ui.end_row();
+                                }
+                                if rec.meta_change_count > 0 {
+                                    ui.label("Meta changes");
+                                    ui.label(format!("{} change(s)", rec.meta_change_count));
+                                    ui.end_row();
+                                }
+                                if let Some(sid) = &rec.stream_id {
+                                    ui.label("Stream ID");
+                                    ui.add(
+                                        egui::Label::new(egui::RichText::new(sid).monospace())
+                                            .truncate(),
+                                    );
+                                    ui.end_row();
+                                }
+                                if let Some(tg) = &rec.take_group {
+                                    ui.label("Take group");
+                                    ui.add(
+                                        egui::Label::new(egui::RichText::new(tg).monospace())
+                                            .truncate(),
+                                    );
+                                    ui.end_row();
+                                }
+                            });
+
+                        if !rec.log_excerpt.is_empty() {
+                            ui.add_space(8.0);
+                            ui.strong("Log excerpt");
+                            egui::ScrollArea::vertical()
+                                .id_salt("rp_log")
+                                .max_height(90.0)
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&rec.log_excerpt)
+                                                .monospace()
+                                                .small(),
+                                        )
+                                        .wrap_mode(egui::TextWrapMode::Wrap),
+                                    );
+                                });
+                        }
+
+                        // ── Notes (editable) ──────────────────────────────
+                        ui.add_space(8.0);
+                        ui.strong("Notes");
+                        let resp = ui.add(
+                            egui::TextEdit::multiline(&mut notes_draft)
+                                .hint_text("Add notes for this take…")
+                                .desired_rows(4)
+                                .desired_width(f32::INFINITY),
+                        );
+                        if resp.changed() {
+                            notes_changed = Some(notes_draft.clone());
+                        }
+                    });
+                });
+            },
+        );
+        if !open {
+            self.rec_props = None;
+        }
+        if let Some(path) = copy_path {
+            ctx.copy_text(path);
+        }
+        if let Some(notes) = notes_changed {
+            self.rec_props_notes = notes.clone();
+            // Update in-memory cache so the draft stays in sync if the dialog
+            // is closed and reopened without a full reload.
+            for recs in self.rec_cache.values_mut() {
+                for r in recs.iter_mut() {
+                    if r.id == rid {
+                        r.notes = notes.clone();
+                    }
+                }
+            }
+            let _ = self.core.store.set_recording_notes(rid, &notes);
+        }
+    }
+
     /// Window listing a monitor's upcoming scheduled streams (datetime — title).
     /// Opened by double-clicking a Next stream cell.
     #[allow(deprecated)]
@@ -7232,6 +7463,7 @@ impl StreamArchiverApp {
         let mut open_path: Option<std::path::PathBuf> = None;
         let mut copy_text: Option<String> = None;
         let mut delete_recording: Option<i64> = None;
+        let mut open_recording_props: Option<i64> = None;
         // Container-level actions.
         let mut toggle_channel_enabled: Option<(i64, bool)> = None; // set all instances
         let mut rename_channel: Option<i64> = None;
@@ -8188,6 +8420,11 @@ impl StreamArchiverApp {
                                             ui.close();
                                         }
                                         ui.separator();
+                                        if ui.button("📄  Properties…").clicked() {
+                                            open_recording_props = Some(t.id);
+                                            ui.close();
+                                        }
+                                        ui.separator();
                                         let del_hint = if t.is_active() {
                                             "Stop the recording before removing this take"
                                         } else {
@@ -8351,7 +8588,23 @@ impl StreamArchiverApp {
             if meta_refs_rid {
                 self.meta_popup = None;
             }
+            if self.rec_props == Some(rid) {
+                self.rec_props = None;
+            }
             self.reload_rows();
+        }
+        if let Some(rid) = open_recording_props {
+            // Seed the notes draft from the cached recording (already loaded).
+            if let Some(notes) = self
+                .rec_cache
+                .values()
+                .flat_map(|v| v.iter())
+                .find(|r| r.id == rid)
+                .map(|r| r.notes.clone())
+            {
+                self.rec_props_notes = notes;
+            }
+            self.rec_props = Some(rid);
         }
     }
 
@@ -13367,6 +13620,7 @@ mod tests {
             title: String::new(),
             category: String::new(),
             log_excerpt: String::new(),
+            notes: String::new(),
         }
     }
 

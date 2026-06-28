@@ -1327,6 +1327,8 @@ pub struct Recording {
     pub category: String,
     /// Captured stderr tail (`log_excerpt`) — the failure reason for a failed take.
     pub log_excerpt: String,
+    /// User-entered free-text notes for this take (empty by default).
+    pub notes: String,
 }
 
 impl Recording {
@@ -1543,6 +1545,7 @@ mod tests {
             title: String::new(),
             category: String::new(),
             log_excerpt: String::new(),
+            notes: String::new(),
         }
     }
 

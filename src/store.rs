@@ -18,7 +18,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 28;
+const SCHEMA_VERSION: i64 = 29;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -494,7 +494,14 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 28)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 28);
+        if version < 29 {
+            // Per-take free-text notes, editable in the recording properties dialog.
+            conn.execute_batch(
+                "ALTER TABLE recording ADD COLUMN notes TEXT NOT NULL DEFAULT '';",
+            )?;
+            conn.pragma_update(None, "user_version", 29)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 29);
         Ok(())
     }
 
@@ -1011,6 +1018,13 @@ impl Store {
             "UPDATE recording SET lost_secs=?2 WHERE id=?1",
             params![id, lost_secs],
         )?;
+        Ok(())
+    }
+
+    /// Update the user-authored notes for a recording take.
+    pub fn set_recording_notes(&self, id: i64, notes: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE recording SET notes=?2 WHERE id=?1", params![id, notes])?;
         Ok(())
     }
 
@@ -1668,7 +1682,7 @@ impl Store {
                     COALESCE((SELECT new_value FROM stream_meta_change smc
                               WHERE smc.recording_id = recording.id AND smc.kind = 'category'
                               ORDER BY smc.at_secs DESC, smc.id DESC LIMIT 1), ''),
-                    take_group
+                    take_group, COALESCE(notes, '')
              FROM recording WHERE monitor_id = ?1 ORDER BY started_at, id",
         )?;
         let rows = stmt
@@ -1693,6 +1707,7 @@ impl Store {
                     title: r.get(16)?,
                     category: r.get(17)?,
                     log_excerpt: r.get(15)?,
+                    notes: r.get(19)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1735,6 +1750,7 @@ impl Store {
                     title: String::new(),
                     category: String::new(),
                     log_excerpt: String::new(),
+                    notes: String::new(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
