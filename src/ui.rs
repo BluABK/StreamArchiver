@@ -666,10 +666,9 @@ pub struct StreamArchiverApp {
     /// Play animated emotes (off ⇒ static first frame). Default on. Persisted under
     /// [`K_ANIMATE_EMOTES`].
     animate_emotes: bool,
-    /// Bumping this counter causes the Streams table to forget all user-resized
-    /// column widths and revert to content-fit auto widths. Used by the "Fit
-    /// columns" button.
-    streams_table_gen: u64,
+    /// Set to true by the "⇔ Fit columns" button; consumed in `channels_view`
+    /// to call `TableBuilder::reset()` so columns revert to content-fit widths.
+    reset_streams_columns: bool,
     /// Currently running background tasks (asset fetches, thumbnail downloads).
     background_tasks: Vec<crate::events::BackgroundTask>,
     /// Completed/failed background tasks (task, outcome, finished-at unix), newest
@@ -977,7 +976,7 @@ impl StreamArchiverApp {
             shorten_timestamps,
             render_emotes,
             animate_emotes,
-            streams_table_gen: 0,
+            reset_streams_columns: false,
             background_tasks: Vec::new(),
             finished_tasks: Vec::new(),
             job_toggles,
@@ -4068,7 +4067,7 @@ impl eframe::App for StreamArchiverApp {
                                 .on_hover_text("Auto-fit all columns to their content width")
                                 .clicked()
                             {
-                                self.streams_table_gen += 1;
+                                self.reset_streams_columns = true;
                             }
                         }
                     });
@@ -7891,14 +7890,20 @@ impl StreamArchiverApp {
                     .platform_tex
                     .get_or_insert_with(|| PlatformTextures::load(ui.ctx()))
                     .clone();
+                let reset_cols = std::mem::replace(&mut self.reset_streams_columns, false);
                 let mut tb = TableBuilder::new(ui)
-                    .id_salt(self.streams_table_gen)
+                    .id_salt("streams_table")
                     .striped(true)
                     .resizable(true)
                     // Make rows sense clicks so they can be selected and carry a
                     // right-click context menu.
                     .sense(egui::Sense::click())
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+                if reset_cols {
+                    // Clear persisted column widths so the next load() triggers a
+                    // fresh sizing pass at the columns' initial widths.
+                    tb.reset();
+                }
                 // One column per descriptor — count is guaranteed to match the
                 // header and the per-row cells (all driven by STREAM_COLUMNS). The
                 // Actions column is skipped (here, in the header, and in every
@@ -7907,7 +7912,16 @@ impl StreamArchiverApp {
                     if !show_actions && i == STREAM_ACTIONS_COL {
                         continue;
                     }
-                    let col = if c.initial > 0.0 {
+                    let col = if reset_cols {
+                        // Drive a clean sizing pass: auto_with_initial_suggestion
+                        // seeds the column at min_width (not 0) so cells render
+                        // normally during the pass — no zero-width wrapping, no
+                        // vertical row bounce. After the pass, content widths are
+                        // stored and the next frame snaps to them.
+                        Column::auto_with_initial_suggestion(c.min_width)
+                            .at_least(c.min_width)
+                            .clip(c.initial > 0.0)
+                    } else if c.initial > 0.0 {
                         // Content-capped column (Title / Game): start narrow and
                         // clip — the cell truncates and shows the full text on hover.
                         Column::initial(c.initial).at_least(c.min_width).clip(true)
