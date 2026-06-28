@@ -187,10 +187,24 @@ pub struct DetectContext {
     /// Serializes user-token refresh: Twitch device-code refresh tokens are
     /// one-time-use, so concurrent detection passes must not double-spend one.
     twitch_refresh: Mutex<()>,
-    /// Byte-hash → last OCR result per `(monitor_id, source_id)`. Skips a
-    /// (multi-second, token-spending) re-OCR when the source image is unchanged
-    /// since the previous pass — banners/community images rarely change.
+    /// FNV-1a image hash → last OCR result per `(monitor_id, source_id)`. Skips a
+    /// (multi-second, token-spending) re-OCR when the source image is unchanged.
+    /// Persisted to `app_settings` (K_OCR_IMAGE_HASHES) so cache hits survive restarts.
     ocr_cache: Mutex<HashMap<(i64, String), (u64, Vec<ScheduleSegment>)>>,
+}
+
+/// FNV-1a 64-bit hash — simple, stable, and fast; used instead of `DefaultHasher`
+/// (which is not guaranteed stable across Rust versions) for the persisted OCR
+/// image cache.
+fn fnv64(data: &[u8]) -> u64 {
+    const PRIME: u64 = 1_099_511_628_211;
+    const BASIS: u64 = 14_695_981_039_346_656_037;
+    let mut h = BASIS;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(PRIME);
+    }
+    h
 }
 
 impl DetectContext {
@@ -200,6 +214,31 @@ impl DetectContext {
             .timeout(Duration::from_secs(20))
             .build()
             .expect("building reqwest client");
+
+        // Pre-populate the OCR cache from the persisted hash map so unchanged
+        // images are not re-OCR'd after an app restart. The segments come from
+        // the DB (they were already stored by the previous OCR run).
+        let ocr_cache = {
+            let hashes: HashMap<String, u64> = store
+                .get_setting(crate::models::K_OCR_IMAGE_HASHES)
+                .ok()
+                .flatten()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            let mut map: HashMap<(i64, String), (u64, Vec<ScheduleSegment>)> = HashMap::new();
+            for (key_str, hash) in hashes {
+                if let Some((mid_str, source_id)) = key_str.split_once(':') {
+                    if let Ok(monitor_id) = mid_str.parse::<i64>() {
+                        let segs = store
+                            .schedule_segments_for_source(monitor_id, source_id)
+                            .unwrap_or_default();
+                        map.insert((monitor_id, source_id.to_string()), (hash, segs));
+                    }
+                }
+            }
+            Mutex::new(map)
+        };
+
         DetectContext {
             http,
             store,
@@ -207,7 +246,24 @@ impl DetectContext {
             twitch_token: Mutex::new(None),
             kick_token: Mutex::new(None),
             twitch_refresh: Mutex::new(()),
-            ocr_cache: Mutex::new(HashMap::new()),
+            ocr_cache,
+        }
+    }
+
+    /// Persist the FNV-1a hash for a single `(monitor_id, source_id)` to the
+    /// settings store so the OCR cache survives app restarts.
+    fn persist_ocr_hash(&self, monitor_id: i64, source_id: &str, hash: u64) {
+        let key_str = format!("{monitor_id}:{source_id}");
+        let mut hashes: HashMap<String, u64> = self
+            .store
+            .get_setting(crate::models::K_OCR_IMAGE_HASHES)
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        hashes.insert(key_str, hash);
+        if let Ok(json) = serde_json::to_string(&hashes) {
+            let _ = self.store.set_setting(crate::models::K_OCR_IMAGE_HASHES, &json);
         }
     }
 
@@ -877,12 +933,7 @@ impl DetectContext {
         cfg: &ChannelSourceConfig,
     ) -> Option<Vec<ScheduleSegment>> {
         let bytes = tokio::fs::read(path).await.ok()?;
-        let hash = {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            bytes.hash(&mut h);
-            h.finish()
-        };
+        let hash = fnv64(&bytes);
         let key = (monitor_id, source_id.to_string());
         if let Some((cached, segs)) = self.ocr_cache.lock().await.get(&key) {
             if *cached == hash {
@@ -943,7 +994,9 @@ impl DetectContext {
             .send(crate::events::AppEvent::BackgroundTaskFinished { id: task_id, outcome });
 
         let segs = result.segments?;
-        self.ocr_cache.lock().await.insert(key, (hash, segs.clone()));
+        self.ocr_cache.lock().await.insert(key.clone(), (hash, segs.clone()));
+        // Persist the hash so this cache hit survives an app restart.
+        self.persist_ocr_hash(key.0, &key.1, hash);
         Some(segs)
     }
 

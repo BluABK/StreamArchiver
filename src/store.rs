@@ -1282,6 +1282,39 @@ impl Store {
         Ok(rows)
     }
 
+    /// All non-canceled schedule segments for one `(monitor, source)` pair, sorted
+    /// by start time. Used by the OCR hash cache to reconstruct in-memory segment
+    /// lists from the DB after an app restart, so OCR is not re-run on unchanged
+    /// images.
+    pub fn schedule_segments_for_source(
+        &self,
+        monitor_id: i64,
+        source: &str,
+    ) -> Result<Vec<ScheduleSegment>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, monitor_id, start_time, end_time, title, category, canceled, video_id
+             FROM schedule_segment
+             WHERE monitor_id = ?1 AND source = ?2 AND canceled = 0
+             ORDER BY start_time",
+        )?;
+        let rows = stmt
+            .query_map(params![monitor_id, source], |r| {
+                Ok(ScheduleSegment {
+                    id: r.get(0)?,
+                    monitor_id: r.get(1)?,
+                    start_time: r.get(2)?,
+                    end_time: r.get(3)?,
+                    title: r.get(4)?,
+                    category: r.get(5)?,
+                    canceled: r.get::<_, i64>(6)? != 0,
+                    video_id: r.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// YouTube monitors that have at least one `platform` schedule segment with a
     /// NULL `video_id`. Used by the "Re-fetch missing video IDs" button to target
     /// only the channels that need a scrape pass, not every YouTube monitor.

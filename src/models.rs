@@ -1212,6 +1212,10 @@ pub const K_OCR_TIMEOUT_SECS: &str = "ocr_timeout_secs";
 pub const K_OCR_EFFORT: &str = "ocr_effort";
 /// Cumulative OCR call stats (JSON blob).
 pub const K_OCR_STATS: &str = "ocr_stats";
+/// Persistent OCR image-hash cache: JSON `{"<monitor_id>:<source_id>": <fnv64_hash>}`.
+/// Populated after every successful OCR run so a restart doesn't re-run OCR on
+/// an unchanged banner/community-post image.
+pub const K_OCR_IMAGE_HASHES: &str = "ocr_image_hashes";
 
 /// Cumulative statistics for all `claude` CLI OCR invocations.
 #[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
