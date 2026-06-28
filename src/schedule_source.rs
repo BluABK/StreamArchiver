@@ -165,6 +165,21 @@ impl ScheduleSourceKind {
         !matches!(self, ScheduleSourceKind::Discord)
     }
 
+    /// Whether resolving this source spends OCR work — a download plus a
+    /// multi-second, token-costing CLI call. These are gated to their own slow
+    /// cadence in the refresh walk so a forced UI refresh (which re-runs the
+    /// cheap API/scrape sources immediately) can't re-OCR an image that was
+    /// already processed minutes ago.
+    pub fn is_ocr(self) -> bool {
+        matches!(
+            self,
+            ScheduleSourceKind::TwitchBannerOcr
+                | ScheduleSourceKind::YouTubeCommunityOcr
+                | ScheduleSourceKind::TwitterPinned
+                | ScheduleSourceKind::OtherImageOcr
+        )
+    }
+
     /// Whether this source can produce a schedule for a given monitor — its
     /// platform matches and any required per-channel config is present.
     pub fn applies_to(self, platform: Platform, cfg: &ChannelSourceConfig) -> bool {

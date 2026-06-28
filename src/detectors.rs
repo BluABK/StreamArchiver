@@ -2056,6 +2056,11 @@ pub async fn refresh_schedules(
     const REFRESH_SECS: u64 = 6 * 3600;
 
     let mut last_fetched: HashMap<i64, Instant> = HashMap::new();
+    // Separate, slower cadence for the expensive OCR sources, keyed by
+    // (monitor, source id). A forced UI refresh resets `last_fetched` (so cheap
+    // API/scrape sources re-run at once) but NOT this map, so an image OCR'd in
+    // the last `OCR_MIN_INTERVAL_SECS` is never re-OCR'd on a config save.
+    let mut last_ocr: HashMap<(i64, &'static str), Instant> = HashMap::new();
     let mut discord_last: Option<Instant> = None;
     sleep_cancellable(Duration::from_secs(INITIAL_DELAY_SECS), &shutdown).await;
     loop {
@@ -2068,6 +2073,7 @@ pub async fn refresh_schedules(
                 &events,
                 &shutdown,
                 &mut last_fetched,
+                &mut last_ocr,
                 &mut discord_last,
                 &yt_video_id_refetch,
                 REFRESH_SECS,
@@ -2084,8 +2090,8 @@ pub async fn refresh_schedules(
                     return;
                 }
                 refresh_schedules_once(
-                    &ctx, &events, &shutdown, &mut last_fetched, &mut discord_last,
-                    &yt_video_id_refetch, 0,
+                    &ctx, &events, &shutdown, &mut last_fetched, &mut last_ocr,
+                    &mut discord_last, &yt_video_id_refetch, 0,
                 )
                 .await;
             }
@@ -2150,6 +2156,7 @@ async fn refresh_schedules_once(
     events: &EventTx,
     shutdown: &Arc<AtomicBool>,
     last_fetched: &mut HashMap<i64, Instant>,
+    last_ocr: &mut HashMap<(i64, &'static str), Instant>,
     discord_last: &mut Option<Instant>,
     yt_video_id_refetch: &Arc<AtomicBool>,
     refresh_secs: u64,
@@ -2161,6 +2168,7 @@ async fn refresh_schedules_once(
     // Drop staleness entries for monitors that no longer exist.
     let live: std::collections::HashSet<i64> = rows.iter().map(|r| r.monitor.id).collect();
     last_fetched.retain(|id, _| live.contains(id));
+    last_ocr.retain(|k, _| live.contains(&k.0));
     let now = Instant::now();
 
     // If the UI requested a targeted re-scrape for YouTube monitors whose stored
@@ -2196,6 +2204,10 @@ async fn refresh_schedules_once(
     // On a pure transient failure, retry sooner than the full interval (but not
     // every 60s tick — that would hammer the source).
     const TRANSIENT_RETRY_SECS: u64 = 300;
+    // Expensive OCR sources re-resolve at most this often per (monitor, source),
+    // independent of `refresh_secs` — so a forced UI refresh re-runs the cheap
+    // sources at once but never re-OCRs an image processed this recently.
+    const OCR_MIN_INTERVAL_SECS: u64 = 6 * 3600;
 
     for row in &rows {
         if shutdown.load(Ordering::SeqCst) {
@@ -2236,13 +2248,47 @@ async fn refresh_schedules_once(
             if !kind.applies_to(platform, &cfg) {
                 continue;
             }
-            let key = (kind.id(), row.monitor.url.clone());
-            let segs_opt = match fetched.get(&key) {
-                Some(s) => s.clone(),
-                None => {
-                    let s = ctx.resolve_source(kind, row, &cfg).await;
-                    fetched.insert(key, s.clone());
-                    s
+
+            // Expensive OCR sources resolve at most once per OCR_MIN_INTERVAL_SECS
+            // per (monitor, source), tracked separately from `last_fetched`. Within
+            // that window we reuse the rows the source last stored (no download, no
+            // claude call) so it still wins / donates titles exactly as before;
+            // outside it we re-OCR. This stops a forced UI refresh (refresh_secs ==
+            // 0, fired on every config save) from re-OCR'ing already-processed
+            // images. `None` = not an OCR source; `Some(true/false)` = OCR due/not.
+            let ocr_due = kind.is_ocr().then(|| {
+                let okey = (row.monitor.id, kind.id());
+                let due = last_ocr
+                    .get(&okey)
+                    .map(|t| now.duration_since(*t).as_secs() >= OCR_MIN_INTERVAL_SECS)
+                    .unwrap_or(true);
+                if due {
+                    last_ocr.insert(okey, now);
+                }
+                due
+            });
+
+            let segs_opt = if ocr_due == Some(false) {
+                // Within the cadence window: reuse the rows this source stored last
+                // run. Empty → skip entirely (an empty cache must not pose as an
+                // authoritative "nothing scheduled" and clear a real winner).
+                let cached = ctx
+                    .store
+                    .schedule_segments_for_source(row.monitor.id, kind.id())
+                    .unwrap_or_default();
+                if cached.is_empty() {
+                    continue;
+                }
+                Some(cached)
+            } else {
+                let key = (kind.id(), row.monitor.url.clone());
+                match fetched.get(&key) {
+                    Some(s) => s.clone(),
+                    None => {
+                        let s = ctx.resolve_source(kind, row, &cfg).await;
+                        fetched.insert(key, s.clone());
+                        s
+                    }
                 }
             };
             let Some(segs) = segs_opt else { continue };
@@ -2616,15 +2662,36 @@ fn community_images(v: &Value, out: &mut Vec<String>) {
     }
 }
 
-/// The largest (last) thumbnail URL from an `image.thumbnails[]` node.
+/// The largest (last) thumbnail URL from an `image.thumbnails[]` node,
+/// [normalized][normalize_yt_image_url] to a stable size so the same logical
+/// image yields a byte-identical fetch every pass.
 fn largest_thumbnail(image: Option<&Value>) -> Option<String> {
-    image?
+    let url = image?
         .get("thumbnails")?
         .as_array()?
         .last()?
         .get("url")?
-        .as_str()
-        .map(str::to_string)
+        .as_str()?;
+    Some(normalize_yt_image_url(url))
+}
+
+/// Normalize a Google image-CDN URL (`yt3.ggpht.com`, `*.googleusercontent.com`)
+/// to a stable identity: strip the volatile resize/crop directive (`=s512-c-…`,
+/// `=w640-h480-…`) that drifts between fetches as YouTube reshuffles the size
+/// ladder, then request one fixed canonical size. This keeps both the
+/// community-pass URL hash and the downloaded bytes identical for an unchanged
+/// post, so an already-OCR'd image reliably hits the cache instead of churning
+/// into a fresh `claude` call. Non-Google URLs are returned unchanged.
+fn normalize_yt_image_url(url: &str) -> String {
+    if !(url.contains("ggpht.com") || url.contains("googleusercontent.com")) {
+        return url.to_string();
+    }
+    // The resize directive lives in the final path segment, after a `=`. Cut at
+    // the first `=` (Google CDN paths carry no query string) and pin one size.
+    match url.split_once('=') {
+        Some((base, _)) => format!("{base}=s1024"),
+        None => url.to_string(),
+    }
 }
 
 /// First `pbs.twimg.com/media/…` image URL in a Twitter syndication response,
@@ -3139,6 +3206,25 @@ mod tests {
     fn parse_kick_slug() {
         assert_eq!(kick_slug("https://kick.com/Bar/").as_deref(), Some("Bar"));
         assert_eq!(kick_slug("https://kick.com/").as_deref(), None);
+    }
+
+    #[test]
+    fn normalize_yt_image_url_stabilizes_size_ladder() {
+        // Two size variants of the same community image collapse to one stable
+        // identity, so the combined-URL hash and the downloaded bytes no longer
+        // churn between passes (the cause of spurious community re-OCR).
+        let a = "https://yt3.ggpht.com/ABC123=s512-c-fcrop64=1,00000000ffffffff-rj";
+        let b = "https://yt3.ggpht.com/ABC123=s1080-c-k-no";
+        assert_eq!(normalize_yt_image_url(a), normalize_yt_image_url(b));
+        assert_eq!(normalize_yt_image_url(a), "https://yt3.ggpht.com/ABC123=s1024");
+        // googleusercontent host is handled too.
+        assert_eq!(
+            normalize_yt_image_url("https://lh3.googleusercontent.com/XYZ=s256"),
+            "https://lh3.googleusercontent.com/XYZ=s1024"
+        );
+        // Non-Google URLs pass through untouched.
+        let other = "https://example.com/banner.png";
+        assert_eq!(normalize_yt_image_url(other), other);
     }
 
     #[test]
