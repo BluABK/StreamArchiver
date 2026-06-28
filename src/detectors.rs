@@ -3148,7 +3148,7 @@ fn yt_render_title(v: Option<&Value>) -> String {
 /// attribute's stray `=`, or `marker = null` — instead of latching onto the next
 /// brace anywhere on the page. Walks every occurrence, returning the first that
 /// is a valid assignment whose object parses.
-fn extract_json_after(body: &str, marker: &str) -> Option<Value> {
+pub(crate) fn extract_json_after(body: &str, marker: &str) -> Option<Value> {
     use serde::Deserialize;
     let bytes = body.as_bytes();
     let mut start = 0;

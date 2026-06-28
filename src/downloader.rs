@@ -1165,26 +1165,24 @@ impl Supervisor {
                         .ok()
                         .flatten()
                         .unwrap_or_default();
-                    if api_key.is_empty() {
-                        TaskOutcome::Failed("no YouTube API key set".into())
+                    // Only resolve the UC channel ID when we have an API key to use it;
+                    // the page-banner scrape only needs the channel URL.
+                    let uc = if !known_bid.is_empty() {
+                        Some(known_bid)
+                    } else if !api_key.is_empty() {
+                        crate::websub::resolve_channel_uc(&http, &url).await
                     } else {
-                        let uc = if !known_bid.is_empty() {
-                            Some(known_bid)
-                        } else {
-                            crate::websub::resolve_channel_uc(&http, &url).await
-                        };
-                        match uc {
-                            Some(uc)
-                                if crate::assets::run_youtube_assets(
-                                    &http, &api_key, &uc, &asset_dir,
-                                )
-                                .await =>
-                            {
-                                TaskOutcome::Completed
-                            }
-                            Some(_) => TaskOutcome::Failed("channel asset fetch failed".into()),
-                            None => TaskOutcome::Failed("could not resolve channel id".into()),
-                        }
+                        None
+                    };
+                    let channel_id = uc.as_deref().unwrap_or("");
+                    if crate::assets::run_youtube_assets(
+                        &http, &api_key, channel_id, &url, &asset_dir,
+                    )
+                    .await
+                    {
+                        TaskOutcome::Completed
+                    } else {
+                        TaskOutcome::Failed("YouTube channel asset fetch failed".into())
                     }
                 }
                 Platform::Kick => {

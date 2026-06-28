@@ -917,23 +917,114 @@ async fn fetch_twitch_name_color(
     Ok(())
 }
 
-/// Run YouTube channel asset fetches (icon, banner). Stamps only on success.
+/// Extract the channel banner URL from a parsed `ytInitialData` blob, trying the
+/// newer `pageHeaderRenderer` path first, then the classic `c4TabbedHeaderRenderer`
+/// path. Returns `None` when no banner is found (channel has no art set).
+fn youtube_banner_from_page_data(data: &serde_json::Value) -> Option<String> {
+    // New format (2024+): pageHeaderRenderer → imageBannerViewModel
+    if let Some(sources) = data["header"]["pageHeaderRenderer"]["banner"]
+        ["imageBannerViewModel"]["image"]["sources"]
+        .as_array()
+    {
+        if let Some(url) = sources.last().and_then(|s| s["url"].as_str()) {
+            return Some(normalize_yt_banner_url(url));
+        }
+    }
+    // Legacy format: c4TabbedHeaderRenderer → banner → thumbnails
+    if let Some(thumbs) = data["header"]["c4TabbedHeaderRenderer"]["banner"]["thumbnails"]
+        .as_array()
+    {
+        if let Some(url) = thumbs.last().and_then(|t| t["url"].as_str()) {
+            return Some(normalize_yt_banner_url(url));
+        }
+    }
+    None
+}
+
+/// Request the widest available crop of a YouTube banner URL. YouTube banner URLs
+/// on googleusercontent.com carry a `=w<N>-fcrop64=…` suffix; stripping it and
+/// appending `=w2560` gives the full-width version (2560 px, the maximum YouTube
+/// serves). Non-Google URLs are returned unchanged.
+fn normalize_yt_banner_url(url: &str) -> String {
+    if url.contains("googleusercontent.com") || url.contains("ggpht.com") {
+        if let Some((base, _)) = url.split_once('=') {
+            return format!("{base}=w2560");
+        }
+    }
+    url.to_string()
+}
+
+/// Fetch the YouTube channel page and download the page-header banner from
+/// `ytInitialData`. Works without a YouTube API key — just scrapes the channel
+/// home page. Saves as `banner.<ext>` in `asset_dir/` with history preservation.
+async fn fetch_youtube_page_banner(
+    client: &Client,
+    channel_url: &str,
+    asset_dir: &Path,
+) -> Result<()> {
+    let base = {
+        let t = channel_url.trim().trim_end_matches('/');
+        t.strip_suffix("/live")
+            .or_else(|| t.strip_suffix("/streams"))
+            .or_else(|| t.strip_suffix("/community"))
+            .unwrap_or(t)
+            .to_string()
+    };
+    let resp = client
+        .get(&base)
+        .query(&[("hl", "en"), ("gl", "US")])
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .header("Cookie", "CONSENT=YES+1; SOCS=CAI")
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        bail!("YouTube channel page: {}", resp.status());
+    }
+    let body = resp.text().await?;
+    let data = crate::detectors::extract_json_after(&body, "ytInitialData")
+        .ok_or_else(|| anyhow::anyhow!("ytInitialData not found"))?;
+    let banner_url = youtube_banner_from_page_data(&data)
+        .ok_or_else(|| anyhow::anyhow!("no banner found in ytInitialData"))?;
+    let ext = ext_from_url(&banner_url).unwrap_or("jpg");
+    tokio::fs::create_dir_all(asset_dir).await?;
+    download_image_archival(client, &banner_url, asset_dir, "banner", ext).await
+}
+
+/// Run YouTube channel asset fetches. Tries two approaches:
+/// 1. YouTube Data API (icon + banner + branding) when `api_key` and `channel_id`
+///    are both non-empty.
+/// 2. Page-scrape banner (fetches the channel home page, extracts the wide
+///    page-header banner from `ytInitialData`) — works without an API key, runs
+///    alongside or instead of the API fetch.
+/// The 24 h stamp is written only when at least one approach succeeds.
 pub async fn run_youtube_assets(
     client: &Client,
     api_key: &str,
     channel_id: &str,
+    channel_url: &str,
     asset_dir: &Path,
 ) -> bool {
-    match fetch_youtube_channel_assets(client, api_key, channel_id, asset_dir).await {
-        Ok(()) => {
-            write_fetched_stamp(asset_dir);
-            true
-        }
-        Err(e) => {
-            warn!("YouTube channel assets ({channel_id}): {e}");
-            false
+    let mut any_ok = false;
+
+    if !api_key.is_empty() && !channel_id.is_empty() {
+        match fetch_youtube_channel_assets(client, api_key, channel_id, asset_dir).await {
+            Ok(()) => any_ok = true,
+            Err(e) => warn!("YouTube channel assets ({channel_id}): {e}"),
         }
     }
+
+    if !channel_url.is_empty() {
+        match fetch_youtube_page_banner(client, channel_url, asset_dir).await {
+            Ok(()) => any_ok = true,
+            Err(e) if !any_ok => warn!("YouTube page banner ({channel_url}): {e}"),
+            Err(_) => {}
+        }
+    }
+
+    if any_ok {
+        write_fetched_stamp(asset_dir);
+    }
+    any_ok
 }
 
 /// Run Kick channel asset fetches (icon, banner). Stamps only on success.
