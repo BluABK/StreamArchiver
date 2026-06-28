@@ -12,9 +12,9 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::models::{
-    AdBreak, AuthKind, Channel, Container, DetachedKind, DetachedRow, DetectionMethod, Monitor,
-    MonitorWithChannel, Platform, ScheduleSegment, StreamMetaChange, Tool, UpcomingStream, Video,
-    now_unix,
+    AdBreak, AuthKind, Channel, Container, DetachedKind, DetachedRow, DetectionMethod, GlobalStats,
+    Monitor, MonitorWithChannel, Platform, ScheduleSegment, StreamMetaChange, Tool, UpcomingStream,
+    Video, now_unix,
 };
 
 /// Latest schema version understood by this build.
@@ -475,6 +475,33 @@ impl Store {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    /// Aggregate counts and byte totals across the whole database for the Stats view.
+    pub fn global_stats(&self) -> Result<GlobalStats> {
+        let conn = self.conn.lock().unwrap();
+        let now = now_unix();
+        let r = conn.query_row(
+            "SELECT
+               (SELECT COUNT(*) FROM recording)                                            AS total_recordings,
+               (SELECT COALESCE(SUM(bytes), 0) FROM recording)                            AS total_bytes,
+               (SELECT COUNT(*) FROM monitor)                                              AS total_monitors,
+               (SELECT COUNT(*) FROM monitor WHERE active = 1)                             AS active_monitors,
+               (SELECT COUNT(*) FROM channel)                                              AS total_channels,
+               (SELECT COUNT(*) FROM schedule_segment WHERE canceled = 0 AND start_time > ?1) AS upcoming_segments",
+            params![now],
+            |r| {
+                Ok(GlobalStats {
+                    total_recordings: r.get(0)?,
+                    total_bytes:      r.get(1)?,
+                    total_monitors:   r.get(2)?,
+                    active_monitors:  r.get(3)?,
+                    total_channels:   r.get(4)?,
+                    upcoming_segments: r.get(5)?,
+                })
+            },
+        )?;
+        Ok(r)
     }
 
     /// Whether a periodic background job (see `events::TOGGLEABLE_JOBS`) is enabled.

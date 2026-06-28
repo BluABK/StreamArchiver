@@ -44,7 +44,7 @@ use models::Platform;
 use store::Store;
 
 fn main() -> Result<()> {
-    init_tracing();
+    let _tracing_guard = init_tracing();
 
     // Diagnostics that run and exit (also handy for scripting/headless use).
     let args: Vec<String> = std::env::args().collect();
@@ -549,12 +549,57 @@ fn run_recordings() -> Result<()> {
     Ok(())
 }
 
-fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
+/// Initialise tracing: stderr at the env-filter level **and** a daily-rotating
+/// log file under `data_dir()/logs/streamarchiver.YYYY-MM-DD.log` (kept for 7
+/// days via `tracing_appender::rolling::daily`; older files are not auto-pruned
+/// by the crate, so we prune on startup).
+///
+/// Returns the worker-thread guard — drop it only when the process is about to
+/// exit, otherwise buffered log lines may be lost.
+fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
+    use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,streamarchiver=debug"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
+
+    // ── rotating file layer ───────────────────────────────────────────────────
+    let log_dir = crate::app_paths::logs_dir();
+    prune_old_logs(&log_dir, 7);
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "streamarchiver.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
         .with_target(false)
+        .with_writer(non_blocking);
+
+    // ── stderr layer ─────────────────────────────────────────────────────────
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_writer(std::io::stderr);
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(file_layer)
+        .with(stderr_layer)
         .init();
+
+    guard
+}
+
+/// Delete log files older than `keep_days` days from `dir`.
+fn prune_old_logs(dir: &std::path::Path, keep_days: u64) {
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(keep_days * 86_400))
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().map(|e| e == "log").unwrap_or(false) {
+            if let Ok(meta) = std::fs::metadata(&path) {
+                if meta.modified().map(|m| m < cutoff).unwrap_or(false) {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
 }

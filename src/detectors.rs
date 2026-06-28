@@ -30,7 +30,7 @@ use crate::models::{
     K_DISCORD_SCHEDULE, K_DISCORD_TOKEN, K_YT_API_DETECT, K_YT_API_SCHEDULE, MonitorWithChannel,
     Platform, ScheduleSegment, now_unix,
 };
-use crate::schedule_ocr::{ocr_opts_from_settings, ocr_schedule_image};
+use crate::schedule_ocr::{accumulate_ocr_stats, ocr_opts_from_settings, ocr_schedule_image, record_ocr_cache_hit};
 use crate::schedule_source::{
     ChannelSourceConfig, ScheduleSourceKind, SourceEntry, load_channel_cfg, load_source_order,
 };
@@ -884,11 +884,18 @@ impl DetectContext {
         if let Some((cached, segs)) = self.ocr_cache.lock().await.get(&key) {
             if *cached == hash {
                 debug!("OCR cache hit (monitor {monitor_id}, source {source_id})");
+                record_ocr_cache_hit(self.store.as_ref());
                 return Some(segs.clone());
             }
         }
         let opts = ocr_opts_from_settings(self.store.as_ref(), cfg);
-        let segs = ocr_schedule_image(path, &opts).await?;
+        info!(
+            "OCR: scheduling claude call (monitor {monitor_id}, source {source_id}, image {})",
+            path.display()
+        );
+        let result = ocr_schedule_image(path, &opts).await;
+        accumulate_ocr_stats(self.store.as_ref(), &result);
+        let segs = result.segments?;
         self.ocr_cache.lock().await.insert(key, (hash, segs.clone()));
         Some(segs)
     }

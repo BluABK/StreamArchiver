@@ -1204,6 +1204,54 @@ pub const K_OCR_MODEL: &str = "ocr_model";
 pub const K_OCR_FALLBACK_MODEL: &str = "ocr_fallback_model";
 pub const K_OCR_TIMEZONE: &str = "ocr_timezone";
 pub const K_OCR_OFFSET: &str = "ocr_offset";
+/// Per-call USD budget ceiling passed as `--max-budget-usd` (empty = no limit).
+pub const K_OCR_MAX_BUDGET: &str = "ocr_max_budget_usd";
+/// Process timeout in seconds for one `claude` CLI invocation (empty/0 = default 150).
+pub const K_OCR_TIMEOUT_SECS: &str = "ocr_timeout_secs";
+/// Effort level passed as `--effort` (empty = omit flag; valid: low/medium/high/xhigh/max).
+pub const K_OCR_EFFORT: &str = "ocr_effort";
+/// Cumulative OCR call stats (JSON blob).
+pub const K_OCR_STATS: &str = "ocr_stats";
+
+/// Cumulative statistics for all `claude` CLI OCR invocations.
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OcrStats {
+    /// Successful CLI calls (got a result back, regardless of parse outcome).
+    pub calls: u64,
+    /// Times the CLI itself failed (bad exit, timeout, spawn error).
+    pub cli_failures: u64,
+    /// Times the CLI succeeded but the output couldn't be parsed as schedule JSON.
+    pub parse_failures: u64,
+    /// OCR skipped because the source image was byte-identical to the last run.
+    pub cache_hits: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cost_usd: f64,
+    /// Unix timestamp of the most recent CLI call.
+    pub last_call_at: Option<i64>,
+    pub by_model: std::collections::HashMap<String, OcrModelStats>,
+}
+
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OcrModelStats {
+    pub calls: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd: f64,
+}
+
+/// Aggregate counts/sizes across the whole DB — populated on demand for the Stats view.
+#[derive(Default, Clone)]
+pub struct GlobalStats {
+    pub total_recordings: i64,
+    pub total_bytes: i64,
+    pub active_monitors: i64,
+    pub total_monitors: i64,
+    pub upcoming_segments: i64,
+    pub total_channels: i64,
+}
 
 /// Current unix timestamp in seconds.
 pub fn now_unix() -> i64 {

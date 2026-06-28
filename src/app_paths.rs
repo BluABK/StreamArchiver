@@ -49,3 +49,10 @@ pub fn platform_assets_dir() -> PathBuf {
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
+
+/// Directory for rotating log files, e.g. `%APPDATA%\StreamArchiver\data\logs\`.
+pub fn logs_dir() -> PathBuf {
+    let dir = data_dir().join("logs");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}

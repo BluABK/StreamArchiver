@@ -20,12 +20,13 @@ use tray_icon::TrayIcon;
 use crate::app_core::AppCore;
 use crate::events::{ManualCommand, UiCommand};
 use crate::models::{
-    AdBreak, AuthKind, Channel, Container, DetectionMethod, DownloadDefaults, K_DISCORD_SCHEDULE,
-    K_DISCORD_TOKEN, K_FILENAME_MEDIA, K_MONITOR_DEFAULTS, K_OCR_COMMAND, K_OCR_FALLBACK_MODEL,
-    K_OCR_MODEL, K_OCR_OFFSET, K_OCR_TIMEZONE, K_YT_API_DETECT, K_YT_API_SCHEDULE,
-    MediaInfoMode, Monitor, MonitorDefaults, MonitorWithChannel, Platform,
-    Recording, ScheduleSegment, StreamGroup, StreamMetaChange, Tool, UpcomingStream, Video,
-    group_recordings, now_unix,
+    AdBreak, AuthKind, Channel, Container, DetectionMethod, DownloadDefaults, GlobalStats,
+    K_DISCORD_SCHEDULE, K_DISCORD_TOKEN, K_FILENAME_MEDIA, K_MONITOR_DEFAULTS, K_OCR_COMMAND,
+    K_OCR_EFFORT, K_OCR_FALLBACK_MODEL, K_OCR_MAX_BUDGET, K_OCR_MODEL, K_OCR_OFFSET,
+    K_OCR_STATS, K_OCR_TIMEOUT_SECS, K_OCR_TIMEZONE,
+    K_YT_API_DETECT, K_YT_API_SCHEDULE, MediaInfoMode, Monitor, MonitorDefaults,
+    MonitorWithChannel, OcrStats, Platform, Recording, ScheduleSegment, StreamGroup,
+    StreamMetaChange, Tool, UpcomingStream, Video, group_recordings, now_unix,
 };
 use crate::google_oauth;
 use crate::imports::{self, ImportCandidate};
@@ -95,6 +96,7 @@ enum View {
     Schedule,
     Background,
     Settings,
+    Stats,
     Debug,
 }
 
@@ -405,6 +407,12 @@ struct SettingsForm {
     ocr_fallback_model: String,
     ocr_timezone: String,
     ocr_offset: String,
+    /// Per-call USD budget cap passed as `--max-budget-usd` (empty = no cap).
+    ocr_max_budget: String,
+    /// Process timeout in seconds (empty/0 = default 150 s).
+    ocr_timeout_secs: String,
+    /// Effort level passed as `--effort` (empty = omit; low/medium/high/xhigh/max).
+    ocr_effort: String,
 }
 
 /// Background load state of an import fetch (followed/subscriptions).
@@ -636,6 +644,8 @@ pub struct StreamArchiverApp {
     format_designer: Option<FormatDesignerState>,
     /// Pending "Stop recordings & quit" confirmation (triggered by the tray item).
     confirm_quit_stop: bool,
+    /// Cached (ocr_stats, global_stats) for the Stats view; None = not yet loaded.
+    stats_snapshot: Option<(OcrStats, GlobalStats)>,
 }
 
 impl StreamArchiverApp {
@@ -755,6 +765,9 @@ impl StreamArchiverApp {
             ocr_fallback_model: setting_or_empty(&core, K_OCR_FALLBACK_MODEL),
             ocr_timezone: setting_or_empty(&core, K_OCR_TIMEZONE),
             ocr_offset: setting_or_empty(&core, K_OCR_OFFSET),
+            ocr_max_budget: setting_or_empty(&core, K_OCR_MAX_BUDGET),
+            ocr_timeout_secs: setting_or_empty(&core, K_OCR_TIMEOUT_SECS),
+            ocr_effort: setting_or_empty(&core, K_OCR_EFFORT),
         };
         // Apply the loaded date format before the first render.
         set_active_date_fmt(settings.date_fmt);
@@ -903,6 +916,7 @@ impl StreamArchiverApp {
             debug_monitor_idx: 0,
             debug_test_title: "Test Stream Title".into(),
             debug_test_game: "Just Chatting".into(),
+            stats_snapshot: None,
         };
         app.reload_rows();
         app.reload_videos();
@@ -1193,6 +1207,9 @@ impl StreamArchiverApp {
             (K_OCR_FALLBACK_MODEL, s.ocr_fallback_model.trim()),
             (K_OCR_TIMEZONE, s.ocr_timezone.trim()),
             (K_OCR_OFFSET, s.ocr_offset.trim()),
+            (K_OCR_MAX_BUDGET, s.ocr_max_budget.trim()),
+            (K_OCR_TIMEOUT_SECS, s.ocr_timeout_secs.trim()),
+            (K_OCR_EFFORT, s.ocr_effort.trim()),
         ];
         for (k, v) in pairs {
             if let Err(e) = self.core.store.set_setting(k, v) {
@@ -3583,6 +3600,9 @@ impl eframe::App for StreamArchiverApp {
                     ui.selectable_value(&mut self.view, View::Schedule, "Schedule");
                     ui.selectable_value(&mut self.view, View::Background, "Background");
                     ui.selectable_value(&mut self.view, View::Settings, "Settings");
+                    if ui.selectable_value(&mut self.view, View::Stats, "Stats").clicked() {
+                        self.stats_snapshot = None; // force reload on tab open
+                    }
                     if cfg!(debug_assertions) {
                         ui.selectable_value(&mut self.view, View::Debug, "Debug");
                     }
@@ -3659,6 +3679,7 @@ impl eframe::App for StreamArchiverApp {
             View::Schedule => self.schedule_view(ui),
             View::Background => self.background_view(ui),
             View::Settings => self.settings_view(ui),
+            View::Stats => self.stats_view(ui),
             View::Debug => self.debug_view(ui),
         });
 
@@ -3699,7 +3720,7 @@ impl eframe::App for StreamArchiverApp {
                         ui.close();
                     }
                 }
-                View::Videos | View::Debug => {}
+                View::Videos | View::Stats | View::Debug => {}
             }
         });
         if ctx_add_stream {
@@ -8769,6 +8790,55 @@ impl StreamArchiverApp {
                          the machine's current local offset.",
                     );
                     ui.end_row();
+                    ui.label("Max budget (USD/call)");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.ocr_max_budget)
+                            .hint_text("(no limit)")
+                            .desired_width(120.0),
+                    )
+                    .on_hover_text(
+                        "Hard cost cap per claude CLI call via --max-budget-usd (e.g. 0.05). \
+                         The call is aborted and counted as a failure if the budget is hit. \
+                         Leave empty for no cap.",
+                    );
+                    ui.end_row();
+                    ui.label("Timeout (seconds)");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.ocr_timeout_secs)
+                            .hint_text("150")
+                            .desired_width(80.0),
+                    )
+                    .on_hover_text(
+                        "Maximum seconds to wait for one claude CLI call before killing it and \
+                         counting it as a failure. Default: 150 s.",
+                    );
+                    ui.end_row();
+                    ui.label("Effort level");
+                    egui::ComboBox::from_id_salt("ocr_effort_combo")
+                        .selected_text(if self.settings.ocr_effort.is_empty() {
+                            "default"
+                        } else {
+                            &self.settings.ocr_effort
+                        })
+                        .width(120.0)
+                        .show_ui(ui, |ui| {
+                            for level in &["", "low", "medium", "high", "xhigh", "max"] {
+                                let label = if level.is_empty() { "default" } else { level };
+                                ui.selectable_value(
+                                    &mut self.settings.ocr_effort,
+                                    level.to_string(),
+                                    label,
+                                );
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "Effort level passed as --effort to the claude CLI. Lower effort = \
+                             fewer tokens and lower cost, but may miss details. 'default' omits \
+                             the flag entirely (claude chooses). 'low' is recommended for simple \
+                             banner OCR.",
+                        );
+                    ui.end_row();
                 });
 
             ui.add_space(12.0);
@@ -9522,6 +9592,196 @@ impl StreamArchiverApp {
             if ui.button("💾 Save settings").clicked() {
                 self.save_settings();
             }
+        });
+    }
+
+    fn stats_view(&mut self, ui: &mut egui::Ui) {
+        use crate::schedule_ocr::load_ocr_stats;
+
+        // Load on first render of this tab; also re-loadable via the Refresh button.
+        if self.stats_snapshot.is_none() {
+            let ocr = load_ocr_stats(self.core.store.as_ref());
+            let global = self.core.store.global_stats().unwrap_or_default();
+            self.stats_snapshot = Some((ocr, global));
+        }
+        let (ocr, global) = match self.stats_snapshot.clone() {
+            Some(s) => s,
+            None => (OcrStats::default(), GlobalStats::default()),
+        };
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.add_space(8.0);
+
+            // ── Claude OCR ───────────────────────────────────────────────────
+            ui.horizontal(|ui| {
+                ui.heading("Claude OCR");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("⟳  Refresh").clicked() {
+                        self.stats_snapshot = None;
+                    }
+                    if ui.button("🗑  Reset").on_hover_text("Clear all accumulated OCR stats").clicked() {
+                        let _ = self.core.store.set_setting(K_OCR_STATS, "{}");
+                        self.stats_snapshot = None;
+                    }
+                });
+            });
+            ui.separator();
+
+            egui::Grid::new("ocr_stats_grid")
+                .num_columns(4)
+                .spacing([32.0, 6.0])
+                .show(ui, |ui| {
+                    let total_calls = ocr.calls + ocr.cli_failures + ocr.parse_failures;
+
+                    ui.label("Total invocations");
+                    ui.strong(format!("{total_calls}"));
+                    ui.label("Cache hits (skipped)");
+                    ui.strong(format!("{}", ocr.cache_hits));
+                    ui.end_row();
+
+                    ui.label("Successful calls");
+                    ui.strong(format!("{}", ocr.calls));
+                    ui.label("CLI failures");
+                    ui.strong(format!("{}", ocr.cli_failures));
+                    ui.end_row();
+
+                    ui.label("Parse failures");
+                    ui.strong(format!("{}", ocr.parse_failures));
+                    ui.label("Last call");
+                    ui.strong(match ocr.last_call_at {
+                        Some(t) => {
+                            use chrono::{Local, TimeZone};
+                            Local.timestamp_opt(t, 0)
+                                .single()
+                                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                                .unwrap_or_else(|| "—".into())
+                        }
+                        None => "Never".into(),
+                    });
+                    ui.end_row();
+                });
+
+            ui.add_space(8.0);
+
+            // Token / cost row
+            egui::Grid::new("ocr_token_grid")
+                .num_columns(4)
+                .spacing([32.0, 6.0])
+                .show(ui, |ui| {
+                    let fmt_n = |n: u64| -> String {
+                        // simple thousands-separator formatting
+                        let s = n.to_string();
+                        let mut out = String::new();
+                        for (i, c) in s.chars().rev().enumerate() {
+                            if i > 0 && i % 3 == 0 { out.push(','); }
+                            out.push(c);
+                        }
+                        out.chars().rev().collect()
+                    };
+
+                    ui.label("Input tokens");
+                    ui.strong(fmt_n(ocr.input_tokens));
+                    ui.label("Output tokens");
+                    ui.strong(fmt_n(ocr.output_tokens));
+                    ui.end_row();
+
+                    ui.label("Cache-read tokens");
+                    ui.strong(fmt_n(ocr.cache_read_tokens));
+                    ui.label("Cache-create tokens");
+                    ui.strong(fmt_n(ocr.cache_creation_tokens));
+                    ui.end_row();
+
+                    ui.label("Total cost");
+                    ui.strong(format!("${:.4}", ocr.cost_usd));
+                    ui.label("");
+                    ui.label("");
+                    ui.end_row();
+                });
+
+            // Per-model breakdown table
+            if !ocr.by_model.is_empty() {
+                ui.add_space(10.0);
+                ui.label("Per model:");
+                ui.add_space(4.0);
+
+                let mut models: Vec<_> = ocr.by_model.iter().collect();
+                models.sort_by(|a, b| b.1.calls.cmp(&a.1.calls));
+
+                egui::Grid::new("ocr_model_grid")
+                    .num_columns(5)
+                    .spacing([24.0, 4.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("Model");
+                        ui.strong("Calls");
+                        ui.strong("Input tok");
+                        ui.strong("Output tok");
+                        ui.strong("Cost");
+                        ui.end_row();
+
+                        let fmt_n = |n: u64| -> String {
+                            let s = n.to_string();
+                            let mut out = String::new();
+                            for (i, c) in s.chars().rev().enumerate() {
+                                if i > 0 && i % 3 == 0 { out.push(','); }
+                                out.push(c);
+                            }
+                            out.chars().rev().collect()
+                        };
+
+                        for (model, m) in &models {
+                            ui.label(model.as_str());
+                            ui.label(m.calls.to_string());
+                            ui.label(fmt_n(m.input_tokens));
+                            ui.label(fmt_n(m.output_tokens));
+                            ui.label(format!("${:.4}", m.cost_usd));
+                            ui.end_row();
+                        }
+                    });
+            }
+
+            ui.add_space(16.0);
+
+            // ── Recordings ───────────────────────────────────────────────────
+            ui.heading("Recordings");
+            ui.separator();
+
+            let fmt_bytes = |b: i64| -> String {
+                if b >= 1_000_000_000_000 {
+                    format!("{:.1} TB", b as f64 / 1e12)
+                } else if b >= 1_000_000_000 {
+                    format!("{:.1} GB", b as f64 / 1e9)
+                } else if b >= 1_000_000 {
+                    format!("{:.1} MB", b as f64 / 1e6)
+                } else {
+                    format!("{:.1} KB", b as f64 / 1e3)
+                }
+            };
+
+            egui::Grid::new("global_stats_grid")
+                .num_columns(4)
+                .spacing([32.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("Total recordings");
+                    ui.strong(global.total_recordings.to_string());
+                    ui.label("Total archived");
+                    ui.strong(fmt_bytes(global.total_bytes));
+                    ui.end_row();
+
+                    ui.label("Total channels");
+                    ui.strong(global.total_channels.to_string());
+                    ui.label("Monitors (active)");
+                    ui.strong(format!("{} ({} active)", global.total_monitors, global.active_monitors));
+                    ui.end_row();
+
+                    ui.label("Upcoming schedule");
+                    ui.strong(format!("{} segments", global.upcoming_segments));
+                    ui.label("");
+                    ui.label("");
+                    ui.end_row();
+                });
+
+            ui.add_space(8.0);
         });
     }
 
