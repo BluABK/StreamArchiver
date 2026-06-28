@@ -990,7 +990,7 @@ impl StreamArchiverApp {
         // The Properties "Upcoming streams" popup caches per-monitor segments
         // separately; drop it so an edit/delete here isn't shown stale there.
         self.schedule_cache.clear();
-        match self.core.store.all_upcoming_schedule(today_start_unix()) {
+        match self.core.store.all_upcoming_schedule(0) {
             Ok(v) => {
                 self.schedule_all = v;
                 // Drop hide choices only for channels that no longer EXIST (deleted),

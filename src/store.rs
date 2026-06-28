@@ -1056,24 +1056,27 @@ impl Store {
     ) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        // Drop stale tombstones (canceled rows well past their instant): an
-        // automatic source only re-emits UPCOMING streams, so an old tombstone can
-        // no longer collide with a fetched segment and would otherwise accumulate
-        // forever (see the suppression set below). Keep a 24h grace so a deleted
-        // event still showing in today's calendar window (which spans back to local
-        // midnight) stays suppressed even after its start time passes.
+        // Drop stale tombstones (canceled rows well past their instant): a
+        // tombstone's job is to suppress re-insertion of a deleted event on the
+        // next refresh. Because we only ever re-insert UPCOMING events (the delete
+        // below is future-only), a tombstone becomes inert once its start_time is
+        // comfortably in the past. Keep a 7-day grace so a deletion stays visible
+        // while the user can still see that week in the calendar.
         tx.execute(
             "DELETE FROM schedule_segment
              WHERE monitor_id = ?1 AND canceled = 1 AND start_time < ?2",
-            params![monitor_id, now_unix() - 86_400],
+            params![monitor_id, now_unix() - 7 * 86_400],
         )?;
-        // Replace only this source's LIVE rows. Tombstones (canceled = 1) are
-        // deliberately preserved so a user's "Delete" / time-correction survives
-        // this re-fetch (see the suppression set below).
+        // Replace only this source's FUTURE non-canceled rows. Past events are
+        // intentionally preserved as a schedule archive — the next banner fetch only
+        // re-emits upcoming streams, so old rows accumulate as history. Tombstones
+        // (canceled = 1) are also preserved so a user's "Delete" keeps suppressing
+        // a recurring event on future re-fetches.
         tx.execute(
             "DELETE FROM schedule_segment
-             WHERE monitor_id = ?1 AND source = ?2 AND canceled = 0",
-            params![monitor_id, source],
+             WHERE monitor_id = ?1 AND source = ?2 AND canceled = 0
+               AND start_time >= ?3",
+            params![monitor_id, source, now_unix()],
         )?;
         // Start instants an automatic source must NOT re-create for this monitor:
         //  • those claimed by a protected manual row (a user's correction — don't
@@ -1117,21 +1120,20 @@ impl Store {
         Ok(())
     }
 
-    /// Delete a monitor's schedule segments from every source EXCEPT `keep` (and
-    /// EXCEPT protected `"manual"` rows). The ordered-source refresh calls this
-    /// after a source resolves a schedule, so exactly one automatic source's rows
-    /// remain per monitor (the highest-priority one that resolved) — a
-    /// lower-priority source can't leave stale rows behind. User-edited `"manual"`
-    /// rows always survive so an automatic refresh never discards a correction;
-    /// tombstones (`canceled = 1`) also survive so a user's "Delete" keeps
-    /// suppressing the deleted occurrence on later refreshes.
+    /// Delete a monitor's UPCOMING (future) schedule segments from every source
+    /// EXCEPT `keep` (and EXCEPT protected `"manual"` rows). Past events are
+    /// intentionally left untouched as a schedule archive. The ordered-source
+    /// refresh calls this after a source resolves a schedule, so exactly one
+    /// automatic source's future rows remain per monitor — a lower-priority source
+    /// can't leave stale upcoming rows behind while historical rows accumulate.
+    /// User-edited `"manual"` rows and tombstones (`canceled = 1`) always survive.
     pub fn clear_other_schedule_sources(&self, monitor_id: i64, keep: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "DELETE FROM schedule_segment
              WHERE monitor_id = ?1 AND source <> ?2 AND source <> 'manual'
-               AND canceled = 0",
-            params![monitor_id, keep],
+               AND canceled = 0 AND start_time >= ?3",
+            params![monitor_id, keep, now_unix()],
         )?;
         Ok(())
     }
@@ -2215,6 +2217,7 @@ mod tests {
         m.channel_id = cid;
         let mid = store.insert_monitor(&m).unwrap();
 
+        let now = now_unix();
         let seg = |start: i64, title: &str, canceled: bool| ScheduleSegment {
             id: 0,
             monitor_id: 0,
@@ -2231,30 +2234,30 @@ mod tests {
                 mid,
                 "platform",
                 &[
-                    seg(5_000, "Later", false),
+                    seg(now + 5_000, "Later", false),
                     seg(500, "Past", false),
-                    seg(3_000, "Canceled soon", true),
-                    seg(2_000, "Next up", false),
+                    seg(now + 3_000, "Canceled soon", true),
+                    seg(now + 2_000, "Next up", false),
                 ],
             )
             .unwrap();
 
-        // Upcoming (start >= now), non-canceled, soonest first.
-        let upcoming = store.schedule_for_monitor(mid, 1_000).unwrap();
+        // Upcoming (start >= after), non-canceled, soonest first.
+        let upcoming = store.schedule_for_monitor(mid, now + 1_000).unwrap();
         assert_eq!(
             upcoming.iter().map(|s| s.title.as_str()).collect::<Vec<_>>(),
             vec!["Next up", "Later"],
         );
         // The soonest future per monitor drives the Next stream column.
-        let next = store.next_scheduled_streams(1_000).unwrap();
-        assert_eq!(next, vec![(mid, 2_000, "Next up".to_string())]);
+        let next = store.next_scheduled_streams(now + 1_000).unwrap();
+        assert_eq!(next, vec![(mid, now + 2_000, "Next up".to_string())]);
 
-        // Replace wipes the old set.
+        // Replace wipes the old future set and leaves the past row archived.
         store
-            .replace_schedule_source(mid, "platform", &[seg(9_000, "Fresh", false)])
+            .replace_schedule_source(mid, "platform", &[seg(now + 9_000, "Fresh", false)])
             .unwrap();
-        let next = store.next_scheduled_streams(1_000).unwrap();
-        assert_eq!(next, vec![(mid, 9_000, "Fresh".to_string())]);
+        let next = store.next_scheduled_streams(now + 1_000).unwrap();
+        assert_eq!(next, vec![(mid, now + 9_000, "Fresh".to_string())]);
 
         // Deleting the monitor cascades to its schedule.
         store.delete_monitor(mid).unwrap();
@@ -2274,6 +2277,7 @@ mod tests {
         m2.url = "https://youtube.com/@streamer".into();
         let mid2 = store.insert_monitor(&m2).unwrap();
 
+        let now = now_unix();
         let seg = |start: i64, title: &str, canceled: bool| ScheduleSegment {
             id: 0,
             monitor_id: 0,
@@ -2288,19 +2292,19 @@ mod tests {
             .replace_schedule_source(
                 mid1,
                 "platform",
-                &[seg(500, "Past", false), seg(2_000, "TW soon", false)],
+                &[seg(500, "Past", false), seg(now + 2_000, "TW soon", false)],
             )
             .unwrap();
         store
             .replace_schedule_source(
                 mid2,
                 "platform",
-                &[seg(3_000, "Canceled", true), seg(1_500, "YT soon", false)],
+                &[seg(now + 3_000, "Canceled", true), seg(now + 1_500, "YT soon", false)],
             )
             .unwrap();
 
         // Every upcoming occurrence, soonest first, canceled + past excluded.
-        let all = store.all_upcoming_schedule(1_000).unwrap();
+        let all = store.all_upcoming_schedule(now + 1_000).unwrap();
         assert_eq!(
             all.iter().map(|s| s.title.as_str()).collect::<Vec<_>>(),
             vec!["YT soon", "TW soon"],
@@ -2322,6 +2326,7 @@ mod tests {
         m.channel_id = cid;
         let mid = store.insert_monitor(&m).unwrap();
 
+        let now = now_unix();
         let seg = |start: i64, title: &str| ScheduleSegment {
             id: 0,
             monitor_id: 0,
@@ -2335,12 +2340,12 @@ mod tests {
 
         // A platform segment and a Discord segment for the same monitor coexist.
         store
-            .replace_schedule_source(mid, "platform", &[seg(2_000, "Platform")])
+            .replace_schedule_source(mid, "platform", &[seg(now + 2_000, "Platform")])
             .unwrap();
         store
-            .replace_schedule_source(mid, "discord", &[seg(3_000, "Discord")])
+            .replace_schedule_source(mid, "discord", &[seg(now + 3_000, "Discord")])
             .unwrap();
-        let all = store.all_upcoming_schedule(1_000).unwrap();
+        let all = store.all_upcoming_schedule(now + 1_000).unwrap();
         let mut titles: Vec<&str> = all.iter().map(|s| s.title.as_str()).collect();
         titles.sort_unstable();
         assert_eq!(titles, vec!["Discord", "Platform"]);
@@ -2349,16 +2354,16 @@ mod tests {
 
         // The monitor counts as having an upcoming non-Discord schedule (the
         // platform segment), which suppresses the Discord sweep for it.
-        assert!(store.monitors_with_upcoming_non_discord(1_000).unwrap().contains(&mid));
+        assert!(store.monitors_with_upcoming_non_discord(now + 1_000).unwrap().contains(&mid));
 
         // Replacing one source leaves the other intact.
         store.replace_schedule_source(mid, "discord", &[]).unwrap();
-        let all = store.all_upcoming_schedule(1_000).unwrap();
+        let all = store.all_upcoming_schedule(now + 1_000).unwrap();
         assert_eq!(all.iter().map(|s| s.title.as_str()).collect::<Vec<_>>(), vec!["Platform"]);
 
         // Clearing the platform source drops it from the non-Discord presence set.
         store.replace_schedule_source(mid, "platform", &[]).unwrap();
-        assert!(!store.monitors_with_upcoming_non_discord(1_000).unwrap().contains(&mid));
+        assert!(!store.monitors_with_upcoming_non_discord(now + 1_000).unwrap().contains(&mid));
     }
 
     #[test]
