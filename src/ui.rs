@@ -588,6 +588,8 @@ pub struct StreamArchiverApp {
     platform_tex: Option<PlatformTextures>,
     /// Which monitor's Properties window is open (None = closed).
     properties_popup: Option<i64>,
+    /// Which channel's Properties window is open (None = closed).
+    channel_properties_popup: Option<i64>,
     /// Per-channel cached icon textures loaded from disk for the Properties window.
     /// A `None` value means the lookup was attempted but no icon file was found.
     channel_icons: HashMap<i64, Option<egui::TextureHandle>>,
@@ -895,6 +897,7 @@ impl StreamArchiverApp {
             chat_popup: None,
             platform_tex: None,
             properties_popup: None,
+            channel_properties_popup: None,
             channel_icons: HashMap::new(),
             emote_anim: Arc::new(Mutex::new(HashMap::new())),
             emote_epoch: Arc::new(AtomicU64::new(0)),
@@ -2166,16 +2169,18 @@ fn schedule_time_grid(
                         );
                     }
 
-                    // Text inside the block (white, clipped to block height)
+                    // Text inside the block — clip to block_rect so text never
+                    // bleeds into adjacent columns.
                     let text_rect = block_rect.shrink2(egui::vec2(5.0, 3.0));
                     if text_rect.height() >= 12.0 {
+                        let text_painter = painter.with_clip_rect(block_rect);
                         let name_font = egui::FontId::proportional(11.0);
                         let time_font = egui::FontId::proportional(10.0);
                         let white = egui::Color32::WHITE;
                         let text_y = text_rect.top();
                         // Source badge glyph + channel name (the dense grid has no
                         // room for a separate widget, so prefix the channel name).
-                        painter.text(
+                        text_painter.text(
                             egui::pos2(text_rect.left(), text_y),
                             egui::Align2::LEFT_TOP,
                             format!("{} {}", source_badge(&s.source).0, s.channel_name),
@@ -2184,7 +2189,7 @@ fn schedule_time_grid(
                         );
                         // Time range (below channel name if enough space)
                         if block_h >= 36.0 {
-                            painter.text(
+                            text_painter.text(
                                 egui::pos2(text_rect.left(), text_y + 13.0),
                                 egui::Align2::LEFT_TOP,
                                 fmt_time_range(s.start_time, s.end_time),
@@ -2194,7 +2199,7 @@ fn schedule_time_grid(
                         }
                         // Title (if enough height)
                         if block_h >= 56.0 && !s.title.is_empty() {
-                            painter.text(
+                            text_painter.text(
                                 egui::pos2(text_rect.left(), text_y + 26.0),
                                 egui::Align2::LEFT_TOP,
                                 &s.title,
@@ -3761,7 +3766,8 @@ impl eframe::App for StreamArchiverApp {
         self.schedule_day_window(ui.ctx());
         self.edit_schedule_window(ui.ctx());
         self.chat_popup_window(ui.ctx());
-        self.properties_window(ui.ctx());
+        self.instance_properties_window(ui.ctx());
+        self.channel_properties_window(ui.ctx());
         self.processes_window(ui.ctx());
         self.format_designer_window(ui.ctx());
         self.confirm_quit_stop_window(ui.ctx());
@@ -6851,6 +6857,7 @@ impl StreamArchiverApp {
         let mut rename_channel: Option<i64> = None;
         let mut delete_channel: Option<(i64, String)> = None;
         let mut clear_channel_err: Option<i64> = None;
+        let mut open_channel_props: Option<i64> = None;
 
         let selected_monitor = self.selected_monitor;
         let now = crate::models::now_unix();
@@ -7364,6 +7371,10 @@ impl StreamArchiverApp {
                                         }
                                         if ui.button("✏  Rename channel").clicked() {
                                             rename_channel = Some(cid);
+                                            ui.close();
+                                        }
+                                        if ui.button("ℹ  Properties").clicked() {
+                                            open_channel_props = Some(cid);
                                             ui.close();
                                         }
                                         if any_err {
@@ -7914,6 +7925,11 @@ impl StreamArchiverApp {
             } else {
                 self.reload_rows();
             }
+        }
+        if let Some(cid) = open_channel_props {
+            self.channel_properties_popup = Some(cid);
+            self.channel_icons.remove(&cid);
+            self.channel_twitch_colors.remove(&cid);
         }
         if let Some(id) = acts.start {
             self.core.manual(ManualCommand::Start(id));
@@ -10808,8 +10824,9 @@ impl StreamArchiverApp {
             .clear();
     }
 
+    /// Instance (monitor) properties window — header + monitor-specific info.
     #[allow(deprecated)]
-    fn properties_window(&mut self, ctx: &egui::Context) {
+    fn instance_properties_window(&mut self, ctx: &egui::Context) {
         let Some(mid) = self.properties_popup else { return };
         let Some(row) = self.rows.iter().find(|r| r.monitor.id == mid).cloned() else {
             self.properties_popup = None;
@@ -10818,39 +10835,175 @@ impl StreamArchiverApp {
         let ch = &row.channel;
         let m = &row.monitor;
 
-        // Every platform this container spans (first-seen order) — drives the
-        // chosen-platform avatar and the per-platform asset status below.
         let platforms: Vec<Platform> = {
             let mons: Vec<&MonitorWithChannel> =
                 self.rows.iter().filter(|r| r.channel.id == ch.id).collect();
             channel_platforms(&mons)
         };
-        // Platforms that actually have an asset source (Generic has none) — used
-        // for the icon-source picker and the per-platform status grid.
-        let asset_platforms: Vec<Platform> =
-            platforms.iter().copied().filter(|p| *p != Platform::Generic).collect();
 
-        // Lazy-load (or serve cached) the chosen-platform channel avatar.
         let icon_tex = self
             .channel_icons
             .entry(ch.id)
             .or_insert_with(|| resolve_channel_icon(ch, &platforms, ctx))
             .clone();
 
-        // Set inside the icon-source combo, applied after the panel renders.
+        let mut open = true;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("instance_props_vp"),
+            egui::ViewportBuilder::default()
+                .with_title(format!("Instance — {}", ch.name))
+                .with_inner_size([480.0, 380.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                // ── Header ──────────────────────────────────────────────
+                ui.horizontal(|ui| {
+                    if let Some(tex) = &icon_tex {
+                        ui.add(
+                            egui::Image::from_texture(tex)
+                                .max_size(egui::vec2(96.0, 96.0))
+                                .corner_radius(egui::CornerRadius::same(8)),
+                        );
+                    } else {
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(96.0, 96.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().rect_filled(
+                            rect,
+                            8.0,
+                            ui.visuals().weak_text_color(),
+                        );
+                    }
+                    ui.add_space(8.0);
+                    ui.vertical(|ui| {
+                        ui.add_space(4.0);
+                        ui.heading(&ch.name);
+                        ui.horizontal(|ui| {
+                            let ptex = self
+                                .platform_tex
+                                .get_or_insert_with(|| PlatformTextures::load(ui.ctx()));
+                            for &p in &platforms {
+                                if let Some(t) = ptex.get(p) {
+                                    ui.add(
+                                        egui::Image::from_texture(t)
+                                            .max_size(egui::vec2(14.0, 14.0)),
+                                    );
+                                }
+                            }
+                            let names: Vec<&str> =
+                                platforms.iter().map(|p| p.label()).collect();
+                            ui.label(if names.is_empty() {
+                                "—".to_string()
+                            } else {
+                                names.join(" · ")
+                            });
+                        });
+                    });
+                });
+
+                ui.separator();
+
+                // ── Monitor (instance) ───────────────────────────────────
+                ui.strong("Monitor (instance)");
+                egui::Grid::new("props_mon")
+                    .num_columns(2)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("DB monitor ID");
+                        ui.label(m.id.to_string());
+                        ui.end_row();
+                        ui.label("Detection");
+                        ui.label(m.detection_method.as_str());
+                        ui.end_row();
+                        ui.label("Tool");
+                        ui.label(format!("{:?}", m.tool));
+                        ui.end_row();
+                        ui.label("Poll interval");
+                        ui.label(format!("{}s", m.poll_interval_secs));
+                        ui.end_row();
+                        ui.label("Quality");
+                        ui.label(&m.quality);
+                        ui.end_row();
+                        ui.label("Max concurrent");
+                        ui.label(m.max_concurrent.to_string());
+                        ui.end_row();
+                        ui.label("Last state");
+                        ui.label(&m.last_state);
+                        ui.end_row();
+                        ui.label("Recordings");
+                        ui.label(row.recording_count.to_string());
+                        ui.end_row();
+                        ui.label("Output dir");
+                        ui.horizontal(|ui| {
+                            ui.label(prop_truncate_path(&m.output_dir, 28));
+                            if ui
+                                .small_button("📂")
+                                .on_hover_text("Open folder")
+                                .clicked()
+                            {
+                                crate::platform::open_path(
+                                    std::path::Path::new(&m.output_dir),
+                                );
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("Fetch thumbnail");
+                        ui.label(prop_bool(m.fetch_thumbnail));
+                        ui.end_row();
+                        ui.label("Fetch assets");
+                        ui.label(prop_bool(m.fetch_chat_assets));
+                        ui.end_row();
+                    });
+                });
+            },
+        );
+
+        if !open {
+            self.properties_popup = None;
+        }
+    }
+
+    /// Channel properties window — header + channel info, assets, and schedule-source config.
+    #[allow(deprecated)]
+    fn channel_properties_window(&mut self, ctx: &egui::Context) {
+        let Some(cid) = self.channel_properties_popup else { return };
+        let ch = match self.channels.iter().find(|c| c.id == cid).cloned() {
+            Some(c) => c,
+            None => {
+                self.channel_properties_popup = None;
+                return;
+            }
+        };
+        // First monitor of this channel — used for asset refetch.
+        let first_mon = self.rows.iter().find(|r| r.channel.id == cid).map(|r| r.monitor.clone());
+
+        let platforms: Vec<Platform> = {
+            let mons: Vec<&MonitorWithChannel> =
+                self.rows.iter().filter(|r| r.channel.id == cid).collect();
+            channel_platforms(&mons)
+        };
+        let asset_platforms: Vec<Platform> =
+            platforms.iter().copied().filter(|p| *p != Platform::Generic).collect();
+
+        let icon_tex = self
+            .channel_icons
+            .entry(ch.id)
+            .or_insert_with(|| resolve_channel_icon(&ch, &platforms, ctx))
+            .clone();
+
         let mut pref_change: Option<Option<Platform>> = None;
 
-        // Load this channel's schedule-source config into the editable draft (once
-        // per channel — keep edits while the window stays open on the same channel).
         if self.channel_cfg_draft.as_ref().map(|(id, _)| *id) != Some(ch.id) {
             self.channel_cfg_draft = Some((ch.id, load_channel_cfg(&self.core.store, ch.id)));
         }
-        // Set when a per-channel config field is edited; persisted after the panel.
         let mut cfg_dirty = false;
 
         let mut open = true;
         ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("properties_vp"),
+            egui::ViewportId::from_hash_of("channel_props_vp"),
             egui::ViewportBuilder::default()
                 .with_title(format!("Properties — {}", ch.name))
                 .with_inner_size([480.0, 600.0]),
@@ -10919,8 +11072,7 @@ impl StreamArchiverApp {
 
                         ui.label("URL");
                         if ui.link(&ch.url).clicked() {
-                            ui.ctx()
-                                .open_url(egui::OpenUrl::new_tab(ch.url.clone()));
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(ch.url.clone()));
                         }
                         ui.end_row();
 
@@ -10931,10 +11083,7 @@ impl StreamArchiverApp {
                             ui.horizontal(|ui| {
                                 ui.label(&yt_id);
                                 if !yt_id.starts_with('—')
-                                    && ui
-                                        .small_button("⧉")
-                                        .on_hover_text("Copy")
-                                        .clicked()
+                                    && ui.small_button("⧉").on_hover_text("Copy").clicked()
                                 {
                                     ui.ctx().copy_text(yt_id.clone());
                                 }
@@ -10943,79 +11092,26 @@ impl StreamArchiverApp {
                         }
                     });
 
-                ui.add_space(6.0);
-
-                // ── Monitor (instance) ───────────────────────────────────
-                ui.strong("Monitor (instance)");
-                egui::Grid::new("props_mon")
-                    .num_columns(2)
-                    .spacing([12.0, 4.0])
-                    .show(ui, |ui| {
-                        ui.label("DB monitor ID");
-                        ui.label(m.id.to_string());
-                        ui.end_row();
-                        ui.label("Detection");
-                        ui.label(m.detection_method.as_str());
-                        ui.end_row();
-                        ui.label("Tool");
-                        ui.label(format!("{:?}", m.tool));
-                        ui.end_row();
-                        ui.label("Poll interval");
-                        ui.label(format!("{}s", m.poll_interval_secs));
-                        ui.end_row();
-                        ui.label("Quality");
-                        ui.label(&m.quality);
-                        ui.end_row();
-                        ui.label("Max concurrent");
-                        ui.label(m.max_concurrent.to_string());
-                        ui.end_row();
-                        ui.label("Last state");
-                        ui.label(&m.last_state);
-                        ui.end_row();
-                        ui.label("Recordings");
-                        ui.label(row.recording_count.to_string());
-                        ui.end_row();
-                        ui.label("Output dir");
-                        ui.horizontal(|ui| {
-                            ui.label(prop_truncate_path(&m.output_dir, 28));
-                            if ui
-                                .small_button("📂")
-                                .on_hover_text("Open folder")
-                                .clicked()
-                            {
-                                crate::platform::open_path(
-                                    std::path::Path::new(&m.output_dir),
-                                );
-                            }
-                        });
-                        ui.end_row();
-                        ui.label("Fetch thumbnail");
-                        ui.label(prop_bool(m.fetch_thumbnail));
-                        ui.end_row();
-                        ui.label("Fetch assets");
-                        ui.label(prop_bool(m.fetch_chat_assets));
-                        ui.end_row();
-                    });
-
                 // ── Assets ───────────────────────────────────────────────
                 {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         ui.strong("Channel assets");
-                        if ui
-                            .button("⟳ Refetch")
-                            .on_hover_text(format!(
-                                "Fetch icon / banner / badges / emotes for this instance's \
-                                 platform ({}) now — ignores the 24h cache and the per-monitor \
-                                 Fetch-assets toggle.",
-                                m.platform().label(),
-                            ))
-                            .clicked()
-                        {
-                            self.core.manual(ManualCommand::RefetchAssets(m.id));
-                            self.channel_icons.remove(&ch.id); // reload after fetch
-                            self.channel_twitch_colors.remove(&ch.id);
-                            self.status = format!("Refetching assets for {}…", ch.name);
+                        if let Some(m) = &first_mon {
+                            if ui
+                                .button("⟳ Refetch")
+                                .on_hover_text(format!(
+                                    "Fetch icon / banner / badges / emotes for this channel's \
+                                     platform ({}) now — ignores the 24h cache.",
+                                    m.platform().label(),
+                                ))
+                                .clicked()
+                            {
+                                self.core.manual(ManualCommand::RefetchAssets(m.id));
+                                self.channel_icons.remove(&ch.id);
+                                self.channel_twitch_colors.remove(&ch.id);
+                                self.status = format!("Refetching assets for {}…", ch.name);
+                            }
                         }
                         if ui
                             .button("📂")
@@ -11031,18 +11127,8 @@ impl StreamArchiverApp {
                             crate::platform::open_path(&root);
                         }
                     });
-                    if !m.fetch_chat_assets {
-                        ui.label(
-                            egui::RichText::new(
-                                "Auto-fetch is off for this monitor; Refetch pulls them on demand.",
-                            )
-                            .small()
-                            .weak(),
-                        );
-                    }
 
-                    // Icon source: which platform's profile pic represents this
-                    // container in the Streams list and in this window's header.
+                    // Icon source picker.
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.label("Icon source:");
@@ -11075,7 +11161,7 @@ impl StreamArchiverApp {
                             );
                     });
 
-                    // Per-platform asset status (each platform has its own dir).
+                    // Per-platform asset status.
                     ui.add_space(4.0);
                     egui::Grid::new("props_assets")
                         .num_columns(6)
@@ -11113,7 +11199,6 @@ impl StreamArchiverApp {
                                     prop_find_first(&pdir, "banner.").is_some(),
                                     prop_variant_count(&pdir, "banner"),
                                 );
-                                // Badges + emotes are Twitch-only concepts.
                                 let badges = prop_count_nested_dirs(&pdir.join("badges"), 2);
                                 ui.label(if badges > 0 {
                                     badges.to_string()
@@ -11243,7 +11328,6 @@ impl StreamArchiverApp {
                     {
                         self.status = format!("Error: {e}");
                     } else {
-                        // Reload so the avatar + container row reflect the choice.
                         self.channel_icons.remove(&ch.id);
                         self.reload_rows();
                     }
@@ -11252,7 +11336,6 @@ impl StreamArchiverApp {
             },
         );
 
-        // Persist edited per-channel schedule-source config (cheap; small JSON).
         if cfg_dirty {
             if let Some((cid, cfg)) = &self.channel_cfg_draft {
                 if let Err(e) = save_channel_cfg(&self.core.store, *cid, cfg) {
@@ -11262,7 +11345,7 @@ impl StreamArchiverApp {
         }
 
         if !open {
-            self.properties_popup = None;
+            self.channel_properties_popup = None;
             self.channel_cfg_draft = None;
         }
     }
