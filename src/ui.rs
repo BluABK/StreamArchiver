@@ -3169,6 +3169,8 @@ fn video_cells(
 
 /// Columns derived from a monitor's latest recording.
 struct RecordingCells {
+    /// True while the take is still in progress (status == "recording").
+    active: bool,
     /// When *we* started recording.
     started_on: String,
     /// How long we've recorded (ticks while active; final length otherwise).
@@ -3209,6 +3211,7 @@ fn recording_cells(row: &MonitorWithChannel, now: i64) -> RecordingCells {
         },
     };
     RecordingCells {
+        active,
         started_on: started.map(fmt_datetime_short).unwrap_or_default(),
         duration: dur.map(fmt_duration).unwrap_or_default(),
         went_live,
@@ -3354,8 +3357,8 @@ fn channel_cells(channel: &Channel, monitors: &[&MonitorWithChannel], now: i64) 
                 next_at.map(fmt_datetime_short).unwrap_or_default(),
             )
         },
-        Cell::text(primary.last_recording_category.clone()),
-        Cell::text(primary.last_recording_title.clone()),
+        Cell::text(if rec.active { primary.last_recording_category.clone() } else { String::new() }),
+        Cell::text(if rec.active { primary.last_recording_title.clone() } else { String::new() }),
         Cell::num(
             primary.last_recording_went_live.unwrap_or(0) as f64,
             rec.went_live.clone(),
@@ -3604,10 +3607,14 @@ fn render_instance_row(
         }
     });
     tr.col(|ui| {
-        meta_value_cell(ui, &row.last_recording_category);
+        if rec.active {
+            meta_value_cell(ui, &row.last_recording_category);
+        }
     });
     tr.col(|ui| {
-        meta_value_cell(ui, &row.last_recording_title);
+        if rec.active {
+            meta_value_cell(ui, &row.last_recording_title);
+        }
     });
     tr.col(|ui| {
         ui.label(&rec.went_live);
@@ -7780,9 +7787,11 @@ impl StreamArchiverApp {
                                 let meta_changes =
                                     primary.map(|m| m.last_recording_meta_changes);
                                 let cur_category = primary
+                                    .filter(|m| m.last_recording_status.as_deref() == Some("recording"))
                                     .map(|m| m.last_recording_category.clone())
                                     .unwrap_or_default();
                                 let cur_title = primary
+                                    .filter(|m| m.last_recording_status.as_deref() == Some("recording"))
                                     .map(|m| m.last_recording_title.clone())
                                     .unwrap_or_default();
                                 // The channel's next stream = the SOONEST upcoming
