@@ -8660,6 +8660,9 @@ impl StreamArchiverApp {
 
     fn background_view(&mut self, ui: &mut egui::Ui) {
         use egui_extras::{Column, TableBuilder};
+        // Both elapsed-time and next-run-countdown labels update every second —
+        // request a repaint so they tick continuously without needing mouse input.
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
         let now = now_unix();
         // Next-run estimates, plus the editable enable/disable state for each job.
         let reg = self.core.jobs.lock().unwrap().clone();
