@@ -1767,15 +1767,21 @@ fn fmt_datetime_short(secs: i64) -> String {
 /// the interval `(60s)` so the configured cadence is still visible.
 fn fmt_polled(last_checked: Option<i64>, interval_secs: i64) -> String {
     let secs = last_checked.unwrap_or(0);
-    let when = if short_ts_on() {
-        fmt_datetime_compact(secs)
+    if short_ts_on() {
+        // Compact: HH:MM only — no date, no interval (full info on hover).
+        if secs <= 0 {
+            return String::new();
+        }
+        chrono::DateTime::from_timestamp(secs, 0)
+            .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
+            .unwrap_or_default()
     } else {
-        fmt_datetime_short(secs)
-    };
-    if when.is_empty() {
-        format!("({interval_secs}s)")
-    } else {
-        format!("{when} ({interval_secs}s)")
+        let when = fmt_datetime_short(secs);
+        if when.is_empty() {
+            format!("({interval_secs}s)")
+        } else {
+            format!("{when} ({interval_secs}s)")
+        }
     }
 }
 
@@ -3087,10 +3093,10 @@ const STREAM_COLUMNS: [StreamCol; 19] = [
     StreamCol { title: "Actions",    tooltip: "Per-row actions: start/stop recording, edit, add instance, open folder, delete.",            min_width: 126.0, initial: 0.0,   sortable: false },
     StreamCol { title: "Plat",       tooltip: "Source platform (icon): Twitch, YouTube, Kick, or a generic URL. A channel shows every platform among its instances.", min_width: 52.0, initial: 0.0, sortable: true },
     StreamCol { title: "Name",       tooltip: "Channel (container) name. Expand it to see its instances and recording history.",            min_width: 130.0, initial: 0.0,   sortable: true },
-    StreamCol { title: "Tool",       tooltip: "Capture tool: streamlink, yt-dlp, or ffmpeg.",                                              min_width: 60.0,  initial: 0.0,   sortable: true },
-    StreamCol { title: "Detection",  tooltip: "How a live stream is detected (API poll, page scrape, Twitch EventSub, or a generic probe).", min_width: 70.0, initial: 0.0,   sortable: true },
-    StreamCol { title: "Polled",     tooltip: "When this instance was last checked, with its poll interval in parentheses.",                min_width: 100.0, initial: 0.0,   sortable: true },
-    StreamCol { title: "State",      tooltip: "Current state (idle / live / recording / failed). Hover a failed row to see why it failed.", min_width: 66.0,  initial: 0.0,   sortable: true },
+    StreamCol { title: "Tool",  tooltip: "Capture tool: SL = streamlink, yt-dlp, ff = ffmpeg. Hover a row for the full name.", min_width: 36.0, initial: 0.0, sortable: true },
+    StreamCol { title: "⇄",    tooltip: "Detection method — how liveness is detected: ↺ = API poll, ⚡ = push event, ⌁ = scrape, ◉ = probe, C = CLI. Hover a row for the full method.", min_width: 24.0, initial: 0.0, sortable: true },
+    StreamCol { title: "Polled", tooltip: "When this instance was last checked. Compact mode shows HH:MM only; hover for the full timestamp.", min_width: 64.0, initial: 0.0, sortable: true },
+    StreamCol { title: "●",    tooltip: "Current monitor state. ⏺ = recording, ● = live (not recording), ○ = idle, ⚠ = failed, ⚡ = aborted.", min_width: 26.0, initial: 0.0, sortable: true },
     StreamCol { title: "Next stream",tooltip: "Next scheduled stream (Twitch schedule / YouTube upcoming). Hover for its title; double-click for the full schedule.", min_width: 96.0, initial: 0.0, sortable: true },
     StreamCol { title: "Game",       tooltip: "Current game / category of the most recent recording. Truncated — hover for the full name.", min_width: 60.0,  initial: 96.0,  sortable: true },
     StreamCol { title: "Title",      tooltip: "Current stream title of the most recent recording. Truncated — hover for the full title.",   min_width: 80.0,  initial: 170.0, sortable: true },
@@ -3332,17 +3338,41 @@ fn recording_cells(row: &MonitorWithChannel, now: i64) -> RecordingCells {
 }
 
 /// Theme color for a recording / stream status string.
-fn rec_status_color(status: &str) -> egui::Color32 {
+/// Short abbreviation for the Tool column — narrower than the full label.
+fn short_tool_label(tool: crate::models::Tool) -> &'static str {
+    match tool {
+        crate::models::Tool::Streamlink => "SL",
+        crate::models::Tool::YtDlp => "yt-dlp",
+        crate::models::Tool::Ffmpeg => "ff",
+    }
+}
+
+/// Icon for the Detection column — one or two Unicode chars that convey the
+/// detection mechanism. Tooltip shows the full label + explanation.
+fn detection_icon(m: crate::models::DetectionMethod) -> &'static str {
+    use crate::models::DetectionMethod::*;
+    match m {
+        TwitchApi | YouTubeApi | KickApi => "↺",  // API polling
+        Scrape => "⌁",                            // page scrape
+        CliSelfPoll => "C",                       // CLI retry loop
+        GenericProbe => "◉",                      // HTTP probe
+        EventSub => "⚡",                          // pure push event
+        EventSubHelix => "⚡↺",                   // push + poll fallback
+        WebSub | WebSubOnly => "⚡",             // WebSub push
+    }
+}
+
+/// Icon + color for the State column. Returns `(icon, text_color)`.
+fn state_icon(state: &str) -> (&'static str, egui::Color32) {
     use egui::Color32;
-    match status {
-        "recording" => Color32::from_rgb(0x4d, 0x9b, 0xff),
-        "completed" => SUCCESS_GREEN,
-        "failed" => Color32::from_rgb(0xe0, 0x6c, 0x6c),
-        // Cut short by app shutdown — amber, not an error but not clean either.
-        "aborted" => Color32::from_rgb(0xe0, 0xa8, 0x50),
-        // "ended" (stream had ended / wasn't live), "stopped", "orphaned": neutral
-        // gray — terminal but not an error.
-        _ => Color32::from_gray(0xa0),
+    match state {
+        "recording" => ("⏺", Color32::from_rgb(0x4d, 0x9b, 0xff)), // blue
+        "live" => ("●", SUCCESS_GREEN),                              // green (live not yet recording)
+        "failed" => ("⚠", HL_ERROR_TEXT),                           // red
+        "stopped" => ("⏹", Color32::from_gray(0xa0)),               // gray
+        "aborted" => ("⚡", Color32::from_rgb(0xe0, 0xa8, 0x50)),   // amber
+        "ended" => ("✔", Color32::from_gray(0xa0)),                  // gray
+        _ => ("○", Color32::from_gray(0x70)),                        // idle/unknown — dim
     }
 }
 
@@ -3432,11 +3462,7 @@ fn channel_cells(channel: &Channel, monitors: &[&MonitorWithChannel], now: i64) 
     let primary = channel_primary(monitors).unwrap_or(monitors[0]);
     let rec = recording_cells(primary, now);
     let ninst = monitors.len();
-    let tool = if ninst == 1 {
-        "1 instance".to_string()
-    } else {
-        format!("{ninst} instances")
-    };
+    let tool = ninst.to_string();
     let last = monitors
         .iter()
         .filter_map(|m| m.monitor.last_checked_at)
@@ -3664,20 +3690,21 @@ fn render_instance_row(
         platform_icon(ui, ptex, m.platform()).on_hover_text(m.platform().label());
     });
     tr.col(|ui| {
+        let (_, name_color) = state_icon(&m.last_state);
         disclosure_clicked = tree_name(
             ui,
             depth,
             has_history,
             expanded,
-            egui::RichText::new(instance_label(&row.monitor.url)),
+            egui::RichText::new(instance_label(&row.monitor.url)).color(name_color),
         );
         ui.response().on_hover_text(&row.monitor.url);
     });
     tr.col(|ui| {
-        ui.label(m.tool.label()).on_hover_text(m.tool.tooltip());
+        ui.label(short_tool_label(m.tool)).on_hover_text(m.tool.tooltip());
     });
     tr.col(|ui| {
-        ui.label(m.detection_method.short_label()).on_hover_text(format!(
+        ui.label(detection_icon(m.detection_method)).on_hover_text(format!(
             "{}\n\n{}",
             m.detection_method.label(),
             m.detection_method.tooltip()
@@ -3697,9 +3724,14 @@ fn render_instance_row(
     });
     tr.col(|ui| {
         ui.horizontal(|ui| {
-            let resp = ui.label(&m.last_state);
-            if m.last_state == "failed" || row.last_recording_status.as_deref() == Some("failed") {
+            let (icon, color) = state_icon(&m.last_state);
+            let resp = ui.colored_label(color, icon);
+            let is_failed = m.last_state == "failed"
+                || row.last_recording_status.as_deref() == Some("failed");
+            if is_failed {
                 resp.on_hover_text(fail_hover(&row.last_recording_log));
+            } else {
+                resp.on_hover_text(&m.last_state);
             }
             if chat_active {
                 ui.colored_label(
@@ -8073,11 +8105,7 @@ impl StreamArchiverApp {
                                         disc = clicked;
                                     });
                                     tr.col(|ui| {
-                                        ui.weak(if ninst == 1 {
-                                            "1 instance".to_string()
-                                        } else {
-                                            format!("{ninst} instances")
-                                        });
+                                        ui.weak(ninst.to_string());
                                     });
                                     tr.col(|_ui| {}); // detection
                                     tr.col(|ui| {
@@ -8085,13 +8113,12 @@ impl StreamArchiverApp {
                                     });
                                     tr.col(|ui| {
                                         if any_rec {
-                                            ui.colored_label(
-                                                rec_status_color("recording"),
-                                                "recording",
-                                            );
+                                            let (icon, color) = state_icon("recording");
+                                            ui.colored_label(color, icon).on_hover_text("recording");
                                         } else if let Some(p) = primary {
                                             if p.last_recording_status.as_deref() == Some("failed") {
-                                                ui.colored_label(rec_status_color("failed"), "failed")
+                                                let (icon, color) = state_icon("failed");
+                                                ui.colored_label(color, icon)
                                                     .on_hover_text(fail_hover(&p.last_recording_log));
                                             }
                                         }
@@ -8296,8 +8323,8 @@ impl StreamArchiverApp {
                                     tr.col(|_ui| {}); // detection
                                     tr.col(|_ui| {}); // polled
                                     tr.col(|ui| {
-                                        let resp =
-                                            ui.colored_label(rec_status_color(g.status()), g.status());
+                                        let (icon, color) = state_icon(g.status());
+                                        let resp = ui.colored_label(color, icon);
                                         if g.status() == "failed" {
                                             let log = g
                                                 .takes
@@ -8305,6 +8332,8 @@ impl StreamArchiverApp {
                                                 .map(|t| t.log_excerpt.as_str())
                                                 .unwrap_or("");
                                             resp.on_hover_text(fail_hover(log));
+                                        } else {
+                                            resp.on_hover_text(g.status());
                                         }
                                     });
                                     tr.col(|_ui| {}); // next stream (n/a per stream)
@@ -8486,8 +8515,8 @@ impl StreamArchiverApp {
                                     tr.col(|_ui| {}); // detection
                                     tr.col(|_ui| {}); // polled
                                     tr.col(|ui| {
-                                        let resp =
-                                            ui.colored_label(rec_status_color(&t.status), &t.status);
+                                        let (icon, color) = state_icon(&t.status);
+                                        let resp = ui.colored_label(color, icon);
                                         if t.status == "failed" {
                                             let mut msg = fail_hover(&t.log_excerpt);
                                             if let Some(code) = t.exit_code {
@@ -8501,6 +8530,8 @@ impl StreamArchiverApp {
                                             );
                                         } else if let Some(code) = t.exit_code {
                                             resp.on_hover_text(format!("exit code {code}"));
+                                        } else {
+                                            resp.on_hover_text(&t.status);
                                         }
                                         // VOD state badge (Twitch only)
                                         match t.vod_state.as_deref() {
