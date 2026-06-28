@@ -159,15 +159,22 @@ fn handle(store: &Store, ev: AppEvent) {
             if status == "ended" {
                 return;
             }
-            let row = store
-                .monitor_id_for_recording(recording_id)
-                .ok()
-                .flatten()
-                .and_then(|mid| store.get_monitor_with_channel(mid).ok().flatten());
+            let resolved = store.monitor_id_for_recording(recording_id).ok().flatten();
+            let row = resolved
+                .as_ref()
+                .and_then(|(mid, _)| store.get_monitor_with_channel(*mid).ok().flatten());
             match row {
                 Some(row) => {
                     let heading = format!("{} — {status}", row.channel.name);
-                    content_for(&row, heading, "Watch VOD")
+                    // For YouTube, prefer the specific video URL when we recorded
+                    // the stream id; the channel URL just opens the completed-stream
+                    // page rather than the VOD itself.
+                    let vod_url =
+                        resolved.as_ref().and_then(|(_, sid)| sid.as_deref()).and_then(|sid| {
+                            matches!(row.monitor.platform(), crate::models::Platform::YouTube)
+                                .then(|| format!("https://www.youtube.com/watch?v={sid}"))
+                        });
+                    content_for_url(&row, heading, "Watch VOD", vod_url)
                 }
                 None => ToastContent::text(
                     "Recording finished".to_string(),
@@ -186,8 +193,14 @@ fn handle(store: &Store, ev: AppEvent) {
 
 /// Enrich a toast from a monitor+channel row: the channel's profile pic / banner
 /// (from the per-platform asset dir), its current stream title + game, and an
-/// action button to the source URL labelled `action_label`.
-fn content_for(row: &MonitorWithChannel, heading: String, action_label: &str) -> ToastContent {
+/// action button labelled `action_label`. The button URL is `override_url` when
+/// `Some`, otherwise the monitor's channel URL.
+fn content_for_url(
+    row: &MonitorWithChannel,
+    heading: String,
+    action_label: &str,
+    override_url: Option<String>,
+) -> ToastContent {
     let dir = crate::assets::channel_asset_dir(&row.channel.name, row.monitor.platform());
     let mut lines = Vec::new();
     if !row.last_recording_title.is_empty() {
@@ -196,9 +209,10 @@ fn content_for(row: &MonitorWithChannel, heading: String, action_label: &str) ->
     if !row.last_recording_category.is_empty() {
         lines.push(row.last_recording_category.clone());
     }
-    let action = (!row.monitor.url.trim().is_empty()).then(|| ToastAction {
+    let url = override_url.unwrap_or_else(|| row.monitor.url.clone());
+    let action = (!url.trim().is_empty()).then(|| ToastAction {
         label: action_label.to_string(),
-        url: row.monitor.url.clone(),
+        url,
     });
     ToastContent {
         heading,
@@ -207,6 +221,10 @@ fn content_for(row: &MonitorWithChannel, heading: String, action_label: &str) ->
         hero: crate::assets::find_asset(&dir, "banner."),
         action,
     }
+}
+
+fn content_for(row: &MonitorWithChannel, heading: String, action_label: &str) -> ToastContent {
+    content_for_url(row, heading, action_label, None)
 }
 
 // ---------- Windows: rich WinRT toast ----------

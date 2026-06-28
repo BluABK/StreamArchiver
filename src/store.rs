@@ -943,18 +943,22 @@ impl Store {
             .find(|r| r.monitor.id == id))
     }
 
-    /// The monitor a recording belongs to (so a `RecordingFinished` event, which
-    /// only carries the recording id, can resolve the channel for a rich toast).
-    pub fn monitor_id_for_recording(&self, recording_id: i64) -> Result<Option<i64>> {
+    /// The monitor and stream/video id a recording belongs to (so a
+    /// `RecordingFinished` event can resolve the channel for a rich toast and
+    /// build a platform-specific VOD URL when a video id is known).
+    pub fn monitor_id_for_recording(
+        &self,
+        recording_id: i64,
+    ) -> Result<Option<(i64, Option<String>)>> {
         let conn = self.conn.lock().unwrap();
-        let id = conn
+        let row = conn
             .query_row(
-                "SELECT monitor_id FROM recording WHERE id = ?1",
+                "SELECT monitor_id, stream_id FROM recording WHERE id = ?1",
                 params![recording_id],
-                |r| r.get::<_, i64>(0),
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)),
             )
             .optional()?;
-        Ok(id)
+        Ok(row)
     }
 
     // ----- recordings -----
