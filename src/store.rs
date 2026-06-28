@@ -1075,6 +1075,18 @@ impl Store {
         Ok(())
     }
 
+    /// Return whether a recording's go-live time is approximate (detection-clock,
+    /// not platform-reported). `false` on any error or missing row.
+    pub fn recording_went_live_approx(&self, id: i64) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT went_live_approx FROM recording WHERE id=?1",
+            params![id],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
+    }
+
     /// Record an advertisement break detected during a recording take. `at_secs`
     /// is the offset from the take's start; `duration_secs` the reported ad length.
     pub fn insert_ad_break(

@@ -2309,7 +2309,7 @@ impl Supervisor {
             channel: row.channel.name.clone(),
             status: status.into(),
         });
-        self.schedule_vod_check(rec_id, row.monitor.platform(), status, &row.monitor.url, went_live_at);
+        self.schedule_vod_check(rec_id, row.monitor.platform(), status, &row.monitor.url, went_live_at, approximate);
         info!(monitor_id, bytes, status, "recording finished");
         if status == "failed" && !outcome.log.is_empty() {
             warn!(monitor_id, "recording stderr:\n{}", outcome.log);
@@ -2995,7 +2995,8 @@ impl Supervisor {
                     status: status.into(),
                 });
                 if let Some(platform) = vod_platform {
-                    self.schedule_vod_check(row.ref_id, platform, status, &vod_url, row.went_live_at);
+                    let approx = self.store.recording_went_live_approx(row.ref_id);
+                    self.schedule_vod_check(row.ref_id, platform, status, &vod_url, row.went_live_at, approx);
                 }
                 if let Some(mid) = row.monitor_id {
                     let _ = self.events.send(AppEvent::MonitorState {
@@ -3248,7 +3249,7 @@ impl Supervisor {
             channel: row.channel.name.clone(),
             status: status.into(),
         });
-        self.schedule_vod_check(rec_id, row.monitor.platform(), status, &row.monitor.url, rec.went_live_at);
+        self.schedule_vod_check(rec_id, row.monitor.platform(), status, &row.monitor.url, rec.went_live_at, rec.went_live_approx);
         info!(monitor_id, rec_id, bytes, status, "resumed recording finished");
         self.active.lock().unwrap().remove(&monitor_id);
     }
@@ -3296,6 +3297,9 @@ impl Supervisor {
     /// Mark a Twitch recording as VOD-pending and spawn the background poller.
     /// No-op for non-Twitch platforms, or statuses that imply the stream had
     /// already ended before capture began (`ended`).
+    /// When `went_live_approx` is true the stored go-live time is our detection
+    /// clock rather than the platform-reported start — pass `None` to the VOD
+    /// matcher so it falls back to "most recent archive" instead of a stale anchor.
     fn schedule_vod_check(
         &self,
         rec_id: i64,
@@ -3303,6 +3307,7 @@ impl Supervisor {
         status: &str,
         monitor_url: &str,
         went_live_at: Option<i64>,
+        went_live_approx: bool,
     ) {
         if platform != Platform::Twitch || status == "ended" {
             return;
@@ -3310,6 +3315,7 @@ impl Supervisor {
         let Some(login) = crate::detectors::twitch_login(monitor_url) else {
             return;
         };
+        let anchor = if went_live_approx { None } else { went_live_at };
         let _ = self.store.set_recording_vod_pending(rec_id);
         tokio::spawn(check_twitch_vod(
             Arc::clone(&self.ctx),
@@ -3317,7 +3323,7 @@ impl Supervisor {
             self.events.clone(),
             rec_id,
             login,
-            went_live_at,
+            anchor,
         ));
     }
 
@@ -4946,7 +4952,7 @@ async fn poll_twitch_vod(
         .get("https://api.twitch.tv/helix/videos")
         .header("Client-Id", client_id)
         .bearer_auth(token)
-        .query(&[("user_id", user_id), ("type", "archive"), ("first", "5")])
+        .query(&[("user_id", user_id), ("type", "archive"), ("first", "20")])
         .send()
         .await?;
     if !resp.status().is_success() {
