@@ -666,6 +666,10 @@ pub struct StreamArchiverApp {
     /// Play animated emotes (off ⇒ static first frame). Default on. Persisted under
     /// [`K_ANIMATE_EMOTES`].
     animate_emotes: bool,
+    /// Bumping this counter causes the Streams table to forget all user-resized
+    /// column widths and revert to content-fit auto widths. Used by the "Fit
+    /// columns" button.
+    streams_table_gen: u64,
     /// Currently running background tasks (asset fetches, thumbnail downloads).
     background_tasks: Vec<crate::events::BackgroundTask>,
     /// Completed/failed background tasks (task, outcome, finished-at unix), newest
@@ -973,6 +977,7 @@ impl StreamArchiverApp {
             shorten_timestamps,
             render_emotes,
             animate_emotes,
+            streams_table_gen: 0,
             background_tasks: Vec::new(),
             finished_tasks: Vec::new(),
             job_toggles,
@@ -4055,6 +4060,13 @@ impl eframe::App for StreamArchiverApp {
                                     name: String::new(),
                                     color: String::new(),
                                 });
+                            }
+                            if ui
+                                .button("⇔")
+                                .on_hover_text("Auto-fit all columns to their content width")
+                                .clicked()
+                            {
+                                self.streams_table_gen += 1;
                             }
                         }
                     });
@@ -7878,6 +7890,7 @@ impl StreamArchiverApp {
                     .get_or_insert_with(|| PlatformTextures::load(ui.ctx()))
                     .clone();
                 let mut tb = TableBuilder::new(ui)
+                    .id_salt(self.streams_table_gen)
                     .striped(true)
                     .resizable(true)
                     // Make rows sense clicks so they can be selected and carry a
