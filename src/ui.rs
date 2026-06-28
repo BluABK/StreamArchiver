@@ -3741,7 +3741,7 @@ fn render_instance_row(
             if chat_active {
                 ui.colored_label(
                     egui::Color32::from_rgb(0x4a, 0xc2, 0xff),
-                    egui::RichText::new("Chat ●").small(),
+                    egui::RichText::new("💬").small(),
                 )
                 .on_hover_text(
                     "Live-chat download is still running.\n\
