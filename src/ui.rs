@@ -2972,7 +2972,7 @@ fn ts_label(ui: &mut egui::Ui, secs: i64) {
     }
 }
 
-/// Like [`ts_label`] but prepends `~` for approximate times (Went Live column).
+/// Like [`ts_label`] but appends `~` for approximate times (Went Live column).
 fn ts_went_live_label(ui: &mut egui::Ui, secs: i64, approx: bool) {
     if secs <= 0 {
         return;
@@ -2980,13 +2980,13 @@ fn ts_went_live_label(ui: &mut egui::Ui, secs: i64, approx: bool) {
     let compact = short_ts_on();
     let display = {
         let s = if compact { fmt_datetime_compact(secs) } else { fmt_datetime_short(secs) };
-        if approx { format!("~{s}") } else { s }
+        if approx { format!("{s}~") } else { s }
     };
     let resp = ui.label(display);
     if compact {
         let full = {
             let s = fmt_datetime_short(secs);
-            if approx { format!("~{s}") } else { s }
+            if approx { format!("{s}~") } else { s }
         };
         resp.on_hover_text(full);
     }
@@ -3010,12 +3010,12 @@ fn stream_key_monitor(key: &str) -> Option<i64> {
     rest.split(':').next()?.parse().ok()
 }
 
-/// Format a go-live time (`~`-prefixed when only our approximate time is known).
+/// Format a go-live time (`~`-suffixed when only our approximate time is known).
 fn fmt_went_live(at: Option<i64>, approx: bool) -> String {
     match at {
         Some(w) => {
             let s = fmt_datetime_short(w);
-            if approx { format!("~{s}") } else { s }
+            if approx { format!("{s}~") } else { s }
         }
         None => String::new(),
     }
@@ -3108,7 +3108,7 @@ const STREAM_COLUMNS: [StreamCol; 19] = [
     StreamCol { title: "Title",      tooltip: "Current stream title of the most recent recording. Truncated — hover for the full title.",   min_width: 80.0,  initial: 170.0, sortable: true },
     StreamCol { title: "✏",          tooltip: "Title / game-category changes logged during the recording. Hover or double-click for the log.", min_width: 24.0, initial: 0.0, sortable: true },
     StreamCol { title: "📢",         tooltip: "Ad breaks detected (Twitch + streamlink); each is a hard cut. Hover for count + total time; double-click for the cut list.", min_width: 24.0, initial: 0.0, sortable: true },
-    StreamCol { title: "Went Live",  tooltip: "When the stream went live on the platform (a \"~\" prefix means it's our approximate time).", min_width: 96.0, initial: 0.0,  sortable: true },
+    StreamCol { title: "Went Live",  tooltip: "When the stream went live on the platform (a trailing \"~\" means it's our approximate time).", min_width: 96.0, initial: 0.0,  sortable: true },
     StreamCol { title: "Started On", tooltip: "When recording started.",                                                                    min_width: 92.0,  initial: 0.0,   sortable: true },
     StreamCol { title: "Lost time",  tooltip: "How much of the start was missed. Drops to 0 once a from-start capture catches up to the live edge.", min_width: 52.0, initial: 0.0, sortable: true },
     StreamCol { title: "Duration",   tooltip: "How long we've recorded (ticks while live).",                                               min_width: 56.0,  initial: 0.0,   sortable: true },
@@ -3315,7 +3315,7 @@ fn recording_cells(row: &MonitorWithChannel, now: i64) -> RecordingCells {
         Some(w) => {
             let s = fmt_datetime_short(w);
             if went_live_approx {
-                format!("~{s}")
+                format!("{s}~")
             } else {
                 s
             }
