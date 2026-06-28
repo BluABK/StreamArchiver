@@ -8780,19 +8780,40 @@ impl StreamArchiverApp {
                         .body(|mut body| {
                             for (task, outcome, finished_at) in &self.finished_tasks {
                                 let dur = fmt_duration_secs(finished_at - task.started_at);
-                                let outcome_str = match outcome {
-                                    crate::events::TaskOutcome::Completed => {
-                                        format!("✔ Completed ({dur})")
-                                    }
-                                    crate::events::TaskOutcome::Failed(e) => {
-                                        format!("✘ Failed: {e}")
-                                    }
-                                };
                                 body.row(20.0, |mut row| {
                                     row.col(|ui| { ui.label(&task.label); });
                                     row.col(|ui| { ui.label(task.kind.label()); });
                                     row.col(|ui| { ui.label(&task.detail); });
-                                    row.col(|ui| { ui.label(&outcome_str); });
+                                    row.col(|ui| {
+                                        match outcome {
+                                            crate::events::TaskOutcome::Completed => {
+                                                ui.label(format!("✔ OK ({dur})"));
+                                            }
+                                            crate::events::TaskOutcome::CompletedWithNote(note) => {
+                                                // "0 events" is a soft-warn (OCR ran but found
+                                                // nothing); anything else is a normal success.
+                                                let zero = note.starts_with("0 ");
+                                                let text = format!("{} ({dur})", note);
+                                                if zero {
+                                                    ui.colored_label(
+                                                        egui::Color32::from_rgb(200, 160, 50),
+                                                        format!("⚠ {text}"),
+                                                    );
+                                                } else {
+                                                    ui.colored_label(
+                                                        egui::Color32::from_rgb(80, 200, 120),
+                                                        format!("✔ {text}"),
+                                                    );
+                                                }
+                                            }
+                                            crate::events::TaskOutcome::Failed(e) => {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(220, 80, 80),
+                                                    format!("✘ {e}"),
+                                                );
+                                            }
+                                        }
+                                    });
                                 });
                             }
                         });

@@ -914,12 +914,29 @@ impl DetectContext {
         let result = ocr_schedule_image(path, &opts).await;
         accumulate_ocr_stats(self.store.as_ref(), &result);
 
-        let outcome = if result.cli_failures > 0 && result.cli_calls.is_empty() {
-            crate::events::TaskOutcome::Failed("CLI failed".into())
-        } else if result.parse_failures > 0 && result.segments.is_none() {
-            crate::events::TaskOutcome::Failed("Parse failed".into())
-        } else {
-            crate::events::TaskOutcome::Completed
+        let outcome = match &result.segments {
+            Some(segs) => {
+                let n = segs.len();
+                let note = if n == 1 {
+                    "1 event decoded".to_string()
+                } else if n > 1 {
+                    format!("{n} events decoded")
+                } else {
+                    // Parsed OK but the model found nothing — likely a non-schedule image
+                    // or all cards had vague/null times.
+                    "0 events (nothing found)".to_string()
+                };
+                crate::events::TaskOutcome::CompletedWithNote(note)
+            }
+            None => {
+                if result.cli_failures > 0 && result.cli_calls.is_empty() {
+                    crate::events::TaskOutcome::Failed(
+                        format!("CLI failed — is '{}' on PATH?", opts.command),
+                    )
+                } else {
+                    crate::events::TaskOutcome::Failed("Parse failed".into())
+                }
+            }
         };
         let _ = self
             .events

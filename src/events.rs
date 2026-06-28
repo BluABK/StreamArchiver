@@ -40,6 +40,8 @@ impl BackgroundTaskKind {
 #[derive(Clone, Debug)]
 pub enum TaskOutcome {
     Completed,
+    /// Completed successfully, with a short human-readable note (e.g. "5 events decoded").
+    CompletedWithNote(String),
     Failed(String),
 }
 
