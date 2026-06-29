@@ -64,6 +64,34 @@ pub struct RecInfo {
 }
 
 impl Store {
+    /// Acquire the DB connection, logging a warning when contention caused a
+    /// wait longer than 50 ms. `#[track_caller]` embeds the caller's source
+    /// location in the log line so the slow call-site is immediately visible.
+    #[track_caller]
+    fn db(&self) -> std::sync::MutexGuard<'_, Connection> {
+        let t = std::time::Instant::now();
+        let g = self.conn.lock().unwrap();
+        let ms = t.elapsed().as_millis();
+        if ms >= 50 {
+            let loc = std::panic::Location::caller();
+            tracing::warn!(
+                wait_ms = ms,
+                file = loc.file(),
+                line = loc.line(),
+                "store: slow DB lock – another thread held the connection"
+            );
+        } else if ms >= 5 {
+            let loc = std::panic::Location::caller();
+            tracing::debug!(
+                wait_ms = ms,
+                file = loc.file(),
+                line = loc.line(),
+                "store: DB lock wait"
+            );
+        }
+        g
+    }
+
     /// Open (or create) the database at `path`, set pragmas, and migrate.
     pub fn open(path: &Path) -> Result<Store> {
         let conn = Connection::open(path)
@@ -97,7 +125,7 @@ impl Store {
     }
 
     fn migrate(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version < 1 {
             conn.execute_batch(
@@ -520,7 +548,7 @@ impl Store {
     // ----- settings (key/value, also used for credentials) -----
 
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let value = conn
             .query_row(
                 "SELECT value FROM app_settings WHERE key = ?1",
@@ -532,7 +560,7 @@ impl Store {
     }
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "INSERT INTO app_settings(key, value) VALUES(?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -553,7 +581,7 @@ impl Store {
         monitor_id: i64,
         content_hash: &str,
     ) -> Result<Option<ArchivedPost>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let row = conn
             .query_row(
                 "SELECT content_hash, local_path, ocr_attempted, decoded_events, decoded_json
@@ -587,7 +615,7 @@ impl Store {
         local_path: &str,
         fetched_at: i64,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "INSERT INTO community_post_archive
                  (monitor_id, source, image_url, content_hash, local_path, fetched_at)
@@ -611,7 +639,7 @@ impl Store {
         events: i64,
         json: &str,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "UPDATE community_post_archive
              SET ocr_attempted = 1, decoded_events = ?3, decoded_json = ?4
@@ -624,7 +652,7 @@ impl Store {
     /// Number of archived community-post images for a monitor (test/diagnostic helper).
     #[allow(dead_code)]
     pub fn community_post_count(&self, monitor_id: i64) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let n = conn.query_row(
             "SELECT COUNT(*) FROM community_post_archive WHERE monitor_id = ?1",
             params![monitor_id],
@@ -635,7 +663,7 @@ impl Store {
 
     /// Aggregate counts and byte totals across the whole database for the Stats view.
     pub fn global_stats(&self) -> Result<GlobalStats> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let now = now_unix();
         let r = conn.query_row(
             "SELECT
@@ -673,7 +701,7 @@ impl Store {
     // ----- channels -----
 
     pub fn find_channel_by_url(&self, url: &str) -> Result<Option<Channel>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let ch = conn
             .query_row(
                 "SELECT id, name, url, platform, created_at, color, preferred_platform, enabled \
@@ -686,7 +714,7 @@ impl Store {
     }
 
     pub fn insert_channel(&self, name: &str, url: &str, platform: Platform) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "INSERT INTO channel(name, url, platform, created_at) VALUES(?1, ?2, ?3, ?4)",
             params![name, url, platform.as_str(), now_unix()],
@@ -703,7 +731,7 @@ impl Store {
     }
 
     pub fn delete_channel(&self, id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute("DELETE FROM channel WHERE id = ?1", params![id])?;
         Ok(())
     }
@@ -711,7 +739,7 @@ impl Store {
     /// All channel containers (including ones with no instances yet), ordered to
     /// match the monitor list (name, then id).
     pub fn list_channels(&self) -> Result<Vec<Channel>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT id, name, url, platform, created_at, color, preferred_platform, enabled FROM channel
              ORDER BY name COLLATE NOCASE, id",
@@ -730,7 +758,7 @@ impl Store {
 
     /// Rename a channel container.
     pub fn rename_channel(&self, id: i64, name: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "UPDATE channel SET name = ?2 WHERE id = ?1",
             params![id, name],
@@ -741,7 +769,7 @@ impl Store {
     /// Set (or clear) the custom hex color for a channel container.
     /// Pass an empty string to revert to the automatic palette color.
     pub fn set_channel_color(&self, id: i64, color: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "UPDATE channel SET color = ?2 WHERE id = ?1",
             params![id, color],
@@ -757,7 +785,7 @@ impl Store {
         id: i64,
         platform: Option<Platform>,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "UPDATE channel SET preferred_platform = ?2 WHERE id = ?1",
             params![id, platform.map(|p| p.as_str()).unwrap_or("")],
@@ -768,7 +796,7 @@ impl Store {
     /// Enable/disable a channel container's own flag. Does NOT touch individual
     /// instance (monitor) enabled states — those are independent.
     pub fn set_channel_enabled(&self, channel_id: i64, enabled: bool) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "UPDATE channel SET enabled = ?2 WHERE id = ?1",
             params![channel_id, enabled as i64],
@@ -780,7 +808,7 @@ impl Store {
 
     #[allow(clippy::too_many_arguments)]
     pub fn insert_monitor(&self, m: &Monitor) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "INSERT INTO monitor(channel_id, url, enabled, tool, detection_method, poll_interval_secs,
                 quality, output_dir, filename_template, container, capture_from_start, auth_kind,
@@ -818,7 +846,7 @@ impl Store {
     }
 
     pub fn update_monitor(&self, m: &Monitor) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "UPDATE monitor SET url=?2, enabled=?3, tool=?4, detection_method=?5, poll_interval_secs=?6,
                 quality=?7, output_dir=?8, filename_template=?9, container=?10, capture_from_start=?11,
@@ -857,7 +885,7 @@ impl Store {
 
     /// Persist a detection result: last observed state + check timestamp.
     pub fn set_monitor_check_result(&self, id: i64, state: &str, checked_at: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "UPDATE monitor SET last_state = ?2, last_checked_at = ?3 WHERE id = ?1",
             params![id, state, checked_at],
@@ -866,7 +894,7 @@ impl Store {
     }
 
     pub fn clear_channel_errors(&self, channel_id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "UPDATE monitor SET last_state = 'idle' WHERE channel_id = ?1 AND last_state IN ('error', 'failed')",
             params![channel_id],
@@ -875,7 +903,7 @@ impl Store {
     }
 
     pub fn set_monitor_enabled(&self, id: i64, enabled: bool) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "UPDATE monitor SET enabled=?2 WHERE id=?1",
             params![id, enabled as i64],
@@ -884,7 +912,7 @@ impl Store {
     }
 
     pub fn delete_monitor(&self, id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute("DELETE FROM monitor WHERE id = ?1", params![id])?;
         Ok(())
     }
@@ -903,7 +931,7 @@ impl Store {
         checked_at: i64,
         connected_key: &str,
     ) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let n = conn.execute(
             "UPDATE monitor SET ad_free_sub = ?2, ad_free_sub_at = ?3
              WHERE id = ?1
@@ -917,7 +945,7 @@ impl Store {
     /// needs, avoiding the heavy channel/recording/ad-break join of
     /// [`Self::list_monitors_with_channels`] on its frequent poll tick.
     pub fn twitch_monitors_for_ad_free(&self) -> Result<Vec<AdFreeRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT id, url, ad_free, ad_free_sub, ad_free_sub_at, last_state
              FROM monitor WHERE url LIKE '%twitch.tv%'",
@@ -939,7 +967,7 @@ impl Store {
 
     /// Clear all cached auto Twitch-sub ad-free results (e.g. on disconnect).
     pub fn clear_ad_free_sub(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "UPDATE monitor SET ad_free_sub = NULL, ad_free_sub_at = NULL",
             [],
@@ -962,7 +990,7 @@ impl Store {
         &self,
         recording_id: i64,
     ) -> Result<Option<(i64, Option<String>)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let row = conn
             .query_row(
                 "SELECT monitor_id, stream_id FROM recording WHERE id = ?1",
@@ -986,7 +1014,7 @@ impl Store {
         stream_id: Option<&str>,
         take_group: Option<&str>,
     ) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "INSERT INTO recording(monitor_id, started_at, output_path, status, went_live_at, went_live_approx, stream_id, take_group)
              VALUES(?1, ?2, ?3, 'recording', ?4, ?5, ?6, ?7)",
@@ -1006,7 +1034,7 @@ impl Store {
         output_path: &str,
         log_excerpt: &str,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "UPDATE recording SET ended_at=?2, bytes=?3, exit_code=?4, status=?5, output_path=?6, log_excerpt=?7 WHERE id=?1",
             params![id, ended_at, bytes, exit_code, status, output_path, log_excerpt],
@@ -1018,7 +1046,7 @@ impl Store {
     /// is left untouched. Refuses an in-progress ('recording') take so we never
     /// orphan a running capture from its history row; returns the rows removed.
     pub fn delete_recording(&self, id: i64) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let n = conn.execute(
             "DELETE FROM recording WHERE id = ?1 AND status <> 'recording'",
             params![id],
@@ -1029,7 +1057,7 @@ impl Store {
     /// Set the resolved "missed footage" (seconds) for a recording. Used by the
     /// from-start catch-up watcher (0 on catch-up) and finalize (the residual).
     pub fn set_recording_lost_secs(&self, id: i64, lost_secs: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "UPDATE recording SET lost_secs=?2 WHERE id=?1",
             params![id, lost_secs],
@@ -1039,14 +1067,14 @@ impl Store {
 
     /// Update the user-authored notes for a recording take.
     pub fn set_recording_notes(&self, id: i64, notes: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute("UPDATE recording SET notes=?2 WHERE id=?1", params![id, notes])?;
         Ok(())
     }
 
     /// Mark a recording as awaiting Twitch VOD resolution.
     pub fn set_recording_vod_pending(&self, id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "UPDATE recording SET vod_state='pending' WHERE id=?1",
             params![id],
@@ -1056,7 +1084,7 @@ impl Store {
 
     /// Record a confirmed Twitch VOD: the VOD id and total muted seconds (0 = clean).
     pub fn set_recording_vod_found(&self, id: i64, vod_id: &str, muted_secs: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "UPDATE recording SET vod_id=?2, vod_state='found', vod_muted_secs=?3 WHERE id=?1",
             params![id, vod_id, muted_secs],
@@ -1067,7 +1095,7 @@ impl Store {
     /// Record that no Twitch VOD was published for this take (VOD-less stream —
     /// the local recording may be the only surviving copy).
     pub fn set_recording_vod_not_published(&self, id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "UPDATE recording SET vod_state='not_published' WHERE id=?1",
             params![id],
@@ -1078,7 +1106,7 @@ impl Store {
     /// Return whether a recording's go-live time is approximate (detection-clock,
     /// not platform-reported). `false` on any error or missing row.
     pub fn recording_went_live_approx(&self, id: i64) -> bool {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.query_row(
             "SELECT went_live_approx FROM recording WHERE id=?1",
             params![id],
@@ -1095,7 +1123,7 @@ impl Store {
         at_secs: i64,
         duration_secs: i64,
     ) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         // OR IGNORE + the UNIQUE(recording_id, at_secs) index makes this a no-op
         // when re-attach re-observes a break already persisted before a restart.
         conn.execute(
@@ -1108,7 +1136,7 @@ impl Store {
     /// All ad breaks for a recording take, ordered by offset (for the cut-list
     /// tooltip/popup).
     pub fn ad_breaks_for_recording(&self, recording_id: i64) -> Result<Vec<AdBreak>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT id, recording_id, at_secs, duration_secs FROM ad_break
              WHERE recording_id = ?1 ORDER BY at_secs, id",
@@ -1133,7 +1161,7 @@ impl Store {
     /// (kind, ref_id) so a restarted take doesn't leave a stale entry.
     #[allow(clippy::too_many_arguments)]
     pub fn register_detached(&self, row: &DetachedRow) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "DELETE FROM detached_process WHERE kind=?1 AND ref_id=?2",
             params![row.kind.as_str(), row.ref_id],
@@ -1168,7 +1196,7 @@ impl Store {
 
     /// Drop a registry row once its download has been finalized or stopped.
     pub fn clear_detached(&self, kind: DetachedKind, ref_id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "DELETE FROM detached_process WHERE kind=?1 AND ref_id=?2",
             params![kind.as_str(), ref_id],
@@ -1179,7 +1207,7 @@ impl Store {
     /// All registry rows — the startup reconcile reads this to decide what to
     /// re-attach, finalize, or orphan.
     pub fn list_detached(&self) -> Result<Vec<DetachedRow>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT kind, ref_id, monitor_id, pid, proc_start, job_name, log_path,
                     capture_path, final_path, remux_to_mkv, take_group, spawn_build, started_at,
@@ -1221,7 +1249,7 @@ impl Store {
         old_value: &str,
         new_value: &str,
     ) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "INSERT INTO stream_meta_change(recording_id, at_secs, kind, old_value, new_value)
              VALUES(?1, ?2, ?3, ?4, ?5)",
@@ -1232,7 +1260,7 @@ impl Store {
 
     /// All metadata changes for a recording take, in chronological order.
     pub fn meta_changes_for_recording(&self, recording_id: i64) -> Result<Vec<StreamMetaChange>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT id, recording_id, at_secs, kind, old_value, new_value FROM stream_meta_change
              WHERE recording_id = ?1 ORDER BY at_secs, id",
@@ -1264,7 +1292,7 @@ impl Store {
         source: &str,
         segs: &[ScheduleSegment],
     ) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.db();
         let tx = conn.transaction()?;
         // Drop stale tombstones (canceled rows well past their instant): a
         // tombstone's job is to suppress re-insertion of a deleted event on the
@@ -1356,7 +1384,7 @@ impl Store {
     /// can't leave stale upcoming rows behind while historical rows accumulate.
     /// User-edited `"manual"` rows and tombstones (`canceled = 1`) always survive.
     pub fn clear_other_schedule_sources(&self, monitor_id: i64, keep: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "DELETE FROM schedule_segment
              WHERE monitor_id = ?1 AND source <> ?2 AND source <> 'manual'
@@ -1386,7 +1414,7 @@ impl Store {
         title: &str,
         category: &str,
     ) -> Result<usize> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.db();
         let tx = conn.transaction()?;
         // Capture the pre-edit state so we know whether a time-move tombstone is
         // needed and what source to attribute it to.
@@ -1426,7 +1454,7 @@ impl Store {
     /// treats the tombstoned instant as suppressed, so the occurrence stays gone.
     /// Returns the number of rows affected (`0` if it was already gone).
     pub fn delete_schedule_segment(&self, id: i64) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let n = conn.execute(
             "UPDATE schedule_segment SET canceled = 1 WHERE id = ?1",
             params![id],
@@ -1437,7 +1465,7 @@ impl Store {
     /// Delete every schedule segment from one `source` across all monitors. Used to
     /// purge imported Discord events when that import is turned off.
     pub fn clear_schedule_source(&self, source: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "DELETE FROM schedule_segment WHERE source = ?1",
             params![source],
@@ -1454,7 +1482,7 @@ impl Store {
         &self,
         after: i64,
     ) -> Result<std::collections::HashSet<i64>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT DISTINCT monitor_id FROM schedule_segment
              WHERE source <> 'discord' AND canceled = 0 AND start_time >= ?1",
@@ -1468,7 +1496,7 @@ impl Store {
     /// Upcoming (non-canceled, start ≥ `after`) schedule segments for one monitor,
     /// soonest first — for the Next stream popup.
     pub fn schedule_for_monitor(&self, monitor_id: i64, after: i64) -> Result<Vec<ScheduleSegment>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT id, monitor_id, start_time, end_time, title, category, canceled, video_id
              FROM schedule_segment
@@ -1501,7 +1529,7 @@ impl Store {
         monitor_id: i64,
         source: &str,
     ) -> Result<Vec<ScheduleSegment>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT id, monitor_id, start_time, end_time, title, category, canceled, video_id
              FROM schedule_segment
@@ -1529,7 +1557,7 @@ impl Store {
     /// NULL `video_id`. Used by the "Re-fetch missing video IDs" button to target
     /// only the channels that need a scrape pass, not every YouTube monitor.
     pub fn youtube_monitors_missing_video_ids(&self) -> Result<Vec<(i64, String)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT DISTINCT m.id, m.url
              FROM monitor m
@@ -1548,7 +1576,7 @@ impl Store {
     /// `(monitor_id, start_time, title)`. Drives the Next stream column. (SQLite
     /// returns the bare `title` from the same row as `MIN(start_time)`.)
     pub fn next_scheduled_streams(&self, after: i64) -> Result<Vec<(i64, i64, String)>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT monitor_id, MIN(start_time), title
              FROM schedule_segment
@@ -1568,7 +1596,7 @@ impl Store {
     /// first. Drives the Schedule calendar (one row per occurrence, unlike
     /// [`Self::next_scheduled_streams`] which collapses to the soonest per monitor).
     pub fn all_upcoming_schedule(&self, after: i64) -> Result<Vec<UpcomingStream>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT s.id, s.monitor_id, m.channel_id, c.name, m.url,
                     s.start_time, s.end_time, s.title, s.category, s.source,
@@ -1602,7 +1630,7 @@ impl Store {
     /// Mark any recordings still flagged 'recording' (i.e. left over from a
     /// crash) as 'orphaned'. Returns the number updated. Called on startup.
     pub fn mark_orphaned_recordings(&self, ended_at: i64) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let n = conn.execute(
             "UPDATE recording SET status='orphaned', ended_at=?1 WHERE status='recording'",
             params![ended_at],
@@ -1613,7 +1641,7 @@ impl Store {
     /// Mark a single in-flight recording 'orphaned' (used at startup for crash
     /// leftovers that aren't being resumed). No-op if it's no longer 'recording'.
     pub fn mark_recording_orphaned(&self, id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "UPDATE recording SET status='orphaned', ended_at=?2 WHERE id=?1 AND status='recording'",
             params![id, now_unix()],
@@ -1623,7 +1651,7 @@ impl Store {
 
     /// All monitors joined with their channel, ordered by channel name.
     pub fn list_monitors_with_channels(&self) -> Result<Vec<MonitorWithChannel>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT
                 c.id, c.name, c.url, c.platform, c.created_at,
@@ -1726,7 +1754,7 @@ impl Store {
 
     /// All recording takes for a monitor (oldest first), for the history tree.
     pub fn recordings_for_monitor(&self, monitor_id: i64) -> Result<Vec<crate::models::Recording>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT id, monitor_id, started_at, ended_at, status, bytes, exit_code,
                     COALESCE(output_path, ''), went_live_at, went_live_approx, lost_secs, stream_id,
@@ -1782,7 +1810,7 @@ impl Store {
     /// owned by the detach reconcile (`reconcile_detached`), not the legacy
     /// resume/orphan path. Only the core fields needed for handling are populated.
     pub fn inflight_recordings(&self) -> Result<Vec<crate::models::Recording>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT id, monitor_id, started_at, ended_at, COALESCE(output_path, ''),
                     went_live_at, went_live_approx, stream_id, take_group
@@ -1826,7 +1854,7 @@ impl Store {
     /// Distinct output directories across all monitors and videos — used to locate
     /// `.cache\` working dirs for the startup sweep.
     pub fn all_output_dirs(&self) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let mut stmt = conn
             .prepare("SELECT output_dir FROM monitor UNION SELECT output_dir FROM video")?;
         let rows = stmt
@@ -1837,7 +1865,7 @@ impl Store {
 
     /// Recent recordings, newest first.
     pub fn recent_recordings(&self, limit: i64) -> Result<Vec<RecInfo>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT id, monitor_id, status, bytes, started_at, went_live_at, went_live_approx,
                     COALESCE(output_path, '')
@@ -1864,7 +1892,7 @@ impl Store {
 
     /// Insert a new video download request (status starts as `queued`).
     pub fn insert_video(&self, v: &Video) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "INSERT INTO video(url, title, channel, platform, tool, quality, output_dir,
                 filename_template, auth_kind, auth_value, extra_args, auto_title, status, created_at,
@@ -1894,14 +1922,14 @@ impl Store {
 
     /// Persist a resolved/display title for a video (used by auto-detect title).
     pub fn set_video_title(&self, id: i64, title: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute("UPDATE video SET title=?2 WHERE id=?1", params![id, title])?;
         Ok(())
     }
 
     /// Persist a detected channel/uploader name for a video.
     pub fn set_video_channel(&self, id: i64, channel: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "UPDATE video SET channel=?2 WHERE id=?1",
             params![id, channel],
@@ -1911,7 +1939,7 @@ impl Store {
 
     /// Mark a video as started (status `downloading` + start time).
     pub fn set_video_started(&self, id: i64, started_at: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "UPDATE video SET status='downloading', started_at=?2 WHERE id=?1",
             params![id, started_at],
@@ -1921,7 +1949,7 @@ impl Store {
 
     /// Update only a video's status string (e.g. to `stopped`).
     pub fn set_video_status(&self, id: i64, status: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "UPDATE video SET status=?2 WHERE id=?1",
             params![id, status],
@@ -1941,7 +1969,7 @@ impl Store {
         output_path: &str,
         log_excerpt: &str,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "UPDATE video SET ended_at=?2, bytes=?3, exit_code=?4, status=?5, output_path=?6,
                 log_excerpt=?7 WHERE id=?1",
@@ -1960,7 +1988,7 @@ impl Store {
 
     /// Reset a finished video back to `queued` so it can be retried.
     pub fn reset_video_for_retry(&self, id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute(
             "UPDATE video SET status='queued', started_at=NULL, ended_at=NULL, bytes=0,
                 exit_code=NULL, log_excerpt='' WHERE id=?1",
@@ -1970,7 +1998,7 @@ impl Store {
     }
 
     pub fn delete_video(&self, id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         conn.execute("DELETE FROM video WHERE id=?1", params![id])?;
         Ok(())
     }
@@ -1979,7 +2007,7 @@ impl Store {
     /// Excludes videos with a `detached_process` registry entry — those outlived
     /// the app and are reconciled (re-attached or finalized) by the detach path.
     pub fn mark_orphaned_videos(&self, ended_at: i64) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let n = conn.execute(
             "UPDATE video SET status='orphaned', ended_at=?1
              WHERE status IN ('downloading','queued')
@@ -1990,7 +2018,7 @@ impl Store {
     }
 
     pub fn get_video(&self, id: i64) -> Result<Option<Video>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let v = conn
             .query_row(
                 "SELECT id, url, title, platform, tool, quality, output_dir, filename_template,
@@ -2007,7 +2035,7 @@ impl Store {
 
     /// All videos, newest first.
     pub fn list_videos(&self) -> Result<Vec<Video>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT id, url, title, platform, tool, quality, output_dir, filename_template,
                 auth_kind, auth_value, extra_args, status, output_path, bytes, exit_code,

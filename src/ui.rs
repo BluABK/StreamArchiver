@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
-use tracing::warn;
+use tracing::{debug, warn};
 use tray_icon::TrayIcon;
 
 use crate::app_core::AppCore;
@@ -520,6 +520,9 @@ pub struct StreamArchiverApp {
     show_processes: bool,
     processes: Vec<crate::app_core::ProcInfo>,
     processes_refreshed: Option<std::time::Instant>,
+    /// In-flight background load of the process list (spawned off the UI thread
+    /// to avoid blocking on the store mutex during `list_processes()`).
+    processes_load: Option<std::sync::mpsc::Receiver<Vec<crate::app_core::ProcInfo>>>,
     quitting: bool,
     /// UI-freeze watchdog heartbeat: stamped each frame so a background thread can
     /// detect (and surface as a native dialog) a hung UI thread. See [`crate::watchdog`].
@@ -748,6 +751,9 @@ pub struct StreamArchiverApp {
     confirm_quit_stop: bool,
     /// Cached (ocr_stats, global_stats) for the Stats view; None = not yet loaded.
     stats_snapshot: Option<(OcrStats, GlobalStats)>,
+    /// Channel id to scroll into view on the next Streams render, after a save
+    /// adds a new channel. Cleared once consumed. None = no pending scroll.
+    scroll_to_channel: Option<i64>,
 }
 
 impl StreamArchiverApp {
@@ -972,6 +978,7 @@ impl StreamArchiverApp {
             show_processes: false,
             processes: Vec::new(),
             processes_refreshed: None,
+            processes_load: None,
             quitting: false,
             heartbeat,
             view: View::Streams,
@@ -1060,6 +1067,7 @@ impl StreamArchiverApp {
             debug_test_title: "Test Stream Title".into(),
             debug_test_game: "Just Chatting".into(),
             stats_snapshot: None,
+            scroll_to_channel: None,
         };
         app.reload_rows();
         app.reload_videos();
@@ -1067,6 +1075,7 @@ impl StreamArchiverApp {
     }
 
     fn reload_rows(&mut self) {
+        let _t = std::time::Instant::now();
         match self.core.store.list_monitors_with_channels() {
             Ok(rows) => self.rows = rows,
             Err(e) => {
@@ -1110,6 +1119,12 @@ impl StreamArchiverApp {
         // Stream keys are "s<mid>:…" / "t<mid>:…"; keep only live monitors'.
         self.expanded_streams
             .retain(|k| stream_key_monitor(k).is_some_and(|mid| live_monitors.contains(&mid)));
+        let elapsed_ms = _t.elapsed().as_millis();
+        if elapsed_ms >= 100 {
+            warn!(elapsed_ms, rows = self.rows.len(), "reload_rows slow");
+        } else {
+            debug!(elapsed_ms, rows = self.rows.len(), "reload_rows");
+        }
     }
 
     fn reload_videos(&mut self) {
@@ -1350,9 +1365,11 @@ impl StreamArchiverApp {
 
         let store = self.core.store.clone();
         let (tx, rx) = std::sync::mpsc::channel();
+        debug!("spawning save-monitor thread");
         std::thread::Builder::new()
             .name("save-monitor".into())
             .spawn(move || {
+                let t = std::time::Instant::now();
                 let result: Result<SaveRows, String> = (|| {
                     // Resolve the channel_id, creating a new container if needed.
                     let channel_id = match new_channel_name {
@@ -1373,6 +1390,7 @@ impl StreamArchiverApp {
                     let channels = store.list_channels().map_err(|e| e.to_string())?;
                     Ok(SaveRows { rows, channels, next_streams })
                 })();
+                debug!(elapsed_ms = t.elapsed().as_millis(), ok = result.is_ok(), "save-monitor done");
                 let _ = tx.send(result);
             })
             .ok();
@@ -1409,15 +1427,18 @@ impl StreamArchiverApp {
         };
         match recv {
             Ok(Ok(save)) => {
+                debug!(rows = save.rows.len(), channels = save.channels.len(), "save-monitor result installed");
                 self.pending_save = None;
                 self.status = "Saved.".into();
                 self.install_save_rows(save);
             }
-            Ok(Err(e)) => {
+            Ok(Err(ref e)) => {
+                warn!(error = %e, "save-monitor thread returned error");
                 self.pending_save = None;
                 self.status = format!("Error saving: {e}");
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                warn!("save-monitor thread disconnected without sending a result");
                 self.pending_save = None;
                 self.status = "Save failed (internal error).".into();
             }
@@ -1427,6 +1448,8 @@ impl StreamArchiverApp {
 
     /// Install a completed save's rows into the UI, mirroring `reload_rows`.
     fn install_save_rows(&mut self, save: SaveRows) {
+        // Capture existing channel ids before replacing, to detect the new one.
+        let old_channel_ids: HashSet<i64> = self.channels.iter().map(|c| c.id).collect();
         self.rows = save.rows;
         let by_mid: HashMap<i64, (i64, String)> = save
             .next_streams
@@ -1440,6 +1463,11 @@ impl StreamArchiverApp {
             }
         }
         self.channels = save.channels;
+        // Scroll to the newly-added channel on the next render so it's visible
+        // regardless of where it lands in the alphabetically-sorted list.
+        if let Some(new_ch) = self.channels.iter().find(|c| !old_channel_ids.contains(&c.id)) {
+            self.scroll_to_channel = Some(new_ch.id);
+        }
         let live_channels: HashSet<i64> = self.channels.iter().map(|c| c.id).collect();
         let live_monitors: HashSet<i64> = self.rows.iter().map(|r| r.monitor.id).collect();
         self.rec_cache.retain(|k, _| live_monitors.contains(k));
@@ -6027,11 +6055,14 @@ impl StreamArchiverApp {
             let store = Arc::clone(&self.core.store);
             let monitor_id = m.monitor.id;
             let (tx, rx) = std::sync::mpsc::channel();
+            debug!(monitor_id, "spawning fd-recordings-load thread");
             std::thread::Builder::new()
                 .name("fd-recordings-load".into())
                 .spawn(move || {
+                    let t = std::time::Instant::now();
                     let recs = store.recordings_for_monitor(monitor_id).unwrap_or_default();
                     let default_idx = recs.len().saturating_sub(1);
+                    debug!(elapsed_ms = t.elapsed().as_millis(), monitor_id, count = recs.len(), "fd-recordings-load done");
                     let _ = tx.send((recs, default_idx));
                 })
                 .ok();
@@ -6304,11 +6335,14 @@ impl StreamArchiverApp {
                     let store = Arc::clone(&self.core.store);
                     let monitor_id = m.monitor.id;
                     let (tx, rx) = std::sync::mpsc::channel();
+                    debug!(monitor_id, "spawning fd-recordings-load thread (monitor change)");
                     std::thread::Builder::new()
                         .name("fd-recordings-load".into())
                         .spawn(move || {
+                            let t = std::time::Instant::now();
                             let recs = store.recordings_for_monitor(monitor_id).unwrap_or_default();
                             let default_idx = recs.len().saturating_sub(1);
+                            debug!(elapsed_ms = t.elapsed().as_millis(), monitor_id, count = recs.len(), "fd-recordings-load done");
                             let _ = tx.send((recs, default_idx));
                         })
                         .ok();
@@ -8462,6 +8496,9 @@ impl StreamArchiverApp {
         // Whether the Actions column is shown (Settings → Display). When off it's
         // skipped in the builder, header, and every renderer so the counts match.
         let show_actions = self.show_actions;
+        // Snapshot before the table closure so we can read it inside (which only
+        // has an immutable borrow of self) and clear it afterwards.
+        let scroll_to_cid = self.scroll_to_channel;
 
         // Fill the available height so the horizontal scrollbar sits at the
         // bottom of the window rather than directly under the (short) row list.
@@ -8639,6 +8676,11 @@ impl StreamArchiverApp {
                                     tr.set_selected(tint.is_some());
                                     let mut disc = false;
                                     tr.col(|ui| {
+                                        // Scroll the new channel into view on the
+                                        // first render after a save.
+                                        if scroll_to_cid == Some(cid) {
+                                            ui.scroll_to_cursor(Some(egui::Align::Center));
+                                        }
                                         let mut on = ch.enabled;
                                         let cb = ui
                                             .add_enabled(ninst > 0, egui::Checkbox::new(&mut on, ""))
@@ -9294,6 +9336,11 @@ impl StreamArchiverApp {
             });
         self.streams_sort = sort;
         self.streams_filters = filters;
+        // Consume the scroll target: it fired (or the channel was filtered out)
+        // — either way, clear it so we don't keep requesting scroll every frame.
+        if scroll_to_cid.is_some() {
+            self.scroll_to_channel = None;
+        }
         if let Some(rid) = open_ad_popup {
             self.ad_popup = Some(rid);
         }
@@ -11549,16 +11596,47 @@ impl StreamArchiverApp {
         if !self.show_processes {
             return;
         }
+        // Drain a completed background load first.
+        if let Some(rx) = &self.processes_load {
+            match rx.try_recv() {
+                Ok(procs) => {
+                    debug!(count = procs.len(), "list-processes result installed");
+                    self.processes = procs;
+                    self.processes_refreshed = Some(Instant::now());
+                    self.processes_load = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    warn!("list-processes thread disconnected without sending");
+                    self.processes_load = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
         // Throttle the snapshot (each row does a pid_alive + a couple DB reads).
+        // Spawn off the UI thread so the store-mutex wait can't freeze the UI.
         let stale = self
             .processes_refreshed
             .map(|t| t.elapsed() >= Duration::from_millis(1500))
             .unwrap_or(true);
-        if stale {
-            self.processes = self.core.list_processes();
-            self.processes_refreshed = Some(Instant::now());
+        if stale && self.processes_load.is_none() {
+            let core = self.core.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            debug!("spawning list-processes thread");
+            std::thread::Builder::new()
+                .name("list-processes".into())
+                .spawn(move || {
+                    let t = std::time::Instant::now();
+                    let procs = core.list_processes();
+                    debug!(elapsed_ms = t.elapsed().as_millis(), count = procs.len(), "list-processes done");
+                    let _ = tx.send(procs);
+                })
+                .ok();
+            self.processes_load = Some(rx);
+            // Keep repainting until the load arrives.
+            ctx.request_repaint_after(Duration::from_millis(50));
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(1500));
         }
-        ctx.request_repaint_after(Duration::from_millis(1500));
 
         let now = now_unix();
         let mut open = true;
@@ -12596,9 +12674,11 @@ impl StreamArchiverApp {
             let asset_platforms_bg = asset_platforms.to_vec();
             let ctx_bg = ctx.clone();
             let store = self.core.store.clone();
+            debug!(channel_id = cid, "spawning props-load thread");
             let spawned = std::thread::Builder::new()
                 .name("props-load".into())
                 .spawn(move || {
+                    let t = std::time::Instant::now();
                     // None of this touches `self`. egui's `load_texture` (inside
                     // `resolve_channel_icon` / `load_channel_asset_thumbs`) is thread-safe:
                     // it queues a `TexturesDelta` the paint thread uploads later.
@@ -12613,6 +12693,7 @@ impl StreamArchiverApp {
                         source_order: load_source_order(&store),
                         scope: load_channel_scope(&store, id),
                     };
+                    debug!(elapsed_ms = t.elapsed().as_millis(), channel_id = id, "props-load done");
                     // Receiver gone (window closed) → the send is simply dropped.
                     let _ = tx.send(loaded);
                     // Wake the UI thread to install the bundle even if otherwise idle.
