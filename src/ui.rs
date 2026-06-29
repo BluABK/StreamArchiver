@@ -639,6 +639,22 @@ pub struct StreamArchiverApp {
     /// spawn and skip their insert if it changed, so a decode finishing after a
     /// popup-close / asset-refetch can't resurrect a stale (leaked) cache entry.
     emote_epoch: Arc<AtomicU64>,
+    /// Loaded mainpage image assets (icon + banner per platform) for the channel
+    /// Properties thumbnail strip, keyed by channel id. Full-resolution textures
+    /// (so Alt-preview is crisp); loaded on window open, dropped on close/refetch.
+    channel_asset_thumbs: HashMap<i64, Vec<AssetThumb>>,
+    /// Per-provider *viewable* emote counts for the open Properties window, keyed by
+    /// channel id. Cached because the count is derived from the same enumeration the
+    /// viewer uses (one `fs::metadata` per emote) — recomputing it every frame would
+    /// be hundreds of stat calls per repaint. Invalidated wherever `channel_asset_thumbs`
+    /// is (open/rename/refetch/close).
+    channel_emote_counts: HashMap<i64, [(EmoteProvider, usize); 4]>,
+    /// Open emote-viewer window (None = closed). Reuses the shared `emote_anim`
+    /// decode cache, so its emotes animate against the same clock as chat replay.
+    emote_viewer: Option<EmoteViewer>,
+    /// GPU textures for the third-party emote-provider logos (7TV/BTTV), uploaded
+    /// once on first use of the emote launcher buttons.
+    provider_tex: Option<ProviderTextures>,
     /// Per-channel Twitch broadcaster name colour (from `name_color.txt`, fetched
     /// via Helix). `None` = looked up but the streamer set no colour / not Twitch.
     /// Tints the channel name in the Streams list; cleared with `channel_icons`.
@@ -970,6 +986,10 @@ impl StreamArchiverApp {
             channel_icons_small: HashMap::new(),
             emote_anim: Arc::new(Mutex::new(HashMap::new())),
             emote_epoch: Arc::new(AtomicU64::new(0)),
+            channel_asset_thumbs: HashMap::new(),
+            channel_emote_counts: HashMap::new(),
+            emote_viewer: None,
+            provider_tex: None,
             channel_twitch_colors: HashMap::new(),
             videos_sort: SortState::default(),
             videos_filters: vec![String::new(); VIDEO_COLS],
@@ -1165,6 +1185,12 @@ impl StreamArchiverApp {
                             self.channel_icons.clear();
                             self.channel_icons_small.clear();
                             self.channel_twitch_colors.clear();
+                            // Banners/icons may have changed — drop the cached
+                            // Properties thumbnails so they reload from disk.
+                            self.channel_asset_thumbs.clear();
+                            // Emote sets may have changed too — drop the cached counts
+                            // so the launcher buttons re-enumerate.
+                            self.channel_emote_counts.clear();
                             // Drop decoded emote frames so refreshed images re-decode
                             // from disk at their stable paths.
                             self.clear_emote_cache();
@@ -3879,6 +3905,106 @@ impl PlatformTextures {
     }
 }
 
+/// Third-party emote-provider brand logos, rasterized from their SVGs to 64×64
+/// straight-alpha RGBA at build time (see `decode_provider_logos` in build.rs) and
+/// embedded so no SVG decoder ships in the binary. Used for the emote-viewer
+/// launcher buttons (7TV blue, BTTV red). FFZ has no embedded logo (text button).
+const LOGO_SRC: usize = 64;
+static LOGO_7TV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/logo_7tv.rgba"));
+static LOGO_BTTV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/logo_bttv.rgba"));
+
+/// GPU textures for the emote-provider logos, uploaded once and cheaply cloned.
+#[derive(Clone)]
+struct ProviderTextures {
+    seventv: egui::TextureHandle,
+    bttv: egui::TextureHandle,
+}
+
+impl ProviderTextures {
+    fn load(ctx: &egui::Context) -> ProviderTextures {
+        let mk = |name: &str, rgba: &[u8]| {
+            let image = egui::ColorImage::from_rgba_unmultiplied([LOGO_SRC, LOGO_SRC], rgba);
+            ctx.load_texture(format!("emote_logo_{name}"), image, egui::TextureOptions::LINEAR)
+        };
+        ProviderTextures {
+            seventv: mk("7tv", LOGO_7TV),
+            bttv: mk("bttv", LOGO_BTTV),
+        }
+    }
+}
+
+/// Which emote provider the emote viewer is showing. Twitch is first-party
+/// (directory-listed, opaque ids, no codes); the rest read their JSON manifests.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EmoteProvider {
+    Twitch,
+    SevenTv,
+    Bttv,
+    Ffz,
+}
+
+impl EmoteProvider {
+    fn label(self) -> &'static str {
+        match self {
+            EmoteProvider::Twitch => "Twitch",
+            EmoteProvider::SevenTv => "7TV",
+            EmoteProvider::Bttv => "BetterTTV",
+            EmoteProvider::Ffz => "FrankerFaceZ",
+        }
+    }
+    /// Manifest filename for third-party providers; `None` for Twitch (no manifest).
+    fn manifest(self) -> Option<&'static str> {
+        match self {
+            EmoteProvider::Twitch => None,
+            EmoteProvider::SevenTv => Some("7tv.json"),
+            EmoteProvider::Bttv => Some("bttv.json"),
+            EmoteProvider::Ffz => Some("ffz.json"),
+        }
+    }
+}
+
+/// Open emote-viewer window: shows one provider's emotes for one channel. The emote
+/// list is enumerated once on open (a dir-list / manifest parse) and split into
+/// still-present (`active`) and gone-from-cache (`deprecated`) so the window can
+/// repaint — e.g. for animation — without re-touching the disk each frame.
+struct EmoteViewer {
+    channel_name: String,
+    provider: EmoteProvider,
+    active: Vec<ViewerEmote>,
+    deprecated: Vec<ViewerEmote>,
+}
+
+impl EmoteViewer {
+    fn new(channel_name: String, provider: EmoteProvider) -> EmoteViewer {
+        let (active, deprecated): (Vec<ViewerEmote>, Vec<ViewerEmote>) =
+            enumerate_provider_emotes(&channel_name, provider)
+                .into_iter()
+                .partition(|e| e.exists);
+        EmoteViewer { channel_name, provider, active, deprecated }
+    }
+}
+
+/// A loaded mainpage image asset (icon/banner) shown as a thumbnail in the channel
+/// Properties window. Holds the full-resolution texture so the global Alt-hover
+/// preview shows it at original size; the strip itself draws it small.
+#[derive(Clone)]
+struct AssetThumb {
+    /// Human label, e.g. "Twitch icon" / "YouTube banner".
+    label: String,
+    /// Absolute path on disk (opened on click).
+    path: std::path::PathBuf,
+    tex: egui::TextureHandle,
+    dims: (u32, u32),
+}
+
+/// One emote row for the emote viewer: a code resolved to its on-disk image, plus
+/// whether that image still exists (absent ⇒ shown in the "Deprecated" section).
+struct ViewerEmote {
+    name: String,
+    path: std::path::PathBuf,
+    exists: bool,
+}
+
 /// Draw one platform's icon (its favicon, or the colored badge for Generic),
 /// returning the response so callers can attach the platform name on hover.
 fn platform_icon(ui: &mut egui::Ui, ptex: &PlatformTextures, platform: Platform) -> egui::Response {
@@ -4183,6 +4309,7 @@ impl eframe::App for StreamArchiverApp {
         self.chat_popup_window(ui.ctx());
         self.instance_properties_window(ui.ctx());
         self.channel_properties_window(ui.ctx());
+        self.emote_viewer_window(ui.ctx());
         self.recording_properties_window(ui.ctx());
         self.processes_window(ui.ctx());
         self.format_designer_window(ui.ctx());
@@ -4592,6 +4719,8 @@ impl StreamArchiverApp {
                             self.channel_icons.remove(&id);
                             self.channel_icons_small.remove(&id);
                             self.channel_twitch_colors.remove(&id);
+                            self.channel_asset_thumbs.remove(&id);
+                            self.channel_emote_counts.remove(&id);
                         }
                         self.reload_rows();
                     }
@@ -8831,6 +8960,8 @@ impl StreamArchiverApp {
             self.channel_icons.remove(&cid);
             self.channel_icons_small.remove(&cid);
             self.channel_twitch_colors.remove(&cid);
+            self.channel_asset_thumbs.remove(&cid);
+            self.channel_emote_counts.remove(&cid);
         }
         if let Some(id) = acts.start {
             self.core.manual(ManualCommand::Start(id));
@@ -11725,41 +11856,8 @@ impl StreamArchiverApp {
                 draw_alt_image_preview(ctx);
             },
         );
-        // Decode any newly-seen emotes off the UI thread, then enforce the LRU
-        // memory budget on the (now drawn) cache. Bound how many decodes start per
-        // frame so opening a chat with hundreds of distinct emotes doesn't spawn a
-        // blocking-thread storm; the over-cap ones revert to "unseen" and retry next
-        // frame.
-        const MAX_DECODE_PER_FRAME: usize = 64;
-        if decode_misses.len() > MAX_DECODE_PER_FRAME {
-            let mut g = self.emote_anim.lock().unwrap_or_else(|e| e.into_inner());
-            for path in &decode_misses[MAX_DECODE_PER_FRAME..] {
-                g.remove(path);
-            }
-            decode_misses.truncate(MAX_DECODE_PER_FRAME);
-        }
-        let epoch = self.emote_epoch.load(Ordering::SeqCst);
-        for path in decode_misses {
-            let cache = self.emote_anim.clone();
-            let epoch_at = self.emote_epoch.clone();
-            let ctx2 = ctx.clone();
-            self.core.rt.spawn_blocking(move || {
-                let decoded = std::fs::read(&path).ok().and_then(|b| crate::emote_anim::decode(&b));
-                let entry = match decoded {
-                    Some((imgs, delays)) => crate::emote_anim::EmoteLoad::Decoded(imgs, delays),
-                    None => crate::emote_anim::EmoteLoad::Failed,
-                };
-                let mut g = cache.lock().unwrap_or_else(|e| e.into_inner());
-                // Skip if the cache was cleared (popup closed / assets refetched)
-                // since this decode started — don't resurrect a stale entry.
-                if epoch_at.load(Ordering::SeqCst) == epoch {
-                    g.insert(path, entry);
-                    drop(g);
-                    ctx2.request_repaint();
-                }
-            });
-        }
-        evict_emote_cache(&self.emote_anim, now);
+        // Decode any newly-seen emotes off the UI thread, then LRU-evict the cache.
+        self.pump_emote_decodes(decode_misses, now, ctx);
 
         // Tail-reload: re-parse the chat file in the background while the
         // recording is still live so new messages appear without re-opening.
@@ -11799,6 +11897,48 @@ impl StreamArchiverApp {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+    }
+
+    /// Decode newly-seen emotes off the UI thread, then enforce the LRU memory
+    /// budget on the (now drawn) cache. Bounds how many decodes start per frame so
+    /// opening a view with hundreds of distinct emotes doesn't spawn a blocking-
+    /// thread storm; the over-cap ones revert to "unseen" and retry next frame. The
+    /// epoch guard drops results whose cache was cleared (view closed / assets
+    /// refetched) mid-decode. Shared by the chat replay popup and the emote viewer.
+    fn pump_emote_decodes(
+        &self,
+        mut decode_misses: Vec<std::path::PathBuf>,
+        now: f64,
+        ctx: &egui::Context,
+    ) {
+        const MAX_DECODE_PER_FRAME: usize = 64;
+        if decode_misses.len() > MAX_DECODE_PER_FRAME {
+            let mut g = self.emote_anim.lock().unwrap_or_else(|e| e.into_inner());
+            for path in &decode_misses[MAX_DECODE_PER_FRAME..] {
+                g.remove(path);
+            }
+            decode_misses.truncate(MAX_DECODE_PER_FRAME);
+        }
+        let epoch = self.emote_epoch.load(Ordering::SeqCst);
+        for path in decode_misses {
+            let cache = self.emote_anim.clone();
+            let epoch_at = self.emote_epoch.clone();
+            let ctx2 = ctx.clone();
+            self.core.rt.spawn_blocking(move || {
+                let decoded = std::fs::read(&path).ok().and_then(|b| crate::emote_anim::decode(&b));
+                let entry = match decoded {
+                    Some((imgs, delays)) => crate::emote_anim::EmoteLoad::Decoded(imgs, delays),
+                    None => crate::emote_anim::EmoteLoad::Failed,
+                };
+                let mut g = cache.lock().unwrap_or_else(|e| e.into_inner());
+                if epoch_at.load(Ordering::SeqCst) == epoch {
+                    g.insert(path, entry);
+                    drop(g);
+                    ctx2.request_repaint();
+                }
+            });
+        }
+        evict_emote_cache(&self.emote_anim, now);
     }
 
     /// Instance (monitor) properties window — header + monitor-specific info.
@@ -12008,7 +12148,22 @@ impl StreamArchiverApp {
             .or_insert_with(|| resolve_channel_icon(&ch, &platforms, ctx))
             .clone();
 
+        // Mainpage asset thumbnails (icon + banner per platform). Loaded full-res
+        // once per open; the clone is cheap (Arc-backed texture handles).
+        let thumbs = self
+            .channel_asset_thumbs
+            .entry(ch.id)
+            .or_insert_with(|| load_channel_asset_thumbs(&ch, &platforms, ctx))
+            .clone();
+        // Viewable emote counts per provider — enumerated once per open (one stat per
+        // emote) and cached, since this runs every frame the window is up.
+        let emote_counts = *self
+            .channel_emote_counts
+            .entry(ch.id)
+            .or_insert_with(|| emote_provider_counts(&ch.name));
+
         let mut pref_change: Option<Option<Platform>> = None;
+        let mut open_emote_viewer: Option<EmoteProvider> = None;
 
         if self.channel_cfg_draft.as_ref().map(|(id, _)| *id) != Some(ch.id) {
             self.channel_cfg_draft = Some((ch.id, load_channel_cfg(&self.core.store, ch.id)));
@@ -12081,6 +12236,41 @@ impl StreamArchiverApp {
 
                 ui.separator();
 
+                // ── Mainpage asset thumbnails ────────────────────────────
+                // A visual overview of every original icon/banner this channel
+                // has across its platforms. Hover for size, Alt to preview at
+                // full resolution, click to open the file.
+                if !thumbs.is_empty() {
+                    ui.add_space(2.0);
+                    ui.strong("Assets");
+                    ui.add_space(3.0);
+                    const THUMB_H: f32 = 56.0;
+                    ui.horizontal_wrapped(|ui| {
+                        for t in &thumbs {
+                            let (w, h) = t.dims;
+                            let aspect = if h > 0 { w as f32 / h as f32 } else { 1.0 };
+                            // Clamp very wide banners so one asset can't dominate.
+                            let width = (THUMB_H * aspect).min(THUMB_H * 4.0);
+                            let resp = ui
+                                .add(
+                                    egui::Image::from_texture(&t.tex)
+                                        .fit_to_exact_size(egui::vec2(width, THUMB_H))
+                                        .corner_radius(egui::CornerRadius::same(4))
+                                        .sense(egui::Sense::click()),
+                                )
+                                .on_hover_text(format!(
+                                    "{} — {w}×{h} px\nAlt: preview full size · click: open file",
+                                    t.label,
+                                ));
+                            queue_alt_image_preview(ui.ctx(), &resp, &t.tex);
+                            if resp.clicked() {
+                                crate::platform::open_path(&t.path);
+                            }
+                        }
+                    });
+                    ui.separator();
+                }
+
                 // ── Channel ─────────────────────────────────────────────
                 ui.strong("Channel");
                 egui::Grid::new("props_ch")
@@ -12132,6 +12322,8 @@ impl StreamArchiverApp {
                                 self.channel_icons.remove(&ch.id);
                                 self.channel_icons_small.remove(&ch.id);
                                 self.channel_twitch_colors.remove(&ch.id);
+                                self.channel_asset_thumbs.remove(&ch.id);
+                                self.channel_emote_counts.remove(&ch.id);
                                 self.status = format!("Refetching assets for {}…", ch.name);
                             }
                         }
@@ -12244,6 +12436,48 @@ impl StreamArchiverApp {
                                 ui.end_row();
                             }
                         });
+
+                    // Emote viewers: one launcher per provider that has emotes.
+                    // Twitch (first-party) uses a generic emote glyph; the third
+                    // parties use their brand logo (7TV/BTTV) or a text badge (FFZ).
+                    if emote_counts.iter().any(|(_, n)| *n > 0) {
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.strong("View emotes:");
+                            let ptex = self
+                                .provider_tex
+                                .get_or_insert_with(|| ProviderTextures::load(ui.ctx()))
+                                .clone();
+                            for (provider, count) in emote_counts {
+                                if count == 0 {
+                                    continue;
+                                }
+                                let resp = match provider {
+                                    EmoteProvider::SevenTv => ui.add(egui::ImageButton::new(
+                                        egui::Image::from_texture(&ptex.seventv)
+                                            .fit_to_exact_size(egui::vec2(18.0, 18.0)),
+                                    )),
+                                    EmoteProvider::Bttv => ui.add(egui::ImageButton::new(
+                                        egui::Image::from_texture(&ptex.bttv)
+                                            .fit_to_exact_size(egui::vec2(18.0, 18.0)),
+                                    )),
+                                    EmoteProvider::Twitch => ui.button("😀"),
+                                    EmoteProvider::Ffz => ui.button("FFZ"),
+                                };
+                                if resp
+                                    .on_hover_text(format!(
+                                        "View {} {} emote{} for this channel",
+                                        count,
+                                        provider.label(),
+                                        if count == 1 { "" } else { "s" },
+                                    ))
+                                    .clicked()
+                                {
+                                    open_emote_viewer = Some(provider);
+                                }
+                            }
+                        });
+                    }
                 }
 
                 // ── Schedule sources (per-channel) ───────────────────────
@@ -12386,6 +12620,11 @@ impl StreamArchiverApp {
             },
         );
 
+        // A launcher button was clicked above — open the emote viewer for it.
+        if let Some(provider) = open_emote_viewer {
+            self.emote_viewer = Some(EmoteViewer::new(ch.name.clone(), provider));
+        }
+
         if cfg_dirty {
             if let Some((cid, cfg)) = &self.channel_cfg_draft {
                 if let Err(e) = save_channel_cfg(&self.core.store, *cid, cfg) {
@@ -12407,6 +12646,124 @@ impl StreamArchiverApp {
             self.channel_properties_popup = None;
             self.channel_cfg_draft = None;
             self.channel_scope_draft = None;
+            // Free the full-resolution thumbnail textures (only this window uses
+            // them); they reload from disk on the next open.
+            self.channel_asset_thumbs.remove(&cid);
+            self.channel_emote_counts.remove(&cid);
+        }
+    }
+
+    /// Emote-viewer window — every emote one provider has for one channel, drawn as a
+    /// grid of images with their codes. Emotes whose image file is gone (the manifest
+    /// still lists them, but the file was removed upstream) appear separately under
+    /// "Deprecated". Reuses the shared `emote_anim` decode cache, so emotes animate
+    /// against the same clock as chat replay.
+    #[allow(deprecated)]
+    fn emote_viewer_window(&mut self, ctx: &egui::Context) {
+        if self.emote_viewer.is_none() {
+            return;
+        }
+        // Render toggles + shared cache copied out before borrowing the viewer, so
+        // the closure never has to touch `self`.
+        let anim_cache = self.emote_anim.clone();
+        let animate_emotes = self.animate_emotes;
+        let now = ctx.input(|i| i.time);
+        let mut decode_misses: Vec<std::path::PathBuf> = Vec::new();
+
+        // Borrow the (already-enumerated) emote lists; no disk access per frame.
+        let viewer = self.emote_viewer.as_ref().expect("checked Some above");
+        let provider = viewer.provider;
+        let channel_name = &viewer.channel_name;
+        let active = &viewer.active;
+        let deprecated = &viewer.deprecated;
+
+        let mut open = true;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("emote_viewer_vp"),
+            egui::ViewportBuilder::default()
+                .with_title(format!("{} emotes — {}", provider.label(), channel_name))
+                .with_inner_size([560.0, 600.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading(provider.label());
+                        // Active tally, plus the deprecated count when any — so the two
+                        // reconcile with the launcher button (which counts the universe).
+                        let mut tally = format!(
+                            "· {} emote{}",
+                            active.len(),
+                            if active.len() == 1 { "" } else { "s" },
+                        );
+                        if !deprecated.is_empty() {
+                            tally.push_str(&format!(" · {} deprecated", deprecated.len()));
+                        }
+                        ui.label(egui::RichText::new(tally).weak());
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        // Only claim "no emotes" when there is genuinely nothing to show.
+                        // If `active` is empty but `deprecated` is not, the Deprecated
+                        // section below carries the explanation — saying "no emotes
+                        // available" above a populated list would contradict itself.
+                        if active.is_empty() && deprecated.is_empty() {
+                            ui.add_space(8.0);
+                            ui.weak("No emotes available for this provider.");
+                        } else if !active.is_empty() {
+                            emote_viewer_grid(
+                                ui,
+                                active,
+                                &anim_cache,
+                                animate_emotes,
+                                now,
+                                &mut decode_misses,
+                                ctx,
+                                false,
+                            );
+                        }
+                        // The "Deprecated" section appears only when the manifest
+                        // still references codes whose image is gone from the cache.
+                        if !deprecated.is_empty() {
+                            ui.add_space(12.0);
+                            ui.separator();
+                            ui.strong("Deprecated (no longer available)");
+                            ui.label(
+                                egui::RichText::new(
+                                    "Still listed in this channel's emote manifest, but the image \
+                                     is gone from the cache (removed upstream). Refetch assets to \
+                                     prune them.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                            ui.add_space(6.0);
+                            emote_viewer_grid(
+                                ui,
+                                deprecated,
+                                &anim_cache,
+                                animate_emotes,
+                                now,
+                                &mut decode_misses,
+                                ctx,
+                                true,
+                            );
+                        }
+                    });
+                });
+                draw_alt_image_preview(ctx);
+            },
+        );
+
+        self.pump_emote_decodes(decode_misses, now, ctx);
+
+        if !open {
+            self.emote_viewer = None;
+            // Free decoded emote frames now the window is closed (mirrors the chat
+            // popup). If the chat replay is still open it re-decodes its visible
+            // emotes next frame — cheap and bounded.
+            self.clear_emote_cache();
         }
     }
 }
@@ -12506,6 +12863,155 @@ fn build_emote_map(name: &str) -> HashMap<String, std::path::PathBuf> {
         plat.join("ffz").join("emotes").join(format!("{}.{}", e.id, e.ext))
     });
     map
+}
+
+/// Decode an image file into an egui texture, returning the texture and its pixel
+/// dimensions. `key` must be unique per logical image so textures never collide.
+/// Returns `None` when the file is missing or undecodable.
+fn load_image_texture(
+    path: &std::path::Path,
+    ctx: &egui::Context,
+    key: &str,
+) -> Option<(egui::TextureHandle, (u32, u32))> {
+    let bytes = std::fs::read(path).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let (w, h) = (img.width(), img.height());
+    let color_image =
+        egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &img.into_raw());
+    let tex = ctx.load_texture(format!("asset_{key}"), color_image, egui::TextureOptions::LINEAR);
+    Some((tex, (w, h)))
+}
+
+/// Load a channel's mainpage image assets (the `icon.*` and `banner.*` of each
+/// platform — never emotes or badges) into textures for the Properties thumbnail
+/// strip, in a stable platform/asset order. Skips assets that are absent.
+fn load_channel_asset_thumbs(
+    channel: &Channel,
+    platforms: &[Platform],
+    ctx: &egui::Context,
+) -> Vec<AssetThumb> {
+    let mut out: Vec<AssetThumb> = Vec::new();
+    for &p in platforms.iter().filter(|p| **p != Platform::Generic) {
+        let dir = channel_asset_dir(&channel.name, p);
+        for (prefix, kind) in [("icon.", "icon"), ("banner.", "banner")] {
+            let Some(path) = prop_find_first(&dir, prefix) else { continue };
+            let key = format!("thumb_{}_{}_{kind}", channel.id, p.as_str());
+            if let Some((tex, dims)) = load_image_texture(&path, ctx, &key) {
+                out.push(AssetThumb {
+                    label: format!("{} {kind}", p.label()),
+                    path,
+                    tex,
+                    dims,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Count the emotes per provider the viewer would list for a channel — its whole
+/// *universe* of named entries (active + deprecated), derived from the very same
+/// [`enumerate_provider_emotes`] the viewer enumerates. Using that one source means the
+/// launcher button's count can never drift from what the viewer shows: an empty-code
+/// manifest entry is excluded here exactly as the viewer excludes it, while a
+/// missing/0-byte image still counts (it appears in the viewer's "Deprecated" section).
+/// Counting the universe — not just the active ones — keeps the button (and thus the
+/// Deprecated section) reachable even for a provider whose emotes were all removed
+/// upstream. Order: Twitch, 7TV, BTTV, FFZ — the order the launcher buttons are drawn
+/// in. This stats one file per emote, so callers cache the result rather than recompute
+/// it per frame.
+fn emote_provider_counts(name: &str) -> [(EmoteProvider, usize); 4] {
+    [
+        EmoteProvider::Twitch,
+        EmoteProvider::SevenTv,
+        EmoteProvider::Bttv,
+        EmoteProvider::Ffz,
+    ]
+    .map(|p| (p, enumerate_provider_emotes(name, p).len()))
+}
+
+/// Enumerate a provider's emotes for a channel, resolved to on-disk image paths.
+/// Third parties read their manifest and resolve into the per-channel/shared caches
+/// exactly like [`build_emote_map`]; an entry whose image is gone is kept but marked
+/// `exists = false` (the viewer lists those under "Deprecated"). Twitch is
+/// directory-listed by opaque id (no codes, so never deprecated). Sorted by code.
+fn enumerate_provider_emotes(name: &str, provider: EmoteProvider) -> Vec<ViewerEmote> {
+    use crate::assets::EmoteManifestEntry;
+    let emotes_dir = channel_asset_dir(name, Platform::Twitch).join("emotes");
+    let plat = crate::app_paths::platform_assets_dir();
+
+    if provider == EmoteProvider::Twitch {
+        let mut out: Vec<ViewerEmote> = std::fs::read_dir(emotes_dir.join("twitch"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
+            .map(|p| {
+                let name = p
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                ViewerEmote { name, path: p, exists: true }
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        return out;
+    }
+
+    let Some(manifest_file) = provider.manifest() else { return Vec::new() };
+    let entries: Vec<EmoteManifestEntry> =
+        std::fs::read_to_string(emotes_dir.join(manifest_file))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+
+    let resolve = |e: &EmoteManifestEntry| -> std::path::PathBuf {
+        match provider {
+            EmoteProvider::SevenTv => {
+                plat.join("7tv").join("emotes").join(format!("{}.{}", e.id, e.ext))
+            }
+            EmoteProvider::Ffz => {
+                plat.join("ffz").join("emotes").join(format!("{}.{}", e.id, e.ext))
+            }
+            EmoteProvider::Bttv => {
+                let base = if e.shared {
+                    plat.join("bttv").join("emotes")
+                } else {
+                    emotes_dir.join("bttv")
+                };
+                base.join(format!("{}.{}", e.id, e.ext))
+            }
+            EmoteProvider::Twitch => unreachable!("Twitch handled above"),
+        }
+    };
+
+    let mut out: Vec<ViewerEmote> = entries
+        .into_iter()
+        .filter(|e| !e.name.trim().is_empty())
+        .map(|e| {
+            let path = resolve(&e);
+            // Mirror `assets::asset_present`: a 0-byte file is treated as absent
+            // (downloads write truncate-then-write, so a partial/aborted fetch can
+            // leave an empty stub). Using bare `path.exists()` would classify it as
+            // an active emote that then decodes to Failed and shows a permanent "…".
+            let exists = std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false);
+            ViewerEmote { name: e.name, path, exists }
+        })
+        .collect();
+    out.sort_by_key(|e| e.name.to_lowercase());
+    out
+}
+
+/// Truncate a label to at most `max` characters, appending `…` when shortened.
+/// Char-aware so it never splits a multi-byte UTF-8 emote code mid-codepoint.
+fn truncate_label(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{head}…")
 }
 
 /// Twitch `/me` actions arrive over IRC wrapped as `\x01ACTION <body>\x01` (CTCP).
@@ -13086,10 +13592,65 @@ fn render_chat_message(
     });
 }
 
+/// Lay out a provider's emotes as a wrapping grid of fixed-width cells: the emote
+/// image above its code. `deprecated` cells skip the image entirely (the file is
+/// gone) — they show a 🚫 placeholder and strike through the code. Loading cells
+/// show a `…` until the off-thread decode lands.
+#[allow(clippy::too_many_arguments)]
+fn emote_viewer_grid(
+    ui: &mut egui::Ui,
+    emotes: &[ViewerEmote],
+    cache: &Mutex<HashMap<std::path::PathBuf, crate::emote_anim::EmoteLoad>>,
+    animate: bool,
+    now: f64,
+    misses: &mut Vec<std::path::PathBuf>,
+    ctx: &egui::Context,
+    deprecated: bool,
+) {
+    const CELL_W: f32 = 92.0;
+    const IMG_H: f32 = 44.0;
+    ui.horizontal_wrapped(|ui| {
+        for e in emotes {
+            ui.allocate_ui(egui::vec2(CELL_W, IMG_H + 22.0), |ui| {
+                // Virtualize: only decode/upload/draw emotes whose cell is on screen.
+                // `draw_cached_emote` stamps `last_drawn = now` on every Ready entry it
+                // touches, which pins it against `evict_emote_cache` (it keeps anything
+                // with `last_drawn >= now`). Drawing every emote each frame would pin the
+                // entire provider — hundreds of animated emotes — past EMOTE_BUDGET_BYTES
+                // and the LRU could never reclaim it. Off-screen cells reserve the same
+                // band height (so wrap points / scroll extent stay put) but skip the cache
+                // entirely, letting scrolled-away emotes age out and be evicted.
+                let visible = ui.is_rect_visible(ui.max_rect());
+                ui.vertical_centered(|ui| {
+                    if deprecated {
+                        ui.add_space((IMG_H - 18.0) / 2.0);
+                        ui.label(egui::RichText::new("🚫").size(18.0).weak());
+                        ui.add_space((IMG_H - 18.0) / 2.0);
+                    } else if !visible {
+                        ui.add_space(IMG_H);
+                    } else if draw_cached_emote(ui, cache, &e.path, animate, IMG_H, now, misses, ctx)
+                        .is_none()
+                    {
+                        ui.add_space(IMG_H / 2.0 - 6.0);
+                        ui.weak("…");
+                        ui.add_space(IMG_H / 2.0 - 6.0);
+                    }
+                    let mut rt = egui::RichText::new(truncate_label(&e.name, 12)).small();
+                    if deprecated {
+                        rt = rt.strikethrough().weak();
+                    }
+                    ui.label(rt).on_hover_text(&e.name);
+                });
+            });
+        }
+    });
+}
+
 /// Draw an emote from the decode cache. Returns the image `Response` when drawn, or
 /// `None` (caller shows the text fallback) when the emote is still loading / failed.
 /// Promotes a freshly-decoded entry to GPU textures (UI-thread upload), advances
 /// the animation against the global clock `now`, and records `last_drawn` for LRU.
+#[allow(clippy::too_many_arguments)]
 fn draw_cached_emote(
     ui: &mut egui::Ui,
     cache: &Mutex<HashMap<std::path::PathBuf, crate::emote_anim::EmoteLoad>>,

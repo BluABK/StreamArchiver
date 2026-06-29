@@ -40,6 +40,7 @@ fn main() {
     let minor = env_or("CARGO_PKG_VERSION_MINOR", "0");
 
     decode_platform_icons();
+    decode_provider_logos();
 
     // Force a re-run on every build: we depend on `.build-counter`, which this
     // script rewrites each run, so Cargo always sees it as changed and re-runs
@@ -87,6 +88,44 @@ fn decode_platform_icons() {
             .to_rgba8();
         std::fs::write(out.join(format!("platform_{name}.rgba")), img.as_raw())
             .unwrap_or_else(|e| panic!("write platform_{name}.rgba: {e}"));
+    }
+}
+
+/// Rasterize the third-party emote-provider brand logos (`assets/emote/<name>.svg`)
+/// to a uniform 64×64 straight-alpha RGBA buffer written to `OUT_DIR/logo_<name>.rgba`,
+/// which the app embeds with `include_bytes!`. The logo is aspect-fit and centered in
+/// the square canvas. Rasterizing at build time keeps the SVG stack (resvg/usvg/
+/// tiny-skia) out of the shipped binary, mirroring `decode_platform_icons`.
+fn decode_provider_logos() {
+    use resvg::{tiny_skia, usvg};
+    // Must match `LOGO_SRC` in src/ui.rs: it reads these buffers as `SIZE×SIZE` RGBA
+    // and `ColorImage::from_rgba_unmultiplied` panics at startup if the dims disagree.
+    const SIZE: u32 = 64;
+    let out = PathBuf::from(env_or("OUT_DIR", "."));
+    for name in ["7tv", "bttv"] {
+        let src = format!("assets/emote/{name}.svg");
+        println!("cargo:rerun-if-changed={src}");
+        let svg = std::fs::read_to_string(&src).unwrap_or_else(|e| panic!("read {src}: {e}"));
+        let tree = usvg::Tree::from_str(&svg, &usvg::Options::default())
+            .unwrap_or_else(|e| panic!("parse {src}: {e}"));
+        let ts = tree.size();
+        // Aspect-fit the SVG's natural size into the square canvas, centered.
+        let scale = (SIZE as f32 / ts.width()).min(SIZE as f32 / ts.height());
+        let tx = (SIZE as f32 - ts.width() * scale) / 2.0;
+        let ty = (SIZE as f32 - ts.height() * scale) / 2.0;
+        let transform = tiny_skia::Transform::from_scale(scale, scale).post_translate(tx, ty);
+        let mut pixmap =
+            tiny_skia::Pixmap::new(SIZE, SIZE).unwrap_or_else(|| panic!("alloc pixmap for {src}"));
+        resvg::render(&tree, transform, &mut pixmap.as_mut());
+        // tiny-skia stores premultiplied alpha; egui's `from_rgba_unmultiplied`
+        // expects straight alpha, so demultiply each pixel.
+        let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
+        for px in pixmap.pixels() {
+            let c = px.demultiply();
+            rgba.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
+        }
+        std::fs::write(out.join(format!("logo_{name}.rgba")), &rgba)
+            .unwrap_or_else(|e| panic!("write logo_{name}.rgba: {e}"));
     }
 }
 

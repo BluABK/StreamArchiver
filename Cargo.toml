@@ -33,6 +33,10 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # RGBA embedded into the binary. Keeps the runtime dependency-free (no image
 # crate shipped) so the binary stays lean.
 image = { version = "0.25.8", default-features = false, features = ["png"] }
+# Build-time only: rasterize the third-party emote-provider logos
+# (assets/emote/*.svg) to raw RGBA. Like the favicons above, the SVG stack never
+# ships in the binary. resvg re-exports usvg + tiny-skia, so this is the only dep.
+resvg = { version = "0.45", default-features = false }
 
 [profile.release]
 opt-level = "z"
