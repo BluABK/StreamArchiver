@@ -13128,7 +13128,6 @@ fn draw_cached_emote(
             if animate && anim.is_animated() {
                 let (tex, remaining) = anim.frame_at(now);
                 let resp = ui.add(egui::Image::from_texture(tex).fit_to_exact_size(size));
-                queue_alt_image_preview(ctx, &resp, tex);
                 // Only schedule the next frame for emotes actually on screen, so a
                 // scrolled-away animation doesn't keep waking the UI.
                 if ui.is_rect_visible(resp.rect) {
@@ -13139,9 +13138,7 @@ fn draw_cached_emote(
                 Some(resp)
             } else {
                 let (tex, _) = anim.frame_at(0.0);
-                let resp = ui.add(egui::Image::from_texture(tex).fit_to_exact_size(size));
-                queue_alt_image_preview(ctx, &resp, tex);
-                Some(resp)
+                Some(ui.add(egui::Image::from_texture(tex).fit_to_exact_size(size)))
             }
         }
     }
