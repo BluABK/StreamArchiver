@@ -26,6 +26,7 @@ mod scheduler;
 mod store;
 mod ui;
 mod version;
+mod watchdog;
 mod websub;
 
 use std::sync::Arc;
@@ -93,6 +94,11 @@ fn main() -> Result<()> {
         }
     };
 
+    // GUI path only (the CLI diagnostic sub-commands above all returned already):
+    // turn a process-killing panic into a visible native dialog before the runtime
+    // aborts, so startup panics (store/core/tray/font setup) aren't silent crashes.
+    watchdog::install_panic_dialog();
+
     let store = Store::open(&app_paths::db_path()).context("opening data store")?;
     // Crash recovery for on-demand downloads: any left mid-flight is stale.
     // (In-flight live recordings are handled in `core.start()` →
@@ -131,6 +137,18 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
+    // UI-freeze watchdog: the app stamps a heartbeat each frame; this background
+    // thread pops a native dialog (off the UI thread) if the heartbeat goes stale
+    // while the UI is meant to be rendering, so a hard GUI hang surfaces as an
+    // error instead of a silent "Not Responding" freeze. Started right before the
+    // UI loop so the gap to the first frame can't trip the threshold.
+    let heartbeat = watchdog::Heartbeat::new();
+    watchdog::start_watchdog(
+        heartbeat.clone(),
+        std::time::Duration::from_secs(10),
+        false, // inform-only: downloads are detached, so don't auto-kill the UI
+    );
+
     let core_for_app = core.clone();
     eframe::run_native(
         "StreamArchiver",
@@ -145,6 +163,7 @@ fn main() -> Result<()> {
                 core_for_app,
                 tray,
                 ui_rx,
+                heartbeat,
             )))
         }),
     )

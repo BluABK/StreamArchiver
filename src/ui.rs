@@ -517,6 +517,9 @@ pub struct StreamArchiverApp {
     processes: Vec<crate::app_core::ProcInfo>,
     processes_refreshed: Option<std::time::Instant>,
     quitting: bool,
+    /// UI-freeze watchdog heartbeat: stamped each frame so a background thread can
+    /// detect (and surface as a native dialog) a hung UI thread. See [`crate::watchdog`].
+    heartbeat: crate::watchdog::Heartbeat,
 
     view: View,
     rows: Vec<MonitorWithChannel>,
@@ -722,6 +725,7 @@ impl StreamArchiverApp {
         core: Arc<AppCore>,
         tray: TrayIcon,
         ui_rx: Receiver<UiCommand>,
+        heartbeat: crate::watchdog::Heartbeat,
     ) -> StreamArchiverApp {
         let events_rx = core.subscribe();
         let autostart = AutoStart::new();
@@ -939,6 +943,7 @@ impl StreamArchiverApp {
             processes: Vec::new(),
             processes_refreshed: None,
             quitting: false,
+            heartbeat,
             view: View::Streams,
             rows: Vec::new(),
             channels: Vec::new(),
@@ -4177,6 +4182,20 @@ impl eframe::App for StreamArchiverApp {
     /// Non-drawing logic. eframe also calls this while the window is hidden when
     /// `request_repaint` was called — which is how the tray's "Open" wakes us.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // ── UI-freeze watchdog heartbeat ──────────────────────────────────────
+        // Stamp "the UI thread is alive" at the start of every frame. A frame that
+        // enters here and never returns — or whose subsequent egui paint hangs
+        // (e.g. a GPU emote-texture stall) — stops beating, and the watchdog thread
+        // surfaces a native dialog instead of a silent freeze. The ≥1 fps repaint
+        // floor keeps a *healthy* idle (reactive) UI beating so it never
+        // false-alarms; while minimised the OS legitimately stops delivering
+        // frames, so we mark the heartbeat inactive to suppress the alarm there.
+        self.heartbeat.beat();
+        self.heartbeat.set_activity(crate::watchdog::Activity::Frame);
+        let minimized = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
+        self.heartbeat.set_active(!minimized);
+        ctx.request_repaint_after(std::time::Duration::from_secs(1));
+
         self.pump_messages(ctx);
 
         // Close button hides to tray unless we're really quitting.
@@ -11761,6 +11780,8 @@ impl StreamArchiverApp {
         let Some(popup) = &mut self.chat_popup else {
             return;
         };
+        // Watchdog: name this phase so a freeze dialog points at the chat popup.
+        self.heartbeat.set_activity(crate::watchdog::Activity::Chat);
         let mut open = true;
         let title = format!("💬  Chat — {}", popup.monitor_name);
 
@@ -12015,6 +12036,8 @@ impl StreamArchiverApp {
         now: f64,
         ctx: &egui::Context,
     ) {
+        // Watchdog: the decode/upload/evict sweep is the most texture-churning phase.
+        self.heartbeat.set_activity(crate::watchdog::Activity::EmoteDecodePump);
         const MAX_DECODE_PER_FRAME: usize = 64;
         if decode_misses.len() > MAX_DECODE_PER_FRAME {
             let mut g = self.emote_anim.lock().unwrap_or_else(|e| e.into_inner());
@@ -12235,6 +12258,9 @@ impl StreamArchiverApp {
                 return;
             }
         };
+        // Watchdog: name this phase so a freeze dialog points at the properties window
+        // (this is REPRO 1 — hovering the emote-launcher buttons here).
+        self.heartbeat.set_activity(crate::watchdog::Activity::Properties);
         // First monitor of this channel — used for asset refetch.
         let first_mon = self.rows.iter().find(|r| r.channel.id == cid).map(|r| r.monitor.clone());
 
@@ -12785,6 +12811,8 @@ impl StreamArchiverApp {
         if self.emote_viewer.is_none() {
             return;
         }
+        // Watchdog: name this phase (REPRO 2 — emote viewer grid left open).
+        self.heartbeat.set_activity(crate::watchdog::Activity::EmoteViewerGrid);
         // Render toggles + shared cache copied out before borrowing the viewer, so
         // the closure never has to touch `self`.
         let anim_cache = self.emote_anim.clone();
