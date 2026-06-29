@@ -439,6 +439,91 @@ download captures `live_chat` (e.g. a YouTube VOD's chat replay) the same way.
 Chat sidecars sit next to the video and **follow it** if the file is renamed
 (see *Filename media info*), so they stay matched to their recording.
 
+### Channel assets & change history
+
+To make chat replay look right offline — and to archive a channel's *visual
+identity* over time — StreamArchiver downloads each channel's icon, banner,
+badges, emotes, and the broadcaster's chat name colour into a per-channel asset
+cache, and records every change it sees on later refetches.
+
+**What's fetched, per platform:**
+
+- **Twitch** (needs Twitch credentials — the same app/user token as detection):
+  profile icon, offline banner, channel + global chat **badges**, first-party
+  **emotes**, plus third-party **BTTV / FFZ / 7TV** emotes (the channel's sets,
+  fetched from its Twitch broadcaster id), and the broadcaster's chosen chat
+  **name colour** (tints the channel's name in the Streams list and chat replay).
+- **YouTube** (needs a **YouTube Data API key**, Settings → Detection): profile
+  icon + channel banner via the Data API. Without a key the background refresh
+  **skips** YouTube (the manual Refetch button still explains why); when the API
+  returns no banner it falls back to scraping the channel page's header banner.
+  YouTube has no badge/emote set, so only icon + banner are archived.
+- **Kick**: profile icon + banner via the public v2 channel API (no credentials).
+- Generic URLs have no asset source.
+
+Shared third-party emotes (BTTV/FFZ/7TV) and global Twitch badges are
+**deduplicated** into one platform-wide cache rather than copied per channel, and
+superseded icons / banners are **archived** rather than overwritten (see *change
+history* below).
+
+**Where it shows up — channel Properties** (right-click a channel → **Properties**):
+
+- The header avatar plus an **Assets** thumbnail strip of every original
+  icon/banner across the channel's platforms — hover for pixel size, hold **Alt**
+  to preview full-size, click to open the file.
+- A per-platform status grid (**Icon · Banner · Badges · Emotes · Updated**) and
+  an **Icon source** picker (which platform's profile pic represents the channel).
+- **⟳ Refetch** forces a fetch now (ignores the 24 h cache); **📂** opens the
+  channel's asset folder; **🕑 History** opens the change log (below).
+- **View emotes** — one launcher per provider that has emotes, opening an **emote
+  viewer**: a grid of every emote with its chat code (animated emotes play when
+  *Animate emotes* is on in Settings). Codes still listed in the manifest whose
+  image has gone from the cache are shown separately under **Deprecated (no longer
+  available)**.
+
+**Change history.** Manifests and images are overwritten wholesale on each
+refetch, so a removed emote code or a swapped banner would otherwise vanish with
+no trace. Instead, every refetch is diffed against the previous state: the changes
+are appended to a per-channel log (`asset_changes.jsonl`), the superseded emote
+manifest is snapshotted under `emotes/history/`, and replaced icons/banners under
+`history/`. The **🕑 History** popup lists the changes newest-first across all the
+channel's platforms:
+
+- **Emotes** — `+ code` added / `− code` removed (keyed by the code as typed in
+  chat, so id/CDN churn alone isn't a change).
+- **Icon / Banner** — *replaced* (the prior image is kept in `history/`).
+- **Name colour** — set / cleared / changed.
+
+Removed emotes stay in the history even after they're gone from the channel's
+manifest — so the log is a durable record of what the channel *used* to have. If
+the emote viewer or History window is open when a background refetch for that
+channel lands, an amber **"assets were refetched — reopen"** banner appears (the
+History window also reloads itself in place).
+
+**Refresh cadence.** Per instance, **Fetch chat assets** (on by default) controls
+whether that channel participates. A background job (**Channel asset refresh**,
+toggleable like the other jobs) rescans hourly and refetches any channel whose
+assets are older than **24 hours**; recording channels are handled by their own
+record path, and YouTube is skipped without an API key. The **⟳ Refetch** button
+bypasses both the 24 h staleness check and the per-instance toggle.
+
+**Limitations & caveats:**
+
+- The **first** fetch is a silent **baseline** — it establishes the initial state,
+  so nothing is logged as a "change" until a *later* refetch differs from it.
+- Tracking is **diff-on-refetch**, not continuous: a change is recorded only when a
+  refetch sees a state different from the last stored one. A code added and removed
+  entirely between two refetches is never seen. Timestamps are whole seconds, so
+  two changes in the same second sort arbitrarily within that second.
+- A provider returning a **transient empty** set isn't treated as "all removed":
+  the previous manifest is kept until a non-empty refetch, so a provider outage
+  doesn't log a mass-removal. (Flip side: a genuine removal of *every* emote isn't
+  recorded until the provider responds non-empty again.)
+- **Twitch first-party emotes** aren't change-tracked — they're files on disk with
+  no manifest of chat codes; only BTTV/FFZ/7TV (which carry such a manifest) are.
+- The on-disk history is **append-only** and never pruned by the app; deleting the
+  channel's asset folder (via **📂**) is what clears it.
+
 ### Filename templates
 
 The **filename template** sets the output file's *name*. The separate **Output
@@ -653,6 +738,19 @@ both. Use it only when the formats you want are split across both protocols.
 - Config/state DB: `%APPDATA%\StreamArchiver\data\streamarchiver.sqlite3` (SQLite, WAL).
 - Override the DB path with `STREAMARCHIVER_DB`, default output dir with
   `STREAMARCHIVER_OUT` (handy for testing).
+- Recordings + sidecars (`.chat.jsonl`, `.live_chat.json`, subtitle `.vtt`): your
+  configured output folder (default: `Videos\StreamArchiver\`).
+- Asset cache: `%APPDATA%\StreamArchiver\data\asset-cache\` (see *Channel assets &
+  change history*):
+  - `channel_assets\{name}\{platform}\` — per channel + platform:
+    - `icon.<ext>`, `banner.<ext>` (current), `name_color.txt`, `.assets_fetched_at`
+      (24 h freshness stamp).
+    - `badges\`, `emotes\twitch\` (first-party files), `emotes\{bttv,ffz,7tv}.json`
+      (third-party emote manifests).
+    - `history\` — superseded icons/banners; `emotes\history\` — superseded emote
+      manifests; `asset_changes.jsonl` — the append-only change log.
+  - `platform_assets\` — deduplicated shared emote images + global Twitch badges
+    (referenced by every channel, stored once).
 
 ## CLI / diagnostics
 

@@ -34,8 +34,8 @@ pub fn default_output_dir() -> PathBuf {
     dir
 }
 
-/// Root of the centralised asset cache (alongside the DB).
-/// e.g. `%APPDATA%\StreamArchiver\asset-cache\` on Windows.
+/// Root of the centralised asset cache (alongside the DB, under the data dir).
+/// e.g. `%APPDATA%\StreamArchiver\data\asset-cache\` on Windows.
 pub fn asset_cache_dir() -> PathBuf {
     let dir = data_dir().join("asset-cache");
     let _ = std::fs::create_dir_all(&dir);
@@ -43,7 +43,7 @@ pub fn asset_cache_dir() -> PathBuf {
 }
 
 /// Platform-wide shared asset cache for deduplicated emote images and global badges.
-/// e.g. `%APPDATA%\StreamArchiver\asset-cache\platform_assets\`.
+/// e.g. `%APPDATA%\StreamArchiver\data\asset-cache\platform_assets\`.
 pub fn platform_assets_dir() -> PathBuf {
     let dir = asset_cache_dir().join("platform_assets");
     let _ = std::fs::create_dir_all(&dir);
