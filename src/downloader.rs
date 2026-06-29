@@ -72,9 +72,6 @@ pub type VideoSpeed = Arc<Mutex<HashMap<i64, f64>>>;
 pub type AdActive = Arc<Mutex<HashMap<i64, i64>>>;
 
 const RING_MAX_LINES: usize = 80;
-/// A recording that fails faster than this is treated as a transient failure
-/// and subject to backoff.
-const SHORT_RUN_SECS: i64 = 15;
 /// How often the from-start catch-up watcher probes the growing capture.
 const CATCHUP_PROBE_INTERVAL_SECS: u64 = 20;
 /// Treat a from-start capture as caught up once its media is within this many
@@ -138,6 +135,13 @@ pub const SABR_DEFAULT_EXTRACTOR_ARGS: &str =
 /// Used when the setting key has never been written; an explicit empty value
 /// disables it (rely on the plugin's own auto-detection instead).
 pub const SABR_DEFAULT_POT_ARGS: &str = "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416";
+/// Consecutive from-start SABR stalls ("not near live head") tolerated with
+/// deep-rewind enabled before giving up and falling back to live-edge capture.
+/// Deep-rewind extends the DVR window, so the *first* stall may be transient;
+/// but a persistent stall repeats every attempt (each re-downloading the opening
+/// — observed ~190 MiB — then dying), so we tolerate one retry then fall back.
+/// With deep-rewind off a stall is a true window expiry and we fall back at once.
+const SABR_STALL_FALLBACK_TRIES: u32 = 2;
 /// Default DASH-companion format selector when the setting is unset/empty.
 pub const DASH_DEFAULT_FORMAT: &str = "bestvideo+bestaudio/best";
 
@@ -1007,7 +1011,23 @@ pub struct Supervisor {
     /// live head"). The next attempt falls back to live-edge so we at least
     /// capture the ongoing stream instead of looping forever. Cleared on a
     /// successful capture (bytes > 0); in-memory only (resets on app restart).
+    ///
+    /// Keyed by `monitor_id`, not per-stream, because YouTube-scrape detection
+    /// exposes no stable stream identity (stream_id is None and went_live_at
+    /// jitters every poll), so a per-stream key is impossible here. The accepted
+    /// trade-offs of the coarser key: (1) cross-stream stickiness — a monitor's
+    /// *next* broadcast inherits the flag until its first successful capture
+    /// clears it; (2) oscillation — once a from-start capture succeeds and clears
+    /// the flag, a later stall on the same broadcast can re-arm it. Both are
+    /// bounded by clear-on-success + app restart + backoff, and self-correct in
+    /// the common case (a healthy stream clears the flag on its first good grab).
     sabr_dvr_exceeded: Arc<Mutex<HashSet<i64>>>,
+    /// Per-monitor count of *consecutive* from-start SABR stalls. Once it reaches
+    /// [`SABR_STALL_FALLBACK_TRIES`] (with deep-rewind on) the monitor is added to
+    /// `sabr_dvr_exceeded` so the next attempt captures the live edge. Reset on
+    /// any non-stall outcome (success, ended, manual) so it tracks back-to-back
+    /// stalls only; in-memory only.
+    sabr_stall_count: Arc<Mutex<HashMap<i64, u32>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1049,6 +1069,7 @@ impl Supervisor {
             sem: Arc::new(Semaphore::new(max_concurrent.max(1))),
             backoff: Arc::new(Mutex::new(HashMap::new())),
             sabr_dvr_exceeded: Arc::new(Mutex::new(HashSet::new())),
+            sabr_stall_count: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1808,7 +1829,13 @@ impl Supervisor {
 
     fn note_result(&self, monitor_id: i64, duration_secs: i64, ok: bool) {
         let mut map = self.backoff.lock().unwrap();
-        if ok || duration_secs >= SHORT_RUN_SECS {
+        // Back off on any capture that produced no footage (bytes == 0), even one
+        // that ran a while before dying: a long run that wrote nothing is still a
+        // failure (e.g. a SABR from-start stall that downloads ~hundreds of MiB to
+        // its cache, then crashes without finalizing the MKV). Without this such a
+        // capture would re-spawn on the very next poll and tight-loop, re-fetching
+        // the same opening segments forever.
+        if ok {
             map.remove(&monitor_id);
         } else {
             let entry = map.entry(monitor_id).or_insert(BackoffEntry {
@@ -1822,7 +1849,8 @@ impl Supervisor {
                 monitor_id,
                 fails = entry.fails,
                 wait,
-                "recording failed quickly; backing off"
+                duration_secs,
+                "recording captured nothing; backing off"
             );
         }
     }
@@ -1838,16 +1866,17 @@ impl Supervisor {
         stream_title: Option<String>,
     ) {
         let monitor_id = row.monitor.id;
-        // SABR DVR fallback: a prior attempt hit YouTube's ~4-hour DVR window
-        // limit ("not near live head"). Override capture_from_start so we fall
-        // back to live-edge this time instead of stalling from the beginning
-        // again. The flag is cleared when a capture succeeds (bytes > 0).
+        // SABR from-start fallback: prior attempts stalled "not near live head"
+        // (DVR window expired, or persistent from-start stalls under deep-rewind).
+        // Override capture_from_start so we capture the live edge this time instead
+        // of stalling from the beginning again. Cleared when a capture succeeds
+        // (bytes > 0).
         let mut row = row;
         if row.monitor.capture_from_start
             && self.sabr_dvr_exceeded.lock().unwrap().contains(&monitor_id)
         {
             row.monitor.capture_from_start = false;
-            info!(monitor_id, "SABR DVR window exceeded; switching to live-edge capture");
+            info!(monitor_id, "SABR from-start unavailable; capturing live edge");
         }
         let global_method = self
             .store
@@ -2254,25 +2283,48 @@ impl Supervisor {
         let ok = bytes > 0;
         let manually_stopped = self.stopping_monitors.lock().unwrap().remove(&monitor_id);
         let shutting_down = self.shutdown.load(Ordering::SeqCst);
-        // SABR DVR window exceeded: YouTube only serves the last ~4 hours of a
-        // live stream via SABR; once the stream is older than that, each attempt
-        // stalls shortly after starting ("not near live head"). Record this so the
-        // next attempt falls back to live-edge capture (see override at top of fn).
-        // Skip when deep-rewind is on: that flag specifically extends the DVR
-        // window, so "not near live head" with it enabled is a transient SABR
-        // error rather than a true window expiry — normal backoff handles it
-        // better than a permanent live-edge override.
+        // SABR from-start stall ("not near live head"): YouTube only serves the
+        // last ~4 hours of a live stream via SABR, so once a stream is older than
+        // its DVR window each from-start attempt downloads the opening segments
+        // then stalls. The next attempt should fall back to live-edge capture (see
+        // override at top of fn) so we at least record the ongoing stream.
+        //
+        // With deep-rewind OFF this is a true window expiry — fall back on the very
+        // first stall. With deep-rewind ON the flag extends the window, so an early
+        // stall *might* be transient; tolerate a few consecutive stalls before
+        // giving up. (Empirically a persistent stall repeats every attempt — each
+        // re-fetching ~hundreds of MiB before dying — so without a bound we'd never
+        // fall back and never record anything.)
         let deep_rewind = setting_str(&self.store, "ytdlp_sabr_deep_rewind") == "1";
-        let sabr_dvr = !ok
+        let sabr_stall = !ok
             && !manually_stopped
             && !shutting_down
-            && !deep_rewind
             && sabr_dvr_window_exceeded(&outcome.log);
-        if sabr_dvr {
-            self.sabr_dvr_exceeded.lock().unwrap().insert(monitor_id);
-            warn!(monitor_id, "SABR hit DVR window limit; next attempt will use live-edge");
-        } else if ok {
-            self.sabr_dvr_exceeded.lock().unwrap().remove(&monitor_id);
+        if sabr_stall {
+            let threshold = if deep_rewind { SABR_STALL_FALLBACK_TRIES } else { 1 };
+            let stalls = {
+                let mut counts = self.sabr_stall_count.lock().unwrap();
+                let n = counts.entry(monitor_id).or_insert(0);
+                *n = n.saturating_add(1);
+                *n
+            };
+            if stalls >= threshold {
+                self.sabr_dvr_exceeded.lock().unwrap().insert(monitor_id);
+                self.sabr_stall_count.lock().unwrap().remove(&monitor_id);
+                warn!(monitor_id, stalls, "SABR stalled from-start; next attempt will use live-edge");
+            } else {
+                warn!(monitor_id, stalls, threshold, "SABR stalled from-start; will retry from-start");
+            }
+        } else {
+            // Any non-stall outcome breaks the consecutive-stall streak, so the
+            // counter only ever reflects *back-to-back* from-start stalls. Clear
+            // the live-edge fallback flag only when the capture actually succeeded
+            // — an "ended"/"aborted"/manual outcome shouldn't un-stick a monitor
+            // we already decided to capture at the live edge.
+            self.sabr_stall_count.lock().unwrap().remove(&monitor_id);
+            if ok {
+                self.sabr_dvr_exceeded.lock().unwrap().remove(&monitor_id);
+            }
         }
         // A 0-byte capture isn't always a failure: a livestream that had already
         // ended (or hadn't started, or exposed no live video formats) leaves
@@ -2287,7 +2339,7 @@ impl Supervisor {
             "aborted"
         } else if ok {
             "completed"
-        } else if sabr_dvr || stream_ended_or_unavailable(&outcome.log) {
+        } else if sabr_stall || stream_ended_or_unavailable(&outcome.log) {
             "ended"
         } else {
             "failed"
@@ -2315,7 +2367,13 @@ impl Supervisor {
             warn!(monitor_id, "recording stderr:\n{}", outcome.log);
         }
 
-        self.note_result(monitor_id, duration, ok);
+        // A manual stop already installed its own 120s cooldown (see `manual_stop`);
+        // don't let the subprocess's exit clobber it — a 0-byte stopped capture would
+        // otherwise reset the wait to 30s, and a captured one would clear it entirely,
+        // either way re-triggering the moment the next LIVE signal arrives.
+        if !manually_stopped {
+            self.note_result(monitor_id, duration, ok);
+        }
         self.active.lock().unwrap().remove(&monitor_id);
         self.ad_active.lock().unwrap().remove(&monitor_id);
     }
