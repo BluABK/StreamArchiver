@@ -685,6 +685,10 @@ pub struct StreamArchiverApp {
     /// block on the store mutex when a detection pass holds it; running off the UI
     /// thread prevents a visible freeze on "Save".
     pending_save: Option<PendingSave>,
+    /// In-flight F5 / manual reload (background thread). Same DB queries as
+    /// `pending_save` but no write — avoids blocking the UI thread on the store
+    /// mutex while a schedule-refresh Tokio task holds it.
+    pending_reload: Option<std::sync::mpsc::Receiver<Option<SaveRows>>>,
     /// Open emote-viewer window (None = closed). Reuses the shared `emote_anim`
     /// decode cache, so its emotes animate against the same clock as chat replay.
     emote_viewer: Option<EmoteViewer>,
@@ -1042,6 +1046,7 @@ impl StreamArchiverApp {
             props_load: None,
             pending_browse: None,
             pending_save: None,
+            pending_reload: None,
             emote_viewer: None,
             emote_viewer_stale: false,
             asset_history: None,
@@ -1295,7 +1300,7 @@ impl StreamArchiverApp {
             }
         }
         if dirty {
-            self.reload_rows();
+            self.spawn_pending_reload();
             self.reload_videos();
             // Keep the Schedule calendar in sync with background schedule fetches
             // (which emit a state event) — but only once it has been loaded, so we
@@ -1441,6 +1446,64 @@ impl StreamArchiverApp {
                 warn!("save-monitor thread disconnected without sending a result");
                 self.pending_save = None;
                 self.status = "Save failed (internal error).".into();
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    /// Spawn a background thread that reads the current rows/channels from the
+    /// store without writing anything.  The result is drained by
+    /// `drain_pending_reload` inside `logic()`.  If a reload is already in
+    /// flight, the new request is silently dropped (the in-flight one will
+    /// provide up-to-date data).
+    fn spawn_pending_reload(&mut self) {
+        if self.pending_reload.is_some() {
+            return;
+        }
+        let store = self.core.store.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        debug!("spawning reload-rows thread");
+        std::thread::Builder::new()
+            .name("reload-rows".into())
+            .spawn(move || {
+                let t = std::time::Instant::now();
+                let result = (|| -> Option<SaveRows> {
+                    let rows = store.list_monitors_with_channels().ok()?;
+                    let next_streams = store.next_scheduled_streams(crate::models::now_unix()).ok()?;
+                    let channels = store.list_channels().ok()?;
+                    Some(SaveRows { rows, channels, next_streams })
+                })();
+                debug!(
+                    elapsed_ms = t.elapsed().as_millis(),
+                    ok = result.is_some(),
+                    "reload-rows done"
+                );
+                let _ = tx.send(result);
+            })
+            .ok();
+        self.pending_reload = Some(rx);
+    }
+
+    fn drain_pending_reload(&mut self) {
+        let recv = match &self.pending_reload {
+            Some(rx) => rx.try_recv(),
+            None => return,
+        };
+        match recv {
+            Ok(Some(save)) => {
+                debug!(rows = save.rows.len(), "reload-rows result installed");
+                self.install_save_rows(save);
+                self.status = "Refreshed.".into();
+                self.pending_reload = None;
+            }
+            Ok(None) => {
+                warn!("reload-rows thread produced no data");
+                self.status = "Refresh failed (DB error).".into();
+                self.pending_reload = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                warn!("reload-rows thread disconnected without sending");
+                self.pending_reload = None;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
@@ -4481,6 +4544,13 @@ impl eframe::App for StreamArchiverApp {
         self.pump_messages(ctx);
         self.drain_pending_browse();
         self.drain_pending_save();
+        self.drain_pending_reload();
+
+        // Keep repainting at 50ms while a background DB load is in-flight so
+        // the result is shown as soon as it arrives, not after the 1s heartbeat.
+        if self.pending_save.is_some() || self.pending_reload.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
 
         // Close button hides to tray unless we're really quitting.
         if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
@@ -4766,13 +4836,13 @@ impl StreamArchiverApp {
             self.view = View::Settings;
         }
         if ctx.input_mut(|i| i.consume_shortcut(&REFRESH)) {
-            self.reload_rows();
+            self.spawn_pending_reload();
             if self.view == View::Schedule {
                 // Force a network re-fetch (not just a DB reload) + show current data.
                 self.core.request_schedule_refresh();
                 self.reload_schedule();
             }
-            self.status = "Refreshed.".into();
+            self.status = "Refreshing…".into();
         }
 
         // Row-targeted keys only fire on the channel list when not typing.

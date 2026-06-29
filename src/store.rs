@@ -6,7 +6,7 @@
 //! `Arc<Store>` via `spawn_blocking`.
 
 use std::path::Path;
-use std::sync::Mutex;
+use parking_lot::FairMutex;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -18,10 +18,10 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 30;
+const SCHEMA_VERSION: i64 = 32;
 
 pub struct Store {
-    conn: Mutex<Connection>,
+    conn: FairMutex<Connection>,
 }
 
 /// One archived community-post image (schema v28 `community_post_archive`), as
@@ -63,33 +63,72 @@ pub struct RecInfo {
     pub output_path: String,
 }
 
-impl Store {
-    /// Acquire the DB connection, logging a warning when contention caused a
-    /// wait longer than 50 ms. `#[track_caller]` embeds the caller's source
-    /// location in the log line so the slow call-site is immediately visible.
-    #[track_caller]
-    fn db(&self) -> std::sync::MutexGuard<'_, Connection> {
-        let t = std::time::Instant::now();
-        let g = self.conn.lock().unwrap();
-        let ms = t.elapsed().as_millis();
-        if ms >= 50 {
-            let loc = std::panic::Location::caller();
+/// RAII guard returned by [`Store::db`]. Logs a warning when the lock is held
+/// longer than 200 ms, showing the call-site that acquired it — useful for
+/// identifying which store method is the bottleneck.
+struct DbGuard<'a> {
+    inner: parking_lot::FairMutexGuard<'a, Connection>,
+    acquired_at: std::time::Instant,
+    caller: &'static std::panic::Location<'static>,
+}
+
+impl std::ops::Deref for DbGuard<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection { &*self.inner }
+}
+
+impl std::ops::DerefMut for DbGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Connection { &mut *self.inner }
+}
+
+impl Drop for DbGuard<'_> {
+    fn drop(&mut self) {
+        let ms = self.acquired_at.elapsed().as_millis();
+        if ms >= 200 {
             tracing::warn!(
-                wait_ms = ms,
-                file = loc.file(),
-                line = loc.line(),
+                hold_ms = ms,
+                file = self.caller.file(),
+                line = self.caller.line(),
+                "store: long DB lock hold"
+            );
+        } else if ms >= 50 {
+            tracing::debug!(
+                hold_ms = ms,
+                file = self.caller.file(),
+                line = self.caller.line(),
+                "store: DB lock hold"
+            );
+        }
+    }
+}
+
+impl Store {
+    /// Acquire the DB connection. Logs a warning when contention caused a wait
+    /// longer than 50 ms (waiter side) or when the lock is held longer than
+    /// 200 ms (holder side). `#[track_caller]` embeds the caller's source
+    /// location in both log lines so slow call-sites are immediately visible.
+    #[track_caller]
+    fn db(&self) -> DbGuard<'_> {
+        let caller = std::panic::Location::caller();
+        let t = std::time::Instant::now();
+        let g = self.conn.lock();
+        let wait_ms = t.elapsed().as_millis();
+        if wait_ms >= 50 {
+            tracing::warn!(
+                wait_ms,
+                file = caller.file(),
+                line = caller.line(),
                 "store: slow DB lock – another thread held the connection"
             );
-        } else if ms >= 5 {
-            let loc = std::panic::Location::caller();
+        } else if wait_ms >= 5 {
             tracing::debug!(
-                wait_ms = ms,
-                file = loc.file(),
-                line = loc.line(),
+                wait_ms,
+                file = caller.file(),
+                line = caller.line(),
                 "store: DB lock wait"
             );
         }
-        g
+        DbGuard { inner: g, acquired_at: std::time::Instant::now(), caller }
     }
 
     /// Open (or create) the database at `path`, set pragmas, and migrate.
@@ -98,7 +137,7 @@ impl Store {
             .with_context(|| format!("opening database at {}", path.display()))?;
         Self::configure(&conn)?;
         let store = Store {
-            conn: Mutex::new(conn),
+            conn: FairMutex::new(conn),
         };
         store.migrate()?;
         Ok(store)
@@ -110,7 +149,7 @@ impl Store {
         let conn = Connection::open_in_memory()?;
         Self::configure(&conn)?;
         let store = Store {
-            conn: Mutex::new(conn),
+            conn: FairMutex::new(conn),
         };
         store.migrate()?;
         Ok(store)
@@ -541,7 +580,31 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 30)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 30);
+        if version < 31 {
+            // Covering index for schedule_segments_for_source: the existing
+            // idx_schedule_monitor covers (monitor_id, start_time) but not
+            // `source`, so queries filtering by source scanned every row for
+            // that monitor. On an accumulated historical archive (past segments
+            // are kept as history) this caused multi-second lock holds per call.
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_schedule_source
+                 ON schedule_segment(monitor_id, source, start_time);",
+            )?;
+            conn.pragma_update(None, "user_version", 31)?;
+        }
+        if version < 32 {
+            // Index for all_upcoming_schedule: the query filters
+            // `canceled = 0 AND start_time >= ?` across all monitors, but the
+            // existing idx_schedule_monitor leads with monitor_id, so SQLite
+            // had to full-scan the entire table. With months of historical rows
+            // accumulated this caused 4+ second lock holds on Schedule tab clicks.
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_schedule_canceled_start
+                 ON schedule_segment(canceled, start_time);",
+            )?;
+            conn.pragma_update(None, "user_version", 32)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 32);
         Ok(())
     }
 
@@ -1292,6 +1355,39 @@ impl Store {
         source: &str,
         segs: &[ScheduleSegment],
     ) -> Result<()> {
+        let now = now_unix();
+        // Phase 1 — short lock: read suppressed start instants so the lock is
+        // released before the heavier write transaction below.  Other threads
+        // (save, reload-rows) can acquire the DB between the two phases.
+        //
+        // Start instants an automatic source must NOT re-create for this monitor:
+        //  • those claimed by a protected manual row (a user's correction — don't
+        //    duplicate it at the same instant), and
+        //  • those a user explicitly removed or moved away from (tombstones,
+        //    canceled = 1 — re-inserting would resurrect a deleted occurrence, or
+        //    re-add the pre-correction copy of a rescheduled one).
+        // Storing the manual source itself doesn't self-suppress on manual rows,
+        // but still honours tombstones.
+        let suppressed_starts: std::collections::HashSet<i64> = {
+            let conn = self.db();
+            let mut stmt = conn.prepare(
+                "SELECT start_time FROM schedule_segment
+                 WHERE monitor_id = ?1
+                   AND ((source = 'manual' AND ?2 <> 'manual') OR canceled = 1)",
+            )?;
+            stmt.query_map(params![monitor_id, source], |r| r.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?
+        };
+        // DB lock released — other threads get a turn between phases.
+
+        // Pre-filter in memory: only the segments we'll actually write.
+        let segs_to_write: Vec<&ScheduleSegment> = segs
+            .iter()
+            .filter(|s| !suppressed_starts.contains(&s.start_time))
+            .collect();
+
+        // Phase 2 — write transaction: all SQL is writes-only, keeping this
+        // lock hold as short as possible.
         let mut conn = self.db();
         let tx = conn.transaction()?;
         // Drop stale tombstones (canceled rows well past their instant): a
@@ -1303,7 +1399,7 @@ impl Store {
         tx.execute(
             "DELETE FROM schedule_segment
              WHERE monitor_id = ?1 AND canceled = 1 AND start_time < ?2",
-            params![monitor_id, now_unix() - 7 * 86_400],
+            params![monitor_id, now - 7 * 86_400],
         )?;
         // Replace only this source's FUTURE non-canceled rows. Past events are
         // intentionally preserved as a schedule archive — the next banner fetch only
@@ -1314,25 +1410,8 @@ impl Store {
             "DELETE FROM schedule_segment
              WHERE monitor_id = ?1 AND source = ?2 AND canceled = 0
                AND start_time >= ?3",
-            params![monitor_id, source, now_unix()],
+            params![monitor_id, source, now],
         )?;
-        // Start instants an automatic source must NOT re-create for this monitor:
-        //  • those claimed by a protected manual row (a user's correction — don't
-        //    duplicate it at the same instant), and
-        //  • those a user explicitly removed or moved away from (tombstones,
-        //    canceled = 1 — re-inserting would resurrect a deleted occurrence, or
-        //    re-add the pre-correction copy of a rescheduled one).
-        // Storing the manual source itself doesn't self-suppress on manual rows,
-        // but still honours tombstones.
-        let suppressed_starts: std::collections::HashSet<i64> = {
-            let mut stmt = tx.prepare(
-                "SELECT start_time FROM schedule_segment
-                 WHERE monitor_id = ?1
-                   AND ((source = 'manual' AND ?2 <> 'manual') OR canceled = 1)",
-            )?;
-            stmt.query_map(params![monitor_id, source], |r| r.get::<_, i64>(0))?
-                .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?
-        };
         // For each segment the winning source is about to write, evict any other
         // automatic source's live row at that SAME instant — both past and future.
         // This prevents cross-source duplicates from accumulating in the archive
@@ -1345,10 +1424,8 @@ impl Store {
                  WHERE monitor_id = ?1 AND source <> ?2 AND source <> 'manual'
                    AND start_time = ?3 AND canceled = 0",
             )?;
-            for s in segs {
-                if !suppressed_starts.contains(&s.start_time) {
-                    evict.execute(params![monitor_id, source, s.start_time])?;
-                }
+            for s in &segs_to_write {
+                evict.execute(params![monitor_id, source, s.start_time])?;
             }
         }
         {
@@ -1356,10 +1433,7 @@ impl Store {
                 "INSERT INTO schedule_segment(monitor_id, start_time, end_time, title, category, canceled, source, video_id)
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
-            for s in segs {
-                if suppressed_starts.contains(&s.start_time) {
-                    continue;
-                }
+            for s in &segs_to_write {
                 stmt.execute(params![
                     monitor_id,
                     s.start_time,
@@ -1521,9 +1595,11 @@ impl Store {
     }
 
     /// All non-canceled schedule segments for one `(monitor, source)` pair, sorted
-    /// by start time. Used by the OCR hash cache to reconstruct in-memory segment
-    /// lists from the DB after an app restart, so OCR is not re-run on unchanged
-    /// images.
+    /// Non-canceled segments for one `(monitor, source)`, ordered by start
+    /// time. Limited to rows within the past 24 hours and forward — past-only
+    /// history rows accumulate indefinitely and make a full-table scan expensive.
+    /// Used by the OCR hash cache to reconstruct in-memory segment lists from the
+    /// DB after an app restart so OCR is not re-run on unchanged images.
     pub fn schedule_segments_for_source(
         &self,
         monitor_id: i64,
@@ -1534,10 +1610,11 @@ impl Store {
             "SELECT id, monitor_id, start_time, end_time, title, category, canceled, video_id
              FROM schedule_segment
              WHERE monitor_id = ?1 AND source = ?2 AND canceled = 0
+               AND start_time >= ?3
              ORDER BY start_time",
         )?;
         let rows = stmt
-            .query_map(params![monitor_id, source], |r| {
+            .query_map(params![monitor_id, source, now_unix() - 86_400], |r| {
                 Ok(ScheduleSegment {
                     id: r.get(0)?,
                     monitor_id: r.get(1)?,

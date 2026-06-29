@@ -33,7 +33,7 @@ use crate::models::{
 use crate::schedule_ocr::{accumulate_ocr_stats, ocr_opts_from_settings, ocr_schedule_image, record_ocr_cache_hit};
 use crate::schedule_source::{
     ChannelSourceConfig, ScheduleSourceKind, SourceEntry, community_max_posts,
-    effective_order_from, effective_title_fill_from, global_title_fill, load_channel_cfg,
+    effective_order_from, effective_title_fill_from, global_title_fill, load_channel_cfg_map,
     load_channel_scope_map, load_monitor_scope_map, load_source_order,
 };
 use crate::store::Store;
@@ -2250,6 +2250,9 @@ async fn refresh_schedules_once(
     let channel_scope = load_channel_scope_map(ctx.store.as_ref());
     let monitor_scope = load_monitor_scope_map(ctx.store.as_ref());
     let global_fill = global_title_fill(ctx.store.as_ref());
+    // Per-channel source configs loaded once up front — avoids re-reading and
+    // re-parsing the same JSON setting key on every iteration of the monitor loop.
+    let channel_cfg_map = load_channel_cfg_map(ctx.store.as_ref());
 
     // Whether to refine scraped YouTube timestamps with a batched videos.list call.
     let yt_api_enabled = ctx.youtube_api_enabled(K_YT_API_SCHEDULE);
@@ -2287,7 +2290,10 @@ async fn refresh_schedules_once(
             }
         }
         let platform = row.monitor.platform();
-        let cfg = load_channel_cfg(ctx.store.as_ref(), row.channel.id);
+        let cfg = channel_cfg_map
+            .get(&row.channel.id.to_string())
+            .cloned()
+            .unwrap_or_default();
 
         // Resolve this monitor's effective source order + title-fill toggle from
         // the global config and any channel/monitor scope override.

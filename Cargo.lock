@@ -4293,6 +4293,7 @@ dependencies = [
  "futures-util",
  "image",
  "notify-rust",
+ "parking_lot",
  "reqwest",
  "resvg",
  "rfd",

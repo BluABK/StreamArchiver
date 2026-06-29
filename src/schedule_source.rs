@@ -331,7 +331,10 @@ pub struct ChannelSourceConfig {
 }
 
 /// Load the per-channel source config map (`{channel_id -> cfg}`).
-fn load_channel_cfg_map(
+/// Call this once and look up per-channel entries from the returned map rather
+/// than calling [`load_channel_cfg`] once per monitor (which re-reads the same
+/// JSON key on every iteration).
+pub fn load_channel_cfg_map(
     store: &Store,
 ) -> std::collections::HashMap<String, ChannelSourceConfig> {
     store
