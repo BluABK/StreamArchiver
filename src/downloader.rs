@@ -71,6 +71,10 @@ pub type VideoSpeed = Arc<Mutex<HashMap<i64, f64>>>;
 /// naturally (now >= value) and are removed when the recording ends.
 pub type AdActive = Arc<Mutex<HashMap<i64, i64>>>;
 
+/// Key for the per-stream SABR stall maps: `(monitor_id, stream_id)`. Fully
+/// per-stream when a video ID is known; degrades to per-monitor otherwise.
+type SabrKey = (i64, Option<String>);
+
 const RING_MAX_LINES: usize = 80;
 /// How often the from-start catch-up watcher probes the growing capture.
 const CATCHUP_PROBE_INTERVAL_SECS: u64 = 20;
@@ -1007,27 +1011,23 @@ pub struct Supervisor {
     ad_active: AdActive,
     sem: Arc<Semaphore>,
     backoff: Arc<Mutex<HashMap<i64, BackoffEntry>>>,
-    /// Monitors where SABR live-from-start hit the DVR window limit ("not near
+    /// Streams where SABR live-from-start hit the DVR window limit ("not near
     /// live head"). The next attempt falls back to live-edge so we at least
     /// capture the ongoing stream instead of looping forever. Cleared on a
     /// successful capture (bytes > 0); in-memory only (resets on app restart).
     ///
-    /// Keyed by `monitor_id`, not per-stream, because YouTube-scrape detection
-    /// exposes no stable stream identity (stream_id is None and went_live_at
-    /// jitters every poll), so a per-stream key is impossible here. The accepted
-    /// trade-offs of the coarser key: (1) cross-stream stickiness — a monitor's
-    /// *next* broadcast inherits the flag until its first successful capture
-    /// clears it; (2) oscillation — once a from-start capture succeeds and clears
-    /// the flag, a later stall on the same broadcast can re-arm it. Both are
-    /// bounded by clear-on-success + app restart + backoff, and self-correct in
-    /// the common case (a healthy stream clears the flag on its first good grab).
-    sabr_dvr_exceeded: Arc<Mutex<HashSet<i64>>>,
-    /// Per-monitor count of *consecutive* from-start SABR stalls. Once it reaches
-    /// [`SABR_STALL_FALLBACK_TRIES`] (with deep-rewind on) the monitor is added to
+    /// Keyed by `(monitor_id, stream_id)`. When a stable video ID is available
+    /// (scraped from `videoDetails.videoId` or the YouTube Data API), the key is
+    /// fully per-stream, so cross-broadcast stickiness cannot occur. When
+    /// `stream_id` is `None` (non-YouTube monitors or degraded scrape), the key
+    /// degrades to per-monitor — same as the previous behaviour.
+    sabr_dvr_exceeded: Arc<Mutex<HashSet<SabrKey>>>,
+    /// Per-stream count of *consecutive* from-start SABR stalls. Once it reaches
+    /// [`SABR_STALL_FALLBACK_TRIES`] (with deep-rewind on) the stream is added to
     /// `sabr_dvr_exceeded` so the next attempt captures the live edge. Reset on
     /// any non-stall outcome (success, ended, manual) so it tracks back-to-back
-    /// stalls only; in-memory only.
-    sabr_stall_count: Arc<Mutex<HashMap<i64, u32>>>,
+    /// stalls only; in-memory only. Keyed by `(monitor_id, stream_id)`.
+    sabr_stall_count: Arc<Mutex<HashMap<SabrKey, u32>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1866,6 +1866,9 @@ impl Supervisor {
         stream_title: Option<String>,
     ) {
         let monitor_id = row.monitor.id;
+        // Per-stream key for the SABR stall maps. Fully per-stream when a video ID
+        // is available (YouTube scrape / API); degrades to per-monitor when not.
+        let sabr_key = (monitor_id, stream_id.clone());
         // SABR from-start fallback: prior attempts stalled "not near live head"
         // (DVR window expired, or persistent from-start stalls under deep-rewind).
         // Override capture_from_start so we capture the live edge this time instead
@@ -1873,7 +1876,7 @@ impl Supervisor {
         // (bytes > 0).
         let mut row = row;
         if row.monitor.capture_from_start
-            && self.sabr_dvr_exceeded.lock().unwrap().contains(&monitor_id)
+            && self.sabr_dvr_exceeded.lock().unwrap().contains(&sabr_key)
         {
             row.monitor.capture_from_start = false;
             info!(monitor_id, "SABR from-start unavailable; capturing live edge");
@@ -2304,13 +2307,13 @@ impl Supervisor {
             let threshold = if deep_rewind { SABR_STALL_FALLBACK_TRIES } else { 1 };
             let stalls = {
                 let mut counts = self.sabr_stall_count.lock().unwrap();
-                let n = counts.entry(monitor_id).or_insert(0);
+                let n = counts.entry(sabr_key.clone()).or_insert(0);
                 *n = n.saturating_add(1);
                 *n
             };
             if stalls >= threshold {
-                self.sabr_dvr_exceeded.lock().unwrap().insert(monitor_id);
-                self.sabr_stall_count.lock().unwrap().remove(&monitor_id);
+                self.sabr_dvr_exceeded.lock().unwrap().insert(sabr_key.clone());
+                self.sabr_stall_count.lock().unwrap().remove(&sabr_key);
                 warn!(monitor_id, stalls, "SABR stalled from-start; next attempt will use live-edge");
             } else {
                 warn!(monitor_id, stalls, threshold, "SABR stalled from-start; will retry from-start");
@@ -2319,11 +2322,11 @@ impl Supervisor {
             // Any non-stall outcome breaks the consecutive-stall streak, so the
             // counter only ever reflects *back-to-back* from-start stalls. Clear
             // the live-edge fallback flag only when the capture actually succeeded
-            // — an "ended"/"aborted"/manual outcome shouldn't un-stick a monitor
+            // — an "ended"/"aborted"/manual outcome shouldn't un-stick a stream
             // we already decided to capture at the live edge.
-            self.sabr_stall_count.lock().unwrap().remove(&monitor_id);
+            self.sabr_stall_count.lock().unwrap().remove(&sabr_key);
             if ok {
-                self.sabr_dvr_exceeded.lock().unwrap().remove(&monitor_id);
+                self.sabr_dvr_exceeded.lock().unwrap().remove(&sabr_key);
             }
         }
         // A 0-byte capture isn't always a failure: a livestream that had already

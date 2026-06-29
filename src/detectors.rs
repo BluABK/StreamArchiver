@@ -1809,7 +1809,7 @@ impl DetectContext {
                         || body.contains("\"isLiveNow\":true")
                 };
                 if live {
-                    let (broadcaster_id, thumbnail_url) = if let Some(pr) = &pr_opt {
+                    let (broadcaster_id, thumbnail_url, video_id) = if let Some(pr) = &pr_opt {
                         let ch_id =
                             pr["videoDetails"]["channelId"].as_str().map(str::to_string);
                         let thumb = pr["videoDetails"]["thumbnail"]["thumbnails"]
@@ -1817,13 +1817,15 @@ impl DetectContext {
                             .and_then(|arr| arr.last())
                             .and_then(|t| t["url"].as_str())
                             .map(str::to_string);
-                        (ch_id, thumb)
+                        let vid = pr["videoDetails"]["videoId"].as_str().map(str::to_string);
+                        (ch_id, thumb, vid)
                     } else {
-                        (None, None)
+                        (None, None, None)
                     };
                     DetectOutcome::live(item.monitor_id, "live")
                         .with_broadcaster_id(broadcaster_id)
                         .with_thumbnail_url(thumbnail_url)
+                        .with_stream_id(video_id)
                 } else {
                     DetectOutcome::offline(item.monitor_id)
                 }
