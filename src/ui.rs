@@ -6085,14 +6085,32 @@ impl StreamArchiverApp {
         ];
 
         // ── Drain any completed background recordings load ────────────────────
-        if let Some(fd) = self.format_designer.as_mut() {
+        // When a load is in-flight, schedule a repaint so we check again next
+        // frame even if there is no user input — otherwise the data sits in the
+        // channel until the user moves the mouse.
+        let still_loading = if let Some(fd) = self.format_designer.as_mut() {
             if let Some(rx) = &fd.recordings_load {
-                if let Ok((recs, default_idx)) = rx.try_recv() {
-                    fd.recordings = recs;
-                    fd.selected_recording_idx = default_idx;
-                    fd.recordings_load = None;
+                match rx.try_recv() {
+                    Ok((recs, default_idx)) => {
+                        fd.recordings = recs;
+                        fd.selected_recording_idx = default_idx;
+                        fd.recordings_load = None;
+                        false
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        fd.recordings_load = None;
+                        false
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => true,
                 }
+            } else {
+                false
             }
+        } else {
+            false
+        };
+        if still_loading {
+            ctx.request_repaint_after(std::time::Duration::from_millis(30));
         }
 
         // ── Snapshot state before closure (avoids borrow conflicts) ──────────
