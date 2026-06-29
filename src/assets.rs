@@ -25,6 +25,16 @@ fn write_fetched_stamp(asset_dir: &Path) {
     let _ = std::fs::write(asset_dir.join(".assets_fetched_at"), now_unix().to_string());
 }
 
+/// True if this channel's assets have been fetched at least once (the freshness
+/// stamp exists). Used to suppress change-log noise on the very first fetch: the
+/// baseline run establishes the initial state, so a name colour appearing for the
+/// first time is not a "change". The stamp is written only at the END of a fetch
+/// run, so during the first run this returns false and the first-seen colour is
+/// recorded silently — matching how emote/icon/banner baselines are silent.
+fn assets_ever_fetched(asset_dir: &Path) -> bool {
+    asset_dir.join(".assets_fetched_at").exists()
+}
+
 fn should_refetch_global_badges(platform_dir: &Path) -> bool {
     let stamp = platform_dir.join("twitch").join(".global_badges_fetched_at");
     match std::fs::read_to_string(&stamp) {
@@ -205,6 +215,27 @@ async fn archive_and_write(dir: &Path, stem: &str, ext: &str, bytes: &[u8]) -> R
                     tokio::fs::copy(&cur_path, &archived).await?;
                     let _ = tokio::fs::remove_file(&cur_path).await;
                 }
+                // Log the replacement so the change-history can show it. `stem` is
+                // "icon"/"banner"; `id` points at the archived previous version.
+                let archived_name = archived
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                append_asset_changes(
+                    dir,
+                    &[AssetChange {
+                        at: ts,
+                        kind: stem.to_string(),
+                        provider: String::new(),
+                        action: "changed".to_string(),
+                        name: String::new(),
+                        id: archived_name,
+                        old: String::new(),
+                        new: String::new(),
+                    }],
+                )
+                .await;
             }
             // Unreadable current file — just overwrite it.
             Err(_) => {}
@@ -486,6 +517,185 @@ fn asset_present(path: &Path) -> bool {
     std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
 }
 
+// ---------- Asset change history ----------
+
+/// One recorded change to a channel's assets, appended as a JSON line to the
+/// per-channel-platform `asset_changes.jsonl`. This is the queryable companion to
+/// the filesystem `history/` archives: the images/manifests preserve the *bytes*,
+/// this log preserves *what changed and when* so the UI can present a timeline.
+///
+/// Why a log at all: emote manifests are overwritten wholesale on every refetch,
+/// so a code the streamer later removes would otherwise vanish without a trace
+/// (it's not even caught as "deprecated", since it's no longer in the manifest).
+/// Diffing the old manifest against the new before the overwrite records the
+/// removal (and additions) here, permanently.
+///
+/// The `kind`/`action` pair is a small open vocabulary the UI maps to display:
+/// - `kind = "emote"`  → `action` `"added"`/`"removed"`, with `provider`
+///   (`"7tv"`/`"bttv"`/`"ffz"`), `name` (the code) and `id`.
+/// - `kind = "icon"`/`"banner"` → `action` `"changed"`; `id` is the archived
+///   filename kept under `history/`.
+/// - `kind = "name_color"` → `action` `"added"`/`"removed"`/`"changed"` with the
+///   `old`/`new` hex strings.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AssetChange {
+    /// Unix seconds the change was recorded (when the refetch saw it).
+    pub at: i64,
+    pub kind: String,
+    /// Emote provider stem for `kind = "emote"` (`"7tv"`/`"bttv"`/`"ffz"`); empty otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub provider: String,
+    pub action: String,
+    /// Emote code (for `kind = "emote"`); empty otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Emote id, or the archived `history/` filename for icon/banner; empty otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    /// Previous value (e.g. old name colour); empty when not applicable.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub old: String,
+    /// New value (e.g. new name colour); empty when not applicable.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub new: String,
+}
+
+impl AssetChange {
+    fn emote(at: i64, provider: &str, action: &str, name: &str, id: &str) -> AssetChange {
+        AssetChange {
+            at,
+            kind: "emote".to_string(),
+            provider: provider.to_string(),
+            action: action.to_string(),
+            name: name.to_string(),
+            id: id.to_string(),
+            old: String::new(),
+            new: String::new(),
+        }
+    }
+}
+
+/// Diff two emote manifests by **code** (case-sensitive, as typed in chat) and
+/// return one [`AssetChange`] per added/removed code. Empty/whitespace codes are
+/// ignored (legacy name-less entries can never match chat anyway). An id-only
+/// change to an existing code yields nothing — only the code set matters here, so
+/// churn in ids/urls doesn't spam the history. Output is sorted by code so the log
+/// (and the unit test) is deterministic.
+fn diff_emote_manifest(
+    old: &[EmoteManifestEntry],
+    new: &[EmoteManifestEntry],
+    provider: &str,
+    at: i64,
+) -> Vec<AssetChange> {
+    use std::collections::HashMap;
+    let index = |m: &[EmoteManifestEntry]| -> HashMap<String, String> {
+        m.iter()
+            .filter(|e| !e.name.trim().is_empty())
+            .map(|e| (e.name.clone(), e.id.clone()))
+            .collect()
+    };
+    let old_idx = index(old);
+    let new_idx = index(new);
+    let mut out: Vec<AssetChange> = Vec::new();
+    for (name, id) in &old_idx {
+        if !new_idx.contains_key(name) {
+            out.push(AssetChange::emote(at, provider, "removed", name, id));
+        }
+    }
+    for (name, id) in &new_idx {
+        if !old_idx.contains_key(name) {
+            out.push(AssetChange::emote(at, provider, "added", name, id));
+        }
+    }
+    // A code is in at most one of {added, removed}, so sorting by code alone is a
+    // total, stable order.
+    out.sort_by_key(|c| c.name.to_lowercase());
+    out
+}
+
+/// Append change records to the channel-platform `asset_changes.jsonl` (one JSON
+/// object per line, append-only). Best-effort: a write failure is swallowed — the
+/// history is a convenience layer and must never abort or fail an asset fetch.
+async fn append_asset_changes(asset_dir: &Path, changes: &[AssetChange]) {
+    if changes.is_empty() {
+        return;
+    }
+    let mut buf = String::new();
+    for c in changes {
+        if let Ok(line) = serde_json::to_string(c) {
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+    }
+    if buf.is_empty() || tokio::fs::create_dir_all(asset_dir).await.is_err() {
+        return;
+    }
+    use tokio::io::AsyncWriteExt;
+    if let Ok(mut f) = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(asset_dir.join("asset_changes.jsonl"))
+        .await
+    {
+        let _ = f.write_all(buf.as_bytes()).await;
+    }
+}
+
+/// Read a channel-platform's recorded asset changes (`asset_changes.jsonl`) in
+/// chronological append order (oldest first). Malformed/blank lines are skipped;
+/// a missing file yields an empty vec. Synchronous — the UI calls it directly on
+/// popup-open (the file is tiny: a handful of lines per refetch).
+pub fn read_asset_changes(asset_dir: &Path) -> Vec<AssetChange> {
+    let Ok(s) = std::fs::read_to_string(asset_dir.join("asset_changes.jsonl")) else {
+        return Vec::new();
+    };
+    s.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<AssetChange>(l).ok())
+        .collect()
+}
+
+/// Record what a freshly-fetched emote manifest changed, *before* it overwrites the
+/// previous one at `asset_dir/emotes/{provider}.json`. The prior manifest is read,
+/// diffed by code against `new`, and on any add/remove: the old manifest is
+/// snapshotted to `emotes/history/{provider}_{ts}.json` (full archival, mirroring
+/// the icon/banner `history/`) and the per-emote changes are appended to
+/// `asset_changes.jsonl`. A no-op on the first fetch (no prior manifest = baseline,
+/// not a change) or when the code set is unchanged. `provider` is the manifest stem
+/// (`"7tv"`/`"bttv"`/`"ffz"`). The current manifest file is left in place — the
+/// caller writes the new one right after, so the canonical manifest is never
+/// missing even if this snapshot write fails.
+async fn record_manifest_change(asset_dir: &Path, provider: &str, new: &[EmoteManifestEntry]) {
+    let emotes_dir = asset_dir.join("emotes");
+    let Ok(old_json) = std::fs::read_to_string(emotes_dir.join(format!("{provider}.json"))) else {
+        return;
+    };
+    // Treat a corrupt/truncated prior manifest as "unknown" and bail, mirroring the
+    // missing-file early return above. Defaulting to an empty Vec would diff every
+    // current emote as a fresh "add" and snapshot a manifest we couldn't even parse.
+    let Ok(old) = serde_json::from_str::<Vec<EmoteManifestEntry>>(&old_json) else {
+        return;
+    };
+    let at = now_unix();
+    let changes = diff_emote_manifest(&old, new, provider, at);
+    if changes.is_empty() {
+        return;
+    }
+    // Snapshot the prior manifest (full archival) before it's overwritten. Written
+    // from the in-memory bytes, not a rename, so the canonical path stays valid.
+    let hist = emotes_dir.join("history");
+    if tokio::fs::create_dir_all(&hist).await.is_ok() {
+        let mut dest = hist.join(format!("{provider}_{at}.json"));
+        let mut n = 1;
+        while tokio::fs::try_exists(&dest).await.unwrap_or(false) {
+            n += 1;
+            dest = hist.join(format!("{provider}_{at}_{n}.json"));
+        }
+        let _ = tokio::fs::write(&dest, old_json.as_bytes()).await;
+    }
+    append_asset_changes(asset_dir, &changes).await;
+}
+
 /// Download BTTV emotes:
 /// - Channel emotes → `asset_dir/emotes/bttv/{id}.ext` (per-channel, unchanged)
 /// - Shared emotes  → `platform_dir/bttv/emotes/{id}.ext` (global dedup, skip if present)
@@ -587,6 +797,8 @@ async fn fetch_bttv_emotes(
     if !manifest.is_empty() {
         let manifest_dir = asset_dir.join("emotes");
         tokio::fs::create_dir_all(&manifest_dir).await?;
+        // Record added/removed codes against the previous manifest before overwriting.
+        record_manifest_change(asset_dir, "bttv", &manifest).await;
         if let Ok(json) = serde_json::to_string(&manifest) {
             let _ = tokio::fs::write(manifest_dir.join("bttv.json"), json).await;
         }
@@ -673,6 +885,7 @@ async fn fetch_ffz_emotes(
     if !manifest.is_empty() {
         let manifest_dir = asset_dir.join("emotes");
         tokio::fs::create_dir_all(&manifest_dir).await?;
+        record_manifest_change(asset_dir, "ffz", &manifest).await;
         if let Ok(json) = serde_json::to_string(&manifest) {
             let _ = tokio::fs::write(manifest_dir.join("ffz.json"), json).await;
         }
@@ -742,6 +955,7 @@ async fn fetch_7tv_emotes(
     if !manifest.is_empty() {
         let manifest_dir = asset_dir.join("emotes");
         tokio::fs::create_dir_all(&manifest_dir).await?;
+        record_manifest_change(asset_dir, "7tv", &manifest).await;
         if let Ok(json) = serde_json::to_string(&manifest) {
             let _ = tokio::fs::write(manifest_dir.join("7tv.json"), json).await;
         }
@@ -753,12 +967,15 @@ async fn fetch_7tv_emotes(
 // ---------- YouTube ----------
 
 /// Download YouTube channel icon and banner into `asset_dir/`.
+/// Returns `Ok(true)` when a banner image was successfully written, so the caller
+/// can skip the page-scrape banner fallback and avoid two YouTube banner sources
+/// overwriting each other on every fetch (phantom "banner replaced" history).
 async fn fetch_youtube_channel_assets(
     client: &Client,
     api_key: &str,
     channel_id: &str,
     asset_dir: &Path,
-) -> Result<()> {
+) -> Result<bool> {
     if api_key.is_empty() || channel_id.is_empty() {
         bail!("missing YouTube API key or channel ID");
     }
@@ -790,14 +1007,16 @@ async fn fetch_youtube_channel_assets(
     }
 
     // Channel banner
+    let mut banner_set = false;
     let banner_url = item["brandingSettings"]["image"]["bannerExternalUrl"].as_str();
     if let Some(url) = banner_url {
         let ext = ext_from_url(url).unwrap_or("jpg");
-        if let Err(e) = download_image_archival(client, url, asset_dir, "banner", ext).await {
-            warn!("YouTube banner: {e}");
+        match download_image_archival(client, url, asset_dir, "banner", ext).await {
+            Ok(()) => banner_set = true,
+            Err(e) => warn!("YouTube banner: {e}"),
         }
     }
-    Ok(())
+    Ok(banner_set)
 }
 
 // ---------- Kick ----------
@@ -935,13 +1154,43 @@ async fn fetch_twitch_name_color(
     let v: serde_json::Value = resp.json().await?;
     let color = v["data"][0]["color"].as_str().unwrap_or("").trim().to_string();
     let dest = asset_dir.join("name_color.txt");
+    // Read the previous colour first so we can log a transition (and only a real one).
+    let old_color = std::fs::read_to_string(&dest)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
     if color.is_empty() {
         // Broadcaster cleared their colour — drop any stale cache so the UI reverts
         // to the automatic palette instead of tinting with a colour no longer used.
         let _ = tokio::fs::remove_file(&dest).await;
     } else {
         tokio::fs::create_dir_all(asset_dir).await?;
-        let _ = tokio::fs::write(&dest, color).await;
+        let _ = tokio::fs::write(&dest, &color).await;
+    }
+    // Only log a transition once a baseline exists. On the first-ever fetch the
+    // stamp is absent, so a name colour appearing for the first time is the baseline
+    // (silent), not an "added" change — consistent with emote/icon/banner baselines.
+    if old_color != color && assets_ever_fetched(asset_dir) {
+        let action = if old_color.is_empty() {
+            "added"
+        } else if color.is_empty() {
+            "removed"
+        } else {
+            "changed"
+        };
+        append_asset_changes(
+            asset_dir,
+            &[AssetChange {
+                at: now_unix(),
+                kind: "name_color".to_string(),
+                provider: String::new(),
+                action: action.to_string(),
+                name: String::new(),
+                id: String::new(),
+                old: old_color,
+                new: color,
+            }],
+        )
+        .await;
     }
     Ok(())
 }
@@ -1023,9 +1272,14 @@ async fn fetch_youtube_page_banner(
 /// 1. YouTube Data API (icon + banner + branding) when `api_key` and `channel_id`
 ///    are both non-empty.
 /// 2. Page-scrape banner (fetches the channel home page, extracts the wide
-///    page-header banner from `ytInitialData`) — works without an API key, runs
-///    alongside or instead of the API fetch.
-/// The 24 h stamp is written only when at least one approach succeeds.
+///    page-header banner from `ytInitialData`) — works without an API key.
+///
+/// The page-scrape banner is a **fallback**: it runs only when the API path did
+/// not already write a banner. The two sources expose different banner images
+/// (the API's `bannerExternalUrl` vs the page-header banner), so writing both on
+/// every fetch made them overwrite each other and spam the change history with
+/// phantom "banner replaced" entries. The 24 h stamp is written only when at
+/// least one approach succeeds.
 pub async fn run_youtube_assets(
     client: &Client,
     api_key: &str,
@@ -1034,15 +1288,21 @@ pub async fn run_youtube_assets(
     asset_dir: &Path,
 ) -> bool {
     let mut any_ok = false;
+    let mut api_set_banner = false;
 
     if !api_key.is_empty() && !channel_id.is_empty() {
         match fetch_youtube_channel_assets(client, api_key, channel_id, asset_dir).await {
-            Ok(()) => any_ok = true,
+            Ok(banner_set) => {
+                any_ok = true;
+                api_set_banner = banner_set;
+            }
             Err(e) => warn!("YouTube channel assets ({channel_id}): {e}"),
         }
     }
 
-    if !channel_url.is_empty() {
+    // Fallback only: skip the page scrape entirely when the API already supplied a
+    // banner, so a single channel never alternates between two banner sources.
+    if !api_set_banner && !channel_url.is_empty() {
         match fetch_youtube_page_banner(client, channel_url, asset_dir).await {
             Ok(()) => any_ok = true,
             Err(e) if !any_ok => warn!("YouTube page banner ({channel_url}): {e}"),
@@ -1074,10 +1334,28 @@ pub async fn run_kick_assets(client: &Client, slug: &str, asset_dir: &Path) -> b
 mod tests {
     use super::*;
 
+    /// A fresh, unique temp directory for a test. Combines the pid, a
+    /// process-lifetime counter, and a nanosecond timestamp so a directory left
+    /// behind by a *panicking* run (whose end-of-test cleanup never runs) can
+    /// never be reused — even if the OS recycles the pid — which would otherwise
+    /// let stale `asset_changes.jsonl` lines leak into a later run's assertions.
+    fn unique_test_dir(prefix: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir()
+            .join(format!("{prefix}-{}-{n}-{nanos}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
     #[test]
     fn refetch_freshness_round_trip() {
-        let dir = std::env::temp_dir().join(format!("sa-assets-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = unique_test_dir("sa-assets");
         std::fs::create_dir_all(&dir).unwrap();
 
         // No stamp → must refetch (this is what makes a failed fetch retry, since the
@@ -1114,8 +1392,7 @@ mod tests {
 
     #[tokio::test]
     async fn archival_write_preserves_changed_versions() {
-        let dir = std::env::temp_dir().join(format!("sa-archival-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = unique_test_dir("sa-archival");
         std::fs::create_dir_all(&dir).unwrap();
 
         // First fetch: no history yet, canonical written.
@@ -1142,6 +1419,99 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("icon.jpg")).unwrap(), b"v3");
         assert!(!dir.join("icon.png").exists(), "stale extension must be cleared");
         assert_eq!(history_variants(&dir, "icon").len(), 2);
+
+        // Each change is logged to asset_changes.jsonl (v1→v2 and v2→v3).
+        let log = read_asset_changes(&dir);
+        assert_eq!(log.iter().filter(|c| c.kind == "icon").count(), 2);
+        assert!(log.iter().all(|c| c.action == "changed"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn entry(name: &str, id: &str) -> EmoteManifestEntry {
+        EmoteManifestEntry {
+            name: name.to_string(),
+            id: id.to_string(),
+            ext: "webp".to_string(),
+            shared: false,
+        }
+    }
+
+    #[test]
+    fn manifest_diff_detects_adds_and_removes() {
+        let old = vec![entry("Keep", "1"), entry("Gone", "2"), entry("", "blank")];
+        // Keep stays (id churn ignored), Gone removed, New added; blank code ignored.
+        let new = vec![entry("Keep", "1b"), entry("New", "3"), entry("", "blank2")];
+        let diff = diff_emote_manifest(&old, &new, "7tv", 1000);
+
+        assert_eq!(diff.len(), 2, "only Gone (removed) + New (added)");
+        // Deterministic, sorted by code: Gone < New.
+        assert_eq!(diff[0].name, "Gone");
+        assert_eq!(diff[0].action, "removed");
+        assert_eq!(diff[0].provider, "7tv");
+        assert_eq!(diff[0].at, 1000);
+        assert_eq!(diff[1].name, "New");
+        assert_eq!(diff[1].action, "added");
+
+        // An unchanged code set (even with reordering / id churn) yields nothing.
+        let same = vec![entry("New", "3"), entry("Keep", "9")];
+        let same2 = vec![entry("Keep", "1"), entry("New", "zzz")];
+        assert!(diff_emote_manifest(&same, &same2, "7tv", 1).is_empty());
+    }
+
+    #[tokio::test]
+    async fn record_manifest_change_logs_and_snapshots() {
+        let dir = unique_test_dir("sa-manifest");
+        let emotes = dir.join("emotes");
+        std::fs::create_dir_all(&emotes).unwrap();
+
+        // First fetch: no prior manifest → baseline, nothing recorded.
+        let v1 = vec![entry("Pog", "a"), entry("Kappa", "b")];
+        record_manifest_change(&dir, "7tv", &v1).await;
+        assert!(read_asset_changes(&dir).is_empty(), "first fetch is the baseline");
+        // Simulate the caller writing the manifest.
+        std::fs::write(
+            emotes.join("7tv.json"),
+            serde_json::to_string(&v1).unwrap(),
+        )
+        .unwrap();
+
+        // Second fetch removes Kappa, adds Sadge.
+        let v2 = vec![entry("Pog", "a"), entry("Sadge", "c")];
+        record_manifest_change(&dir, "7tv", &v2).await;
+        let log = read_asset_changes(&dir);
+        assert_eq!(log.len(), 2);
+        assert!(log.iter().any(|c| c.name == "Kappa" && c.action == "removed"));
+        assert!(log.iter().any(|c| c.name == "Sadge" && c.action == "added"));
+        // The prior manifest was snapshotted under emotes/history/.
+        let snaps = history_variants(&emotes, "7tv");
+        assert_eq!(snaps.len(), 1, "old manifest archived");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn record_manifest_change_bails_on_corrupt_old_manifest() {
+        let dir = unique_test_dir("sa-manifest-corrupt");
+        let emotes = dir.join("emotes");
+        std::fs::create_dir_all(&emotes).unwrap();
+
+        // A truncated / corrupt prior manifest must be treated as "unknown", not as
+        // an empty set — otherwise every current emote diffs as a fresh "add" and we
+        // snapshot a file we couldn't even parse.
+        std::fs::write(emotes.join("7tv.json"), b"{ this is not valid json").unwrap();
+
+        let v = vec![entry("Pog", "a"), entry("Kappa", "b")];
+        record_manifest_change(&dir, "7tv", &v).await;
+
+        assert!(
+            read_asset_changes(&dir).is_empty(),
+            "corrupt manifest must not produce phantom add entries"
+        );
+        assert!(
+            history_variants(&emotes, "7tv").is_empty(),
+            "an unparseable manifest must not be snapshotted"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

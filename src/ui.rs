@@ -652,6 +652,13 @@ pub struct StreamArchiverApp {
     /// Open emote-viewer window (None = closed). Reuses the shared `emote_anim`
     /// decode cache, so its emotes animate against the same clock as chat replay.
     emote_viewer: Option<EmoteViewer>,
+    /// Set when this channel's assets are refetched while its emote viewer is open:
+    /// the viewer enumerated its list once on open, so it's now stale. Drives a
+    /// "close and reopen" banner; cleared when the viewer is (re)opened or closed.
+    emote_viewer_stale: bool,
+    /// Open asset change-history popup (None = closed). Holds the channel's
+    /// `asset_changes.jsonl` parsed + formatted once on open (newest first).
+    asset_history: Option<AssetHistoryView>,
     /// GPU textures for the third-party emote-provider logos (7TV/BTTV), uploaded
     /// once on first use of the emote launcher buttons.
     provider_tex: Option<ProviderTextures>,
@@ -989,6 +996,8 @@ impl StreamArchiverApp {
             channel_asset_thumbs: HashMap::new(),
             channel_emote_counts: HashMap::new(),
             emote_viewer: None,
+            emote_viewer_stale: false,
+            asset_history: None,
             provider_tex: None,
             channel_twitch_colors: HashMap::new(),
             videos_sort: SortState::default(),
@@ -1194,6 +1203,22 @@ impl StreamArchiverApp {
                             // Drop decoded emote frames so refreshed images re-decode
                             // from disk at their stable paths.
                             self.clear_emote_cache();
+                            // If the emote viewer is open for this channel, its
+                            // enumerated list was loaded once on open and is now
+                            // stale — flag it so the window can show a re-open banner.
+                            if let Some(v) = &self.emote_viewer
+                                && v.channel_name == task.label
+                            {
+                                self.emote_viewer_stale = true;
+                            }
+                            // The asset-history view reads the change logs once on
+                            // open; if it's showing this channel, reload it in place
+                            // so freshly-recorded changes appear without a reopen.
+                            if let Some(h) = &mut self.asset_history
+                                && h.channel_name == task.label
+                            {
+                                h.reload();
+                            }
                         }
                         self.finished_tasks.insert(0, (task, outcome, now_unix()));
                         self.finished_tasks.truncate(100);
@@ -3984,6 +4009,84 @@ impl EmoteViewer {
     }
 }
 
+/// Open asset change-history popup: a channel's recorded asset changes (added /
+/// removed emotes, icon / banner / name-colour replacements) across all its
+/// platforms, read from each platform's `asset_changes.jsonl` and formatted once
+/// on open into display lines (newest first). Mirrors [`EmoteViewer`]'s
+/// load-once-on-open pattern so the popup never touches the disk per frame.
+struct AssetHistoryView {
+    channel_name: String,
+    /// Platforms this channel runs on (non-`Generic`), retained so the view can be
+    /// reloaded in place when a background asset refetch lands while it's open.
+    platforms: Vec<Platform>,
+    lines: Vec<String>,
+}
+
+impl AssetHistoryView {
+    fn new(channel_name: String, platforms: &[Platform]) -> AssetHistoryView {
+        let lines = load_asset_history_lines(&channel_name, platforms);
+        AssetHistoryView { channel_name, platforms: platforms.to_vec(), lines }
+    }
+
+    /// Re-read the change logs from disk (newest first), keeping the window open.
+    /// Called when an asset refetch for this channel completes so a live history
+    /// view reflects the just-recorded changes without a manual reopen.
+    fn reload(&mut self) {
+        self.lines = load_asset_history_lines(&self.channel_name, &self.platforms);
+    }
+}
+
+/// Short display label for an emote-provider manifest stem as stored in
+/// [`crate::assets::AssetChange::provider`]. Falls back to the raw stem.
+fn provider_label_from_id(id: &str) -> &str {
+    match id {
+        "7tv" => "7TV",
+        "bttv" => "BTTV",
+        "ffz" => "FFZ",
+        other => other,
+    }
+}
+
+/// One display line for a recorded asset change, e.g.
+/// `2026-06-29 14:30  Twitch · 7TV emote +PogU`, `… · Twitch icon replaced`, or
+/// `… · Twitch name colour #9146FF → #00FF00`.
+fn fmt_asset_change_line(platform: Platform, c: &crate::assets::AssetChange) -> String {
+    let when = fmt_datetime_short(c.at);
+    let what = match c.kind.as_str() {
+        "emote" => {
+            let prov = provider_label_from_id(&c.provider);
+            // U+2212 MINUS SIGN for removals to line up visually with '+'.
+            let sign = if c.action == "removed" { "−" } else { "+" };
+            format!("{prov} emote {sign}{}", c.name)
+        }
+        "icon" => "icon replaced".to_string(),
+        "banner" => "banner replaced".to_string(),
+        "name_color" => match c.action.as_str() {
+            "added" => format!("name colour set {}", c.new),
+            "removed" => format!("name colour cleared (was {})", c.old),
+            _ => format!("name colour {} → {}", c.old, c.new),
+        },
+        other => format!("{other} {}", c.action),
+    };
+    format!("{when}  {} · {what}", platform.label())
+}
+
+/// Load and format a channel's recorded asset changes across all its (non-generic)
+/// platforms, newest first. Empty when nothing has been recorded yet.
+fn load_asset_history_lines(name: &str, platforms: &[Platform]) -> Vec<String> {
+    let mut all: Vec<(Platform, crate::assets::AssetChange)> = Vec::new();
+    for &p in platforms.iter().filter(|p| **p != Platform::Generic) {
+        let dir = channel_asset_dir(name, p);
+        for c in crate::assets::read_asset_changes(&dir) {
+            all.push((p, c));
+        }
+    }
+    // Newest first. `sort_by_key` is stable, so changes sharing a timestamp keep
+    // their per-platform append order.
+    all.sort_by_key(|c| std::cmp::Reverse(c.1.at));
+    all.iter().map(|(p, c)| fmt_asset_change_line(*p, c)).collect()
+}
+
 /// A loaded mainpage image asset (icon/banner) shown as a thumbnail in the channel
 /// Properties window. Holds the full-resolution texture so the global Alt-hover
 /// preview shows it at original size; the strip itself draws it small.
@@ -4310,6 +4413,7 @@ impl eframe::App for StreamArchiverApp {
         self.instance_properties_window(ui.ctx());
         self.channel_properties_window(ui.ctx());
         self.emote_viewer_window(ui.ctx());
+        self.asset_history_window(ui.ctx());
         self.recording_properties_window(ui.ctx());
         self.processes_window(ui.ctx());
         self.format_designer_window(ui.ctx());
@@ -12164,6 +12268,7 @@ impl StreamArchiverApp {
 
         let mut pref_change: Option<Option<Platform>> = None;
         let mut open_emote_viewer: Option<EmoteProvider> = None;
+        let mut open_asset_history = false;
 
         if self.channel_cfg_draft.as_ref().map(|(id, _)| *id) != Some(ch.id) {
             self.channel_cfg_draft = Some((ch.id, load_channel_cfg(&self.core.store, ch.id)));
@@ -12339,6 +12444,17 @@ impl StreamArchiverApp {
                                 .join("channel_assets")
                                 .join(crate::downloader::sanitize_filename(&ch.name));
                             crate::platform::open_path(&root);
+                        }
+                        if ui
+                            .button("🕑 History")
+                            .on_hover_text(
+                                "Show this channel's recorded asset changes over time \
+                                 (added / removed emotes, icon / banner / name-colour \
+                                 replacements) across all its platforms.",
+                            )
+                            .clicked()
+                        {
+                            open_asset_history = true;
                         }
                     });
 
@@ -12623,6 +12739,12 @@ impl StreamArchiverApp {
         // A launcher button was clicked above — open the emote viewer for it.
         if let Some(provider) = open_emote_viewer {
             self.emote_viewer = Some(EmoteViewer::new(ch.name.clone(), provider));
+            // Fresh enumeration — clear any stale flag left from a prior session.
+            self.emote_viewer_stale = false;
+        }
+        // The "🕑 History" button was clicked — load and open the asset-history popup.
+        if open_asset_history {
+            self.asset_history = Some(AssetHistoryView::new(ch.name.clone(), &asset_platforms));
         }
 
         if cfg_dirty {
@@ -12669,6 +12791,9 @@ impl StreamArchiverApp {
         let animate_emotes = self.animate_emotes;
         let now = ctx.input(|i| i.time);
         let mut decode_misses: Vec<std::path::PathBuf> = Vec::new();
+        // Were this channel's assets refetched while the window stayed open? The
+        // lists below were enumerated once on open, so they no longer reflect disk.
+        let stale = self.emote_viewer_stale;
 
         // Borrow the (already-enumerated) emote lists; no disk access per frame.
         let viewer = self.emote_viewer.as_ref().expect("checked Some above");
@@ -12688,6 +12813,17 @@ impl StreamArchiverApp {
                     open = false;
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
+                    if stale {
+                        // Assets were refetched behind this window; the lists are a
+                        // snapshot from when it opened. Amber, matching other
+                        // "outdated info" hints elsewhere in the UI.
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xe0, 0xb0, 0x6c),
+                            "⚠ Assets were refetched while this was open — close and \
+                             reopen to see the latest.",
+                        );
+                        ui.separator();
+                    }
                     ui.horizontal(|ui| {
                         ui.heading(provider.label());
                         // Active tally, plus the deprecated count when any — so the two
@@ -12760,10 +12896,64 @@ impl StreamArchiverApp {
 
         if !open {
             self.emote_viewer = None;
+            // Reset the stale flag so a later re-open starts fresh (not pre-flagged).
+            self.emote_viewer_stale = false;
             // Free decoded emote frames now the window is closed (mirrors the chat
             // popup). If the chat replay is still open it re-decodes its visible
             // emotes next frame — cheap and bounded.
             self.clear_emote_cache();
+        }
+    }
+
+    /// Asset change-history popup: the recorded add/remove of emotes plus
+    /// icon / banner / name-colour replacements for one channel, newest first,
+    /// across all its platforms. Lines are built once on open (see
+    /// [`AssetHistoryView::new`]); this just renders the snapshot. Mirrors
+    /// [`Self::meta_popup_window`].
+    #[allow(deprecated)]
+    fn asset_history_window(&mut self, ctx: &egui::Context) {
+        let Some(view) = self.asset_history.as_ref() else {
+            return;
+        };
+        let mut open = true;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("asset_history_vp"),
+            egui::ViewportBuilder::default()
+                .with_title(format!("Asset history — {}", view.channel_name))
+                .with_inner_size([560.0, 440.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if view.lines.is_empty() {
+                        ui.label(
+                            "No asset changes recorded yet. The first asset fetch is the \
+                             baseline; changes appear here after a later refetch alters the \
+                             channel's emotes, icon, banner, or name colour.",
+                        );
+                        return;
+                    }
+                    ui.label(format!(
+                        "{} recorded change(s), newest first. Removed emotes are kept here \
+                         even after they vanish from the channel's manifest.",
+                        view.lines.len(),
+                    ));
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        for line in &view.lines {
+                            ui.label(egui::RichText::new(line).monospace());
+                        }
+                    });
+                    ui.add_space(6.0);
+                    if ui.button("📋  Copy").clicked() {
+                        ui.ctx().copy_text(view.lines.join("\n"));
+                    }
+                });
+            },
+        );
+        if !open {
+            self.asset_history = None;
         }
     }
 }
