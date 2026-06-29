@@ -328,9 +328,19 @@ fn build_prompt(image_path: &str, opts: &OcrOpts) -> String {
 - If NO timezone is printed anywhere, {no_label_clause}. Never convert to my machine's local timezone.",
         )
     } else {
+        // No primary timezone configured. Provide an explicit abbreviation→offset
+        // table so the model doesn't fall back to the machine's local offset when
+        // a recognisable label (e.g. PDT, EST) IS printed on the banner.
         format!(
-            "- Timezone: use exactly what the banner prints; if none is shown, assume UTC offset {offset}.\n\
-- A single stream may print its start time in SEVERAL timezones at once (e.g. 'PDT / JST / GMT'). Those are the SAME moment shown more than once — NOT separate streams. Emit exactly ONE event per stream block, fixing the instant from the first/topmost printed timezone (with its real UTC offset).\n\
+            "- Timezone: identify the timezone abbreviation(s) printed on the banner and map each to its real UTC offset using this table:\n\
+  PDT=-07:00  PST=-08:00  MDT=-06:00  MST=-07:00  CDT=-05:00  CST=-06:00\n\
+  EDT=-04:00  EST=-05:00  BRT=-03:00  GMT=+00:00  UTC=+00:00  BST=+01:00\n\
+  CET=+01:00  CEST=+02:00  EET=+02:00  EEST=+03:00  MSK=+03:00\n\
+  IST=+05:30  ICT=+07:00  HKT=+08:00  SGT=+08:00  AWST=+08:00\n\
+  JST=+09:00  KST=+09:00  AEST=+10:00  AEDT=+11:00  NZST=+12:00  NZDT=+13:00\n\
+  CRITICAL: when a timezone abbreviation IS visible on the banner, always use that abbreviation's real UTC offset from the table — NEVER use the assumed offset below.\n\
+  Only if absolutely NO timezone abbreviation appears anywhere on the banner should you assume UTC offset {offset}.\n\
+- A single stream may print its start time in SEVERAL timezones at once (e.g. 'PDT / JST / GMT'). Those are the SAME moment shown more than once — NOT separate streams. Emit exactly ONE event per stream block, anchored to the first/topmost printed timezone with its real UTC offset from the table.\n\
 - A '*' or 'next day' mark beside a converted time only means that conversion lands on the following calendar day — it does not change the instant.\n\
 - Never convert to my machine's local timezone.",
         )
