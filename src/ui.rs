@@ -1091,15 +1091,20 @@ impl StreamArchiverApp {
             Ok(chs) => self.channels = chs,
             Err(e) => warn!("failed to load channels: {e:#}"),
         }
-        // History may have changed; re-fetch lazily on next expand.
-        self.rec_cache.clear();
-        self.ad_break_cache.clear();
-        self.meta_change_cache.clear();
-        self.schedule_cache.clear();
         // Drop expansion state for channels/monitors that no longer exist (avoids
         // an unbounded leak and "sticky" expansion if a row id is later reused).
         let live_channels: HashSet<i64> = self.channels.iter().map(|c| c.id).collect();
         let live_monitors: HashSet<i64> = self.rows.iter().map(|r| r.monitor.id).collect();
+        // Evict dead monitors from the rec/ad/meta/schedule caches, but KEEP
+        // entries for live monitors — clearing everything forces a synchronous
+        // recordings_for_monitor() DB call for every expanded monitor on the very
+        // next frame, which freezes the UI thread proportionally to the number of
+        // expanded rows. Stale data (a just-finished recording) is refreshed at
+        // the specific UiCommand::Reload sites that already know which monitor changed.
+        self.rec_cache.retain(|k, _| live_monitors.contains(k));
+        self.ad_break_cache.retain(|k, _| live_monitors.contains(k));
+        self.meta_change_cache.retain(|k, _| live_monitors.contains(k));
+        self.schedule_cache.retain(|k, _| live_monitors.contains(k));
         self.expanded_channels.retain(|id| live_channels.contains(id));
         self.expanded_instances.retain(|id| live_monitors.contains(id));
         // Stream keys are "s<mid>:…" / "t<mid>:…"; keep only live monitors'.
@@ -1435,12 +1440,12 @@ impl StreamArchiverApp {
             }
         }
         self.channels = save.channels;
-        self.rec_cache.clear();
-        self.ad_break_cache.clear();
-        self.meta_change_cache.clear();
-        self.schedule_cache.clear();
         let live_channels: HashSet<i64> = self.channels.iter().map(|c| c.id).collect();
         let live_monitors: HashSet<i64> = self.rows.iter().map(|r| r.monitor.id).collect();
+        self.rec_cache.retain(|k, _| live_monitors.contains(k));
+        self.ad_break_cache.retain(|k, _| live_monitors.contains(k));
+        self.meta_change_cache.retain(|k, _| live_monitors.contains(k));
+        self.schedule_cache.retain(|k, _| live_monitors.contains(k));
         self.expanded_channels.retain(|id| live_channels.contains(id));
         self.expanded_instances.retain(|id| live_monitors.contains(id));
         self.expanded_streams

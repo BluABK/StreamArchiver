@@ -416,8 +416,7 @@ fn show_task_dialog_win32(
 
     let icon = if warning { TD_WARNING_ICON } else { TD_ERROR_ICON };
 
-    // Re-show after "Copy" / "Open log folder" so the user can still dismiss.
-    loop {
+    {
         let mut buttons: Vec<TASKDIALOG_BUTTON> = Vec::new();
         if warning {
             buttons.push(TASKDIALOG_BUTTON {
@@ -494,14 +493,14 @@ fn show_task_dialog_win32(
         match btn {
             BTN_COPY => {
                 copy_to_clipboard(detail);
-                // Loop: re-show so the user can still dismiss.
+                false
             }
             BTN_OPEN_LOGS => {
                 let _ = std::process::Command::new("explorer").arg(log_dir).spawn();
-                // Loop: re-show so the user can still dismiss.
+                false
             }
-            BTN_FORCE_QUIT => return true,
-            _ => return false, // "Close" / "Keep waiting" / cancel (X button)
+            BTN_FORCE_QUIT => true,
+            _ => false, // "Close" / "Keep waiting" / cancel (X button)
         }
     }
 }
