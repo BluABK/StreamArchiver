@@ -29,6 +29,7 @@ windows = { version = "0.62", features = ["Win32_System_JobObjects", "Win32_Foun
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 
 [build-dependencies]
+embed-manifest = "1.4"
 # Build-time only: decode the platform favicons (assets/platform/*.png) to raw
 # RGBA embedded into the binary. Keeps the runtime dependency-free (no image
 # crate shipped) so the binary stays lean.

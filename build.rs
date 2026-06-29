@@ -42,6 +42,13 @@ fn main() {
     decode_platform_icons();
     decode_provider_logos();
 
+    // Embed a Windows application manifest requesting Common Controls v6 (required
+    // for TaskDialogIndirect), DPI awareness, and visual styles. Without this,
+    // Windows loads the old comctl32 v5 which lacks TaskDialogIndirect and the
+    // process never reaches main() — an invisible "Entry Point Not Found" crash.
+    embed_manifest::embed_manifest(embed_manifest::new_manifest("streamarchiver"))
+        .expect("embed application manifest");
+
     // Force a re-run on every build: we depend on `.build-counter`, which this
     // script rewrites each run, so Cargo always sees it as changed and re-runs
     // (keeping the counter, git hash, and timestamp fresh on every build).
