@@ -483,6 +483,9 @@ struct FormatDesignerState {
     selected_recording_idx: usize,
     /// Which field opened the designer (None = standalone / no write-back).
     target: Option<FormatDesignerTarget>,
+    /// In-flight background load of recordings for the selected monitor. Drained
+    /// each frame in `format_designer_window`; avoids blocking the UI thread.
+    recordings_load: Option<std::sync::mpsc::Receiver<(Vec<Recording>, usize)>>,
 }
 
 impl FormatDesignerState {
@@ -493,6 +496,7 @@ impl FormatDesignerState {
             recordings: Vec::new(),
             selected_recording_idx: 0,
             target,
+            recordings_load: None,
         }
     }
 }
@@ -6013,14 +6017,20 @@ impl StreamArchiverApp {
     /// the first monitor in the list.
     fn open_format_designer(&mut self, template: String, target: Option<FormatDesignerTarget>) {
         let mut state = FormatDesignerState::new(template, target);
-        // Default to the first monitor and pre-load its recordings.
+        // Load recordings for the first monitor off the UI thread.
         if let Some(m) = self.rows.first() {
-            state.selected_recording_idx = 0;
-            state.recordings = self.core.store.recordings_for_monitor(m.monitor.id).unwrap_or_default();
-            // Default to the most recent recording (last in oldest-first list).
-            if !state.recordings.is_empty() {
-                state.selected_recording_idx = state.recordings.len() - 1;
-            }
+            let store = Arc::clone(&self.core.store);
+            let monitor_id = m.monitor.id;
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .name("fd-recordings-load".into())
+                .spawn(move || {
+                    let recs = store.recordings_for_monitor(monitor_id).unwrap_or_default();
+                    let default_idx = recs.len().saturating_sub(1);
+                    let _ = tx.send((recs, default_idx));
+                })
+                .ok();
+            state.recordings_load = Some(rx);
         }
         self.format_designer = Some(state);
     }
@@ -6073,6 +6083,17 @@ impl StreamArchiverApp {
                 ("{acodec}", "Audio codec e.g. aac · opus"),
             ]),
         ];
+
+        // ── Drain any completed background recordings load ────────────────────
+        if let Some(fd) = self.format_designer.as_mut() {
+            if let Some(rx) = &fd.recordings_load {
+                if let Ok((recs, default_idx)) = rx.try_recv() {
+                    fd.recordings = recs;
+                    fd.selected_recording_idx = default_idx;
+                    fd.recordings_load = None;
+                }
+            }
+        }
 
         // ── Snapshot state before closure (avoids borrow conflicts) ──────────
         let template = self.format_designer.as_ref().unwrap().template.clone();
@@ -6250,23 +6271,27 @@ impl StreamArchiverApp {
 
         // ── Apply closure results back to state ──────────────────────────────
         let monitor_changed = new_monitor_idx != selected_monitor_idx;
-        let new_recordings = if monitor_changed {
-            self.rows.get(new_monitor_idx).map(|m| {
-                let recs = self.core.store.recordings_for_monitor(m.monitor.id).unwrap_or_default();
-                // Default to the most recent recording.
-                let default_idx = recs.len().saturating_sub(1);
-                (recs, default_idx)
-            })
-        } else {
-            None
-        };
 
         if let Some(fd) = self.format_designer.as_mut() {
             fd.template = new_template.clone();
             fd.selected_monitor_idx = new_monitor_idx;
-            if let Some((recs, default_idx)) = new_recordings {
-                fd.recordings = recs;
-                fd.selected_recording_idx = default_idx;
+            if monitor_changed {
+                // Load recordings for the newly selected monitor off the UI thread.
+                if let Some(m) = self.rows.get(new_monitor_idx) {
+                    let store = Arc::clone(&self.core.store);
+                    let monitor_id = m.monitor.id;
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::Builder::new()
+                        .name("fd-recordings-load".into())
+                        .spawn(move || {
+                            let recs = store.recordings_for_monitor(monitor_id).unwrap_or_default();
+                            let default_idx = recs.len().saturating_sub(1);
+                            let _ = tx.send((recs, default_idx));
+                        })
+                        .ok();
+                    fd.recordings_load = Some(rx);
+                }
+                fd.selected_recording_idx = 0;
             } else {
                 fd.selected_recording_idx = new_recording_idx;
             }
