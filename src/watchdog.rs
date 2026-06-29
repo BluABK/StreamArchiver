@@ -37,10 +37,12 @@ pub enum Activity {
     EmoteDecodePump = 4,
     Chat = 5,
     /// First-open work of the channel Properties window *before* its sub-window is
-    /// created: synchronous image decode/upload of the icon + asset thumbnails and the
-    /// per-platform asset enumeration. Split from [`Activity::Properties`] (which then
-    /// covers the sub-window build + paint) so a freeze dialog says whether the UI thread
-    /// stalled loading assets or inside the window itself.
+    /// created. The heavy load (image decode/upload, asset enumeration, schedule-source DB
+    /// reads) now runs on a background `props-load` thread, so under this label the UI
+    /// thread only does cheap in-memory work (platform list, cache lookups); a freeze here
+    /// would mean a cache miss fell back to an inline load. Split from [`Activity::Properties`]
+    /// (which covers the sub-window/placeholder build + paint) so the dialog still
+    /// distinguishes pre-window work from the window itself.
     PropertiesLoad = 6,
 }
 
@@ -157,55 +159,67 @@ impl Default for Heartbeat {
 /// to beat Windows' own "Not Responding" ghosting).
 ///
 /// Policy note (`exit_after_dialog`):
-/// - `false` (recommended default): only *inform*. The user can wait (the UI may
-///   recover if it was a transient stall) or kill the app via Task Manager. We
-///   re-arm after the dialog closes, so a still-frozen app warns again next cycle.
-/// - `true`: after the user dismisses the dialog, force `std::process::exit(101)`.
-///   Use only if a frozen UI is unrecoverable for your app and you'd rather guarantee
-///   the process dies than leave a zombie window. Because downloads run in detached
+/// - `false` (recommended default): don't *auto*-kill. The dialog still offers a
+///   **Force quit** button so the user can exit a wedged UI without Task Manager;
+///   choosing **Keep waiting** lets a transient stall recover, after which we re-arm
+///   (and re-offer the escape hatch on a still-frozen UI once the cooldown passes).
+/// - `true`: force `std::process::exit(101)` once the dialog is dismissed, regardless
+///   of which button was chosen. Use only if a frozen UI is unrecoverable for your app
+///   and you'd rather guarantee the process dies than leave a zombie window — choosing
+///   **Force quit** in the dialog already exits, so this only adds exit-on-Keep-waiting.
+///   Because downloads run in detached
 ///   child processes (per this project's design) and recordings survive app exit,
 ///   killing the UI is relatively safe here — but it's still a policy choice, so it's
 ///   off by default.
 pub fn start_watchdog(hb: Heartbeat, threshold: Duration, exit_after_dialog: bool) {
+    /// After the user picks "Keep waiting", stay quiet this long before offering the
+    /// escape hatch again on a *still*-frozen UI — long enough not to spam dialogs,
+    /// short enough that a persistent hang keeps offering a way out.
+    const REPROMPT_COOLDOWN: Duration = Duration::from_secs(20);
     std::thread::Builder::new()
         .name("ui-watchdog".into())
         .spawn(move || {
-            // Debounce: only one dialog per distinct hang. Re-arm once the UI
-            // recovers (a fresh beat younger than the threshold).
-            let mut warned = false;
+            // When we last showed (and the user dismissed) a hang dialog. `None` =
+            // armed: a hang may prompt immediately. After a "Keep waiting" we hold
+            // off for `REPROMPT_COOLDOWN`; once the UI recovers we re-arm at once.
+            let mut last_dialog: Option<Instant> = None;
             loop {
                 std::thread::sleep(Duration::from_secs(1));
                 let age = hb.age();
                 let active = hb.is_active();
 
                 if active && age >= threshold {
-                    if !warned {
-                        warned = true;
+                    let cooled = last_dialog.is_none_or(|t| t.elapsed() >= REPROMPT_COOLDOWN);
+                    if cooled {
                         let secs = age.as_secs();
                         let doing = hb.activity().label();
                         let msg = format!(
                             "StreamArchiver's UI thread has stopped responding.\n\n\
                              Last UI heartbeat: {secs}s ago\n\
                              Last known activity: {doing}\n\n\
-                             The window is frozen. You can wait to see if it recovers, \
-                             or close it from Task Manager.\n\n\
-                             Background recordings and downloads are NOT affected — they \
-                             run in separate processes and keep going.",
+                             The window is frozen. Choose \"Keep waiting\" to give it more \
+                             time to recover, or \"Force quit\" to close the app now.\n\n\
+                             Background recordings and downloads are NOT affected — they run \
+                             in separate processes and keep going, so force-quitting is safe.",
                         );
-                        // Blocks THIS (watchdog) thread until dismissed — fine,
-                        // it's not the UI thread. MessageBoxW with a null parent
-                        // is safe to call from any thread (see module docs).
-                        show_blocking_dialog("StreamArchiver — UI frozen", &msg, true);
-
-                        if exit_after_dialog {
-                            // Last buffered logs already on disk via tracing_appender;
-                            // 101 mirrors the Rust panic/abort exit code.
+                        // Blocks THIS (watchdog) thread until dismissed — fine, it's not
+                        // the UI thread. MessageBoxW with a null parent is safe to call
+                        // from any thread (see module docs).
+                        let force_quit =
+                            show_hang_dialog("StreamArchiver — UI frozen", &msg);
+                        if force_quit || exit_after_dialog {
+                            // The frozen UI thread can't tear itself down, so exit the
+                            // whole process. Buffered logs are already on disk via
+                            // tracing_appender; 101 mirrors the Rust panic/abort code.
                             std::process::exit(101);
                         }
+                        // "Keep waiting": measure the cooldown from dismissal so a still
+                        // -frozen UI re-prompts later instead of going silent forever.
+                        last_dialog = Some(Instant::now());
                     }
                 } else if age < threshold {
-                    // UI is alive again (or went inactive): re-arm for next hang.
-                    warned = false;
+                    // UI is alive again (or went inactive): re-arm for the next hang.
+                    last_dialog = None;
                 }
             }
         })
@@ -279,4 +293,24 @@ fn show_blocking_dialog(title: &str, body: &str, warning: bool) {
         .set_buttons(rfd::MessageButtons::Ok)
         .set_description(body)
         .show();
+}
+
+/// Like [`show_blocking_dialog`] but for the UI-freeze case: two buttons,
+/// **Force quit** and **Keep waiting**. Returns `true` when the user chose to
+/// force-quit. A plain OK can't *un-hang* the UI thread, so this gives the user a
+/// real escape hatch (safe here — recordings/downloads run in detached processes).
+///
+/// Null owner window (no `.set_parent`) so the call cannot deadlock against the
+/// frozen UI HWND; runs on the watchdog thread, never the UI thread.
+fn show_hang_dialog(title: &str, body: &str) -> bool {
+    let result = rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Warning)
+        .set_title(title)
+        .set_buttons(rfd::MessageButtons::OkCancelCustom(
+            "Force quit".to_owned(),
+            "Keep waiting".to_owned(),
+        ))
+        .set_description(body)
+        .show();
+    matches!(result, rfd::MessageDialogResult::Custom(s) if s == "Force quit")
 }

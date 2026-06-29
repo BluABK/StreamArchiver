@@ -663,6 +663,13 @@ pub struct StreamArchiverApp {
     /// once on open so `scope_override_editor` reads it from memory instead of doing a
     /// settings DB read (store mutex) every frame.
     props_source_order: Vec<SourceEntry>,
+    /// In-flight background load of the channel Properties window's per-open data (icon +
+    /// asset-thumbnail decode/upload, per-platform asset enumeration, and the schedule
+    /// -source config/scope/order DB reads). Run OFF the UI thread so a slow disk, an AV
+    /// scan, or the store mutex being held by a background task can't freeze the GUI on
+    /// open — the window shows a "Loading…" placeholder until the bundle lands. `None`
+    /// when no load is running.
+    props_load: Option<PropsLoad>,
     /// Open emote-viewer window (None = closed). Reuses the shared `emote_anim`
     /// decode cache, so its emotes animate against the same clock as chat replay.
     emote_viewer: Option<EmoteViewer>,
@@ -1013,6 +1020,7 @@ impl StreamArchiverApp {
             channel_emote_counts: HashMap::new(),
             channel_asset_status: HashMap::new(),
             props_source_order: Vec::new(),
+            props_load: None,
             emote_viewer: None,
             emote_viewer_stale: false,
             asset_history: None,
@@ -4138,6 +4146,32 @@ struct PlatformAssetStatus {
     badges: usize,
     emotes: usize,
     stamp: String,
+}
+
+/// Handle to the background thread loading a channel Properties window's per-open data.
+/// Polled each frame the window is open until the [`PropsLoaded`] bundle arrives. See
+/// the `props_load` field for why this work is off the UI thread.
+struct PropsLoad {
+    /// The channel being loaded; lets us ignore a bundle that arrives after the user
+    /// switched the window to a different channel.
+    channel_id: i64,
+    rx: std::sync::mpsc::Receiver<PropsLoaded>,
+}
+
+/// The fully-loaded per-open Properties data, produced on a background thread and
+/// installed into the per-channel caches on the UI thread. Every field is the result of
+/// blocking work (disk reads + image decode/upload, asset-dir enumeration, store-mutex
+/// DB reads) that previously ran inline on the UI thread and could freeze the GUI.
+struct PropsLoaded {
+    channel_id: i64,
+    /// `None` = no icon file found (a successful "no icon" result, not a failure).
+    icon: Option<egui::TextureHandle>,
+    thumbs: Vec<AssetThumb>,
+    emote_counts: [(EmoteProvider, usize); 4],
+    asset_status: Vec<PlatformAssetStatus>,
+    cfg: crate::schedule_source::ChannelSourceConfig,
+    source_order: Vec<SourceEntry>,
+    scope: crate::schedule_source::SourceScopeConfig,
 }
 
 /// Build the Properties window's per-platform asset-status rows. Runs the blocking
@@ -12313,6 +12347,158 @@ impl StreamArchiverApp {
         }
     }
 
+    /// Drive the off-UI-thread load of the channel Properties window's per-open data,
+    /// drawing a "Loading…" placeholder until it lands. Returns `true` once the bundle has
+    /// been installed into the per-channel caches (the caller then falls through and draws
+    /// the real window *this* frame, no flicker); `false` while still loading (the caller
+    /// returns — the placeholder is on screen). All the blocking work (disk reads, image
+    /// decode/upload, asset-dir enumeration, store-mutex DB reads) happens on the spawned
+    /// thread, so the UI thread can't freeze on a slow disk / AV scan / contended store.
+    #[must_use]
+    #[allow(deprecated)] // CentralPanel::show in an immediate viewport (matches the real window)
+    fn drive_props_load(
+        &mut self,
+        cid: i64,
+        ch: &Channel,
+        platforms: &[Platform],
+        asset_platforms: &[Platform],
+        ctx: &egui::Context,
+    ) -> bool {
+        // Ensure a load for THIS channel is in flight (replace a stale one left over from
+        // a different channel if the user switched the open window).
+        let need_spawn = !matches!(&self.props_load, Some(pl) if pl.channel_id == cid);
+        if need_spawn {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let ch_bg = ch.clone();
+            let platforms_bg = platforms.to_vec();
+            let asset_platforms_bg = asset_platforms.to_vec();
+            let ctx_bg = ctx.clone();
+            let store = self.core.store.clone();
+            let spawned = std::thread::Builder::new()
+                .name("props-load".into())
+                .spawn(move || {
+                    // None of this touches `self`. egui's `load_texture` (inside
+                    // `resolve_channel_icon` / `load_channel_asset_thumbs`) is thread-safe:
+                    // it queues a `TexturesDelta` the paint thread uploads later.
+                    let id = ch_bg.id;
+                    let loaded = PropsLoaded {
+                        channel_id: id,
+                        icon: resolve_channel_icon(&ch_bg, &platforms_bg, &ctx_bg),
+                        thumbs: load_channel_asset_thumbs(&ch_bg, &platforms_bg, &ctx_bg),
+                        emote_counts: emote_provider_counts(&ch_bg.name),
+                        asset_status: build_platform_asset_status(&ch_bg.name, &asset_platforms_bg),
+                        cfg: load_channel_cfg(&store, id),
+                        source_order: load_source_order(&store),
+                        scope: load_channel_scope(&store, id),
+                    };
+                    // Receiver gone (window closed) → the send is simply dropped.
+                    let _ = tx.send(loaded);
+                    // Wake the UI thread to install the bundle even if otherwise idle.
+                    ctx_bg.request_repaint();
+                });
+            match spawned {
+                Ok(_) => self.props_load = Some(PropsLoad { channel_id: cid, rx }),
+                Err(e) => {
+                    // Spawn failed (extremely unlikely). Fall back to a synchronous load so
+                    // the window still opens rather than spinning forever.
+                    warn!("props-load thread spawn failed ({e}); loading on the UI thread");
+                    let id = ch.id;
+                    let loaded = PropsLoaded {
+                        channel_id: id,
+                        icon: resolve_channel_icon(ch, platforms, ctx),
+                        thumbs: load_channel_asset_thumbs(ch, platforms, ctx),
+                        emote_counts: emote_provider_counts(&ch.name),
+                        asset_status: build_platform_asset_status(&ch.name, asset_platforms),
+                        cfg: load_channel_cfg(&self.core.store, id),
+                        source_order: load_source_order(&self.core.store),
+                        scope: load_channel_scope(&self.core.store, id),
+                    };
+                    self.install_props_loaded(loaded);
+                    return true;
+                }
+            }
+        }
+
+        // Poll the in-flight load without blocking. Extract the owned `try_recv` result
+        // first so the `&self.props_load` borrow ends before we mutate `self`.
+        let polled = self
+            .props_load
+            .as_ref()
+            .filter(|pl| pl.channel_id == cid)
+            .map(|pl| pl.rx.try_recv());
+        match polled {
+            Some(Ok(loaded)) => {
+                self.install_props_loaded(loaded);
+                self.props_load = None;
+                return true; // caller draws the real window this frame
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                // Loader vanished without sending (it never panics in practice — every
+                // step degrades to a default). Drop the handle so the next frame respawns;
+                // the placeholder stays up meanwhile.
+                self.props_load = None;
+            }
+            // `Some(Err(Empty))` (still loading) or `None` (no load for this channel) →
+            // fall through to the placeholder.
+            _ => {}
+        }
+
+        // Still loading: draw the placeholder. Same viewport id as the real window so it
+        // morphs in place when the bundle lands.
+        self.heartbeat.set_activity(crate::watchdog::Activity::Properties);
+        let mut open = true;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("channel_props_vp"),
+            egui::ViewportBuilder::default()
+                .with_title(format!("Properties — {}", ch.name))
+                .with_inner_size([480.0, 600.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(220.0);
+                        ui.spinner();
+                        ui.add_space(8.0);
+                        ui.label(format!("Loading {} assets…", ch.name));
+                    });
+                });
+            },
+        );
+        if !open {
+            // Closed mid-load: forget the popup and the in-flight load (a bundle that
+            // still arrives is dropped because the receiver is gone).
+            self.channel_properties_popup = None;
+            self.props_load = None;
+        }
+        // Keep frames coming so we poll the loader (the spinner also animates).
+        ctx.request_repaint();
+        false
+    }
+
+    /// Install a finished [`PropsLoaded`] bundle into the per-channel Properties caches —
+    /// but only if the window is still showing that channel (the user may have closed it or
+    /// switched away while the background load ran). In-progress config/scope edits are
+    /// preserved: the drafts are only seeded when they don't already belong to this channel.
+    fn install_props_loaded(&mut self, loaded: PropsLoaded) {
+        if self.channel_properties_popup != Some(loaded.channel_id) {
+            return;
+        }
+        let id = loaded.channel_id;
+        self.channel_icons.insert(id, loaded.icon);
+        self.channel_asset_thumbs.insert(id, loaded.thumbs);
+        self.channel_emote_counts.insert(id, loaded.emote_counts);
+        self.channel_asset_status.insert(id, loaded.asset_status);
+        self.props_source_order = loaded.source_order;
+        if self.channel_cfg_draft.as_ref().map(|(i, _)| *i) != Some(id) {
+            self.channel_cfg_draft = Some((id, loaded.cfg));
+        }
+        if self.channel_scope_draft.as_ref().map(|(i, _)| *i) != Some(id) {
+            self.channel_scope_draft = Some((id, loaded.scope));
+        }
+    }
+
     /// Channel properties window — header + channel info, assets, and schedule-source config.
     #[allow(deprecated)]
     fn channel_properties_window(&mut self, ctx: &egui::Context) {
@@ -12340,6 +12526,21 @@ impl StreamArchiverApp {
         };
         let asset_platforms: Vec<Platform> =
             platforms.iter().copied().filter(|p| *p != Platform::Generic).collect();
+
+        // First-open — and every reopen, since these per-open caches are dropped on
+        // close — asset load runs OFF the UI thread: icon/thumbnail image decode + GPU
+        // upload, the per-platform asset enumeration, and the schedule-source
+        // config/scope/order DB reads. Those reads take the single store mutex, which a
+        // background task (e.g. the asset-refresh loop's heavy `list_monitors_with_channels`
+        // query) can hold long enough to freeze the GUI here. Until the bundle lands we
+        // show a "Loading…" placeholder and stay responsive. Gated on `channel_asset_status`
+        // because it is the cache dropped on every close (and on rename/refetch), so each
+        // open re-loads through this off-thread path rather than blocking the UI thread.
+        if !self.channel_asset_status.contains_key(&ch.id)
+            && !self.drive_props_load(cid, &ch, &platforms, &asset_platforms, ctx)
+        {
+            return; // still loading — placeholder is on screen
+        }
 
         let icon_tex = self
             .channel_icons
