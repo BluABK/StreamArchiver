@@ -2607,14 +2607,12 @@ fn schedule_time_grid(
 
     let grid_w = SCHED_TIME_COL_W + days.len() as f32 * (col_w + SCHED_COL_GAP);
 
-    let mut hovered_tip: Option<String> = None;
     let mut clicked_day: Option<chrono::NaiveDate> = None;
-    let mut ctx_stream: Option<usize> = None; // stream idx for context menu
 
     scroll.show(ui, |ui| {
             let (response, painter) = ui.allocate_painter(
                 egui::vec2(grid_w, SCHED_TOTAL_H),
-                egui::Sense::click(),
+                egui::Sense::hover(),
             );
             let origin = response.rect.min;
 
@@ -2686,11 +2684,6 @@ fn schedule_time_grid(
             }
 
             // ── Event blocks ──────────────────────────────────────────────
-            let hover_pos = response.hover_pos();
-
-            // Collect all event rects for hit-testing after painting.
-            let mut event_rects: Vec<(egui::Rect, usize, chrono::NaiveDate)> = Vec::new();
-
             for (col_idx, &day) in days.iter().enumerate() {
                 let col_x = origin.x + SCHED_TIME_COL_W + col_idx as f32 * (col_w + SCHED_COL_GAP);
                 let indices = by_day.get(&day).map(Vec::as_slice).unwrap_or(&[]);
@@ -2719,11 +2712,15 @@ fn schedule_time_grid(
                         egui::pos2(left, top),
                         egui::vec2(lane_w, block_h),
                     );
-                    event_rects.push((block_rect, stream_idx, day));
+                    // Per-block interactive region: hover coloring, tooltip,
+                    // left-click (→ day popup), right-click context menu.
+                    // Must be allocated before painting so hovered() is accurate.
+                    let is_hidden = hidden_segs.contains(&s.segment_id);
+                    let evt_id = egui::Id::new("sched_evt").with(day).with(stream_idx);
+                    let evt_resp = ui.interact(block_rect, evt_id, egui::Sense::click());
+                    let hovered = evt_resp.hovered();
 
                     let color = channel_event_color(s.channel_id, &s.channel_color);
-                    let is_hidden = hidden_segs.contains(&s.segment_id);
-                    let hovered = hover_pos.is_some_and(|p| block_rect.contains(p));
                     let fill = if is_hidden {
                         // Soft-hidden: keep hue but drop alpha to ~35% so it reads as "ghost"
                         egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 85)
@@ -2810,56 +2807,16 @@ fn schedule_time_grid(
                         }
                     }
 
-                    if hovered {
-                        hovered_tip = Some(schedule_detail_line(s));
+                    let block_clicked = evt_resp.clicked();
+                    evt_resp
+                        .on_hover_text(schedule_detail_line(s))
+                        .context_menu(|ui| schedule_copy_menu(ui, s, is_hidden));
+                    if block_clicked {
+                        clicked_day = Some(day);
                     }
                 }
-            }
-
-            // ── Hit-testing: click + right-click ─────────────────────────
-            if response.clicked() {
-                if let Some(pos) = response.interact_pointer_pos() {
-                    for &(rect, _idx, day) in &event_rects {
-                        if rect.contains(pos) {
-                            clicked_day = Some(day);
-                            break;
-                        }
-                    }
-                }
-            }
-            if response.secondary_clicked() {
-                if let Some(pos) = response.interact_pointer_pos() {
-                    for &(rect, idx, _day) in &event_rects {
-                        if rect.contains(pos) {
-                            ctx_stream = Some(idx);
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Tooltip for hovered event — only set when pointer is over an event block.
-            if let Some(tip) = hovered_tip {
-                response.on_hover_text(tip);
             }
         });
-
-    // Context menu (must be outside the closure since it borrows ui)
-    if let Some(idx) = ctx_stream {
-        let s = &all[idx];
-        // Use a small invisible area near the mouse for the context menu.
-        // egui doesn't easily support per-painted-rect context menus, so we
-        // surface a right-click popup via a dummy response.
-        let resp = ui.allocate_rect(
-            egui::Rect::from_min_size(
-                ui.ctx().pointer_interact_pos().unwrap_or_default(),
-                egui::vec2(1.0, 1.0),
-            ),
-            egui::Sense::click(),
-        );
-        let is_hidden_ctx = hidden_segs.contains(&s.segment_id);
-        resp.context_menu(|ui| schedule_copy_menu(ui, s, is_hidden_ctx));
-    }
 
     if let Some(day) = clicked_day {
         *open_day = Some(day);
@@ -8037,6 +7994,35 @@ impl StreamArchiverApp {
                                 // surfaces ⚠ markers, so rows here are shown unmarked.
                                 let hidden = hidden_segs.contains(&s.segment_id);
                                 schedule_detail_row(ui, s, false, hidden, &ptex);
+                                // Action button strip — writes to the same temp-data keys
+                                // that schedule_view() drains each frame.
+                                ui.horizontal(|ui| {
+                                    ui.add_space(10.0);
+                                    if ui.small_button("✏  Edit").on_hover_text("Edit title, category or time").clicked() {
+                                        ctx.data_mut(|d| d.insert_temp(egui::Id::new("sched_edit"), s.segment_id));
+                                    }
+                                    let can_open_src = !s.is_manual()
+                                        && ScheduleSourceKind::from_id(&s.source)
+                                            .is_some_and(|k| k.has_open_target());
+                                    ui.add_enabled(can_open_src, egui::Button::new("🔗  Source").small())
+                                        .on_hover_text("Open where this item came from (schedule page or OCR image)")
+                                        .on_disabled_hover_text("No external source (manually edited or Discord event)")
+                                        .clicked()
+                                        .then(|| ctx.data_mut(|d| d.insert_temp(egui::Id::new("sched_open_src"), s.segment_id)));
+                                    let hide_label = if hidden { "👁  Show" } else { "🙈  Hide" };
+                                    let hide_tip   = if hidden { "Show this event on the calendar" } else { "Soft-hide (still stored, just greyed out)" };
+                                    if ui.small_button(hide_label).on_hover_text(hide_tip).clicked() {
+                                        ctx.data_mut(|d| d.insert_temp(egui::Id::new("sched_hide"), s.segment_id));
+                                    }
+                                    if ui.add(egui::Button::new(
+                                            egui::RichText::new("🗑  Delete").color(HL_ERROR_TEXT)).small())
+                                        .on_hover_text("Tombstone — permanently suppress; won't reappear on refresh")
+                                        .clicked()
+                                    {
+                                        ctx.data_mut(|d| d.insert_temp(egui::Id::new("sched_delete"), s.segment_id));
+                                    }
+                                });
+                                ui.add_space(4.0);
                             }
                         });
                     ui.add_space(6.0);
