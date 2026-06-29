@@ -670,6 +670,14 @@ pub struct StreamArchiverApp {
     /// open — the window shows a "Loading…" placeholder until the bundle lands. `None`
     /// when no load is running.
     props_load: Option<PropsLoad>,
+    /// In-flight native file/folder picker (background thread). The OS dialog blocks
+    /// until the user picks or cancels; running it off the UI thread keeps egui alive.
+    /// At most one picker open at a time (a second Browse click replaces any existing).
+    pending_browse: Option<PendingBrowse>,
+    /// In-flight form save (background thread). The INSERT/UPDATE + reload queries can
+    /// block on the store mutex when a detection pass holds it; running off the UI
+    /// thread prevents a visible freeze on "Save".
+    pending_save: Option<PendingSave>,
     /// Open emote-viewer window (None = closed). Reuses the shared `emote_anim`
     /// decode cache, so its emotes animate against the same clock as chat replay.
     emote_viewer: Option<EmoteViewer>,
@@ -1021,6 +1029,8 @@ impl StreamArchiverApp {
             channel_asset_status: HashMap::new(),
             props_source_order: Vec::new(),
             props_load: None,
+            pending_browse: None,
+            pending_save: None,
             emote_viewer: None,
             emote_viewer_stale: false,
             asset_history: None,
@@ -1276,33 +1286,26 @@ impl StreamArchiverApp {
         let Some(form) = self.form.as_ref() else {
             return;
         };
+        // Validate before closing the form.
         if form.url.trim().is_empty() {
             self.status = "An instance URL is required.".into();
             return;
         }
-        let channel_id = match form.channel_id {
-            // Existing channel container (add instance / edit instance) — the
-            // channel is unchanged here; rename it from the channel row instead.
-            Some(cid) => cid,
-            // "Add stream": create a new channel container for this first instance.
+        let new_channel_name: Option<String> = match form.channel_id {
+            Some(_) => None, // existing container, no create needed
             None => {
                 if form.name.trim().is_empty() {
                     self.status = "A channel name is required.".into();
                     return;
                 }
-                match self.core.store.create_container(form.name.trim()) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        self.status = format!("Error saving channel: {e}");
-                        return;
-                    }
-                }
+                Some(form.name.trim().to_string())
             }
         };
-
+        // Build the monitor value now; channel_id may be 0 when creating a new
+        // container — the background thread overwrites it with the real id.
         let monitor = Monitor {
             id: form.monitor_id.unwrap_or(0),
-            channel_id,
+            channel_id: form.channel_id.unwrap_or(0),
             url: form.url.trim().to_string(),
             enabled: form.enabled,
             tool: form.tool,
@@ -1328,19 +1331,116 @@ impl StreamArchiverApp {
             last_checked_at: None,
             last_state: "idle".into(),
         };
+        let monitor_id = form.monitor_id;
 
-        let result = match form.monitor_id {
-            Some(_) => self.core.store.update_monitor(&monitor),
-            None => self.core.store.insert_monitor(&monitor).map(|_| ()),
+        // Close the form immediately so the UI stays responsive while the DB
+        // work runs. On a background-thread error the status bar shows the error;
+        // the user can re-open Add/Edit to retry.
+        self.form = None;
+        self.status = "Saving…".into();
+
+        let store = self.core.store.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("save-monitor".into())
+            .spawn(move || {
+                let result: Result<SaveRows, String> = (|| {
+                    // Resolve the channel_id, creating a new container if needed.
+                    let channel_id = match new_channel_name {
+                        Some(name) => store.create_container(&name).map_err(|e| e.to_string())?,
+                        None => monitor.channel_id,
+                    };
+                    let mut m = monitor;
+                    m.channel_id = channel_id;
+                    match monitor_id {
+                        Some(_) => store.update_monitor(&m).map_err(|e| e.to_string())?,
+                        None => {
+                            store.insert_monitor(&m).map_err(|e| e.to_string())?;
+                        }
+                    }
+                    let rows = store.list_monitors_with_channels().map_err(|e| e.to_string())?;
+                    let next_streams =
+                        store.next_scheduled_streams(now_unix()).map_err(|e| e.to_string())?;
+                    let channels = store.list_channels().map_err(|e| e.to_string())?;
+                    Ok(SaveRows { rows, channels, next_streams })
+                })();
+                let _ = tx.send(result);
+            })
+            .ok();
+        self.pending_save = Some(PendingSave { rx });
+    }
+
+    /// Poll the in-flight file/folder picker. When the user confirms a selection
+    /// the `apply` closure runs on the UI thread to install the chosen path.
+    fn drain_pending_browse(&mut self) {
+        let recv = match &self.pending_browse {
+            Some(pb) => pb.rx.try_recv(),
+            None => return,
         };
-        match result {
-            Ok(()) => {
-                self.status = "Saved.".into();
-                self.form = None;
-                self.reload_rows();
+        match recv {
+            Ok(maybe_path) => {
+                let pb = self.pending_browse.take().unwrap();
+                if let Some(path) = maybe_path {
+                    (pb.apply)(self, path);
+                }
             }
-            Err(e) => self.status = format!("Error saving monitor: {e}"),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.pending_browse = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
+    }
+
+    /// Poll the in-flight save-form thread. Installs the loaded rows on success
+    /// or shows an error in the status bar on failure.
+    fn drain_pending_save(&mut self) {
+        let recv = match &self.pending_save {
+            Some(ps) => ps.rx.try_recv(),
+            None => return,
+        };
+        match recv {
+            Ok(Ok(save)) => {
+                self.pending_save = None;
+                self.status = "Saved.".into();
+                self.install_save_rows(save);
+            }
+            Ok(Err(e)) => {
+                self.pending_save = None;
+                self.status = format!("Error saving: {e}");
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.pending_save = None;
+                self.status = "Save failed (internal error).".into();
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    /// Install a completed save's rows into the UI, mirroring `reload_rows`.
+    fn install_save_rows(&mut self, save: SaveRows) {
+        self.rows = save.rows;
+        let by_mid: HashMap<i64, (i64, String)> = save
+            .next_streams
+            .into_iter()
+            .map(|(mid, at, title)| (mid, (at, title)))
+            .collect();
+        for row in &mut self.rows {
+            if let Some((at, title)) = by_mid.get(&row.monitor.id) {
+                row.next_stream_at = Some(*at);
+                row.next_stream_title = title.clone();
+            }
+        }
+        self.channels = save.channels;
+        self.rec_cache.clear();
+        self.ad_break_cache.clear();
+        self.meta_change_cache.clear();
+        self.schedule_cache.clear();
+        let live_channels: HashSet<i64> = self.channels.iter().map(|c| c.id).collect();
+        let live_monitors: HashSet<i64> = self.rows.iter().map(|r| r.monitor.id).collect();
+        self.expanded_channels.retain(|id| live_channels.contains(id));
+        self.expanded_instances.retain(|id| live_monitors.contains(id));
+        self.expanded_streams
+            .retain(|k| stream_key_monitor(k).is_some_and(|mid| live_monitors.contains(&mid)));
     }
 
     fn save_settings(&mut self) {
@@ -4174,6 +4274,29 @@ struct PropsLoaded {
     scope: crate::schedule_source::SourceScopeConfig,
 }
 
+/// In-flight native file/folder picker spawned on a background thread so the UI
+/// thread is never blocked by the OS dialog. Polled each frame via `try_recv`.
+struct PendingBrowse {
+    rx: std::sync::mpsc::Receiver<Option<String>>,
+    /// Called on the UI thread once the picker returns a path. Receives `&mut App`
+    /// and the selected path; skipped when the user cancels (dialog returns `None`).
+    apply: Box<dyn FnOnce(&mut StreamArchiverApp, String)>,
+}
+
+/// Loaded rows returned by a background save-form thread; installed by
+/// `drain_pending_save` once the thread completes.
+struct SaveRows {
+    rows: Vec<MonitorWithChannel>,
+    channels: Vec<Channel>,
+    next_streams: Vec<(i64, i64, String)>,
+}
+
+/// In-flight form-save spawned on a background thread. The thread holds the store
+/// mutex while doing the INSERT/UPDATE + reload queries, keeping the UI thread free.
+struct PendingSave {
+    rx: std::sync::mpsc::Receiver<Result<SaveRows, String>>,
+}
+
 /// Build the Properties window's per-platform asset-status rows. Runs the blocking
 /// filesystem I/O once on open (the result is cached in `channel_asset_status`); see
 /// [`PlatformAssetStatus`] for why this must not run per frame. Logic mirrors what the
@@ -4254,26 +4377,50 @@ fn fail_hover(log: &str) -> String {
     }
 }
 
-/// Open a native folder picker, seeded at `current` if it exists.
-fn browse_folder(current: &str) -> Option<String> {
-    let mut dialog = rfd::FileDialog::new();
-    if !current.trim().is_empty() && std::path::Path::new(current).exists() {
-        dialog = dialog.set_directory(current);
-    }
-    dialog
-        .pick_folder()
-        .map(|p| p.to_string_lossy().to_string())
+/// Spawn a native folder picker on a background thread. The picker blocks until
+/// the user chooses or cancels; keeping it off the UI thread lets egui keep
+/// painting (and the watchdog heartbeat keep beating). Returns a [`PendingBrowse`]
+/// that the caller stores in `app.pending_browse`; the `apply` closure is called
+/// on the UI thread once the user confirms a selection.
+fn spawn_browse_folder(
+    current: &str,
+    apply: impl FnOnce(&mut StreamArchiverApp, String) + 'static,
+) -> PendingBrowse {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let current = current.to_string();
+    std::thread::Builder::new()
+        .name("browse-folder".into())
+        .spawn(move || {
+            let mut dialog = rfd::FileDialog::new();
+            if !current.trim().is_empty() && std::path::Path::new(&current).exists() {
+                dialog = dialog.set_directory(&current);
+            }
+            let _ = tx.send(dialog.pick_folder().map(|p| p.to_string_lossy().to_string()));
+        })
+        .ok();
+    PendingBrowse { rx, apply: Box::new(apply) }
 }
 
-/// Open a native file picker (for a cookies.txt), seeded at `current`'s folder.
-fn browse_file(current: &str) -> Option<String> {
-    let mut dialog = rfd::FileDialog::new();
-    if let Some(parent) = std::path::Path::new(current).parent() {
-        if parent.is_dir() {
-            dialog = dialog.set_directory(parent);
-        }
-    }
-    dialog.pick_file().map(|p| p.to_string_lossy().to_string())
+/// Same as [`spawn_browse_folder`] but opens a file picker instead.
+fn spawn_browse_file(
+    current: &str,
+    apply: impl FnOnce(&mut StreamArchiverApp, String) + 'static,
+) -> PendingBrowse {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let current = current.to_string();
+    std::thread::Builder::new()
+        .name("browse-file".into())
+        .spawn(move || {
+            let mut dialog = rfd::FileDialog::new();
+            if let Some(parent) = std::path::Path::new(&current).parent() {
+                if parent.is_dir() {
+                    dialog = dialog.set_directory(parent);
+                }
+            }
+            let _ = tx.send(dialog.pick_file().map(|p| p.to_string_lossy().to_string()));
+        })
+        .ok();
+    PendingBrowse { rx, apply: Box::new(apply) }
 }
 
 impl eframe::App for StreamArchiverApp {
@@ -4295,6 +4442,8 @@ impl eframe::App for StreamArchiverApp {
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
 
         self.pump_messages(ctx);
+        self.drain_pending_browse();
+        self.drain_pending_save();
 
         // Close button hides to tray unless we're really quitting.
         if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
@@ -4990,6 +5139,11 @@ impl StreamArchiverApp {
     /// pre-fills from these per detected platform.
     fn video_defaults_editor(&mut self, ui: &mut egui::Ui) {
         let mut dirty = false;
+        // Collect a Browse request inside the loop (where `defs` borrows
+        // `self.download_defaults`) and spawn it AFTER the loop releases
+        // the borrow, so we can reach `self.pending_browse`.
+        // (true = folder, false = file), platform, current path.
+        let mut browse_req: Option<(bool, Platform, String)> = None;
         // Borrow the defaults (not `self`) so the nested egui closures don't
         // alias `self`; persist afterwards.
         let defs = &mut self.download_defaults;
@@ -5070,10 +5224,7 @@ impl StreamArchiverApp {
                                             dirty = true;
                                         }
                                         if ui.button("Browse…").clicked() {
-                                            if let Some(p) = browse_file(&d.auth_value) {
-                                                d.auth_value = p;
-                                                dirty = true;
-                                            }
+                                            browse_req = Some((false, platform, d.auth_value.clone()));
                                         }
                                     });
                                     ui.end_row();
@@ -5100,10 +5251,7 @@ impl StreamArchiverApp {
                                     dirty = true;
                                 }
                                 if ui.button("Browse…").clicked() {
-                                    if let Some(p) = browse_folder(&d.output_dir) {
-                                        d.output_dir = p;
-                                        dirty = true;
-                                    }
+                                    browse_req = Some((true, platform, d.output_dir.clone()));
                                 }
                             });
                             ui.end_row();
@@ -5142,6 +5290,20 @@ impl StreamArchiverApp {
         }
         if dirty {
             self.persist_download_defaults();
+        }
+        // defs borrow ends; now we can reach self.pending_browse.
+        if let Some((is_folder, plat, current)) = browse_req {
+            self.pending_browse = Some(if is_folder {
+                spawn_browse_folder(&current, move |app, p| {
+                    app.download_defaults.get_mut(plat).output_dir = p;
+                    app.persist_download_defaults();
+                })
+            } else {
+                spawn_browse_file(&current, move |app, p| {
+                    app.download_defaults.get_mut(plat).auth_value = p;
+                    app.persist_download_defaults();
+                })
+            });
         }
     }
 
@@ -5608,9 +5770,10 @@ impl StreamArchiverApp {
                             ui.horizontal(|ui| {
                                 ui.text_edit_singleline(&mut vf.auth_value);
                                 if ui.button("Browse…").clicked() {
-                                    if let Some(p) = browse_file(&vf.auth_value) {
-                                        vf.auth_value = p;
-                                    }
+                                    self.pending_browse = Some(spawn_browse_file(
+                                        &vf.auth_value,
+                                        |app, p| app.video_form.auth_value = p,
+                                    ));
                                 }
                             });
                             ui.end_row();
@@ -5630,9 +5793,10 @@ impl StreamArchiverApp {
                     ui.horizontal(|ui| {
                         ui.text_edit_singleline(&mut vf.output_dir);
                         if ui.button("Browse…").clicked() {
-                            if let Some(p) = browse_folder(&vf.output_dir) {
-                                vf.output_dir = p;
-                            }
+                            self.pending_browse = Some(spawn_browse_folder(
+                                &vf.output_dir,
+                                |app, p| app.video_form.output_dir = p,
+                            ));
                         }
                     });
                     let tmpl_hint = "Variables: {name} {title} {channel} {date} {time} {timestamp} {year} {month} {day} {hour} {minute} {second} {tool} {mode} {platform} {video_id} {quality} {resolution} {height} {width} {fps} {vcodec} {acodec} {take} {games} {went_live_date} {went_live_time}";
@@ -10349,9 +10513,10 @@ impl StreamArchiverApp {
                     ui.horizontal(|ui| {
                         ui.text_edit_singleline(&mut self.settings.default_output_dir);
                         if ui.button("Browse…").clicked() {
-                            if let Some(p) = browse_folder(&self.settings.default_output_dir) {
-                                self.settings.default_output_dir = p;
-                            }
+                            self.pending_browse = Some(spawn_browse_folder(
+                                &self.settings.default_output_dir,
+                                |app, p| app.settings.default_output_dir = p,
+                            ));
                         }
                     });
                     ui.end_row();
@@ -10552,9 +10717,10 @@ impl StreamArchiverApp {
                                 .desired_width(360.0),
                         );
                         if ui.button("Browse…").clicked() {
-                            if let Some(p) = browse_file(&self.settings.ytdlp_binary_path) {
-                                self.settings.ytdlp_binary_path = p;
-                            }
+                            self.pending_browse = Some(spawn_browse_file(
+                                &self.settings.ytdlp_binary_path,
+                                |app, p| app.settings.ytdlp_binary_path = p,
+                            ));
                         }
                     });
                     ui.end_row();
@@ -10567,9 +10733,10 @@ impl StreamArchiverApp {
                                 .desired_width(360.0),
                         );
                         if ui.button("Browse…").clicked() {
-                            if let Some(p) = browse_file(&self.settings.sabr_binary_path) {
-                                self.settings.sabr_binary_path = p;
-                            }
+                            self.pending_browse = Some(spawn_browse_file(
+                                &self.settings.sabr_binary_path,
+                                |app, p| app.settings.sabr_binary_path = p,
+                            ));
                         }
                     })
                     .response
@@ -11523,6 +11690,7 @@ impl StreamArchiverApp {
         let mut do_save = false;
         let mut do_cancel = false;
         let mut open_format_designer = false;
+        let mut browse_req: Option<PendingBrowse> = None;
 
         let f = self.form.as_ref().unwrap();
         let title = if f.monitor_id.is_some() {
@@ -11744,9 +11912,10 @@ impl StreamArchiverApp {
                                 ui.horizontal(|ui| {
                                     ui.text_edit_singleline(&mut form.auth_value);
                                     if ui.button("Browse…").clicked() {
-                                        if let Some(p) = browse_file(&form.auth_value) {
-                                            form.auth_value = p;
-                                        }
+                                        browse_req = Some(spawn_browse_file(
+                                            &form.auth_value,
+                                            |app, p| { if let Some(f) = &mut app.form { f.auth_value = p; } },
+                                        ));
                                     }
                                 });
                                 ui.end_row();
@@ -11766,9 +11935,10 @@ impl StreamArchiverApp {
                         ui.horizontal(|ui| {
                             ui.text_edit_singleline(&mut form.output_dir);
                             if ui.button("Browse…").clicked() {
-                                if let Some(p) = browse_folder(&form.output_dir) {
-                                    form.output_dir = p;
-                                }
+                                browse_req = Some(spawn_browse_folder(
+                                    &form.output_dir,
+                                    |app, p| { if let Some(f) = &mut app.form { f.output_dir = p; } },
+                                ));
                             }
                         });
                         ui.end_row();
@@ -11801,6 +11971,10 @@ impl StreamArchiverApp {
                 });
             },
         );
+
+        if let Some(br) = browse_req {
+            self.pending_browse = Some(br);
+        }
 
         if do_save {
             self.save_form();
