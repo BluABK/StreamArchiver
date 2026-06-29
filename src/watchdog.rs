@@ -36,6 +36,12 @@ pub enum Activity {
     EmoteViewerGrid = 3,
     EmoteDecodePump = 4,
     Chat = 5,
+    /// First-open work of the channel Properties window *before* its sub-window is
+    /// created: synchronous image decode/upload of the icon + asset thumbnails and the
+    /// per-platform asset enumeration. Split from [`Activity::Properties`] (which then
+    /// covers the sub-window build + paint) so a freeze dialog says whether the UI thread
+    /// stalled loading assets or inside the window itself.
+    PropertiesLoad = 6,
 }
 
 impl Activity {
@@ -46,6 +52,7 @@ impl Activity {
             3 => Activity::EmoteViewerGrid,
             4 => Activity::EmoteDecodePump,
             5 => Activity::Chat,
+            6 => Activity::PropertiesLoad,
             _ => Activity::Idle,
         }
     }
@@ -57,6 +64,7 @@ impl Activity {
             Activity::EmoteViewerGrid => "drawing the emote viewer",
             Activity::EmoteDecodePump => "decoding / uploading emote images",
             Activity::Chat => "drawing the chat replay popup",
+            Activity::PropertiesLoad => "loading the channel properties assets",
         }
     }
 }

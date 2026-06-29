@@ -652,6 +652,17 @@ pub struct StreamArchiverApp {
     /// be hundreds of stat calls per repaint. Invalidated wherever `channel_asset_thumbs`
     /// is (open/rename/refetch/close).
     channel_emote_counts: HashMap<i64, [(EmoteProvider, usize); 4]>,
+    /// Per-platform asset-status rows for the open Properties window, keyed by channel
+    /// id. Cached for the same reason as [`channel_emote_counts`]: each row is built from
+    /// blocking filesystem I/O (`read_dir` + per-file `metadata` + full JSON manifest
+    /// parse), and the status grid is rebuilt every frame — so doing the I/O per frame is
+    /// dozens of syscalls per repaint and can freeze the UI thread on slow/AV-scanned
+    /// storage. Invalidated wherever `channel_asset_thumbs` is (open/rename/refetch/close).
+    channel_asset_status: HashMap<i64, Vec<PlatformAssetStatus>>,
+    /// Snapshot of the global schedule-source order for the open Properties window. Taken
+    /// once on open so `scope_override_editor` reads it from memory instead of doing a
+    /// settings DB read (store mutex) every frame.
+    props_source_order: Vec<SourceEntry>,
     /// Open emote-viewer window (None = closed). Reuses the shared `emote_anim`
     /// decode cache, so its emotes animate against the same clock as chat replay.
     emote_viewer: Option<EmoteViewer>,
@@ -1000,6 +1011,8 @@ impl StreamArchiverApp {
             emote_epoch: Arc::new(AtomicU64::new(0)),
             channel_asset_thumbs: HashMap::new(),
             channel_emote_counts: HashMap::new(),
+            channel_asset_status: HashMap::new(),
+            props_source_order: Vec::new(),
             emote_viewer: None,
             emote_viewer_stale: false,
             asset_history: None,
@@ -1205,6 +1218,9 @@ impl StreamArchiverApp {
                             // Emote sets may have changed too — drop the cached counts
                             // so the launcher buttons re-enumerate.
                             self.channel_emote_counts.clear();
+                            // Asset presence/variants/stamps moved — drop the cached
+                            // status grid so it re-enumerates from disk on the next frame.
+                            self.channel_asset_status.clear();
                             // Drop decoded emote frames so refreshed images re-decode
                             // from disk at their stable paths.
                             self.clear_emote_cache();
@@ -4105,6 +4121,54 @@ struct AssetThumb {
     dims: (u32, u32),
 }
 
+/// One row of the Properties window's per-platform asset-status grid. Every field is
+/// derived from blocking filesystem I/O (`read_dir` for presence/variants, a recursive
+/// depth-2 badge-dir count, a `read_dir` of the Twitch emote dir, a full JSON parse of
+/// each third-party manifest, and a `read_to_string` of the fetch stamp). The grid is
+/// rebuilt every frame the window is open, so these rows are computed once on open and
+/// cached (see `channel_asset_status`) — doing the I/O per frame is dozens of syscalls
+/// per repaint and can stall the UI thread for >10s on slow or AV-scanned storage.
+#[derive(Clone)]
+struct PlatformAssetStatus {
+    platform: Platform,
+    icon_present: bool,
+    icon_variants: usize,
+    banner_present: bool,
+    banner_variants: usize,
+    badges: usize,
+    emotes: usize,
+    stamp: String,
+}
+
+/// Build the Properties window's per-platform asset-status rows. Runs the blocking
+/// filesystem I/O once on open (the result is cached in `channel_asset_status`); see
+/// [`PlatformAssetStatus`] for why this must not run per frame. Logic mirrors what the
+/// status grid used to compute inline: icon/banner presence + archived-variant counts,
+/// a depth-2 badge-dir count, the Twitch emote-dir file count plus each third-party
+/// manifest length, and the last-fetched stamp.
+fn build_platform_asset_status(name: &str, platforms: &[Platform]) -> Vec<PlatformAssetStatus> {
+    platforms
+        .iter()
+        .map(|&p| {
+            let pdir = channel_asset_dir(name, p);
+            let mut emotes = prop_count_dir_files(&pdir.join("emotes").join("twitch"));
+            for src in &["bttv", "ffz", "7tv"] {
+                emotes += prop_read_manifest_count(&pdir.join("emotes").join(format!("{src}.json")));
+            }
+            PlatformAssetStatus {
+                platform: p,
+                icon_present: prop_find_first(&pdir, "icon.").is_some(),
+                icon_variants: prop_variant_count(&pdir, "icon"),
+                banner_present: prop_find_first(&pdir, "banner.").is_some(),
+                banner_variants: prop_variant_count(&pdir, "banner"),
+                badges: prop_count_nested_dirs(&pdir.join("badges"), 2),
+                emotes,
+                stamp: fmt_asset_stamp(&pdir),
+            }
+        })
+        .collect()
+}
+
 /// One emote row for the emote viewer: a code resolved to its on-disk image, plus
 /// whether that image still exists (absent ⇒ shown in the "Deprecated" section).
 struct ViewerEmote {
@@ -4844,6 +4908,7 @@ impl StreamArchiverApp {
                             self.channel_twitch_colors.remove(&id);
                             self.channel_asset_thumbs.remove(&id);
                             self.channel_emote_counts.remove(&id);
+                            self.channel_asset_status.remove(&id);
                         }
                         self.reload_rows();
                     }
@@ -9085,6 +9150,7 @@ impl StreamArchiverApp {
             self.channel_twitch_colors.remove(&cid);
             self.channel_asset_thumbs.remove(&cid);
             self.channel_emote_counts.remove(&cid);
+            self.channel_asset_status.remove(&cid);
         }
         if let Some(id) = acts.start {
             self.core.manual(ManualCommand::Start(id));
@@ -12258,9 +12324,12 @@ impl StreamArchiverApp {
                 return;
             }
         };
-        // Watchdog: name this phase so a freeze dialog points at the properties window
-        // (this is REPRO 1 — hovering the emote-launcher buttons here).
-        self.heartbeat.set_activity(crate::watchdog::Activity::Properties);
+        // Watchdog: the synchronous first-open work below (icon/thumbnail image decode +
+        // GPU upload and the per-platform asset enumeration) is the part that can block
+        // the UI thread for seconds. Stamp it distinctly from the window paint so a freeze
+        // dialog says whether we stalled *loading assets* or *inside the window*. Reset to
+        // `Properties` right before the sub-window is created (below).
+        self.heartbeat.set_activity(crate::watchdog::Activity::PropertiesLoad);
         // First monitor of this channel — used for asset refetch.
         let first_mon = self.rows.iter().find(|r| r.channel.id == cid).map(|r| r.monitor.clone());
 
@@ -12291,6 +12360,16 @@ impl StreamArchiverApp {
             .channel_emote_counts
             .entry(ch.id)
             .or_insert_with(|| emote_provider_counts(&ch.name));
+        // Per-platform asset-status rows — built once per open from blocking filesystem
+        // I/O (read_dir + per-file metadata + full JSON manifest parse) and cached, so the
+        // status grid (rebuilt every frame the window is open) reads from memory instead of
+        // re-running dozens of syscalls per repaint (which can stall the UI thread on slow
+        // or AV-scanned storage). The clone is cheap (a handful of small rows).
+        let asset_status = self
+            .channel_asset_status
+            .entry(ch.id)
+            .or_insert_with(|| build_platform_asset_status(&ch.name, &asset_platforms))
+            .clone();
 
         let mut pref_change: Option<Option<Platform>> = None;
         let mut open_emote_viewer: Option<EmoteProvider> = None;
@@ -12298,14 +12377,22 @@ impl StreamArchiverApp {
 
         if self.channel_cfg_draft.as_ref().map(|(id, _)| *id) != Some(ch.id) {
             self.channel_cfg_draft = Some((ch.id, load_channel_cfg(&self.core.store, ch.id)));
+            // Snapshot the global source order once per open (read once here, not via a
+            // settings DB read every frame inside `scope_override_editor`).
+            self.props_source_order = load_source_order(&self.core.store);
         }
         if self.channel_scope_draft.as_ref().map(|(id, _)| *id) != Some(ch.id) {
             self.channel_scope_draft =
                 Some((ch.id, load_channel_scope(&self.core.store, ch.id)));
         }
-        let global_order = load_source_order(&self.core.store);
+        let global_order = self.props_source_order.clone();
         let mut cfg_dirty = false;
         let mut scope_dirty = false;
+
+        // The first-open asset loads are done; everything from here is the sub-window
+        // build + paint. Stamp that distinctly so a freeze here is attributed to the
+        // window itself rather than to asset loading.
+        self.heartbeat.set_activity(crate::watchdog::Activity::Properties);
 
         let mut open = true;
         ctx.show_viewport_immediate(
@@ -12455,6 +12542,7 @@ impl StreamArchiverApp {
                                 self.channel_twitch_colors.remove(&ch.id);
                                 self.channel_asset_thumbs.remove(&ch.id);
                                 self.channel_emote_counts.remove(&ch.id);
+                                self.channel_asset_status.remove(&ch.id);
                                 self.status = format!("Refetching assets for {}…", ch.name);
                             }
                         }
@@ -12531,50 +12619,35 @@ impl StreamArchiverApp {
                             ui.strong("Emotes");
                             ui.strong("Updated");
                             ui.end_row();
-                            for &p in &asset_platforms {
-                                let pdir = channel_asset_dir(&ch.name, p);
+                            // Reads from the per-open `asset_status` cache — NO filesystem
+                            // I/O here (it would otherwise be dozens of syscalls per frame;
+                            // see `PlatformAssetStatus`).
+                            for st in &asset_status {
                                 ui.horizontal(|ui| {
                                     let ptex = self.platform_tex.get_or_insert_with(|| {
                                         PlatformTextures::load(ui.ctx())
                                     });
-                                    if let Some(t) = ptex.get(p) {
+                                    if let Some(t) = ptex.get(st.platform) {
                                         ui.add(
                                             egui::Image::from_texture(t)
                                                 .max_size(egui::vec2(13.0, 13.0)),
                                         );
                                     }
-                                    ui.label(p.label());
+                                    ui.label(st.platform.label());
                                 });
-                                asset_status_cell(
-                                    ui,
-                                    prop_find_first(&pdir, "icon.").is_some(),
-                                    prop_variant_count(&pdir, "icon"),
-                                );
-                                asset_status_cell(
-                                    ui,
-                                    prop_find_first(&pdir, "banner.").is_some(),
-                                    prop_variant_count(&pdir, "banner"),
-                                );
-                                let badges = prop_count_nested_dirs(&pdir.join("badges"), 2);
-                                ui.label(if badges > 0 {
-                                    badges.to_string()
+                                asset_status_cell(ui, st.icon_present, st.icon_variants);
+                                asset_status_cell(ui, st.banner_present, st.banner_variants);
+                                ui.label(if st.badges > 0 {
+                                    st.badges.to_string()
                                 } else {
                                     "—".into()
                                 });
-                                let mut emotes = prop_count_dir_files(
-                                    &pdir.join("emotes").join("twitch"),
-                                );
-                                for src in &["bttv", "ffz", "7tv"] {
-                                    emotes += prop_read_manifest_count(
-                                        &pdir.join("emotes").join(format!("{src}.json")),
-                                    );
-                                }
-                                ui.label(if emotes > 0 {
-                                    emotes.to_string()
+                                ui.label(if st.emotes > 0 {
+                                    st.emotes.to_string()
                                 } else {
                                     "—".into()
                                 });
-                                ui.label(fmt_asset_stamp(&pdir));
+                                ui.label(&st.stamp);
                                 ui.end_row();
                             }
                         });
@@ -12798,6 +12871,7 @@ impl StreamArchiverApp {
             // them); they reload from disk on the next open.
             self.channel_asset_thumbs.remove(&cid);
             self.channel_emote_counts.remove(&cid);
+            self.channel_asset_status.remove(&cid);
         }
     }
 
@@ -13083,6 +13157,28 @@ fn build_emote_map(name: &str) -> HashMap<String, std::path::PathBuf> {
     map
 }
 
+/// Decode encoded image `bytes` to RGBA8 under hard resource limits. A corrupt or
+/// hostile image (absurd dimensions / a decompression bomb) would otherwise tie up the
+/// UI thread for many seconds inside a synchronous decode — exactly the kind of single
+/// blocking op that trips the freeze watchdog — or balloon into a multi-GB allocation
+/// that, under the release `panic = "abort"` profile, kills the process outright.
+///
+/// Bounds: 16384×16384 px (the usual `GL_MAX_TEXTURE_SIZE`; anything larger could not be
+/// uploaded as a texture anyway) and a 1 GiB peak decode allocation. A limit breach or a
+/// decode error returns `None`, which every caller already treats as "no usable image".
+fn decode_rgba_bounded(bytes: &[u8]) -> Option<image::RgbaImage> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    // `Limits` is `#[non_exhaustive]`, so build via `default()` and set fields.
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(1 << 30); // 1 GiB
+    reader.limits(limits);
+    Some(reader.decode().ok()?.to_rgba8())
+}
+
 /// Decode an image file into an egui texture, returning the texture and its pixel
 /// dimensions. `key` must be unique per logical image so textures never collide.
 /// Returns `None` when the file is missing or undecodable.
@@ -13092,7 +13188,7 @@ fn load_image_texture(
     key: &str,
 ) -> Option<(egui::TextureHandle, (u32, u32))> {
     let bytes = std::fs::read(path).ok()?;
-    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let img = decode_rgba_bounded(&bytes)?;
     let (w, h) = (img.width(), img.height());
     let color_image =
         egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &img.into_raw());
@@ -13497,7 +13593,7 @@ fn load_channel_icon(
 ) -> Option<egui::TextureHandle> {
     let entry = prop_find_first(asset_dir, "icon.")?;
     let bytes = std::fs::read(&entry).ok()?;
-    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let img = decode_rgba_bounded(&bytes)?;
     let size = [img.width() as usize, img.height() as usize];
     let color_image =
         egui::ColorImage::from_rgba_unmultiplied(size, &img.into_raw());
@@ -13519,7 +13615,7 @@ fn load_channel_icon_small(
 ) -> Option<egui::TextureHandle> {
     let path = crate::assets::ensure_scaled_icon(asset_dir, 64)?;
     let bytes = std::fs::read(&path).ok()?;
-    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let img = decode_rgba_bounded(&bytes)?;
     let size = [img.width() as usize, img.height() as usize];
     let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &img.into_raw());
     Some(ctx.load_texture(
