@@ -4634,13 +4634,27 @@ impl eframe::App for StreamArchiverApp {
                             self.show_processes = true;
                             self.processes_refreshed = None; // force an immediate refresh
                         }
-                        if ui
-                            .small_button("⚠ Issues")
-                            .on_hover_text("Recordings that need attention")
-                            .clicked()
                         {
-                            self.show_issues = true;
-                            self.issues_refreshed = None;
+                            let n = self.issues_recs.len();
+                            let label = if n > 0 {
+                                format!("⚠ Issues ({})", n)
+                            } else {
+                                "⚠ Issues".to_string()
+                            };
+                            let btn = egui::Button::new(label).small();
+                            let btn = if n > 0 {
+                                btn.fill(egui::Color32::from_rgb(160, 90, 10))
+                            } else {
+                                btn
+                            };
+                            if ui
+                                .add(btn)
+                                .on_hover_text("Recordings that need attention")
+                                .clicked()
+                            {
+                                self.show_issues = true;
+                                self.issues_refreshed = None;
+                            }
                         }
                         if self.view == View::Streams {
                             if ui
@@ -12002,17 +12016,23 @@ impl StreamArchiverApp {
     fn issues_window(&mut self, ctx: &egui::Context) {
         use egui_extras::{Column, TableBuilder};
         use std::time::{Duration, Instant};
-        if !self.show_issues {
-            return;
-        }
-        // Refresh the list periodically or when explicitly invalidated.
+        // Always refresh so the toolbar button count stays current even when the
+        // panel is closed. Use a slower interval when hidden.
+        let interval = if self.show_issues {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(30)
+        };
         let stale = self
             .issues_refreshed
-            .map(|t| t.elapsed() >= Duration::from_secs(5))
+            .map(|t| t.elapsed() >= interval)
             .unwrap_or(true);
         if stale {
             self.issues_recs = self.core.store.recordings_needing_remux().unwrap_or_default();
             self.issues_refreshed = Some(Instant::now());
+        }
+        if !self.show_issues {
+            return;
         }
 
         // Build owned lookup: monitor_id -> (channel_name, platform) to avoid
