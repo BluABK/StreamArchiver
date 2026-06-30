@@ -1234,6 +1234,13 @@ pub const K_OCR_IMAGE_HASHES: &str = "ocr_image_hashes";
 /// one session — a rebuild/restart can't trigger a fresh re-OCR sweep.
 pub const K_OCR_LAST_ATTEMPT: &str = "ocr_last_attempt";
 
+/// `app_settings` key for the last successful schedule-fetch timestamp per
+/// monitor, persisted as a JSON `HashMap<String, i64>` (monitor_id → unix_secs).
+/// Loaded at startup so the 6-hour staleness window survives app restarts —
+/// without this, every restart triggers a full re-fetch of all YouTube API
+/// schedule channels, burning expensive `search.list` quota.
+pub const K_SCHEDULE_LAST_FETCHED: &str = "schedule_last_fetched";
+
 /// `app_settings` key for the global "go to the next schedule source when an
 /// event has no title" toggle (`"1"` = on). When on, the schedule walk keeps
 /// querying lower-priority sources after a winner is found, to fill in blank

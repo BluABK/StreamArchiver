@@ -2133,6 +2133,29 @@ fn load_ocr_attempts(store: &Store) -> HashMap<(i64, String), i64> {
         .collect()
 }
 
+/// Load the persisted per-monitor schedule-fetch timestamps from `app_settings`.
+/// Keys are monitor IDs as strings; values are unix seconds of the last fetch.
+fn load_schedule_fetched(store: &Store) -> HashMap<i64, i64> {
+    let raw: HashMap<String, i64> = store
+        .get_setting(crate::models::K_SCHEDULE_LAST_FETCHED)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    raw.into_iter()
+        .filter_map(|(k, ts)| Some((k.parse::<i64>().ok()?, ts)))
+        .collect()
+}
+
+/// Persist the current `last_fetched` map so the staleness window survives
+/// app restarts (no unnecessary re-fetches of expensive YouTube API sources).
+fn persist_schedule_fetched(store: &Store, map: &HashMap<i64, i64>) {
+    let raw: HashMap<String, i64> = map.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+    if let Ok(json) = serde_json::to_string(&raw) {
+        let _ = store.set_setting(crate::models::K_SCHEDULE_LAST_FETCHED, &json);
+    }
+}
+
 /// Background task: periodically refresh upcoming-stream schedules for enabled
 /// Twitch/YouTube monitors. A short poll tick picks up newly-added monitors
 /// quickly; each monitor is re-fetched at most every few hours (tracked
@@ -2150,7 +2173,10 @@ pub async fn refresh_schedules(
     const TICK_SECS: u64 = 60;
     const REFRESH_SECS: u64 = 6 * 3600;
 
-    let mut last_fetched: HashMap<i64, Instant> = HashMap::new();
+    // Persisted across restarts so the 6-hour staleness window is respected even
+    // after a rebuild/restart — prevents every launch from burning expensive
+    // `search.list` quota on all YouTube API schedule channels at once.
+    let mut last_fetched: HashMap<i64, i64> = load_schedule_fetched(ctx.store.as_ref());
     // Separate, slower cadence for the expensive OCR sources, keyed by
     // (monitor, source id) and stamped in wall-clock unix seconds. A forced UI
     // refresh resets `last_fetched` (so cheap API/scrape sources re-run at once)
@@ -2253,7 +2279,7 @@ async fn refresh_schedules_once(
     ctx: &Arc<DetectContext>,
     events: &EventTx,
     shutdown: &Arc<AtomicBool>,
-    last_fetched: &mut HashMap<i64, Instant>,
+    last_fetched: &mut HashMap<i64, i64>,
     last_ocr: &mut HashMap<(i64, String), i64>,
     discord_last: &mut Option<Instant>,
     yt_video_id_refetch: &Arc<AtomicBool>,
@@ -2268,9 +2294,10 @@ async fn refresh_schedules_once(
     let live: std::collections::HashSet<i64> = rows.iter().map(|r| r.monitor.id).collect();
     last_fetched.retain(|id, _| live.contains(id));
     last_ocr.retain(|k, _| live.contains(&k.0));
+    // `now_secs` is the authoritative clock for both `last_fetched` (persisted,
+    // must survive restarts) and the OCR cadence.  `now` (Instant) is kept only
+    // for `discord_last`, which is in-memory-only and doesn't need wall-clock.
     let now = Instant::now();
-    // Wall-clock counterpart of `now`, used for the persisted OCR cadence (which
-    // must survive restarts, where monotonic `Instant`s reset).
     let now_secs = now_unix();
 
     // If the UI requested a targeted re-scrape for YouTube monitors whose stored
@@ -2338,9 +2365,9 @@ async fn refresh_schedules_once(
         if !row.channel.enabled || !row.monitor.enabled {
             continue;
         }
-        // Re-fetch each monitor at most every `refresh_secs`.
+        // Re-fetch each monitor at most every `refresh_secs` (wall-clock, survives restarts).
         if let Some(t) = last_fetched.get(&row.monitor.id) {
-            if now.duration_since(*t).as_secs() < refresh_secs {
+            if now_secs.saturating_sub(*t) < refresh_secs as i64 {
                 continue;
             }
         }
@@ -2446,13 +2473,11 @@ async fn refresh_schedules_once(
 
         // Stamp staleness: full interval on success/authoritative-empty; sooner on a
         // pure transient failure (every applicable source returned `None`).
-        let stamp = if any_authoritative {
-            now
+        let stamp: i64 = if any_authoritative {
+            now_secs
         } else {
-            now.checked_sub(Duration::from_secs(
-                refresh_secs.saturating_sub(TRANSIENT_RETRY_SECS),
-            ))
-            .unwrap_or(now)
+            // Back-date so the next check fires after TRANSIENT_RETRY_SECS, not REFRESH_SECS.
+            now_secs.saturating_sub(refresh_secs.saturating_sub(TRANSIENT_RETRY_SECS) as i64)
         };
         last_fetched.insert(row.monitor.id, stamp);
 
@@ -2604,6 +2629,10 @@ async fn refresh_schedules_once(
             state: String::new(),
         });
     }
+
+    // Persist the updated fetch timestamps so the staleness window survives
+    // the next restart (avoids a search.list burst on every rebuild/relaunch).
+    persist_schedule_fetched(ctx.store.as_ref(), last_fetched);
 }
 
 /// Extract the Twitch login from a channel URL (`twitch.tv/<login>`).
