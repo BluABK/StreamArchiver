@@ -885,6 +885,13 @@ pub struct UpcomingStream {
     /// Custom hex color for this channel (mirrors `Channel::color`). Empty
     /// means "use the automatic palette color".
     pub channel_color: String,
+    /// For manual merges: the `segment_id` of the primary this segment was merged
+    /// into. `None` = standalone or IS the primary. Segments with a non-None value
+    /// are hidden from the calendar in favor of their primary.
+    pub merged_into: Option<i64>,
+    /// When true, this segment is excluded from automatic time-overlap merge
+    /// grouping with same-channel events.
+    pub auto_merge_excluded: bool,
 }
 
 impl UpcomingStream {

@@ -658,6 +658,18 @@ pub struct StreamArchiverApp {
     /// Draft for the "Edit schedule item" dialog (None = closed). Saving converts
     /// the row to a protected `"manual"` source so refreshes don't overwrite it.
     edit_schedule: Option<EditScheduleDraft>,
+    /// Segment IDs selected in the schedule calendar (Ctrl+click multi-select).
+    schedule_selected: HashSet<i64>,
+    /// Open merge-preview dialog (None = closed).
+    merge_preview: Option<MergePreviewDraft>,
+    /// Pending multi-delete confirmation for schedule segments (None = closed).
+    confirm_delete_segments: Option<Vec<i64>>,
+    /// Computed from `schedule_all`: primary segment_id → merge badge text.
+    /// Built by [`Self::recompute_merge_state`]; drives the 🔀 indicator.
+    schedule_merge_labels: HashMap<i64, String>,
+    /// Computed from `schedule_all`: segment IDs that are auto-merge secondaries
+    /// (hidden in favour of their primary). Built by [`Self::recompute_merge_state`].
+    schedule_auto_secondary: HashSet<i64>,
     /// Chat log viewer popup (None = closed).
     chat_popup: Option<ChatPopup>,
     /// Platform favicons, uploaded to the GPU on first use (None until then).
@@ -1107,6 +1119,11 @@ impl StreamArchiverApp {
             channel_scope_draft: None,
             instance_scope_draft: None,
             edit_schedule: None,
+            schedule_selected: HashSet::new(),
+            merge_preview: None,
+            confirm_delete_segments: None,
+            schedule_merge_labels: HashMap::new(),
+            schedule_auto_secondary: HashSet::new(),
             chat_popup: None,
             platform_tex: None,
             properties_popup: None,
@@ -1308,6 +1325,7 @@ impl StreamArchiverApp {
                 if !live.is_empty() {
                     self.schedule_hidden.retain(|id| live.contains(id));
                 }
+                self.recompute_merge_state();
                 // Only latch on success so a transient error retries via lazy-load.
                 self.schedule_loaded = true;
                 self.pending_schedule = None;
@@ -1322,6 +1340,93 @@ impl StreamArchiverApp {
                 self.pending_schedule = None;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    /// Recompute `schedule_merge_labels` and `schedule_auto_secondary` from the
+    /// current `schedule_all`. Call after any change to `schedule_all` or to
+    /// `merged_into`/`auto_merge_excluded` on any segment.
+    fn recompute_merge_state(&mut self) {
+        self.schedule_merge_labels.clear();
+        self.schedule_auto_secondary.clear();
+
+        // ── Auto-merge: group same-channel overlapping events ──────────────
+        // Group non-excluded, non-manual-secondary segments by channel_id.
+        let mut by_channel: HashMap<i64, Vec<usize>> = HashMap::new();
+        for (i, s) in self.schedule_all.iter().enumerate() {
+            if s.merged_into.is_some() { continue; } // manual secondary → skip
+            by_channel.entry(s.channel_id).or_default().push(i);
+        }
+        for indices in by_channel.values() {
+            // schedule_all is already sorted by start_time, so each channel's
+            // list is time-ordered.
+            let mut processed: HashSet<usize> = HashSet::new();
+            for &pi in indices {
+                if processed.contains(&pi) { continue; }
+                let ps = &self.schedule_all[pi];
+                if ps.auto_merge_excluded { continue; }
+                let p_end = ps.end_time.unwrap_or(ps.start_time + 3600);
+                let mut group: Vec<usize> = vec![pi];
+                let mut group_end = p_end;
+                for &si in indices {
+                    if si == pi || processed.contains(&si) { continue; }
+                    let ss = &self.schedule_all[si];
+                    if ss.auto_merge_excluded { continue; }
+                    let s_end = ss.end_time.unwrap_or(ss.start_time + 3600);
+                    if ss.start_time < group_end && s_end > ps.start_time {
+                        group.push(si);
+                        group_end = group_end.max(s_end);
+                    }
+                }
+                if group.len() > 1 {
+                    // Pick primary: highest source priority (YouTube first)
+                    let primary_pos = group
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, gi)| {
+                            merge_source_priority(&self.schedule_all[**gi].source)
+                        })
+                        .map(|(pos, _)| pos)
+                        .unwrap_or(0);
+                    let primary_idx = group[primary_pos];
+                    let primary_id = self.schedule_all[primary_idx].segment_id;
+                    // Collect secondary info before mutating self.schedule_merge_labels.
+                    let auto_sources: Vec<String> = group
+                        .iter()
+                        .enumerate()
+                        .filter(|(pos, _)| *pos != primary_pos)
+                        .map(|(_, si)| self.schedule_all[*si].source.clone())
+                        .collect();
+                    let secondary_sids: Vec<i64> = group
+                        .iter()
+                        .enumerate()
+                        .filter(|(pos, _)| *pos != primary_pos)
+                        .map(|(_, si)| self.schedule_all[*si].segment_id)
+                        .collect();
+                    for idx in &group {
+                        processed.insert(*idx);
+                    }
+                    for sid in secondary_sids {
+                        self.schedule_auto_secondary.insert(sid);
+                    }
+                    let n = auto_sources.len();
+                    *self.schedule_merge_labels.entry(primary_id).or_default() =
+                        format!("auto-merged {n} ({})", auto_sources.join(", "));
+                }
+            }
+        }
+
+        // ── Manual merge: collect primaries that have manual secondaries ───
+        for s in &self.schedule_all {
+            if let Some(primary_id) = s.merged_into {
+                let src = s.source.clone();
+                let entry = self.schedule_merge_labels.entry(primary_id).or_default();
+                if !entry.is_empty() {
+                    entry.push_str(&format!(", manual: {src}"));
+                } else {
+                    *entry = format!("manually merged ({})", src);
+                }
+            }
         }
     }
 
@@ -2458,6 +2563,19 @@ fn channel_event_color(channel_id: i64, color: &str) -> egui::Color32 {
     PALETTE[(channel_id.unsigned_abs() as usize) % PALETTE.len()]
 }
 
+/// Source-priority weight for auto-merge primary selection: lower = higher priority.
+/// YouTube sources beat platform (Twitch) sources because they're manually scheduled
+/// and have more accurate timing than the Twitch advance schedule.
+fn merge_source_priority(source: &str) -> u8 {
+    match source {
+        "youtube_api" => 0,
+        s if s.starts_with("youtube") => 1,
+        "manual" => 2,
+        "platform" => 4,
+        _ => 3,
+    }
+}
+
 /// Indices into `all` whose visible (channel not in `hidden`) time window overlaps
 /// another visible stream's — i.e. two streams scheduled at the same time. A
 /// stream with no/invalid end time is treated as [`COLLISION_DEFAULT_SECS`] long.
@@ -2531,6 +2649,16 @@ fn month_title(y: i32, m: u32) -> String {
 
 /// Multi-line detail for one upcoming stream — the calendar hover text and the
 /// "Copy details" payload.
+/// Like [`schedule_detail_line`] but appends a "Merged: …" line when this event
+/// is the primary of a merge group.
+fn schedule_detail_line_merged(s: &UpcomingStream, merge_label: Option<&str>) -> String {
+    let mut base = schedule_detail_line(s);
+    if let Some(label) = merge_label {
+        base.push_str(&format!("\nMerged: {label}"));
+    }
+    base
+}
+
 fn schedule_detail_line(s: &UpcomingStream) -> String {
     let mut parts = vec![
         format!("{}  {}", fmt_datetime_short(s.start_time), s.channel_name),
@@ -2569,8 +2697,42 @@ fn schedule_source_badge(ui: &mut egui::Ui, source: &str) {
 /// Right-click menu for an upcoming-stream entry (calendar chip + day popup): copy
 /// its URL / platform / title / channel / full details, or open it in the browser.
 /// All actions are immediate (copy/open go straight through the egui context).
-fn schedule_copy_menu(ui: &mut egui::Ui, s: &UpcomingStream, hidden: bool) {
+/// `merge_label` is non-None when this event is the primary of a merge (auto or manual),
+/// and its value is the human-readable description used in the "Un-merge" button.
+fn schedule_copy_menu(ui: &mut egui::Ui, s: &UpcomingStream, hidden: bool, merge_label: Option<&str>) {
     ui.set_min_width(180.0);
+    // Un-merge actions (shown at top when this is a merged primary).
+    if let Some(label) = merge_label {
+        let is_auto = label.starts_with("auto");
+        let is_manual = label.starts_with("manual");
+        if is_auto {
+            if ui
+                .button("🔀  Un-merge (auto)")
+                .on_hover_text(format!("Show merged events separately ({label})"))
+                .clicked()
+            {
+                ui.ctx().data_mut(|d| {
+                    d.insert_temp(egui::Id::new("sched_unmerge_auto"), s.segment_id)
+                });
+                ui.close();
+            }
+        }
+        if is_manual {
+            if ui
+                .button("🔀  Un-merge (manual)")
+                .on_hover_text(format!("Remove manual merge ({label})"))
+                .clicked()
+            {
+                ui.ctx().data_mut(|d| {
+                    d.insert_temp(egui::Id::new("sched_unmerge_manual"), s.segment_id)
+                });
+                ui.close();
+            }
+        }
+        if is_auto || is_manual {
+            ui.separator();
+        }
+    }
     // Hide / show toggle
     let hide_label = if hidden { "👁  Show" } else { "🙈  Hide" };
     if ui.button(hide_label).clicked() {
@@ -2666,6 +2828,7 @@ fn schedule_detail_row(
     colliding: bool,
     hidden: bool,
     ptex: &PlatformTextures,
+    merge_label: Option<&str>,
 ) {
     let color = channel_event_color(s.channel_id, &s.channel_color);
     let resp = ui
@@ -2679,6 +2842,9 @@ fn schedule_detail_row(
             ui.painter().rect_filled(stripe_rect, egui::CornerRadius::same(2), color);
             if colliding {
                 ui.colored_label(HL_COLLISION, "⚠");
+            }
+            if merge_label.is_some() {
+                ui.label(egui::RichText::new("🔀").small());
             }
             ui.label(egui::RichText::new(fmt_time_range(s.start_time, s.end_time)).monospace());
             platform_icon(ui, ptex, s.platform());
@@ -2695,8 +2861,9 @@ fn schedule_detail_row(
         })
         .response
         .interact(egui::Sense::click());
-    resp.on_hover_text(schedule_detail_line(s))
-        .context_menu(|ui| schedule_copy_menu(ui, s, hidden));
+    let ml_owned = merge_label.map(str::to_string);
+    resp.on_hover_text(schedule_detail_line_merged(s, merge_label))
+        .context_menu(|ui| schedule_copy_menu(ui, s, hidden, ml_owned.as_deref()));
 }
 
 /// Subtle background tint for today's calendar cell (low-alpha accent, so it reads
@@ -2774,6 +2941,8 @@ fn schedule_time_grid(
     collide: &HashSet<usize>,
     open_day: &mut Option<chrono::NaiveDate>,
     hidden_segs: &HashSet<i64>,
+    selected: &HashSet<i64>,
+    merge_labels: &HashMap<i64, String>,
 ) {
     use chrono::Timelike;
     // Scroll to show the current local hour, but only the first time the view
@@ -2937,6 +3106,19 @@ fn schedule_time_grid(
                             egui::StrokeKind::Inside,
                         );
                     }
+                    // Selection highlight: bright white border
+                    let is_selected = selected.contains(&s.segment_id);
+                    if is_selected {
+                        painter.rect_stroke(
+                            block_rect,
+                            rounding,
+                            egui::Stroke::new(2.0, egui::Color32::WHITE),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+
+                    // Merge label for this block (non-empty = primary of a merge)
+                    let merge_label = merge_labels.get(&s.segment_id).map(String::as_str);
 
                     // Text inside the block — clip to block_rect so text never
                     // bleeds into adjacent columns.
@@ -2960,10 +3142,12 @@ fn schedule_time_grid(
                         };
                         let text_y = text_rect.top();
                         let badge = source_badge(&s.source).0;
+                        // Prepend 🔀 if this block is a merged primary
+                        let merge_icon = if merge_label.is_some() { "🔀 " } else { "" };
                         let name_str = if is_hidden {
-                            format!("⊘ {} {}", badge, s.channel_name)
+                            format!("⊘ {}{}{}", merge_icon, badge, s.channel_name)
                         } else {
-                            format!("{} {}", badge, s.channel_name)
+                            format!("{}{} {}", merge_icon, badge, s.channel_name)
                         };
                         text_painter.text(
                             egui::pos2(text_rect.left(), text_y),
@@ -2993,11 +3177,24 @@ fn schedule_time_grid(
                     }
 
                     let block_clicked = evt_resp.clicked();
+                    let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.shift);
+                    let merge_label_owned = merge_label.map(str::to_string);
                     evt_resp
-                        .on_hover_text(schedule_detail_line(s))
-                        .context_menu(|ui| schedule_copy_menu(ui, s, is_hidden));
+                        .on_hover_text(schedule_detail_line_merged(s, merge_label))
+                        .context_menu(|ui| schedule_copy_menu(ui, s, is_hidden, merge_label_owned.as_deref()));
                     if block_clicked {
-                        clicked_day = Some(day);
+                        if ctrl_held {
+                            // Ctrl+click: toggle in selection without opening day
+                            ui.ctx().data_mut(|d| {
+                                d.insert_temp(egui::Id::new("sched_sel_toggle"), s.segment_id)
+                            });
+                        } else {
+                            // Plain click: select single event + open day popup
+                            ui.ctx().data_mut(|d| {
+                                d.insert_temp(egui::Id::new("sched_sel_single"), s.segment_id)
+                            });
+                            clicked_day = Some(day);
+                        }
                     }
                 }
             }
@@ -3215,6 +3412,17 @@ struct EditScheduleDraft {
     end_date: String,
     end_time: String,
     /// Validation message shown in red (empty = none).
+    error: String,
+}
+
+/// Draft state for the "Merge schedule events" preview dialog.
+struct MergePreviewDraft {
+    /// Snapshots of the events to merge (2+), sorted highest-priority first.
+    /// Index 0 is pre-selected as the primary (can be changed by the user).
+    segments: Vec<UpcomingStream>,
+    /// Which element of `segments` is chosen as the primary (shown in the calendar).
+    primary_idx: usize,
+    /// Validation/error message (empty = none).
     error: String,
 }
 
@@ -4970,6 +5178,8 @@ impl eframe::App for StreamArchiverApp {
         self.confirm_delete_window(ui.ctx());
         self.confirm_delete_channel_window(ui.ctx());
         self.confirm_delete_segment_window(ui.ctx());
+        self.merge_preview_window(ui.ctx());
+        self.confirm_delete_segments_window(ui.ctx());
         self.format_probe_window(ui.ctx());
         self.ad_popup_window(ui.ctx());
         self.meta_popup_window(ui.ctx());
@@ -7400,6 +7610,10 @@ impl StreamArchiverApp {
             {
                 continue;
             }
+            // Skip segments that are secondaries of a merge (auto or manual) —
+            // their primary renders the merged event block.
+            if s.merged_into.is_some() { continue; }
+            if self.schedule_auto_secondary.contains(&s.segment_id) { continue; }
             if let Some(d) = local_date(s.start_time) {
                 by_day.entry(d).or_default().push(i);
             }
@@ -7642,6 +7856,69 @@ impl StreamArchiverApp {
             });
             ui.separator();
 
+            // ── Selection action bar (shown when any events are selected). ──
+            let n_sel = self.schedule_selected.len();
+            if n_sel > 0 {
+                let accent = ui.visuals().selection.bg_fill;
+                ui.horizontal(|ui| {
+                    ui.colored_label(accent, format!("{n_sel} selected"));
+                    ui.separator();
+                    // Merge: only valid when ≥2 events from the same channel are selected
+                    let can_merge = n_sel >= 2 && {
+                        let ch_ids: HashSet<i64> = self
+                            .schedule_selected
+                            .iter()
+                            .filter_map(|&sid| {
+                                self.schedule_all.iter().find(|s| s.segment_id == sid)
+                            })
+                            .map(|s| s.channel_id)
+                            .collect();
+                        ch_ids.len() == 1
+                    };
+                    if ui
+                        .add_enabled(can_merge, egui::Button::new("🔀 Merge"))
+                        .on_hover_text("Merge selected events into one calendar entry")
+                        .on_disabled_hover_text(
+                            if n_sel < 2 {
+                                "Select 2+ events to merge"
+                            } else {
+                                "Can only merge events from the same channel"
+                            },
+                        )
+                        .clicked()
+                    {
+                        let mut segs: Vec<UpcomingStream> = self
+                            .schedule_selected
+                            .iter()
+                            .filter_map(|&sid| {
+                                self.schedule_all.iter().find(|s| s.segment_id == sid).cloned()
+                            })
+                            .collect();
+                        // Sort highest priority first (YouTube first) so index 0 is the default primary.
+                        segs.sort_by_key(|s| merge_source_priority(&s.source));
+                        self.merge_preview = Some(MergePreviewDraft {
+                            segments: segs,
+                            primary_idx: 0,
+                            error: String::new(),
+                        });
+                    }
+                    if ui
+                        .button("🗑 Delete")
+                        .on_hover_text("Delete all selected events")
+                        .clicked()
+                    {
+                        self.confirm_delete_segments =
+                            Some(self.schedule_selected.iter().copied().collect());
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("✕ Clear").on_hover_text("Clear selection").clicked() {
+                            self.schedule_selected.clear();
+                        }
+                    });
+                });
+                ui.separator();
+            }
+
             match mode {
                 ScheduleMode::Month => {
                     self.schedule_month_grid(ui, anchor, today, &by_day, &collide, &ptex, &mut open_day)
@@ -7763,6 +8040,69 @@ impl StreamArchiverApp {
         if let Some(v) = set_show_hidden {
             self.schedule_show_hidden = v;
         }
+        // Selection actions written into temp storage from schedule_time_grid
+        // (free function, can't borrow self).
+        if let Some(sid) = ui
+            .ctx()
+            .data_mut(|d| d.remove_temp::<i64>(egui::Id::new("sched_sel_toggle")))
+        {
+            if self.schedule_selected.contains(&sid) {
+                self.schedule_selected.remove(&sid);
+            } else {
+                self.schedule_selected.insert(sid);
+            }
+        }
+        if let Some(sid) = ui
+            .ctx()
+            .data_mut(|d| d.remove_temp::<i64>(egui::Id::new("sched_sel_single")))
+        {
+            self.schedule_selected.clear();
+            self.schedule_selected.insert(sid);
+        }
+        // Un-merge actions from context menus.
+        if let Some(primary_id) = ui
+            .ctx()
+            .data_mut(|d| d.remove_temp::<i64>(egui::Id::new("sched_unmerge_manual")))
+        {
+            if let Err(e) = self.core.store.unmerge_segment(primary_id) {
+                self.status = format!("Error un-merging: {e:#}");
+            } else {
+                self.spawn_reload_schedule();
+            }
+        }
+        if let Some(primary_id) = ui
+            .ctx()
+            .data_mut(|d| d.remove_temp::<i64>(egui::Id::new("sched_unmerge_auto")))
+        {
+            // Set auto_merge_excluded on all auto-secondaries of this primary.
+            let secondary_ids: Vec<i64> = self
+                .schedule_auto_secondary
+                .iter()
+                .copied()
+                .filter(|&sid| {
+                    // Find this segment in schedule_all; check if it overlaps the primary
+                    // and belongs to the same channel.
+                    if let Some(primary) = self.schedule_all.iter().find(|s| s.segment_id == primary_id) {
+                        self.schedule_all.iter().any(|s| {
+                            s.segment_id == sid && s.channel_id == primary.channel_id
+                        })
+                    } else {
+                        false
+                    }
+                })
+                .collect();
+            let mut changed = false;
+            for sid in secondary_ids {
+                if let Err(e) = self.core.store.set_auto_merge_excluded(sid, true) {
+                    self.status = format!("Error excluding from auto-merge: {e:#}");
+                } else {
+                    changed = true;
+                }
+            }
+            if changed {
+                self.spawn_reload_schedule();
+            }
+        }
     }
 
     /// One compact calendar chip (colored stripe · ⚠ · platform icon · time range · channel)
@@ -7777,6 +8117,8 @@ impl StreamArchiverApp {
     ) -> egui::Response {
         let s = &self.schedule_all[i];
         let is_hidden = self.schedule_hidden_segments.contains(&s.segment_id);
+        let is_selected = self.schedule_selected.contains(&s.segment_id);
+        let merge_label = self.schedule_merge_labels.get(&s.segment_id).map(String::as_str);
         let color = channel_event_color(s.channel_id, &s.channel_color);
         let stripe_color = if is_hidden {
             egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 85)
@@ -7794,6 +8136,12 @@ impl StreamArchiverApp {
                 ui.painter().rect_filled(stripe_rect, egui::CornerRadius::same(2), stripe_color);
                 if is_hidden {
                     ui.weak("⊘");
+                }
+                if is_selected {
+                    ui.label(egui::RichText::new("✓").color(ui.visuals().selection.bg_fill).small());
+                }
+                if merge_label.is_some() {
+                    ui.label(egui::RichText::new("🔀").small());
                 }
                 if colliding {
                     ui.colored_label(HL_COLLISION, "⚠");
@@ -7814,8 +8162,9 @@ impl StreamArchiverApp {
             })
             .response
             .interact(egui::Sense::click());
-        let resp = resp.on_hover_text(schedule_detail_line(s));
-        resp.context_menu(|ui| schedule_copy_menu(ui, s, is_hidden));
+        let ml_owned = merge_label.map(str::to_string);
+        let resp = resp.on_hover_text(schedule_detail_line_merged(s, merge_label));
+        resp.context_menu(|ui| schedule_copy_menu(ui, s, is_hidden, ml_owned.as_deref()));
         resp
     }
 
@@ -7951,6 +8300,8 @@ impl StreamArchiverApp {
             collide,
             open_day,
             &self.schedule_hidden_segments,
+            &self.schedule_selected,
+            &self.schedule_merge_labels,
         );
     }
 
@@ -7989,6 +8340,8 @@ impl StreamArchiverApp {
             collide,
             open_day,
             &self.schedule_hidden_segments,
+            &self.schedule_selected,
+            &self.schedule_merge_labels,
         );
     }
 
@@ -8110,6 +8463,7 @@ impl StreamArchiverApp {
                     for &i in indices {
                         let s = &self.schedule_all[i];
                         let is_hidden = self.schedule_hidden_segments.contains(&s.segment_id);
+                        let merge_label_agenda = self.schedule_merge_labels.get(&s.segment_id).map(String::as_str);
                         let color = channel_event_color(s.channel_id, &s.channel_color);
                         let stripe_color = if is_hidden {
                             egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 85)
@@ -8129,6 +8483,9 @@ impl StreamArchiverApp {
                             ui.painter().rect_filled(stripe_rect, egui::CornerRadius::same(2), stripe_color);
                             if is_hidden {
                                 ui.weak("⊘");
+                            }
+                            if merge_label_agenda.is_some() {
+                                ui.label(egui::RichText::new("🔀").small());
                             }
 
                             // Time range
@@ -8179,8 +8536,9 @@ impl StreamArchiverApp {
                         .response
                         .interact(egui::Sense::click());
 
-                        let row_resp = row_resp.on_hover_text(schedule_detail_line(s));
-                        row_resp.context_menu(|ui| schedule_copy_menu(ui, s, is_hidden));
+                        let ml_agenda_owned = merge_label_agenda.map(str::to_string);
+                        let row_resp = row_resp.on_hover_text(schedule_detail_line_merged(s, merge_label_agenda));
+                        row_resp.context_menu(|ui| schedule_copy_menu(ui, s, is_hidden, ml_agenda_owned.as_deref()));
                         if row_resp.clicked() {
                             *open_day = Some(*day);
                         }
@@ -8214,6 +8572,7 @@ impl StreamArchiverApp {
             .to_string();
 
         let hidden_segs = self.schedule_hidden_segments.clone();
+        let merge_labels = self.schedule_merge_labels.clone();
         let mut open = true;
         let mut copy_all: Option<String> = None;
         ctx.show_viewport_immediate(
@@ -8239,7 +8598,8 @@ impl StreamArchiverApp {
                                 // The popup doesn't carry the collision set; the calendar
                                 // surfaces ⚠ markers, so rows here are shown unmarked.
                                 let hidden = hidden_segs.contains(&s.segment_id);
-                                schedule_detail_row(ui, s, false, hidden, &ptex);
+                                let ml = merge_labels.get(&s.segment_id).map(String::as_str);
+                                schedule_detail_row(ui, s, false, hidden, &ptex, ml);
                                 // Action button strip — writes to the same temp-data keys
                                 // that schedule_view() drains each frame.
                                 ui.horizontal(|ui| {
@@ -8464,6 +8824,197 @@ impl StreamArchiverApp {
         } else if !open {
             self.show_rename_dialog = false;
             self.rename_rec_id = None;
+        }
+    }
+
+    /// Preview dialog for merging 2+ selected schedule events into one calendar entry.
+    /// The user picks which event is the "primary" (its time/title/URL is shown);
+    /// the others become hidden secondaries. The merge is stored in the DB via
+    /// `merge_segments_manual`.
+    #[allow(deprecated)]
+    fn merge_preview_window(&mut self, ctx: &egui::Context) {
+        if self.merge_preview.is_none() {
+            return;
+        }
+        let mut open = true;
+        let mut do_merge = false;
+        let mut do_cancel = false;
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("merge_preview_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("Merge schedule events")
+                .with_inner_size([520.0, 380.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                let Some(d) = self.merge_preview.as_mut() else {
+                    return;
+                };
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label("Select which event is the primary. The primary's time, title and URL will be shown on the calendar; the others will be hidden as part of the group.");
+                    ui.add_space(8.0);
+
+                    egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                        for (i, s) in d.segments.iter().enumerate() {
+                            let (src_badge, src_label) = source_badge(&s.source);
+                            let is_primary = d.primary_idx == i;
+                            ui.horizontal(|ui| {
+                                ui.radio_value(&mut d.primary_idx, i, "");
+                                ui.vertical(|ui| {
+                                    ui.horizontal(|ui| {
+                                        if is_primary {
+                                            ui.strong("★ Primary");
+                                        } else {
+                                            ui.weak("Secondary");
+                                        }
+                                        ui.label(format!("· {src_badge} {src_label}"));
+                                    });
+                                    ui.label(format!(
+                                        "{} – {}",
+                                        fmt_datetime_short(s.start_time),
+                                        s.end_time
+                                            .map(|e| fmt_datetime_short(e))
+                                            .unwrap_or_else(|| "?".into()),
+                                    ));
+                                    if !s.title.is_empty() {
+                                        ui.label(format!("Title: {}", s.title));
+                                    }
+                                    if !s.category.is_empty() {
+                                        ui.weak(format!("Category: {}", s.category));
+                                    }
+                                });
+                            });
+                            ui.separator();
+                        }
+                    });
+
+                    if !d.error.is_empty() {
+                        ui.add_space(4.0);
+                        ui.colored_label(HL_ERROR_TEXT, &d.error);
+                    }
+
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("🔀 Merge").clicked() {
+                            do_merge = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
+                });
+            },
+        );
+
+        if do_merge {
+            if let Some(d) = self.merge_preview.take() {
+                let primary_id = d.segments[d.primary_idx].segment_id;
+                let secondary_ids: Vec<i64> = d
+                    .segments
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != d.primary_idx)
+                    .map(|(_, s)| s.segment_id)
+                    .collect();
+                match self.core.store.merge_segments_manual(primary_id, &secondary_ids) {
+                    Ok(()) => {
+                        self.schedule_selected.clear();
+                        self.spawn_reload_schedule();
+                        self.status = format!(
+                            "Merged {} events.",
+                            secondary_ids.len() + 1
+                        );
+                    }
+                    Err(e) => {
+                        // Re-open the dialog with the error shown.
+                        self.merge_preview = Some(MergePreviewDraft {
+                            segments: d.segments,
+                            primary_idx: d.primary_idx,
+                            error: format!("Error merging: {e:#}"),
+                        });
+                    }
+                }
+            }
+        } else if do_cancel || !open {
+            self.merge_preview = None;
+        }
+    }
+
+    /// Confirmation dialog for deleting multiple selected schedule events at once.
+    #[allow(deprecated)]
+    fn confirm_delete_segments_window(&mut self, ctx: &egui::Context) {
+        let Some(ids) = self.confirm_delete_segments.as_ref() else {
+            return;
+        };
+        let count = ids.len();
+        let mut open = true;
+        let mut do_delete = false;
+        let mut do_cancel = false;
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("del_segments_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("Delete schedule items")
+                .with_inner_size([400.0, 130.0])
+                .with_resizable(false),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label(format!(
+                        "Permanently delete {count} selected schedule item{}?",
+                        if count == 1 { "" } else { "s" }
+                    ));
+                    ui.label("They will be suppressed and won't reappear on refresh.");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(egui::RichText::new("🗑 Delete").color(HL_ERROR_TEXT))
+                            .clicked()
+                        {
+                            do_delete = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
+                });
+            },
+        );
+
+        if do_delete {
+            if let Some(ids) = self.confirm_delete_segments.take() {
+                let mut errors = 0usize;
+                for sid in &ids {
+                    match self.core.store.delete_schedule_segment(*sid) {
+                        Ok(_) => {
+                            self.schedule_hidden_segments.remove(sid);
+                        }
+                        Err(e) => {
+                            warn!("Error deleting schedule segment {sid}: {e:#}");
+                            errors += 1;
+                        }
+                    }
+                }
+                self.schedule_selected.clear();
+                self.spawn_reload_schedule();
+                if errors == 0 {
+                    self.status = format!(
+                        "Deleted {count} schedule item{}.",
+                        if count == 1 { "" } else { "s" }
+                    );
+                } else {
+                    self.status = format!(
+                        "Deleted {} of {count} items; {errors} error(s) — check logs.",
+                        count - errors
+                    );
+                }
+            }
+        } else if do_cancel || !open {
+            self.confirm_delete_segments = None;
         }
     }
 

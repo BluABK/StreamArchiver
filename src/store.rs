@@ -19,7 +19,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 33;
+const SCHEMA_VERSION: i64 = 34;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -619,7 +619,19 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 33)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 33);
+        if version < 34 {
+            // Schedule segment merge support: `merged_into` links a secondary
+            // segment to its primary (manual merge) so the secondary is hidden
+            // from the calendar in favour of the primary. `auto_merge_excluded`
+            // opts a segment out of automatic time-overlap merge grouping with
+            // same-channel events.
+            conn.execute_batch(
+                "ALTER TABLE schedule_segment ADD COLUMN merged_into       INTEGER;
+                 ALTER TABLE schedule_segment ADD COLUMN auto_merge_excluded INTEGER NOT NULL DEFAULT 0;",
+            )?;
+            conn.pragma_update(None, "user_version", 34)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 34);
         Ok(())
     }
 
@@ -1592,6 +1604,46 @@ impl Store {
         Ok(n)
     }
 
+    /// Manually merge secondary segments into a primary. Sets `merged_into = primary_id`
+    /// on each secondary. Does not modify the primary row itself.
+    pub fn merge_segments_manual(&self, primary_id: i64, secondary_ids: &[i64]) -> Result<()> {
+        let conn = self.db();
+        for &sid in secondary_ids {
+            conn.execute(
+                "UPDATE schedule_segment SET merged_into = ?1 WHERE id = ?2",
+                params![primary_id, sid],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Undo a manual merge: clears `merged_into` from all segments merged into
+    /// `primary_id`. Also clears `merged_into` on `primary_id` itself in case it
+    /// was itself a secondary of a higher-level merge.
+    pub fn unmerge_segment(&self, primary_id: i64) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE schedule_segment SET merged_into = NULL WHERE merged_into = ?1",
+            params![primary_id],
+        )?;
+        conn.execute(
+            "UPDATE schedule_segment SET merged_into = NULL WHERE id = ?1",
+            params![primary_id],
+        )?;
+        Ok(())
+    }
+
+    /// Opt a segment into (`excluded = false`) or out of (`excluded = true`) automatic
+    /// time-overlap merge grouping with same-channel events.
+    pub fn set_auto_merge_excluded(&self, segment_id: i64, excluded: bool) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE schedule_segment SET auto_merge_excluded = ?1 WHERE id = ?2",
+            params![excluded as i64, segment_id],
+        )?;
+        Ok(())
+    }
+
     /// Delete every schedule segment from one `source` across all monitors. Used to
     /// purge imported Discord events when that import is turned off.
     pub fn clear_schedule_source(&self, source: &str) -> Result<()> {
@@ -1733,7 +1785,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT s.id, s.monitor_id, m.channel_id, c.name, m.url,
                     s.start_time, s.end_time, s.title, s.category, s.source,
-                    c.color
+                    c.color, s.merged_into, s.auto_merge_excluded
              FROM schedule_segment s
              JOIN monitor m ON m.id = s.monitor_id
              JOIN channel c ON c.id = m.channel_id
@@ -1754,6 +1806,8 @@ impl Store {
                     category: r.get(8)?,
                     source: r.get(9)?,
                     channel_color: r.get(10)?,
+                    merged_into: r.get(11)?,
+                    auto_merge_excluded: r.get::<_, i64>(12)? != 0,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
