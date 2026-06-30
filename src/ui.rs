@@ -1139,13 +1139,16 @@ impl StreamArchiverApp {
         }
     }
 
-    /// (Re)load every upcoming scheduled stream for the Schedule calendar. Loaded
-    /// from the start of today (local) so today's full day shows even past streams.
+    /// (Re)load every upcoming scheduled stream for the Schedule calendar.
+    /// Loads 90 days of history plus all future events. The 90-day cutoff is
+    /// required for the idx_schedule_canceled_start index to reduce the scan;
+    /// passing 0 (epoch) would force a full table scan of all historical rows.
     fn reload_schedule(&mut self) {
         // The Properties "Upcoming streams" popup caches per-monitor segments
         // separately; drop it so an edit/delete here isn't shown stale there.
         self.schedule_cache.clear();
-        match self.core.store.all_upcoming_schedule(0) {
+        let after = crate::models::now_unix() - 90 * 86_400;
+        match self.core.store.all_upcoming_schedule(after) {
             Ok(mut v) => {
                 // Collapse cross-source duplicates that may have been stored before
                 // the per-timestamp eviction was in place. Two rows with the same
