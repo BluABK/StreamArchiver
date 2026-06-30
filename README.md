@@ -260,6 +260,20 @@ usable data) and are remuxed losslessly to **`.mkv`** on clean stop. MKV is the
 default; pick TS per channel if you prefer. **MP4 is never produced** (poor for
 interrupted writes).
 
+### Issues panel & re-remux
+
+The **⚠ Issues** button in the toolbar (turns amber with a count when issues exist) opens a panel listing recordings that need attention:
+
+- **Needs re-remux** — a recording whose capture finished as `.ts` but was never successfully remuxed to MKV (e.g. after a crash, a detached process, or an automatic remux failure at finalization). The **🔄 Re-remux** button triggers a background ffmpeg remux; the status cell shows a live progress bar with fps / speed / position once ffmpeg is running. The source `.ts` is deleted only on success.
+- **Empty capture** — the capture file is 0 bytes (nothing to recover); Re-remux is disabled.
+- **Remux failed** — a previous re-remux attempt failed; hover the status cell for the ffmpeg error. The button is locked to avoid re-triggering a known-bad file.
+
+The Issues panel refreshes every 5 s while open and every 30 s while closed, so the count on the button stays current. **⟳ Refresh** forces an immediate rescan.
+
+**In-tree badges.** The recording tree also surfaces the same issue as a **⚠ needs remux** badge at the take row, rolling up to the stream, instance, and channel rows, so you can see there is a problem without opening the panel.
+
+> The active re-remux job is a background tokio task and does not survive an app restart. The source `.ts` is always preserved, so after a restart the file reappears in the Issues panel and can be re-triggered.
+
 ### Audio & subtitle tracks
 
 To archive as much of a stream as possible, each instance has **Audio tracks** and
@@ -416,6 +430,25 @@ import** can pull those in:
 > never displayed or logged. A compliant bot can't read events in servers where
 > you're only a member (a bot must be invited by that server's admin), which is
 > why this path uses your own account.
+
+#### Schedule sources & OCR
+
+Many streamers publish their weekly schedule as an **image** — a Twitch offline banner, a YouTube community post, or a pinned tweet — rather than using platform schedule features. The **⚙ Configure schedule sources** button in the Schedule toolbar opens a dialog to choose which sources are enabled and in what priority order. Sources are tried top-to-bottom per channel; **the first to return a non-empty schedule wins** and later sources are skipped.
+
+| Source | Platform | Notes |
+|---|---|---|
+| **Twitch schedule** | Twitch | Helix `/schedule` API; needs Twitch credentials. Default: on. |
+| **YouTube Data API** | YouTube | `search.list` + `videos.list`; self-gates on a configured API key. Default: on when key is set. |
+| **YouTube scrape** | YouTube | `/streams` page scrape; no API key needed. Default: on. |
+| **Twitch banner OCR** | Twitch | OCR the already-downloaded offline banner via the `claude` CLI. |
+| **YouTube community post OCR** | YouTube | Fetches recent community posts and OCRs the latest attached schedule image. |
+| **Twitter/X pinned tweet OCR** | Any | OCRs the image on the channel's pinned tweet. Requires the handle set in Properties → Schedule. Best-effort — X actively limits unauthenticated access. |
+| **Other image (OCR)** | Any | OCR a user-supplied path or URL configured per-channel in Properties → Schedule. |
+| **Discord events** | Any | Discord scheduled events (existing opt-in import; see above). Lowest priority by default. |
+
+OCR and scraping sources run on the **slow (6 h) cadence** only, never the 60 s live-detection tick, and re-OCR is skipped when the source image is byte-identical to the last run.
+
+**OCR settings** (Settings → Schedule → OCR): the CLI command (default `claude`), primary model (default `haiku`), fallback model (default `sonnet`), default timezone name and UTC offset. Per-channel overrides for timezone, offset, Twitter/X handle, and the "other image" path live in **right-click → Properties → Schedule sources**.
 
 ### Chat logs
 
@@ -781,6 +814,7 @@ egui window (on demand) ◄── events ──┘
 
 ## Roadmap
 
-- YouTube Data API / Kick official API detectors (current scrape works without keys).
 - Installer + AppUserModelID (for branded Windows toast notifications).
 - macOS/Linux polish (tray via `ksni`, process-group kill).
+- Re-remux survival across app restarts (register ffmpeg in the detached-process registry so an in-progress `.ts` → MKV re-remux triggered from the Issues panel is not lost when the app is restarted; the `.ts` source is always preserved on failure or interruption, so the re-remux can be re-triggered from the Issues panel).
+- Kick chat logging.
