@@ -558,6 +558,7 @@ pub struct StreamArchiverApp {
     show_issues: bool,
     issues_recs: Vec<crate::models::Recording>,
     issues_missing: Vec<crate::models::Recording>,
+    issues_errors: Vec<crate::models::Recording>,
     /// In-flight background load of missing-output-file recordings (spawned off
     /// the UI thread because `path.exists()` can block on network/slow drives).
     issues_missing_load: Option<std::sync::mpsc::Receiver<Vec<crate::models::Recording>>>,
@@ -1084,6 +1085,7 @@ impl StreamArchiverApp {
             show_issues: false,
             issues_recs: Vec::new(),
             issues_missing: Vec::new(),
+            issues_errors: Vec::new(),
             issues_missing_load: None,
             issues_refreshed: None,
             issues_confirm_clear: false,
@@ -5128,7 +5130,7 @@ impl eframe::App for StreamArchiverApp {
                         }
                         {
                             let quota_warnings = self.active_quota_warnings();
-                            let n = self.issues_recs.len() + self.issues_missing.len() + quota_warnings.len();
+                            let n = self.issues_recs.len() + self.issues_missing.len() + self.issues_errors.len() + quota_warnings.len();
                             let label = if n > 0 {
                                 format!("⚠ Issues ({})", n)
                             } else {
@@ -13409,8 +13411,9 @@ impl StreamArchiverApp {
             .map(|t| t.elapsed() >= interval)
             .unwrap_or(true);
         if stale && self.issues_missing_load.is_none() {
-            // The remux-needed query is small and fast — run it synchronously.
+            // Both queries are small and fast — run them synchronously.
             self.issues_recs = self.core.store.recordings_needing_remux().unwrap_or_default();
+            self.issues_errors = self.core.store.recordings_with_errors().unwrap_or_default();
             // The missing-file check calls path.exists() up to 500 times, which
             // can block for seconds on network drives. Spawn it off the UI thread.
             let core = self.core.clone();
@@ -13458,17 +13461,21 @@ impl StreamArchiverApp {
             std::path::Path::new(&r.output_path).metadata().map(|m| m.len()).unwrap_or(0) == 0
         }).count();
         let n_missing = self.issues_missing.len();
+        let n_errors = self.issues_errors.len();
         let confirm_clear = self.issues_confirm_clear;
         let quota_warnings = self.active_quota_warnings();
-        let _total_issues = self.issues_recs.len() + n_missing + quota_warnings.len();
 
         let mut open = true;
         enum Act {
             Remux(usize),
+            RemuxError(usize),
             Delete(usize),
             ClearPath(usize),
+            DeleteError(usize),
+            ClearError(usize),
             ClearEmpties,
             ClearAllMissing,
+            ClearAllErrors,
             ConfirmClear,
             ClearAll,
             DismissWarning(String),
@@ -13520,7 +13527,7 @@ impl StreamArchiverApp {
                         ui.separator();
                     }
                     ui.horizontal(|ui| {
-                        ui.label(format!("{} recording(s) need attention", self.issues_recs.len() + n_missing));
+                        ui.label(format!("{} recording(s) need attention", self.issues_recs.len() + n_missing + n_errors));
                         if ui.button("⟳ Refresh").clicked() {
                             self.issues_refreshed = None;
                         }
@@ -13560,9 +13567,17 @@ impl StreamArchiverApp {
                                 act = Some(Act::ClearAllMissing);
                             }
                         }
+                        if n_errors > 0 {
+                            if ui.button(format!("✕ Clear {} failed", n_errors))
+                                .on_hover_text("Delete DB records for all failed/aborted/orphaned recordings. Files on disk (if any) are deleted too.")
+                                .clicked()
+                            {
+                                act = Some(Act::ClearAllErrors);
+                            }
+                        }
                     });
                     ui.separator();
-                    if self.issues_recs.is_empty() && n_missing == 0 {
+                    if self.issues_recs.is_empty() && n_missing == 0 && n_errors == 0 {
                         ui.weak("No recording issues found — all recordings are in their final format.");
                         return;
                     }
@@ -13778,6 +13793,111 @@ impl StreamArchiverApp {
                                     });
                                 });
                             }
+                            // ── Failed / aborted / orphaned rows ─────────────────────────
+                            for (k, rec) in self.issues_errors.iter().enumerate() {
+                                let (ch_name, platform) = mon_info
+                                    .get(&rec.monitor_id)
+                                    .map(|(n, p)| (n.as_str(), *p))
+                                    .unwrap_or(("?", crate::models::Platform::Generic));
+                                let has_file = !rec.output_path.is_empty()
+                                    && std::path::Path::new(&rec.output_path).exists();
+                                let has_ts = rec.output_path.ends_with(".ts");
+                                let path = std::path::Path::new(&rec.output_path);
+                                let fname = if rec.output_path.is_empty() {
+                                    "—".to_string()
+                                } else {
+                                    path.file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| rec.output_path.clone())
+                                };
+                                let file_size = if has_file {
+                                    path.metadata().map(|m| m.len()).unwrap_or(0)
+                                } else {
+                                    0
+                                };
+                                let exit_str = match rec.exit_code {
+                                    Some(c) => format!("exit {c}"),
+                                    None => String::new(),
+                                };
+                                // Build a hover text from whatever info we have.
+                                let hover = {
+                                    let mut parts = vec![format!("status: {}", rec.status)];
+                                    if !exit_str.is_empty() { parts.push(exit_str.clone()); }
+                                    if !rec.output_path.is_empty() { parts.push(format!("path: {}", rec.output_path)); }
+                                    if !rec.log_excerpt.is_empty() { parts.push(format!("\n{}", rec.log_excerpt.trim())); }
+                                    parts.join("\n")
+                                };
+                                body.row(22.0, |mut row| {
+                                    row.col(|ui| {
+                                        if let Some(ref ptex) = ptex {
+                                            platform_icon(ui, ptex, platform);
+                                        } else {
+                                            ui.label(platform.label());
+                                        }
+                                    });
+                                    row.col(|ui| { ui.label(ch_name); });
+                                    row.col(|ui| { ui.label(fmt_datetime_short(rec.started_at)); });
+                                    row.col(|ui| {
+                                        ui.label(&fname).on_hover_text(&rec.output_path);
+                                    });
+                                    row.col(|ui| {
+                                        if has_file && file_size > 0 {
+                                            ui.label(fmt_bytes(file_size as i64));
+                                        } else if has_file {
+                                            ui.colored_label(egui::Color32::from_rgb(180, 60, 60), "empty");
+                                        } else {
+                                            ui.weak("—");
+                                        }
+                                    });
+                                    row.col(|ui| {
+                                        let ext = if rec.output_path.is_empty() {
+                                            "—".to_string()
+                                        } else {
+                                            path.extension()
+                                                .map(|e| e.to_string_lossy().to_uppercase())
+                                                .unwrap_or_else(|| "?".to_string())
+                                        };
+                                        ui.label(ext);
+                                    });
+                                    row.col(|ui| {
+                                        let color = egui::Color32::from_rgb(200, 80, 80);
+                                        let label = if exit_str.is_empty() {
+                                            format!("✗ {}", rec.status)
+                                        } else {
+                                            format!("✗ {} ({})", rec.status, exit_str)
+                                        };
+                                        ui.colored_label(color, label)
+                                            .on_hover_text(&hover);
+                                    });
+                                    row.col(|ui| {
+                                        // Remux if there's a .ts file on disk.
+                                        if has_file && has_ts {
+                                            if ui.button("🔄")
+                                                .on_hover_text("Attempt to remux this partial .ts to MKV.")
+                                                .clicked()
+                                            {
+                                                act = Some(Act::RemuxError(k));
+                                            }
+                                        }
+                                        // Delete file + clear path.
+                                        if has_file {
+                                            if ui.button("🗑")
+                                                .on_hover_text("Delete the output file and clear it from the database.")
+                                                .clicked()
+                                            {
+                                                act = Some(Act::DeleteError(k));
+                                            }
+                                        }
+                                        // Remove DB record entirely.
+                                        if ui.button("✕ Clear")
+                                            .on_hover_text("Permanently remove this failed recording from the database.")
+                                            .clicked()
+                                        {
+                                            act = Some(Act::ClearError(k));
+                                        }
+                                    });
+                                });
+                            }
                         });
                 });
             },
@@ -13855,8 +13975,58 @@ impl StreamArchiverApp {
             }
             self.issues_confirm_clear = false;
         }
-        if let Some(Act::DismissWarning(key)) = act {
-            self.dismissed_quota_warnings.insert(key);
+        if let Some(Act::DismissWarning(ref key)) = act {
+            self.dismissed_quota_warnings.insert(key.clone());
+        }
+        if let Some(Act::RemuxError(k)) = act {
+            if let Some(rec) = self.issues_errors.get(k) {
+                let dest = std::path::Path::new(&rec.output_path)
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .and_then(|d| {
+                        std::path::Path::new(&rec.output_path)
+                            .file_stem()
+                            .map(|s| d.join(format!("{}.mkv", s.to_string_lossy())))
+                    });
+                if let Some(dest) = dest {
+                    self.core.manual(crate::events::ManualCommand::ReRemux {
+                        rec_id: rec.id,
+                        capture: std::path::PathBuf::from(&rec.output_path),
+                        final_: dest,
+                    });
+                    self.status = format!("Re-remux started for recording {}…", rec.id);
+                }
+            }
+        }
+        if let Some(Act::DeleteError(k)) = act {
+            if let Some(rec) = self.issues_errors.get(k).cloned() {
+                let path = std::path::Path::new(&rec.output_path);
+                if path.exists() {
+                    let _ = std::fs::remove_file(path);
+                }
+                let _ = self.core.store.clear_recording_capture(rec.id);
+                self.issues_errors.retain(|r| r.id != rec.id);
+            }
+        }
+        if let Some(Act::ClearError(k)) = act {
+            if let Some(rec) = self.issues_errors.get(k).cloned() {
+                let path = std::path::Path::new(&rec.output_path);
+                if path.exists() {
+                    let _ = std::fs::remove_file(path);
+                }
+                let _ = self.core.store.delete_recording(rec.id);
+                self.issues_errors.retain(|r| r.id != rec.id);
+            }
+        }
+        if let Some(Act::ClearAllErrors) = act {
+            let all: Vec<_> = self.issues_errors.drain(..).collect();
+            for rec in all {
+                let path = std::path::Path::new(&rec.output_path);
+                if path.exists() {
+                    let _ = std::fs::remove_file(path);
+                }
+                let _ = self.core.store.delete_recording(rec.id);
+            }
         }
     }
 

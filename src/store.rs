@@ -2133,6 +2133,53 @@ impl Store {
         Ok(())
     }
 
+    /// Failed, aborted, or orphaned recordings that are not already caught by
+    /// [`recordings_needing_remux`] (ts-in-cache). Returns newest-first, up to 200.
+    pub fn recordings_with_errors(&self) -> Result<Vec<crate::models::Recording>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id, monitor_id, started_at, ended_at, status,
+                    COALESCE(output_path, ''), went_live_at, went_live_approx,
+                    take_group, COALESCE(log_excerpt, ''), exit_code
+             FROM recording
+             WHERE status IN ('failed', 'aborted', 'orphaned')
+               AND NOT (output_path LIKE '%.ts' AND output_path LIKE '%.cache%')
+             ORDER BY started_at DESC
+             LIMIT 200",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(crate::models::Recording {
+                    id: r.get(0)?,
+                    monitor_id: r.get(1)?,
+                    started_at: r.get(2)?,
+                    ended_at: r.get(3)?,
+                    status: r.get(4)?,
+                    output_path: r.get(5)?,
+                    went_live_at: r.get(6)?,
+                    went_live_approx: r.get::<_, Option<i64>>(7)?.unwrap_or(0) != 0,
+                    take_group: r.get(8)?,
+                    log_excerpt: r.get(9)?,
+                    exit_code: r.get(10)?,
+                    bytes: 0,
+                    lost_secs: None,
+                    stream_id: None,
+                    ad_count: 0,
+                    ad_secs: 0,
+                    meta_change_count: 0,
+                    title: String::new(),
+                    category: String::new(),
+                    notes: String::new(),
+                    vod_id: None,
+                    vod_state: None,
+                    vod_muted_secs: None,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+
     /// All completed recordings whose `output_path` is an MKV (non-TS, non-empty).
     /// Used by batch maintenance jobs (embed thumbnails, re-organize, etc.).
     pub fn list_recordings_with_mkv(&self) -> rusqlite::Result<Vec<(i64, String)>> {
