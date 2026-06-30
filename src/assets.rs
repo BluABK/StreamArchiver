@@ -702,8 +702,29 @@ pub fn read_asset_changes(asset_dir: &Path) -> Vec<AssetChange> {
 /// missing even if this snapshot write fails.
 async fn record_manifest_change(asset_dir: &Path, provider: &str, new: &[EmoteManifestEntry]) {
     let emotes_dir = asset_dir.join("emotes");
-    let Ok(old_json) = std::fs::read_to_string(emotes_dir.join(format!("{provider}.json"))) else {
-        return;
+    let manifest_path = emotes_dir.join(format!("{provider}.json"));
+    // Retry on transient lock errors (e.g. Windows Defender scanning a newly written
+    // file on CI). Return immediately on NotFound — that's the expected first-fetch
+    // baseline case, not an error.
+    let old_json = {
+        let mut outcome = None;
+        for attempt in 0..4u32 {
+            if attempt > 0 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            }
+            match tokio::fs::read_to_string(&manifest_path).await {
+                Ok(s) => {
+                    outcome = Some(s);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+                Err(_) => {}
+            }
+        }
+        match outcome {
+            Some(s) => s,
+            None => return,
+        }
     };
     // Treat a corrupt/truncated prior manifest as "unknown" and bail, mirroring the
     // missing-file early return above. Defaulting to an empty Vec would diff every
