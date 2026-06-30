@@ -9274,7 +9274,9 @@ impl StreamArchiverApp {
                                             }
                                             _ => {}
                                         }
-                                        // In-progress job badges
+                                        // In-progress / needs-attention badges
+                                        let needs_remux = t.output_path.ends_with(".ts")
+                                            && t.output_path.contains(".cache");
                                         let remuxing = self.background_tasks.iter().any(|bt| {
                                             bt.kind == crate::events::BackgroundTaskKind::Remux
                                                 && bt.id == t.id as u64
@@ -9284,6 +9286,11 @@ impl StreamArchiverApp {
                                                 egui::Color32::from_rgb(80, 160, 220),
                                                 "⏳ Remuxing…",
                                             ).on_hover_text("Converting .ts capture to .mkv — check the Background tab for progress.");
+                                        } else if needs_remux {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(220, 140, 30),
+                                                "⚠ needs remux",
+                                            ).on_hover_text("Automatic remux failed — right-click → Re-remux to MKV.");
                                         }
                                     });
                                     tr.col(|_ui| {}); // next stream (n/a per take)
