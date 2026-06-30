@@ -2398,6 +2398,12 @@ async fn refresh_schedules_once(
         // before stopping. Track whether any source was authoritative (`Some`).
         let mut any_authoritative = false;
         let mut won: Option<(ScheduleSourceKind, Vec<ScheduleSegment>)> = None;
+        // True when the winning source read its segments from the DB (OCR cadence
+        // cache hit) rather than running fresh. In that case the DB already has the
+        // correct rows and we must NOT call replace_schedule_source — doing so
+        // would re-insert past segments that the DELETE (start_time >= now) skips,
+        // causing exponential row accumulation on every tick.
+        let mut won_is_db_cache = false;
         for &kind in &per_monitor {
             if !kind.applies_to(platform, &cfg) {
                 continue;
@@ -2465,6 +2471,7 @@ async fn refresh_schedules_once(
                 // and title-fill is on (then keep walking for donors).
                 None => {
                     let need_titles = eff_fill && has_blank_title(&segs);
+                    won_is_db_cache = ocr_due == Some(false);
                     won = Some((kind, segs));
                     if !need_titles {
                         break;
@@ -2489,7 +2496,11 @@ async fn refresh_schedules_once(
                 yt_pending.push((row.monitor.id, segs));
             }
             Some((kind, segs)) => {
-                if ctx
+                if won_is_db_cache {
+                    // Rows already in DB from the last real OCR run — writing them
+                    // back would duplicate past segments on every tick.
+                    let _ = ctx.store.clear_other_schedule_sources(row.monitor.id, kind.id());
+                } else if ctx
                     .store
                     .replace_schedule_source(row.monitor.id, kind.id(), &segs)
                     .is_ok()

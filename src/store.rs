@@ -19,7 +19,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 35;
+const SCHEMA_VERSION: i64 = 36;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -642,7 +642,27 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 35)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 35);
+        if version < 36 {
+            // Deduplicate schedule_segment rows that accumulated due to a bug where
+            // OCR-cadence cache hits re-inserted past rows on every 60-second tick
+            // (replace_schedule_source deletes only future rows, so past rows doubled
+            // each tick). Keep the earliest id per (monitor, source, start_time,
+            // canceled) tuple; window function avoids an expensive NOT-IN subquery.
+            conn.execute_batch(
+                "DELETE FROM schedule_segment WHERE id IN (
+                     SELECT id FROM (
+                         SELECT id,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY monitor_id, source, start_time, canceled
+                                    ORDER BY id
+                                ) AS rn
+                         FROM schedule_segment
+                     ) WHERE rn > 1
+                 );",
+            )?;
+            conn.pragma_update(None, "user_version", 36)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 36);
         Ok(())
     }
 
