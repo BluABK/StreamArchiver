@@ -4030,15 +4030,33 @@ pub async fn remux_ts_to_mkv(src: &Path, dst: &Path) -> anyhow::Result<()> {
         .arg(dst)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
-    let status = cmd.status().await?;
-    if status.success() {
+    let out = cmd.output().await?;
+    if out.status.success() {
         Ok(())
     } else {
-        anyhow::bail!("ffmpeg remux exited with {:?}", status.code())
+        let code = out.status.code().unwrap_or(-1);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // Grab the last few non-empty lines of stderr — ffmpeg prints the
+        // relevant error at the end (e.g. "Invalid data found when processing input").
+        let tail: String = stderr
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join(" | ");
+        if tail.is_empty() {
+            anyhow::bail!("ffmpeg remux failed (exit {})", code)
+        } else {
+            anyhow::bail!("ffmpeg remux failed (exit {}): {}", code, tail)
+        }
     }
 }
 
