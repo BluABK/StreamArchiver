@@ -12050,6 +12050,11 @@ impl StreamArchiverApp {
 
         // Clone the platform textures handle so the closure doesn't borrow self.
         let ptex = self.platform_tex.clone();
+        let now = crate::models::now_unix();
+        let has_active_remux = self
+            .background_tasks
+            .iter()
+            .any(|bt| bt.kind == crate::events::BackgroundTaskKind::Remux);
 
         let mut open = true;
         enum Act {
@@ -12065,6 +12070,9 @@ impl StreamArchiverApp {
             |ctx, _class| {
                 if ctx.input(|i| i.viewport().close_requested()) {
                     open = false;
+                }
+                if has_active_remux {
+                    ctx.request_repaint_after(Duration::from_secs(1));
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.horizontal(|ui| {
@@ -12112,10 +12120,11 @@ impl StreamArchiverApp {
                                     .unwrap_or_default();
                                 let file_bytes = path.metadata().map(|m| m.len()).unwrap_or(0);
                                 let empty = file_bytes == 0;
-                                let remuxing = self.background_tasks.iter().any(|bt| {
+                                let remux_task = self.background_tasks.iter().find(|bt| {
                                     bt.kind == crate::events::BackgroundTaskKind::Remux
                                         && bt.id == rec.id as u64
                                 });
+                                let remuxing = remux_task.is_some();
                                 // Check finished_tasks for a prior failed remux attempt.
                                 let remux_err = self.finished_tasks.iter().find_map(|(t, outcome, _)| {
                                     if t.kind == crate::events::BackgroundTaskKind::Remux
@@ -12147,10 +12156,11 @@ impl StreamArchiverApp {
                                             .on_hover_text(format!("{}{}", rec.output_path, size_hint));
                                     });
                                     row.col(|ui| {
-                                        if remuxing {
+                                        if let Some(bt) = remux_task {
+                                            let elapsed = (now - bt.started_at).max(0);
                                             ui.colored_label(
                                                 egui::Color32::from_rgb(80, 160, 220),
-                                                "⏳ remuxing…",
+                                                format!("⏳ remuxing… {}", fmt_duration(elapsed)),
                                             );
                                         } else if empty {
                                             ui.colored_label(
