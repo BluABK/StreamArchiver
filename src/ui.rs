@@ -615,7 +615,7 @@ pub struct StreamArchiverApp {
     /// Monitor id whose upcoming schedule is shown in a popup (None = closed).
     schedule_popup: Option<i64>,
     /// All upcoming scheduled streams (across every monitor), backing the Schedule
-    /// calendar. Loaded lazily on first view + on refresh; see [`Self::reload_schedule`].
+    /// calendar. Loaded lazily on first view + on refresh; see [`Self::spawn_reload_schedule`].
     schedule_all: Vec<UpcomingStream>,
     /// Whether [`Self::schedule_all`] has been loaded yet (lazy on first view).
     schedule_loaded: bool,
@@ -725,6 +725,10 @@ pub struct StreamArchiverApp {
     /// `pending_save` but no write — avoids blocking the UI thread on the store
     /// mutex while a schedule-refresh Tokio task holds it.
     pending_reload: Option<std::sync::mpsc::Receiver<Option<SaveRows>>>,
+    /// In-flight schedule calendar reload (background thread). `all_upcoming_schedule`
+    /// can hold the DB mutex for several seconds when historical rows accumulate;
+    /// running it off the UI thread prevents frame freezes and unblocks the delete action.
+    pending_schedule: Option<std::sync::mpsc::Receiver<Option<Vec<UpcomingStream>>>>,
     /// Open emote-viewer window (None = closed). Reuses the shared `emote_anim`
     /// decode cache, so its emotes animate against the same clock as chat replay.
     emote_viewer: Option<EmoteViewer>,
@@ -1113,6 +1117,7 @@ impl StreamArchiverApp {
             pending_browse: None,
             pending_save: None,
             pending_reload: None,
+            pending_schedule: None,
             emote_viewer: None,
             emote_viewer_stale: false,
             asset_history: None,
@@ -1209,61 +1214,95 @@ impl StreamArchiverApp {
         }
     }
 
-    /// (Re)load every upcoming scheduled stream for the Schedule calendar.
-    /// Loads 90 days of history plus all future events. The 90-day cutoff is
-    /// required for the idx_schedule_canceled_start index to reduce the scan;
-    /// passing 0 (epoch) would force a full table scan of all historical rows.
-    fn reload_schedule(&mut self) {
-        // The Properties "Upcoming streams" popup caches per-monitor segments
-        // separately; drop it so an edit/delete here isn't shown stale there.
+    /// Spawn a background thread to reload the Schedule calendar.  The result is
+    /// installed by [`Self::drain_pending_schedule`] in the next update cycle.
+    /// Loads 90 days of history plus all future events; the 90-day cutoff keeps
+    /// the idx_schedule_canceled_start scan bounded.  If a reload is already in
+    /// flight the new request is dropped — the in-flight one will land shortly.
+    fn spawn_reload_schedule(&mut self) {
+        // Always clear the per-monitor popup cache immediately so an edit/delete
+        // isn't shown stale in the Properties "Upcoming streams" list.
         self.schedule_cache.clear();
+        if self.pending_schedule.is_some() {
+            return;
+        }
         let after = crate::models::now_unix() - 90 * 86_400;
-        match self.core.store.all_upcoming_schedule(after) {
-            Ok(mut v) => {
-                // Collapse cross-source duplicates that may have been stored before
-                // the per-timestamp eviction was in place. Two rows with the same
-                // (monitor_id, start_time) but different sources are the same event;
-                // keep the higher-priority source's version (manual → platform
-                // sources → OCR/scrape sources → discord).
-                let source_priority = |s: &str| -> u8 {
-                    match s {
-                        "manual" => 0,
-                        "platform" => 1,
-                        "youtube_api" => 2,
-                        "youtube" => 3,
-                        "twitch_banner_ocr" | "youtube_community_ocr"
-                        | "twitter_pinned" | "other_image_ocr" => 4,
-                        "discord" => 5,
-                        _ => 6,
-                    }
-                };
-                v.sort_by(|a, b| {
-                    a.monitor_id.cmp(&b.monitor_id)
-                        .then(a.start_time.cmp(&b.start_time))
-                        .then(source_priority(&a.source).cmp(&source_priority(&b.source)))
-                });
-                v.dedup_by(|a, b| a.monitor_id == b.monitor_id && a.start_time == b.start_time);
-                // Restore display order: soonest first, then channel name.
-                v.sort_by(|a, b| {
-                    a.start_time.cmp(&b.start_time)
-                        .then(a.channel_name.to_lowercase().cmp(&b.channel_name.to_lowercase()))
-                });
+        let store = self.core.store.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("reload-schedule".into())
+            .spawn(move || {
+                let result = (|| -> Option<Vec<UpcomingStream>> {
+                    let mut v = store.all_upcoming_schedule(after).ok()?;
+                    // Collapse cross-source duplicates that may have been stored before
+                    // the per-timestamp eviction was in place. Two rows with the same
+                    // (monitor_id, start_time) but different sources are the same event;
+                    // keep the higher-priority source's version.
+                    let source_priority = |s: &str| -> u8 {
+                        match s {
+                            "manual" => 0,
+                            "platform" => 1,
+                            "youtube_api" => 2,
+                            "youtube" => 3,
+                            "twitch_banner_ocr" | "youtube_community_ocr"
+                            | "twitter_pinned" | "other_image_ocr" => 4,
+                            "discord" => 5,
+                            _ => 6,
+                        }
+                    };
+                    v.sort_by(|a, b| {
+                        a.monitor_id
+                            .cmp(&b.monitor_id)
+                            .then(a.start_time.cmp(&b.start_time))
+                            .then(source_priority(&a.source).cmp(&source_priority(&b.source)))
+                    });
+                    v.dedup_by(|a, b| {
+                        a.monitor_id == b.monitor_id && a.start_time == b.start_time
+                    });
+                    // Restore display order: soonest first, then channel name.
+                    v.sort_by(|a, b| {
+                        a.start_time
+                            .cmp(&b.start_time)
+                            .then(a.channel_name.to_lowercase().cmp(&b.channel_name.to_lowercase()))
+                    });
+                    Some(v)
+                })();
+                let _ = tx.send(result);
+            })
+            .ok();
+        self.pending_schedule = Some(rx);
+    }
+
+    /// Install schedule calendar results from an in-flight background reload.
+    /// Called every frame from the main update loop.
+    fn drain_pending_schedule(&mut self) {
+        let recv = match &self.pending_schedule {
+            Some(rx) => rx.try_recv(),
+            None => return,
+        };
+        match recv {
+            Ok(Some(v)) => {
                 self.schedule_all = v;
                 // Drop hide choices only for channels that no longer EXIST (deleted),
-                // not ones merely without an upcoming stream right now — otherwise a
-                // channel temporarily off the schedule would silently un-hide.
+                // not ones merely without an upcoming stream right now.
                 let live: HashSet<i64> = self.channels.iter().map(|c| c.id).collect();
                 if !live.is_empty() {
                     self.schedule_hidden.retain(|id| live.contains(id));
                 }
-                // Only latch on success, so a transient DB error retries on the next
-                // frame via the lazy-load guard instead of stranding the empty state.
+                // Only latch on success so a transient error retries via lazy-load.
                 self.schedule_loaded = true;
+                self.pending_schedule = None;
             }
-            Err(e) => {
-                warn!("failed to load schedule: {e:#}");
-                self.status = format!("Error loading schedule: {e}");
+            Ok(None) => {
+                warn!("reload-schedule thread produced no data");
+                self.status = "Error loading schedule.".into();
+                self.pending_schedule = None;
             }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                warn!("reload-schedule thread disconnected without sending");
+                self.pending_schedule = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
     }
 
@@ -1394,7 +1433,7 @@ impl StreamArchiverApp {
             // (which emit a state event) — but only once it has been loaded, so we
             // don't pull it in before the user ever opens the tab.
             if self.schedule_loaded {
-                self.reload_schedule();
+                self.spawn_reload_schedule();
             }
             // Any event that marks the UI dirty may affect recording statuses —
             // force a refresh of the issues panel on the next frame it is open.
@@ -1715,7 +1754,7 @@ impl StreamArchiverApp {
         // previously-imported Discord events so they don't linger on the calendar.
         if !discord_on {
             let _ = self.core.store.clear_schedule_source("discord");
-            self.reload_schedule();
+            self.spawn_reload_schedule();
         }
         // Apply the (possibly changed) date format + short-timestamp pattern to the live UI.
         set_active_date_fmt(self.settings.date_fmt);
@@ -4634,10 +4673,14 @@ impl eframe::App for StreamArchiverApp {
         self.drain_pending_browse();
         self.drain_pending_save();
         self.drain_pending_reload();
+        self.drain_pending_schedule();
 
         // Keep repainting at 50ms while a background DB load is in-flight so
         // the result is shown as soon as it arrives, not after the 1s heartbeat.
-        if self.pending_save.is_some() || self.pending_reload.is_some() {
+        if self.pending_save.is_some()
+            || self.pending_reload.is_some()
+            || self.pending_schedule.is_some()
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
 
@@ -4870,7 +4913,7 @@ impl eframe::App for StreamArchiverApp {
         }
         if ctx_refresh_schedule {
             self.core.request_schedule_refresh();
-            self.reload_schedule();
+            self.spawn_reload_schedule();
             self.status = "Fetching latest schedules…".into();
         }
         if ctx_open_proc_mgr {
@@ -4953,7 +4996,7 @@ impl StreamArchiverApp {
             if self.view == View::Schedule {
                 // Force a network re-fetch (not just a DB reload) + show current data.
                 self.core.request_schedule_refresh();
-                self.reload_schedule();
+                self.spawn_reload_schedule();
             }
             self.status = "Refreshing…".into();
         }
@@ -5139,7 +5182,7 @@ impl StreamArchiverApp {
                 self.status = format!("Error deleting schedule item: {e}");
             } else {
                 self.schedule_hidden_segments.remove(&sid);
-                self.reload_schedule();
+                self.spawn_reload_schedule();
                 self.status = "Schedule item deleted.".into();
             }
             self.confirm_delete_segment = None;
@@ -7261,7 +7304,13 @@ impl StreamArchiverApp {
 
         // Lazy load on first view + initialize the focused date to today.
         if !self.schedule_loaded {
-            self.reload_schedule();
+            if self.pending_schedule.is_none() {
+                self.spawn_reload_schedule();
+            }
+            ui.centered_and_justified(|ui| {
+                ui.label("Loading schedule…");
+            });
+            return;
         }
         let anchor = *self
             .schedule_anchor
@@ -7279,7 +7328,7 @@ impl StreamArchiverApp {
                 ui.add_space(8.0);
                 if ui.button("⟳  Fetch now").clicked() {
                     self.core.request_schedule_refresh();
-                    self.reload_schedule();
+                    self.spawn_reload_schedule();
                 }
             });
             return;
@@ -7601,7 +7650,7 @@ impl StreamArchiverApp {
             // emits an event when done, which reloads the calendar. Also reload now
             // so the current stored data shows immediately.
             self.core.request_schedule_refresh();
-            self.reload_schedule();
+            self.spawn_reload_schedule();
             self.status = "Fetching latest schedules…".into();
         }
         if open_sources {
@@ -7667,7 +7716,7 @@ impl StreamArchiverApp {
             .data_mut(|d| d.remove_temp::<i64>(egui::Id::new("sched_ch_refetch")))
         {
             self.core.request_schedule_refresh_for_channel(cid);
-            self.reload_schedule();
+            self.spawn_reload_schedule();
             self.status = "Fetching schedule…".into();
         }
         if let Some(v) = set_show_hidden {
@@ -8497,11 +8546,11 @@ impl StreamArchiverApp {
                 match self.core.store.delete_schedule_segment(d.segment_id) {
                     Err(e) => self.status = format!("Error deleting item: {e}"),
                     Ok(0) => {
-                        self.reload_schedule();
+                        self.spawn_reload_schedule();
                         self.status = "Schedule item was already gone.".into();
                     }
                     Ok(_) => {
-                        self.reload_schedule();
+                        self.spawn_reload_schedule();
                         self.status = "Schedule item deleted.".into();
                     }
                 }
@@ -8555,7 +8604,7 @@ impl StreamArchiverApp {
                         }
                         Ok(_) => {
                             self.edit_schedule = None;
-                            self.reload_schedule();
+                            self.spawn_reload_schedule();
                             self.status = "Schedule item updated (marked manual).".into();
                         }
                         Err(e) => {
