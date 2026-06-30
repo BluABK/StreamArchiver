@@ -1336,6 +1336,14 @@ impl StreamArchiverApp {
                         // icon or refreshed emote images — drop both caches so they
                         // reload from disk (emote files can change at a stable path).
                         if task.kind == crate::events::BackgroundTaskKind::AssetFetch {
+                            // Texture caches are cleared here (in logic(), before any
+                            // rendering) so new textures are allocated at the top of
+                            // channels_view() this frame — safe because no paint commands
+                            // have referenced them yet.
+                            debug!(
+                                task_label = task.label.as_str(),
+                                "AssetFetch complete — clearing icon/emote texture caches"
+                            );
                             self.channel_icons.clear();
                             self.channel_icons_small.clear();
                             self.channel_twitch_colors.clear();
@@ -9788,10 +9796,15 @@ impl StreamArchiverApp {
         }
         if let Some(mid) = acts.properties {
             self.properties_popup = Some(mid);
-            // Invalidate cached icon so it reloads (assets may have been fetched since last open).
+            // Invalidate the full-size icon cache so the Properties window reloads it
+            // (assets may have been fetched since last open). We do NOT invalidate
+            // channel_icons_small here: the small avatar in the streams table is still
+            // referenced in this frame's paint commands, and dropping it now would free
+            // the texture from the shared painter before the main viewport paints,
+            // causing "Failed to find texture" warnings. The small icon refreshes
+            // automatically on the next AssetFetch completion (cleared in logic()).
             if let Some(r) = self.rows.iter().find(|r| r.monitor.id == mid) {
                 self.channel_icons.remove(&r.channel.id);
-                self.channel_icons_small.remove(&r.channel.id);
                 self.channel_twitch_colors.remove(&r.channel.id);
             }
         }
@@ -9845,8 +9858,10 @@ impl StreamArchiverApp {
         }
         if let Some(cid) = open_channel_props {
             self.channel_properties_popup = Some(cid);
+            // Same reasoning as acts.properties above: only drop the full-size icon
+            // (used inside the child viewport) — not the small avatar (still painted
+            // by the main viewport this frame).
             self.channel_icons.remove(&cid);
-            self.channel_icons_small.remove(&cid);
             self.channel_twitch_colors.remove(&cid);
             self.channel_asset_thumbs.remove(&cid);
             self.channel_emote_counts.remove(&cid);
@@ -14054,7 +14069,12 @@ impl StreamArchiverApp {
                             {
                                 self.core.manual(ManualCommand::RefetchAssets(m.id));
                                 self.channel_icons.remove(&ch.id);
-                                self.channel_icons_small.remove(&ch.id);
+                                // channel_icons_small is NOT cleared here: this callback
+                                // runs inside a child viewport whose paint_and_update_textures
+                                // would free the texture from the shared painter before the
+                                // main viewport paints the streams table, causing "Failed to
+                                // find texture" warnings. The small icon reloads on the next
+                                // AssetFetch completion (logic() clears it before any rendering).
                                 self.channel_twitch_colors.remove(&ch.id);
                                 self.channel_asset_thumbs.remove(&ch.id);
                                 self.channel_emote_counts.remove(&ch.id);
@@ -14342,7 +14362,8 @@ impl StreamArchiverApp {
                         self.status = format!("Error: {e}");
                     } else {
                         self.channel_icons.remove(&ch.id);
-                        self.channel_icons_small.remove(&ch.id);
+                        // channel_icons_small intentionally omitted — same viewport-race
+                        // reason as the Refetch button above. Refreshes on next AssetFetch.
                         self.reload_rows();
                     }
                 }
