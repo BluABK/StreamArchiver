@@ -1260,9 +1260,10 @@ impl StreamArchiverApp {
                     self.background_tasks.push(task);
                     dirty = true;
                 }
-                Ok(crate::events::AppEvent::BackgroundTaskProgress { id, progress }) => {
+                Ok(crate::events::AppEvent::BackgroundTaskProgress { id, progress, info }) => {
                     if let Some(task) = self.background_tasks.iter_mut().find(|t| t.id == id) {
-                        task.progress = Some(progress);
+                        task.progress = progress;
+                        task.progress_info = Some(info);
                     }
                     dirty = true;
                 }
@@ -10274,7 +10275,16 @@ impl StreamArchiverApp {
                                 body.row(20.0, |mut row| {
                                     row.col(|ui| { ui.label(&task.label); });
                                     row.col(|ui| { ui.label(task.kind.label()); });
-                                    row.col(|ui| { ui.label(&task.detail); });
+                                    row.col(|ui| {
+                                        // Show live ffmpeg stats when available; fall back to static detail.
+                                        let text = task.progress_info.as_deref().unwrap_or(&task.detail);
+                                        if let Some(p) = task.progress {
+                                            ui.add(egui::ProgressBar::new(p).show_percentage().desired_width(90.0));
+                                            ui.label(text);
+                                        } else {
+                                            ui.label(text);
+                                        }
+                                    });
                                     row.col(|ui| {
                                         ui.label(format!(
                                             "⏳ {}",
@@ -12164,13 +12174,22 @@ impl StreamArchiverApp {
                                     row.col(|ui| {
                                         if let Some(bt) = remux_task {
                                             let elapsed = (now - bt.started_at).max(0);
+                                            let hover = bt.progress_info.as_deref()
+                                                .map(|i| format!("{}\nElapsed: {}", i, fmt_duration(elapsed)))
+                                                .unwrap_or_else(|| fmt_duration(elapsed));
                                             if let Some(p) = bt.progress {
                                                 ui.add(
                                                     egui::ProgressBar::new(p)
                                                         .show_percentage()
                                                         .desired_width(110.0),
                                                 )
-                                                .on_hover_text(fmt_duration(elapsed));
+                                                .on_hover_text(hover);
+                                            } else if let Some(ref info) = bt.progress_info {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(80, 160, 220),
+                                                    info,
+                                                )
+                                                .on_hover_text(format!("Elapsed: {}", fmt_duration(elapsed)));
                                             } else {
                                                 ui.colored_label(
                                                     egui::Color32::from_rgb(80, 160, 220),

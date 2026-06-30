@@ -1128,6 +1128,7 @@ impl Supervisor {
                                 detail: format!("→ {dst_name}"),
                                 started_at: now_unix(),
                                 progress: None,
+                progress_info: None,
                             },
                         ));
                         let tx2 = tx.clone();
@@ -1199,6 +1200,7 @@ impl Supervisor {
             detail: format!("{} · icon, banner, badges, emotes", platform.label()),
             started_at: now_unix(),
             progress: None,
+            progress_info: None,
         }));
 
         tokio::spawn(async move {
@@ -2064,6 +2066,7 @@ impl Supervisor {
                         detail: "stream thumbnail".into(),
                         started_at: crate::models::now_unix(),
                         progress: None,
+                progress_info: None,
                     },
                 ));
                 let tx = self.events.clone();
@@ -4068,22 +4071,52 @@ pub async fn remux_ts_to_mkv(
         lines
     });
 
-    // Read stdout for progress events.  `out_time_ms` is microseconds (despite
-    // the name) and appears once per progress block, right before `progress=continue`.
+    // Read stdout for progress events.  ffmpeg's -progress writes one key=value
+    // per line; a block ends with `progress=continue` (or `progress=end`).
+    // `out_time_ms` is microseconds despite the name (historical ffmpeg quirk).
     {
         let mut reader = BufReader::new(stdout).lines();
+        // Per-block accumulators.
+        let mut blk_frame = String::new();
+        let mut blk_fps   = String::new();
+        let mut blk_speed = String::new();
+        let mut blk_pos   = String::new(); // out_time  HH:MM:SS.μs
+        let mut blk_us: Option<i64> = None; // out_time_ms in microseconds
+
         while let Ok(Some(line)) = reader.next_line().await {
-            if let Some((ref tx, task_id)) = progress_tx {
-                if let Some(val) = line.strip_prefix("out_time_ms=") {
-                    if let (Ok(us), Some(total)) = (val.trim().parse::<i64>(), total_us) {
-                        if total > 0 {
-                            let p = (us as f64 / total as f64).clamp(0.0, 1.0) as f32;
+            if let Some((k, v)) = line.split_once('=') {
+                let (k, v) = (k.trim(), v.trim());
+                match k {
+                    "frame"       => blk_frame = v.to_string(),
+                    "fps"         => blk_fps   = v.to_string(),
+                    "speed"       => blk_speed = v.to_string(),
+                    "out_time"    => blk_pos   = v.to_string(),
+                    "out_time_ms" => blk_us    = v.parse::<i64>().ok(),
+                    "progress"    => {
+                        // End of block — fire one event.
+                        if let Some((ref tx, task_id)) = progress_tx {
+                            let progress = blk_us.and_then(|us| {
+                                total_us.filter(|&t| t > 0).map(|t| {
+                                    (us as f64 / t as f64).clamp(0.0, 1.0) as f32
+                                })
+                            });
+                            // Trim subsecond noise from out_time (keep HH:MM:SS).
+                            let pos_short = blk_pos.split('.').next().unwrap_or(&blk_pos);
+                            let info = format!(
+                                "frame={} fps={} speed={} pos={}",
+                                blk_frame, blk_fps, blk_speed, pos_short,
+                            );
                             let _ = tx.send(AppEvent::BackgroundTaskProgress {
                                 id: task_id,
-                                progress: p,
+                                progress,
+                                info,
                             });
                         }
+                        // Reset for next block.
+                        blk_frame.clear(); blk_fps.clear();
+                        blk_speed.clear(); blk_pos.clear(); blk_us = None;
                     }
+                    _ => {}
                 }
             }
         }

@@ -58,7 +58,10 @@ pub struct BackgroundTask {
     /// Unix timestamp when the task was started.
     pub started_at: i64,
     /// Fractional progress 0.0–1.0, if the task reports it (e.g. remux via ffmpeg).
+    /// `None` when duration is unknown (progress block still fires with `info`).
     pub progress: Option<f32>,
+    /// Latest per-step detail from the task (e.g. "fps=60 speed=2.5x pos=00:03:27").
+    pub progress_info: Option<String>,
 }
 
 // ---------- Periodic background jobs ("scheduled") ----------
@@ -154,10 +157,14 @@ pub enum AppEvent {
         id: u64,
         outcome: TaskOutcome,
     },
-    /// A background task reported incremental progress (0.0–1.0).
+    /// A background task reported incremental progress.
+    /// `progress` is `None` when total duration is unknown; `info` is always present.
     BackgroundTaskProgress {
         id: u64,
-        progress: f32,
+        /// Fractional 0.0–1.0, or `None` if duration is unknown.
+        progress: Option<f32>,
+        /// Human-readable step detail, e.g. "fps=60 speed=2.5x pos=00:03:27".
+        info: String,
     },
 }
 

@@ -1003,6 +1003,7 @@ impl DetectContext {
                 detail,
                 started_at: now_unix(),
                 progress: None,
+                progress_info: None,
             },
         ));
 
