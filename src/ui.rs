@@ -727,6 +727,11 @@ pub struct StreamArchiverApp {
     /// `pending_save` but no write — avoids blocking the UI thread on the store
     /// mutex while a schedule-refresh Tokio task holds it.
     pending_reload: Option<std::sync::mpsc::Receiver<Option<SaveRows>>>,
+    /// Cached YouTube Data API quota for today and the configured daily cutoff.
+    /// Updated by the background reload-rows thread; never read from DB on the
+    /// render thread (which would block if the DB mutex is held elsewhere).
+    yt_quota_today: i64,
+    yt_quota_cutoff: i64,
     /// In-flight schedule calendar reload (background thread). `all_upcoming_schedule`
     /// can hold the DB mutex for several seconds when historical rows accumulate;
     /// running it off the UI thread prevents frame freezes and unblocks the delete action.
@@ -1120,6 +1125,8 @@ impl StreamArchiverApp {
             pending_browse: None,
             pending_save: None,
             pending_reload: None,
+            yt_quota_today: 0,
+            yt_quota_cutoff: 9000,
             pending_schedule: None,
             emote_viewer: None,
             emote_viewer_stale: false,
@@ -1154,6 +1161,15 @@ impl StreamArchiverApp {
         };
         app.reload_rows();
         app.reload_videos();
+        app.yt_quota_today = app.core.store.get_quota_today("youtube").unwrap_or(0);
+        app.yt_quota_cutoff = app
+            .core
+            .store
+            .get_setting(K_YT_API_QUOTA_CUTOFF)
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(9000);
         app
     }
 
@@ -1526,7 +1542,14 @@ impl StreamArchiverApp {
                     let next_streams =
                         store.next_scheduled_streams(now_unix()).map_err(|e| e.to_string())?;
                     let channels = store.list_channels().map_err(|e| e.to_string())?;
-                    Ok(SaveRows { rows, channels, next_streams })
+                    let yt_quota_today = store.get_quota_today("youtube").unwrap_or(0);
+                    let yt_quota_cutoff = store
+                        .get_setting(K_YT_API_QUOTA_CUTOFF)
+                        .ok()
+                        .flatten()
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(9000);
+                    Ok(SaveRows { rows, channels, next_streams, yt_quota_today, yt_quota_cutoff })
                 })();
                 debug!(elapsed_ms = t.elapsed().as_millis(), ok = result.is_ok(), "save-monitor done");
                 let _ = tx.send(result);
@@ -1604,7 +1627,14 @@ impl StreamArchiverApp {
                     let rows = store.list_monitors_with_channels().ok()?;
                     let next_streams = store.next_scheduled_streams(crate::models::now_unix()).ok()?;
                     let channels = store.list_channels().ok()?;
-                    Some(SaveRows { rows, channels, next_streams })
+                    let yt_quota_today = store.get_quota_today("youtube").unwrap_or(0);
+                    let yt_quota_cutoff = store
+                        .get_setting(K_YT_API_QUOTA_CUTOFF)
+                        .ok()
+                        .flatten()
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(9000);
+                    Some(SaveRows { rows, channels, next_streams, yt_quota_today, yt_quota_cutoff })
                 })();
                 debug!(
                     elapsed_ms = t.elapsed().as_millis(),
@@ -1659,6 +1689,8 @@ impl StreamArchiverApp {
             }
         }
         self.channels = save.channels;
+        self.yt_quota_today = save.yt_quota_today;
+        self.yt_quota_cutoff = save.yt_quota_cutoff;
         // Scroll to the newly-added channel on the next render so it's visible
         // regardless of where it lands in the alphabetically-sorted list.
         if let Some(new_ch) = self.channels.iter().find(|c| !old_channel_ids.contains(&c.id)) {
@@ -4521,6 +4553,8 @@ struct SaveRows {
     rows: Vec<MonitorWithChannel>,
     channels: Vec<Channel>,
     next_streams: Vec<(i64, i64, String)>,
+    yt_quota_today: i64,
+    yt_quota_cutoff: i64,
 }
 
 /// In-flight form-save spawned on a background thread. The thread holds the store
@@ -11996,15 +12030,8 @@ impl StreamArchiverApp {
             ui.heading("YouTube Data API");
             ui.separator();
             {
-                let quota_today = self.core.store.get_quota_today("youtube").unwrap_or(0);
-                let cutoff: i64 = self
-                    .core
-                    .store
-                    .get_setting(K_YT_API_QUOTA_CUTOFF)
-                    .ok()
-                    .flatten()
-                    .and_then(|s| s.trim().parse().ok())
-                    .unwrap_or(9000);
+                let quota_today = self.yt_quota_today;
+                let cutoff = self.yt_quota_cutoff;
                 egui::Grid::new("quota_grid")
                     .num_columns(4)
                     .spacing([32.0, 6.0])
