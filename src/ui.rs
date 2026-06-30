@@ -12867,6 +12867,7 @@ impl StreamArchiverApp {
             return;
         };
         // Watchdog: name this phase so a freeze dialog points at the chat popup.
+        self.heartbeat.set_context(format!("Chat: {}", popup.monitor_name));
         self.heartbeat.set_activity(crate::watchdog::Activity::Chat);
         let mut open = true;
         let title = format!("💬  Chat — {}", popup.monitor_name);
@@ -13434,6 +13435,7 @@ impl StreamArchiverApp {
 
         // Still loading: draw the placeholder. Same viewport id as the real window so it
         // morphs in place when the bundle lands.
+        self.heartbeat.set_context(format!("Properties: {}", ch.name));
         self.heartbeat.set_activity(crate::watchdog::Activity::Properties);
         let mut open = true;
         ctx.show_viewport_immediate(
@@ -13504,6 +13506,7 @@ impl StreamArchiverApp {
         // the UI thread for seconds. Stamp it distinctly from the window paint so a freeze
         // dialog says whether we stalled *loading assets* or *inside the window*. Reset to
         // `Properties` right before the sub-window is created (below).
+        self.heartbeat.set_context(format!("Properties: {}", ch.name));
         self.heartbeat.set_activity(crate::watchdog::Activity::PropertiesLoad);
         // First monitor of this channel — used for asset refetch.
         let first_mon = self.rows.iter().find(|r| r.channel.id == cid).map(|r| r.monitor.clone());
@@ -13583,6 +13586,7 @@ impl StreamArchiverApp {
         // build + paint. Stamp that distinctly so a freeze here is attributed to the
         // window itself rather than to asset loading.
         self.heartbeat.set_activity(crate::watchdog::Activity::Properties);
+        // context already set during PropertiesLoad above; refresh in case we skipped load
 
         let mut open = true;
         ctx.show_viewport_immediate(

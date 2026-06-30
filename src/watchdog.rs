@@ -14,7 +14,7 @@
 //!    threshold while the app is meant to be rendering, it shows a native dialog
 //!    **off the UI thread**. Debounced so it fires once per hang.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -66,17 +66,26 @@ struct Inner {
     last_beat_ms: AtomicU64,
     activity: AtomicU8,
     active: AtomicBool,
+    /// Free-form context label set by the UI thread alongside the activity
+    /// (e.g. "Channel: MoriCalliope"). Shown in freeze reports.
+    context: Mutex<String>,
+    /// Thread ID of the UI thread captured at heartbeat creation. Used by the
+    /// watchdog to suspend and read the UI thread's stack on freeze.
+    ui_tid: u32,
     start: Instant,
 }
 
 impl Heartbeat {
     pub fn new() -> Heartbeat {
         let start = Instant::now();
+        let ui_tid = current_thread_id();
         let hb = Heartbeat {
             inner: Arc::new(Inner {
                 last_beat_ms: AtomicU64::new(0),
                 activity: AtomicU8::new(Activity::Idle as u8),
                 active: AtomicBool::new(true),
+                context: Mutex::new(String::new()),
+                ui_tid,
                 start,
             }),
         };
@@ -93,6 +102,22 @@ impl Heartbeat {
     #[inline]
     pub fn set_activity(&self, a: Activity) {
         self.inner.activity.store(a as u8, Ordering::Relaxed);
+    }
+
+    /// Set a human-readable context label alongside the activity (e.g. which
+    /// channel window is open). Shown in freeze reports to identify the instance.
+    pub fn set_context(&self, ctx: impl Into<String>) {
+        if let Ok(mut g) = self.inner.context.lock() {
+            *g = ctx.into();
+        }
+    }
+
+    /// Clear the context label (call when leaving a context-tagged section).
+    #[allow(dead_code)]
+    pub fn clear_context(&self) {
+        if let Ok(mut g) = self.inner.context.lock() {
+            g.clear();
+        }
     }
 
     #[inline]
@@ -113,12 +138,27 @@ impl Heartbeat {
     fn activity(&self) -> Activity {
         Activity::from_u8(self.inner.activity.load(Ordering::Relaxed))
     }
+
+    fn context(&self) -> String {
+        self.inner.context.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    fn ui_tid(&self) -> u32 {
+        self.inner.ui_tid
+    }
 }
 
 impl Default for Heartbeat {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn current_thread_id() -> u32 {
+    #[cfg(target_os = "windows")]
+    unsafe { windows::Win32::System::Threading::GetCurrentThreadId() }
+    #[cfg(not(target_os = "windows"))]
+    { 0u32 }
 }
 
 /// Spawn the watchdog thread (call ONCE at startup).
@@ -138,16 +178,22 @@ pub fn start_watchdog(hb: Heartbeat, threshold: Duration, exit_after_dialog: boo
                     if cooled {
                         let secs = age.as_secs();
                         let doing = hb.activity().label();
+                        let ctx = hb.context();
                         let summary = format!(
                             "StreamArchiver's UI thread has stopped responding.\n\n\
                              Last UI heartbeat:   {secs}s ago\n\
-                             Last known activity: {doing}\n\n\
+                             Last known activity: {doing}{}\n\n\
                              Choose \"Keep waiting\" to give it more time, or \
                              \"Force quit\" to close the app now.\n\n\
                              Background recordings are NOT affected — they run \
                              in separate processes.",
+                            if ctx.is_empty() {
+                                String::new()
+                            } else {
+                                format!("\n  Context:             {ctx}")
+                            },
                         );
-                        let detail = build_hang_detail(secs, doing);
+                        let detail = build_hang_detail(&hb, secs, doing);
                         let log_dir = crate::app_paths::logs_dir()
                             .to_string_lossy()
                             .into_owned();
@@ -233,7 +279,7 @@ fn build_panic_detail(msg: &str, thread: &str, location: &str) -> String {
     let version = env!("CARGO_PKG_VERSION");
     let os = os_info_string();
     let log_dir = crate::app_paths::logs_dir().to_string_lossy().into_owned();
-    let threads = enumerate_threads_text(pid);
+    let (thread_count, named_threads) = enumerate_threads_text(pid);
 
     format!(
         "=== Panic ===\n\
@@ -245,37 +291,48 @@ fn build_panic_detail(msg: &str, thread: &str, location: &str) -> String {
          App version: {version}\n\
          OS:          {os}\n\
          Log dir:     {log_dir}\n\n\
-         === Live threads ===\n\
-         {threads}\n\n\
+         === Live threads ({thread_count} total; named) ===\n\
+         {named_threads}\n\n\
          === Stack trace{backtrace_note} ===\n\
          {backtrace_str}"
     )
 }
 
-fn build_hang_detail(frozen_secs: u64, activity: &str) -> String {
+fn build_hang_detail(hb: &Heartbeat, frozen_secs: u64, activity: &str) -> String {
     let pid = std::process::id();
+    let ui_tid = hb.ui_tid();
+    let ctx = hb.context();
     let version = env!("CARGO_PKG_VERSION");
     let os = os_info_string();
     let log_dir = crate::app_paths::logs_dir().to_string_lossy().into_owned();
-    let threads = enumerate_threads_text(pid);
+    let (thread_count, named_threads) = enumerate_threads_text(pid);
+    let stack = capture_ui_thread_stack(ui_tid);
+
+    let context_line = if ctx.is_empty() {
+        String::new()
+    } else {
+        format!("Context:       {ctx}\n")
+    };
 
     format!(
         "=== Freeze Diagnostics ===\n\
          Frozen for:    {frozen_secs}s\n\
          Last activity: {activity}\n\
-         PID:           {pid}\n\n\
+         {context_line}\
+         PID:           {pid}\n\
+         UI thread TID: {ui_tid}\n\n\
          === Environment ===\n\
          App version: {version}\n\
          OS:          {os}\n\
          Log dir:     {log_dir}\n\n\
-         === Live threads ===\n\
-         {threads}"
+         === Live threads ({thread_count} total; named) ===\n\
+         {named_threads}\n\n\
+         === UI thread stack (TID {ui_tid}) ===\n\
+         {stack}"
     )
 }
 
 fn os_info_string() -> String {
-    // Use PowerShell to get a human-readable OS string without wrestling with
-    // Win32 registry types; runs fast enough that it's imperceptible in a crash.
     let out = std::process::Command::new("powershell")
         .args([
             "-NoProfile",
@@ -295,7 +352,10 @@ fn os_info_string() -> String {
     format!("Windows ({})", std::env::consts::ARCH)
 }
 
-fn enumerate_threads_text(pid: u32) -> String {
+/// Enumerate threads in this process. Returns (total_count, named_threads_text).
+/// Uses GetThreadDescription (Win 10 1607+) to show only threads with names,
+/// which is far more useful than a wall of TID+priority numbers.
+fn enumerate_threads_text(pid: u32) -> (usize, String) {
     #[cfg(target_os = "windows")]
     {
         use windows::Win32::Foundation::CloseHandle;
@@ -303,23 +363,52 @@ fn enumerate_threads_text(pid: u32) -> String {
             CreateToolhelp32Snapshot, Thread32First, Thread32Next,
             THREADENTRY32, TH32CS_SNAPTHREAD,
         };
+        use windows::Win32::System::Threading::{
+            GetThreadDescription, OpenThread, THREAD_QUERY_INFORMATION,
+        };
 
         unsafe {
             let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) else {
-                return "(could not snapshot threads)".to_owned();
+                return (0, "(could not snapshot threads)".to_owned());
             };
             let mut te = THREADENTRY32 {
                 dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
                 ..Default::default()
             };
-            let mut lines: Vec<String> = Vec::new();
+            let mut total = 0usize;
+            let mut named: Vec<String> = Vec::new();
+
             if Thread32First(snap, &mut te).is_ok() {
                 loop {
                     if te.th32OwnerProcessID == pid {
-                        lines.push(format!(
-                            "  TID {:6}  base-priority {}",
-                            te.th32ThreadID, te.tpBasePri
-                        ));
+                        total += 1;
+                        // Try to get the thread's name via Win10 1607+ API.
+                        if let Ok(thandle) = OpenThread(
+                            THREAD_QUERY_INFORMATION,
+                            false,
+                            te.th32ThreadID,
+                        ) {
+                            // GetThreadDescription returns Result<PWSTR> in windows 0.62.
+                            if let Ok(desc) = GetThreadDescription(thandle) {
+                                if !desc.is_null() {
+                                    let ptr = desc.0;
+                                    let len = (0..)
+                                        .take_while(|&i| *ptr.add(i) != 0)
+                                        .count();
+                                    if len > 0 {
+                                        let slice = std::slice::from_raw_parts(ptr, len);
+                                        let name = String::from_utf16_lossy(slice);
+                                        named.push(format!(
+                                            "  TID {:6}  {}",
+                                            te.th32ThreadID, name
+                                        ));
+                                    }
+                                    // Intentionally not freeing desc — acceptable in
+                                    // a crash/freeze handler that runs at most once.
+                                }
+                            }
+                            let _ = CloseHandle(thandle);
+                        }
                     }
                     te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
                     if Thread32Next(snap, &mut te).is_err() {
@@ -328,8 +417,143 @@ fn enumerate_threads_text(pid: u32) -> String {
                 }
             }
             let _ = CloseHandle(snap);
+
+            let text = if named.is_empty() {
+                "(no named threads — set thread names via Builder::name())".to_owned()
+            } else {
+                named.join("\n")
+            };
+            (total, text)
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = pid;
+        (0, "(not available on this platform)".to_owned())
+    }
+}
+
+/// Capture the UI thread's call stack by suspending it, reading its CONTEXT,
+/// then walking frames with StackWalk64 and resolving symbols with SymFromAddr.
+/// Returns a formatted multi-line string. Fails gracefully on any error.
+fn capture_ui_thread_stack(tid: u32) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        use std::sync::atomic::AtomicBool;
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Diagnostics::Debug::{
+            GetThreadContext, StackWalk64, SymFromAddr, SymFunctionTableAccess64,
+            SymGetModuleBase64, SymInitialize, SymSetOptions, ADDRESS_MODE,
+            CONTEXT, CONTEXT_FLAGS, STACKFRAME64, SYMBOL_INFO,
+            SYMOPT_DEFERRED_LOADS, SYMOPT_UNDNAME,
+        };
+        use windows::Win32::System::Threading::{
+            GetCurrentProcess, OpenThread, ResumeThread, SuspendThread,
+            THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
+        };
+
+        // AMD64 CONTEXT flags (raw values; avoids chasing crate constant names).
+        const CTX_AMD64: u32 = 0x0010_0000;
+        const CTX_FLAGS: u32 = CTX_AMD64 | 0x3; // CONTEXT_CONTROL | CONTEXT_INTEGER
+        const MACHINE_AMD64: u32 = 0x8664;
+
+        static SYM_INIT: AtomicBool = AtomicBool::new(false);
+
+        unsafe {
+            let Ok(thread) = OpenThread(
+                THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION,
+                false,
+                tid,
+            ) else {
+                return format!("(could not open UI thread {tid})");
+            };
+
+            SuspendThread(thread);
+
+            let mut ctx = std::mem::MaybeUninit::<CONTEXT>::zeroed().assume_init();
+            ctx.ContextFlags = CONTEXT_FLAGS(CTX_FLAGS);
+            let got_ctx = GetThreadContext(thread, &mut ctx).is_ok();
+
+            if !got_ctx {
+                ResumeThread(thread);
+                let _ = CloseHandle(thread);
+                return "(GetThreadContext failed)".to_string();
+            }
+
+            let proc = GetCurrentProcess();
+
+            // SymInitialize is idempotent but call it once to avoid races.
+            if !SYM_INIT.swap(true, Ordering::SeqCst) {
+                SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+                let _ = SymInitialize(proc, None, true);
+            }
+
+            let mut frame = std::mem::MaybeUninit::<STACKFRAME64>::zeroed().assume_init();
+            frame.AddrPC.Offset = ctx.Rip;
+            frame.AddrPC.Mode = ADDRESS_MODE(3); // AddrModeFlat
+            frame.AddrFrame.Offset = ctx.Rbp;
+            frame.AddrFrame.Mode = ADDRESS_MODE(3);
+            frame.AddrStack.Offset = ctx.Rsp;
+            frame.AddrStack.Mode = ADDRESS_MODE(3);
+
+            let mut ctx_walk = ctx;
+            let mut lines: Vec<String> = Vec::new();
+
+            for i in 0..48 {
+                // The windows crate declares these helpers as `unsafe fn` (cdecl)
+            // but StackWalk64 wants `extern "system"` fn pointers. Transmute the
+            // calling convention — on x64 Windows they are identical in practice.
+            use windows::Win32::Foundation::HANDLE;
+            type FtaFn = unsafe extern "system" fn(HANDLE, u64) -> *mut std::ffi::c_void;
+            type MbFn  = unsafe extern "system" fn(HANDLE, u64) -> u64;
+            let fta: FtaFn = std::mem::transmute(SymFunctionTableAccess64 as *const ());
+            let mb:  MbFn  = std::mem::transmute(SymGetModuleBase64 as *const ());
+
+            let ok = StackWalk64(
+                    MACHINE_AMD64,
+                    proc,
+                    thread,
+                    &mut frame,
+                    &mut ctx_walk as *mut CONTEXT as *mut _,
+                    None,
+                    Some(fta),
+                    Some(mb),
+                    None,
+                );
+                if !ok.as_bool() || frame.AddrPC.Offset == 0 {
+                    break;
+                }
+
+                let addr = frame.AddrPC.Offset;
+
+                // Resolve symbol. SYMBOL_INFO has a variable-length Name tail.
+                const MAX_NAME: usize = 512;
+                let sym_total = std::mem::size_of::<SYMBOL_INFO>() + MAX_NAME;
+                let mut sym_buf: Vec<u8> = vec![0u8; sym_total];
+                let sym = sym_buf.as_mut_ptr() as *mut SYMBOL_INFO;
+                (*sym).SizeOfStruct = std::mem::size_of::<SYMBOL_INFO>() as u32;
+                (*sym).MaxNameLen = MAX_NAME as u32;
+
+                let mut disp = 0u64;
+                let label = if SymFromAddr(proc, addr, Some(&mut disp), sym).is_ok() {
+                    let name_ptr = std::ptr::addr_of!((*sym).Name) as *const u8;
+                    let name_len = ((*sym).NameLen as usize).min(MAX_NAME);
+                    let bytes = std::slice::from_raw_parts(name_ptr, name_len);
+                    let name = String::from_utf8_lossy(bytes);
+                    format!("{name}+{disp}")
+                } else {
+                    format!("0x{addr:016x}")
+                };
+                lines.push(format!("  {i:2}: {label}"));
+            }
+
+            // Resume AFTER the full stack walk — thread must stay suspended
+            // while StackWalk64 reads its stack memory.
+            ResumeThread(thread);
+            let _ = CloseHandle(thread);
+
             if lines.is_empty() {
-                "(no threads found)".to_owned()
+                "(no frames captured — debug symbols may be stripped)".to_string()
             } else {
                 lines.join("\n")
             }
@@ -337,8 +561,8 @@ fn enumerate_threads_text(pid: u32) -> String {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = pid;
-        "(not available on this platform)".to_owned()
+        let _ = tid;
+        "(stack capture not available on this platform)".to_string()
     }
 }
 
@@ -379,6 +603,43 @@ const BTN_FORCE_QUIT: i32 = 1001;
 const BTN_COPY: i32 = 1002;
 const BTN_OPEN_LOGS: i32 = 1003;
 
+// Thread-locals used by the TaskDialog callback to perform actions without
+// closing the dialog. Set before each TaskDialogIndirect call.
+thread_local! {
+    static CB_DETAIL: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+    static CB_LOG_DIR: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+}
+
+/// TaskDialog callback. Intercepts button clicks that should NOT close the
+/// dialog (Copy details, Open log folder) and returns S_FALSE to keep it open.
+/// Force quit / Close / Keep waiting return S_OK and close normally.
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn task_dialog_cb(
+    _hwnd: windows::Win32::Foundation::HWND,
+    msg: windows::Win32::UI::Controls::TASKDIALOG_NOTIFICATIONS,
+    wparam: windows::Win32::Foundation::WPARAM,
+    _lparam: windows::Win32::Foundation::LPARAM,
+    _lp_ref: isize,
+) -> windows::core::HRESULT {
+    use windows::Win32::UI::Controls::TDN_BUTTON_CLICKED;
+    if msg == TDN_BUTTON_CLICKED {
+        let btn = wparam.0 as i32;
+        if btn == BTN_COPY {
+            CB_DETAIL.with(|d| copy_to_clipboard(&d.borrow()));
+            return windows::core::HRESULT(1); // S_FALSE — keep dialog open
+        }
+        if btn == BTN_OPEN_LOGS {
+            CB_LOG_DIR.with(|d| {
+                let _ = std::process::Command::new("explorer")
+                    .arg(d.borrow().as_str())
+                    .spawn();
+            });
+            return windows::core::HRESULT(1); // S_FALSE — keep dialog open
+        }
+    }
+    windows::core::HRESULT(0) // S_OK — allow dialog to close
+}
+
 #[cfg(target_os = "windows")]
 fn show_task_dialog_win32(
     title: &str,
@@ -398,6 +659,10 @@ fn show_task_dialog_win32(
     use windows::Win32::UI::WindowsAndMessaging::IDCANCEL;
     use windows::core::PCWSTR;
 
+    // Make detail and log_dir available to the callback via thread-locals.
+    CB_DETAIL.with(|d| *d.borrow_mut() = detail.to_string());
+    CB_LOG_DIR.with(|d| *d.borrow_mut() = log_dir.to_string());
+
     let w = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
 
     let title_w = w(title);
@@ -416,99 +681,86 @@ fn show_task_dialog_win32(
 
     let icon = if warning { TD_WARNING_ICON } else { TD_ERROR_ICON };
 
-    {
-        let mut buttons: Vec<TASKDIALOG_BUTTON> = Vec::new();
-        if warning {
-            buttons.push(TASKDIALOG_BUTTON {
-                nButtonID: BTN_FORCE_QUIT,
-                pszButtonText: PCWSTR(lbl_force.as_ptr()),
-            });
-            buttons.push(TASKDIALOG_BUTTON {
-                nButtonID: IDCANCEL.0 as i32,
-                pszButtonText: PCWSTR(lbl_wait.as_ptr()),
-            });
-        } else {
-            buttons.push(TASKDIALOG_BUTTON {
-                nButtonID: IDCANCEL.0 as i32,
-                pszButtonText: PCWSTR(lbl_close.as_ptr()),
-            });
-        }
+    let mut buttons: Vec<TASKDIALOG_BUTTON> = Vec::new();
+    if warning {
         buttons.push(TASKDIALOG_BUTTON {
-            nButtonID: BTN_COPY,
-            pszButtonText: PCWSTR(lbl_copy.as_ptr()),
+            nButtonID: BTN_FORCE_QUIT,
+            pszButtonText: PCWSTR(lbl_force.as_ptr()),
         });
         buttons.push(TASKDIALOG_BUTTON {
-            nButtonID: BTN_OPEN_LOGS,
-            pszButtonText: PCWSTR(lbl_logs.as_ptr()),
+            nButtonID: IDCANCEL.0 as i32,
+            pszButtonText: PCWSTR(lbl_wait.as_ptr()),
         });
-
-        let config = TASKDIALOGCONFIG {
-            cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
-            hwndParent: HWND(std::ptr::null_mut()),
-            hInstance: HINSTANCE(std::ptr::null_mut()),
-            dwFlags: TDF_SIZE_TO_CONTENT | TDF_ALLOW_DIALOG_CANCELLATION,
-            dwCommonButtons: TDCBF_CLOSE_BUTTON,
-            pszWindowTitle: PCWSTR(title_w.as_ptr()),
-            Anonymous1: TASKDIALOGCONFIG_0 { pszMainIcon: icon },
-            pszMainInstruction: PCWSTR(heading_w.as_ptr()),
-            pszContent: PCWSTR(summary_w.as_ptr()),
-            cButtons: buttons.len() as u32,
-            pButtons: buttons.as_ptr(),
-            nDefaultButton: IDCANCEL.0 as i32,
-            cRadioButtons: 0,
-            pRadioButtons: std::ptr::null(),
-            nDefaultRadioButton: 0,
-            pszVerificationText: PCWSTR::null(),
-            pszExpandedInformation: PCWSTR(detail_w.as_ptr()),
-            pszExpandedControlText: PCWSTR(collapse_w.as_ptr()),
-            pszCollapsedControlText: PCWSTR(expand_w.as_ptr()),
-            Anonymous2: TASKDIALOGCONFIG_1 {
-                hFooterIcon: windows::Win32::UI::WindowsAndMessaging::HICON(std::ptr::null_mut()),
-            },
-            pszFooter: PCWSTR(footer_w.as_ptr()),
-            pfCallback: None,
-            lpCallbackData: 0,
-            cxWidth: 0,
-        };
-
-        let mut btn: i32 = IDCANCEL.0 as i32;
-        let ok = unsafe { TaskDialogIndirect(&config, Some(&mut btn), None, None) };
-
-        if ok.is_err() {
-            // TaskDialogIndirect unavailable; fall back to rfd.
-            let level = if warning {
-                rfd::MessageLevel::Warning
-            } else {
-                rfd::MessageLevel::Error
-            };
-            let _ = rfd::MessageDialog::new()
-                .set_level(level)
-                .set_title(title)
-                .set_buttons(rfd::MessageButtons::Ok)
-                .set_description(summary)
-                .show();
-            return false;
-        }
-
-        match btn {
-            BTN_COPY => {
-                copy_to_clipboard(detail);
-                false
-            }
-            BTN_OPEN_LOGS => {
-                let _ = std::process::Command::new("explorer").arg(log_dir).spawn();
-                false
-            }
-            BTN_FORCE_QUIT => true,
-            _ => false, // "Close" / "Keep waiting" / cancel (X button)
-        }
+    } else {
+        buttons.push(TASKDIALOG_BUTTON {
+            nButtonID: IDCANCEL.0 as i32,
+            pszButtonText: PCWSTR(lbl_close.as_ptr()),
+        });
     }
+    buttons.push(TASKDIALOG_BUTTON {
+        nButtonID: BTN_COPY,
+        pszButtonText: PCWSTR(lbl_copy.as_ptr()),
+    });
+    buttons.push(TASKDIALOG_BUTTON {
+        nButtonID: BTN_OPEN_LOGS,
+        pszButtonText: PCWSTR(lbl_logs.as_ptr()),
+    });
+
+    let config = TASKDIALOGCONFIG {
+        cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
+        hwndParent: HWND(std::ptr::null_mut()),
+        hInstance: HINSTANCE(std::ptr::null_mut()),
+        dwFlags: TDF_SIZE_TO_CONTENT | TDF_ALLOW_DIALOG_CANCELLATION,
+        dwCommonButtons: TDCBF_CLOSE_BUTTON,
+        pszWindowTitle: PCWSTR(title_w.as_ptr()),
+        Anonymous1: TASKDIALOGCONFIG_0 { pszMainIcon: icon },
+        pszMainInstruction: PCWSTR(heading_w.as_ptr()),
+        pszContent: PCWSTR(summary_w.as_ptr()),
+        cButtons: buttons.len() as u32,
+        pButtons: buttons.as_ptr(),
+        nDefaultButton: IDCANCEL.0 as i32,
+        cRadioButtons: 0,
+        pRadioButtons: std::ptr::null(),
+        nDefaultRadioButton: 0,
+        pszVerificationText: PCWSTR::null(),
+        pszExpandedInformation: PCWSTR(detail_w.as_ptr()),
+        pszExpandedControlText: PCWSTR(collapse_w.as_ptr()),
+        pszCollapsedControlText: PCWSTR(expand_w.as_ptr()),
+        Anonymous2: TASKDIALOGCONFIG_1 {
+            hFooterIcon: windows::Win32::UI::WindowsAndMessaging::HICON(std::ptr::null_mut()),
+        },
+        pszFooter: PCWSTR(footer_w.as_ptr()),
+        pfCallback: Some(task_dialog_cb),
+        lpCallbackData: 0,
+        cxWidth: 0,
+    };
+
+    let mut btn: i32 = IDCANCEL.0 as i32;
+    let ok = unsafe { TaskDialogIndirect(&config, Some(&mut btn), None, None) };
+
+    if ok.is_err() {
+        let level = if warning {
+            rfd::MessageLevel::Warning
+        } else {
+            rfd::MessageLevel::Error
+        };
+        let _ = rfd::MessageDialog::new()
+            .set_level(level)
+            .set_title(title)
+            .set_buttons(rfd::MessageButtons::Ok)
+            .set_description(summary)
+            .show();
+        return false;
+    }
+
+    // BTN_COPY and BTN_OPEN_LOGS are handled by the callback (S_FALSE keeps the
+    // dialog open so they never appear here). Only BTN_FORCE_QUIT reaches this.
+    matches!(btn, BTN_FORCE_QUIT)
 }
 
 /// Copy `text` to the system clipboard via PowerShell (avoids wrestling with
 /// Win32 memory handle types across crate versions).
 fn copy_to_clipboard(text: &str) {
-    // Write to a temp file so we don't need to escape anything for PowerShell.
     let tmp = std::env::temp_dir().join("streamarchiver_crash_detail.txt");
     if std::fs::write(&tmp, text).is_ok() {
         let _ = std::process::Command::new("powershell")
