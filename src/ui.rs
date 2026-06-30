@@ -670,6 +670,10 @@ pub struct StreamArchiverApp {
     /// Computed from `schedule_all`: segment IDs that are auto-merge secondaries
     /// (hidden in favour of their primary). Built by [`Self::recompute_merge_state`].
     schedule_auto_secondary: HashSet<i64>,
+    /// User-defined filename template presets loaded from the DB.
+    custom_presets: Vec<(i64, String, String)>,
+    /// Open "Save preset" naming dialog (None = closed).
+    save_preset_dialog: Option<SavePresetDraft>,
     /// Chat log viewer popup (None = closed).
     chat_popup: Option<ChatPopup>,
     /// Platform favicons, uploaded to the GPU on first use (None until then).
@@ -1053,6 +1057,8 @@ impl StreamArchiverApp {
                 .iter()
                 .map(|(_, key)| (key.to_string(), core.store.job_enabled(key)))
                 .collect();
+        // Load user-defined filename presets before `core` is moved.
+        let initial_custom_presets = core.store.get_filename_presets().unwrap_or_default();
 
         let mut app = StreamArchiverApp {
             core,
@@ -1124,6 +1130,8 @@ impl StreamArchiverApp {
             confirm_delete_segments: None,
             schedule_merge_labels: HashMap::new(),
             schedule_auto_secondary: HashSet::new(),
+            custom_presets: initial_custom_presets,
+            save_preset_dialog: None,
             chat_popup: None,
             platform_tex: None,
             properties_popup: None,
@@ -1925,25 +1933,66 @@ const FILENAME_PRESETS: &[(&str, &str)] = &[
     ("Date + name + title + game", "{date}_{time}_{name}_{title}_{games}"),
 ];
 
-/// Render a filename-template preset ComboBox. Selecting a preset writes its
-/// template into `template`; editing the textbox elsewhere automatically shows
-/// "Manual" (no extra state required — the label is derived each frame).
-fn filename_preset_combo(ui: &mut egui::Ui, id_salt: &str, template: &mut String) {
+/// Render a filename-template preset ComboBox with both built-in and user-defined
+/// presets. Selecting a preset writes its template into `template`.
+///
+/// Returns `(delete_id, open_save)`:
+/// - `delete_id` — a custom preset the user clicked "×" on (caller should delete + reload)
+/// - `open_save` — the 💾 button was clicked (caller should open the save-preset dialog)
+fn filename_preset_combo(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    template: &mut String,
+    custom_presets: &[(i64, String, String)],
+) -> (Option<i64>, bool) {
     let current = FILENAME_PRESETS
         .iter()
         .find(|(_, t)| *t == template.as_str())
         .map(|(l, _)| *l)
+        .or_else(|| {
+            custom_presets
+                .iter()
+                .find(|(_, _, t)| t.as_str() == template.as_str())
+                .map(|(_, n, _)| n.as_str())
+        })
         .unwrap_or("Manual");
+    let mut delete_id: Option<i64> = None;
     egui::ComboBox::from_id_salt(id_salt)
         .selected_text(current)
         .width(160.0)
         .show_ui(ui, |ui| {
             for &(label, tmpl) in FILENAME_PRESETS {
-                if ui.selectable_label(template == tmpl, label).clicked() {
+                if ui.selectable_label(template.as_str() == tmpl, label).clicked() {
                     *template = tmpl.to_string();
                 }
             }
+            if !custom_presets.is_empty() {
+                ui.separator();
+                ui.add(egui::Label::new(egui::RichText::new("My presets").weak().small()));
+                for (id, name, tmpl) in custom_presets {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_label(template.as_str() == tmpl.as_str(), name.as_str())
+                            .clicked()
+                        {
+                            *template = tmpl.clone();
+                        }
+                        if ui
+                            .small_button("×")
+                            .on_hover_text("Delete this preset")
+                            .clicked()
+                        {
+                            delete_id = Some(*id);
+                        }
+                    });
+                }
+            }
         });
+    let open_save = ui
+        .button("💾")
+        .on_hover_text("Save current template as a named preset")
+        .clicked();
+    (delete_id, open_save)
 }
 
 /// Coarse human duration: `45s` / `5m` / `6h` / `2d`.
@@ -3423,6 +3472,15 @@ struct MergePreviewDraft {
     /// Which element of `segments` is chosen as the primary (shown in the calendar).
     primary_idx: usize,
     /// Validation/error message (empty = none).
+    error: String,
+}
+
+struct SavePresetDraft {
+    /// Template string to be saved.
+    template: String,
+    /// Name the user has typed for this preset.
+    name: String,
+    /// Validation or save error message (empty = none).
     error: String,
 }
 
@@ -5180,6 +5238,7 @@ impl eframe::App for StreamArchiverApp {
         self.confirm_delete_segment_window(ui.ctx());
         self.merge_preview_window(ui.ctx());
         self.confirm_delete_segments_window(ui.ctx());
+        self.save_preset_window(ui.ctx());
         self.format_probe_window(ui.ctx());
         self.ad_popup_window(ui.ctx());
         self.meta_popup_window(ui.ctx());
@@ -5658,6 +5717,11 @@ impl StreamArchiverApp {
         // the borrow, so we can reach `self.pending_browse`.
         // (true = folder, false = file), platform, current path.
         let mut browse_req: Option<(bool, Platform, String)> = None;
+        // Preset actions collected inside the loop and applied after all borrows end.
+        let mut preset_delete: Option<i64> = None;
+        let mut preset_save_tmpl: Option<String> = None;
+        // Snapshot custom presets as a slice; separate from `defs` borrow (different field).
+        let custom_presets = self.custom_presets.as_slice();
         // Borrow the defaults (not `self`) so the nested egui closures don't
         // alias `self`; persist afterwards.
         let defs = &mut self.download_defaults;
@@ -5773,7 +5837,14 @@ impl StreamArchiverApp {
                             ui.label("Filename template");
                             ui.horizontal(|ui| {
                                 let before = d.filename_template.clone();
-                                filename_preset_combo(ui, &format!("vdef_tmpl_{}", platform.as_str()), &mut d.filename_template);
+                                let (del, save) = filename_preset_combo(
+                                    ui,
+                                    &format!("vdef_tmpl_{}", platform.as_str()),
+                                    &mut d.filename_template,
+                                    custom_presets,
+                                );
+                                if del.is_some() { preset_delete = del; }
+                                if save { preset_save_tmpl = Some(d.filename_template.clone()); }
                                 if ui.text_edit_singleline(&mut d.filename_template).changed()
                                     || d.filename_template != before
                                 {
@@ -5805,7 +5876,21 @@ impl StreamArchiverApp {
         if dirty {
             self.persist_download_defaults();
         }
-        // defs borrow ends; now we can reach self.pending_browse.
+        // defs and custom_presets borrows end; now we can mutate self freely.
+        if let Some(id) = preset_delete {
+            if let Err(e) = self.core.store.delete_filename_preset(id) {
+                self.status = format!("Error deleting preset: {e:#}");
+            } else {
+                self.custom_presets = self.core.store.get_filename_presets().unwrap_or_default();
+            }
+        }
+        if let Some(tmpl) = preset_save_tmpl {
+            self.save_preset_dialog = Some(SavePresetDraft {
+                template: tmpl,
+                name: String::new(),
+                error: String::new(),
+            });
+        }
         if let Some((is_folder, plat, current)) = browse_req {
             self.pending_browse = Some(if is_folder {
                 spawn_browse_folder(&current, move |app, p| {
@@ -6187,8 +6272,11 @@ impl StreamArchiverApp {
         let mut do_download = false;
         let mut do_list_formats = false;
         let mut open_vf_designer = false;
+        let mut vf_preset_delete: Option<i64> = None;
+        let mut vf_preset_save_tmpl: Option<String> = None;
 
         {
+            let custom_presets = self.custom_presets.as_slice();
             let vf = &mut self.video_form;
 
             ui.add_space(6.0);
@@ -6316,7 +6404,14 @@ impl StreamArchiverApp {
                     let tmpl_hint = "Variables: {name} {title} {channel} {date} {time} {timestamp} {year} {month} {day} {hour} {minute} {second} {tool} {mode} {platform} {video_id} {quality} {resolution} {height} {width} {fps} {vcodec} {acodec} {take} {games} {went_live_date} {went_live_time}";
                     ui.label("Filename template").on_hover_text(tmpl_hint);
                     ui.horizontal(|ui| {
-                        filename_preset_combo(ui, "video_form_tmpl", &mut vf.filename_template);
+                        let (del, save) = filename_preset_combo(
+                            ui,
+                            "video_form_tmpl",
+                            &mut vf.filename_template,
+                            custom_presets,
+                        );
+                        if del.is_some() { vf_preset_delete = del; }
+                        if save { vf_preset_save_tmpl = Some(vf.filename_template.clone()); }
                         ui.text_edit_singleline(&mut vf.filename_template).on_hover_text(tmpl_hint);
                         if ui.button("Design…").on_hover_text("Open the Format Designer").clicked() {
                             open_vf_designer = true;
@@ -6383,6 +6478,20 @@ impl StreamArchiverApp {
         if open_vf_designer {
             let tmpl = self.video_form.filename_template.clone();
             self.open_format_designer(tmpl, Some(FormatDesignerTarget::VideoForm));
+        }
+        if let Some(id) = vf_preset_delete {
+            if let Err(e) = self.core.store.delete_filename_preset(id) {
+                self.status = format!("Error deleting preset: {e:#}");
+            } else {
+                self.custom_presets = self.core.store.get_filename_presets().unwrap_or_default();
+            }
+        }
+        if let Some(tmpl) = vf_preset_save_tmpl {
+            self.save_preset_dialog = Some(SavePresetDraft {
+                template: tmpl,
+                name: String::new(),
+                error: String::new(),
+            });
         }
     }
 
@@ -6650,6 +6759,7 @@ impl StreamArchiverApp {
         let mut new_recording_idx = selected_recording_idx;
         let mut close = false;
         let mut apply = false;
+        let mut fd_save_preset = false;
 
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("format_designer_vp"),
@@ -6792,6 +6902,9 @@ impl StreamArchiverApp {
                         if target.is_some() && ui.button("Apply").on_hover_text("Write this template back to the field that opened the designer").clicked() {
                             apply = true;
                         }
+                        if ui.button("💾 Save as preset…").on_hover_text("Save this template as a named preset available in all filename dropdowns").clicked() {
+                            fd_save_preset = true;
+                        }
                         if ui.button("Close").clicked() {
                             close = true;
                         }
@@ -6829,6 +6942,14 @@ impl StreamArchiverApp {
             } else {
                 fd.selected_recording_idx = new_recording_idx;
             }
+        }
+
+        if fd_save_preset {
+            self.save_preset_dialog = Some(SavePresetDraft {
+                template: new_template.clone(),
+                name: String::new(),
+                error: String::new(),
+            });
         }
 
         if apply {
@@ -8824,6 +8945,76 @@ impl StreamArchiverApp {
         } else if !open {
             self.show_rename_dialog = false;
             self.rename_rec_id = None;
+        }
+    }
+
+    /// Dialog for naming and saving a custom filename-template preset.
+    #[allow(deprecated)]
+    fn save_preset_window(&mut self, ctx: &egui::Context) {
+        if self.save_preset_dialog.is_none() {
+            return;
+        }
+        let mut open = true;
+        let mut do_save = false;
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("save_preset_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("Save as preset")
+                .with_inner_size([340.0, 120.0])
+                .with_resizable(false),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                let Some(d) = self.save_preset_dialog.as_mut() else { return; };
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label("Preset name:");
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut d.name)
+                            .hint_text("e.g. My favourite format")
+                            .desired_width(310.0),
+                    );
+                    if resp.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        do_save = true;
+                    }
+                    if !d.error.is_empty() {
+                        ui.colored_label(HL_ERROR_TEXT, &d.error);
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let can_save = !d.name.trim().is_empty();
+                        if ui.add_enabled(can_save, egui::Button::new("Save")).clicked() {
+                            do_save = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            open = false;
+                        }
+                    });
+                });
+            },
+        );
+
+        if do_save {
+            if let Some(d) = self.save_preset_dialog.take() {
+                let name = d.name.trim().to_string();
+                match self.core.store.save_filename_preset(&name, &d.template) {
+                    Ok(_) => {
+                        self.custom_presets =
+                            self.core.store.get_filename_presets().unwrap_or_default();
+                        self.status = format!("Preset \"{name}\" saved.");
+                    }
+                    Err(e) => {
+                        self.save_preset_dialog = Some(SavePresetDraft {
+                            name: d.name,
+                            template: d.template,
+                            error: format!("Error saving: {e:#}"),
+                        });
+                    }
+                }
+            }
+        } else if !open {
+            self.save_preset_dialog = None;
         }
     }
 
@@ -12022,6 +12213,9 @@ impl StreamArchiverApp {
             // Work on a local clone to avoid borrow-checker issues (cross-field access
             // for hint text vs mutable edit access for the combo/text widgets).
             let mut md = self.monitor_defaults.clone();
+            let custom_presets = self.custom_presets.as_slice();
+            let mut mdef_preset_delete: Option<i64> = None;
+            let mut mdef_preset_save_tmpl: Option<String> = None;
 
             for (label, platform_opt) in [
                 ("🌐  Global", None),
@@ -12164,7 +12358,14 @@ impl StreamArchiverApp {
                                 ui.label("Filename");
                                 let ft_ref = d.filename_template.get_or_insert_with(String::new);
                                 ui.horizontal(|ui| {
-                                    filename_preset_combo(ui, &format!("mdef_tmpl_{label}"), ft_ref);
+                                    let (del, save) = filename_preset_combo(
+                                        ui,
+                                        &format!("mdef_tmpl_{label}"),
+                                        ft_ref,
+                                        custom_presets,
+                                    );
+                                    if del.is_some() { mdef_preset_delete = del; }
+                                    if save { mdef_preset_save_tmpl = Some(ft_ref.clone()); }
                                     ui.add(
                                         egui::TextEdit::singleline(ft_ref)
                                             .hint_text(&ft_hint)
@@ -12215,6 +12416,22 @@ impl StreamArchiverApp {
 
             // Write back the (possibly edited) clone.
             self.monitor_defaults = md;
+
+            // Apply preset actions now that md borrow is released.
+            if let Some(id) = mdef_preset_delete {
+                if let Err(e) = self.core.store.delete_filename_preset(id) {
+                    self.status = format!("Error deleting preset: {e:#}");
+                } else {
+                    self.custom_presets = self.core.store.get_filename_presets().unwrap_or_default();
+                }
+            }
+            if let Some(tmpl) = mdef_preset_save_tmpl {
+                self.save_preset_dialog = Some(SavePresetDraft {
+                    template: tmpl,
+                    name: String::new(),
+                    error: String::new(),
+                });
+            }
 
             ui.add_space(12.0);
             ui.heading("Startup");
@@ -13520,6 +13737,8 @@ impl StreamArchiverApp {
         let mut do_cancel = false;
         let mut open_format_designer = false;
         let mut browse_req: Option<PendingBrowse> = None;
+        let mut form_preset_delete: Option<i64> = None;
+        let mut form_preset_save_tmpl: Option<String> = None;
 
         let f = self.form.as_ref().unwrap();
         let title = if f.monitor_id.is_some() {
@@ -13775,7 +13994,15 @@ impl StreamArchiverApp {
                         let fn_tmpl_hint = "{name} {date} {time} {year} {month} {day} {hour} {minute} {second} {title} {games} {video_id} {quality} {resolution} {height} {width} {fps} {vcodec} {acodec} {take} {tool} {mode} {platform} {went_live_date} {went_live_time} {timestamp}";
                         ui.label("Filename template").on_hover_text(fn_tmpl_hint);
                         ui.horizontal(|ui| {
-                            filename_preset_combo(ui, "monitor_form_tmpl", &mut form.filename_template);
+                            let custom_presets = self.custom_presets.as_slice();
+                            let (del, save) = filename_preset_combo(
+                                ui,
+                                "monitor_form_tmpl",
+                                &mut form.filename_template,
+                                custom_presets,
+                            );
+                            if del.is_some() { form_preset_delete = del; }
+                            if save { form_preset_save_tmpl = Some(form.filename_template.clone()); }
                             ui.text_edit_singleline(&mut form.filename_template).on_hover_text(fn_tmpl_hint);
                             if ui.button("Design…").on_hover_text("Open the Format Designer to preview and compose the template").clicked() {
                                 open_format_designer = true;
@@ -13814,6 +14041,20 @@ impl StreamArchiverApp {
         if open_format_designer {
             let tmpl = self.form.as_ref().map(|f| f.filename_template.clone()).unwrap_or_default();
             self.open_format_designer(tmpl, Some(FormatDesignerTarget::MonitorForm));
+        }
+        if let Some(id) = form_preset_delete {
+            if let Err(e) = self.core.store.delete_filename_preset(id) {
+                self.status = format!("Error deleting preset: {e:#}");
+            } else {
+                self.custom_presets = self.core.store.get_filename_presets().unwrap_or_default();
+            }
+        }
+        if let Some(tmpl) = form_preset_save_tmpl {
+            self.save_preset_dialog = Some(SavePresetDraft {
+                template: tmpl,
+                name: String::new(),
+                error: String::new(),
+            });
         }
     }
 

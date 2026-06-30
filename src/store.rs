@@ -19,7 +19,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 34;
+const SCHEMA_VERSION: i64 = 35;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -631,7 +631,18 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 34)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 34);
+        if version < 35 {
+            // User-defined filename-template presets (name + template string).
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS filename_preset (
+                     id       INTEGER PRIMARY KEY,
+                     name     TEXT NOT NULL,
+                     template TEXT NOT NULL
+                 );",
+            )?;
+            conn.pragma_update(None, "user_version", 35)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 35);
         Ok(())
     }
 
@@ -1641,6 +1652,32 @@ impl Store {
             "UPDATE schedule_segment SET auto_merge_excluded = ?1 WHERE id = ?2",
             params![excluded as i64, segment_id],
         )?;
+        Ok(())
+    }
+
+    // ----- user-defined filename presets -----
+
+    pub fn get_filename_presets(&self) -> Result<Vec<(i64, String, String)>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, template FROM filename_preset ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    pub fn save_filename_preset(&self, name: &str, template: &str) -> Result<i64> {
+        let conn = self.db();
+        conn.execute(
+            "INSERT INTO filename_preset (name, template) VALUES (?1, ?2)",
+            params![name, template],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn delete_filename_preset(&self, id: i64) -> Result<()> {
+        let conn = self.db();
+        conn.execute("DELETE FROM filename_preset WHERE id = ?1", params![id])?;
         Ok(())
     }
 
