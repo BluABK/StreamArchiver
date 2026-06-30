@@ -1105,6 +1105,17 @@ impl Store {
         Ok(())
     }
 
+    /// Update the output path of a finished recording — used after a manual
+    /// re-remux succeeds to replace the `.ts` capture path with the final `.mkv`.
+    pub fn update_recording_output_path(&self, id: i64, path: &str) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE recording SET output_path = ?2 WHERE id = ?1",
+            params![id, path],
+        )?;
+        Ok(())
+    }
+
     /// Remove a recording (take) row from the history. The captured file on disk
     /// is left untouched. Refuses an in-progress ('recording') take so we never
     /// orphan a running capture from its history row; returns the rows removed.

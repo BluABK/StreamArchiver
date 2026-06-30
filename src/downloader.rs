@@ -1108,6 +1108,28 @@ impl Supervisor {
                             self.fetch_channel_assets(&row, None, true);
                         }
                     }
+                    ManualCommand::ReRemux { rec_id, capture, final_ } => {
+                        let store = self.store.clone();
+                        let tx = self.events.clone();
+                        tokio::spawn(async move {
+                            info!("re-remux start: {}", capture.display());
+                            match remux_ts_to_mkv(&capture, &final_).await {
+                                Ok(()) => {
+                                    let _ = tokio::fs::remove_file(&capture).await;
+                                    let path_s = final_.to_string_lossy();
+                                    if let Err(e) = store.update_recording_output_path(rec_id, &path_s) {
+                                        warn!("re-remux: DB update failed for rec_id={rec_id}: {e:#}");
+                                    }
+                                    let _ = tx.send(AppEvent::RecordingUpdated { recording_id: rec_id });
+                                    info!("re-remux done: {}", final_.display());
+                                }
+                                Err(e) => {
+                                    warn!("re-remux failed for rec_id={rec_id}: {e:#}");
+                                    let _ = tx.send(AppEvent::RecordingUpdated { recording_id: rec_id });
+                                }
+                            }
+                        });
+                    }
                 },
                 else => break,
             }
@@ -4439,7 +4461,27 @@ async fn rename_companion_sidecars(dir: &Path, old_stem: &str, new_stem: &str) {
         if to.exists() {
             continue; // don't clobber an unrelated existing file
         }
-        if let Err(e) = tokio::fs::rename(entry.path(), &to).await {
+        // Retry with exponential backoff: on Windows the chat downloader
+        // (yt-dlp) may still have live_chat.json open when finalization runs,
+        // producing os error 32 (ERROR_SHARING_VIOLATION). Give the process
+        // time to flush and release the handle before giving up.
+        let src = entry.path();
+        let mut delay_ms = 500u64;
+        let mut last_err: Option<std::io::Error> = None;
+        for attempt in 0u32..5 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                delay_ms *= 2; // 500 → 1000 → 2000 → 4000 ms
+            }
+            match tokio::fs::rename(&src, &to).await {
+                Ok(()) => { last_err = None; break; }
+                Err(e) if e.raw_os_error() == Some(32)  // Windows: SHARING_VIOLATION
+                       || e.raw_os_error() == Some(16)  // Unix: EBUSY
+                => { last_err = Some(e); }
+                Err(e) => { last_err = Some(e); break; } // non-retryable error
+            }
+        }
+        if let Some(e) = last_err {
             warn!("companion sidecar rename failed for {}: {e:#}", name);
         }
     }

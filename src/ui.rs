@@ -9331,6 +9331,36 @@ impl StreamArchiverApp {
                                         ui.set_min_width(180.0);
                                         let file_ok = !t.output_path.is_empty()
                                             && std::path::Path::new(&t.output_path).is_file();
+                                        // Offer re-remux when the finalized file is still a .ts
+                                        // (the automatic remux failed at recording end).
+                                        let needs_remux = t.output_path.ends_with(".ts")
+                                            && t.output_path.contains(".cache");
+                                        if needs_remux {
+                                            let remux_dest = std::path::Path::new(&t.output_path)
+                                                .parent() // .cache/
+                                                .and_then(|p| p.parent()) // output dir
+                                                .and_then(|d| {
+                                                    std::path::Path::new(&t.output_path)
+                                                        .file_stem()
+                                                        .map(|s| d.join(format!("{}.mkv", s.to_string_lossy())))
+                                                });
+                                            if ui
+                                                .button("🔄  Re-remux to MKV")
+                                                .on_hover_text("Convert the captured .ts to .mkv using ffmpeg (the automatic remux failed when the recording ended).")
+                                                .clicked()
+                                            {
+                                                if let Some(dest) = remux_dest {
+                                                    self.core.manual(ManualCommand::ReRemux {
+                                                        rec_id: t.id,
+                                                        capture: std::path::PathBuf::from(&t.output_path),
+                                                        final_: dest,
+                                                    });
+                                                    self.status = "Re-remux started…".into();
+                                                }
+                                                ui.close();
+                                            }
+                                            ui.separator();
+                                        }
                                         if ui
                                             .add_enabled(file_ok, egui::Button::new("▶  Open file"))
                                             .clicked()

@@ -225,7 +225,7 @@ pub enum UiCommand {
 }
 
 /// On-demand recording commands from the UI to the download supervisor.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ManualCommand {
     /// Check the channel now and, if live, start recording (bypassing backoff).
     Start(i64),
@@ -242,4 +242,12 @@ pub enum ManualCommand {
     /// Force a channel-asset refetch for a monitor (by monitor id), ignoring the
     /// 24h freshness stamp and the per-monitor `fetch_chat_assets` toggle.
     RefetchAssets(i64),
+    /// Re-remux a captured `.ts` file to MKV in the background (for recordings
+    /// where the automatic remux failed at finalization time). On success the
+    /// source TS is deleted and `recording.output_path` is updated to the MKV.
+    ReRemux {
+        rec_id: i64,
+        capture: std::path::PathBuf,
+        final_: std::path::PathBuf,
+    },
 }
