@@ -17039,8 +17039,16 @@ fn emote_viewer_grid(
                 });
             });
 
-            // Right-click context menu on the entire cell
-            cell.response.context_menu(|ui| {
+            // Right-click context menu on the entire cell.
+            // allocate_ui returns Sense::hover(), which makes secondary_clicked()
+            // always false and context_menu never fires. Re-interact with Sense::click()
+            // on the same rect so the right-click is detected properly.
+            let ctx_resp = ui.interact(
+                cell.response.rect,
+                egui::Id::new("emote_ctx").with(&e.id),
+                egui::Sense::click(),
+            );
+            ctx_resp.context_menu(|ui| {
                 if ui.button("Copy Image").clicked() {
                     copy_emote_image_to_clipboard(&e.path);
                     ui.close();
