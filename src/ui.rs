@@ -523,6 +523,11 @@ pub struct StreamArchiverApp {
     /// In-flight background load of the process list (spawned off the UI thread
     /// to avoid blocking on the store mutex during `list_processes()`).
     processes_load: Option<std::sync::mpsc::Receiver<Vec<crate::app_core::ProcInfo>>>,
+    /// The issues panel: whether it's open, its last snapshot of recordings
+    /// that still have a `.ts` path, and when that snapshot was taken.
+    show_issues: bool,
+    issues_recs: Vec<crate::models::Recording>,
+    issues_refreshed: Option<std::time::Instant>,
     quitting: bool,
     /// UI-freeze watchdog heartbeat: stamped each frame so a background thread can
     /// detect (and surface as a native dialog) a hung UI thread. See [`crate::watchdog`].
@@ -983,6 +988,9 @@ impl StreamArchiverApp {
             processes: Vec::new(),
             processes_refreshed: None,
             processes_load: None,
+            show_issues: false,
+            issues_recs: Vec::new(),
+            issues_refreshed: None,
             quitting: false,
             heartbeat,
             view: View::Streams,
@@ -1311,6 +1319,9 @@ impl StreamArchiverApp {
             if self.schedule_loaded {
                 self.reload_schedule();
             }
+            // Any event that marks the UI dirty may affect recording statuses —
+            // force a refresh of the issues panel on the next frame it is open.
+            self.issues_refreshed = None;
         }
     }
 
@@ -4623,6 +4634,14 @@ impl eframe::App for StreamArchiverApp {
                             self.show_processes = true;
                             self.processes_refreshed = None; // force an immediate refresh
                         }
+                        if ui
+                            .small_button("⚠ Issues")
+                            .on_hover_text("Recordings that need attention")
+                            .clicked()
+                        {
+                            self.show_issues = true;
+                            self.issues_refreshed = None;
+                        }
                         if self.view == View::Streams {
                             if ui
                                 .button("➕ Add stream")
@@ -4764,6 +4783,7 @@ impl eframe::App for StreamArchiverApp {
         self.asset_history_window(ui.ctx());
         self.recording_properties_window(ui.ctx());
         self.processes_window(ui.ctx());
+        self.issues_window(ui.ctx());
         self.format_designer_window(ui.ctx());
         self.confirm_quit_stop_window(ui.ctx());
         self.import_window(ui.ctx());
@@ -11973,6 +11993,174 @@ impl StreamArchiverApp {
                 }
             }
             None => {}
+        }
+    }
+
+    /// Issues panel: lists all recordings whose output path is still a `.ts`
+    /// file inside a `.cache` directory, and lets the user re-remux them to MKV.
+    #[allow(deprecated)]
+    fn issues_window(&mut self, ctx: &egui::Context) {
+        use egui_extras::{Column, TableBuilder};
+        use std::time::{Duration, Instant};
+        if !self.show_issues {
+            return;
+        }
+        // Refresh the list periodically or when explicitly invalidated.
+        let stale = self
+            .issues_refreshed
+            .map(|t| t.elapsed() >= Duration::from_secs(5))
+            .unwrap_or(true);
+        if stale {
+            self.issues_recs = self.core.store.recordings_needing_remux().unwrap_or_default();
+            self.issues_refreshed = Some(Instant::now());
+        }
+
+        // Build owned lookup: monitor_id -> (channel_name, platform) to avoid
+        // holding a borrow on self.rows inside the viewport closure.
+        let mon_info: std::collections::HashMap<i64, (String, crate::models::Platform)> = self
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    r.monitor.id,
+                    (r.channel.name.clone(), r.monitor.platform()),
+                )
+            })
+            .collect();
+
+        // Clone the platform textures handle so the closure doesn't borrow self.
+        let ptex = self.platform_tex.clone();
+
+        let mut open = true;
+        enum Act {
+            Remux(usize),
+        }
+        let mut act: Option<Act> = None;
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("issues_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("⚠ Issues")
+                .with_inner_size([820.0, 380.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "{} recording(s) need attention",
+                            self.issues_recs.len()
+                        ));
+                        if ui.button("⟳ Refresh").clicked() {
+                            self.issues_refreshed = None;
+                        }
+                        ui.weak("These captures finished as .ts and need re-remuxing to MKV.");
+                    });
+                    ui.separator();
+                    if self.issues_recs.is_empty() {
+                        ui.weak("No issues found — all recordings are in their final format.");
+                        return;
+                    }
+                    TableBuilder::new(ui)
+                        .striped(true)
+                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                        .column(Column::auto())                                    // Platform icon
+                        .column(Column::auto().at_least(120.0))                    // Channel
+                        .column(Column::auto())                                    // Started
+                        .column(Column::remainder().clip(true).at_least(200.0))   // File
+                        .column(Column::auto())                                    // Status
+                        .column(Column::auto())                                    // Actions
+                        .header(20.0, |mut h| {
+                            h.col(|_ui| {});
+                            h.col(|ui| { ui.strong("Channel"); });
+                            h.col(|ui| { ui.strong("Started"); });
+                            h.col(|ui| { ui.strong("File"); });
+                            h.col(|ui| { ui.strong("Status"); });
+                            h.col(|ui| { ui.strong("Actions"); });
+                        })
+                        .body(|mut body| {
+                            for (i, rec) in self.issues_recs.iter().enumerate() {
+                                let (ch_name, platform) = mon_info
+                                    .get(&rec.monitor_id)
+                                    .map(|(n, p)| (n.as_str(), *p))
+                                    .unwrap_or(("?", crate::models::Platform::Generic));
+                                let fname = std::path::Path::new(&rec.output_path)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                let remuxing = self.background_tasks.iter().any(|bt| {
+                                    bt.kind == crate::events::BackgroundTaskKind::Remux
+                                        && bt.id == rec.id as u64
+                                });
+                                body.row(22.0, |mut row| {
+                                    row.col(|ui| {
+                                        if let Some(ref ptex) = ptex {
+                                            platform_icon(ui, ptex, platform);
+                                        } else {
+                                            ui.label(platform.label());
+                                        }
+                                    });
+                                    row.col(|ui| { ui.label(ch_name); });
+                                    row.col(|ui| { ui.label(fmt_datetime_short(rec.started_at)); });
+                                    row.col(|ui| {
+                                        ui.label(&fname).on_hover_text(&rec.output_path);
+                                    });
+                                    row.col(|ui| {
+                                        if remuxing {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(80, 160, 220),
+                                                "⏳ remuxing…",
+                                            );
+                                        } else {
+                                            let (icon, color) = state_icon(&rec.status);
+                                            ui.colored_label(color, icon)
+                                                .on_hover_text(&rec.status);
+                                        }
+                                    });
+                                    row.col(|ui| {
+                                        if ui
+                                            .add_enabled(
+                                                !remuxing,
+                                                egui::Button::new("🔄 Re-remux").small(),
+                                            )
+                                            .on_hover_text(
+                                                "Convert the .ts capture to .mkv using ffmpeg.",
+                                            )
+                                            .clicked()
+                                        {
+                                            act = Some(Act::Remux(i));
+                                        }
+                                    });
+                                });
+                            }
+                        });
+                });
+            },
+        );
+
+        if !open {
+            self.show_issues = false;
+        }
+        if let Some(Act::Remux(i)) = act {
+            if let Some(rec) = self.issues_recs.get(i) {
+                let dest = std::path::Path::new(&rec.output_path)
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .and_then(|d| {
+                        std::path::Path::new(&rec.output_path)
+                            .file_stem()
+                            .map(|s| d.join(format!("{}.mkv", s.to_string_lossy())))
+                    });
+                if let Some(dest) = dest {
+                    self.core.manual(crate::events::ManualCommand::ReRemux {
+                        rec_id: rec.id,
+                        capture: std::path::PathBuf::from(&rec.output_path),
+                        final_: dest,
+                    });
+                    self.status = format!("Re-remux started for recording {}…", rec.id);
+                }
+            }
         }
     }
 
