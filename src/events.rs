@@ -57,6 +57,8 @@ pub struct BackgroundTask {
     pub detail: String,
     /// Unix timestamp when the task was started.
     pub started_at: i64,
+    /// Fractional progress 0.0–1.0, if the task reports it (e.g. remux via ffmpeg).
+    pub progress: Option<f32>,
 }
 
 // ---------- Periodic background jobs ("scheduled") ----------
@@ -151,6 +153,11 @@ pub enum AppEvent {
     BackgroundTaskFinished {
         id: u64,
         outcome: TaskOutcome,
+    },
+    /// A background task reported incremental progress (0.0–1.0).
+    BackgroundTaskProgress {
+        id: u64,
+        progress: f32,
     },
 }
 

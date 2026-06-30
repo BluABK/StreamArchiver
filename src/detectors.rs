@@ -1002,6 +1002,7 @@ impl DetectContext {
                 label: channel_name.to_string(),
                 detail,
                 started_at: now_unix(),
+                progress: None,
             },
         ));
 

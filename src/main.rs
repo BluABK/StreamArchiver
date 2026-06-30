@@ -457,7 +457,7 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
             ts_len / 1024
         );
         if plan.remux_to_mkv && ts_len > 0 {
-            match downloader::remux_ts_to_mkv(&plan.capture_path, &plan.final_path).await {
+            match downloader::remux_ts_to_mkv(&plan.capture_path, &plan.final_path, None).await {
                 Ok(()) => {
                     let mkv = tokio::fs::metadata(&plan.final_path)
                         .await

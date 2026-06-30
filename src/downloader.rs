@@ -1127,11 +1127,13 @@ impl Supervisor {
                                 label: src_name,
                                 detail: format!("→ {dst_name}"),
                                 started_at: now_unix(),
+                                progress: None,
                             },
                         ));
+                        let tx2 = tx.clone();
                         tokio::spawn(async move {
                             info!("re-remux start: {}", capture.display());
-                            match remux_ts_to_mkv(&capture, &final_).await {
+                            match remux_ts_to_mkv(&capture, &final_, Some((tx2, task_id))).await {
                                 Ok(()) => {
                                     let _ = tokio::fs::remove_file(&capture).await;
                                     let path_s = final_.to_string_lossy();
@@ -1196,6 +1198,7 @@ impl Supervisor {
             label: row.channel.name.clone(),
             detail: format!("{} · icon, banner, badges, emotes", platform.label()),
             started_at: now_unix(),
+            progress: None,
         }));
 
         tokio::spawn(async move {
@@ -2060,6 +2063,7 @@ impl Supervisor {
                         label: task_label,
                         detail: "stream thumbnail".into(),
                         started_at: crate::models::now_unix(),
+                        progress: None,
                     },
                 ));
                 let tx = self.events.clone();
@@ -4009,7 +4013,22 @@ pub async fn probe_formats(tool: Tool, url: &str, auth: &AuthSource) -> Result<S
     }
 }
 
-pub async fn remux_ts_to_mkv(src: &Path, dst: &Path) -> anyhow::Result<()> {
+/// When `progress_tx` is `Some((tx, task_id))`, ffmpeg progress is streamed as
+/// `AppEvent::BackgroundTaskProgress` events on `tx`.
+pub async fn remux_ts_to_mkv(
+    src: &Path,
+    dst: &Path,
+    progress_tx: Option<(EventTx, u64)>,
+) -> anyhow::Result<()> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    // Get total duration so we can compute a percentage from ffmpeg's output.
+    let total_us: Option<i64> = if progress_tx.is_some() {
+        media_duration_secs(src).await.map(|s| s * 1_000_000)
+    } else {
+        None
+    };
+
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-y")
         .arg("-i")
@@ -4019,34 +4038,72 @@ pub async fn remux_ts_to_mkv(src: &Path, dst: &Path) -> anyhow::Result<()> {
         // `--hls-audio-select=*` would be dropped here. Map by type (each `?`
         // optional) rather than `-map 0` so TS data streams (e.g. timed-ID3),
         // which MKV can't hold, don't fail the remux.
-        .arg("-map")
-        .arg("0:v?")
-        .arg("-map")
-        .arg("0:a?")
-        .arg("-map")
-        .arg("0:s?")
-        .arg("-c")
-        .arg("copy")
+        .arg("-map").arg("0:v?")
+        .arg("-map").arg("0:a?")
+        .arg("-map").arg("0:s?")
+        .arg("-c").arg("copy")
+        // Write structured key=value progress lines to stdout.
+        .arg("-progress").arg("pipe:1")
+        // Suppress the default per-frame stats line that goes to stderr.
+        .arg("-nostats")
         .arg(dst)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
-    let out = cmd.output().await?;
-    if out.status.success() {
+
+    let mut child = cmd.spawn()?;
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+
+    // Collect stderr in background so we can report it on failure.
+    let stderr_task = tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr).lines();
+        let mut lines: Vec<String> = Vec::new();
+        while let Ok(Some(line)) = reader.next_line().await {
+            lines.push(line);
+        }
+        lines
+    });
+
+    // Read stdout for progress events.  `out_time_ms` is microseconds (despite
+    // the name) and appears once per progress block, right before `progress=continue`.
+    {
+        let mut reader = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            if let Some((ref tx, task_id)) = progress_tx {
+                if let Some(val) = line.strip_prefix("out_time_ms=") {
+                    if let (Ok(us), Some(total)) = (val.trim().parse::<i64>(), total_us) {
+                        if total > 0 {
+                            let p = (us as f64 / total as f64).clamp(0.0, 1.0) as f32;
+                            let _ = tx.send(AppEvent::BackgroundTaskProgress {
+                                id: task_id,
+                                progress: p,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let status = child.wait().await?;
+    let stderr_lines = stderr_task.await.unwrap_or_default();
+
+    if status.success() {
         Ok(())
     } else {
-        let code = out.status.code().unwrap_or(-1);
-        let stderr = String::from_utf8_lossy(&out.stderr);
+        let code = status.code().unwrap_or(-1);
         // Grab the last few non-empty lines of stderr — ffmpeg prints the
         // relevant error at the end (e.g. "Invalid data found when processing input").
-        let tail: String = stderr
-            .lines()
+        let tail: String = stderr_lines
+            .iter()
             .filter(|l| !l.trim().is_empty())
             .rev()
             .take(3)
+            .map(|s| s.as_str())
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
@@ -4411,7 +4468,7 @@ async fn promote_capture(plan: &DownloadPlan) -> PathBuf {
         return plan.capture_path.clone(); // failed: leave the partial for the sweep
     }
     if plan.remux_to_mkv {
-        match remux_ts_to_mkv(&plan.capture_path, &plan.final_path).await {
+        match remux_ts_to_mkv(&plan.capture_path, &plan.final_path, None).await {
             Ok(()) => {
                 let _ = tokio::fs::remove_file(&plan.capture_path).await;
                 plan.final_path.clone()
