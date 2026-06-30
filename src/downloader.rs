@@ -1111,6 +1111,24 @@ impl Supervisor {
                     ManualCommand::ReRemux { rec_id, capture, final_ } => {
                         let store = self.store.clone();
                         let tx = self.events.clone();
+                        let task_id = rec_id as u64;
+                        let src_name = capture
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let dst_name = final_
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let _ = tx.send(AppEvent::BackgroundTaskStarted(
+                            crate::events::BackgroundTask {
+                                id: task_id,
+                                kind: crate::events::BackgroundTaskKind::Remux,
+                                label: src_name,
+                                detail: format!("→ {dst_name}"),
+                                started_at: now_unix(),
+                            },
+                        ));
                         tokio::spawn(async move {
                             info!("re-remux start: {}", capture.display());
                             match remux_ts_to_mkv(&capture, &final_).await {
@@ -1120,11 +1138,19 @@ impl Supervisor {
                                     if let Err(e) = store.update_recording_output_path(rec_id, &path_s) {
                                         warn!("re-remux: DB update failed for rec_id={rec_id}: {e:#}");
                                     }
+                                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                                        id: task_id,
+                                        outcome: crate::events::TaskOutcome::Completed,
+                                    });
                                     let _ = tx.send(AppEvent::RecordingUpdated { recording_id: rec_id });
                                     info!("re-remux done: {}", final_.display());
                                 }
                                 Err(e) => {
                                     warn!("re-remux failed for rec_id={rec_id}: {e:#}");
+                                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                                        id: task_id,
+                                        outcome: crate::events::TaskOutcome::Failed(e.to_string()),
+                                    });
                                     let _ = tx.send(AppEvent::RecordingUpdated { recording_id: rec_id });
                                 }
                             }

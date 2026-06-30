@@ -9274,6 +9274,17 @@ impl StreamArchiverApp {
                                             }
                                             _ => {}
                                         }
+                                        // In-progress job badges
+                                        let remuxing = self.background_tasks.iter().any(|bt| {
+                                            bt.kind == crate::events::BackgroundTaskKind::Remux
+                                                && bt.id == t.id as u64
+                                        });
+                                        if remuxing {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(80, 160, 220),
+                                                "⏳ Remuxing…",
+                                            ).on_hover_text("Converting .ts capture to .mkv — check the Background tab for progress.");
+                                        }
                                     });
                                     tr.col(|_ui| {}); // next stream (n/a per take)
                                     tr.col(|ui| {

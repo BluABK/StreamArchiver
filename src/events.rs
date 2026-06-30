@@ -25,6 +25,7 @@ pub enum BackgroundTaskKind {
     AssetFetch,
     ThumbnailFetch,
     OcrCall,
+    Remux,
 }
 
 impl BackgroundTaskKind {
@@ -33,6 +34,7 @@ impl BackgroundTaskKind {
             BackgroundTaskKind::AssetFetch => "Asset fetch",
             BackgroundTaskKind::ThumbnailFetch => "Thumbnail",
             BackgroundTaskKind::OcrCall => "Schedule OCR",
+            BackgroundTaskKind::Remux => "Re-remux",
         }
     }
 }
