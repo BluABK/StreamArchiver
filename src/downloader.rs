@@ -4700,18 +4700,35 @@ pub async fn reorganize_recording_files(
         return Ok(None);
     }
     let current = PathBuf::from(&output_path);
-    if !current.exists() {
-        return Ok(None);
-    }
 
+    // Fetch base_dir unconditionally — we need it even when the video is gone,
+    // to sort any companion files (chat logs, thumbnails) stranded in the root.
     let (output_dir, _) = match store.get_monitor_output_dir(mid)? {
         Some(v) => v,
         None => return Ok(None),
     };
     let base_dir = PathBuf::from(&output_dir);
 
+    if !current.exists() {
+        // Video file is gone (failed recording, external move, etc.).
+        // Still try to sort companion files in the directory the video was supposed to land in.
+        if cfg.enabled && !reverse {
+            if let Some(s) = current.file_stem().and_then(|s| s.to_str()) {
+                let from_dir = current.parent().map(PathBuf::from).unwrap_or_else(|| base_dir.clone());
+                move_companions_to_subdirs(&from_dir, &base_dir, s, cfg).await;
+            }
+        }
+        return Ok(None);
+    }
+
     let ext = current.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let is_mkv = ext == "mkv" || ext == "mp4" || ext == "ts";
+
+    // Extract stem early so both the "already in place" path and the move path can use it.
+    let stem = match current.file_stem().and_then(|s| s.to_str()) {
+        Some(s) => s.to_string(),
+        None => return Ok(None),
+    };
 
     let target_dir = if reverse {
         base_dir.clone()
@@ -4722,17 +4739,18 @@ pub async fn reorganize_recording_files(
     };
 
     if target_dir == current.parent().unwrap_or(&base_dir) {
-        return Ok(None); // already in the right place
+        // Video is already in the right place. Still scan base_dir for any companion
+        // files that were left behind by a previous run (e.g. because the extension
+        // wasn't handled at the time).
+        if cfg.enabled && !reverse {
+            move_companions_to_subdirs(&base_dir, &base_dir, &stem, cfg).await;
+        }
+        return Ok(None);
     }
 
     if let Err(e) = tokio::fs::create_dir_all(&target_dir).await {
         anyhow::bail!("create_dir_all {:?}: {e:#}", target_dir);
     }
-
-    let stem = match current.file_stem().and_then(|s| s.to_str()) {
-        Some(s) => s.to_string(),
-        None => return Ok(None),
-    };
     let file_name = match current.file_name().and_then(|n| n.to_str()) {
         Some(n) => n.to_string(),
         None => return Ok(None),
@@ -4779,7 +4797,7 @@ async fn move_companions_to_subdirs(from_dir: &Path, base_dir: &Path, stem: &str
             continue;
         }
         let rest = &name[prefix.len()..];
-        let target_sub = if rest.ends_with("chat.jsonl") || rest.ends_with("live_chat.json") {
+        let target_sub = if rest.ends_with("chat.jsonl") || rest.ends_with("live_chat.json") || rest.ends_with("chat.log") {
             Some(&cfg.chat)
         } else if rest.ends_with("thumbnail.jpg") || rest.ends_with("thumbnail.webp") {
             Some(&cfg.thumbs)
