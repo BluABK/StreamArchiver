@@ -204,6 +204,7 @@ pub fn start_watchdog(hb: Heartbeat, threshold: Duration, exit_after_dialog: boo
                             &detail,
                             &log_dir,
                             true,
+                            Some((&hb, threshold)),
                         );
                         if force_quit || exit_after_dialog {
                             std::process::exit(101);
@@ -258,6 +259,7 @@ pub fn install_panic_dialog() {
             &detail,
             &log_dir,
             false,
+            None,
         );
 
         previous(info);
@@ -574,6 +576,10 @@ fn capture_ui_thread_stack(tid: u32) -> String {
 /// - panic (false): "Close" + "Copy details" + "Open log folder"
 /// - hang  (true):  "Force quit" + "Keep waiting" + "Copy details" + "Open log folder"
 ///
+/// `hb_for_timer`: when `Some`, the dialog polls the heartbeat every ~200ms
+/// and auto-dismisses with "Keep waiting" if the UI recovers. Pass `None` for
+/// crash/panic dialogs where no heartbeat exists.
+///
 /// Returns `true` only when the user chose **Force quit** (hang path).
 fn show_detail_dialog(
     title: &str,
@@ -582,13 +588,14 @@ fn show_detail_dialog(
     detail: &str,
     log_dir: &str,
     warning: bool,
+    hb_for_timer: Option<(&Heartbeat, Duration)>,
 ) -> bool {
     #[cfg(target_os = "windows")]
-    return show_task_dialog_win32(title, heading, summary, detail, log_dir, warning);
+    return show_task_dialog_win32(title, heading, summary, detail, log_dir, warning, hb_for_timer);
 
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (heading, detail, log_dir, warning);
+        let _ = (heading, detail, log_dir, warning, hb_for_timer);
         let _ = rfd::MessageDialog::new()
             .set_level(rfd::MessageLevel::Error)
             .set_title(title)
@@ -603,11 +610,16 @@ const BTN_FORCE_QUIT: i32 = 1001;
 const BTN_COPY: i32 = 1002;
 const BTN_OPEN_LOGS: i32 = 1003;
 
-// Thread-locals used by the TaskDialog callback to perform actions without
-// closing the dialog. Set before each TaskDialogIndirect call.
+// Thread-locals used by the TaskDialog callback. Set before each
+// TaskDialogIndirect call; cleared immediately after it returns.
 thread_local! {
     static CB_DETAIL: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
     static CB_LOG_DIR: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+    /// Raw `*const Inner` for the hang-dialog heartbeat check (0 = not a hang dialog).
+    /// The Inner lives for the program's lifetime so this pointer is always valid
+    /// while the dialog is open.
+    static CB_HB_PTR: std::cell::Cell<usize> = std::cell::Cell::new(0);
+    static CB_THRESHOLD_MS: std::cell::Cell<u64> = std::cell::Cell::new(0);
 }
 
 /// Raw HICON handle (as `usize`) for the custom crash/freeze dialog icon.
@@ -616,12 +628,14 @@ thread_local! {
 static DIALOG_ICON_HANDLE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 /// Set the PNG file to use as the main icon in crash and freeze dialogs.
+/// Downscales with Lanczos3, caches as an ICO in appdata, then loads it via
+/// `LoadImageW` so Windows handles pixel layout correctly.
 /// Call once at startup after the settings store is opened.
 /// A missing file or an unloadable PNG silently falls back to the standard icon.
 pub fn set_dialog_icon(path: Option<std::path::PathBuf>) {
     #[cfg(target_os = "windows")]
     if let Some(p) = path {
-        if let Some(hicon) = load_png_as_hicon(&p) {
+        if let Some(hicon) = prepare_and_load_icon(&p) {
             let _ = DIALOG_ICON_HANDLE.set(hicon.0 as usize);
         }
     }
@@ -629,91 +643,90 @@ pub fn set_dialog_icon(path: Option<std::path::PathBuf>) {
     let _ = path;
 }
 
-/// Load a PNG from `path` and create a Win32 HICON from it.
-/// Returns `None` on any failure (missing file, bad PNG, GDI error).
+/// Downscale `src` to 48×48 with Lanczos3, write an ICO to appdata, and load
+/// it via `LoadImageW`. Returns `None` on any failure (bad PNG, save error, …).
+/// Using LoadImageW with an ICO file avoids the manual BGRA flip and premultiply
+/// dance required by CreateBitmap/CreateIconIndirect.
 #[cfg(target_os = "windows")]
-fn load_png_as_hicon(
-    path: &std::path::Path,
+fn prepare_and_load_icon(
+    src: &std::path::Path,
 ) -> Option<windows::Win32::UI::WindowsAndMessaging::HICON> {
-    use windows::core::BOOL;
-    use windows::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject};
-    use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, ICONINFO};
+    use image::imageops::FilterType;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        LoadImageW, HICON, IMAGE_ICON, LR_LOADFROMFILE,
+    };
+    use windows::core::PCWSTR;
 
-    let img = image::open(path).ok()?.to_rgba8();
-    let (w, h) = img.dimensions();
-    if w == 0 || h == 0 {
-        return None;
-    }
+    const ICON_SIZE: u32 = 48;
 
-    // Convert top-down RGBA → bottom-up premultiplied BGRA (Windows icon layout).
-    let mut bgra = vec![0u8; (w * h * 4) as usize];
-    for row in 0..h {
-        let dst_row = h - 1 - row;
-        for col in 0..w {
-            let [r, g, b, a] = img.get_pixel(col, row).0;
-            let af = a as u32;
-            let base = ((dst_row * w + col) * 4) as usize;
-            bgra[base]     = ((b as u32 * af + 127) / 255) as u8;
-            bgra[base + 1] = ((g as u32 * af + 127) / 255) as u8;
-            bgra[base + 2] = ((r as u32 * af + 127) / 255) as u8;
-            bgra[base + 3] = a;
-        }
-    }
+    // High-quality downscale; avoids the aliasing Windows produces when given a
+    // large PNG and asked to scale it to a 48×48 icon on its own.
+    let img = image::open(src).ok()?.into_rgba8();
+    let scaled = image::imageops::resize(&img, ICON_SIZE, ICON_SIZE, FilterType::Lanczos3);
 
+    // Persist to appdata as an ICO so the result can be inspected and reused.
+    let ico_path = crate::app_paths::data_dir().join("dialog_icon.ico");
+    image::DynamicImage::ImageRgba8(scaled).save(&ico_path).ok()?;
+
+    // LoadImageW handles pixel layout (orientation, alpha) correctly for ICO files.
+    let path_w: Vec<u16> = ico_path
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     unsafe {
-        let hbm_color = CreateBitmap(
-            w as i32,
-            h as i32,
-            1,
-            32,
-            Some(bgra.as_ptr() as *const _),
-        );
-        if hbm_color.is_invalid() {
-            return None;
-        }
-
-        // 1-bpp mask: all zeros lets the 32-bpp alpha channel drive transparency.
-        let mask_stride = (w + 15) / 16 * 2; // WORD-aligned bytes per row
-        let mask = vec![0u8; (mask_stride * h) as usize];
-        let hbm_mask = CreateBitmap(
-            w as i32,
-            h as i32,
-            1,
-            1,
-            Some(mask.as_ptr() as *const _),
-        );
-        if hbm_mask.is_invalid() {
-            let _ = DeleteObject(hbm_color.into());
-            return None;
-        }
-
-        let info = ICONINFO {
-            fIcon: BOOL(1),
-            xHotspot: 0,
-            yHotspot: 0,
-            hbmMask: hbm_mask,
-            hbmColor: hbm_color,
-        };
-        let hicon = CreateIconIndirect(&info).ok();
-        let _ = DeleteObject(hbm_color.into());
-        let _ = DeleteObject(hbm_mask.into());
-
-        hicon.filter(|h| !h.is_invalid())
+        let handle = LoadImageW(
+            None,
+            PCWSTR(path_w.as_ptr()),
+            IMAGE_ICON,
+            ICON_SIZE as i32,
+            ICON_SIZE as i32,
+            LR_LOADFROMFILE,
+        )
+        .ok()?;
+        Some(HICON(handle.0))
     }
 }
 
+// TDM_CLICK_BUTTON = WM_USER + 102 = 0x0466: simulates a button click on the
+// task dialog. Used to auto-dismiss the hang dialog when the UI recovers.
+const TDM_CLICK_BUTTON: u32 = 0x0466;
+
 /// TaskDialog callback. Intercepts button clicks that should NOT close the
 /// dialog (Copy details, Open log folder) and returns S_FALSE to keep it open.
-/// Force quit / Close / Keep waiting return S_OK and close normally.
+/// For hang dialogs, also polls the heartbeat on every timer tick (≈200ms) and
+/// auto-dismisses with "Keep waiting" if the UI thread becomes responsive again.
 #[cfg(target_os = "windows")]
 unsafe extern "system" fn task_dialog_cb(
-    _hwnd: windows::Win32::Foundation::HWND,
+    hwnd: windows::Win32::Foundation::HWND,
     msg: windows::Win32::UI::Controls::TASKDIALOG_NOTIFICATIONS,
     wparam: windows::Win32::Foundation::WPARAM,
     _lparam: windows::Win32::Foundation::LPARAM,
     _lp_ref: isize,
 ) -> windows::core::HRESULT {
-    use windows::Win32::UI::Controls::TDN_BUTTON_CLICKED;
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::Controls::{TDN_BUTTON_CLICKED, TASKDIALOG_NOTIFICATIONS};
+    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+
+    // TDN_TIMER fires every ~200ms when TDF_CALLBACK_TIMER is set.
+    if msg == TASKDIALOG_NOTIFICATIONS(4) {
+        let hb_ptr = CB_HB_PTR.with(|c| c.get());
+        if hb_ptr != 0 {
+            let threshold_ms = CB_THRESHOLD_MS.with(|c| c.get());
+            // SAFETY: CB_HB_PTR holds a raw pointer to Inner from an Arc that lives
+            // for the program's lifetime (owned by start_watchdog's closure).
+            let inner = unsafe { &*(hb_ptr as *const Inner) };
+            let now = inner.start.elapsed().as_millis() as u64;
+            let last = inner.last_beat_ms.load(Ordering::Relaxed);
+            if now.saturating_sub(last) < threshold_ms {
+                // UI recovered — queue a "Keep waiting" click to dismiss.
+                // SAFETY: hwnd is valid for the lifetime of the dialog callback.
+                unsafe { let _ = PostMessageW(Some(hwnd), TDM_CLICK_BUTTON, WPARAM(2), LPARAM(0)); }
+            }
+        }
+        return windows::core::HRESULT(0);
+    }
+
     if msg == TDN_BUTTON_CLICKED {
         let btn = wparam.0 as i32;
         if btn == BTN_COPY {
@@ -740,10 +753,11 @@ fn show_task_dialog_win32(
     detail: &str,
     log_dir: &str,
     warning: bool,
+    hb_for_timer: Option<(&Heartbeat, Duration)>,
 ) -> bool {
     use windows::Win32::Foundation::{HWND, HINSTANCE};
     use windows::Win32::UI::Controls::{
-        TaskDialogIndirect, TASKDIALOG_BUTTON, TASKDIALOGCONFIG,
+        TaskDialogIndirect, TASKDIALOG_BUTTON, TASKDIALOGCONFIG, TASKDIALOG_FLAGS,
         TASKDIALOGCONFIG_0, TASKDIALOGCONFIG_1,
         TDF_ALLOW_DIALOG_CANCELLATION, TDF_SIZE_TO_CONTENT, TDF_USE_HICON_MAIN,
         TDCBF_CLOSE_BUTTON, TD_ERROR_ICON, TD_WARNING_ICON,
@@ -751,9 +765,18 @@ fn show_task_dialog_win32(
     use windows::Win32::UI::WindowsAndMessaging::{HICON, IDCANCEL};
     use windows::core::PCWSTR;
 
+    // TDF_CALLBACK_TIMER (0x0040): fires TDN_TIMER every ~200ms so we can poll
+    // the heartbeat and auto-dismiss when the UI thread becomes responsive again.
+    const TDF_CALLBACK_TIMER: TASKDIALOG_FLAGS = TASKDIALOG_FLAGS(0x0040);
+
     // Make detail and log_dir available to the callback via thread-locals.
     CB_DETAIL.with(|d| *d.borrow_mut() = detail.to_string());
     CB_LOG_DIR.with(|d| *d.borrow_mut() = log_dir.to_string());
+    // For hang dialogs: expose the heartbeat so the timer callback can auto-close.
+    if let Some((hb, threshold)) = hb_for_timer {
+        CB_HB_PTR.with(|c| c.set(std::sync::Arc::as_ptr(&hb.inner) as usize));
+        CB_THRESHOLD_MS.with(|c| c.set(threshold.as_millis() as u64));
+    }
 
     let w = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
 
@@ -820,7 +843,8 @@ fn show_task_dialog_win32(
         cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
         hwndParent: HWND(std::ptr::null_mut()),
         hInstance: HINSTANCE(std::ptr::null_mut()),
-        dwFlags: TDF_SIZE_TO_CONTENT | TDF_ALLOW_DIALOG_CANCELLATION | extra_flags,
+        dwFlags: TDF_SIZE_TO_CONTENT | TDF_ALLOW_DIALOG_CANCELLATION | extra_flags
+            | if hb_for_timer.is_some() { TDF_CALLBACK_TIMER } else { TASKDIALOG_FLAGS(0) },
         dwCommonButtons: TDCBF_CLOSE_BUTTON,
         pszWindowTitle: PCWSTR(title_w.as_ptr()),
         Anonymous1: anon1,
@@ -847,6 +871,9 @@ fn show_task_dialog_win32(
 
     let mut btn: i32 = IDCANCEL.0 as i32;
     let ok = unsafe { TaskDialogIndirect(&config, Some(&mut btn), None, None) };
+    // Clear heartbeat pointer so the callback never sees a dangling reference.
+    CB_HB_PTR.with(|c| c.set(0));
+    CB_THRESHOLD_MS.with(|c| c.set(0));
 
     if ok.is_err() {
         let level = if warning {
