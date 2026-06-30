@@ -12116,6 +12116,17 @@ impl StreamArchiverApp {
                                     bt.kind == crate::events::BackgroundTaskKind::Remux
                                         && bt.id == rec.id as u64
                                 });
+                                // Check finished_tasks for a prior failed remux attempt.
+                                let remux_err = self.finished_tasks.iter().find_map(|(t, outcome, _)| {
+                                    if t.kind == crate::events::BackgroundTaskKind::Remux
+                                        && t.id == rec.id as u64
+                                    {
+                                        if let crate::events::TaskOutcome::Failed(msg) = outcome {
+                                            return Some(msg.clone());
+                                        }
+                                    }
+                                    None
+                                });
                                 body.row(22.0, |mut row| {
                                     row.col(|ui| {
                                         if let Some(ref ptex) = ptex {
@@ -12146,6 +12157,11 @@ impl StreamArchiverApp {
                                                 egui::Color32::from_rgb(180, 60, 60),
                                                 "✗ empty",
                                             ).on_hover_text("Capture wrote 0 bytes — no data to recover.");
+                                        } else if let Some(ref err) = remux_err {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(180, 60, 60),
+                                                "✗ remux failed",
+                                            ).on_hover_text(err.as_str());
                                         } else {
                                             let (icon, color) = state_icon(&rec.status);
                                             ui.colored_label(color, icon)
@@ -12156,6 +12172,9 @@ impl StreamArchiverApp {
                                         if empty {
                                             ui.add_enabled(false, egui::Button::new("🔄 Re-remux").small())
                                                 .on_hover_text("Capture is empty — nothing to remux.");
+                                        } else if remux_err.is_some() {
+                                            ui.add_enabled(false, egui::Button::new("🔄 Re-remux").small())
+                                                .on_hover_text("Remux failed — hover the status cell for the ffmpeg error.");
                                         } else if ui
                                             .add_enabled(
                                                 !remuxing,
