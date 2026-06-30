@@ -1363,6 +1363,16 @@ impl Supervisor {
                                     Err(e) => warn!("reorganize-all rec_id={rec_id}: {e:#}"),
                                 }
                             }
+                            // Second pass: sweep every monitor output directory for companion
+                            // files that aren't linked to any recording (e.g. chat logs from
+                            // recordings that failed before an output_path was set).
+                            if cfg.enabled {
+                                if let Ok(dirs) = store.list_monitor_output_dirs() {
+                                    for dir in dirs {
+                                        sweep_companion_files(std::path::Path::new(&dir), &cfg).await;
+                                    }
+                                }
+                            }
                             let _ = tx.send(AppEvent::BackgroundTaskFinished {
                                 id: task_id,
                                 outcome: crate::events::TaskOutcome::CompletedWithNote(format!("{total} checked")),
@@ -4814,6 +4824,51 @@ async fn move_companions_to_subdirs(from_dir: &Path, base_dir: &Path, stem: &str
         };
         if let Some(sub) = target_sub {
             let target_dir = base_dir.join(sub);
+            let _ = tokio::fs::create_dir_all(&target_dir).await;
+            let dst = target_dir.join(&name);
+            let _ = tokio::fs::rename(entry.path(), dst).await;
+        }
+    }
+}
+
+/// Sweep every file directly in `dir` (non-recursive) and move companion files
+/// (chat logs, thumbnails, subtitles) into their configured subdirectories.
+/// This catches files that aren't linked to any recording in the database
+/// (e.g. chat logs from recordings that ended with no output_path).
+/// Video/part files are ignored — only known companion extensions are moved.
+pub(crate) async fn sweep_companion_files(dir: &Path, cfg: &crate::models::SubdirConfig) {
+    if !cfg.enabled {
+        return;
+    }
+    let mut rd = match tokio::fs::read_dir(dir).await {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(true) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let lower = name.to_ascii_lowercase();
+        let target_sub = if lower.ends_with(".chat.log")
+            || lower.ends_with(".chat.jsonl")
+            || lower.ends_with(".live_chat.json")
+        {
+            Some(&cfg.chat)
+        } else if lower.ends_with(".thumbnail.jpg") || lower.ends_with(".thumbnail.webp") {
+            Some(&cfg.thumbs)
+        } else {
+            let ext = Path::new(&lower).extension().and_then(|e| e.to_str()).unwrap_or("");
+            if SUBTITLE_EXTS.contains(&ext) {
+                Some(&cfg.subs)
+            } else if THUMBNAIL_EXTS.contains(&ext) {
+                Some(&cfg.thumbs)
+            } else {
+                None
+            }
+        };
+        if let Some(sub) = target_sub {
+            let target_dir = dir.join(sub);
             let _ = tokio::fs::create_dir_all(&target_dir).await;
             let dst = target_dir.join(&name);
             let _ = tokio::fs::rename(entry.path(), dst).await;

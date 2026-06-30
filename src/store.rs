@@ -2278,6 +2278,17 @@ impl Store {
         stmt.query_map([], |r| r.get(0))?.collect()
     }
 
+    /// All distinct output directories currently configured on monitors.
+    /// Used by "re-organize all" to sweep companion files in directories that
+    /// aren't linked to any specific recording (e.g. failed recordings with no output_path).
+    pub fn list_monitor_output_dirs(&self) -> rusqlite::Result<Vec<String>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT output_dir FROM monitor WHERE output_dir != '' ORDER BY output_dir",
+        )?;
+        stmt.query_map([], |r| r.get(0))?.collect()
+    }
+
     /// Fetch the core fields needed for a reorganize/rename operation on one recording.
     /// Returns `(monitor_id, output_path)`.
     pub fn get_recording_paths(&self, rec_id: i64) -> rusqlite::Result<Option<(i64, String)>> {
