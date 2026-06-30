@@ -528,6 +528,9 @@ pub struct StreamArchiverApp {
     show_issues: bool,
     issues_recs: Vec<crate::models::Recording>,
     issues_missing: Vec<crate::models::Recording>,
+    /// In-flight background load of missing-output-file recordings (spawned off
+    /// the UI thread because `path.exists()` can block on network/slow drives).
+    issues_missing_load: Option<std::sync::mpsc::Receiver<Vec<crate::models::Recording>>>,
     issues_refreshed: Option<std::time::Instant>,
     issues_confirm_clear: bool,
     quitting: bool,
@@ -993,6 +996,7 @@ impl StreamArchiverApp {
             show_issues: false,
             issues_recs: Vec::new(),
             issues_missing: Vec::new(),
+            issues_missing_load: None,
             issues_refreshed: None,
             issues_confirm_clear: false,
             quitting: false,
@@ -12044,24 +12048,54 @@ impl StreamArchiverApp {
     fn issues_window(&mut self, ctx: &egui::Context) {
         use egui_extras::{Column, TableBuilder};
         use std::time::{Duration, Instant};
+        // Drain any completed background missing-file check first so the badge
+        // count stays current even when the panel is hidden.
+        if let Some(rx) = &self.issues_missing_load {
+            match rx.try_recv() {
+                Ok(missing) => {
+                    self.issues_missing = missing;
+                    self.issues_missing_load = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.issues_missing_load = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Still in flight — keep repainting so we pick it up promptly.
+                    ctx.request_repaint_after(Duration::from_millis(200));
+                }
+            }
+        }
+
         // Always refresh so the toolbar button count stays current even when the
         // panel is closed. Use a slower interval when hidden.
         let interval = if self.show_issues {
             Duration::from_secs(5)
         } else {
-            Duration::from_secs(30)
+            Duration::from_secs(60)
         };
         let stale = self
             .issues_refreshed
             .map(|t| t.elapsed() >= interval)
             .unwrap_or(true);
-        if stale {
+        if stale && self.issues_missing_load.is_none() {
+            // The remux-needed query is small and fast — run it synchronously.
             self.issues_recs = self.core.store.recordings_needing_remux().unwrap_or_default();
-            let candidates = self.core.store.recordings_with_final_path().unwrap_or_default();
-            self.issues_missing = candidates
-                .into_iter()
-                .filter(|r| !std::path::Path::new(&r.output_path).exists())
-                .collect();
+            // The missing-file check calls path.exists() up to 500 times, which
+            // can block for seconds on network drives. Spawn it off the UI thread.
+            let core = self.core.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .name("issues-missing-check".into())
+                .spawn(move || {
+                    let candidates = core.store.recordings_with_final_path().unwrap_or_default();
+                    let missing: Vec<_> = candidates
+                        .into_iter()
+                        .filter(|r| !std::path::Path::new(&r.output_path).exists())
+                        .collect();
+                    let _ = tx.send(missing);
+                })
+                .ok();
+            self.issues_missing_load = Some(rx);
             self.issues_refreshed = Some(Instant::now());
         }
         if !self.show_issues {
