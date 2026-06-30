@@ -1253,6 +1253,34 @@ pub const K_MONITOR_SCOPE_CFG: &str = "monitor_schedule_scope";
 /// in crash and freeze dialogs. Empty = standard Windows error/warning icon.
 pub const K_DIALOG_ICON: &str = "dialog_icon";
 
+// ---------- Remux embedding options ----------
+
+/// `app_settings` key — embed the thumbnail sidecar as MKV cover art on remux.
+pub const K_REMUX_EMBED_THUMBNAIL: &str = "remux_embed_thumbnail";
+/// `app_settings` key — embed a title metadata tag in the MKV on remux.
+pub const K_REMUX_EMBED_TITLE: &str = "remux_embed_title";
+/// `app_settings` key — filename-template used to generate the MKV title tag.
+/// Supports the same tokens as the capture filename template (`{title}`, `{channel}`, …).
+/// Default when empty: `"{title}"`.
+pub const K_REMUX_TITLE_TEMPLATE: &str = "remux_title_template";
+/// `app_settings` key — embed subtitle sidecar files (`.srt`/`.ass`/`.vtt`) into the MKV.
+pub const K_REMUX_EMBED_SUBS: &str = "remux_embed_subs";
+
+// ---------- File management / subdirectory splitting ----------
+
+/// `app_settings` key — split output files into per-type subdirectories.
+pub const K_FILE_SPLIT_ENABLED: &str = "file_split_enabled";
+/// `app_settings` key — subdirectory name for video files (default `"videos"`).
+pub const K_FILE_SPLIT_VIDEOS: &str = "file_split_videos";
+/// `app_settings` key — subdirectory name for subtitle sidecars (default `"subs"`).
+pub const K_FILE_SPLIT_SUBS: &str = "file_split_subs";
+/// `app_settings` key — subdirectory name for chat logs (default `"chat"`).
+pub const K_FILE_SPLIT_CHAT: &str = "file_split_chat";
+/// `app_settings` key — subdirectory name for thumbnail sidecars (default `"thumbs"`).
+pub const K_FILE_SPLIT_THUMBS: &str = "file_split_thumbs";
+/// `app_settings` key — subdirectory name for process log files (default `"logs"`).
+pub const K_FILE_SPLIT_LOGS: &str = "file_split_logs";
+
 /// Cumulative statistics for all `claude` CLI OCR invocations.
 #[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OcrStats {
@@ -1280,6 +1308,56 @@ pub struct OcrModelStats {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_usd: f64,
+}
+
+/// Controls what gets embedded into the MKV container during a TS→MKV remux.
+#[derive(Clone, Debug)]
+pub struct RemuxOpts {
+    /// Attach a thumbnail sidecar as cover art (image/jpeg or image/png).
+    pub embed_thumbnail: bool,
+    /// Write a `title` metadata tag. `title_template` must be non-empty.
+    pub embed_title: bool,
+    /// Template string for the title tag; same token set as the capture filename template.
+    /// `"{title}"` is the recommended default.
+    pub title_template: String,
+    /// Copy subtitle sidecar files (`.srt`/`.ass`/`.vtt`) as subtitle streams.
+    pub embed_subs: bool,
+}
+
+impl Default for RemuxOpts {
+    fn default() -> Self {
+        RemuxOpts {
+            embed_thumbnail: true,
+            embed_title: false,
+            title_template: "{title}".into(),
+            embed_subs: false,
+        }
+    }
+}
+
+/// Configuration for splitting captured files into per-type subdirectories under
+/// each monitor's output directory (e.g. `output_dir/videos/`, `output_dir/chat/`, …).
+#[derive(Clone, Debug)]
+pub struct SubdirConfig {
+    pub enabled: bool,
+    pub videos: String,
+    pub subs: String,
+    pub chat: String,
+    pub thumbs: String,
+    pub logs: String,
+}
+
+impl Default for SubdirConfig {
+    fn default() -> Self {
+        SubdirConfig {
+            enabled: false,
+            videos: "videos".into(),
+            subs: "subs".into(),
+            chat: "chat".into(),
+            thumbs: "thumbs".into(),
+            logs: "logs".into(),
+        }
+    }
 }
 
 /// Aggregate counts/sizes across the whole DB — populated on demand for the Stats view.

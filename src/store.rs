@@ -1997,6 +1997,128 @@ impl Store {
         Ok(())
     }
 
+    /// All completed recordings whose `output_path` is an MKV (non-TS, non-empty).
+    /// Used by batch maintenance jobs (embed thumbnails, re-organize, etc.).
+    pub fn list_recordings_with_mkv(&self) -> rusqlite::Result<Vec<(i64, String)>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id, output_path FROM recording
+             WHERE output_path != ''
+               AND output_path NOT LIKE '%.ts'
+               AND status NOT IN ('recording')
+             ORDER BY id",
+        )?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect()
+    }
+
+    /// Completed recordings that have a non-empty `output_path` (any extension)
+    /// and a non-null `stream_id` (the YouTube/Twitch/Kick platform id).
+    /// Used to find recordings we might be able to download a thumbnail for.
+    /// Returns `(recording_id, output_path, stream_id)`.
+    pub fn list_recordings_with_stream_id(&self) -> rusqlite::Result<Vec<(i64, String, String)>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id, output_path, stream_id FROM recording
+             WHERE output_path != ''
+               AND stream_id IS NOT NULL
+               AND stream_id != ''
+               AND status NOT IN ('recording')
+             ORDER BY id",
+        )?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect()
+    }
+
+    /// All recording ids for a given monitor.
+    pub fn list_recording_ids_for_monitor(&self, mid: i64) -> rusqlite::Result<Vec<i64>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM recording WHERE monitor_id = ? AND status NOT IN ('recording') ORDER BY id",
+        )?;
+        stmt.query_map([mid], |r| r.get(0))?.collect()
+    }
+
+    /// All recording ids for all monitors belonging to a channel.
+    pub fn list_recording_ids_for_channel(&self, channel_id: i64) -> rusqlite::Result<Vec<i64>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT r.id FROM recording r
+             JOIN monitor m ON r.monitor_id = m.id
+             WHERE m.channel_id = ? AND r.status NOT IN ('recording')
+             ORDER BY r.id",
+        )?;
+        stmt.query_map([channel_id], |r| r.get(0))?.collect()
+    }
+
+    /// All recording ids, regardless of monitor or channel. Used by "re-organize all".
+    pub fn list_all_recording_ids(&self) -> rusqlite::Result<Vec<i64>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM recording WHERE status NOT IN ('recording') ORDER BY id",
+        )?;
+        stmt.query_map([], |r| r.get(0))?.collect()
+    }
+
+    /// Fetch the core fields needed for a reorganize/rename operation on one recording.
+    /// Returns `(monitor_id, output_path)`.
+    pub fn get_recording_paths(&self, rec_id: i64) -> rusqlite::Result<Option<(i64, String)>> {
+        let conn = self.db();
+        conn.query_row(
+            "SELECT monitor_id, COALESCE(output_path, '') FROM recording WHERE id = ?",
+            [rec_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+    }
+
+    /// Fetch the monitor's `output_dir` and `channel_id` for context during batch ops.
+    pub fn get_monitor_output_dir(&self, mid: i64) -> rusqlite::Result<Option<(String, i64)>> {
+        let conn = self.db();
+        conn.query_row(
+            "SELECT output_dir, channel_id FROM monitor WHERE id = ?",
+            [mid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+    }
+
+    /// Read the current [`SubdirConfig`] from app settings.
+    pub fn subdir_config(&self) -> crate::models::SubdirConfig {
+        let enabled = self.get_setting(crate::models::K_FILE_SPLIT_ENABLED)
+            .ok().flatten().map_or(false, |v| v == "1");
+        let str_or = |key: &str, default: &str| {
+            self.get_setting(key).ok().flatten()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| default.to_string())
+        };
+        crate::models::SubdirConfig {
+            enabled,
+            videos: str_or(crate::models::K_FILE_SPLIT_VIDEOS, "videos"),
+            subs:   str_or(crate::models::K_FILE_SPLIT_SUBS,   "subs"),
+            chat:   str_or(crate::models::K_FILE_SPLIT_CHAT,   "chat"),
+            thumbs: str_or(crate::models::K_FILE_SPLIT_THUMBS, "thumbs"),
+            logs:   str_or(crate::models::K_FILE_SPLIT_LOGS,   "logs"),
+        }
+    }
+
+    /// Read the current [`RemuxOpts`] from app settings.
+    pub fn remux_opts(&self) -> crate::models::RemuxOpts {
+        let bool_setting = |key: &str| {
+            self.get_setting(key).ok().flatten().map_or(false, |v| v == "1")
+        };
+        let embed_thumbnail = self.get_setting(crate::models::K_REMUX_EMBED_THUMBNAIL)
+            .ok().flatten()
+            .map_or(true, |v| v != "0"); // default on
+        let embed_title = bool_setting(crate::models::K_REMUX_EMBED_TITLE);
+        let title_template = self.get_setting(crate::models::K_REMUX_TITLE_TEMPLATE)
+            .ok().flatten()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "{title}".to_string());
+        let embed_subs = bool_setting(crate::models::K_REMUX_EMBED_SUBS);
+        crate::models::RemuxOpts { embed_thumbnail, embed_title, title_template, embed_subs }
+    }
+
     /// In-flight recordings (status `recording`) — crash/quit leftovers seen at
     /// startup. Excludes rows with a `detached_process` registry entry: those are
     /// owned by the detach reconcile (`reconcile_detached`), not the legacy

@@ -26,6 +26,13 @@ pub enum BackgroundTaskKind {
     ThumbnailFetch,
     OcrCall,
     Remux,
+    ReRemuxAll,
+    EmbedMissingThumbnails,
+    FetchMissingThumbnails,
+    ReorganizeAll,
+    ReorganizeTake(i64),
+    ReorganizeMonitor(i64),
+    ReorganizeChannel(i64),
 }
 
 impl BackgroundTaskKind {
@@ -35,6 +42,13 @@ impl BackgroundTaskKind {
             BackgroundTaskKind::ThumbnailFetch => "Thumbnail",
             BackgroundTaskKind::OcrCall => "Schedule OCR",
             BackgroundTaskKind::Remux => "Re-remux",
+            BackgroundTaskKind::ReRemuxAll => "Re-remux all",
+            BackgroundTaskKind::EmbedMissingThumbnails => "Embed thumbnails",
+            BackgroundTaskKind::FetchMissingThumbnails => "Fetch thumbnails",
+            BackgroundTaskKind::ReorganizeAll => "Re-organize all",
+            BackgroundTaskKind::ReorganizeTake(_) => "Re-organize take",
+            BackgroundTaskKind::ReorganizeMonitor(_) => "Re-organize monitor",
+            BackgroundTaskKind::ReorganizeChannel(_) => "Re-organize channel",
         }
     }
 }
@@ -266,4 +280,21 @@ pub enum ManualCommand {
         capture: std::path::PathBuf,
         final_: std::path::PathBuf,
     },
+    /// Re-remux all recordings that still have a `.ts` source file.
+    ReRemuxAll,
+    /// Embed the thumbnail sidecar into all MKV files that don't already have one.
+    EmbedMissingThumbnails,
+    /// Download missing thumbnails for recordings; if `embed` is true, immediately
+    /// embed them into the MKV after download.
+    FetchMissingThumbnails { embed: bool },
+    /// Reorganize all recordings according to the current [`SubdirConfig`].
+    ReorganizeAll,
+    /// Reorganize all recordings belonging to a specific take group (by recording id).
+    ReorganizeTake(i64),
+    /// Reorganize all recordings belonging to a monitor.
+    ReorganizeMonitor(i64),
+    /// Reorganize all recordings belonging to a channel.
+    ReorganizeChannel(i64),
+    /// Rename a recording's output file using the given new filename stem.
+    RenameRecording { rec_id: i64, new_stem: String },
 }

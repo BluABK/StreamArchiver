@@ -1134,7 +1134,7 @@ impl Supervisor {
                         let tx2 = tx.clone();
                         tokio::spawn(async move {
                             info!("re-remux start: {}", capture.display());
-                            match remux_ts_to_mkv(&capture, &final_, Some((tx2, task_id))).await {
+                            match remux_ts_to_mkv(&capture, &final_, Some((tx2, task_id)), &Default::default()).await {
                                 Ok(()) => {
                                     let _ = tokio::fs::remove_file(&capture).await;
                                     let path_s = final_.to_string_lossy();
@@ -1155,6 +1155,355 @@ impl Supervisor {
                                         outcome: crate::events::TaskOutcome::Failed(e.to_string()),
                                     });
                                     let _ = tx.send(AppEvent::RecordingUpdated { recording_id: rec_id });
+                                }
+                            }
+                        });
+                    }
+                    ManualCommand::ReRemuxAll => {
+                        let store = self.store.clone();
+                        let tx = self.events.clone();
+                        tokio::spawn(async move {
+                            let task_id = crate::events::next_task_id();
+                            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
+                                id: task_id,
+                                kind: crate::events::BackgroundTaskKind::ReRemuxAll,
+                                label: "Re-remux all".into(),
+                                detail: String::new(),
+                                started_at: now_unix(),
+                                progress: Some(0.0),
+                                progress_info: None,
+                            }));
+                            let recs = match store.list_recordings_with_mkv() {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                                        id: task_id,
+                                        outcome: crate::events::TaskOutcome::Failed(e.to_string()),
+                                    });
+                                    return;
+                                }
+                            };
+                            let total = recs.len();
+                            let mut done = 0usize;
+                            let opts = store.remux_opts();
+                            for (rec_id, output_path) in &recs {
+                                let mkv = PathBuf::from(output_path);
+                                // Only re-remux if the TS source is still present.
+                                let ts = mkv.with_extension("ts");
+                                if !ts.exists() {
+                                    done += 1;
+                                    continue;
+                                }
+                                let _ = tx.send(AppEvent::BackgroundTaskProgress {
+                                    id: task_id,
+                                    progress: Some(done as f32 / total as f32),
+                                    info: format!("{}/{total}: {}", done + 1, mkv.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()),
+                                });
+                                match remux_ts_to_mkv(&ts, &mkv, None, &opts).await {
+                                    Ok(()) => {
+                                        let _ = tokio::fs::remove_file(&ts).await;
+                                        let _ = tx.send(AppEvent::RecordingUpdated { recording_id: *rec_id });
+                                    }
+                                    Err(e) => warn!("re-remux-all failed for rec_id={rec_id}: {e:#}"),
+                                }
+                                done += 1;
+                            }
+                            let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                                id: task_id,
+                                outcome: crate::events::TaskOutcome::CompletedWithNote(format!("{total} checked")),
+                            });
+                        });
+                    }
+                    ManualCommand::EmbedMissingThumbnails => {
+                        let store = self.store.clone();
+                        let tx = self.events.clone();
+                        tokio::spawn(async move {
+                            let task_id = crate::events::next_task_id();
+                            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
+                                id: task_id,
+                                kind: crate::events::BackgroundTaskKind::EmbedMissingThumbnails,
+                                label: "Embed missing thumbnails".into(),
+                                detail: String::new(),
+                                started_at: now_unix(),
+                                progress: Some(0.0),
+                                progress_info: None,
+                            }));
+                            let recs = match store.list_recordings_with_mkv() {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                                        id: task_id,
+                                        outcome: crate::events::TaskOutcome::Failed(e.to_string()),
+                                    });
+                                    return;
+                                }
+                            };
+                            let total = recs.len();
+                            let mut embedded = 0usize;
+                            for (i, (rec_id, output_path)) in recs.iter().enumerate() {
+                                let mkv = PathBuf::from(output_path);
+                                if !mkv.exists() { continue; }
+                                let _ = tx.send(AppEvent::BackgroundTaskProgress {
+                                    id: task_id,
+                                    progress: Some(i as f32 / total as f32),
+                                    info: format!("{}/{total}: {}", i + 1, mkv.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()),
+                                });
+                                let mkv2 = mkv.clone();
+                                let has = tokio::task::spawn_blocking(move || mkv_has_thumbnail(&mkv2)).await.unwrap_or(false);
+                                if has { continue; }
+                                if let Some(thumb) = find_thumbnail_for(&mkv) {
+                                    match embed_thumbnail_into_mkv(&mkv, &thumb).await {
+                                        Ok(()) => {
+                                            embedded += 1;
+                                            let _ = tx.send(AppEvent::RecordingUpdated { recording_id: *rec_id });
+                                        }
+                                        Err(e) => warn!("embed-thumbnail failed for rec_id={rec_id}: {e:#}"),
+                                    }
+                                }
+                            }
+                            let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                                id: task_id,
+                                outcome: crate::events::TaskOutcome::CompletedWithNote(format!("{embedded} embedded")),
+                            });
+                        });
+                    }
+                    ManualCommand::FetchMissingThumbnails { embed } => {
+                        let store = self.store.clone();
+                        let tx = self.events.clone();
+                        tokio::spawn(async move {
+                            let task_id = crate::events::next_task_id();
+                            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
+                                id: task_id,
+                                kind: crate::events::BackgroundTaskKind::FetchMissingThumbnails,
+                                label: "Fetch missing thumbnails".into(),
+                                detail: String::new(),
+                                started_at: now_unix(),
+                                progress: Some(0.0),
+                                progress_info: None,
+                            }));
+                            let recs = match store.list_recordings_with_stream_id() {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                                        id: task_id,
+                                        outcome: crate::events::TaskOutcome::Failed(e.to_string()),
+                                    });
+                                    return;
+                                }
+                            };
+                            let total = recs.len();
+                            let mut fetched = 0usize;
+                            for (i, (rec_id, output_path, _stream_id)) in recs.iter().enumerate() {
+                                let output = PathBuf::from(output_path);
+                                if !output.exists() { continue; }
+                                // Skip if a thumbnail sidecar already exists.
+                                if find_thumbnail_for(&output).is_some() { continue; }
+                                let _ = tx.send(AppEvent::BackgroundTaskProgress {
+                                    id: task_id,
+                                    progress: Some(i as f32 / total as f32),
+                                    info: format!("{}/{total}: {}", i + 1, output.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()),
+                                });
+                                // We don't have a standalone thumbnail-fetch API here;
+                                // log a note for now — actual YouTube thumbnail fetching
+                                // requires the YT API helpers which live in detectors.rs.
+                                info!("fetch-missing-thumbnails: rec_id={rec_id} has no thumbnail sidecar (manual implementation required per-platform)");
+                                if embed {
+                                    if let Some(thumb) = find_thumbnail_for(&output) {
+                                        if let Err(e) = embed_thumbnail_into_mkv(&output, &thumb).await {
+                                            warn!("embed after fetch failed rec_id={rec_id}: {e:#}");
+                                        } else {
+                                            fetched += 1;
+                                            let _ = tx.send(AppEvent::RecordingUpdated { recording_id: *rec_id });
+                                        }
+                                    }
+                                }
+                            }
+                            let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                                id: task_id,
+                                outcome: crate::events::TaskOutcome::CompletedWithNote(format!("{fetched} processed")),
+                            });
+                        });
+                    }
+                    ManualCommand::ReorganizeAll => {
+                        let store = self.store.clone();
+                        let tx = self.events.clone();
+                        tokio::spawn(async move {
+                            let task_id = crate::events::next_task_id();
+                            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
+                                id: task_id,
+                                kind: crate::events::BackgroundTaskKind::ReorganizeAll,
+                                label: "Re-organize all".into(),
+                                detail: String::new(),
+                                started_at: now_unix(),
+                                progress: Some(0.0),
+                                progress_info: None,
+                            }));
+                            let cfg = store.subdir_config();
+                            let ids = match store.list_all_recording_ids() {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                                        id: task_id,
+                                        outcome: crate::events::TaskOutcome::Failed(e.to_string()),
+                                    });
+                                    return;
+                                }
+                            };
+                            let total = ids.len();
+                            for (i, rec_id) in ids.iter().enumerate() {
+                                let _ = tx.send(AppEvent::BackgroundTaskProgress {
+                                    id: task_id,
+                                    progress: Some(i as f32 / total.max(1) as f32),
+                                    info: format!("{}/{total}", i + 1),
+                                });
+                                let reverse = !cfg.enabled;
+                                match reorganize_recording_files(*rec_id, &store, &cfg, reverse).await {
+                                    Ok(Some(_)) => { let _ = tx.send(AppEvent::RecordingUpdated { recording_id: *rec_id }); }
+                                    Ok(None) => {}
+                                    Err(e) => warn!("reorganize-all rec_id={rec_id}: {e:#}"),
+                                }
+                            }
+                            let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                                id: task_id,
+                                outcome: crate::events::TaskOutcome::CompletedWithNote(format!("{total} checked")),
+                            });
+                        });
+                    }
+                    ManualCommand::ReorganizeTake(rec_id) => {
+                        let store = self.store.clone();
+                        let tx = self.events.clone();
+                        tokio::spawn(async move {
+                            let task_id = crate::events::next_task_id();
+                            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
+                                id: task_id,
+                                kind: crate::events::BackgroundTaskKind::ReorganizeTake(rec_id),
+                                label: format!("Re-organize recording #{rec_id}"),
+                                detail: String::new(),
+                                started_at: now_unix(),
+                                progress: None,
+                                progress_info: None,
+                            }));
+                            let cfg = store.subdir_config();
+                            let reverse = !cfg.enabled;
+                            match reorganize_recording_files(rec_id, &store, &cfg, reverse).await {
+                                Ok(_) => {
+                                    let _ = tx.send(AppEvent::RecordingUpdated { recording_id: rec_id });
+                                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                                        id: task_id,
+                                        outcome: crate::events::TaskOutcome::Completed,
+                                    });
+                                }
+                                Err(e) => {
+                                    warn!("reorganize take {rec_id}: {e:#}");
+                                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                                        id: task_id,
+                                        outcome: crate::events::TaskOutcome::Failed(e.to_string()),
+                                    });
+                                }
+                            }
+                        });
+                    }
+                    ManualCommand::ReorganizeMonitor(mid) => {
+                        let store = self.store.clone();
+                        let tx = self.events.clone();
+                        tokio::spawn(async move {
+                            let task_id = crate::events::next_task_id();
+                            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
+                                id: task_id,
+                                kind: crate::events::BackgroundTaskKind::ReorganizeMonitor(mid),
+                                label: format!("Re-organize monitor #{mid}"),
+                                detail: String::new(),
+                                started_at: now_unix(),
+                                progress: Some(0.0),
+                                progress_info: None,
+                            }));
+                            let cfg = store.subdir_config();
+                            let ids = match store.list_recording_ids_for_monitor(mid) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                                        id: task_id,
+                                        outcome: crate::events::TaskOutcome::Failed(e.to_string()),
+                                    });
+                                    return;
+                                }
+                            };
+                            let total = ids.len();
+                            let reverse = !cfg.enabled;
+                            for (i, rec_id) in ids.iter().enumerate() {
+                                let _ = tx.send(AppEvent::BackgroundTaskProgress {
+                                    id: task_id, progress: Some(i as f32 / total.max(1) as f32), info: format!("{}/{total}", i+1),
+                                });
+                                match reorganize_recording_files(*rec_id, &store, &cfg, reverse).await {
+                                    Ok(Some(_)) => { let _ = tx.send(AppEvent::RecordingUpdated { recording_id: *rec_id }); }
+                                    Err(e) => warn!("reorganize monitor {mid} rec_id={rec_id}: {e:#}"),
+                                    _ => {}
+                                }
+                            }
+                            let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                                id: task_id,
+                                outcome: crate::events::TaskOutcome::CompletedWithNote(format!("{total} checked")),
+                            });
+                        });
+                    }
+                    ManualCommand::ReorganizeChannel(channel_id) => {
+                        let store = self.store.clone();
+                        let tx = self.events.clone();
+                        tokio::spawn(async move {
+                            let task_id = crate::events::next_task_id();
+                            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
+                                id: task_id,
+                                kind: crate::events::BackgroundTaskKind::ReorganizeChannel(channel_id),
+                                label: format!("Re-organize channel #{channel_id}"),
+                                detail: String::new(),
+                                started_at: now_unix(),
+                                progress: Some(0.0),
+                                progress_info: None,
+                            }));
+                            let cfg = store.subdir_config();
+                            let ids = match store.list_recording_ids_for_channel(channel_id) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                                        id: task_id,
+                                        outcome: crate::events::TaskOutcome::Failed(e.to_string()),
+                                    });
+                                    return;
+                                }
+                            };
+                            let total = ids.len();
+                            let reverse = !cfg.enabled;
+                            for (i, rec_id) in ids.iter().enumerate() {
+                                let _ = tx.send(AppEvent::BackgroundTaskProgress {
+                                    id: task_id, progress: Some(i as f32 / total.max(1) as f32), info: format!("{}/{total}", i+1),
+                                });
+                                match reorganize_recording_files(*rec_id, &store, &cfg, reverse).await {
+                                    Ok(Some(_)) => { let _ = tx.send(AppEvent::RecordingUpdated { recording_id: *rec_id }); }
+                                    Err(e) => warn!("reorganize channel {channel_id} rec_id={rec_id}: {e:#}"),
+                                    _ => {}
+                                }
+                            }
+                            let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                                id: task_id,
+                                outcome: crate::events::TaskOutcome::CompletedWithNote(format!("{total} checked")),
+                            });
+                        });
+                    }
+                    ManualCommand::RenameRecording { rec_id, new_stem } => {
+                        let store = self.store.clone();
+                        let tx = self.events.clone();
+                        tokio::spawn(async move {
+                            match rename_recording_files(rec_id, &store, &new_stem).await {
+                                Ok(Some(_)) => {
+                                    let _ = tx.send(AppEvent::RecordingUpdated { recording_id: rec_id });
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    warn!("rename rec_id={rec_id}: {e:#}");
+                                    let _ = tx.send(AppEvent::Error {
+                                        context: format!("Rename recording #{rec_id}"),
+                                        message: e.to_string(),
+                                    });
                                 }
                             }
                         });
@@ -4048,6 +4397,7 @@ pub async fn remux_ts_to_mkv(
     src: &Path,
     dst: &Path,
     progress_tx: Option<(EventTx, u64)>,
+    opts: &crate::models::RemuxOpts,
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -4060,14 +4410,28 @@ pub async fn remux_ts_to_mkv(
 
     // Look for a thumbnail sidecar sitting next to the source TS (either our
     // HTTP fetch → `{stem}.thumbnail.jpg`, or yt-dlp's `--write-thumbnail` →
-    // `{stem}.webp`/`.jpg`/`.png`). If found, embed it as an MKV cover-art
-    // attachment so media players (mpv, VLC, …) pick it up automatically.
-    let thumbnail = find_thumbnail_for(src);
+    // `{stem}.webp`/`.jpg`/`.png`). If found and embedding is enabled, attach
+    // it as MKV cover art so media players (mpv, VLC, …) pick it up automatically.
+    let thumbnail = if opts.embed_thumbnail { find_thumbnail_for(src) } else { None };
+
+    // Collect subtitle sidecars if embedding is enabled.
+    let subs: Vec<PathBuf> = if opts.embed_subs {
+        collect_subtitle_sidecars(src)
+    } else {
+        Vec::new()
+    };
 
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-y")
         .arg("-i")
-        .arg(src)
+        .arg(src);
+
+    // Add subtitle sidecar inputs before -map flags so we can reference them.
+    for sub in &subs {
+        cmd.arg("-i").arg(sub);
+    }
+
+    cmd
         // Keep EVERY video/audio/subtitle stream, not just ffmpeg's default
         // one-per-type — otherwise the extra audio tracks captured via
         // `--hls-audio-select=*` would be dropped here. Map by type (each `?`
@@ -4075,8 +4439,19 @@ pub async fn remux_ts_to_mkv(
         // which MKV can't hold, don't fail the remux.
         .arg("-map").arg("0:v?")
         .arg("-map").arg("0:a?")
-        .arg("-map").arg("0:s?")
-        .arg("-c").arg("copy");
+        .arg("-map").arg("0:s?");
+
+    // Map each subtitle sidecar input stream.
+    for i in 1..=subs.len() {
+        cmd.arg("-map").arg(format!("{i}:s?"));
+    }
+
+    cmd.arg("-c").arg("copy");
+
+    // Title metadata tag.
+    if opts.embed_title && !opts.title_template.is_empty() {
+        cmd.arg("-metadata").arg(format!("title={}", opts.title_template));
+    }
 
     if let Some(ref thumb) = thumbnail {
         let ext = thumb
@@ -4235,6 +4610,247 @@ async fn media_duration_secs(path: &Path) -> Option<i64> {
     } else {
         None
     }
+}
+
+/// True if the MKV at `path` already has at least one attachment stream (cover art).
+/// Runs `ffprobe` synchronously — only call from a blocking context or `spawn_blocking`.
+pub fn mkv_has_thumbnail(path: &Path) -> bool {
+    let out = std::process::Command::new("ffprobe")
+        .args(["-v", "quiet", "-select_streams", "t",
+               "-show_entries", "stream=index", "-of", "csv=p=0"])
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output();
+    match out {
+        Ok(o) => !String::from_utf8_lossy(&o.stdout).trim().is_empty(),
+        Err(_) => false,
+    }
+}
+
+/// Embed `thumb` as a cover-art attachment into an existing MKV file in-place
+/// (remux to a temp file, then atomically replace the original).
+pub async fn embed_thumbnail_into_mkv(mkv: &Path, thumb: &Path) -> anyhow::Result<()> {
+    let tmp = mkv.with_extension("tmp.mkv");
+    let ext = thumb.extension().and_then(|e| e.to_str()).unwrap_or("jpg").to_ascii_lowercase();
+    let mime = match ext.as_str() {
+        "png"  => "image/png",
+        "webp" => "image/webp",
+        _      => "image/jpeg",
+    };
+    let cover_name = format!("cover.{ext}");
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-y")
+        .arg("-i").arg(mkv)
+        .arg("-i").arg(thumb)
+        .arg("-map").arg("0")
+        .arg("-c").arg("copy")
+        .arg("-attach").arg(thumb)
+        .arg("-metadata:s:t").arg(format!("mimetype={mime}"))
+        .arg("-metadata:s:t").arg(format!("filename={cover_name}"))
+        .arg(&tmp)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let out = cmd.output().await?;
+    if !out.status.success() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        let tail = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("ffmpeg embed-thumbnail failed: {}", tail.trim().lines().last().unwrap_or(""));
+    }
+    tokio::fs::rename(&tmp, mkv).await?;
+    Ok(())
+}
+
+/// Reorganize the files for one recording according to `cfg`. When `reverse` is
+/// true, moves files from subdirs back to the base output dir.
+/// Returns the new `output_path` for the video file, or the original if unchanged.
+pub async fn reorganize_recording_files(
+    rec_id: i64,
+    store: &std::sync::Arc<crate::store::Store>,
+    cfg: &crate::models::SubdirConfig,
+    reverse: bool,
+) -> anyhow::Result<Option<String>> {
+    let (mid, output_path) = match store.get_recording_paths(rec_id)? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    if output_path.is_empty() {
+        return Ok(None);
+    }
+    let current = PathBuf::from(&output_path);
+    if !current.exists() {
+        return Ok(None);
+    }
+
+    let (output_dir, _) = match store.get_monitor_output_dir(mid)? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let base_dir = PathBuf::from(&output_dir);
+
+    let ext = current.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let is_mkv = ext == "mkv" || ext == "mp4" || ext == "ts";
+
+    let target_dir = if reverse {
+        base_dir.clone()
+    } else if is_mkv && cfg.enabled {
+        base_dir.join(&cfg.videos)
+    } else {
+        return Ok(None); // nothing to move
+    };
+
+    if target_dir == current.parent().unwrap_or(&base_dir) {
+        return Ok(None); // already in the right place
+    }
+
+    if let Err(e) = tokio::fs::create_dir_all(&target_dir).await {
+        anyhow::bail!("create_dir_all {:?}: {e:#}", target_dir);
+    }
+
+    let stem = match current.file_stem().and_then(|s| s.to_str()) {
+        Some(s) => s.to_string(),
+        None => return Ok(None),
+    };
+    let file_name = match current.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n.to_string(),
+        None => return Ok(None),
+    };
+    let new_video_path = target_dir.join(&file_name);
+    tokio::fs::rename(&current, &new_video_path).await?;
+
+    // Move companion files (subs, thumbnail, chat) to their own dirs.
+    if cfg.enabled && !reverse {
+        let from_dir = current.parent().unwrap_or(&base_dir);
+        move_companions_to_subdirs(from_dir, &base_dir, &stem, cfg).await;
+    } else if reverse {
+        // Collapse all companions from sub-dirs back to base_dir.
+        let dirs = [&cfg.videos, &cfg.subs, &cfg.chat, &cfg.thumbs, &cfg.logs];
+        for sub in &dirs {
+            let sub_dir = base_dir.join(sub);
+            move_companions(&sub_dir, &base_dir, &stem).await;
+            // Try to remove the empty sub-dir (best effort; only our dirs).
+            let _ = tokio::fs::remove_dir(&sub_dir).await;
+        }
+    } else {
+        // Normal companion move: keep everything together with the video.
+        if let Some(from_dir) = current.parent() {
+            move_companions(from_dir, &target_dir, &stem).await;
+        }
+    }
+
+    let new_path_str = new_video_path.to_string_lossy().into_owned();
+    store.update_recording_output_path(rec_id, &new_path_str)?;
+    Ok(Some(new_path_str))
+}
+
+/// Move companion files (subs, thumbnail, chat log) to the appropriate sub-dirs
+/// based on `cfg`. Best-effort — skips files that can't be moved.
+async fn move_companions_to_subdirs(from_dir: &Path, base_dir: &Path, stem: &str, cfg: &crate::models::SubdirConfig) {
+    let prefix = format!("{stem}.");
+    let mut rd = match tokio::fs::read_dir(from_dir).await {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let rest = &name[prefix.len()..];
+        let target_sub = if rest.ends_with("chat.jsonl") || rest.ends_with("live_chat.json") {
+            Some(&cfg.chat)
+        } else if rest.ends_with("thumbnail.jpg") || rest.ends_with("thumbnail.webp") {
+            Some(&cfg.thumbs)
+        } else {
+            let lower = rest.to_ascii_lowercase();
+            let ext = Path::new(&lower).extension().and_then(|e| e.to_str()).unwrap_or(&lower);
+            if SUBTITLE_EXTS.contains(&ext) {
+                Some(&cfg.subs)
+            } else if THUMBNAIL_EXTS.contains(&ext) {
+                Some(&cfg.thumbs)
+            } else {
+                None
+            }
+        };
+        if let Some(sub) = target_sub {
+            let target_dir = base_dir.join(sub);
+            let _ = tokio::fs::create_dir_all(&target_dir).await;
+            let dst = target_dir.join(&name);
+            let _ = tokio::fs::rename(entry.path(), dst).await;
+        }
+    }
+}
+
+/// Rename a recording's output file (and its companions) to a new stem.
+/// Updates `recording.output_path` in the database.
+/// Returns the new path string, or None if the recording has no output path.
+pub async fn rename_recording_files(
+    rec_id: i64,
+    store: &std::sync::Arc<crate::store::Store>,
+    new_stem: &str,
+) -> anyhow::Result<Option<String>> {
+    let (_, output_path) = match store.get_recording_paths(rec_id)? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    if output_path.is_empty() {
+        return Ok(None);
+    }
+    let current = PathBuf::from(&output_path);
+    if !current.exists() {
+        anyhow::bail!("output file not found: {}", current.display());
+    }
+    let dir = match current.parent() {
+        Some(d) => d.to_path_buf(),
+        None => return Ok(None),
+    };
+    let ext = current.extension().and_then(|e| e.to_str()).unwrap_or("").to_string();
+    let old_stem = match current.file_stem().and_then(|s| s.to_str()) {
+        Some(s) => s.to_string(),
+        None => return Ok(None),
+    };
+
+    // Sanitize the new stem (same as capture filenames).
+    let new_stem_clean = sanitize_filename(new_stem);
+    if new_stem_clean.is_empty() || new_stem_clean == old_stem {
+        return Ok(None);
+    }
+
+    let new_file = dir.join(format!("{new_stem_clean}.{ext}"));
+    tokio::fs::rename(&current, &new_file).await?;
+
+    // Rename companion files.
+    let prefix_old = format!("{old_stem}.");
+    let mut rd = match tokio::fs::read_dir(&dir).await {
+        Ok(rd) => rd,
+        Err(_) => {
+            let new_path = new_file.to_string_lossy().into_owned();
+            store.update_recording_output_path(rec_id, &new_path)?;
+            return Ok(Some(new_path));
+        }
+    };
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == new_file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default() {
+            continue;
+        }
+        if let Some(rest) = name.strip_prefix(&prefix_old) {
+            if is_companion_suffix(rest) {
+                let new_name = format!("{new_stem_clean}.{rest}");
+                let dst = dir.join(&new_name);
+                let _ = tokio::fs::rename(entry.path(), dst).await;
+            }
+        }
+    }
+
+    let new_path = new_file.to_string_lossy().into_owned();
+    store.update_recording_output_path(rec_id, &new_path)?;
+    Ok(Some(new_path))
 }
 
 /// Actual media properties of a capture, for the filename `{resolution}`/
@@ -4535,6 +5151,31 @@ fn find_thumbnail_for(src: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Collect subtitle sidecar files adjacent to `src` (e.g. `{stem}.en.srt`,
+/// `{stem}.vtt`, `{stem}.ass`). Used by `remux_ts_to_mkv` when `embed_subs` is on.
+fn collect_subtitle_sidecars(src: &Path) -> Vec<PathBuf> {
+    let dir = match src.parent() { Some(d) => d, None => return Vec::new() };
+    let stem = match src.file_stem() { Some(s) => s.to_string_lossy().into_owned(), None => return Vec::new() };
+    let prefix = format!("{stem}.");
+    let mut subs = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            let rest = &name[prefix.len()..];
+            let lower = rest.to_ascii_lowercase();
+            let ext = Path::new(&lower).extension().and_then(|e| e.to_str()).unwrap_or(&lower);
+            if SUBTITLE_EXTS.contains(&ext) {
+                subs.push(entry.path());
+            }
+        }
+    }
+    subs.sort();
+    subs
+}
+
 /// Subtitle-sidecar extensions, for companion-file moves when the video is
 /// renamed (so external subs stay associated with their recording).
 const SUBTITLE_EXTS: [&str; 6] = ["vtt", "srt", "ass", "ssa", "sub", "lrc"];
@@ -4571,7 +5212,7 @@ async fn promote_capture(plan: &DownloadPlan) -> PathBuf {
         return plan.capture_path.clone(); // failed: leave the partial for the sweep
     }
     if plan.remux_to_mkv {
-        match remux_ts_to_mkv(&plan.capture_path, &plan.final_path, None).await {
+        match remux_ts_to_mkv(&plan.capture_path, &plan.final_path, None, &Default::default()).await {
             Ok(()) => {
                 let _ = tokio::fs::remove_file(&plan.capture_path).await;
                 plan.final_path.clone()

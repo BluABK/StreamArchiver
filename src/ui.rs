@@ -24,9 +24,13 @@ use crate::models::{
     K_DIALOG_ICON, K_DISCORD_SCHEDULE, K_DISCORD_TOKEN, K_FILENAME_MEDIA, K_MONITOR_DEFAULTS,
     K_OCR_COMMAND, K_OCR_EFFORT, K_OCR_FALLBACK_MODEL, K_OCR_MAX_BUDGET, K_OCR_MODEL,
     K_OCR_OFFSET, K_OCR_STATS, K_OCR_TIMEOUT_SECS, K_OCR_TIMEZONE, K_SCHEDULE_TITLE_FILL,
-    K_YT_API_DETECT, K_YT_API_SCHEDULE, K_YT_COMMUNITY_MAX_POSTS, MediaInfoMode, Monitor,
-    MonitorDefaults, MonitorWithChannel, OcrStats, Platform, Recording, ScheduleSegment,
-    StreamGroup, StreamMetaChange, Tool, UpcomingStream, Video, group_recordings, now_unix,
+    K_YT_API_DETECT, K_YT_API_SCHEDULE, K_YT_COMMUNITY_MAX_POSTS,
+    K_REMUX_EMBED_THUMBNAIL, K_REMUX_EMBED_TITLE, K_REMUX_TITLE_TEMPLATE, K_REMUX_EMBED_SUBS,
+    K_FILE_SPLIT_ENABLED, K_FILE_SPLIT_VIDEOS, K_FILE_SPLIT_SUBS, K_FILE_SPLIT_CHAT,
+    K_FILE_SPLIT_THUMBS, K_FILE_SPLIT_LOGS,
+    MediaInfoMode, Monitor, MonitorDefaults, MonitorWithChannel, OcrStats, Platform, Recording,
+    ScheduleSegment, StreamGroup, StreamMetaChange, Tool, UpcomingStream, Video,
+    group_recordings, now_unix,
 };
 use crate::google_oauth;
 use crate::imports::{self, ImportCandidate};
@@ -431,6 +435,25 @@ struct SettingsForm {
     /// (backlog depth). Empty = built-in default (5). Per-channel override in
     /// channel Properties.
     youtube_community_max_posts: String,
+    // --- Remux embedding options ---
+    /// Embed the thumbnail sidecar as MKV cover art on remux.
+    remux_embed_thumbnail: bool,
+    /// Embed a title metadata tag in the MKV on remux.
+    remux_embed_title: bool,
+    /// Template used to generate the MKV title tag.
+    remux_title_template: String,
+    /// Embed subtitle sidecar files as MKV subtitle streams on remux.
+    remux_embed_subs: bool,
+    // --- File management ---
+    /// Split output files into per-type subdirectories.
+    file_split_enabled: bool,
+    file_split_videos: String,
+    file_split_subs: String,
+    file_split_chat: String,
+    file_split_thumbs: String,
+    file_split_logs: String,
+    /// Checkbox for "fetch missing thumbnails" in the Maintenance section.
+    fetch_thumb_embed: bool,
 }
 
 /// Background load state of an import fetch (followed/subscriptions).
@@ -771,6 +794,14 @@ pub struct StreamArchiverApp {
     /// Channel id to scroll into view on the next Streams render, after a save
     /// adds a new channel. Cleared once consumed. None = no pending scroll.
     scroll_to_channel: Option<i64>,
+    /// Rename dialog: whether the dialog is open.
+    show_rename_dialog: bool,
+    /// Rename dialog: the recording id being renamed.
+    rename_rec_id: Option<i64>,
+    /// Rename dialog: the current template/stem string the user is editing.
+    rename_draft: String,
+    /// Rename dialog: live-expanded preview of `rename_draft`.
+    rename_preview: String,
 }
 
 impl StreamArchiverApp {
@@ -901,6 +932,21 @@ impl StreamArchiverApp {
             schedule_title_fill: setting_or_empty(&core, K_SCHEDULE_TITLE_FILL) == "1",
             youtube_community_max_posts: setting_or_empty(&core, K_YT_COMMUNITY_MAX_POSTS),
             dialog_icon: setting_or_empty(&core, K_DIALOG_ICON),
+            remux_embed_thumbnail: core.store.get_setting(K_REMUX_EMBED_THUMBNAIL)
+                .ok().flatten().map_or(true, |v| v != "0"),
+            remux_embed_title: setting_or_empty(&core, K_REMUX_EMBED_TITLE) == "1",
+            remux_title_template: {
+                let v = setting_or_empty(&core, K_REMUX_TITLE_TEMPLATE);
+                if v.is_empty() { "{title}".into() } else { v }
+            },
+            remux_embed_subs: setting_or_empty(&core, K_REMUX_EMBED_SUBS) == "1",
+            file_split_enabled: setting_or_empty(&core, K_FILE_SPLIT_ENABLED) == "1",
+            file_split_videos: { let v = setting_or_empty(&core, K_FILE_SPLIT_VIDEOS); if v.is_empty() { "videos".into() } else { v } },
+            file_split_subs:   { let v = setting_or_empty(&core, K_FILE_SPLIT_SUBS);   if v.is_empty() { "subs".into()   } else { v } },
+            file_split_chat:   { let v = setting_or_empty(&core, K_FILE_SPLIT_CHAT);   if v.is_empty() { "chat".into()   } else { v } },
+            file_split_thumbs: { let v = setting_or_empty(&core, K_FILE_SPLIT_THUMBS); if v.is_empty() { "thumbs".into() } else { v } },
+            file_split_logs:   { let v = setting_or_empty(&core, K_FILE_SPLIT_LOGS);   if v.is_empty() { "logs".into()   } else { v } },
+            fetch_thumb_embed: false,
         };
         // Apply the loaded date format + short-timestamp pattern before the first render.
         set_active_date_fmt(settings.date_fmt);
@@ -1093,6 +1139,10 @@ impl StreamArchiverApp {
             debug_test_game: "Just Chatting".into(),
             stats_snapshot: None,
             scroll_to_channel: None,
+            show_rename_dialog: false,
+            rename_rec_id: None,
+            rename_draft: String::new(),
+            rename_preview: String::new(),
         };
         app.reload_rows();
         app.reload_videos();
@@ -1636,6 +1686,16 @@ impl StreamArchiverApp {
                 s.youtube_community_max_posts.trim(),
             ),
             (K_DIALOG_ICON, s.dialog_icon.trim()),
+            (K_REMUX_EMBED_THUMBNAIL, if s.remux_embed_thumbnail { "1" } else { "0" }),
+            (K_REMUX_EMBED_TITLE,     if s.remux_embed_title     { "1" } else { "0" }),
+            (K_REMUX_TITLE_TEMPLATE, s.remux_title_template.trim()),
+            (K_REMUX_EMBED_SUBS,      if s.remux_embed_subs      { "1" } else { "0" }),
+            (K_FILE_SPLIT_ENABLED,  if s.file_split_enabled { "1" } else { "0" }),
+            (K_FILE_SPLIT_VIDEOS, s.file_split_videos.trim()),
+            (K_FILE_SPLIT_SUBS,   s.file_split_subs.trim()),
+            (K_FILE_SPLIT_CHAT,   s.file_split_chat.trim()),
+            (K_FILE_SPLIT_THUMBS, s.file_split_thumbs.trim()),
+            (K_FILE_SPLIT_LOGS,   s.file_split_logs.trim()),
         ];
         for (k, v) in pairs {
             if let Err(e) = self.core.store.set_setting(k, v) {
@@ -3833,6 +3893,8 @@ struct RowActions {
     select: Option<i64>,                // monitor id
     open_schedule: Option<i64>,         // monitor id (open its Next stream popup)
     properties: Option<i64>,            // monitor id
+    reorganize_monitor: Option<i64>,    // monitor id
+    reorganize_channel: Option<i64>,    // channel id
 }
 
 /// Render one capture-instance (monitor) row across all columns, with the Name
@@ -3912,6 +3974,11 @@ fn render_instance_row(
         let toggle_label = if m.enabled { "⏸  Disable" } else { "✔  Enable" };
         if ui.button(toggle_label).clicked() {
             a.toggle_enabled = Some((m.id, !m.enabled));
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("📁  Re-organize recordings").on_hover_text("Move all recordings for this monitor into/out of subdirectories.").clicked() {
+            a.reorganize_monitor = Some(m.id);
             ui.close();
         }
         ui.separator();
@@ -4822,6 +4889,7 @@ impl eframe::App for StreamArchiverApp {
         self.instance_properties_window(ui.ctx());
         self.channel_properties_window(ui.ctx());
         self.emote_viewer_window(ui.ctx());
+        self.rename_dialog_window(ui.ctx());
         self.asset_history_window(ui.ctx());
         self.recording_properties_window(ui.ctx());
         self.processes_window(ui.ctx());
@@ -8222,6 +8290,85 @@ impl StreamArchiverApp {
 
     /// The "Edit schedule item" dialog (None = closed). Lets the user correct an
     /// occurrence's time/title/category or delete it; saving marks the row
+    /// Rename-recording dialog: shows a text-edit for the new file stem, a live
+    /// preview of the final filename, and OK / Cancel buttons.
+    #[allow(deprecated)]
+    fn rename_dialog_window(&mut self, ctx: &egui::Context) {
+        if !self.show_rename_dialog {
+            return;
+        }
+        let rec_id = match self.rename_rec_id {
+            Some(id) => id,
+            None => { self.show_rename_dialog = false; return; }
+        };
+
+        let mut open = true;
+        let mut do_rename = false;
+        // These are local vars captured mutably by the closure.
+        let mut new_draft = self.rename_draft.clone();
+        let preview = self.rename_preview.clone();
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("rename_recording_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("Rename recording")
+                .with_inner_size([500.0, 160.0])
+                .with_resizable(false),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.add_space(8.0);
+                    ui.label("New file name (without extension):");
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut new_draft)
+                            .desired_width(ui.available_width())
+                            .hint_text("new stem"),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(format!("→ {preview}.mkv"))
+                        .color(egui::Color32::from_rgb(0xa0, 0xa0, 0xa0)));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("✔  OK").clicked() {
+                            do_rename = true;
+                        }
+                        if ui.button("✖  Cancel").clicked() {
+                            open = false;
+                        }
+                    });
+                });
+            },
+        );
+
+        // Update draft and recompute preview outside the closure (borrow is released).
+        if new_draft != self.rename_draft {
+            self.rename_draft = new_draft.clone();
+            self.rename_preview = crate::downloader::preview_filename(
+                &new_draft,
+                &crate::downloader::TemplateVars {
+                    name: &new_draft, title: &new_draft, channel: "",
+                    video_id: "", quality: "", resolution: "", height: "",
+                    width: "", fps: "", vcodec: "", acodec: "",
+                    take: "", games: "", tool: "", mode: "", platform: "",
+                    secs: 0, went_live: 0,
+                },
+            );
+        }
+
+        if do_rename {
+            let stem = self.rename_preview.clone();
+            self.core.manual(ManualCommand::RenameRecording { rec_id, new_stem: stem });
+            self.show_rename_dialog = false;
+            self.rename_rec_id = None;
+        } else if !open {
+            self.show_rename_dialog = false;
+            self.rename_rec_id = None;
+        }
+    }
+
     /// `"manual"` so a later automatic refresh leaves the correction intact.
     #[allow(deprecated)] // CentralPanel::show inside a viewport (matches the other dialogs)
     fn edit_schedule_window(&mut self, ctx: &egui::Context) {
@@ -9016,6 +9163,11 @@ impl StreamArchiverApp {
                                             }
                                         }
                                         ui.separator();
+                                        if ui.button("📁  Re-organize all recordings").on_hover_text("Move all recordings for this channel into/out of subdirectories.").clicked() {
+                                            acts.reorganize_channel = Some(cid);
+                                            ui.close();
+                                        }
+                                        ui.separator();
                                         if ui.button("🗑  Delete channel").clicked() {
                                             delete_channel = Some((cid, ch.name.clone()));
                                             ui.close();
@@ -9542,6 +9694,30 @@ impl StreamArchiverApp {
                                             ui.close();
                                         }
                                         ui.separator();
+                                        if ui
+                                            .add_enabled(file_ok, egui::Button::new("📁  Re-organize files"))
+                                            .on_hover_text("Move this recording's files into/out of subdirectories based on File Management settings.")
+                                            .clicked()
+                                        {
+                                            self.core.manual(ManualCommand::ReorganizeTake(t.id));
+                                            ui.close();
+                                        }
+                                        if ui
+                                            .add_enabled(file_ok, egui::Button::new("✏  Rename…"))
+                                            .on_hover_text("Rename this recording's file (and its companions) to a new stem.")
+                                            .clicked()
+                                        {
+                                            self.rename_rec_id = Some(t.id);
+                                            self.rename_draft = std::path::Path::new(&t.output_path)
+                                                .file_stem()
+                                                .and_then(|s| s.to_str())
+                                                .unwrap_or("")
+                                                .to_string();
+                                            self.rename_preview = self.rename_draft.clone();
+                                            self.show_rename_dialog = true;
+                                            ui.close();
+                                        }
+                                        ui.separator();
                                         let del_hint = if t.is_active() {
                                             "Stop the recording before removing this take"
                                         } else {
@@ -9687,6 +9863,14 @@ impl StreamArchiverApp {
         if let Some(id) = acts.stop_chat {
             self.core.manual(ManualCommand::StopChat(id));
             self.status = "Stopping chat download…".into();
+        }
+        if let Some(mid) = acts.reorganize_monitor {
+            self.core.manual(ManualCommand::ReorganizeMonitor(mid));
+            self.status = "Re-organizing monitor recordings…".into();
+        }
+        if let Some(cid) = acts.reorganize_channel {
+            self.core.manual(ManualCommand::ReorganizeChannel(cid));
+            self.status = "Re-organizing channel recordings…".into();
         }
         if let Some(mid) = acts.view_chat {
             self.open_chat_popup(mid, ui.ctx());
@@ -11437,6 +11621,103 @@ impl StreamArchiverApp {
             }
 
             ui.add_space(12.0);
+            // ── Remux ──────────────────────────────────────────────────────────
+            ui.add_space(12.0);
+            ui.heading("Remux");
+            ui.label("Controls what gets embedded into MKV files when a recording is finalized (TS→MKV remux).");
+            egui::Grid::new("remux_opts_grid")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.checkbox(&mut self.settings.remux_embed_thumbnail, "Embed thumbnail as cover art");
+                    ui.label("Attach the thumbnail sidecar (if present) as MKV cover art.");
+                    ui.end_row();
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.settings.remux_embed_title, "Embed title tag");
+                        ui.add_enabled(
+                            self.settings.remux_embed_title,
+                            egui::TextEdit::singleline(&mut self.settings.remux_title_template)
+                                .hint_text("{title}")
+                                .desired_width(200.0),
+                        );
+                    });
+                    ui.label("Template for the MKV title tag. Tokens: {title} {channel} {date} {name}");
+                    ui.end_row();
+                    ui.checkbox(&mut self.settings.remux_embed_subs, "Embed subtitle sidecars");
+                    ui.label("Copy .srt/.ass/.vtt sidecar files as subtitle streams in the MKV.");
+                    ui.end_row();
+                });
+
+            // ── File Management ────────────────────────────────────────────────
+            ui.add_space(12.0);
+            ui.heading("File Management");
+            ui.label("Split captured files into per-type subdirectories under the monitor output directory.");
+            egui::Grid::new("file_split_grid")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.checkbox(&mut self.settings.file_split_enabled, "Enable subdirectory splitting");
+                    ui.label("Move files into separate dirs (videos/, subs/, chat/, thumbs/, logs/).");
+                    ui.end_row();
+
+                    let enabled = self.settings.file_split_enabled;
+                    ui.label("Videos dir");
+                    ui.add_enabled(enabled, egui::TextEdit::singleline(&mut self.settings.file_split_videos).desired_width(140.0).hint_text("videos"));
+                    ui.end_row();
+                    ui.label("Subs dir");
+                    ui.add_enabled(enabled, egui::TextEdit::singleline(&mut self.settings.file_split_subs).desired_width(140.0).hint_text("subs"));
+                    ui.end_row();
+                    ui.label("Chat dir");
+                    ui.add_enabled(enabled, egui::TextEdit::singleline(&mut self.settings.file_split_chat).desired_width(140.0).hint_text("chat"));
+                    ui.end_row();
+                    ui.label("Thumbs dir");
+                    ui.add_enabled(enabled, egui::TextEdit::singleline(&mut self.settings.file_split_thumbs).desired_width(140.0).hint_text("thumbs"));
+                    ui.end_row();
+                    ui.label("Logs dir");
+                    ui.add_enabled(enabled, egui::TextEdit::singleline(&mut self.settings.file_split_logs).desired_width(140.0).hint_text("logs"));
+                    ui.end_row();
+                });
+
+            // ── Maintenance ────────────────────────────────────────────────────
+            ui.add_space(12.0);
+            ui.heading("Maintenance 🔧");
+            ui.label("One-time batch jobs — each runs in the background and reports progress in the Background tab.");
+            ui.add_space(6.0);
+            egui::Grid::new("maintenance_grid")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    if ui.button("Re-remux all").clicked() {
+                        self.core.manual(ManualCommand::ReRemuxAll);
+                    }
+                    ui.label("Re-run TS→MKV remux for any recording whose .ts source is still on disk.");
+                    ui.end_row();
+
+                    if ui.button("Embed missing thumbnails").clicked() {
+                        self.core.manual(ManualCommand::EmbedMissingThumbnails);
+                    }
+                    ui.label("Embed the thumbnail sidecar into MKV files that don't already have cover art.");
+                    ui.end_row();
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Fetch missing thumbnails").clicked() {
+                            self.core.manual(ManualCommand::FetchMissingThumbnails { embed: self.settings.fetch_thumb_embed });
+                        }
+                        ui.checkbox(&mut self.settings.fetch_thumb_embed, "Embed after fetch");
+                    });
+                    ui.label("Download thumbnails for recordings that are missing a sidecar.");
+                    ui.end_row();
+
+                    if ui.button("Re-organize all files").clicked() {
+                        self.core.manual(ManualCommand::ReorganizeAll);
+                    }
+                    ui.label("Move files into/out of subdirectories based on current File Management settings.");
+                    ui.end_row();
+                });
+
+            ui.add_space(12.0);
+
+            // ── Diagnostics ────────────────────────────────────────────────────
             ui.heading("Diagnostics");
             ui.label(
                 "Crash / freeze dialog icon — path to a PNG file shown as the main icon in \
