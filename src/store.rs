@@ -10,7 +10,21 @@ use parking_lot::FairMutex;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
-use chrono::Local;
+use chrono::TimeZone;
+
+/// Current date in US Pacific Time (UTC-8), which is when Google's API quotas
+/// reset. Using PST (UTC-8) exactly matches the reset in winter; in summer PDT
+/// (UTC-7) the local Pacific day starts 1h earlier than our boundary, so we
+/// carry at most 1 hour of extra headroom — the safe direction vs. resetting
+/// 9+ hours early when using the user's local timezone.
+fn quota_date_today() -> String {
+    let utc_secs = chrono::Utc::now().timestamp();
+    let pst = chrono::FixedOffset::west_opt(8 * 3600).unwrap();
+    pst.timestamp_opt(utc_secs, 0)
+        .unwrap()
+        .format("%Y-%m-%d")
+        .to_string()
+}
 
 use crate::models::{
     AdBreak, AuthKind, Channel, Container, DetachedKind, DetachedRow, DetectionMethod, GlobalStats,
@@ -695,7 +709,7 @@ impl Store {
     /// Increment the quota-units counter for `provider` on today's date.
     /// Silently ignores errors (quota tracking is best-effort).
     pub fn record_quota_usage(&self, provider: &str, units: i64) -> Result<()> {
-        let today = Local::now().format("%Y-%m-%d").to_string();
+        let today = quota_date_today();
         let conn = self.db();
         conn.execute(
             "INSERT INTO api_quota(provider, date, units) VALUES(?1, ?2, ?3)
@@ -707,7 +721,7 @@ impl Store {
 
     /// Return the total quota units consumed by `provider` today, or 0 if none.
     pub fn get_quota_today(&self, provider: &str) -> Result<i64> {
-        let today = Local::now().format("%Y-%m-%d").to_string();
+        let today = quota_date_today();
         let conn = self.db();
         let units = conn
             .query_row(
