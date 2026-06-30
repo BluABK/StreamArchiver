@@ -2974,6 +2974,14 @@ impl Supervisor {
             info!(monitor_id = m.id, rec_id = rec.id, "resuming interrupted SABR capture");
             to_resume.push((rec, row));
         }
+        // Promote orphaned recordings that now have an intact non-TS output file
+        // to 'completed'. These are captures where the app crashed after writing
+        // finished but before the status column was updated — the content is fine.
+        match self.store.promote_intact_orphans() {
+            Ok(n) if n > 0 => info!("promoted {n} intact orphaned recording(s) to 'completed'"),
+            Ok(_) => {}
+            Err(e) => warn!("promote_intact_orphans failed: {e:#}"),
+        }
         to_resume
     }
 

@@ -1851,6 +1851,23 @@ impl Store {
         Ok(rows)
     }
 
+    /// Promote orphaned recordings that have a non-TS final output file to
+    /// 'completed'. These are captures where the app crashed after the file was
+    /// fully written but before the status column was updated — the content is
+    /// intact, so 'orphaned' is a misnomer. Returns the count updated.
+    pub fn promote_intact_orphans(&self) -> Result<usize> {
+        let conn = self.db();
+        let n = conn.execute(
+            "UPDATE recording SET status='completed'
+             WHERE status='orphaned'
+               AND output_path != ''
+               AND output_path NOT LIKE '%.ts'
+               AND output_path NOT LIKE '%.cache%'",
+            [],
+        )?;
+        Ok(n)
+    }
+
     /// Mark any recordings still flagged 'recording' (i.e. left over from a
     /// crash) as 'orphaned'. Returns the number updated. Called on startup.
     pub fn mark_orphaned_recordings(&self, ended_at: i64) -> Result<usize> {
@@ -2135,6 +2152,10 @@ impl Store {
 
     /// Failed, aborted, or orphaned recordings that are not already caught by
     /// [`recordings_needing_remux`] (ts-in-cache). Returns newest-first, up to 200.
+    ///
+    /// Excludes orphaned recordings that have a non-TS final output path — those
+    /// are intact files where the app crashed after the capture finished but before
+    /// `status` was updated; they should be shown as completed, not errors.
     pub fn recordings_with_errors(&self) -> Result<Vec<crate::models::Recording>> {
         let conn = self.db();
         let mut stmt = conn.prepare(
@@ -2144,6 +2165,10 @@ impl Store {
              FROM recording
              WHERE status IN ('failed', 'aborted', 'orphaned')
                AND NOT (output_path LIKE '%.ts' AND output_path LIKE '%.cache%')
+               AND NOT (status = 'orphaned'
+                        AND output_path != ''
+                        AND output_path NOT LIKE '%.ts'
+                        AND output_path NOT LIKE '%.cache%')
              ORDER BY started_at DESC
              LIMIT 200",
         )?;
