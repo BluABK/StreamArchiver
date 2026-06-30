@@ -4334,10 +4334,9 @@ impl EmoteProvider {
             EmoteProvider::Ffz => "FrankerFaceZ",
         }
     }
-    /// Manifest filename for third-party providers; `None` for Twitch (no manifest).
     fn manifest(self) -> Option<&'static str> {
         match self {
-            EmoteProvider::Twitch => None,
+            EmoteProvider::Twitch => Some("twitch.json"),
             EmoteProvider::SevenTv => Some("7tv.json"),
             EmoteProvider::Bttv => Some("bttv.json"),
             EmoteProvider::Ffz => Some("ffz.json"),
@@ -4354,6 +4353,7 @@ struct EmoteViewer {
     provider: EmoteProvider,
     active: Vec<ViewerEmote>,
     deprecated: Vec<ViewerEmote>,
+    emote_properties: Option<ViewerEmote>,
 }
 
 impl EmoteViewer {
@@ -4362,7 +4362,7 @@ impl EmoteViewer {
             enumerate_provider_emotes(&channel_name, provider)
                 .into_iter()
                 .partition(|e| e.exists);
-        EmoteViewer { channel_name, provider, active, deprecated }
+        EmoteViewer { channel_name, provider, active, deprecated, emote_properties: None }
     }
 }
 
@@ -4556,8 +4556,11 @@ fn build_platform_asset_status(name: &str, platforms: &[Platform]) -> Vec<Platfo
 
 /// One emote row for the emote viewer: a code resolved to its on-disk image, plus
 /// whether that image still exists (absent ⇒ shown in the "Deprecated" section).
+#[derive(Clone)]
 struct ViewerEmote {
     name: String,
+    id: String,
+    ext: String,
     path: std::path::PathBuf,
     exists: bool,
 }
@@ -14483,14 +14486,20 @@ impl StreamArchiverApp {
         // lists below were enumerated once on open, so they no longer reflect disk.
         let stale = self.emote_viewer_stale;
 
-        // Borrow the (already-enumerated) emote lists; no disk access per frame.
+        // Extract everything we need from the viewer up front, so the borrow ends
+        // before we need to mutably borrow self later (for NLL borrow checker).
         let viewer = self.emote_viewer.as_ref().expect("checked Some above");
         let provider = viewer.provider;
-        let channel_name = &viewer.channel_name;
-        let active = &viewer.active;
-        let deprecated = &viewer.deprecated;
+        let channel_name = viewer.channel_name.clone();
+        let active = viewer.active.clone();
+        let deprecated = viewer.deprecated.clone();
+        let current_properties = viewer.emote_properties.clone();
+        // viewer borrow ends here; all derived values are owned or Copy
 
         let mut open = true;
+        let mut pending_properties: Option<ViewerEmote> = None;
+        let mut clear_properties = false;
+
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("emote_viewer_vp"),
             egui::ViewportBuilder::default()
@@ -14538,13 +14547,15 @@ impl StreamArchiverApp {
                         } else if !active.is_empty() {
                             emote_viewer_grid(
                                 ui,
-                                active,
+                                &active,
                                 &anim_cache,
                                 animate_emotes,
                                 now,
                                 &mut decode_misses,
                                 ctx,
                                 false,
+                                provider,
+                                &mut pending_properties,
                             );
                         }
                         // The "Deprecated" section appears only when the manifest
@@ -14565,20 +14576,90 @@ impl StreamArchiverApp {
                             ui.add_space(6.0);
                             emote_viewer_grid(
                                 ui,
-                                deprecated,
+                                &deprecated,
                                 &anim_cache,
                                 animate_emotes,
                                 now,
                                 &mut decode_misses,
                                 ctx,
                                 true,
+                                provider,
+                                &mut pending_properties,
                             );
                         }
                     });
                 });
+
+                // Properties window (floats above the central panel)
+                if let Some(ep) = &current_properties {
+                    let url = emote_cdn_url(provider, &ep.id, &ep.ext);
+                    let size_bytes = std::fs::metadata(&ep.path).map(|m| m.len()).unwrap_or(0);
+                    let mut prop_open = true;
+                    egui::Window::new("Emote Properties")
+                        .collapsible(false)
+                        .resizable(false)
+                        .open(&mut prop_open)
+                        .show(ctx, |ui| {
+                            egui::Grid::new("ep_grid")
+                                .num_columns(2)
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    ui.label("Name:");
+                                    ui.label(&ep.name);
+                                    ui.end_row();
+                                    ui.label("ID:");
+                                    ui.label(&ep.id);
+                                    ui.end_row();
+                                    ui.label("Provider:");
+                                    ui.label(provider.label());
+                                    ui.end_row();
+                                    ui.label("Extension:");
+                                    ui.label(&ep.ext);
+                                    ui.end_row();
+                                    ui.label("File:");
+                                    ui.label(ep.path.to_string_lossy());
+                                    ui.end_row();
+                                    ui.label("Size:");
+                                    ui.label(fmt_bytes(size_bytes as i64));
+                                    ui.end_row();
+                                    ui.label("URL:");
+                                    ui.label(&url);
+                                    ui.end_row();
+                                });
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                if ui.button("Copy URL").clicked() {
+                                    ui.ctx().copy_text(url.clone());
+                                }
+                                if ui.button("Open File").clicked() {
+                                    open_path(&ep.path);
+                                }
+                                if ui.button("Open Folder").clicked() {
+                                    if let Some(dir) = ep.path.parent() {
+                                        open_path(dir);
+                                    }
+                                }
+                            });
+                        });
+                    if !prop_open {
+                        clear_properties = true;
+                    }
+                }
+
                 draw_alt_image_preview(ctx);
             },
         );
+
+        // Apply context-menu / properties-window state changes collected during render.
+        if let Some(ep) = pending_properties {
+            if let Some(viewer) = &mut self.emote_viewer {
+                viewer.emote_properties = Some(ep);
+            }
+        } else if clear_properties {
+            if let Some(viewer) = &mut self.emote_viewer {
+                viewer.emote_properties = None;
+            }
+        }
 
         self.pump_emote_decodes(decode_misses, now, ctx);
 
@@ -14836,11 +14917,48 @@ fn emote_provider_counts(name: &str) -> [(EmoteProvider, usize); 4] {
 /// `exists = false` (the viewer lists those under "Deprecated"). Twitch is
 /// directory-listed by opaque id (no codes, so never deprecated). Sorted by code.
 fn enumerate_provider_emotes(name: &str, provider: EmoteProvider) -> Vec<ViewerEmote> {
-    use crate::assets::EmoteManifestEntry;
+    use crate::assets::{EmoteManifestEntry, sanitize_emote_name};
     let emotes_dir = channel_asset_dir(name, Platform::Twitch).join("emotes");
     let plat = crate::app_paths::platform_assets_dir();
 
+    // Resolve an emote's on-disk path: try the new `{id}_{name}.{ext}` pattern
+    // first (written by updated fetchers), fall back to old `{id}.{ext}` for
+    // files downloaded before this change.
+    let resolve_path = |base: std::path::PathBuf, e: &EmoteManifestEntry| -> std::path::PathBuf {
+        let new_name = format!("{}_{}.{}", e.id, sanitize_emote_name(&e.name), e.ext);
+        let new_path = base.join(&new_name);
+        if new_path.exists() {
+            new_path
+        } else {
+            base.join(format!("{}.{}", e.id, e.ext))
+        }
+    };
+
+    // For Twitch: use the manifest when available (written after a refetch under
+    // the new code). Fall back to directory listing for channels not yet refetched
+    // so existing `{id}.{ext}` files still appear, shown with the numeric id as name.
     if provider == EmoteProvider::Twitch {
+        let manifest_path = emotes_dir.join("twitch.json");
+        if manifest_path.exists() {
+            let entries: Vec<EmoteManifestEntry> =
+                std::fs::read_to_string(&manifest_path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+            let twitch_dir = emotes_dir.join("twitch");
+            let mut out: Vec<ViewerEmote> = entries
+                .into_iter()
+                .filter(|e| !e.name.trim().is_empty())
+                .map(|e| {
+                    let path = resolve_path(twitch_dir.clone(), &e);
+                    let exists = std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false);
+                    ViewerEmote { name: e.name, id: e.id, ext: e.ext, path, exists }
+                })
+                .collect();
+            out.sort_by_key(|e| e.name.to_lowercase());
+            return out;
+        }
+        // No manifest yet — dir-list fallback (shows numeric id as name)
         let mut out: Vec<ViewerEmote> = std::fs::read_dir(emotes_dir.join("twitch"))
             .into_iter()
             .flatten()
@@ -14848,12 +14966,18 @@ fn enumerate_provider_emotes(name: &str, provider: EmoteProvider) -> Vec<ViewerE
             .map(|e| e.path())
             .filter(|p| p.is_file())
             .map(|p| {
-                let name = p
+                let stem = p
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or_default()
                     .to_string();
-                ViewerEmote { name, path: p, exists: true }
+                let ext = p
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                // In the old layout the stem is the numeric id
+                ViewerEmote { name: stem.clone(), id: stem, ext, path: p, exists: true }
             })
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -14870,10 +14994,10 @@ fn enumerate_provider_emotes(name: &str, provider: EmoteProvider) -> Vec<ViewerE
     let resolve = |e: &EmoteManifestEntry| -> std::path::PathBuf {
         match provider {
             EmoteProvider::SevenTv => {
-                plat.join("7tv").join("emotes").join(format!("{}.{}", e.id, e.ext))
+                resolve_path(plat.join("7tv").join("emotes"), e)
             }
             EmoteProvider::Ffz => {
-                plat.join("ffz").join("emotes").join(format!("{}.{}", e.id, e.ext))
+                resolve_path(plat.join("ffz").join("emotes"), e)
             }
             EmoteProvider::Bttv => {
                 let base = if e.shared {
@@ -14881,7 +15005,7 @@ fn enumerate_provider_emotes(name: &str, provider: EmoteProvider) -> Vec<ViewerE
                 } else {
                     emotes_dir.join("bttv")
                 };
-                base.join(format!("{}.{}", e.id, e.ext))
+                resolve_path(base, e)
             }
             EmoteProvider::Twitch => unreachable!("Twitch handled above"),
         }
@@ -14892,12 +15016,9 @@ fn enumerate_provider_emotes(name: &str, provider: EmoteProvider) -> Vec<ViewerE
         .filter(|e| !e.name.trim().is_empty())
         .map(|e| {
             let path = resolve(&e);
-            // Mirror `assets::asset_present`: a 0-byte file is treated as absent
-            // (downloads write truncate-then-write, so a partial/aborted fetch can
-            // leave an empty stub). Using bare `path.exists()` would classify it as
-            // an active emote that then decodes to Failed and shows a permanent "…".
+            // Mirror `assets::asset_present`: a 0-byte file is treated as absent.
             let exists = std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false);
-            ViewerEmote { name: e.name, path, exists }
+            ViewerEmote { name: e.name, id: e.id, ext: e.ext, path, exists }
         })
         .collect();
     out.sort_by_key(|e| e.name.to_lowercase());
@@ -15492,6 +15613,64 @@ fn render_chat_message(
     });
 }
 
+/// CDN URL for an emote given provider, id, and extension.
+fn emote_cdn_url(provider: EmoteProvider, id: &str, ext: &str) -> String {
+    match provider {
+        EmoteProvider::Twitch => {
+            if ext == "gif" {
+                format!("https://static-cdn.jtvnw.net/emoticons/v2/{id}/animated/dark/3.0")
+            } else {
+                format!("https://static-cdn.jtvnw.net/emoticons/v2/{id}/static/dark/3.0")
+            }
+        }
+        EmoteProvider::SevenTv => format!("https://cdn.7tv.app/emote/{id}/4x.{ext}"),
+        EmoteProvider::Bttv => format!("https://cdn.betterttv.net/emote/{id}/3x.{ext}"),
+        EmoteProvider::Ffz => format!("https://cdn.frankerfacez.com/emoticon/{id}/4"),
+    }
+}
+
+/// Open a path (file or directory) with the default associated application.
+fn open_path(path: &std::path::Path) {
+    let _ = std::process::Command::new("explorer").arg(path).spawn();
+}
+
+/// Copy an image file's raw bytes to the Windows clipboard under the `PNG` format.
+/// Most apps (Discord, browsers, image editors) accept `CF_PNG` for paste.
+fn copy_emote_image_to_clipboard(path: &std::path::Path) {
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+
+    let Ok(bytes) = std::fs::read(path) else { return };
+
+    let fmt_name: Vec<u16> = "PNG\0".encode_utf16().collect();
+    let fmt = unsafe { RegisterClipboardFormatW(windows::core::PCWSTR(fmt_name.as_ptr())) };
+    if fmt == 0 {
+        return;
+    }
+
+    unsafe {
+        let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, bytes.len()) else { return };
+        let ptr = GlobalLock(hmem);
+        if ptr.is_null() {
+            return;
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
+        let _ = GlobalUnlock(hmem);
+
+        if OpenClipboard(None).is_ok() {
+            let _ = EmptyClipboard();
+            // SetClipboardData takes ownership of hmem on success; do not free it.
+            let _ = SetClipboardData(
+                fmt,
+                Some(windows::Win32::Foundation::HANDLE(hmem.0 as *mut std::ffi::c_void)),
+            );
+            let _ = CloseClipboard();
+        }
+    }
+}
+
 /// Lay out a provider's emotes as a wrapping grid of fixed-width cells: the emote
 /// image above its code. `deprecated` cells skip the image entirely (the file is
 /// gone) — they show a 🚫 placeholder and strike through the code. Loading cells
@@ -15506,12 +15685,14 @@ fn emote_viewer_grid(
     misses: &mut Vec<std::path::PathBuf>,
     ctx: &egui::Context,
     deprecated: bool,
+    provider: EmoteProvider,
+    pending_properties: &mut Option<ViewerEmote>,
 ) {
     const CELL_W: f32 = 92.0;
     const IMG_H: f32 = 44.0;
     ui.horizontal_wrapped(|ui| {
         for e in emotes {
-            ui.allocate_ui(egui::vec2(CELL_W, IMG_H + 22.0), |ui| {
+            let cell = ui.allocate_ui(egui::vec2(CELL_W, IMG_H + 22.0), |ui| {
                 // Virtualize: only decode/upload/draw emotes whose cell is on screen.
                 // `draw_cached_emote` stamps `last_drawn = now` on every Ready entry it
                 // touches, which pins it against `evict_emote_cache` (it keeps anything
@@ -15522,25 +15703,103 @@ fn emote_viewer_grid(
                 // entirely, letting scrolled-away emotes age out and be evicted.
                 let visible = ui.is_rect_visible(ui.max_rect());
                 ui.vertical_centered(|ui| {
-                    if deprecated {
+                    let img_resp = if deprecated {
                         ui.add_space((IMG_H - 18.0) / 2.0);
                         ui.label(egui::RichText::new("🚫").size(18.0).weak());
                         ui.add_space((IMG_H - 18.0) / 2.0);
+                        None
                     } else if !visible {
                         ui.add_space(IMG_H);
-                    } else if draw_cached_emote(ui, cache, &e.path, animate, IMG_H, now, misses, ctx)
-                        .is_none()
-                    {
-                        ui.add_space(IMG_H / 2.0 - 6.0);
-                        ui.weak("…");
-                        ui.add_space(IMG_H / 2.0 - 6.0);
+                        None
+                    } else {
+                        let r = draw_cached_emote(ui, cache, &e.path, animate, IMG_H, now, misses, ctx);
+                        if r.is_none() {
+                            ui.add_space(IMG_H / 2.0 - 6.0);
+                            ui.weak("…");
+                            ui.add_space(IMG_H / 2.0 - 6.0);
+                        }
+                        r
+                    };
+
+                    // Alt-hover: show enlarged image + emote info as a tooltip.
+                    // on_hover_ui_at_pointer takes self; clone the response so
+                    // img_resp stays usable for the label below.
+                    if let Some(resp) = img_resp.clone() {
+                        if resp.hovered() && ctx.input(|i| i.modifiers.alt) {
+                            let (epath, ename, eid, eext) = (
+                                e.path.clone(),
+                                e.name.clone(),
+                                e.id.clone(),
+                                e.ext.clone(),
+                            );
+                            resp.on_hover_ui_at_pointer(|ui| {
+                                ui.set_max_width(280.0);
+                                // Render cached texture at 3-4× cell size.
+                                // The cache caps decode at 56 px so no re-upload.
+                                draw_cached_emote(
+                                    ui, cache, &epath, false, 160.0, now,
+                                    &mut Vec::new(), ctx,
+                                );
+                                ui.separator();
+                                let url = emote_cdn_url(provider, &eid, &eext);
+                                egui::Grid::new(
+                                    egui::Id::new("alt_emote_tip").with(&eid),
+                                )
+                                .num_columns(2)
+                                .show(ui, |ui| {
+                                    ui.label("Name:");
+                                    ui.label(&ename);
+                                    ui.end_row();
+                                    ui.label("ID:");
+                                    ui.label(&eid);
+                                    ui.end_row();
+                                    ui.label("URL:");
+                                    ui.label(&url);
+                                    ui.end_row();
+                                });
+                            });
+                        }
                     }
+
                     let mut rt = egui::RichText::new(truncate_label(&e.name, 12)).small();
                     if deprecated {
                         rt = rt.strikethrough().weak();
                     }
                     ui.label(rt).on_hover_text(&e.name);
                 });
+            });
+
+            // Right-click context menu on the entire cell
+            cell.response.context_menu(|ui| {
+                if ui.button("Copy Image").clicked() {
+                    copy_emote_image_to_clipboard(&e.path);
+                    ui.close();
+                }
+                if ui.button("Open File").clicked() {
+                    open_path(&e.path);
+                    ui.close();
+                }
+                if ui.button("Open Folder").clicked() {
+                    if let Some(dir) = e.path.parent() {
+                        open_path(dir);
+                    }
+                    ui.close();
+                }
+                if ui.button("Copy URL").clicked() {
+                    ui.ctx().copy_text(emote_cdn_url(provider, &e.id, &e.ext));
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Properties").clicked() {
+                    *pending_properties = Some(ViewerEmote {
+                        name: e.name.clone(),
+                        id: e.id.clone(),
+                        ext: e.ext.clone(),
+                        path: e.path.clone(),
+                        exists: e.exists,
+                    });
+                    ui.close();
+                }
             });
         }
     });

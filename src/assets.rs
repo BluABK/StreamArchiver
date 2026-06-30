@@ -426,6 +426,7 @@ struct HelixEmoteImages {
 #[derive(Deserialize)]
 struct HelixEmote {
     id: String,
+    name: String,
     #[serde(default)]
     format: Vec<String>,
     images: HelixEmoteImages,
@@ -435,8 +436,9 @@ struct HelixEmotesResp {
     data: Vec<HelixEmote>,
 }
 
-/// Download Twitch channel emotes into `asset_dir/emotes/twitch/`.
-/// These are per-channel by nature so no global dedup is applied.
+/// Download Twitch channel emotes into `asset_dir/emotes/twitch/` and write a
+/// per-channel manifest `asset_dir/emotes/twitch.json`. Mirrors the BTTV/FFZ/7TV
+/// pattern so Twitch emotes also have named files and diff/history tracking.
 async fn fetch_twitch_emotes(
     client: &Client,
     client_id: &str,
@@ -464,6 +466,8 @@ async fn fetch_twitch_emotes(
     }
     let r: HelixEmotesResp = resp.json().await?;
 
+    let mut manifest: Vec<EmoteManifestEntry> = Vec::new();
+
     for emote in &r.data {
         let animated = emote.format.iter().any(|f| f == "animated");
         let (src_url, ext) = if animated {
@@ -477,14 +481,35 @@ async fn fetch_twitch_emotes(
         } else {
             (emote.images.url_4x.clone(), "png")
         };
-        let dest = emote_dir.join(format!("{}.{ext}", emote.id));
-        if asset_present(&dest) {
+        manifest.push(EmoteManifestEntry {
+            name: emote.name.clone(),
+            id: emote.id.clone(),
+            ext: ext.to_string(),
+            shared: false,
+        });
+        // New downloads get `{id}_{name}.{ext}`; old `{id}.{ext}` files are kept
+        // as-is (the viewer resolver falls back to them).
+        let new_dest = emote_dir.join(format!(
+            "{}_{}.{ext}",
+            emote.id,
+            sanitize_emote_name(&emote.name)
+        ));
+        let old_dest = emote_dir.join(format!("{}.{ext}", emote.id));
+        if asset_present(&new_dest) || asset_present(&old_dest) {
             continue;
         }
-        if let Err(e) = download_image(client, &src_url, &dest).await {
+        if let Err(e) = download_image(client, &src_url, &new_dest).await {
             warn!("Twitch emote {}: {e}", emote.id);
         }
     }
+
+    if !manifest.is_empty() {
+        record_manifest_change(asset_dir, "twitch", &manifest).await;
+        if let Ok(json) = serde_json::to_string(&manifest) {
+            let _ = tokio::fs::write(asset_dir.join("emotes").join("twitch.json"), json).await;
+        }
+    }
+
     Ok(())
 }
 
@@ -515,6 +540,14 @@ pub(crate) struct EmoteManifestEntry {
 /// it instead of the `exists()` guard pinning the corrupt file forever.
 fn asset_present(path: &Path) -> bool {
     std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
+}
+
+/// Sanitize an emote code for use as a filename component. Keeps alphanumerics,
+/// underscores, and hyphens; replaces anything else with `_`.
+pub(crate) fn sanitize_emote_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect()
 }
 
 // ---------- Asset change history ----------
@@ -754,15 +787,21 @@ async fn fetch_bttv_emotes(
                 ext: emote.image_type.clone(),
                 shared: false,
             });
-            let dest = dir.join(format!("{}.{}", emote.id, emote.image_type));
-            if asset_present(&dest) {
+            let new_dest = dir.join(format!(
+                "{}_{}.{}",
+                emote.id,
+                sanitize_emote_name(&emote.code),
+                emote.image_type
+            ));
+            let old_dest = dir.join(format!("{}.{}", emote.id, emote.image_type));
+            if asset_present(&new_dest) || asset_present(&old_dest) {
                 continue;
             }
             let url = format!(
                 "https://cdn.betterttv.net/emote/{}/3x.{}",
                 emote.id, emote.image_type
             );
-            if let Err(e) = download_image(client, &url, &dest).await {
+            if let Err(e) = download_image(client, &url, &new_dest).await {
                 warn!("BTTV channel emote {}: {e}", emote.id);
             }
         }
@@ -779,15 +818,21 @@ async fn fetch_bttv_emotes(
                 ext: emote.image_type.clone(),
                 shared: true,
             });
-            let dest = global_dir.join(format!("{}.{}", emote.id, emote.image_type));
-            if asset_present(&dest) {
+            let new_dest = global_dir.join(format!(
+                "{}_{}.{}",
+                emote.id,
+                sanitize_emote_name(&emote.code),
+                emote.image_type
+            ));
+            let old_dest = global_dir.join(format!("{}.{}", emote.id, emote.image_type));
+            if asset_present(&new_dest) || asset_present(&old_dest) {
                 continue;
             }
             let url = format!(
                 "https://cdn.betterttv.net/emote/{}/3x.{}",
                 emote.id, emote.image_type
             );
-            if let Err(e) = download_image(client, &url, &dest).await {
+            if let Err(e) = download_image(client, &url, &new_dest).await {
                 warn!("BTTV shared emote {}: {e}", emote.id);
             }
         }
@@ -872,11 +917,12 @@ async fn fetch_ffz_emotes(
                 ext: ext.to_string(),
                 shared: false,
             });
-            let dest = global_dir.join(format!("{id}.{ext}"));
-            if asset_present(&dest) {
+            let new_dest = global_dir.join(format!("{id}_{}.{ext}", sanitize_emote_name(name)));
+            let old_dest = global_dir.join(format!("{id}.{ext}"));
+            if asset_present(&new_dest) || asset_present(&old_dest) {
                 continue;
             }
-            if let Err(e) = download_image(client, &full_url, &dest).await {
+            if let Err(e) = download_image(client, &full_url, &new_dest).await {
                 warn!("FFZ emote {id}: {e}");
             }
         }
@@ -941,13 +987,14 @@ async fn fetch_7tv_emotes(
             ext: "webp".to_string(),
             shared: false,
         });
-        let dest = global_dir.join(format!("{id}.webp"));
-        if asset_present(&dest) {
+        let new_dest = global_dir.join(format!("{id}_{}.webp", sanitize_emote_name(name)));
+        let old_dest = global_dir.join(format!("{id}.webp"));
+        if asset_present(&new_dest) || asset_present(&old_dest) {
             continue;
         }
         // Prefer animated WebP; fall back to static
         let url = format!("https://cdn.7tv.app/emote/{id}/4x.webp");
-        if let Err(e) = download_image(client, &url, &dest).await {
+        if let Err(e) = download_image(client, &url, &new_dest).await {
             warn!("7TV emote {id}: {e}");
         }
     }
