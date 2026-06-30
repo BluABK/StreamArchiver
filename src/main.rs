@@ -128,6 +128,9 @@ fn main() -> Result<()> {
 
     let (rgba, w, h) = platform::app_icon_rgba();
     let native_options = eframe::NativeOptions {
+        // Persist egui's Memory to disk so resized column widths, window
+        // positions, and other UI state survive restarts.
+        persistence_path: Some(crate::app_paths::data_dir().join("egui_state.ron")),
         viewport: egui::ViewportBuilder::default()
             .with_title(concat!(
                 "StreamArchiver v",
