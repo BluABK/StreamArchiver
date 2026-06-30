@@ -25,6 +25,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 use crate::app_core::sleep_cancellable;
+use crate::browser_ua::{BrowserFingerprint, build_browser_fingerprint};
 use crate::events::{AppEvent, EventTx};
 use crate::models::{
     K_DISCORD_SCHEDULE, K_DISCORD_TOKEN, K_YT_API_DETECT, K_YT_API_SCHEDULE, MonitorWithChannel,
@@ -37,8 +38,6 @@ use crate::schedule_source::{
     load_channel_scope_map, load_monitor_scope_map, load_source_order,
 };
 use crate::store::Store;
-
-const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -189,6 +188,9 @@ pub struct DetectContext {
     /// Serializes user-token refresh: Twitch device-code refresh tokens are
     /// one-time-use, so concurrent detection passes must not double-spend one.
     twitch_refresh: Mutex<()>,
+    /// Browser fingerprint (UA + Sec-CH-UA headers) derived from the configured
+    /// cookies browser. Applied to all YouTube/Kick scrapes.
+    fingerprint: BrowserFingerprint,
     /// FNV-1a image hash → last OCR result per `(monitor_id, source_id)`. Skips a
     /// (multi-second, token-spending) re-OCR when the source image is unchanged.
     /// Persisted to `app_settings` (K_OCR_IMAGE_HASHES) so cache hits survive restarts.
@@ -211,8 +213,19 @@ fn fnv64(data: &[u8]) -> u64 {
 
 impl DetectContext {
     pub fn new(store: Arc<Store>, events: EventTx) -> DetectContext {
+        let browser = store
+            .get_setting("cookies_browser")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let browser_name = browser.split(':').next().unwrap_or("chrome");
+        let fingerprint = build_browser_fingerprint(if browser_name.is_empty() {
+            "chrome"
+        } else {
+            browser_name
+        });
         let http = Client::builder()
-            .user_agent(UA)
+            .user_agent(fingerprint.ua.clone())
             .timeout(Duration::from_secs(20))
             .build()
             .expect("building reqwest client");
@@ -248,6 +261,7 @@ impl DetectContext {
             twitch_token: Mutex::new(None),
             kick_token: Mutex::new(None),
             twitch_refresh: Mutex::new(()),
+            fingerprint,
             ocr_cache,
         }
     }
@@ -290,6 +304,20 @@ impl DetectContext {
     /// Clone of the shared HTTP client for use outside this struct (e.g. asset fetching).
     pub fn http_client(&self) -> Client {
         self.http.clone()
+    }
+
+    /// True when today's YouTube Data API usage has reached or exceeded the
+    /// configured cutoff (default 9000 units). Callers skip API calls when true.
+    fn youtube_quota_exceeded(&self) -> bool {
+        let cutoff: i64 = self
+            .store
+            .get_setting(crate::models::K_YT_API_QUOTA_CUTOFF)
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(9000);
+        let used = self.store.get_quota_today("youtube").unwrap_or(0);
+        used >= cutoff
     }
 
     /// Obtain a valid Twitch app token and the configured Client-Id.
@@ -779,8 +807,14 @@ impl DetectContext {
     /// `/streams` page (no credentials, no quota). `Some(vec)` on a successful
     /// fetch (possibly empty); `None` on a network/HTTP error.
     pub async fn youtube_schedule(&self, url: &str) -> Option<Vec<ScheduleSegment>> {
+        let jitter_ms = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos()
+            % 2000) as u64;
+        tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
         let streams_url = youtube_streams_url(url);
-        let resp = self
+        let rb = self
             .http
             .get(&streams_url)
             // Force English + US locale. YouTube geo-localizes the server-rendered
@@ -791,10 +825,8 @@ impl DetectContext {
             // params override that more reliably than `Accept-Language` alone.
             .query(&[("hl", "en"), ("gl", "US")])
             .header("Accept-Language", "en-US,en;q=0.9")
-            .header("Cookie", "CONSENT=YES+1; SOCS=CAI")
-            .send()
-            .await
-            .ok()?;
+            .header("Cookie", "CONSENT=YES+1; SOCS=CAI");
+        let resp = self.fingerprint.apply_yt_nav_headers(rb).send().await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -825,6 +857,10 @@ impl DetectContext {
         if key.is_empty() {
             return None;
         }
+        if self.youtube_quota_exceeded() {
+            debug!("YouTube schedule API skipped — daily quota limit reached");
+            return None;
+        }
         let channel_id = self.youtube_channel_id(url, &key).await.ok()?;
         // search.list for upcoming live broadcasts on this channel.
         let resp = self
@@ -844,6 +880,7 @@ impl DetectContext {
         if !resp.status().is_success() {
             return None;
         }
+        let _ = self.store.record_quota_usage("youtube", 100);
         let v: Value = resp.json().await.ok()?;
         let ids: Vec<String> = v["items"]
             .as_array()
@@ -903,6 +940,7 @@ impl DetectContext {
             if !resp.status().is_success() {
                 return None;
             }
+            let _ = self.store.record_quota_usage("youtube", 1);
             let v: Value = resp.json().await.ok()?;
             for item in v["items"].as_array().into_iter().flatten() {
                 if let (Some(id), Some(title)) =
@@ -1115,15 +1153,19 @@ impl DetectContext {
         let max_posts = community_max_posts(self.store.as_ref(), cfg);
 
         let community_url = youtube_community_url(&row.monitor.url);
-        let resp = self
+        let jitter_ms = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos()
+            % 2000) as u64;
+        tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
+        let rb = self
             .http
             .get(&community_url)
             .query(&[("hl", "en"), ("gl", "US")])
             .header("Accept-Language", "en-US,en;q=0.9")
-            .header("Cookie", "CONSENT=YES+1; SOCS=CAI")
-            .send()
-            .await
-            .ok()?;
+            .header("Cookie", "CONSENT=YES+1; SOCS=CAI");
+        let resp = self.fingerprint.apply_yt_nav_headers(rb).send().await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -1517,6 +1559,9 @@ impl DetectContext {
         if key.is_empty() {
             return DetectOutcome::err(item.monitor_id, "no YouTube API key (Settings)");
         }
+        if self.youtube_quota_exceeded() {
+            return DetectOutcome::err(item.monitor_id, "YouTube API daily quota limit reached");
+        }
         let channel_id = match self.youtube_channel_id(&item.url, &key).await {
             Ok(id) => id,
             Err(e) => return DetectOutcome::err(item.monitor_id, e.to_string()),
@@ -1536,6 +1581,7 @@ impl DetectContext {
             .await;
         match resp {
             Ok(r) if r.status().is_success() => {
+                let _ = self.store.record_quota_usage("youtube", 100);
                 let v: Value = r.json().await.unwrap_or_default();
                 match v["items"][0]["id"]["videoId"].as_str() {
                     Some(vid) => {
@@ -1639,6 +1685,7 @@ impl DetectContext {
             if !resp.status().is_success() {
                 return None;
             }
+            let _ = self.store.record_quota_usage("youtube", 1);
             let v: Value = resp.json().await.ok()?;
             for item in v["items"].as_array().into_iter().flatten() {
                 if let (Some(id), Some(ts)) = (
@@ -1780,15 +1827,20 @@ impl DetectContext {
     }
 
     async fn scrape_youtube(&self, item: &DetectItem) -> DetectOutcome {
+        let jitter_ms = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos()
+            % 2000) as u64;
+        tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
         let url = youtube_live_url(&item.url);
-        let resp = self
+        let rb = self
             .http
             .get(&url)
             .header("Accept-Language", "en-US,en;q=0.9")
             // Bypass the EU consent interstitial that otherwise replaces the page.
-            .header("Cookie", "CONSENT=YES+1; SOCS=CAI")
-            .send()
-            .await;
+            .header("Cookie", "CONSENT=YES+1; SOCS=CAI");
+        let resp = self.fingerprint.apply_yt_nav_headers(rb).send().await;
         match resp {
             Ok(r) => {
                 let body = r.text().await.unwrap_or_default();
@@ -1844,14 +1896,12 @@ impl DetectContext {
     /// (e.g. "Gaming") — the closest stable signal.
     pub async fn youtube_stream_meta(&self, url: &str) -> Option<StreamMeta> {
         let live_url = youtube_live_url(url);
-        let resp = self
+        let rb = self
             .http
             .get(&live_url)
             .header("Accept-Language", "en-US,en;q=0.9")
-            .header("Cookie", "CONSENT=YES+1; SOCS=CAI")
-            .send()
-            .await
-            .ok()?;
+            .header("Cookie", "CONSENT=YES+1; SOCS=CAI");
+        let resp = self.fingerprint.apply_yt_nav_headers(rb).send().await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -1863,13 +1913,18 @@ impl DetectContext {
         let Some(slug) = kick_slug(&item.url) else {
             return DetectOutcome::err(item.monitor_id, "cannot parse kick slug");
         };
+        let jitter_ms = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos()
+            % 2000) as u64;
+        tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
         let url = format!("https://kick.com/api/v2/channels/{slug}");
-        let resp = self
+        let rb = self
             .http
             .get(&url)
-            .header("Accept", "application/json")
-            .send()
-            .await;
+            .header("Accept", "application/json, text/plain, */*");
+        let resp = self.fingerprint.apply_kick_xhr_headers(rb).send().await;
         match resp {
             Ok(r) if r.status().is_success() => {
                 #[derive(Deserialize)]
@@ -1910,13 +1965,11 @@ impl DetectContext {
     pub async fn kick_stream_meta(&self, url: &str) -> Option<StreamMeta> {
         let slug = kick_slug(url)?;
         let api = format!("https://kick.com/api/v2/channels/{slug}");
-        let resp = self
+        let rb = self
             .http
             .get(&api)
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .ok()?;
+            .header("Accept", "application/json, text/plain, */*");
+        let resp = self.fingerprint.apply_kick_xhr_headers(rb).send().await.ok()?;
         if !resp.status().is_success() {
             return None;
         }

@@ -1280,6 +1280,10 @@ pub const K_FILE_SPLIT_CHAT: &str = "file_split_chat";
 pub const K_FILE_SPLIT_THUMBS: &str = "file_split_thumbs";
 /// `app_settings` key — subdirectory name for process log files (default `"logs"`).
 pub const K_FILE_SPLIT_LOGS: &str = "file_split_logs";
+/// `app_settings` key — YouTube Data API daily quota cutoff (integer, units).
+/// When set and today's usage meets or exceeds this value, API calls are skipped
+/// to protect the remaining quota. Default (when absent) = 9000.
+pub const K_YT_API_QUOTA_CUTOFF: &str = "youtube_api_quota_cutoff";
 
 /// Cumulative statistics for all `claude` CLI OCR invocations.
 #[derive(Default, Clone, serde::Serialize, serde::Deserialize)]

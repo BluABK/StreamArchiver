@@ -5,6 +5,7 @@
 mod app_core;
 mod app_paths;
 mod assets;
+mod browser_ua;
 mod chat;
 mod compat;
 mod detectors;

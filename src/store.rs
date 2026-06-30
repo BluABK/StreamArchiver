@@ -10,6 +10,7 @@ use parking_lot::FairMutex;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
+use chrono::Local;
 
 use crate::models::{
     AdBreak, AuthKind, Channel, Container, DetachedKind, DetachedRow, DetectionMethod, GlobalStats,
@@ -18,7 +19,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 32;
+const SCHEMA_VERSION: i64 = 33;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -604,7 +605,21 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 32)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 32);
+        if version < 33 {
+            // Per-provider, per-day API quota tracking. Currently used for the
+            // YouTube Data API (10,000 free units/day). `provider` is a short key
+            // like "youtube"; `date` is an ISO date string "YYYY-MM-DD".
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS api_quota (
+                    provider TEXT NOT NULL,
+                    date     TEXT NOT NULL,
+                    units    INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (provider, date)
+                );",
+            )?;
+            conn.pragma_update(None, "user_version", 33)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 33);
         Ok(())
     }
 
@@ -630,6 +645,36 @@ impl Store {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    // ----- API quota tracking (schema v33) -----
+
+    /// Increment the quota-units counter for `provider` on today's date.
+    /// Silently ignores errors (quota tracking is best-effort).
+    pub fn record_quota_usage(&self, provider: &str, units: i64) -> Result<()> {
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        let conn = self.db();
+        conn.execute(
+            "INSERT INTO api_quota(provider, date, units) VALUES(?1, ?2, ?3)
+             ON CONFLICT(provider, date) DO UPDATE SET units = units + excluded.units",
+            params![provider, today, units],
+        )?;
+        Ok(())
+    }
+
+    /// Return the total quota units consumed by `provider` today, or 0 if none.
+    pub fn get_quota_today(&self, provider: &str) -> Result<i64> {
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        let conn = self.db();
+        let units = conn
+            .query_row(
+                "SELECT units FROM api_quota WHERE provider = ?1 AND date = ?2",
+                params![provider, today],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        Ok(units)
     }
 
     // ----- community-post archive (schema v28) -----

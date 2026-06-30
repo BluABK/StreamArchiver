@@ -24,7 +24,7 @@ use crate::models::{
     K_DIALOG_ICON, K_DISCORD_SCHEDULE, K_DISCORD_TOKEN, K_FILENAME_MEDIA, K_MONITOR_DEFAULTS,
     K_OCR_COMMAND, K_OCR_EFFORT, K_OCR_FALLBACK_MODEL, K_OCR_MAX_BUDGET, K_OCR_MODEL,
     K_OCR_OFFSET, K_OCR_STATS, K_OCR_TIMEOUT_SECS, K_OCR_TIMEZONE, K_SCHEDULE_TITLE_FILL,
-    K_YT_API_DETECT, K_YT_API_SCHEDULE, K_YT_COMMUNITY_MAX_POSTS,
+    K_YT_API_DETECT, K_YT_API_SCHEDULE, K_YT_COMMUNITY_MAX_POSTS, K_YT_API_QUOTA_CUTOFF,
     K_REMUX_EMBED_THUMBNAIL, K_REMUX_EMBED_TITLE, K_REMUX_TITLE_TEMPLATE, K_REMUX_EMBED_SUBS,
     K_FILE_SPLIT_ENABLED, K_FILE_SPLIT_VIDEOS, K_FILE_SPLIT_SUBS, K_FILE_SPLIT_CHAT,
     K_FILE_SPLIT_THUMBS, K_FILE_SPLIT_LOGS,
@@ -364,6 +364,8 @@ struct SettingsForm {
     /// (each costs quota — see the Settings section).
     youtube_api_detect: bool,
     youtube_api_schedule: bool,
+    /// Daily quota cutoff for the YouTube Data API (units). Empty = default (9000).
+    youtube_api_quota_cutoff: String,
     kick_client_id: String,
     kick_client_secret: String,
     default_output_dir: String,
@@ -854,6 +856,7 @@ impl StreamArchiverApp {
             youtube_api_key: setting_or_empty(&core, K_YT_KEY),
             youtube_api_detect: setting_or_empty(&core, K_YT_API_DETECT) == "1",
             youtube_api_schedule: setting_or_empty(&core, K_YT_API_SCHEDULE) == "1",
+            youtube_api_quota_cutoff: setting_or_empty(&core, K_YT_API_QUOTA_CUTOFF),
             kick_client_id: setting_or_empty(&core, K_KICK_ID),
             kick_client_secret: setting_or_empty(&core, K_KICK_SECRET),
             default_output_dir: default_out,
@@ -1699,6 +1702,7 @@ impl StreamArchiverApp {
             (K_SHORT_TS_FMT, s.short_ts_fmt.trim()),
             (K_YT_API_DETECT, if s.youtube_api_detect { "1" } else { "0" }),
             (K_YT_API_SCHEDULE, if s.youtube_api_schedule { "1" } else { "0" }),
+            (K_YT_API_QUOTA_CUTOFF, s.youtube_api_quota_cutoff.trim()),
             (K_YTDLP_ARGS, s.ytdlp_default_args.trim()),
             (K_YTDLP_BINARY, s.ytdlp_binary_path.trim()),
             (K_SABR_BINARY, s.sabr_binary_path.trim()),
@@ -10730,6 +10734,20 @@ impl StreamArchiverApp {
                         self.core.request_yt_video_id_refetch();
                     }
                 }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Daily quota limit (units)");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.youtube_api_quota_cutoff)
+                            .desired_width(80.0)
+                            .hint_text("9000"),
+                    )
+                    .on_hover_text(
+                        "Stop making YouTube Data API calls today once this many units are spent. \
+                         The free tier allows 10,000 units/day; leaving a buffer prevents outages \
+                         from unexpected bursts. Default: 9000.",
+                    );
+                });
             });
 
             ui.add_space(12.0);
@@ -11970,6 +11988,38 @@ impl StreamArchiverApp {
                             ui.end_row();
                         }
                     });
+            }
+
+            ui.add_space(16.0);
+
+            // ── YouTube Data API quota ────────────────────────────────────────
+            ui.heading("YouTube Data API");
+            ui.separator();
+            {
+                let quota_today = self.core.store.get_quota_today("youtube").unwrap_or(0);
+                let cutoff: i64 = self
+                    .core
+                    .store
+                    .get_setting(K_YT_API_QUOTA_CUTOFF)
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(9000);
+                egui::Grid::new("quota_grid")
+                    .num_columns(4)
+                    .spacing([32.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Units used today");
+                        ui.strong(format!("{quota_today}"));
+                        ui.label("Daily limit");
+                        ui.strong(format!("{cutoff}"));
+                        ui.end_row();
+                    });
+                let frac = (quota_today as f32 / cutoff as f32).clamp(0.0, 1.0);
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .text(format!("{quota_today} / {cutoff} units")),
+                );
             }
 
             ui.add_space(16.0);

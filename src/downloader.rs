@@ -1598,8 +1598,17 @@ impl Supervisor {
                         None
                     };
                     let channel_id = uc.as_deref().unwrap_or("");
+                    let browser = store
+                        .get_setting("cookies_browser")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    let browser_name = browser.split(':').next().unwrap_or("chrome");
+                    let fp = crate::browser_ua::build_browser_fingerprint(
+                        if browser_name.is_empty() { "chrome" } else { browser_name }
+                    );
                     if crate::assets::run_youtube_assets(
-                        &http, &api_key, channel_id, &url, &asset_dir,
+                        &http, &api_key, channel_id, &url, &asset_dir, Some(&fp),
                     )
                     .await
                     {

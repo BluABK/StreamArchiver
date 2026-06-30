@@ -1,10 +1,12 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use reqwest::Client;
 use serde::Deserialize;
 use tracing::warn;
 
+use crate::browser_ua::BrowserFingerprint;
 use crate::models::now_unix;
 
 // ---------- Cache stamps ----------
@@ -803,6 +805,8 @@ async fn fetch_bttv_emotes(
             );
             if let Err(e) = download_image(client, &url, &new_dest).await {
                 warn!("BTTV channel emote {}: {e}", emote.id);
+            } else {
+                tokio::time::sleep(Duration::from_millis(150)).await;
             }
         }
     }
@@ -834,6 +838,8 @@ async fn fetch_bttv_emotes(
             );
             if let Err(e) = download_image(client, &url, &new_dest).await {
                 warn!("BTTV shared emote {}: {e}", emote.id);
+            } else {
+                tokio::time::sleep(Duration::from_millis(150)).await;
             }
         }
     }
@@ -924,6 +930,8 @@ async fn fetch_ffz_emotes(
             }
             if let Err(e) = download_image(client, &full_url, &new_dest).await {
                 warn!("FFZ emote {id}: {e}");
+            } else {
+                tokio::time::sleep(Duration::from_millis(150)).await;
             }
         }
     }
@@ -996,6 +1004,8 @@ async fn fetch_7tv_emotes(
         let url = format!("https://cdn.7tv.app/emote/{id}/4x.webp");
         if let Err(e) = download_image(client, &url, &new_dest).await {
             warn!("7TV emote {id}: {e}");
+        } else {
+            tokio::time::sleep(Duration::from_millis(150)).await;
         }
     }
 
@@ -1142,16 +1152,19 @@ pub async fn run_twitch_assets(
             false
         }
     };
+    tokio::time::sleep(Duration::from_millis(300)).await;
     if let Err(e) =
         fetch_twitch_badges(client, client_id, token, broadcaster_id, asset_dir, platform_dir).await
     {
         warn!("Twitch badges ({broadcaster_id}): {e}");
     }
+    tokio::time::sleep(Duration::from_millis(300)).await;
     if let Err(e) =
         fetch_twitch_emotes(client, client_id, token, broadcaster_id, asset_dir).await
     {
         warn!("Twitch emotes ({broadcaster_id}): {e}");
     }
+    tokio::time::sleep(Duration::from_millis(300)).await;
     if let Err(e) = fetch_bttv_emotes(client, broadcaster_id, asset_dir, platform_dir).await {
         warn!("BTTV ({broadcaster_id}): {e}");
     }
@@ -1161,6 +1174,7 @@ pub async fn run_twitch_assets(
     if let Err(e) = fetch_7tv_emotes(client, broadcaster_id, asset_dir, platform_dir).await {
         warn!("7TV ({broadcaster_id}): {e}");
     }
+    tokio::time::sleep(Duration::from_millis(300)).await;
     if let Err(e) =
         fetch_twitch_name_color(client, client_id, token, broadcaster_id, asset_dir).await
     {
@@ -1286,6 +1300,7 @@ async fn fetch_youtube_page_banner(
     client: &Client,
     channel_url: &str,
     asset_dir: &Path,
+    fingerprint: Option<&BrowserFingerprint>,
 ) -> Result<()> {
     let base = {
         let t = channel_url.trim().trim_end_matches('/');
@@ -1295,13 +1310,17 @@ async fn fetch_youtube_page_banner(
             .unwrap_or(t)
             .to_string()
     };
-    let resp = client
+    let rb = client
         .get(&base)
         .query(&[("hl", "en"), ("gl", "US")])
         .header("Accept-Language", "en-US,en;q=0.9")
-        .header("Cookie", "CONSENT=YES+1; SOCS=CAI")
-        .send()
-        .await?;
+        .header("Cookie", "CONSENT=YES+1; SOCS=CAI");
+    let rb = if let Some(fp) = fingerprint {
+        fp.apply_yt_nav_headers(rb)
+    } else {
+        rb
+    };
+    let resp = rb.send().await?;
     if !resp.status().is_success() {
         bail!("YouTube channel page: {}", resp.status());
     }
@@ -1333,6 +1352,7 @@ pub async fn run_youtube_assets(
     channel_id: &str,
     channel_url: &str,
     asset_dir: &Path,
+    fingerprint: Option<&BrowserFingerprint>,
 ) -> bool {
     let mut any_ok = false;
     let mut api_set_banner = false;
@@ -1350,7 +1370,7 @@ pub async fn run_youtube_assets(
     // Fallback only: skip the page scrape entirely when the API already supplied a
     // banner, so a single channel never alternates between two banner sources.
     if !api_set_banner && !channel_url.is_empty() {
-        match fetch_youtube_page_banner(client, channel_url, asset_dir).await {
+        match fetch_youtube_page_banner(client, channel_url, asset_dir, fingerprint).await {
             Ok(()) => any_ok = true,
             Err(e) if !any_ok => warn!("YouTube page banner ({channel_url}): {e}"),
             Err(_) => {}
