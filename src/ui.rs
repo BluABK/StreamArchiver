@@ -13462,6 +13462,10 @@ impl StreamArchiverApp {
         }).count();
         let n_missing = self.issues_missing.len();
         let n_errors = self.issues_errors.len();
+        // Errors where no file exists on disk — only "✕ Clear" is available for these.
+        let n_fileless_errors = self.issues_errors.iter().filter(|r| {
+            r.output_path.is_empty() || !std::path::Path::new(&r.output_path).exists()
+        }).count();
         let confirm_clear = self.issues_confirm_clear;
         let quota_warnings = self.active_quota_warnings();
 
@@ -13476,6 +13480,7 @@ impl StreamArchiverApp {
             ClearEmpties,
             ClearAllMissing,
             ClearAllErrors,
+            ClearFilelessErrors,
             ConfirmClear,
             ClearAll,
             DismissWarning(String),
@@ -13567,8 +13572,16 @@ impl StreamArchiverApp {
                                 act = Some(Act::ClearAllMissing);
                             }
                         }
+                        if n_fileless_errors > 0 {
+                            if ui.button(format!("✕ Clear {} no-file", n_fileless_errors))
+                                .on_hover_text("Remove DB records for failed recordings that have no output file — these have no other cleanup action.")
+                                .clicked()
+                            {
+                                act = Some(Act::ClearFilelessErrors);
+                            }
+                        }
                         if n_errors > 0 {
-                            if ui.button(format!("✕ Clear {} failed", n_errors))
+                            if ui.button(format!("✕ Clear all {} failed", n_errors))
                                 .on_hover_text("Delete DB records for all failed/aborted/orphaned recordings. Files on disk (if any) are deleted too.")
                                 .clicked()
                             {
@@ -14026,6 +14039,16 @@ impl StreamArchiverApp {
                     let _ = std::fs::remove_file(path);
                 }
                 let _ = self.core.store.delete_recording(rec.id);
+            }
+        }
+        if let Some(Act::ClearFilelessErrors) = act {
+            let fileless: Vec<_> = self.issues_errors.iter()
+                .filter(|r| r.output_path.is_empty() || !std::path::Path::new(&r.output_path).exists())
+                .cloned()
+                .collect();
+            for rec in fileless {
+                let _ = self.core.store.delete_recording(rec.id);
+                self.issues_errors.retain(|r| r.id != rec.id);
             }
         }
     }
