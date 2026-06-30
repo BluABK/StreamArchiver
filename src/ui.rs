@@ -12105,10 +12105,13 @@ impl StreamArchiverApp {
                                     .get(&rec.monitor_id)
                                     .map(|(n, p)| (n.as_str(), *p))
                                     .unwrap_or(("?", crate::models::Platform::Generic));
-                                let fname = std::path::Path::new(&rec.output_path)
+                                let path = std::path::Path::new(&rec.output_path);
+                                let fname = path
                                     .file_name()
                                     .map(|n| n.to_string_lossy().into_owned())
                                     .unwrap_or_default();
+                                let file_bytes = path.metadata().map(|m| m.len()).unwrap_or(0);
+                                let empty = file_bytes == 0;
                                 let remuxing = self.background_tasks.iter().any(|bt| {
                                     bt.kind == crate::events::BackgroundTaskKind::Remux
                                         && bt.id == rec.id as u64
@@ -12124,7 +12127,13 @@ impl StreamArchiverApp {
                                     row.col(|ui| { ui.label(ch_name); });
                                     row.col(|ui| { ui.label(fmt_datetime_short(rec.started_at)); });
                                     row.col(|ui| {
-                                        ui.label(&fname).on_hover_text(&rec.output_path);
+                                        let size_hint = if empty {
+                                            " (empty)".to_string()
+                                        } else {
+                                            format!(" ({})", fmt_bytes(file_bytes as i64))
+                                        };
+                                        ui.label(&fname)
+                                            .on_hover_text(format!("{}{}", rec.output_path, size_hint));
                                     });
                                     row.col(|ui| {
                                         if remuxing {
@@ -12132,6 +12141,11 @@ impl StreamArchiverApp {
                                                 egui::Color32::from_rgb(80, 160, 220),
                                                 "⏳ remuxing…",
                                             );
+                                        } else if empty {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(180, 60, 60),
+                                                "✗ empty",
+                                            ).on_hover_text("Capture wrote 0 bytes — no data to recover.");
                                         } else {
                                             let (icon, color) = state_icon(&rec.status);
                                             ui.colored_label(color, icon)
@@ -12139,7 +12153,10 @@ impl StreamArchiverApp {
                                         }
                                     });
                                     row.col(|ui| {
-                                        if ui
+                                        if empty {
+                                            ui.add_enabled(false, egui::Button::new("🔄 Re-remux").small())
+                                                .on_hover_text("Capture is empty — nothing to remux.");
+                                        } else if ui
                                             .add_enabled(
                                                 !remuxing,
                                                 egui::Button::new("🔄 Re-remux").small(),
