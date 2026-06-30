@@ -1939,6 +1939,54 @@ impl Store {
         Ok(rows)
     }
 
+    /// Recordings that have a non-TS final output path but whose file no longer
+    /// exists on disk — e.g. the user manually deleted the file. Returns the most
+    /// recent 500 candidates; caller filters with `path.exists()`.
+    pub fn recordings_with_final_path(&self) -> Result<Vec<crate::models::Recording>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id, monitor_id, started_at, ended_at, status,
+                    COALESCE(output_path, ''), went_live_at, went_live_approx,
+                    take_group, COALESCE(log_excerpt, '')
+             FROM recording
+             WHERE output_path != ''
+               AND output_path NOT LIKE '%.ts'
+               AND status NOT IN ('recording')
+             ORDER BY started_at DESC
+             LIMIT 500",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(crate::models::Recording {
+                    id: r.get(0)?,
+                    monitor_id: r.get(1)?,
+                    started_at: r.get(2)?,
+                    ended_at: r.get(3)?,
+                    status: r.get(4)?,
+                    output_path: r.get(5)?,
+                    went_live_at: r.get(6)?,
+                    went_live_approx: r.get::<_, Option<i64>>(7)?.unwrap_or(0) != 0,
+                    take_group: r.get(8)?,
+                    log_excerpt: r.get(9)?,
+                    bytes: 0,
+                    exit_code: None,
+                    lost_secs: None,
+                    stream_id: None,
+                    ad_count: 0,
+                    ad_secs: 0,
+                    meta_change_count: 0,
+                    title: String::new(),
+                    category: String::new(),
+                    notes: String::new(),
+                    vod_id: None,
+                    vod_state: None,
+                    vod_muted_secs: None,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Clear a stuck capture from the Issues panel: wipe `output_path` so the
     /// recording no longer matches the `recordings_needing_remux` query. Status is
     /// left as-is (already 'failed'/'completed'); the file itself must be deleted

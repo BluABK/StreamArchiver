@@ -527,6 +527,7 @@ pub struct StreamArchiverApp {
     /// that still have a `.ts` path, and when that snapshot was taken.
     show_issues: bool,
     issues_recs: Vec<crate::models::Recording>,
+    issues_missing: Vec<crate::models::Recording>,
     issues_refreshed: Option<std::time::Instant>,
     issues_confirm_clear: bool,
     quitting: bool,
@@ -991,6 +992,7 @@ impl StreamArchiverApp {
             processes_load: None,
             show_issues: false,
             issues_recs: Vec::new(),
+            issues_missing: Vec::new(),
             issues_refreshed: None,
             issues_confirm_clear: false,
             quitting: false,
@@ -4652,7 +4654,7 @@ impl eframe::App for StreamArchiverApp {
                             self.processes_refreshed = None; // force an immediate refresh
                         }
                         {
-                            let n = self.issues_recs.len();
+                            let n = self.issues_recs.len() + self.issues_missing.len();
                             let label = if n > 0 {
                                 format!("⚠ Issues ({})", n)
                             } else {
@@ -12055,6 +12057,11 @@ impl StreamArchiverApp {
             .unwrap_or(true);
         if stale {
             self.issues_recs = self.core.store.recordings_needing_remux().unwrap_or_default();
+            let candidates = self.core.store.recordings_with_final_path().unwrap_or_default();
+            self.issues_missing = candidates
+                .into_iter()
+                .filter(|r| !std::path::Path::new(&r.output_path).exists())
+                .collect();
             self.issues_refreshed = Some(Instant::now());
         }
         if !self.show_issues {
@@ -12085,13 +12092,17 @@ impl StreamArchiverApp {
         let n_empty = self.issues_recs.iter().filter(|r| {
             std::path::Path::new(&r.output_path).metadata().map(|m| m.len()).unwrap_or(0) == 0
         }).count();
+        let n_missing = self.issues_missing.len();
         let confirm_clear = self.issues_confirm_clear;
+        let total_issues = self.issues_recs.len() + n_missing;
 
         let mut open = true;
         enum Act {
             Remux(usize),
             Delete(usize),
+            ClearPath(usize),
             ClearEmpties,
+            ClearAllMissing,
             ConfirmClear,
             ClearAll,
         }
@@ -12111,10 +12122,7 @@ impl StreamArchiverApp {
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(format!(
-                            "{} recording(s) need attention",
-                            self.issues_recs.len()
-                        ));
+                        ui.label(format!("{} recording(s) need attention", total_issues));
                         if ui.button("⟳ Refresh").clicked() {
                             self.issues_refreshed = None;
                         }
@@ -12131,24 +12139,32 @@ impl StreamArchiverApp {
                             if confirm_clear {
                                 ui.colored_label(
                                     egui::Color32::from_rgb(200, 80, 80),
-                                    format!("Delete all {} files?", self.issues_recs.len()),
+                                    format!("Delete all {} capture files?", self.issues_recs.len()),
                                 );
                                 if ui.button("✓ Yes, delete all").clicked() {
                                     act = Some(Act::ClearAll);
                                 }
                                 if ui.button("✗ Cancel").clicked() {
-                                    act = Some(Act::ConfirmClear); // toggle off
+                                    act = Some(Act::ConfirmClear);
                                 }
                             } else if ui.button("🗑 Delete all")
-                                .on_hover_text("Delete all capture files and remove them from the list.")
+                                .on_hover_text("Delete all .ts capture files and remove them from the list.")
                                 .clicked()
                             {
                                 act = Some(Act::ConfirmClear);
                             }
                         }
+                        if n_missing > 0 {
+                            if ui.button(format!("🔗 Clear {} missing", n_missing))
+                                .on_hover_text("Clear DB path for recordings whose output file was deleted from disk.")
+                                .clicked()
+                            {
+                                act = Some(Act::ClearAllMissing);
+                            }
+                        }
                     });
                     ui.separator();
-                    if self.issues_recs.is_empty() {
+                    if total_issues == 0 {
                         ui.weak("No issues found — all recordings are in their final format.");
                         return;
                     }
@@ -12310,6 +12326,60 @@ impl StreamArchiverApp {
                                     });
                                 });
                             }
+                            // Missing-output-file rows (completed/failed/ended but file gone from disk).
+                            for (j, rec) in self.issues_missing.iter().enumerate() {
+                                let (ch_name, platform) = mon_info
+                                    .get(&rec.monitor_id)
+                                    .map(|(n, p)| (n.as_str(), *p))
+                                    .unwrap_or(("?", crate::models::Platform::Generic));
+                                let path = std::path::Path::new(&rec.output_path);
+                                let fname = path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                let ext = path
+                                    .extension()
+                                    .map(|e| e.to_string_lossy().to_uppercase())
+                                    .unwrap_or_else(|| "?".into());
+                                body.row(22.0, |mut row| {
+                                    row.col(|ui| {
+                                        if let Some(ref ptex) = ptex {
+                                            platform_icon(ui, ptex, platform);
+                                        } else {
+                                            ui.label(platform.label());
+                                        }
+                                    });
+                                    row.col(|ui| { ui.label(ch_name); });
+                                    row.col(|ui| { ui.label(fmt_datetime_short(rec.started_at)); });
+                                    row.col(|ui| {
+                                        ui.label(&fname).on_hover_text(&rec.output_path);
+                                    });
+                                    row.col(|ui| {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(200, 130, 30),
+                                            "gone",
+                                        );
+                                    });
+                                    row.col(|ui| { ui.label(ext.as_str()); });
+                                    row.col(|ui| {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(200, 130, 30),
+                                            "✗ file missing",
+                                        ).on_hover_text(format!(
+                                            "Output file was deleted from disk.\nDB status: {}\nPath: {}",
+                                            rec.status, rec.output_path
+                                        ));
+                                    });
+                                    row.col(|ui| {
+                                        if ui.button("🔗 Clear path")
+                                            .on_hover_text("Remove the stale path from the database record.")
+                                            .clicked()
+                                        {
+                                            act = Some(Act::ClearPath(j));
+                                        }
+                                    });
+                                });
+                            }
                         });
                 });
             },
@@ -12359,6 +12429,18 @@ impl StreamArchiverApp {
                 }
                 let _ = self.core.store.clear_recording_capture(rec.id);
                 self.issues_recs.retain(|r| r.id != rec.id);
+            }
+        }
+        if let Some(Act::ClearPath(j)) = act {
+            if let Some(rec) = self.issues_missing.get(j).cloned() {
+                let _ = self.core.store.clear_recording_capture(rec.id);
+                self.issues_missing.retain(|r| r.id != rec.id);
+            }
+        }
+        if let Some(Act::ClearAllMissing) = act {
+            let all: Vec<_> = self.issues_missing.drain(..).collect();
+            for rec in all {
+                let _ = self.core.store.clear_recording_capture(rec.id);
             }
         }
         if let Some(Act::ConfirmClear) = act {
