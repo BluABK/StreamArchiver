@@ -1482,6 +1482,24 @@ impl Supervisor {
         info!(monitor_id, "stop chat download");
     }
 
+    /// Stop the YouTube chat sidecar for `monitor_id` (if running) and wait
+    /// up to `timeout` for it to release its `live_chat.json` file handle.
+    /// Called before `rename_companion_sidecars` so the rename isn't blocked
+    /// by an actively-writing chat process (Windows os error 32).
+    async fn stop_and_wait_for_chat(&self, monitor_id: i64, timeout: Duration) {
+        if !self.active_chats.lock().unwrap().contains_key(&monitor_id) {
+            return;
+        }
+        self.stop_chat_download(monitor_id);
+        let deadline = tokio::time::Instant::now() + timeout;
+        while tokio::time::Instant::now() < deadline {
+            if !self.active_chats.lock().unwrap().contains_key(&monitor_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    }
+
     /// Run a live-chat sidecar yt-dlp process for `monitor_id`. Spawns yt-dlp
     /// with `--skip-download --sub-langs=live_chat --write-subs` so it captures
     /// only chat alongside the video recording. Registers its PID in
@@ -2310,6 +2328,9 @@ impl Supervisor {
                     row.monitor.platform().as_str(),
                     went_live_at.unwrap_or(0),
                 );
+                // Stop the YouTube chat sidecar before renaming so its open
+                // live_chat.json handle is released before companion rename.
+                self.stop_and_wait_for_chat(monitor_id, Duration::from_secs(6)).await;
                 final_path = rename_for_media(final_path, &stem).await;
             }
             // Drop this recording's working leftovers (SABR parts/state, etc.).
@@ -3051,6 +3072,11 @@ impl Supervisor {
                     mrow.monitor.platform().as_str(),
                     row.went_live_at.unwrap_or(0),
                 );
+                // Stop the YouTube chat sidecar before renaming so its open
+                // live_chat.json handle is released before companion rename.
+                if let Some(mid) = row.monitor_id {
+                    self.stop_and_wait_for_chat(mid, Duration::from_secs(6)).await;
+                }
                 final_path = rename_for_media(final_path, &stem).await;
             }
         }
