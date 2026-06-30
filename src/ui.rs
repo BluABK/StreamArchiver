@@ -12641,24 +12641,29 @@ impl StreamArchiverApp {
             let mut maint_preset_save_tmpl: Option<String> = None;
             let mut do_set_filename_default = false;
             let maint_custom_presets = self.custom_presets.clone();
+            use crate::events::BackgroundTaskKind as BTK;
+            let reremux_all_running   = self.background_tasks.iter().any(|t| t.kind == BTK::ReRemuxAll);
+            let embed_thumb_running   = self.background_tasks.iter().any(|t| t.kind == BTK::EmbedMissingThumbnails);
+            let fetch_thumb_running   = self.background_tasks.iter().any(|t| t.kind == BTK::FetchMissingThumbnails);
+            let reorganize_running    = self.background_tasks.iter().any(|t| t.kind == BTK::ReorganizeAll);
             egui::Grid::new("maintenance_grid")
                 .num_columns(2)
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
-                    if ui.button("Re-remux all").clicked() {
+                    if ui.add_enabled(!reremux_all_running, egui::Button::new("Re-remux all")).clicked() {
                         self.core.manual(ManualCommand::ReRemuxAll);
                     }
                     ui.label("Re-run TS→MKV remux for any recording whose .ts source is still on disk.");
                     ui.end_row();
 
-                    if ui.button("Embed missing thumbnails").clicked() {
+                    if ui.add_enabled(!embed_thumb_running, egui::Button::new("Embed missing thumbnails")).clicked() {
                         self.core.manual(ManualCommand::EmbedMissingThumbnails);
                     }
                     ui.label("Embed the thumbnail sidecar into MKV files that don't already have cover art.");
                     ui.end_row();
 
                     ui.horizontal(|ui| {
-                        if ui.button("Fetch missing thumbnails").clicked() {
+                        if ui.add_enabled(!fetch_thumb_running, egui::Button::new("Fetch missing thumbnails")).clicked() {
                             self.core.manual(ManualCommand::FetchMissingThumbnails { embed: self.settings.fetch_thumb_embed });
                         }
                         ui.checkbox(&mut self.settings.fetch_thumb_embed, "Embed after fetch");
@@ -12666,7 +12671,7 @@ impl StreamArchiverApp {
                     ui.label("Download thumbnails for recordings that are missing a sidecar.");
                     ui.end_row();
 
-                    if ui.button("Re-organize all files").clicked() {
+                    if ui.add_enabled(!reorganize_running, egui::Button::new("Re-organize all files")).clicked() {
                         self.core.manual(ManualCommand::ReorganizeAll);
                     }
                     ui.label("Move files into/out of subdirectories based on current File Management settings.");
