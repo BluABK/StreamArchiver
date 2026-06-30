@@ -558,7 +558,11 @@ pub struct StreamArchiverApp {
     show_issues: bool,
     issues_recs: Vec<crate::models::Recording>,
     issues_missing: Vec<crate::models::Recording>,
+    /// Failed/aborted/orphaned recordings that have an output file on disk (or no path at all).
     issues_errors: Vec<crate::models::Recording>,
+    /// Failed/aborted/orphaned recordings whose output path is set but the file is gone from disk.
+    /// Partitioned out of issues_errors at load time; rendered alongside the missing-file section.
+    issues_errors_no_file: Vec<crate::models::Recording>,
     /// In-flight background load of missing-output-file recordings (spawned off
     /// the UI thread because `path.exists()` can block on network/slow drives).
     issues_missing_load: Option<std::sync::mpsc::Receiver<Vec<crate::models::Recording>>>,
@@ -1086,6 +1090,7 @@ impl StreamArchiverApp {
             issues_recs: Vec::new(),
             issues_missing: Vec::new(),
             issues_errors: Vec::new(),
+            issues_errors_no_file: Vec::new(),
             issues_missing_load: None,
             issues_refreshed: None,
             issues_confirm_clear: false,
@@ -5130,7 +5135,9 @@ impl eframe::App for StreamArchiverApp {
                         }
                         {
                             let quota_warnings = self.active_quota_warnings();
-                            let n = self.issues_recs.len() + self.issues_missing.len() + self.issues_errors.len() + quota_warnings.len();
+                            let n = self.issues_recs.len() + self.issues_missing.len()
+                                + self.issues_errors.len() + self.issues_errors_no_file.len()
+                                + quota_warnings.len();
                             let label = if n > 0 {
                                 format!("⚠ Issues ({})", n)
                             } else {
@@ -13413,7 +13420,14 @@ impl StreamArchiverApp {
         if stale && self.issues_missing_load.is_none() {
             // Both queries are small and fast — run them synchronously.
             self.issues_recs = self.core.store.recordings_needing_remux().unwrap_or_default();
-            self.issues_errors = self.core.store.recordings_with_errors().unwrap_or_default();
+            // Partition errors: those whose output file is gone from disk go to
+            // issues_errors_no_file (treated as missing), the rest stay in issues_errors.
+            let all_errors = self.core.store.recordings_with_errors().unwrap_or_default();
+            let (with_file, no_file): (Vec<_>, Vec<_>) = all_errors.into_iter().partition(|r| {
+                r.output_path.is_empty() || std::path::Path::new(&r.output_path).exists()
+            });
+            self.issues_errors = with_file;
+            self.issues_errors_no_file = no_file;
             // The missing-file check calls path.exists() up to 500 times, which
             // can block for seconds on network drives. Spawn it off the UI thread.
             let core = self.core.clone();
@@ -13462,10 +13476,7 @@ impl StreamArchiverApp {
         }).count();
         let n_missing = self.issues_missing.len();
         let n_errors = self.issues_errors.len();
-        // Errors where no file exists on disk — only "✕ Clear" is available for these.
-        let n_fileless_errors = self.issues_errors.iter().filter(|r| {
-            r.output_path.is_empty() || !std::path::Path::new(&r.output_path).exists()
-        }).count();
+        let n_missing_errors = self.issues_errors_no_file.len();
         let confirm_clear = self.issues_confirm_clear;
         let quota_warnings = self.active_quota_warnings();
 
@@ -13477,6 +13488,7 @@ impl StreamArchiverApp {
             ClearPath(usize),
             DeleteError(usize),
             ClearError(usize),
+            ClearMissingError(usize),
             ClearEmpties,
             ClearAllMissing,
             ClearAllErrors,
@@ -13572,9 +13584,9 @@ impl StreamArchiverApp {
                                 act = Some(Act::ClearAllMissing);
                             }
                         }
-                        if n_fileless_errors > 0 {
-                            if ui.button(format!("✕ Clear {} no-file", n_fileless_errors))
-                                .on_hover_text("Remove DB records for failed recordings that have no output file — these have no other cleanup action.")
+                        if n_missing_errors > 0 {
+                            if ui.button(format!("✕ Clear {} no-file failed", n_missing_errors))
+                                .on_hover_text("Remove DB records for failed recordings whose output file no longer exists on disk.")
                                 .clicked()
                             {
                                 act = Some(Act::ClearFilelessErrors);
@@ -13582,7 +13594,7 @@ impl StreamArchiverApp {
                         }
                         if n_errors > 0 {
                             if ui.button(format!("✕ Clear all {} failed", n_errors))
-                                .on_hover_text("Delete DB records for all failed/aborted/orphaned recordings. Files on disk (if any) are deleted too.")
+                                .on_hover_text("Delete DB records for all failed/aborted/orphaned recordings that still have a file. Files are deleted too.")
                                 .clicked()
                             {
                                 act = Some(Act::ClearAllErrors);
@@ -13590,7 +13602,7 @@ impl StreamArchiverApp {
                         }
                     });
                     ui.separator();
-                    if self.issues_recs.is_empty() && n_missing == 0 && n_errors == 0 {
+                    if self.issues_recs.is_empty() && n_missing == 0 && n_errors == 0 && n_missing_errors == 0 {
                         ui.weak("No recording issues found — all recordings are in their final format.");
                         return;
                     }
@@ -13802,6 +13814,66 @@ impl StreamArchiverApp {
                                             .clicked()
                                         {
                                             act = Some(Act::ClearPath(j));
+                                        }
+                                    });
+                                });
+                            }
+                            // ── Failed but file gone (treated as missing) ─────────────────
+                            for (j2, rec) in self.issues_errors_no_file.iter().enumerate() {
+                                let (ch_name, platform) = mon_info
+                                    .get(&rec.monitor_id)
+                                    .map(|(n, p)| (n.as_str(), *p))
+                                    .unwrap_or(("?", crate::models::Platform::Generic));
+                                let path = std::path::Path::new(&rec.output_path);
+                                let fname = path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                let ext = path
+                                    .extension()
+                                    .map(|e| e.to_string_lossy().to_uppercase())
+                                    .unwrap_or_else(|| "?".to_string());
+                                body.row(22.0, |mut row| {
+                                    row.col(|ui| {
+                                        if let Some(ref ptex) = ptex {
+                                            platform_icon(ui, ptex, platform);
+                                        } else {
+                                            ui.label(platform.label());
+                                        }
+                                    });
+                                    row.col(|ui| { ui.label(ch_name); });
+                                    row.col(|ui| { ui.label(fmt_datetime_short(rec.started_at)); });
+                                    row.col(|ui| {
+                                        ui.label(&fname).on_hover_text(&rec.output_path);
+                                    });
+                                    row.col(|ui| {
+                                        ui.colored_label(egui::Color32::from_rgb(200, 130, 30), "gone");
+                                    });
+                                    row.col(|ui| { ui.label(ext.as_str()); });
+                                    row.col(|ui| {
+                                        let exit_str = rec.exit_code
+                                            .map(|c| format!(" (exit {c})"))
+                                            .unwrap_or_default();
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(200, 80, 80),
+                                            format!("✗ {}{} — file missing", rec.status, exit_str),
+                                        ).on_hover_text({
+                                            let mut parts = vec![
+                                                format!("status: {}", rec.status),
+                                                format!("path: {}", rec.output_path),
+                                            ];
+                                            if !rec.log_excerpt.is_empty() {
+                                                parts.push(rec.log_excerpt.trim().to_string());
+                                            }
+                                            parts.join("\n")
+                                        });
+                                    });
+                                    row.col(|ui| {
+                                        if ui.button("✕ Clear")
+                                            .on_hover_text("Permanently remove this failed recording from the database.")
+                                            .clicked()
+                                        {
+                                            act = Some(Act::ClearMissingError(j2));
                                         }
                                     });
                                 });
@@ -14042,13 +14114,16 @@ impl StreamArchiverApp {
             }
         }
         if let Some(Act::ClearFilelessErrors) = act {
-            let fileless: Vec<_> = self.issues_errors.iter()
-                .filter(|r| r.output_path.is_empty() || !std::path::Path::new(&r.output_path).exists())
-                .cloned()
-                .collect();
-            for rec in fileless {
+            // issues_errors_no_file holds all failed recordings where the file is gone.
+            let all: Vec<_> = self.issues_errors_no_file.drain(..).collect();
+            for rec in all {
                 let _ = self.core.store.delete_recording(rec.id);
-                self.issues_errors.retain(|r| r.id != rec.id);
+            }
+        }
+        if let Some(Act::ClearMissingError(j2)) = act {
+            if let Some(rec) = self.issues_errors_no_file.get(j2).cloned() {
+                let _ = self.core.store.delete_recording(rec.id);
+                self.issues_errors_no_file.retain(|r| r.id != rec.id);
             }
         }
     }
