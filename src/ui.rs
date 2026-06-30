@@ -3812,6 +3812,7 @@ fn render_instance_row(
     has_history: bool,
     expanded: bool,
     show_actions: bool,
+    needs_remux_count: usize,
     a: &mut RowActions,
 ) -> bool {
     let m = &row.monitor;
@@ -3994,6 +3995,20 @@ fn render_instance_row(
                     "Live-chat download is still running.\n\
                      Right-click → Stop chat download to abort it.",
                 );
+            }
+            if needs_remux_count > 0 {
+                let lbl = if needs_remux_count == 1 {
+                    "⚠ needs remux".to_string()
+                } else {
+                    format!("⚠ {} need remux", needs_remux_count)
+                };
+                let tip = if needs_remux_count == 1 {
+                    "1 recording is stuck as .ts — expand and right-click the take to re-remux.".to_string()
+                } else {
+                    format!("{} recordings are stuck as .ts — expand and right-click each take to re-remux.", needs_remux_count)
+                };
+                ui.colored_label(egui::Color32::from_rgb(220, 140, 30), lbl)
+                    .on_hover_text(tip);
             }
         });
     });
@@ -8844,6 +8859,29 @@ impl StreamArchiverApp {
                                                     .on_hover_text(fail_hover(&p.last_recording_log));
                                             }
                                         }
+                                        let chan_needs_remux: usize = e.rows.iter()
+                                            .filter_map(|&ri| groups.get(&self.rows[ri].monitor.id))
+                                            .flat_map(|gs| gs.iter())
+                                            .flat_map(|g| g.takes.iter())
+                                            .filter(|t| {
+                                                t.output_path.ends_with(".ts")
+                                                    && t.output_path.contains(".cache")
+                                            })
+                                            .count();
+                                        if chan_needs_remux > 0 {
+                                            let lbl = if chan_needs_remux == 1 {
+                                                "⚠ needs remux".to_string()
+                                            } else {
+                                                format!("⚠ {} need remux", chan_needs_remux)
+                                            };
+                                            let tip = if chan_needs_remux == 1 {
+                                                "1 recording is stuck as .ts — expand to find it.".to_string()
+                                            } else {
+                                                format!("{} recordings are stuck as .ts — expand to find them.", chan_needs_remux)
+                                            };
+                                            ui.colored_label(egui::Color32::from_rgb(220, 140, 30), lbl)
+                                                .on_hover_text(tip);
+                                        }
                                     });
                                     tr.col(|ui| {
                                         if next_stream_cell(ui, next_stream_at, &next_stream_title, true) {
@@ -8962,11 +9000,22 @@ impl StreamArchiverApp {
                                 if let Some(c) = tint {
                                     body.ui_mut().visuals_mut().selection.bg_fill = c;
                                 }
+                                let inst_needs_remux = groups.get(&mid)
+                                    .map(|gs| {
+                                        gs.iter()
+                                            .flat_map(|g| g.takes.iter())
+                                            .filter(|t| {
+                                                t.output_path.ends_with(".ts")
+                                                    && t.output_path.contains(".cache")
+                                            })
+                                            .count()
+                                    })
+                                    .unwrap_or(0);
                                 body.row(24.0, |mut tr| {
                                     if render_instance_row(
                                         &mut tr, row, &ptex, now, recording, chat_active,
                                         tint.is_some(), depth, has_hist, expanded,
-                                        show_actions, &mut acts,
+                                        show_actions, inst_needs_remux, &mut acts,
                                     ) {
                                         toggle_instance = Some(mid);
                                     }
@@ -9056,6 +9105,19 @@ impl StreamArchiverApp {
                                             resp.on_hover_text(fail_hover(log));
                                         } else {
                                             resp.on_hover_text(g.status());
+                                        }
+                                        let nr = g.takes.iter().filter(|t| {
+                                            t.output_path.ends_with(".ts")
+                                                && t.output_path.contains(".cache")
+                                        }).count();
+                                        if nr > 0 {
+                                            let lbl = if nr == 1 {
+                                                "⚠ needs remux".to_string()
+                                            } else {
+                                                format!("⚠ {} need remux", nr)
+                                            };
+                                            ui.colored_label(egui::Color32::from_rgb(220, 140, 30), lbl)
+                                                .on_hover_text("Right-click → Re-remux to MKV.");
                                         }
                                     });
                                     tr.col(|_ui| {}); // next stream (n/a per stream)
