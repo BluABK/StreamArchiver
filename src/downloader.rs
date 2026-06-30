@@ -1028,6 +1028,10 @@ pub struct Supervisor {
     /// any non-stall outcome (success, ended, manual) so it tracks back-to-back
     /// stalls only; in-memory only. Keyed by `(monitor_id, stream_id)`.
     sabr_stall_count: Arc<Mutex<HashMap<SabrKey, u32>>>,
+    /// (channel_name, platform_str) pairs for which an asset-fetch task is currently
+    /// in flight. Prevents stacking duplicate fetches when the user clicks
+    /// "Re-fetch" repeatedly or a periodic fetch fires while one is already running.
+    running_asset_fetches: Arc<Mutex<HashSet<(String, String)>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1070,6 +1074,7 @@ impl Supervisor {
             backoff: Arc::new(Mutex::new(HashMap::new())),
             sabr_dvr_exceeded: Arc::new(Mutex::new(HashSet::new())),
             sabr_stall_count: Arc::new(Mutex::new(HashMap::new())),
+            running_asset_fetches: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -1543,6 +1548,15 @@ impl Supervisor {
         if !force && !crate::assets::should_refetch_assets(&asset_dir) {
             return;
         }
+        // Guard: skip if a fetch for this (channel, platform) is already in flight.
+        let fetch_key = (row.channel.name.clone(), platform.as_str().to_string());
+        {
+            let mut running = self.running_asset_fetches.lock().unwrap();
+            if running.contains(&fetch_key) {
+                return;
+            }
+            running.insert(fetch_key.clone());
+        }
         let http = self.ctx.http_client();
         let ctx = self.ctx.clone();
         let store = self.store.clone();
@@ -1550,6 +1564,7 @@ impl Supervisor {
         let url = row.monitor.url.clone();
         let known_bid = broadcaster_id.unwrap_or_default();
         let monitor_id = row.monitor.id;
+        let running_asset_fetches = self.running_asset_fetches.clone();
 
         let task_id = crate::events::next_task_id();
         let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
@@ -1648,6 +1663,7 @@ impl Supervisor {
             if let TaskOutcome::Failed(ref e) = outcome {
                 tracing::warn!(monitor_id, "asset fetch failed: {e}");
             }
+            running_asset_fetches.lock().unwrap().remove(&fetch_key);
             let _ = tx.send(AppEvent::BackgroundTaskFinished { id: task_id, outcome });
         });
     }
