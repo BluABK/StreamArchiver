@@ -1939,6 +1939,16 @@ impl Store {
         Ok(rows)
     }
 
+    /// Clear a stuck capture from the Issues panel: wipe `output_path` so the
+    /// recording no longer matches the `recordings_needing_remux` query. Status is
+    /// left as-is (already 'failed'/'completed'); the file itself must be deleted
+    /// by the caller before this is called.
+    pub fn clear_recording_capture(&self, rec_id: i64) -> rusqlite::Result<()> {
+        self.db()
+            .execute("UPDATE recording SET output_path = '' WHERE id = ?", [rec_id])?;
+        Ok(())
+    }
+
     /// In-flight recordings (status `recording`) — crash/quit leftovers seen at
     /// startup. Excludes rows with a `detached_process` registry entry: those are
     /// owned by the detach reconcile (`reconcile_detached`), not the legacy

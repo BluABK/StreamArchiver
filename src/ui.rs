@@ -528,6 +528,7 @@ pub struct StreamArchiverApp {
     show_issues: bool,
     issues_recs: Vec<crate::models::Recording>,
     issues_refreshed: Option<std::time::Instant>,
+    issues_confirm_clear: bool,
     quitting: bool,
     /// UI-freeze watchdog heartbeat: stamped each frame so a background thread can
     /// detect (and surface as a native dialog) a hung UI thread. See [`crate::watchdog`].
@@ -991,6 +992,7 @@ impl StreamArchiverApp {
             show_issues: false,
             issues_recs: Vec::new(),
             issues_refreshed: None,
+            issues_confirm_clear: false,
             quitting: false,
             heartbeat,
             view: View::Streams,
@@ -1686,6 +1688,14 @@ fn filename_preset_combo(ui: &mut egui::Ui, id_salt: &str, template: &mut String
 }
 
 /// Coarse human duration: `45s` / `5m` / `6h` / `2d`.
+fn parse_capture_mode(fname: &str) -> Option<String> {
+    let marker = " (p ";
+    let start = fname.find(marker)? + marker.len();
+    let end = fname[start..].find(')')?;
+    let mode = fname[start..start + end].trim();
+    if mode.is_empty() { None } else { Some(mode.to_string()) }
+}
+
 fn fmt_duration_secs(secs: i64) -> String {
     let s = secs.max(0);
     if s < 90 {
@@ -12072,9 +12082,18 @@ impl StreamArchiverApp {
             .iter()
             .any(|bt| bt.kind == crate::events::BackgroundTaskKind::Remux);
 
+        let n_empty = self.issues_recs.iter().filter(|r| {
+            std::path::Path::new(&r.output_path).metadata().map(|m| m.len()).unwrap_or(0) == 0
+        }).count();
+        let confirm_clear = self.issues_confirm_clear;
+
         let mut open = true;
         enum Act {
             Remux(usize),
+            Delete(usize),
+            ClearEmpties,
+            ConfirmClear,
+            ClearAll,
         }
         let mut act: Option<Act> = None;
 
@@ -12082,7 +12101,7 @@ impl StreamArchiverApp {
             egui::ViewportId::from_hash_of("issues_vp"),
             egui::ViewportBuilder::default()
                 .with_title("⚠ Issues")
-                .with_inner_size([820.0, 380.0]),
+                .with_inner_size([1000.0, 420.0]),
             |ctx, _class| {
                 if ctx.input(|i| i.viewport().close_requested()) {
                     open = false;
@@ -12099,7 +12118,34 @@ impl StreamArchiverApp {
                         if ui.button("⟳ Refresh").clicked() {
                             self.issues_refreshed = None;
                         }
-                        ui.weak("These captures finished as .ts and need re-remuxing to MKV.");
+                        ui.separator();
+                        if n_empty > 0 {
+                            if ui.button(format!("🗑 Delete {} empty", n_empty))
+                                .on_hover_text("Delete all 0-byte captures — they contain no data.")
+                                .clicked()
+                            {
+                                act = Some(Act::ClearEmpties);
+                            }
+                        }
+                        if !self.issues_recs.is_empty() {
+                            if confirm_clear {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(200, 80, 80),
+                                    format!("Delete all {} files?", self.issues_recs.len()),
+                                );
+                                if ui.button("✓ Yes, delete all").clicked() {
+                                    act = Some(Act::ClearAll);
+                                }
+                                if ui.button("✗ Cancel").clicked() {
+                                    act = Some(Act::ConfirmClear); // toggle off
+                                }
+                            } else if ui.button("🗑 Delete all")
+                                .on_hover_text("Delete all capture files and remove them from the list.")
+                                .clicked()
+                            {
+                                act = Some(Act::ConfirmClear);
+                            }
+                        }
                     });
                     ui.separator();
                     if self.issues_recs.is_empty() {
@@ -12110,16 +12156,20 @@ impl StreamArchiverApp {
                         .striped(true)
                         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                         .column(Column::auto())                                    // Platform icon
-                        .column(Column::auto().at_least(120.0))                    // Channel
+                        .column(Column::auto().at_least(100.0))                    // Channel
                         .column(Column::auto())                                    // Started
-                        .column(Column::remainder().clip(true).at_least(200.0))   // File
-                        .column(Column::auto())                                    // Status
+                        .column(Column::remainder().clip(true).at_least(160.0))   // File
+                        .column(Column::auto().at_least(60.0))                     // Size
+                        .column(Column::auto().at_least(80.0))                     // Mode/type
+                        .column(Column::auto().at_least(130.0))                    // Status
                         .column(Column::auto())                                    // Actions
                         .header(20.0, |mut h| {
                             h.col(|_ui| {});
                             h.col(|ui| { ui.strong("Channel"); });
                             h.col(|ui| { ui.strong("Started"); });
                             h.col(|ui| { ui.strong("File"); });
+                            h.col(|ui| { ui.strong("Size"); });
+                            h.col(|ui| { ui.strong("Type"); });
                             h.col(|ui| { ui.strong("Status"); });
                             h.col(|ui| { ui.strong("Actions"); });
                         })
@@ -12136,6 +12186,8 @@ impl StreamArchiverApp {
                                     .unwrap_or_default();
                                 let file_bytes = path.metadata().map(|m| m.len()).unwrap_or(0);
                                 let empty = file_bytes == 0;
+                                // Parse the recording mode from "(p <mode>  )" in the filename.
+                                let mode = parse_capture_mode(&fname).unwrap_or_default();
                                 let remux_task = self.background_tasks.iter().find(|bt| {
                                     bt.kind == crate::events::BackgroundTaskKind::Remux
                                         && bt.id == rec.id as u64
@@ -12163,13 +12215,28 @@ impl StreamArchiverApp {
                                     row.col(|ui| { ui.label(ch_name); });
                                     row.col(|ui| { ui.label(fmt_datetime_short(rec.started_at)); });
                                     row.col(|ui| {
-                                        let size_hint = if empty {
-                                            " (empty)".to_string()
-                                        } else {
-                                            format!(" ({})", fmt_bytes(file_bytes as i64))
-                                        };
                                         ui.label(&fname)
-                                            .on_hover_text(format!("{}{}", rec.output_path, size_hint));
+                                            .on_hover_text(&rec.output_path);
+                                    });
+                                    row.col(|ui| {
+                                        if empty {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(180, 60, 60),
+                                                "empty",
+                                            );
+                                        } else {
+                                            ui.label(fmt_bytes(file_bytes as i64));
+                                        }
+                                    });
+                                    row.col(|ui| {
+                                        // "TS" is implicit for all rows; show the mode qualifier if present.
+                                        let type_str = if mode.is_empty() {
+                                            "TS".to_string()
+                                        } else {
+                                            format!("TS · {mode}")
+                                        };
+                                        ui.label(type_str)
+                                            .on_hover_text(format!("status: {}", rec.status));
                                     });
                                     row.col(|ui| {
                                         if let Some(bt) = remux_task {
@@ -12199,8 +12266,8 @@ impl StreamArchiverApp {
                                         } else if empty {
                                             ui.colored_label(
                                                 egui::Color32::from_rgb(180, 60, 60),
-                                                "✗ empty",
-                                            ).on_hover_text("Capture wrote 0 bytes — no data to recover.");
+                                                "✗ empty — no data",
+                                            ).on_hover_text("Capture wrote 0 bytes. Delete this file.");
                                         } else if let Some(ref err) = remux_err {
                                             ui.colored_label(
                                                 egui::Color32::from_rgb(180, 60, 60),
@@ -12213,23 +12280,32 @@ impl StreamArchiverApp {
                                         }
                                     });
                                     row.col(|ui| {
-                                        if empty {
-                                            ui.add_enabled(false, egui::Button::new("🔄 Re-remux").small())
-                                                .on_hover_text("Capture is empty — nothing to remux.");
-                                        } else if remux_err.is_some() {
-                                            ui.add_enabled(false, egui::Button::new("🔄 Re-remux").small())
-                                                .on_hover_text("Remux failed — hover the status cell for the ffmpeg error.");
-                                        } else if ui
-                                            .add_enabled(
-                                                !remuxing,
-                                                egui::Button::new("🔄 Re-remux").small(),
-                                            )
-                                            .on_hover_text(
-                                                "Convert the .ts capture to .mkv using ffmpeg.",
-                                            )
-                                            .clicked()
-                                        {
-                                            act = Some(Act::Remux(i));
+                                        if !remuxing {
+                                            if empty {
+                                                ui.add_enabled(false, egui::Button::new("🔄").small())
+                                                    .on_hover_text("Empty capture — nothing to remux.");
+                                            } else if remux_err.is_some() {
+                                                ui.add_enabled(false, egui::Button::new("🔄").small())
+                                                    .on_hover_text("Remux failed — see status cell.");
+                                            } else if ui
+                                                .button("🔄")
+                                                .on_hover_text("Re-remux: convert .ts → .mkv via ffmpeg.")
+                                                .clicked()
+                                            {
+                                                act = Some(Act::Remux(i));
+                                            }
+                                            if ui.button("🗑")
+                                                .on_hover_text(
+                                                    if empty {
+                                                        "Delete this empty capture file."
+                                                    } else {
+                                                        "Delete the .ts capture file and remove from list."
+                                                    }
+                                                )
+                                                .clicked()
+                                            {
+                                                act = Some(Act::Delete(i));
+                                            }
                                         }
                                     });
                                 });
@@ -12261,6 +12337,43 @@ impl StreamArchiverApp {
                     self.status = format!("Re-remux started for recording {}…", rec.id);
                 }
             }
+        }
+        if let Some(Act::Delete(i)) = act {
+            if let Some(rec) = self.issues_recs.get(i).cloned() {
+                let path = std::path::Path::new(&rec.output_path);
+                if path.exists() {
+                    let _ = std::fs::remove_file(path);
+                }
+                let _ = self.core.store.clear_recording_capture(rec.id);
+                self.issues_recs.retain(|r| r.id != rec.id);
+            }
+        }
+        if let Some(Act::ClearEmpties) = act {
+            let empties: Vec<_> = self.issues_recs.iter().filter(|r| {
+                std::path::Path::new(&r.output_path).metadata().map(|m| m.len()).unwrap_or(0) == 0
+            }).cloned().collect();
+            for rec in empties {
+                let path = std::path::Path::new(&rec.output_path);
+                if path.exists() {
+                    let _ = std::fs::remove_file(path);
+                }
+                let _ = self.core.store.clear_recording_capture(rec.id);
+                self.issues_recs.retain(|r| r.id != rec.id);
+            }
+        }
+        if let Some(Act::ConfirmClear) = act {
+            self.issues_confirm_clear = !self.issues_confirm_clear;
+        }
+        if let Some(Act::ClearAll) = act {
+            let all: Vec<_> = self.issues_recs.drain(..).collect();
+            for rec in all {
+                let path = std::path::Path::new(&rec.output_path);
+                if path.exists() {
+                    let _ = std::fs::remove_file(path);
+                }
+                let _ = self.core.store.clear_recording_capture(rec.id);
+            }
+            self.issues_confirm_clear = false;
         }
     }
 
