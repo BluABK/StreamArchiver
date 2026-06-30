@@ -1298,6 +1298,10 @@ pub const K_FILE_SPLIT_LOGS: &str = "file_split_logs";
 /// When set and today's usage meets or exceeds this value, API calls are skipped
 /// to protect the remaining quota. Default (when absent) = 9000.
 pub const K_YT_API_QUOTA_CUTOFF: &str = "youtube_api_quota_cutoff";
+/// `app_settings` key — YouTube search.list daily query cutoff (integer, queries).
+/// Default 90 (out of 100 free-tier queries/day). Triggers a dismissable warning
+/// in the Issues panel when exceeded.
+pub const K_YT_SEARCH_QUOTA_CUTOFF: &str = "youtube_search_quota_cutoff";
 
 /// Cumulative statistics for all `claude` CLI OCR invocations.
 #[derive(Default, Clone, serde::Serialize, serde::Deserialize)]

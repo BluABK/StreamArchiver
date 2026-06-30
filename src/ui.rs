@@ -24,7 +24,7 @@ use crate::models::{
     K_DIALOG_ICON, K_DISCORD_SCHEDULE, K_DISCORD_TOKEN, K_FILENAME_MEDIA, K_MONITOR_DEFAULTS,
     K_OCR_COMMAND, K_OCR_EFFORT, K_OCR_FALLBACK_MODEL, K_OCR_MAX_BUDGET, K_OCR_MODEL,
     K_OCR_OFFSET, K_OCR_STATS, K_OCR_TIMEOUT_SECS, K_OCR_TIMEZONE, K_SCHEDULE_TITLE_FILL,
-    K_YT_API_DETECT, K_YT_API_SCHEDULE, K_YT_COMMUNITY_MAX_POSTS, K_YT_API_QUOTA_CUTOFF,
+    K_YT_API_DETECT, K_YT_API_SCHEDULE, K_YT_COMMUNITY_MAX_POSTS, K_YT_API_QUOTA_CUTOFF, K_YT_SEARCH_QUOTA_CUTOFF,
     K_REMUX_EMBED_THUMBNAIL, K_REMUX_EMBED_TITLE, K_REMUX_TITLE_TEMPLATE, K_REMUX_EMBED_SUBS,
     K_FILE_SPLIT_ENABLED, K_FILE_SPLIT_VIDEOS, K_FILE_SPLIT_SUBS, K_FILE_SPLIT_CHAT,
     K_FILE_SPLIT_THUMBS, K_FILE_SPLIT_LOGS,
@@ -366,6 +366,8 @@ struct SettingsForm {
     youtube_api_schedule: bool,
     /// Daily quota cutoff for the YouTube Data API (units). Empty = default (9000).
     youtube_api_quota_cutoff: String,
+    /// Daily search.list query cutoff (queries). Empty = default (90).
+    youtube_search_quota_cutoff: String,
     kick_client_id: String,
     kick_client_secret: String,
     default_output_dir: String,
@@ -748,6 +750,11 @@ pub struct StreamArchiverApp {
     /// render thread (which would block if the DB mutex is held elsewhere).
     yt_quota_today: i64,
     yt_quota_cutoff: i64,
+    /// Daily search.list query count and its cutoff (separate from unit quota).
+    yt_search_today: i64,
+    yt_search_cutoff: i64,
+    /// Keys of quota warning issues the user has dismissed this session.
+    dismissed_quota_warnings: HashSet<String>,
     /// In-flight schedule calendar reload (background thread). `all_upcoming_schedule`
     /// can hold the DB mutex for several seconds when historical rows accumulate;
     /// running it off the UI thread prevents frame freezes and unblocks the delete action.
@@ -878,6 +885,7 @@ impl StreamArchiverApp {
             youtube_api_detect: setting_or_empty(&core, K_YT_API_DETECT) == "1",
             youtube_api_schedule: setting_or_empty(&core, K_YT_API_SCHEDULE) == "1",
             youtube_api_quota_cutoff: setting_or_empty(&core, K_YT_API_QUOTA_CUTOFF),
+            youtube_search_quota_cutoff: setting_or_empty(&core, K_YT_SEARCH_QUOTA_CUTOFF),
             kick_client_id: setting_or_empty(&core, K_KICK_ID),
             kick_client_secret: setting_or_empty(&core, K_KICK_SECRET),
             default_output_dir: default_out,
@@ -1152,6 +1160,9 @@ impl StreamArchiverApp {
             pending_reload: None,
             yt_quota_today: 0,
             yt_quota_cutoff: 9000,
+            yt_search_today: 0,
+            yt_search_cutoff: 90,
+            dismissed_quota_warnings: HashSet::new(),
             pending_schedule: None,
             emote_viewer: None,
             emote_viewer_stale: false,
@@ -1195,6 +1206,15 @@ impl StreamArchiverApp {
             .flatten()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(9000);
+        app.yt_search_today = app.core.store.get_quota_today("youtube_search").unwrap_or(0);
+        app.yt_search_cutoff = app
+            .core
+            .store
+            .get_setting(K_YT_SEARCH_QUOTA_CUTOFF)
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(90);
         app
     }
 
@@ -1662,7 +1682,14 @@ impl StreamArchiverApp {
                         .flatten()
                         .and_then(|s| s.trim().parse().ok())
                         .unwrap_or(9000);
-                    Ok(SaveRows { rows, channels, next_streams, yt_quota_today, yt_quota_cutoff })
+                    let yt_search_today = store.get_quota_today("youtube_search").unwrap_or(0);
+                    let yt_search_cutoff = store
+                        .get_setting(K_YT_SEARCH_QUOTA_CUTOFF)
+                        .ok()
+                        .flatten()
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(90);
+                    Ok(SaveRows { rows, channels, next_streams, yt_quota_today, yt_quota_cutoff, yt_search_today, yt_search_cutoff })
                 })();
                 debug!(elapsed_ms = t.elapsed().as_millis(), ok = result.is_ok(), "save-monitor done");
                 let _ = tx.send(result);
@@ -1747,7 +1774,14 @@ impl StreamArchiverApp {
                         .flatten()
                         .and_then(|s| s.trim().parse().ok())
                         .unwrap_or(9000);
-                    Some(SaveRows { rows, channels, next_streams, yt_quota_today, yt_quota_cutoff })
+                    let yt_search_today = store.get_quota_today("youtube_search").unwrap_or(0);
+                    let yt_search_cutoff = store
+                        .get_setting(K_YT_SEARCH_QUOTA_CUTOFF)
+                        .ok()
+                        .flatten()
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(90);
+                    Some(SaveRows { rows, channels, next_streams, yt_quota_today, yt_quota_cutoff, yt_search_today, yt_search_cutoff })
                 })();
                 debug!(
                     elapsed_ms = t.elapsed().as_millis(),
@@ -1804,6 +1838,8 @@ impl StreamArchiverApp {
         self.channels = save.channels;
         self.yt_quota_today = save.yt_quota_today;
         self.yt_quota_cutoff = save.yt_quota_cutoff;
+        self.yt_search_today = save.yt_search_today;
+        self.yt_search_cutoff = save.yt_search_cutoff;
         // Scroll to the newly-added channel on the next render so it's visible
         // regardless of where it lands in the alphabetically-sorted list.
         if let Some(new_ch) = self.channels.iter().find(|c| !old_channel_ids.contains(&c.id)) {
@@ -1848,6 +1884,7 @@ impl StreamArchiverApp {
             (K_YT_API_DETECT, if s.youtube_api_detect { "1" } else { "0" }),
             (K_YT_API_SCHEDULE, if s.youtube_api_schedule { "1" } else { "0" }),
             (K_YT_API_QUOTA_CUTOFF, s.youtube_api_quota_cutoff.trim()),
+            (K_YT_SEARCH_QUOTA_CUTOFF, s.youtube_search_quota_cutoff.trim()),
             (K_YTDLP_ARGS, s.ytdlp_default_args.trim()),
             (K_YTDLP_BINARY, s.ytdlp_binary_path.trim()),
             (K_SABR_BINARY, s.sabr_binary_path.trim()),
@@ -4821,6 +4858,8 @@ struct SaveRows {
     next_streams: Vec<(i64, i64, String)>,
     yt_quota_today: i64,
     yt_quota_cutoff: i64,
+    yt_search_today: i64,
+    yt_search_cutoff: i64,
 }
 
 /// In-flight form-save spawned on a background thread. The thread holds the store
@@ -5088,7 +5127,8 @@ impl eframe::App for StreamArchiverApp {
                             self.processes_refreshed = None; // force an immediate refresh
                         }
                         {
-                            let n = self.issues_recs.len() + self.issues_missing.len();
+                            let quota_warnings = self.active_quota_warnings();
+                            let n = self.issues_recs.len() + self.issues_missing.len() + quota_warnings.len();
                             let label = if n > 0 {
                                 format!("⚠ Issues ({})", n)
                             } else {
@@ -5102,7 +5142,7 @@ impl eframe::App for StreamArchiverApp {
                             };
                             if ui
                                 .add(btn)
-                                .on_hover_text("Recordings that need attention")
+                                .on_hover_text("Recordings and quota warnings that need attention")
                                 .clicked()
                             {
                                 self.show_issues = true;
@@ -11524,6 +11564,18 @@ impl StreamArchiverApp {
                          from unexpected bursts. Default: 9000.",
                     );
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Search query warning cutoff");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.youtube_search_quota_cutoff)
+                            .desired_width(80.0)
+                            .hint_text("90"),
+                    )
+                    .on_hover_text(
+                        "Show a warning in Issues when today's search.list call count reaches this \
+                         value. The free tier allows 100 search queries/day. Default: 90.",
+                    );
+                });
             });
 
             ui.add_space(12.0);
@@ -12800,20 +12852,32 @@ impl StreamArchiverApp {
             {
                 let quota_today = self.yt_quota_today;
                 let cutoff = self.yt_quota_cutoff;
+                let search_today = self.yt_search_today;
+                let search_cutoff = self.yt_search_cutoff;
                 egui::Grid::new("quota_grid")
                     .num_columns(4)
                     .spacing([32.0, 6.0])
                     .show(ui, |ui| {
                         ui.label("Units used today");
                         ui.strong(format!("{quota_today}"));
-                        ui.label("Daily limit");
+                        ui.label("Units cutoff");
                         ui.strong(format!("{cutoff}"));
+                        ui.end_row();
+                        ui.label("search.list calls today");
+                        ui.strong(format!("{search_today}"));
+                        ui.label("Search cutoff");
+                        ui.strong(format!("{search_cutoff}"));
                         ui.end_row();
                     });
                 let frac = (quota_today as f32 / cutoff as f32).clamp(0.0, 1.0);
                 ui.add(
                     egui::ProgressBar::new(frac)
                         .text(format!("{quota_today} / {cutoff} units")),
+                );
+                let search_frac = (search_today as f32 / 100.0_f32).clamp(0.0, 1.0);
+                ui.add(
+                    egui::ProgressBar::new(search_frac)
+                        .text(format!("{search_today} / 100 search queries")),
                 );
             }
 
@@ -13276,6 +13340,39 @@ impl StreamArchiverApp {
         }
     }
 
+    /// Returns the list of active (non-dismissed) quota warning keys.
+    /// Each key is a stable string used for both display and dismissal tracking.
+    fn active_quota_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.yt_quota_today >= self.yt_quota_cutoff {
+            let key = "youtube_units_exceeded".to_string();
+            if !self.dismissed_quota_warnings.contains(&key) {
+                warnings.push(key);
+            }
+        } else if self.yt_quota_cutoff > 0
+            && self.yt_quota_today as f32 / self.yt_quota_cutoff as f32 >= 0.9
+        {
+            let key = "youtube_units_near_cutoff".to_string();
+            if !self.dismissed_quota_warnings.contains(&key) {
+                warnings.push(key);
+            }
+        }
+        if self.yt_search_today >= self.yt_search_cutoff {
+            let key = "youtube_search_exceeded".to_string();
+            if !self.dismissed_quota_warnings.contains(&key) {
+                warnings.push(key);
+            }
+        } else if self.yt_search_cutoff > 0
+            && self.yt_search_today as f32 / self.yt_search_cutoff as f32 >= 0.9
+        {
+            let key = "youtube_search_near_cutoff".to_string();
+            if !self.dismissed_quota_warnings.contains(&key) {
+                warnings.push(key);
+            }
+        }
+        warnings
+    }
+
     /// Issues panel: lists all recordings whose output path is still a `.ts`
     /// file inside a `.cache` directory, and lets the user re-remux them to MKV.
     #[allow(deprecated)]
@@ -13362,7 +13459,8 @@ impl StreamArchiverApp {
         }).count();
         let n_missing = self.issues_missing.len();
         let confirm_clear = self.issues_confirm_clear;
-        let total_issues = self.issues_recs.len() + n_missing;
+        let quota_warnings = self.active_quota_warnings();
+        let _total_issues = self.issues_recs.len() + n_missing + quota_warnings.len();
 
         let mut open = true;
         enum Act {
@@ -13373,6 +13471,7 @@ impl StreamArchiverApp {
             ClearAllMissing,
             ConfirmClear,
             ClearAll,
+            DismissWarning(String),
         }
         let mut act: Option<Act> = None;
 
@@ -13389,8 +13488,39 @@ impl StreamArchiverApp {
                     ctx.request_repaint_after(Duration::from_secs(1));
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
+                    // ── Quota warnings ───────────────────────────────────────────
+                    for key in &quota_warnings {
+                        let (msg, color) = match key.as_str() {
+                            "youtube_units_exceeded" => (
+                                format!("YouTube Data API daily unit quota reached ({} / {} units). API calls are paused until tomorrow.", self.yt_quota_today, self.yt_quota_cutoff),
+                                egui::Color32::from_rgb(200, 80, 80),
+                            ),
+                            "youtube_units_near_cutoff" => (
+                                format!("YouTube Data API units near cutoff ({} / {} units today).", self.yt_quota_today, self.yt_quota_cutoff),
+                                egui::Color32::from_rgb(200, 150, 60),
+                            ),
+                            "youtube_search_exceeded" => (
+                                format!("YouTube search.list daily limit reached ({} / 100 queries). Search-based detection paused until tomorrow.", self.yt_search_today, ),
+                                egui::Color32::from_rgb(200, 80, 80),
+                            ),
+                            "youtube_search_near_cutoff" => (
+                                format!("YouTube search.list queries near limit ({} / 100 today, cutoff at {}).", self.yt_search_today, self.yt_search_cutoff),
+                                egui::Color32::from_rgb(200, 150, 60),
+                            ),
+                            _ => continue,
+                        };
+                        ui.horizontal(|ui| {
+                            ui.colored_label(color, &msg);
+                            if ui.small_button("✕ Dismiss").clicked() {
+                                act = Some(Act::DismissWarning(key.clone()));
+                            }
+                        });
+                    }
+                    if !quota_warnings.is_empty() {
+                        ui.separator();
+                    }
                     ui.horizontal(|ui| {
-                        ui.label(format!("{} recording(s) need attention", total_issues));
+                        ui.label(format!("{} recording(s) need attention", self.issues_recs.len() + n_missing));
                         if ui.button("⟳ Refresh").clicked() {
                             self.issues_refreshed = None;
                         }
@@ -13432,8 +13562,8 @@ impl StreamArchiverApp {
                         }
                     });
                     ui.separator();
-                    if total_issues == 0 {
-                        ui.weak("No issues found — all recordings are in their final format.");
+                    if self.issues_recs.is_empty() && n_missing == 0 {
+                        ui.weak("No recording issues found — all recordings are in their final format.");
                         return;
                     }
                     TableBuilder::new(ui)
@@ -13724,6 +13854,9 @@ impl StreamArchiverApp {
                 let _ = self.core.store.clear_recording_capture(rec.id);
             }
             self.issues_confirm_clear = false;
+        }
+        if let Some(Act::DismissWarning(key)) = act {
+            self.dismissed_quota_warnings.insert(key);
         }
     }
 

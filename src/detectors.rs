@@ -881,6 +881,7 @@ impl DetectContext {
             return None;
         }
         let _ = self.store.record_quota_usage("youtube", 100);
+        let _ = self.store.record_quota_usage("youtube_search", 1);
         let v: Value = resp.json().await.ok()?;
         let ids: Vec<String> = v["items"]
             .as_array()
@@ -1582,6 +1583,7 @@ impl DetectContext {
         match resp {
             Ok(r) if r.status().is_success() => {
                 let _ = self.store.record_quota_usage("youtube", 100);
+                let _ = self.store.record_quota_usage("youtube_search", 1);
                 let v: Value = r.json().await.unwrap_or_default();
                 match v["items"][0]["id"]["videoId"].as_str() {
                     Some(vid) => {
