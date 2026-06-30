@@ -1249,6 +1249,10 @@ pub const K_YT_COMMUNITY_MAX_POSTS: &str = "youtube_community_max_posts";
 pub const K_CHANNEL_SCOPE_CFG: &str = "channel_schedule_scope";
 pub const K_MONITOR_SCOPE_CFG: &str = "monitor_schedule_scope";
 
+/// `app_settings` key for an absolute path to a PNG file used as the main icon
+/// in crash and freeze dialogs. Empty = standard Windows error/warning icon.
+pub const K_DIALOG_ICON: &str = "dialog_icon";
+
 /// Cumulative statistics for all `claude` CLI OCR invocations.
 #[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OcrStats {

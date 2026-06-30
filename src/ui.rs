@@ -21,9 +21,9 @@ use crate::app_core::AppCore;
 use crate::events::{ManualCommand, UiCommand};
 use crate::models::{
     AdBreak, AuthKind, Channel, Container, DetectionMethod, DownloadDefaults, GlobalStats,
-    K_DISCORD_SCHEDULE, K_DISCORD_TOKEN, K_FILENAME_MEDIA, K_MONITOR_DEFAULTS, K_OCR_COMMAND,
-    K_OCR_EFFORT, K_OCR_FALLBACK_MODEL, K_OCR_MAX_BUDGET, K_OCR_MODEL, K_OCR_OFFSET,
-    K_OCR_STATS, K_OCR_TIMEOUT_SECS, K_OCR_TIMEZONE, K_SCHEDULE_TITLE_FILL,
+    K_DIALOG_ICON, K_DISCORD_SCHEDULE, K_DISCORD_TOKEN, K_FILENAME_MEDIA, K_MONITOR_DEFAULTS,
+    K_OCR_COMMAND, K_OCR_EFFORT, K_OCR_FALLBACK_MODEL, K_OCR_MAX_BUDGET, K_OCR_MODEL,
+    K_OCR_OFFSET, K_OCR_STATS, K_OCR_TIMEOUT_SECS, K_OCR_TIMEZONE, K_SCHEDULE_TITLE_FILL,
     K_YT_API_DETECT, K_YT_API_SCHEDULE, K_YT_COMMUNITY_MAX_POSTS, MediaInfoMode, Monitor,
     MonitorDefaults, MonitorWithChannel, OcrStats, Platform, Recording, ScheduleSegment,
     StreamGroup, StreamMetaChange, Tool, UpcomingStream, Video, group_recordings, now_unix,
@@ -420,6 +420,9 @@ struct SettingsForm {
     ocr_timeout_secs: String,
     /// Effort level passed as `--effort` (empty = omit; low/medium/high/xhigh/max).
     ocr_effort: String,
+    /// File path to a PNG used as the main icon in crash and freeze dialogs.
+    /// Empty = standard Windows error/warning icon. Requires a restart to take effect.
+    dialog_icon: String,
     /// Global "go to the next schedule source when an event has no title" toggle:
     /// after a winner is found, keep querying lower-priority sources to fill in
     /// blank titles (e.g. a Twitch schedule with times but no titles).
@@ -897,6 +900,7 @@ impl StreamArchiverApp {
             ocr_effort: setting_or_empty(&core, K_OCR_EFFORT),
             schedule_title_fill: setting_or_empty(&core, K_SCHEDULE_TITLE_FILL) == "1",
             youtube_community_max_posts: setting_or_empty(&core, K_YT_COMMUNITY_MAX_POSTS),
+            dialog_icon: setting_or_empty(&core, K_DIALOG_ICON),
         };
         // Apply the loaded date format + short-timestamp pattern before the first render.
         set_active_date_fmt(settings.date_fmt);
@@ -1631,6 +1635,7 @@ impl StreamArchiverApp {
                 K_YT_COMMUNITY_MAX_POSTS,
                 s.youtube_community_max_posts.trim(),
             ),
+            (K_DIALOG_ICON, s.dialog_icon.trim()),
         ];
         for (k, v) in pairs {
             if let Err(e) = self.core.store.set_setting(k, v) {
@@ -11430,6 +11435,42 @@ impl StreamArchiverApp {
                     "Downloads will stop when the app closes.".into()
                 };
             }
+
+            ui.add_space(12.0);
+            ui.heading("Diagnostics");
+            ui.label(
+                "Crash / freeze dialog icon — path to a PNG file shown as the main icon in \
+                 error dialogs. Leave empty to use the standard Windows icon. Restart required \
+                 to apply.",
+            );
+            egui::Grid::new("diag_grid")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("Dialog icon (PNG)");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings.dialog_icon)
+                                .hint_text("(standard icon)")
+                                .desired_width(280.0),
+                        )
+                        .on_hover_text(
+                            "Absolute path to a PNG file. Displayed as the main icon in \
+                             crash and freeze dialogs. Falls back to the standard Windows \
+                             icon if the file is missing or not a valid PNG.",
+                        );
+                        if ui.button("Browse…").clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("PNG images", &["png"])
+                                .pick_file()
+                            {
+                                self.settings.dialog_icon =
+                                    path.to_string_lossy().into_owned();
+                            }
+                        }
+                    });
+                    ui.end_row();
+                });
 
             ui.add_space(16.0);
             if ui.button("💾 Save settings").clicked() {

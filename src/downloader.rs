@@ -4058,6 +4058,12 @@ pub async fn remux_ts_to_mkv(
         None
     };
 
+    // Look for a thumbnail sidecar sitting next to the source TS (either our
+    // HTTP fetch → `{stem}.thumbnail.jpg`, or yt-dlp's `--write-thumbnail` →
+    // `{stem}.webp`/`.jpg`/`.png`). If found, embed it as an MKV cover-art
+    // attachment so media players (mpv, VLC, …) pick it up automatically.
+    let thumbnail = find_thumbnail_for(src);
+
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-y")
         .arg("-i")
@@ -4070,7 +4076,26 @@ pub async fn remux_ts_to_mkv(
         .arg("-map").arg("0:v?")
         .arg("-map").arg("0:a?")
         .arg("-map").arg("0:s?")
-        .arg("-c").arg("copy")
+        .arg("-c").arg("copy");
+
+    if let Some(ref thumb) = thumbnail {
+        let ext = thumb
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("jpg")
+            .to_ascii_lowercase();
+        let mime = match ext.as_str() {
+            "png"  => "image/png",
+            "webp" => "image/webp",
+            _      => "image/jpeg",
+        };
+        let cover_name = format!("cover.{ext}");
+        cmd.arg("-attach").arg(thumb)
+            .arg("-metadata:s:t").arg(format!("mimetype={mime}"))
+            .arg("-metadata:s:t").arg(format!("filename={cover_name}"));
+    }
+
+    cmd
         // Write structured key=value progress lines to stdout.
         .arg("-progress").arg("pipe:1")
         // Suppress the default per-frame stats line that goes to stderr.
@@ -4489,6 +4514,25 @@ async fn rename_for_media(final_path: PathBuf, new_stem: &str) -> PathBuf {
             final_path
         }
     }
+}
+
+/// Find a thumbnail sidecar that lives alongside `src` in the same directory.
+///
+/// Checked in priority order:
+/// 1. `{stem}.thumbnail.jpg` — written by our HTTP fetch
+/// 2. `{stem}.webp` / `{stem}.jpg` / `{stem}.png` — written by yt-dlp `--write-thumbnail`
+///
+/// Returns the first match found, or `None` if no thumbnail exists yet.
+fn find_thumbnail_for(src: &Path) -> Option<PathBuf> {
+    let dir = src.parent()?;
+    let stem = src.file_stem()?.to_string_lossy();
+    for suffix in &["thumbnail.jpg", "webp", "jpg", "png", "jpeg"] {
+        let candidate = dir.join(format!("{stem}.{suffix}"));
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// Subtitle-sidecar extensions, for companion-file moves when the video is

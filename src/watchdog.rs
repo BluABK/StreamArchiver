@@ -610,6 +610,98 @@ thread_local! {
     static CB_LOG_DIR: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
 }
 
+/// Raw HICON handle (as `usize`) for the custom crash/freeze dialog icon.
+/// Stored as `usize` so the static is `Send`. Set once at startup via
+/// [`set_dialog_icon`]; `0` means not set, fall back to the built-in icon.
+static DIALOG_ICON_HANDLE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Set the PNG file to use as the main icon in crash and freeze dialogs.
+/// Call once at startup after the settings store is opened.
+/// A missing file or an unloadable PNG silently falls back to the standard icon.
+pub fn set_dialog_icon(path: Option<std::path::PathBuf>) {
+    #[cfg(target_os = "windows")]
+    if let Some(p) = path {
+        if let Some(hicon) = load_png_as_hicon(&p) {
+            let _ = DIALOG_ICON_HANDLE.set(hicon.0 as usize);
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = path;
+}
+
+/// Load a PNG from `path` and create a Win32 HICON from it.
+/// Returns `None` on any failure (missing file, bad PNG, GDI error).
+#[cfg(target_os = "windows")]
+fn load_png_as_hicon(
+    path: &std::path::Path,
+) -> Option<windows::Win32::UI::WindowsAndMessaging::HICON> {
+    use windows::core::BOOL;
+    use windows::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject};
+    use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, ICONINFO};
+
+    let img = image::open(path).ok()?.to_rgba8();
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        return None;
+    }
+
+    // Convert top-down RGBA → bottom-up premultiplied BGRA (Windows icon layout).
+    let mut bgra = vec![0u8; (w * h * 4) as usize];
+    for row in 0..h {
+        let dst_row = h - 1 - row;
+        for col in 0..w {
+            let [r, g, b, a] = img.get_pixel(col, row).0;
+            let af = a as u32;
+            let base = ((dst_row * w + col) * 4) as usize;
+            bgra[base]     = ((b as u32 * af + 127) / 255) as u8;
+            bgra[base + 1] = ((g as u32 * af + 127) / 255) as u8;
+            bgra[base + 2] = ((r as u32 * af + 127) / 255) as u8;
+            bgra[base + 3] = a;
+        }
+    }
+
+    unsafe {
+        let hbm_color = CreateBitmap(
+            w as i32,
+            h as i32,
+            1,
+            32,
+            Some(bgra.as_ptr() as *const _),
+        );
+        if hbm_color.is_invalid() {
+            return None;
+        }
+
+        // 1-bpp mask: all zeros lets the 32-bpp alpha channel drive transparency.
+        let mask_stride = (w + 15) / 16 * 2; // WORD-aligned bytes per row
+        let mask = vec![0u8; (mask_stride * h) as usize];
+        let hbm_mask = CreateBitmap(
+            w as i32,
+            h as i32,
+            1,
+            1,
+            Some(mask.as_ptr() as *const _),
+        );
+        if hbm_mask.is_invalid() {
+            let _ = DeleteObject(hbm_color.into());
+            return None;
+        }
+
+        let info = ICONINFO {
+            fIcon: BOOL(1),
+            xHotspot: 0,
+            yHotspot: 0,
+            hbmMask: hbm_mask,
+            hbmColor: hbm_color,
+        };
+        let hicon = CreateIconIndirect(&info).ok();
+        let _ = DeleteObject(hbm_color.into());
+        let _ = DeleteObject(hbm_mask.into());
+
+        hicon.filter(|h| !h.is_invalid())
+    }
+}
+
 /// TaskDialog callback. Intercepts button clicks that should NOT close the
 /// dialog (Copy details, Open log folder) and returns S_FALSE to keep it open.
 /// Force quit / Close / Keep waiting return S_OK and close normally.
@@ -653,10 +745,10 @@ fn show_task_dialog_win32(
     use windows::Win32::UI::Controls::{
         TaskDialogIndirect, TASKDIALOG_BUTTON, TASKDIALOGCONFIG,
         TASKDIALOGCONFIG_0, TASKDIALOGCONFIG_1,
-        TDF_ALLOW_DIALOG_CANCELLATION, TDF_SIZE_TO_CONTENT,
+        TDF_ALLOW_DIALOG_CANCELLATION, TDF_SIZE_TO_CONTENT, TDF_USE_HICON_MAIN,
         TDCBF_CLOSE_BUTTON, TD_ERROR_ICON, TD_WARNING_ICON,
     };
-    use windows::Win32::UI::WindowsAndMessaging::IDCANCEL;
+    use windows::Win32::UI::WindowsAndMessaging::{HICON, IDCANCEL};
     use windows::core::PCWSTR;
 
     // Make detail and log_dir available to the callback via thread-locals.
@@ -679,7 +771,25 @@ fn show_task_dialog_win32(
     let lbl_copy = w("Copy details");
     let lbl_logs = w("Open log folder");
 
-    let icon = if warning { TD_WARNING_ICON } else { TD_ERROR_ICON };
+    // Try custom icon first; fall back to the built-in TD_WARNING/ERROR constants.
+    let custom_hicon: Option<HICON> = DIALOG_ICON_HANDLE
+        .get()
+        .copied()
+        .map(|raw| HICON(raw as *mut _));
+
+    let (extra_flags, anon1) = match custom_hicon {
+        Some(hicon) => (
+            TDF_USE_HICON_MAIN,
+            TASKDIALOGCONFIG_0 { hMainIcon: hicon },
+        ),
+        None => {
+            let icon = if warning { TD_WARNING_ICON } else { TD_ERROR_ICON };
+            (
+                windows::Win32::UI::Controls::TASKDIALOG_FLAGS(0),
+                TASKDIALOGCONFIG_0 { pszMainIcon: icon },
+            )
+        }
+    };
 
     let mut buttons: Vec<TASKDIALOG_BUTTON> = Vec::new();
     if warning {
@@ -710,10 +820,10 @@ fn show_task_dialog_win32(
         cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
         hwndParent: HWND(std::ptr::null_mut()),
         hInstance: HINSTANCE(std::ptr::null_mut()),
-        dwFlags: TDF_SIZE_TO_CONTENT | TDF_ALLOW_DIALOG_CANCELLATION,
+        dwFlags: TDF_SIZE_TO_CONTENT | TDF_ALLOW_DIALOG_CANCELLATION | extra_flags,
         dwCommonButtons: TDCBF_CLOSE_BUTTON,
         pszWindowTitle: PCWSTR(title_w.as_ptr()),
-        Anonymous1: TASKDIALOGCONFIG_0 { pszMainIcon: icon },
+        Anonymous1: anon1,
         pszMainInstruction: PCWSTR(heading_w.as_ptr()),
         pszContent: PCWSTR(summary_w.as_ptr()),
         cButtons: buttons.len() as u32,
@@ -727,7 +837,7 @@ fn show_task_dialog_win32(
         pszExpandedControlText: PCWSTR(collapse_w.as_ptr()),
         pszCollapsedControlText: PCWSTR(expand_w.as_ptr()),
         Anonymous2: TASKDIALOGCONFIG_1 {
-            hFooterIcon: windows::Win32::UI::WindowsAndMessaging::HICON(std::ptr::null_mut()),
+            hFooterIcon: HICON(std::ptr::null_mut()),
         },
         pszFooter: PCWSTR(footer_w.as_ptr()),
         pfCallback: Some(task_dialog_cb),

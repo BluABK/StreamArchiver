@@ -100,6 +100,16 @@ fn main() -> Result<()> {
     watchdog::install_panic_dialog();
 
     let store = Store::open(&app_paths::db_path()).context("opening data store")?;
+
+    // Load the optional custom crash/freeze dialog icon (set in Settings → Diagnostics).
+    let dialog_icon_path = store
+        .get_setting(models::K_DIALOG_ICON)
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from);
+    watchdog::set_dialog_icon(dialog_icon_path);
+
     // Crash recovery for on-demand downloads: any left mid-flight is stale.
     // (In-flight live recordings are handled in `core.start()` →
     // `Supervisor::resume_inflight`, which resumes SABR-resumable captures and
