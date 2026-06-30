@@ -458,6 +458,10 @@ struct SettingsForm {
     file_split_logs: String,
     /// Checkbox for "fetch missing thumbnails" in the Maintenance section.
     fetch_thumb_embed: bool,
+    /// Selected preset template for the "Set filename default" row in Maintenance.
+    maintenance_filename_preset: String,
+    /// Apply the preset to all existing monitors when "Set as Default" is clicked.
+    maintenance_apply_all: bool,
 }
 
 /// Background load state of an import fetch (followed/subscriptions).
@@ -988,6 +992,8 @@ impl StreamArchiverApp {
             file_split_thumbs: { let v = setting_or_empty(&core, K_FILE_SPLIT_THUMBS); if v.is_empty() { "thumbs".into() } else { v } },
             file_split_logs:   { let v = setting_or_empty(&core, K_FILE_SPLIT_LOGS);   if v.is_empty() { "logs".into()   } else { v } },
             fetch_thumb_embed: false,
+            maintenance_filename_preset: String::new(),
+            maintenance_apply_all: false,
         };
         // Apply the loaded date format + short-timestamp pattern before the first render.
         set_active_date_fmt(settings.date_fmt);
@@ -12631,6 +12637,10 @@ impl StreamArchiverApp {
             ui.heading("Maintenance 🔧");
             ui.label("One-time batch jobs — each runs in the background and reports progress in the Background tab.");
             ui.add_space(6.0);
+            let mut maint_preset_delete: Option<i64> = None;
+            let mut maint_preset_save_tmpl: Option<String> = None;
+            let mut do_set_filename_default = false;
+            let maint_custom_presets = self.custom_presets.clone();
             egui::Grid::new("maintenance_grid")
                 .num_columns(2)
                 .spacing([12.0, 8.0])
@@ -12661,7 +12671,55 @@ impl StreamArchiverApp {
                     }
                     ui.label("Move files into/out of subdirectories based on current File Management settings.");
                     ui.end_row();
+
+                    ui.horizontal(|ui| {
+                        let (del, save) = filename_preset_combo(
+                            ui,
+                            "maint_filename_preset",
+                            &mut self.settings.maintenance_filename_preset,
+                            &maint_custom_presets,
+                        );
+                        if del.is_some() { maint_preset_delete = del; }
+                        if save { maint_preset_save_tmpl = Some(self.settings.maintenance_filename_preset.clone()); }
+                        let has_preset = !self.settings.maintenance_filename_preset.is_empty();
+                        if ui.add_enabled(has_preset, egui::Button::new("Set as Default"))
+                            .on_hover_text("Set this preset as the global filename template default for new monitors.")
+                            .clicked()
+                        {
+                            do_set_filename_default = true;
+                        }
+                        ui.checkbox(&mut self.settings.maintenance_apply_all, "Apply to all existing");
+                    });
+                    ui.label("Set the global filename template default for new monitors; optionally apply it to all existing ones.");
+                    ui.end_row();
                 });
+            if do_set_filename_default {
+                let tmpl = self.settings.maintenance_filename_preset.clone();
+                self.monitor_defaults.global.filename_template = Some(tmpl.clone());
+                self.persist_monitor_defaults();
+                if self.settings.maintenance_apply_all {
+                    match self.core.store.set_all_filename_templates(&tmpl) {
+                        Ok(n) => self.status = format!("Default set; updated {n} existing monitor(s)."),
+                        Err(e) => self.status = format!("Error updating monitors: {e:#}"),
+                    }
+                } else {
+                    self.status = "Default filename template updated.".into();
+                }
+            }
+            if let Some(id) = maint_preset_delete {
+                if let Err(e) = self.core.store.delete_filename_preset(id) {
+                    self.status = format!("Error deleting preset: {e:#}");
+                } else {
+                    self.custom_presets = self.core.store.get_filename_presets().unwrap_or_default();
+                }
+            }
+            if let Some(tmpl) = maint_preset_save_tmpl {
+                self.save_preset_dialog = Some(SavePresetDraft {
+                    template: tmpl,
+                    name: String::new(),
+                    error: String::new(),
+                });
+            }
 
             ui.add_space(12.0);
 

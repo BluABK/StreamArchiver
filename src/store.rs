@@ -1681,6 +1681,16 @@ impl Store {
         Ok(())
     }
 
+    /// Bulk-set every monitor's `filename_template` column. Returns the number of rows updated.
+    pub fn set_all_filename_templates(&self, template: &str) -> Result<usize> {
+        let conn = self.db();
+        let n = conn.execute(
+            "UPDATE monitor SET filename_template = ?1",
+            params![template],
+        )?;
+        Ok(n)
+    }
+
     /// Delete every schedule segment from one `source` across all monitors. Used to
     /// purge imported Discord events when that import is turned off.
     pub fn clear_schedule_source(&self, source: &str) -> Result<()> {
