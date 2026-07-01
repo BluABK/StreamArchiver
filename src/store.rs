@@ -2428,26 +2428,6 @@ impl Store {
         Ok(rows)
     }
 
-    /// Output paths of a monitor's currently-active recordings (status =
-    /// `recording`), newest first — the SABR primary and, in dual capture, the
-    /// DASH companion. Unlike [`Self::inflight_recordings`] this does NOT
-    /// exclude detached-registered rows: every running recording is in the
-    /// `detached_process` registry, so callers that want "what is recording
-    /// right now" (e.g. "Play new instance" opening the live capture) must
-    /// not filter on it.
-    pub fn active_recording_paths(&self, monitor_id: i64) -> Result<Vec<String>> {
-        let conn = self.db();
-        let mut stmt = conn.prepare(
-            "SELECT COALESCE(output_path, '') FROM recording
-             WHERE status = 'recording' AND monitor_id = ?1
-             ORDER BY id DESC",
-        )?;
-        let rows = stmt
-            .query_map([monitor_id], |r| r.get(0))?
-            .collect::<rusqlite::Result<Vec<String>>>()?;
-        Ok(rows)
-    }
-
     /// Distinct output directories across all monitors and videos — used to locate
     /// `.cache\` working dirs for the startup sweep.
     pub fn all_output_dirs(&self) -> Result<Vec<String>> {

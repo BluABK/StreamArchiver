@@ -174,7 +174,7 @@ pub struct SabrConfig {
 
 impl SabrConfig {
     /// True when SABR capture is configured and usable.
-    fn usable(&self) -> bool {
+    pub(crate) fn usable(&self) -> bool {
         self.enabled && !self.binary.is_empty()
     }
 }
@@ -206,7 +206,7 @@ fn setting_str(store: &Store, key: &str) -> String {
 
 /// Load the configured yt-dlp binaries + SABR preset from settings, applying the
 /// built-in fallbacks for any empty preset fields.
-fn load_ytdlp_bins(store: &Store) -> YtDlpBins {
+pub(crate) fn load_ytdlp_bins(store: &Store) -> YtDlpBins {
     let enabled = store
         .get_setting("ytdlp_sabr_enabled")
         .ok()
@@ -629,6 +629,27 @@ fn sabr_capture_args(
     }
     args.extend_from_slice(extra);
     args.push(youtube_live_url(url));
+    args
+}
+
+/// Build the yt-dlp SABR args for a throwaway live-edge preview download
+/// ("Play new instance"): identical to [`sabr_capture_args`] except it joins
+/// at the live edge instead of rewinding to the start — the whole point is
+/// that the preview files BEGIN at the edge, so the player needs no seeking.
+pub(crate) fn sabr_preview_args(
+    out_mkv: &Path,
+    auth: &AuthSource,
+    ytdlp_global_args: &[String],
+    sabr: &SabrConfig,
+    extra: &[String],
+    url: &str,
+) -> Vec<String> {
+    let mut args = sabr_capture_args(out_mkv, auth, ytdlp_global_args, sabr, extra, url);
+    for a in args.iter_mut() {
+        if a == "--live-from-start" {
+            *a = "--no-live-from-start".into();
+        }
+    }
     args
 }
 
@@ -6603,6 +6624,26 @@ mod tests {
                 pot_args: SABR_DEFAULT_POT_ARGS.into(),
             },
         }
+    }
+
+    #[test]
+    fn sabr_preview_args_join_at_live_edge() {
+        // The live-edge preview ("Play new instance") must be the capture
+        // command with from-start swapped for live-edge — nothing else.
+        let bins = sabr_bins();
+        let out = PathBuf::from(r"C:\tmp\.cache\preview.mkv");
+        let preview = sabr_preview_args(
+            &out, &AuthSource::None, &[], &bins.sabr, &[], "https://www.youtube.com/@chan",
+        );
+        assert!(preview.iter().any(|a| a == "--no-live-from-start"));
+        assert!(!preview.iter().any(|a| a == "--live-from-start"));
+        let capture = sabr_capture_args(
+            &out, &AuthSource::None, &[], &bins.sabr, &[], "https://www.youtube.com/@chan",
+        );
+        let normalize = |v: &[String]| {
+            v.iter().filter(|a| !a.contains("live-from-start")).cloned().collect::<Vec<_>>()
+        };
+        assert_eq!(normalize(&preview), normalize(&capture));
     }
 
     #[test]

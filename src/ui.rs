@@ -4398,7 +4398,7 @@ fn render_instance_row(
         }
         if ui
             .add_enabled(!media_player.is_empty(), egui::Button::new("▷  Play new instance"))
-            .on_hover_text("Open a live stream directly in the media player (does not record)")
+            .on_hover_text("Tune into the stream at the live edge in the media player (does not record)")
             .on_disabled_hover_text("Set a media player in Settings → Defaults first")
             .clicked()
         {
@@ -4496,7 +4496,7 @@ fn render_instance_row(
                 {
                     let b = ui
                         .add_enabled(!media_player.is_empty(), egui::Button::new("▷").small())
-                        .on_hover_text("Play new instance in media player (live, does not record)")
+                        .on_hover_text("Play new instance in media player at the live edge (does not record)")
                         .on_disabled_hover_text("Set a media player in Settings → Defaults first");
                     if b.clicked() {
                         a.play_new_instance = Some(m.id);
@@ -10378,7 +10378,7 @@ impl StreamArchiverApp {
                                                     !media_player.is_empty(),
                                                     egui::Button::new("▷").small(),
                                                 )
-                                                .on_hover_text("Play new instance in media player (live, does not record)")
+                                                .on_hover_text("Play new instance in media player at the live edge (does not record)")
                                                 .on_disabled_hover_text("Set a media player in Settings → Defaults first")
                                                 .clicked()
                                             {
@@ -10545,7 +10545,7 @@ impl StreamArchiverApp {
                                                 !media_player.is_empty(),
                                                 egui::Button::new("▷  Play new instance"),
                                             )
-                                            .on_hover_text("Open a live stream directly in the media player (does not record)")
+                                            .on_hover_text("Tune into the stream at the live edge in the media player (does not record)")
                                             .on_disabled_hover_text("Set a media player in Settings → Defaults first")
                                             .clicked()
                                         {
@@ -10632,7 +10632,7 @@ impl StreamArchiverApp {
                                                         !media_player.is_empty(),
                                                         egui::Button::new("▷").small(),
                                                     )
-                                                    .on_hover_text("Play new instance in media player (live, does not record)")
+                                                    .on_hover_text("Play new instance in media player at the live edge (does not record)")
                                                     .on_disabled_hover_text("Set a media player in Settings → Defaults first")
                                                     .clicked()
                                                 {
@@ -10880,7 +10880,7 @@ impl StreamArchiverApp {
                                                     !media_player.is_empty(),
                                                     egui::Button::new("▷  Play new instance"),
                                                 )
-                                                .on_hover_text("Open a live stream directly in the media player (does not record)")
+                                                .on_hover_text("Tune into the stream at the live edge in the media player (does not record)")
                                                 .on_disabled_hover_text("Set a media player in Settings → Defaults first")
                                                 .clicked()
                                             {
@@ -11123,36 +11123,10 @@ impl StreamArchiverApp {
             let player = self.settings.media_player_path.trim().to_string();
             if !player.is_empty()
                 && let Some(row) = self.rows.iter().find(|r| r.monitor.id == mid)
+                && let Some(msg) =
+                    spawn_play_new_instance(row, &player, &self.settings, &self.core.store)
             {
-                // If this monitor is recording right now, a fresh player on
-                // the growing capture is the only reliable live source for
-                // YouTube SABR streams (they can't be piped or URL-played)
-                // and the cheapest for everything else. Across the active
-                // takes (dual capture: SABR primary + DASH companion), pick
-                // the first target the configured player can play.
-                let targets: Vec<StreamTarget> = self
-                    .core
-                    .store
-                    .active_recording_paths(mid)
-                    .ok()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|p| stream_target_for_active(&p))
-                    .collect();
-                let capture = targets.iter().find(|t| playable_with(t, &player)).cloned();
-                if let Some(target) = capture {
-                    tracing::info!(
-                        monitor_id = mid,
-                        ?target,
-                        "play-new-instance: opening the active recording's capture"
-                    );
-                    if let Err(e) = build_player_command(&player, &target).spawn() {
-                        warn!("play-new-instance: failed to launch player: {e}");
-                        self.status = format!("Failed to launch media player: {e}");
-                    }
-                } else if let Some(msg) = spawn_play_new_instance(row, &player, &self.settings) {
-                    self.status = msg;
-                }
+                self.status = msg;
             }
         }
         if let Some(t) = copy_text {
@@ -17572,18 +17546,220 @@ fn spawn_logged(mut cmd: std::process::Command, what: &str) -> Option<String> {
     }
 }
 
-/// Spawn a "play new instance" command — opens the live stream directly in the
-/// configured media player without recording it. Returns a status-bar message
-/// (error or caveat) to show the user, or `None` when nothing needs saying.
+/// Root for throwaway live-edge preview downloads (see [`spawn_live_preview`]).
+fn preview_root() -> std::path::PathBuf {
+    std::env::temp_dir().join("streamarchiver-preview")
+}
+
+/// Best-effort sweep of preview dirs older than a day (leftovers from previews
+/// orphaned by an app exit — their downloader dies when the stream ends, but
+/// the files linger until this runs on the next preview).
+fn sweep_stale_previews() {
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 3600);
+    let Ok(rd) = std::fs::read_dir(preview_root()) else { return };
+    for entry in rd.flatten() {
+        if entry.metadata().and_then(|m| m.modified()).map(|t| t < cutoff).unwrap_or(false) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Spawn a throwaway live-edge download into a temp dir and open its growing
+/// capture in the player once it buffers — "tune in now" for YouTube streams.
 ///
-/// The caller first tries the monitor's active recording capture; this
-/// function is the no-active-capture path:
-/// - Streamlink: `--player <path>` routes output to the player.
-/// - yt-dlp + YouTube: passes the /live URL to the player and lets its yt-dlp
-///   integration extract. This FAILS for SABR-only streams (most YouTube live
-///   streams now) — stock yt-dlp sees no formats and the SABR dev build can
-///   neither pipe to stdout (yt-dlp PR #13515) nor produce URLs a player can
-///   consume; those streams are only watchable while recording (⏵).
+/// This is the only viable live-edge path for SABR-only streams: they can't be
+/// piped to stdout (yt-dlp PR #13515), stock yt-dlp sees no formats for a
+/// player's URL handler, and seeking to the end of the main recording's
+/// growing cue-less MKV means a multi-GB linear scan. A fresh live-edge
+/// download's files BEGIN at the edge, so the player just plays from 0.
+///
+/// A watcher thread polls the temp dir, launches the player when a playable
+/// target appears, waits for the player to exit, then kills the downloader
+/// tree and deletes the temp dir. If the app exits first the downloader is
+/// orphaned but self-limiting (it dies when the stream ends); leftovers are
+/// swept by [`sweep_stale_previews`].
+fn spawn_live_preview(
+    row: &crate::models::MonitorWithChannel,
+    player: &str,
+    settings: &SettingsForm,
+    store: &crate::store::Store,
+) -> Option<String> {
+    use crate::downloader::{load_ytdlp_bins, resolve_auth, sabr_preview_args, split_args, youtube_live_url, AuthSource};
+    use crate::models::Platform;
+
+    let m = &row.monitor;
+    sweep_stale_previews();
+
+    let bins = load_ytdlp_bins(store);
+    let use_sabr = m.platform() == Platform::YouTube && bins.sabr.usable();
+    if use_sabr && !player_is_mpv(player) {
+        return Some("Live-edge preview of SABR streams requires mpv as the media player".into());
+    }
+
+    let tmp = preview_root().join(format!("{}-{}", m.id, crate::models::now_unix()));
+    let cache = tmp.join(".cache");
+    if let Err(e) = std::fs::create_dir_all(&cache) {
+        return Some(format!("Failed to create preview dir: {e}"));
+    }
+
+    let auth = resolve_auth(row, &settings.download_auth_method, &settings.cookies_browser);
+    let extra = split_args(&m.extra_args);
+    let global_args = split_args(&settings.ytdlp_default_args);
+    // Downloader writes into <tmp>\.cache\preview.*, matching the app's capture
+    // convention so stream_target_for_active(<tmp>\preview.mkv) finds it.
+    let probe_path = tmp.join("preview.mkv");
+    let (program, args) = if use_sabr {
+        (
+            bins.sabr.binary.clone(),
+            sabr_preview_args(&cache.join("preview.mkv"), &auth, &global_args, &bins.sabr, &extra, &m.url),
+        )
+    } else {
+        let mut args = vec![
+            "--no-part".to_string(),
+            "--hls-use-mpegts".into(),
+            "-o".into(),
+            cache.join("preview.ts").to_string_lossy().into_owned(),
+            "--no-live-from-start".into(),
+        ];
+        match &auth {
+            AuthSource::CookiesBrowser(b) => {
+                args.push("--cookies-from-browser".into());
+                args.push(b.clone());
+            }
+            AuthSource::CookiesFile(p) => {
+                args.push("--cookies".into());
+                args.push(p.clone());
+            }
+            _ => {}
+        }
+        args.extend(global_args);
+        if m.platform() == Platform::YouTube && !bins.sabr.pot_args.is_empty() {
+            args.push("--extractor-args".into());
+            args.push(bins.sabr.pot_args.clone());
+        }
+        args.extend(extra);
+        args.push(if m.platform() == Platform::YouTube {
+            youtube_live_url(&m.url)
+        } else {
+            m.url.clone()
+        });
+        (bins.system_program(), args)
+    };
+
+    let log_path = tmp.join("preview.log");
+    let (log_out, log_err) = match std::fs::File::create(&log_path)
+        .and_then(|f| Ok((f.try_clone()?, f)))
+    {
+        Ok(pair) => pair,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Some(format!("Failed to create preview log: {e}"));
+        }
+    };
+    let line = format!("{program} {}", args.join(" "));
+    tracing::info!(%line, "live-preview: spawning downloader");
+    let mut dl = match std::process::Command::new(&program)
+        .args(&args)
+        .stdout(log_out)
+        .stderr(log_err)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            warn!(%line, "live-preview: failed to spawn downloader: {e}");
+            return Some(format!("Failed to launch downloader for live preview: {e}"));
+        }
+    };
+
+    let msg = format!(
+        "Starting live-edge preview of {} — the player opens once the stream buffers (~10-30 s)",
+        row.channel.name
+    );
+    let player = player.to_string();
+    let channel = row.channel.name.clone();
+    std::thread::spawn(move || {
+        let cleanup = |dl: &mut std::process::Child, tmp: &std::path::Path| {
+            let pid = dl.id().to_string();
+            let _ = std::process::Command::new("taskkill")
+                .args(["/T", "/F", "/PID", &pid])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            let _ = dl.kill(); // fallback; no-op if taskkill got it
+            let _ = dl.wait();
+            for _ in 0..10 {
+                if std::fs::remove_dir_all(tmp).is_ok() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        };
+        let log_tail = |tmp: &std::path::Path| -> String {
+            std::fs::read_to_string(tmp.join("preview.log"))
+                .map(|s| s.chars().rev().take(600).collect::<Vec<_>>().iter().rev().collect())
+                .unwrap_or_default()
+        };
+
+        // Wait for a playable target: SABR needs both A/V parts (SplitAv), but
+        // settle for a single growing file if no second part shows up shortly.
+        let mut growing_since: Option<std::time::Instant> = None;
+        let mut target: Option<StreamTarget> = None;
+        let probe = probe_path.to_string_lossy().into_owned();
+        for _ in 0..240 {
+            if let Ok(Some(status)) = dl.try_wait() {
+                warn!(
+                    %channel,
+                    %status,
+                    tail = %log_tail(&tmp),
+                    "live-preview: downloader exited before producing a playable stream"
+                );
+                cleanup(&mut dl, &tmp);
+                return;
+            }
+            match stream_target_for_active(&probe).filter(|t| playable_with(t, &player)) {
+                Some(t @ StreamTarget::SplitAv(_)) => {
+                    target = Some(t);
+                    break;
+                }
+                Some(t) => {
+                    let since = *growing_since.get_or_insert_with(std::time::Instant::now);
+                    if !use_sabr || since.elapsed() >= std::time::Duration::from_secs(4) {
+                        target = Some(t);
+                        break;
+                    }
+                }
+                None => growing_since = None,
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        let Some(target) = target else {
+            warn!(%channel, tail = %log_tail(&tmp), "live-preview: no playable stream within 2 minutes");
+            cleanup(&mut dl, &tmp);
+            return;
+        };
+        tracing::info!(%channel, ?target, "live-preview: buffered, launching player");
+        match build_player_command(&player, &target).spawn() {
+            Ok(mut p) => {
+                let _ = p.wait();
+                tracing::info!(%channel, "live-preview: player closed, stopping preview download");
+            }
+            Err(e) => warn!(%channel, "live-preview: failed to launch player: {e}"),
+        }
+        cleanup(&mut dl, &tmp);
+    });
+
+    Some(msg)
+}
+
+/// Spawn a "play new instance" command — tunes into the stream at the LIVE
+/// EDGE in the configured media player, without recording. (⏵ "Stream in
+/// player" is the from-start counterpart: it opens the in-progress capture.)
+/// Returns a status-bar message to show the user, or `None`.
+///
+/// - Streamlink: `--player <path>` routes output to the player (live edge).
+/// - yt-dlp + YouTube: throwaway live-edge preview download, see
+///   [`spawn_live_preview`] — SABR-only streams can't be piped or URL-played.
 /// - yt-dlp + other platforms (Kick): pipes `-o -` stdout to the player's
 ///   stdin (from the live edge — from-start capture can't pipe).
 /// - ffmpeg source: passes the URL directly.
@@ -17591,9 +17767,10 @@ fn spawn_play_new_instance(
     row: &crate::models::MonitorWithChannel,
     player: &str,
     settings: &SettingsForm,
+    store: &crate::store::Store,
 ) -> Option<String> {
     use crate::downloader::{
-        push_track_args, resolve_auth, resolved_quality, split_args, youtube_live_url, AuthSource,
+        push_track_args, resolve_auth, resolved_quality, split_args, AuthSource,
     };
     use crate::models::{Platform, Tool};
 
@@ -17610,9 +17787,8 @@ fn spawn_play_new_instance(
                     args.push(format!("--twitch-api-header=Authorization=OAuth {t}"));
                 }
             }
-            if m.capture_from_start {
-                args.push("--hls-live-restart".into());
-            }
+            // No --hls-live-restart even for from-start monitors: ▷ means
+            // "tune in at the live edge"; ⏵ covers from-start viewing.
             args.push("--retry-streams".into());
             args.push("3".into());
             args.push("--retry-max".into());
@@ -17628,20 +17804,7 @@ fn spawn_play_new_instance(
             spawn_logged(cmd, "streamlink")
         }
         Tool::YtDlp if m.platform() == Platform::YouTube => {
-            // No pipe and no direct URL works for SABR-only streams; the /live
-            // URL at least targets the right video and works for streams that
-            // still expose legacy formats. Never pass the bare channel URL —
-            // the player's yt-dlp would enumerate the whole channel as a
-            // playlist of old VODs (minutes of silence, then wrong content).
-            let mut cmd = std::process::Command::new(player);
-            cmd.arg(youtube_live_url(&m.url));
-            spawn_logged(cmd, "media player").or_else(|| {
-                Some(
-                    "Sent live URL to player — SABR-only streams can't be played this way; \
-                     start a recording and use ⏵ Stream in player instead"
-                        .into(),
-                )
-            })
+            spawn_live_preview(row, player, settings, store)
         }
         Tool::YtDlp => {
             let ytdlp_bin = if settings.ytdlp_binary_path.trim().is_empty() {
