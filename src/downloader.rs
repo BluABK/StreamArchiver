@@ -5326,18 +5326,31 @@ fn is_companion_suffix(rest: &str) -> bool {
 /// cache source on success. A 0-byte/failed capture is left in `.cache\` (returns
 /// the capture path so the caller can tell promotion didn't happen).
 async fn promote_capture(plan: &DownloadPlan) -> PathBuf {
-    if file_len(&plan.capture_path).await == 0 {
+    // yt-dlp SABR dev-build sometimes appends a container extension to the
+    // output path even when the template already specifies one — e.g. writing
+    // `stem.mkv.mp4` instead of `stem.mkv` because the merged container is MP4.
+    // Detect this and use the `.mp4` variant as the effective capture file.
+    let effective = if !plan.remux_to_mkv && file_len(&plan.capture_path).await == 0 {
+        let mut os = plan.capture_path.as_os_str().to_owned();
+        os.push(".mp4");
+        let mp4 = PathBuf::from(os);
+        if file_len(&mp4).await > 0 { mp4 } else { plan.capture_path.clone() }
+    } else {
+        plan.capture_path.clone()
+    };
+
+    if file_len(&effective).await == 0 {
         return plan.capture_path.clone(); // failed: leave the partial for the sweep
     }
     if plan.remux_to_mkv {
-        match remux_ts_to_mkv(&plan.capture_path, &plan.final_path, None, &Default::default()).await {
+        match remux_ts_to_mkv(&effective, &plan.final_path, None, &Default::default()).await {
             Ok(()) => {
-                let _ = tokio::fs::remove_file(&plan.capture_path).await;
+                let _ = tokio::fs::remove_file(&effective).await;
                 plan.final_path.clone()
             }
             Err(e) => {
-                warn!("remux failed, keeping {}: {e:#}", plan.capture_path.display());
-                plan.capture_path.clone()
+                warn!("remux failed, keeping {}: {e:#}", effective.display());
+                effective
             }
         }
     } else {
@@ -5345,11 +5358,11 @@ async fn promote_capture(plan: &DownloadPlan) -> PathBuf {
         if let Some(parent) = plan.final_path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
-        match tokio::fs::rename(&plan.capture_path, &plan.final_path).await {
+        match tokio::fs::rename(&effective, &plan.final_path).await {
             Ok(()) => plan.final_path.clone(),
             Err(e) => {
-                warn!("promote move failed, keeping {}: {e:#}", plan.capture_path.display());
-                plan.capture_path.clone()
+                warn!("promote move failed, keeping {}: {e:#}", effective.display());
+                effective
             }
         }
     }
