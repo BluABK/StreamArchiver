@@ -4131,6 +4131,7 @@ fn state_icon(state: &str) -> (&'static str, egui::Color32) {
         "stopped" => ("⏹", Color32::from_gray(0xa0)),               // gray
         "aborted" => ("⚡", Color32::from_rgb(0xe0, 0xa8, 0x50)),   // amber
         "ended" => ("✔", Color32::from_gray(0xa0)),                  // gray
+        "completed" => ("✔", SUCCESS_GREEN),                         // green
         _ => ("○", Color32::from_gray(0x70)),                        // idle/unknown — dim
     }
 }
