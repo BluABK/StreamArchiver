@@ -11121,9 +11121,35 @@ impl StreamArchiverApp {
         }
         if let Some(mid) = play_new_instance_mid.or(acts.play_new_instance.take()) {
             let player = self.settings.media_player_path.trim().to_string();
-            if !player.is_empty() {
-                if let Some(row) = self.rows.iter().find(|r| r.monitor.id == mid) {
-                    spawn_play_new_instance(row, &player, &self.settings);
+            if !player.is_empty()
+                && let Some(row) = self.rows.iter().find(|r| r.monitor.id == mid)
+            {
+                // If this monitor is recording right now, a fresh player on
+                // the growing capture is the only reliable live source for
+                // YouTube SABR streams (they can't be piped or URL-played)
+                // and the cheapest for everything else.
+                let capture = self
+                    .core
+                    .store
+                    .inflight_recordings()
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter(|r| r.monitor_id == mid)
+                    .find_map(|r| stream_target_for_active(&r.output_path))
+                    .filter(|t| playable_with(t, &player));
+                if let Some(target) = capture {
+                    tracing::info!(
+                        monitor_id = mid,
+                        ?target,
+                        "play-new-instance: opening the active recording's capture"
+                    );
+                    if let Err(e) = build_player_command(&player, &target).spawn() {
+                        warn!("play-new-instance: failed to launch player: {e}");
+                        self.status = format!("Failed to launch media player: {e}");
+                    }
+                } else if let Some(msg) = spawn_play_new_instance(row, &player, &self.settings) {
+                    self.status = msg;
                 }
             }
         }
@@ -17528,19 +17554,44 @@ fn build_player_command(player: &str, t: &StreamTarget) -> std::process::Command
     cmd
 }
 
+/// Log and spawn a player/downloader command built for "play new instance",
+/// returning a status-bar error message on spawn failure.
+fn spawn_logged(mut cmd: std::process::Command, what: &str) -> Option<String> {
+    let line = format!(
+        "{} {}",
+        cmd.get_program().to_string_lossy(),
+        cmd.get_args().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" ")
+    );
+    tracing::info!(%line, "play-new-instance: spawning {what}");
+    match cmd.spawn() {
+        Ok(_) => None,
+        Err(e) => {
+            warn!(%line, "play-new-instance: failed to spawn {what}: {e}");
+            Some(format!("Failed to launch {what}: {e}"))
+        }
+    }
+}
+
 /// Spawn a "play new instance" command — opens the live stream directly in the
-/// configured media player without recording it.
+/// configured media player without recording it. Returns a status-bar message
+/// (error or caveat) to show the user, or `None` when nothing needs saying.
 ///
-/// - Streamlink: uses `--player <path>` to route output to the player.
-/// - yt-dlp non-SABR: pipes `-o -` stdout to the player's stdin.
-/// - yt-dlp SABR: SABR writes fragmented MKV and can't pipe cleanly; falls
-///   back to passing the URL directly (mpv handles it via its yt-dlp integration).
-/// - ffmpeg source: passes URL directly.
+/// The caller first tries the monitor's active recording capture; this
+/// function is the no-active-capture path:
+/// - Streamlink: `--player <path>` routes output to the player.
+/// - yt-dlp + YouTube: passes the /live URL to the player and lets its yt-dlp
+///   integration extract. This FAILS for SABR-only streams (most YouTube live
+///   streams now) — stock yt-dlp sees no formats and the SABR dev build can
+///   neither pipe to stdout (yt-dlp PR #13515) nor produce URLs a player can
+///   consume; those streams are only watchable while recording (⏵).
+/// - yt-dlp + other platforms (Kick): pipes `-o -` stdout to the player's
+///   stdin (from the live edge — from-start capture can't pipe).
+/// - ffmpeg source: passes the URL directly.
 fn spawn_play_new_instance(
     row: &crate::models::MonitorWithChannel,
     player: &str,
     settings: &SettingsForm,
-) {
+) -> Option<String> {
     use crate::downloader::{
         push_track_args, resolve_auth, resolved_quality, split_args, youtube_live_url, AuthSource,
     };
@@ -17572,77 +17623,82 @@ fn spawn_play_new_instance(
             args.push(player.to_string());
             args.push(m.url.clone());
             args.push(resolved_quality(&m.quality));
-            let _ = std::process::Command::new("streamlink").args(&args).spawn();
+            let mut cmd = std::process::Command::new("streamlink");
+            cmd.args(&args);
+            spawn_logged(cmd, "streamlink")
+        }
+        Tool::YtDlp if m.platform() == Platform::YouTube => {
+            // No pipe and no direct URL works for SABR-only streams; the /live
+            // URL at least targets the right video and works for streams that
+            // still expose legacy formats. Never pass the bare channel URL —
+            // the player's yt-dlp would enumerate the whole channel as a
+            // playlist of old VODs (minutes of silence, then wrong content).
+            let mut cmd = std::process::Command::new(player);
+            cmd.arg(youtube_live_url(&m.url));
+            spawn_logged(cmd, "media player").or_else(|| {
+                Some(
+                    "Sent live URL to player — SABR-only streams can't be played this way; \
+                     start a recording and use ⏵ Stream in player instead"
+                        .into(),
+                )
+            })
         }
         Tool::YtDlp => {
-            let is_sabr = settings.sabr_enabled
-                && !settings.sabr_binary_path.trim().is_empty()
-                && m.platform() == Platform::YouTube
-                && m.capture_from_start;
-            if is_sabr {
-                // SABR writes fragmented MKV — stdout pipe not viable.
-                // mpv (and most players) handle YouTube URLs natively via yt-dlp.
-                let _ = std::process::Command::new(player).arg(&m.url).spawn();
+            let ytdlp_bin = if settings.ytdlp_binary_path.trim().is_empty() {
+                "yt-dlp".to_string()
             } else {
-                let ytdlp_bin = if settings.ytdlp_binary_path.trim().is_empty() {
-                    "yt-dlp".to_string()
-                } else {
-                    settings.ytdlp_binary_path.trim().to_string()
-                };
-                let global_args = split_args(&settings.ytdlp_default_args);
-                let mut args = vec![
-                    "--no-part".to_string(),
-                    "--hls-use-mpegts".into(),
-                    "-o".into(),
-                    "-".into(),
-                ];
-                if m.capture_from_start {
-                    args.push("--live-from-start".into());
-                } else {
-                    args.push("--no-live-from-start".into());
+                settings.ytdlp_binary_path.trim().to_string()
+            };
+            let global_args = split_args(&settings.ytdlp_default_args);
+            let mut args = vec![
+                "--no-part".to_string(),
+                "--hls-use-mpegts".into(),
+                "-o".into(),
+                "-".into(),
+                // From-start needs fragment merging, which can't pipe — a new
+                // player instance always starts at the live edge.
+                "--no-live-from-start".into(),
+            ];
+            match &auth {
+                AuthSource::CookiesBrowser(b) => {
+                    args.push("--cookies-from-browser".into());
+                    args.push(b.clone());
                 }
-                match &auth {
-                    AuthSource::CookiesBrowser(b) => {
-                        args.push("--cookies-from-browser".into());
-                        args.push(b.clone());
-                    }
-                    AuthSource::CookiesFile(p) => {
-                        args.push("--cookies".into());
-                        args.push(p.clone());
-                    }
-                    _ => {}
+                AuthSource::CookiesFile(p) => {
+                    args.push("--cookies".into());
+                    args.push(p.clone());
                 }
-                args.extend(global_args);
-                if m.platform() == Platform::YouTube && !settings.sabr_pot_args.trim().is_empty() {
-                    args.push("--extractor-args".into());
-                    args.push(settings.sabr_pot_args.trim().to_string());
+                _ => {}
+            }
+            args.extend(global_args);
+            push_track_args(&mut args, Tool::YtDlp, &m.audio_tracks, &m.subtitle_tracks, false);
+            args.extend(extra);
+            args.push(m.url.clone());
+            use std::process::Stdio;
+            let line = format!("{ytdlp_bin} {}", args.join(" "));
+            tracing::info!(%line, "play-new-instance: spawning yt-dlp pipe");
+            match std::process::Command::new(&ytdlp_bin)
+                .args(&args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(mut child) => {
+                    let pipe = child.stdout.take()?;
+                    let mut cmd = std::process::Command::new(player);
+                    cmd.arg("-").stdin(Stdio::from(pipe));
+                    spawn_logged(cmd, "media player")
                 }
-                push_track_args(&mut args, Tool::YtDlp, &m.audio_tracks, &m.subtitle_tracks, false);
-                args.extend(extra);
-                let url = if m.platform() == Platform::YouTube {
-                    youtube_live_url(&m.url)
-                } else {
-                    m.url.clone()
-                };
-                args.push(url);
-                use std::process::Stdio;
-                if let Ok(mut child) = std::process::Command::new(&ytdlp_bin)
-                    .args(&args)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null())
-                    .spawn()
-                {
-                    if let Some(pipe) = child.stdout.take() {
-                        let _ = std::process::Command::new(player)
-                            .arg("-")
-                            .stdin(Stdio::from(pipe))
-                            .spawn();
-                    }
+                Err(e) => {
+                    warn!(%line, "play-new-instance: failed to spawn yt-dlp: {e}");
+                    Some(format!("Failed to launch yt-dlp: {e}"))
                 }
             }
         }
         Tool::Ffmpeg => {
-            let _ = std::process::Command::new(player).arg(&m.url).spawn();
+            let mut cmd = std::process::Command::new(player);
+            cmd.arg(&m.url);
+            spawn_logged(cmd, "media player")
         }
     }
 }
