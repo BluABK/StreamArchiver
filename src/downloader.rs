@@ -493,6 +493,7 @@ fn build_dash_companion_plan(
     ytdlp_global_args: &[String],
     system_program: &str,
     dash_format: &str,
+    pot_args: &str,
 ) -> DownloadPlan {
     let dir = primary_final.parent().unwrap_or_else(|| Path::new("."));
     let stem = primary_final
@@ -522,6 +523,10 @@ fn build_dash_companion_plan(
         _ => {}
     }
     args.extend_from_slice(ytdlp_global_args);
+    if !pot_args.is_empty() {
+        args.push("--extractor-args".into());
+        args.push(pot_args.to_string());
+    }
     args.push("-f".into());
     args.push(dash_format.to_string());
     args.extend(split_args(&row.monitor.extra_args));
@@ -779,6 +784,12 @@ pub fn build_plan(
             // Global defaults from Settings → yt-dlp default arguments.
             // Per-monitor extra_args extend after and can override these.
             args.extend_from_slice(ytdlp_global_args);
+            // PO-token provider (bgutil HTTP) — YouTube requires a proof-of-origin
+            // token for video formats regardless of whether SABR is in use.
+            if m.platform() == Platform::YouTube && !ytdlp.sabr.pot_args.is_empty() {
+                args.push("--extractor-args".into());
+                args.push(ytdlp.sabr.pot_args.clone());
+            }
             // Never request live_chat for live recordings: yt-dlp's live_chat
             // downloader runs until the stream ends and blocks video download in the
             // same process. YouTube chat replay can be downloaded after the stream
@@ -2436,6 +2447,7 @@ impl Supervisor {
                 &ytdlp_global_args,
                 &ytdlp_bins.system_program(),
                 &load_dash_format(&self.store),
+                &ytdlp_bins.sabr.pot_args,
             );
             let this = self.clone();
             let tg = take_group.clone();
