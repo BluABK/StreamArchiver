@@ -11127,17 +11127,19 @@ impl StreamArchiverApp {
                 // If this monitor is recording right now, a fresh player on
                 // the growing capture is the only reliable live source for
                 // YouTube SABR streams (they can't be piped or URL-played)
-                // and the cheapest for everything else.
-                let capture = self
+                // and the cheapest for everything else. Across the active
+                // takes (dual capture: SABR primary + DASH companion), pick
+                // the first target the configured player can play.
+                let targets: Vec<StreamTarget> = self
                     .core
                     .store
-                    .inflight_recordings()
+                    .active_recording_paths(mid)
                     .ok()
                     .into_iter()
                     .flatten()
-                    .filter(|r| r.monitor_id == mid)
-                    .find_map(|r| stream_target_for_active(&r.output_path))
-                    .filter(|t| playable_with(t, &player));
+                    .filter_map(|p| stream_target_for_active(&p))
+                    .collect();
+                let capture = targets.iter().find(|t| playable_with(t, &player)).cloned();
                 if let Some(target) = capture {
                     tracing::info!(
                         monitor_id = mid,
