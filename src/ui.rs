@@ -4303,6 +4303,8 @@ struct RowActions {
     properties: Option<i64>,            // monitor id
     reorganize_monitor: Option<i64>,    // monitor id
     reorganize_channel: Option<i64>,    // channel id
+    /// Path to open in the configured media player (set by "Stream in player").
+    stream_in_player: Option<std::path::PathBuf>,
 }
 
 /// Render one capture-instance (monitor) row across all columns, with the Name
@@ -4322,6 +4324,8 @@ fn render_instance_row(
     expanded: bool,
     show_actions: bool,
     needs_remux_count: usize,
+    stream_target: Option<&std::path::Path>,
+    media_player: &str,
     a: &mut RowActions,
 ) -> bool {
     let m = &row.monitor;
@@ -4364,6 +4368,25 @@ fn render_instance_row(
             .clicked()
         {
             crate::platform::open_path(std::path::Path::new(&m.output_dir));
+            ui.close();
+        }
+        if ui
+            .add_enabled(
+                !media_player.is_empty() && stream_target.is_some(),
+                egui::Button::new("⏵  Stream in player"),
+            )
+            .on_hover_text(if media_player.is_empty() {
+                "Set a media player in Settings → Defaults first"
+            } else if recording {
+                "Open live capture file in the configured media player"
+            } else {
+                "Open most recent recording in the configured media player"
+            })
+            .clicked()
+        {
+            if let Some(p) = stream_target {
+                a.stream_in_player = Some(p.to_path_buf());
+            }
             ui.close();
         }
         if ui.button("📋  Copy URL").clicked() {
@@ -4416,7 +4439,7 @@ fn render_instance_row(
     if show_actions {
         tr.col(|ui| {
             ui.push_id(m.id, |ui| {
-                let mut btns: Vec<egui::Response> = Vec::with_capacity(4);
+                let mut btns: Vec<egui::Response> = Vec::with_capacity(5);
                 if recording {
                     let b = ui.small_button("⏹").on_hover_text("Stop / abort recording");
                     if b.clicked() {
@@ -4429,6 +4452,24 @@ fn render_instance_row(
                         .on_hover_text("Start recording now (checks if live)");
                     if b.clicked() {
                         a.start = Some(m.id);
+                    }
+                    btns.push(b);
+                }
+                {
+                    let player_ok = !media_player.is_empty() && stream_target.is_some();
+                    let b = ui
+                        .add_enabled(player_ok, egui::Button::new("⏵").small())
+                        .on_hover_text(if media_player.is_empty() {
+                            "Set a media player in Settings → Defaults first"
+                        } else if recording {
+                            "Stream in player"
+                        } else {
+                            "Open in player"
+                        });
+                    if b.clicked() {
+                        if let Some(p) = stream_target {
+                            a.stream_in_player = Some(p.to_path_buf());
+                        }
                     }
                     btns.push(b);
                 }
@@ -10138,11 +10179,41 @@ impl StreamArchiverApp {
                                             .count()
                                     })
                                     .unwrap_or(0);
+                                let media_player = self.settings.media_player_path.trim().to_string();
+                                // Best file to open in the media player for this monitor:
+                                // prefer the live capture file of an active take; fall back
+                                // to the most recent finished recording's output file.
+                                let inst_stream_path: Option<std::path::PathBuf> =
+                                    groups.get(&mid).and_then(|gs| {
+                                        // Active take first.
+                                        for g in gs {
+                                            for t in &g.takes {
+                                                if t.is_active() {
+                                                    if let Some(p) = capture_file_for_active(&t.output_path) {
+                                                        return Some(p);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // Most recent finished take.
+                                        for g in gs {
+                                            for t in &g.takes {
+                                                if !t.output_path.is_empty()
+                                                    && std::path::Path::new(&t.output_path).is_file()
+                                                {
+                                                    return Some(std::path::PathBuf::from(&t.output_path));
+                                                }
+                                            }
+                                        }
+                                        None
+                                    });
                                 body.row(24.0, |mut tr| {
                                     if render_instance_row(
                                         &mut tr, row, &ptex, now, recording, chat_active,
                                         tint.is_some(), depth, has_hist, expanded,
-                                        show_actions, inst_needs_remux, &mut acts,
+                                        show_actions, inst_needs_remux,
+                                        inst_stream_path.as_deref(), &media_player,
+                                        &mut acts,
                                     ) {
                                         toggle_instance = Some(mid);
                                     }
@@ -10849,7 +10920,7 @@ impl StreamArchiverApp {
         if let Some(p) = open_path {
             crate::platform::open_path(&p);
         }
-        if let Some(p) = open_in_player {
+        if let Some(p) = open_in_player.or_else(|| acts.stream_in_player.take()) {
             let player = self.settings.media_player_path.trim().to_string();
             if !player.is_empty() {
                 let _ = std::process::Command::new(&player).arg(&p).spawn();
