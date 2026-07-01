@@ -10262,6 +10262,22 @@ impl StreamArchiverApp {
                                 // detail directly; multi-take shows per-take on expand.
                                 let meta_rec =
                                     if g.takes.len() == 1 { Some(g.takes[0].id) } else { None };
+                                let media_player = self.settings.media_player_path.trim().to_string();
+                                // Best file for this stream group: active capture first,
+                                // then any existing output file across the takes.
+                                let grp_stream_path: Option<std::path::PathBuf> = {
+                                    g.takes.iter()
+                                        .find(|t| t.is_active())
+                                        .and_then(|t| capture_file_for_active(&t.output_path))
+                                        .or_else(|| {
+                                            g.takes.iter()
+                                                .find(|t| {
+                                                    !t.output_path.is_empty()
+                                                        && std::path::Path::new(&t.output_path).is_file()
+                                                })
+                                                .map(|t| std::path::PathBuf::from(&t.output_path))
+                                        })
+                                };
                                 body.row(24.0, |mut tr| {
                                     let mut disc = false;
                                     tr.col(|_ui| {}); // on
@@ -10275,6 +10291,24 @@ impl StreamArchiverApp {
                                                 .clicked()
                                             {
                                                 open_path = dir.clone();
+                                            }
+                                            let player_ok = !media_player.is_empty()
+                                                && grp_stream_path.is_some();
+                                            if ui
+                                                .add_enabled(
+                                                    player_ok,
+                                                    egui::Button::new("⏵").small(),
+                                                )
+                                                .on_hover_text(if media_player.is_empty() {
+                                                    "Set a media player in Settings → Defaults first"
+                                                } else if g.status() == "recording" {
+                                                    "Stream in player"
+                                                } else {
+                                                    "Open in player"
+                                                })
+                                                .clicked()
+                                            {
+                                                open_in_player = grp_stream_path.clone();
                                             }
                                         });
                                     }
@@ -10405,6 +10439,24 @@ impl StreamArchiverApp {
                                                 copy_text = Some(f.clone());
                                                 ui.close();
                                             }
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                !media_player.is_empty()
+                                                    && grp_stream_path.is_some(),
+                                                egui::Button::new("⏵  Stream in player"),
+                                            )
+                                            .on_hover_text(if media_player.is_empty() {
+                                                "Set a media player in Settings → Defaults first"
+                                            } else if g.status() == "recording" {
+                                                "Open live capture file in the configured media player"
+                                            } else {
+                                                "Open in the configured media player"
+                                            })
+                                            .clicked()
+                                        {
+                                            open_in_player = grp_stream_path.clone();
+                                            ui.close();
                                         }
                                         if ui
                                             .add_enabled(
