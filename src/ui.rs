@@ -4304,8 +4304,8 @@ struct RowActions {
     properties: Option<i64>,            // monitor id
     reorganize_monitor: Option<i64>,    // monitor id
     reorganize_channel: Option<i64>,    // channel id
-    /// Path to open in the configured media player (set by "Stream in player").
-    stream_in_player: Option<std::path::PathBuf>,
+    /// Target to open in the configured media player (set by "Stream in player").
+    stream_in_player: Option<StreamTarget>,
     /// Monitor id to open a live stream in the player without recording (set by "Play new instance").
     play_new_instance: Option<i64>,
 }
@@ -4327,7 +4327,7 @@ fn render_instance_row(
     expanded: bool,
     show_actions: bool,
     needs_remux_count: usize,
-    stream_target: Option<&std::path::Path>,
+    stream_target: Option<&StreamTarget>,
     media_player: &str,
     a: &mut RowActions,
 ) -> bool {
@@ -4373,32 +4373,33 @@ fn render_instance_row(
             crate::platform::open_path(std::path::Path::new(&m.output_dir));
             ui.close();
         }
-        if ui
-            .add_enabled(
-                !media_player.is_empty() && stream_target.is_some(),
-                egui::Button::new("⏵  Stream in player"),
-            )
-            .on_hover_text(if media_player.is_empty() {
-                "Set a media player in Settings → Defaults first"
-            } else if recording {
-                "Open live capture file in the configured media player"
-            } else {
-                "Open most recent recording in the configured media player"
-            })
-            .clicked()
         {
-            if let Some(p) = stream_target {
-                a.stream_in_player = Some(p.to_path_buf());
+            let ok = !media_player.is_empty()
+                && stream_target.map(|t| playable_with(t, media_player)).unwrap_or(false);
+            if ui
+                .add_enabled(ok, egui::Button::new("⏵  Stream in player"))
+                .on_hover_text(if recording {
+                    "Open live capture in the configured media player"
+                } else {
+                    "Open most recent recording in the configured media player"
+                })
+                .on_disabled_hover_text(if media_player.is_empty() {
+                    "Set a media player in Settings → Defaults first"
+                } else if stream_target.is_some() {
+                    "In-progress SABR capture needs mpv (separate audio/video files)"
+                } else {
+                    "No playable capture file found"
+                })
+                .clicked()
+            {
+                a.stream_in_player = stream_target.cloned();
+                ui.close();
             }
-            ui.close();
         }
         if ui
             .add_enabled(!media_player.is_empty(), egui::Button::new("▷  Play new instance"))
-            .on_hover_text(if media_player.is_empty() {
-                "Set a media player in Settings → Defaults first"
-            } else {
-                "Open a live stream directly in the media player (does not record)"
-            })
+            .on_hover_text("Open a live stream directly in the media player (does not record)")
+            .on_disabled_hover_text("Set a media player in Settings → Defaults first")
             .clicked()
         {
             a.play_new_instance = Some(m.id);
@@ -4471,31 +4472,32 @@ fn render_instance_row(
                     btns.push(b);
                 }
                 {
-                    let player_ok = !media_player.is_empty() && stream_target.is_some();
+                    let player_ok = !media_player.is_empty()
+                        && stream_target.map(|t| playable_with(t, media_player)).unwrap_or(false);
                     let b = ui
                         .add_enabled(player_ok, egui::Button::new("⏵").small())
-                        .on_hover_text(if media_player.is_empty() {
-                            "Set a media player in Settings → Defaults first"
-                        } else if recording {
+                        .on_hover_text(if recording {
                             "Stream in player"
                         } else {
                             "Open in player"
+                        })
+                        .on_disabled_hover_text(if media_player.is_empty() {
+                            "Set a media player in Settings → Defaults first"
+                        } else if stream_target.is_some() {
+                            "In-progress SABR capture needs mpv (separate audio/video files)"
+                        } else {
+                            "No playable capture file found"
                         });
                     if b.clicked() {
-                        if let Some(p) = stream_target {
-                            a.stream_in_player = Some(p.to_path_buf());
-                        }
+                        a.stream_in_player = stream_target.cloned();
                     }
                     btns.push(b);
                 }
                 {
                     let b = ui
                         .add_enabled(!media_player.is_empty(), egui::Button::new("▷").small())
-                        .on_hover_text(if media_player.is_empty() {
-                            "Set a media player in Settings → Defaults first"
-                        } else {
-                            "Play new instance in media player (live, does not record)"
-                        });
+                        .on_hover_text("Play new instance in media player (live, does not record)")
+                        .on_disabled_hover_text("Set a media player in Settings → Defaults first");
                     if b.clicked() {
                         a.play_new_instance = Some(m.id);
                     }
@@ -9568,7 +9570,7 @@ impl StreamArchiverApp {
         let mut toggle_instance: Option<i64> = None;
         let mut toggle_stream: Option<String> = None;
         let mut open_path: Option<std::path::PathBuf> = None;
-        let mut open_in_player: Option<std::path::PathBuf> = None;
+        let mut open_in_player: Option<StreamTarget> = None;
         let mut play_new_instance_mid: Option<i64> = None;
         let mut copy_text: Option<String> = None;
         let mut delete_recording: Option<i64> = None;
@@ -10209,20 +10211,30 @@ impl StreamArchiverApp {
                                     })
                                     .unwrap_or(0);
                                 let media_player = self.settings.media_player_path.trim().to_string();
-                                // Best file to open in the media player for this monitor:
-                                // prefer the live capture file of an active take; fall back
-                                // to the most recent finished recording's output file.
-                                let inst_stream_path: Option<std::path::PathBuf> =
+                                // Best target to open in the media player for this monitor:
+                                // prefer an active take's live capture the configured player
+                                // can actually play (a dual-capture monitor falls through to
+                                // the DASH companion under non-mpv players); fall back to the
+                                // most recent finished recording's output file.
+                                let inst_stream_target: Option<StreamTarget> =
                                     groups.get(&mid).and_then(|gs| {
-                                        // Active take first.
-                                        for g in gs {
-                                            for t in &g.takes {
-                                                if t.is_active() {
-                                                    if let Some(p) = capture_file_for_active(&t.output_path) {
-                                                        return Some(p);
-                                                    }
-                                                }
-                                            }
+                                        // Active takes first: prefer a target the
+                                        // configured player can play (dual capture falls
+                                        // through to the DASH companion under non-mpv
+                                        // players); with nothing playable, keep an
+                                        // unplayable one so the button can explain itself.
+                                        let active: Vec<StreamTarget> = gs
+                                            .iter()
+                                            .flat_map(|g| g.takes.iter())
+                                            .filter(|t| t.is_active())
+                                            .filter_map(|t| stream_target_for_active(&t.output_path))
+                                            .collect();
+                                        if let Some(t) = active
+                                            .iter()
+                                            .find(|t| playable_with(t, &media_player))
+                                            .or_else(|| active.first())
+                                        {
+                                            return Some(t.clone());
                                         }
                                         // Most recent finished take.
                                         for g in gs {
@@ -10230,7 +10242,9 @@ impl StreamArchiverApp {
                                                 if !t.output_path.is_empty()
                                                     && std::path::Path::new(&t.output_path).is_file()
                                                 {
-                                                    return Some(std::path::PathBuf::from(&t.output_path));
+                                                    return Some(StreamTarget::Finished(
+                                                        std::path::PathBuf::from(&t.output_path),
+                                                    ));
                                                 }
                                             }
                                         }
@@ -10241,7 +10255,7 @@ impl StreamArchiverApp {
                                         &mut tr, row, &ptex, now, recording, chat_active,
                                         tint.is_some(), depth, has_hist, expanded,
                                         show_actions, inst_needs_remux,
-                                        inst_stream_path.as_deref(), &media_player,
+                                        inst_stream_target.as_ref(), &media_player,
                                         &mut acts,
                                     ) {
                                         toggle_instance = Some(mid);
@@ -10292,19 +10306,31 @@ impl StreamArchiverApp {
                                 let meta_rec =
                                     if g.takes.len() == 1 { Some(g.takes[0].id) } else { None };
                                 let media_player = self.settings.media_player_path.trim().to_string();
-                                // Best file for this stream group: active capture first,
-                                // then any existing output file across the takes.
-                                let grp_stream_path: Option<std::path::PathBuf> = {
-                                    g.takes.iter()
-                                        .find(|t| t.is_active())
-                                        .and_then(|t| capture_file_for_active(&t.output_path))
+                                // Best target for this stream group: an active capture the
+                                // configured player can play first (dual capture: the SABR
+                                // primary under mpv, else the DASH companion's .ts; with
+                                // nothing playable an unplayable target is kept so the
+                                // button can explain itself), then any existing output
+                                // file across the takes.
+                                let grp_stream_target: Option<StreamTarget> = {
+                                    let active: Vec<StreamTarget> = g.takes.iter()
+                                        .filter(|t| t.is_active())
+                                        .filter_map(|t| stream_target_for_active(&t.output_path))
+                                        .collect();
+                                    active
+                                        .iter()
+                                        .find(|t| playable_with(t, &media_player))
+                                        .or_else(|| active.first())
+                                        .cloned()
                                         .or_else(|| {
                                             g.takes.iter()
                                                 .find(|t| {
                                                     !t.output_path.is_empty()
                                                         && std::path::Path::new(&t.output_path).is_file()
                                                 })
-                                                .map(|t| std::path::PathBuf::from(&t.output_path))
+                                                .map(|t| StreamTarget::Finished(
+                                                    std::path::PathBuf::from(&t.output_path),
+                                                ))
                                         })
                                 };
                                 body.row(24.0, |mut tr| {
@@ -10322,33 +10348,38 @@ impl StreamArchiverApp {
                                                 open_path = dir.clone();
                                             }
                                             let player_ok = !media_player.is_empty()
-                                                && grp_stream_path.is_some();
+                                                && grp_stream_target
+                                                    .as_ref()
+                                                    .map(|t| playable_with(t, &media_player))
+                                                    .unwrap_or(false);
                                             if ui
                                                 .add_enabled(
                                                     player_ok,
                                                     egui::Button::new("⏵").small(),
                                                 )
-                                                .on_hover_text(if media_player.is_empty() {
-                                                    "Set a media player in Settings → Defaults first"
-                                                } else if g.status() == "recording" {
+                                                .on_hover_text(if g.status() == "recording" {
                                                     "Stream in player"
                                                 } else {
                                                     "Open in player"
                                                 })
+                                                .on_disabled_hover_text(if media_player.is_empty() {
+                                                    "Set a media player in Settings → Defaults first"
+                                                } else if grp_stream_target.is_some() {
+                                                    "In-progress SABR capture needs mpv (separate audio/video files)"
+                                                } else {
+                                                    "No playable capture file found"
+                                                })
                                                 .clicked()
                                             {
-                                                open_in_player = grp_stream_path.clone();
+                                                open_in_player = grp_stream_target.clone();
                                             }
                                             if ui
                                                 .add_enabled(
                                                     !media_player.is_empty(),
                                                     egui::Button::new("▷").small(),
                                                 )
-                                                .on_hover_text(if media_player.is_empty() {
-                                                    "Set a media player in Settings → Defaults first"
-                                                } else {
-                                                    "Play new instance in media player (live, does not record)"
-                                                })
+                                                .on_hover_text("Play new instance in media player (live, does not record)")
+                                                .on_disabled_hover_text("Set a media player in Settings → Defaults first")
                                                 .clicked()
                                             {
                                                 play_new_instance_mid = Some(mid);
@@ -10486,19 +10517,27 @@ impl StreamArchiverApp {
                                         if ui
                                             .add_enabled(
                                                 !media_player.is_empty()
-                                                    && grp_stream_path.is_some(),
+                                                    && grp_stream_target
+                                                        .as_ref()
+                                                        .map(|t| playable_with(t, &media_player))
+                                                        .unwrap_or(false),
                                                 egui::Button::new("⏵  Stream in player"),
                                             )
-                                            .on_hover_text(if media_player.is_empty() {
-                                                "Set a media player in Settings → Defaults first"
-                                            } else if g.status() == "recording" {
-                                                "Open live capture file in the configured media player"
+                                            .on_hover_text(if g.status() == "recording" {
+                                                "Open live capture in the configured media player"
                                             } else {
                                                 "Open in the configured media player"
                                             })
+                                            .on_disabled_hover_text(if media_player.is_empty() {
+                                                "Set a media player in Settings → Defaults first"
+                                            } else if grp_stream_target.is_some() {
+                                                "In-progress SABR capture needs mpv (separate audio/video files)"
+                                            } else {
+                                                "No playable capture file found"
+                                            })
                                             .clicked()
                                         {
-                                            open_in_player = grp_stream_path.clone();
+                                            open_in_player = grp_stream_target.clone();
                                             ui.close();
                                         }
                                         if ui
@@ -10506,11 +10545,8 @@ impl StreamArchiverApp {
                                                 !media_player.is_empty(),
                                                 egui::Button::new("▷  Play new instance"),
                                             )
-                                            .on_hover_text(if media_player.is_empty() {
-                                                "Set a media player in Settings → Defaults first"
-                                            } else {
-                                                "Open a live stream directly in the media player (does not record)"
-                                            })
+                                            .on_hover_text("Open a live stream directly in the media player (does not record)")
+                                            .on_disabled_hover_text("Set a media player in Settings → Defaults first")
                                             .clicked()
                                         {
                                             play_new_instance_mid = Some(mid);
@@ -10557,25 +10593,35 @@ impl StreamArchiverApp {
                                                         Some(std::path::PathBuf::from(&t.output_path));
                                                 }
                                                 let stream_target = if t.is_active() {
-                                                    capture_file_for_active(&t.output_path)
+                                                    stream_target_for_active(&t.output_path)
                                                 } else if file_ok {
-                                                    Some(std::path::PathBuf::from(&t.output_path))
+                                                    Some(StreamTarget::Finished(
+                                                        std::path::PathBuf::from(&t.output_path),
+                                                    ))
                                                 } else {
                                                     None
                                                 };
                                                 let player_ok = !media_player.is_empty()
-                                                    && stream_target.is_some();
+                                                    && stream_target
+                                                        .as_ref()
+                                                        .map(|st| playable_with(st, &media_player))
+                                                        .unwrap_or(false);
                                                 if ui
                                                     .add_enabled(
                                                         player_ok,
                                                         egui::Button::new("⏵").small(),
                                                     )
-                                                    .on_hover_text(if media_player.is_empty() {
-                                                        "Set a media player in Settings → Defaults first"
-                                                    } else if t.is_active() {
-                                                        "Stream in player (opens live capture file)"
+                                                    .on_hover_text(if t.is_active() {
+                                                        "Stream in player (opens the live capture)"
                                                     } else {
                                                         "Open in player"
+                                                    })
+                                                    .on_disabled_hover_text(if media_player.is_empty() {
+                                                        "Set a media player in Settings → Defaults first"
+                                                    } else if stream_target.is_some() {
+                                                        "In-progress SABR capture needs mpv (separate audio/video files)"
+                                                    } else {
+                                                        "No playable capture file found"
                                                     })
                                                     .clicked()
                                                 {
@@ -10586,11 +10632,8 @@ impl StreamArchiverApp {
                                                         !media_player.is_empty(),
                                                         egui::Button::new("▷").small(),
                                                     )
-                                                    .on_hover_text(if media_player.is_empty() {
-                                                        "Set a media player in Settings → Defaults first"
-                                                    } else {
-                                                        "Play new instance in media player (live, does not record)"
-                                                    })
+                                                    .on_hover_text("Play new instance in media player (live, does not record)")
+                                                    .on_disabled_hover_text("Set a media player in Settings → Defaults first")
                                                     .clicked()
                                                 {
                                                     play_new_instance_mid = Some(t.monitor_id);
@@ -10797,24 +10840,35 @@ impl StreamArchiverApp {
                                         }
                                         {
                                             let stream_target = if t.is_active() {
-                                                capture_file_for_active(&t.output_path)
+                                                stream_target_for_active(&t.output_path)
                                             } else if file_ok {
-                                                Some(std::path::PathBuf::from(&t.output_path))
+                                                Some(StreamTarget::Finished(
+                                                    std::path::PathBuf::from(&t.output_path),
+                                                ))
                                             } else {
                                                 None
                                             };
+                                            let player_ok = !media_player.is_empty()
+                                                && stream_target
+                                                    .as_ref()
+                                                    .map(|st| playable_with(st, &media_player))
+                                                    .unwrap_or(false);
                                             if ui
                                                 .add_enabled(
-                                                    !media_player.is_empty()
-                                                        && stream_target.is_some(),
+                                                    player_ok,
                                                     egui::Button::new("⏵  Stream in player"),
                                                 )
-                                                .on_hover_text(if media_player.is_empty() {
-                                                    "Set a media player in Settings → Defaults first"
-                                                } else if t.is_active() {
-                                                    "Open live capture file in the configured media player"
+                                                .on_hover_text(if t.is_active() {
+                                                    "Open live capture in the configured media player"
                                                 } else {
                                                     "Open in the configured media player"
+                                                })
+                                                .on_disabled_hover_text(if media_player.is_empty() {
+                                                    "Set a media player in Settings → Defaults first"
+                                                } else if stream_target.is_some() {
+                                                    "In-progress SABR capture needs mpv (separate audio/video files)"
+                                                } else {
+                                                    "No playable capture file found"
                                                 })
                                                 .clicked()
                                             {
@@ -10826,11 +10880,8 @@ impl StreamArchiverApp {
                                                     !media_player.is_empty(),
                                                     egui::Button::new("▷  Play new instance"),
                                                 )
-                                                .on_hover_text(if media_player.is_empty() {
-                                                    "Set a media player in Settings → Defaults first"
-                                                } else {
-                                                    "Open a live stream directly in the media player (does not record)"
-                                                })
+                                                .on_hover_text("Open a live stream directly in the media player (does not record)")
+                                                .on_disabled_hover_text("Set a media player in Settings → Defaults first")
                                                 .clicked()
                                             {
                                                 play_new_instance_mid = Some(t.monitor_id);
@@ -11059,12 +11110,13 @@ impl StreamArchiverApp {
         if let Some(p) = open_path {
             crate::platform::open_path(&p);
         }
-        if let Some(p) = open_in_player.or_else(|| acts.stream_in_player.take()) {
+        if let Some(target) = open_in_player.or_else(|| acts.stream_in_player.take()) {
             let player = self.settings.media_player_path.trim().to_string();
             if !player.is_empty() {
-                let _ = std::process::Command::new(&player).arg(&p).spawn();
-            } else {
-                crate::platform::open_path(&p);
+                let _ = build_player_command(&player, &target).spawn();
+            } else if let StreamTarget::Finished(p) | StreamTarget::Growing(p) = &target {
+                // SplitAv is unreachable here: its buttons gate on a player.
+                crate::platform::open_path(p);
             }
         }
         if let Some(mid) = play_new_instance_mid.or(acts.play_new_instance.take()) {
@@ -12264,7 +12316,11 @@ impl StreamArchiverApp {
                     ui.end_row();
                     ui.label("Media player path").on_hover_text(
                         "Path to the media player used by \"Stream in player\" on recording rows. \
-                         Passed the file path as the only argument (e.g. mpv.exe, vlc.exe).",
+                         Passed the file path as the only argument (e.g. mpv.exe, vlc.exe). \
+                         With mpv, in-progress recordings open with live-view flags that follow \
+                         the growing file, and in-progress SABR captures (separate audio/video \
+                         files) are playable too — other players only open finished or \
+                         single-file captures.",
                     );
                     ui.horizontal(|ui| {
                         ui.add(
@@ -17280,20 +17336,196 @@ fn open_path(path: &std::path::Path) {
     let _ = std::process::Command::new("explorer").arg(path).spawn();
 }
 
-/// Find the in-progress capture file for an active recording by checking `.cache/`
-/// for the common capture extensions yt-dlp and streamlink produce.
-/// Returns `None` when no recognizable file is present (e.g. mid-SABR fragment phase).
-fn capture_file_for_active(output_path: &str) -> Option<std::path::PathBuf> {
+/// What "Stream in player" should open for a recording, and how.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum StreamTarget {
+    /// A completed output file — open plainly (works with any player).
+    Finished(std::path::PathBuf),
+    /// A single still-growing capture file (`.ts` / `.mkv` / `.mkv.mp4` /
+    /// `.dash.ts`). mpv follows growth via `appending://`; other players open
+    /// it plainly (playable, but they stop at the current end).
+    Growing(std::path::PathBuf),
+    /// Mid-SABR capture: separate still-growing per-format files (video +
+    /// audio), largest first. Playable only in mpv (merged via an `edl://`
+    /// argument of `appending://` sub-URLs).
+    SplitAv(Vec<std::path::PathBuf>),
+}
+
+/// SABR growing per-format files only need moderately-sized init data before
+/// they're openable; also filters out the tiny `.state` sidecars (~50 B).
+const SPLIT_AV_MIN_BYTES: u64 = 64 * 1024;
+
+/// Find what an active recording's in-progress capture can be played from, by
+/// probing `.cache\` next to its final output path.
+///
+/// 1. The single-file captures streamlink/yt-dlp produce (`{stem}.ts`,
+///    `{stem}.mkv`, `{stem}.mkv.mp4`) → [`StreamTarget::Growing`]. This also
+///    covers the DASH companion (its own output path is `{stem}.dash.mkv`, so
+///    its capture probe hits `{stem}.dash.ts`) and the brief post-merge window
+///    of a SABR capture.
+/// 2. SABR mid-download: the per-format growing files. Naming drifts between
+///    dev-build versions — both `{stem}.mkv.f140.mp4[.sq0.part]` and
+///    `{stem}.f303.mkv[.sq0.part]` orderings are seen in the wild — so this
+///    scans for `{stem}.`-prefixed names containing an `f<digits>` dot-segment
+///    with a media extension or an in-flight `.sq<N>.part` suffix. During the
+///    active download the growing media file IS the `.sq<N>.part` file; the
+///    bare-named twin only appears once the stream ends and the merge starts.
+///    Two or more formats → [`StreamTarget::SplitAv`]; one → `Growing`.
+fn stream_target_for_active(output_path: &str) -> Option<StreamTarget> {
     let final_path = std::path::Path::new(output_path);
-    let stem = final_path.file_stem()?.to_string_lossy();
+    let stem = final_path.file_stem()?.to_string_lossy().into_owned();
     let cache_dir = final_path.parent()?.join(".cache");
     for ext in [".ts", ".mkv", ".mkv.mp4"] {
         let candidate = cache_dir.join(format!("{stem}{ext}"));
-        if candidate.is_file() {
-            return Some(candidate);
+        if candidate.metadata().map(|m| m.is_file() && m.len() > 0).unwrap_or(false) {
+            return Some(StreamTarget::Growing(candidate));
         }
     }
-    None
+    // SABR split scan: group candidates by format id, keep the best file per
+    // format (bare beats .part; higher .sq<N> beats lower — a resume starts a
+    // new sequence file and the highest is the one currently growing).
+    // (format_id, sequence: None = bare/merge-phase file) → (path, size)
+    let mut best: std::collections::HashMap<u64, (Option<u64>, std::path::PathBuf, u64)> =
+        std::collections::HashMap::new();
+    let prefix = format!("{stem}.");
+    for entry in std::fs::read_dir(&cache_dir).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix(&prefix) else { continue };
+        if rest.ends_with(".state") || rest.ends_with(".log") || rest.ends_with(".ytdl") {
+            continue;
+        }
+        if rest.contains(".temp.") {
+            continue; // in-flight ffmpeg merge output
+        }
+        let segs: Vec<&str> = rest.split('.').collect();
+        let parse_fmt = |s: &str| -> Option<u64> {
+            let d = s.strip_prefix('f')?;
+            if d.is_empty() || !d.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            d.parse().ok()
+        };
+        let Some(fpos) = segs.iter().position(|s| parse_fmt(s).is_some()) else { continue };
+        // Everything before the f<id> segment must be container decoration
+        // (variant A has the template ext there: `{stem}.mkv.f140.mp4…`),
+        // never arbitrary title text — otherwise a sibling recording whose
+        // stem merely extends this stem after a dot ("Chan" vs
+        // "Chan. Part 2.f303….part" → rest " Part 2.f303….part") leaks in.
+        if !segs[..fpos].iter().all(|s| matches!(*s, "mkv" | "mp4" | "webm" | "m4a" | "ts")) {
+            continue;
+        }
+        let format_id = parse_fmt(segs[fpos]).unwrap_or(0);
+        // Growing in-flight file `….sq<N>.part`, or a bare media file
+        // (merge phase / finished-writing).
+        let seq: Option<u64> = match segs.as_slice() {
+            [.., sq, "part"] => match sq.strip_prefix("sq").and_then(|d| d.parse().ok()) {
+                Some(n) => Some(n),
+                None => continue, // other .part files aren't playable media
+            },
+            [.., ext] if matches!(*ext, "mp4" | "m4a" | "webm" | "mkv") => None,
+            _ => continue,
+        };
+        let Ok(md) = entry.metadata() else { continue };
+        if !md.is_file() || md.len() < SPLIT_AV_MIN_BYTES {
+            continue;
+        }
+        let candidate = (seq, entry.path(), md.len());
+        match best.entry(format_id) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(candidate);
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                // Bare (None) outranks any .part; among .parts, higher sq wins.
+                let better = match (&o.get().0, &candidate.0) {
+                    (Some(_), None) => true,
+                    (Some(cur), Some(new)) => new > cur,
+                    _ => false,
+                };
+                if better {
+                    o.insert(candidate);
+                }
+            }
+        }
+    }
+    let mut parts: Vec<(std::path::PathBuf, u64)> =
+        best.into_values().map(|(_, p, len)| (p, len)).collect();
+    match parts.len() {
+        0 => None,
+        1 => Some(StreamTarget::Growing(parts.remove(0).0)),
+        _ => {
+            parts.sort_by_key(|p| std::cmp::Reverse(p.1)); // video (largest) first
+            Some(StreamTarget::SplitAv(parts.into_iter().map(|(p, _)| p).collect()))
+        }
+    }
+}
+
+/// True when the configured player binary is mpv (or an mpv front-end like
+/// mpv.net) — the only player that supports `appending://` and `edl://`.
+fn player_is_mpv(player_path: &str) -> bool {
+    std::path::Path::new(player_path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase().starts_with("mpv"))
+        .unwrap_or(false)
+}
+
+/// Whether the configured player can play this target. Split SABR captures
+/// need mpv; everything else is a plain file any player opens.
+fn playable_with(t: &StreamTarget, player: &str) -> bool {
+    match t {
+        StreamTarget::Finished(_) | StreamTarget::Growing(_) => true,
+        StreamTarget::SplitAv(_) => player_is_mpv(player),
+    }
+}
+
+/// Flags for watching a still-growing capture in mpv: don't quit on a
+/// momentary EOF/stall, and allow seeking within what's been read.
+const MPV_LIVE_FLAGS: &[&str] = &["--keep-open=yes", "--cache=yes", "--force-seekable=yes"];
+
+/// Forward-slash form of a path — the safe spelling inside `appending://` /
+/// `edl://` URL arguments on Windows.
+fn fwd_slashes(p: &std::path::Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
+}
+
+/// Build the mpv `edl://` argument that merges the still-growing SABR
+/// per-format files into one virtual multi-track file. Each part becomes its
+/// own `!new_stream` so mpv sees all tracks and auto-selects video + audio
+/// (no need to know which file is which). Sub-URLs use `appending://` so mpv
+/// follows growth, and are `%N%` byte-length-quoted so `;`/`,` in filenames
+/// can't break the EDL parser.
+fn sabr_edl_arg(parts: &[std::path::PathBuf]) -> String {
+    let mut s = String::from("edl://");
+    for p in parts {
+        let url = format!("appending://{}", fwd_slashes(p));
+        s.push_str(&format!("!new_stream;%{}%{};", url.len(), url));
+    }
+    s
+}
+
+/// Build the player invocation for a stream target. mpv gets live-view flags
+/// and `appending://` URLs for growing files; other players get plain paths.
+fn build_player_command(player: &str, t: &StreamTarget) -> std::process::Command {
+    let mut cmd = std::process::Command::new(player);
+    let mpv = player_is_mpv(player);
+    match t {
+        StreamTarget::Finished(p) => {
+            cmd.arg(p);
+        }
+        StreamTarget::Growing(p) => {
+            if mpv {
+                cmd.args(MPV_LIVE_FLAGS);
+                cmd.arg(format!("appending://{}", fwd_slashes(p)));
+            } else {
+                cmd.arg(p);
+            }
+        }
+        StreamTarget::SplitAv(parts) => {
+            // Gated to mpv by playable_with; build the mpv form regardless.
+            cmd.args(MPV_LIVE_FLAGS);
+            cmd.arg(sabr_edl_arg(parts));
+        }
+    }
+    cmd
 }
 
 /// Spawn a "play new instance" command — opens the live stream directly in the
@@ -18300,11 +18532,13 @@ fn parse_twitch_chat(
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatSegment, DateFmt, StreamMetaChange, active_date_fmt, aggregate_stream_changes,
-        build_twitch_segments, chat_file_for_recording, compose_browser_profile, contrast_ratio,
-        fmt_polled, hsl_to_rgb, meta_change_lines, monitor_import_identity, parse_first_party_spans,
-        readable_color, rgb_to_hsl, set_active_date_fmt, split_browser_profile, strip_ctcp_action,
-        twitch_username_color, word_match_segments, yt_channel_id,
+        ChatSegment, DateFmt, StreamMetaChange, StreamTarget, active_date_fmt,
+        aggregate_stream_changes, build_twitch_segments, chat_file_for_recording,
+        compose_browser_profile, contrast_ratio, fmt_polled, hsl_to_rgb, meta_change_lines,
+        monitor_import_identity, parse_first_party_spans, playable_with, player_is_mpv,
+        readable_color, rgb_to_hsl, sabr_edl_arg, set_active_date_fmt, split_browser_profile,
+        stream_target_for_active, strip_ctcp_action, twitch_username_color, word_match_segments,
+        yt_channel_id,
     };
     use eframe::egui;
     use std::collections::HashMap;
@@ -18672,5 +18906,214 @@ mod tests {
 
         // Empty browser -> empty (no cookies), even with a profile.
         assert_eq!(compose_browser_profile("", "whatever"), "");
+    }
+
+    // ----- "Stream in player" target probing (incl. mid-SABR captures) -----
+
+    /// A fresh scratch dir mimicking a channel output dir with a `.cache\` inside.
+    fn probe_dir(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "sa_probe_{tag}_{}_{}",
+            std::process::id(),
+            crate::models::now_unix()
+        ));
+        let cache = dir.join(".cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        (dir, cache)
+    }
+
+    /// Write `name` in `cache` with `len` filler bytes.
+    fn put(cache: &PathBuf, name: &str, len: usize) {
+        std::fs::write(cache.join(name), vec![0u8; len]).unwrap();
+    }
+
+    const BIG: usize = 64 * 1024; // SPLIT_AV_MIN_BYTES
+
+    #[test]
+    fn probe_finds_single_growing_ts() {
+        let (dir, cache) = probe_dir("ts");
+        put(&cache, "Chan - 2026.ts", BIG);
+        let out = dir.join("Chan - 2026.mkv");
+        assert_eq!(
+            stream_target_for_active(&out.to_string_lossy()),
+            Some(StreamTarget::Growing(cache.join("Chan - 2026.ts")))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_finds_dash_companion_ts() {
+        let (dir, cache) = probe_dir("dash");
+        put(&cache, "Chan - 2026.dash.ts", BIG);
+        // The companion recording's own output path carries the .dash infix.
+        let out = dir.join("Chan - 2026.dash.mkv");
+        assert_eq!(
+            stream_target_for_active(&out.to_string_lossy()),
+            Some(StreamTarget::Growing(cache.join("Chan - 2026.dash.ts")))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_ignores_empty_single_file() {
+        let (dir, cache) = probe_dir("empty");
+        put(&cache, "Chan - 2026.ts", 0);
+        let out = dir.join("Chan - 2026.mkv");
+        assert_eq!(stream_target_for_active(&out.to_string_lossy()), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_sabr_split_format_id_after_template_ext() {
+        // Naming variant A (seen 2026-07-01): {stem}.mkv.f<id>.mp4.sq0.part
+        let (dir, cache) = probe_dir("sabr_a");
+        put(&cache, "Chan - 2026.mkv.f400.mp4.sq0.part", 4 * BIG); // video (bigger)
+        put(&cache, "Chan - 2026.mkv.f140.mp4.sq0.part", BIG); // audio
+        put(&cache, "Chan - 2026.mkv.f400.mp4.state", 52); // resume sidecars: excluded
+        put(&cache, "Chan - 2026.mkv.f140.mp4.state", 51);
+        put(&cache, "Chan - 2026.log", 9999); // tool log: excluded
+        put(&cache, "Chan - 2026.thumbnail.jpg", 9999); // no f<id> segment: excluded
+        let out = dir.join("Chan - 2026.mkv");
+        assert_eq!(
+            stream_target_for_active(&out.to_string_lossy()),
+            Some(StreamTarget::SplitAv(vec![
+                cache.join("Chan - 2026.mkv.f400.mp4.sq0.part"), // largest first
+                cache.join("Chan - 2026.mkv.f140.mp4.sq0.part"),
+            ]))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_sabr_split_format_id_before_container_ext() {
+        // Naming variant B (seen 2026-06-30): {stem}.f<id>.mkv.sq0.part
+        let (dir, cache) = probe_dir("sabr_b");
+        put(&cache, "Chan - 2026.f303.mkv.sq0.part", 4 * BIG);
+        put(&cache, "Chan - 2026.f140.mkv.sq0.part", BIG);
+        let out = dir.join("Chan - 2026.mkv");
+        assert_eq!(
+            stream_target_for_active(&out.to_string_lossy()),
+            Some(StreamTarget::SplitAv(vec![
+                cache.join("Chan - 2026.f303.mkv.sq0.part"),
+                cache.join("Chan - 2026.f140.mkv.sq0.part"),
+            ]))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_sabr_prefers_bare_over_part_and_higher_sequence() {
+        let (dir, cache) = probe_dir("sabr_pref");
+        // f303: bare (merge phase) outranks the leftover .part.
+        put(&cache, "Chan - 2026.f303.mkv", 4 * BIG);
+        put(&cache, "Chan - 2026.f303.mkv.sq0.part", 4 * BIG);
+        // f140: sq1 (post-resume sequence) outranks sq0.
+        put(&cache, "Chan - 2026.f140.mkv.sq0.part", BIG);
+        put(&cache, "Chan - 2026.f140.mkv.sq1.part", BIG);
+        // In-flight ffmpeg merge output must never be picked.
+        put(&cache, "Chan - 2026.mkv.temp.mp4", 8 * BIG);
+        let out = dir.join("Chan - 2026.mkv");
+        assert_eq!(
+            stream_target_for_active(&out.to_string_lossy()),
+            Some(StreamTarget::SplitAv(vec![
+                cache.join("Chan - 2026.f303.mkv"),
+                cache.join("Chan - 2026.f140.mkv.sq1.part"),
+            ]))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_sabr_single_format_is_growing() {
+        // Audio-only (or video-only) SABR capture: one growing file → Growing.
+        let (dir, cache) = probe_dir("sabr_one");
+        put(&cache, "Chan - 2026.f140.mkv.sq0.part", BIG);
+        let out = dir.join("Chan - 2026.mkv");
+        assert_eq!(
+            stream_target_for_active(&out.to_string_lossy()),
+            Some(StreamTarget::Growing(cache.join("Chan - 2026.f140.mkv.sq0.part")))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_sabr_ignores_tiny_files() {
+        // First seconds of a capture: files below the init-segment floor.
+        let (dir, cache) = probe_dir("sabr_tiny");
+        put(&cache, "Chan - 2026.f303.mkv.sq0.part", 1024);
+        put(&cache, "Chan - 2026.f140.mkv.sq0.part", 512);
+        let out = dir.join("Chan - 2026.mkv");
+        assert_eq!(stream_target_for_active(&out.to_string_lossy()), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_does_not_leak_across_stems() {
+        // Another recording's SABR files in the same .cache must not match.
+        let (dir, cache) = probe_dir("stems");
+        put(&cache, "Other - 2025.f303.mkv.sq0.part", 4 * BIG);
+        put(&cache, "Other - 2025.f140.mkv.sq0.part", BIG);
+        let out = dir.join("Chan - 2026.mkv");
+        assert_eq!(stream_target_for_active(&out.to_string_lossy()), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_does_not_leak_into_prefix_stems() {
+        // A sibling recording whose stem EXTENDS this stem after a dot
+        // ("Chan - Movie Night" vs "Chan - Movie Night. Part 2") must not
+        // leak into the shorter stem's probe: the segments before the f<id>
+        // token would be title text, not container decoration.
+        let (dir, cache) = probe_dir("prefix");
+        put(&cache, "Chan - Movie Night. Part 2.f303.mkv.sq0.part", 4 * BIG);
+        put(&cache, "Chan - Movie Night. Part 2.f140.mkv.sq0.part", BIG);
+        let out = dir.join("Chan - Movie Night.mkv");
+        assert_eq!(stream_target_for_active(&out.to_string_lossy()), None);
+        // With the shorter stem's own files present, only they are picked.
+        put(&cache, "Chan - Movie Night.f303.mkv.sq0.part", 4 * BIG);
+        put(&cache, "Chan - Movie Night.f140.mkv.sq0.part", BIG);
+        assert_eq!(
+            stream_target_for_active(&out.to_string_lossy()),
+            Some(StreamTarget::SplitAv(vec![
+                cache.join("Chan - Movie Night.f303.mkv.sq0.part"),
+                cache.join("Chan - Movie Night.f140.mkv.sq0.part"),
+            ]))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sabr_edl_arg_quotes_by_byte_length() {
+        // Stems with spaces, semicolons, and multi-byte unicode must be
+        // byte-length quoted (%N%) so the EDL parser can't misparse them.
+        let parts = vec![
+            PathBuf::from(r"A:\streams\Nitya Ch. 【Phase】\.cache\a; b.f303.mkv.sq0.part"),
+            PathBuf::from(r"A:\streams\Nitya Ch. 【Phase】\.cache\a; b.f140.mkv.sq0.part"),
+        ];
+        let arg = sabr_edl_arg(&parts);
+        assert!(arg.starts_with("edl://!new_stream;%"));
+        // Backslashes converted; both parts present with appending:// and a
+        // correct byte-length prefix.
+        for p in &parts {
+            let url = format!("appending://{}", p.to_string_lossy().replace('\\', "/"));
+            assert!(arg.contains(&format!("%{}%{url}", url.len())), "missing {url} in {arg}");
+        }
+        assert_eq!(arg.matches("!new_stream").count(), 2);
+    }
+
+    #[test]
+    fn player_kind_sniffing() {
+        assert!(player_is_mpv(r"C:\Progs\mpv\mpv.exe"));
+        assert!(player_is_mpv(r"C:\Apps\mpv.net\mpvnet.exe"));
+        assert!(player_is_mpv("mpv"));
+        assert!(!player_is_mpv(r"C:\Program Files\VideoLAN\VLC\vlc.exe"));
+        assert!(!player_is_mpv(""));
+
+        let split = StreamTarget::SplitAv(vec![PathBuf::from("v"), PathBuf::from("a")]);
+        assert!(playable_with(&split, r"C:\Progs\mpv\mpv.exe"));
+        assert!(!playable_with(&split, r"C:\VLC\vlc.exe"));
+        let single = StreamTarget::Growing(PathBuf::from("x.ts"));
+        assert!(playable_with(&single, r"C:\VLC\vlc.exe"));
+        assert!(playable_with(&StreamTarget::Finished(PathBuf::from("x.mkv")), ""));
     }
 }
