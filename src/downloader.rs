@@ -344,7 +344,7 @@ pub fn resolve_auth_for(
 /// into the same `--sub-langs` list. Twitch chat is captured separately by a
 /// native logger (see `chat::log_twitch_chat`), so callers pass `chat = false`
 /// for Twitch yt-dlp monitors.
-fn push_track_args(args: &mut Vec<String>, tool: Tool, audio: &str, subs: &str, chat: bool) {
+pub(crate) fn push_track_args(args: &mut Vec<String>, tool: Tool, audio: &str, subs: &str, chat: bool) {
     let audio = audio.trim();
     let subs = subs.trim();
     let is_all = |s: &str| s.eq_ignore_ascii_case("all") || s == "*";
@@ -421,7 +421,7 @@ fn extract_yt_video_id(url: &str) -> Option<String> {
 /// their /live variant so yt-dlp goes straight to the active stream instead of
 /// enumerating the whole channel. Specific-video URLs (watch?v=, youtu.be/,
 /// /live/<id>) and already-suffixed /live URLs are left unchanged.
-fn youtube_live_url(url: &str) -> String {
+pub(crate) fn youtube_live_url(url: &str) -> String {
     let u = url.trim_end_matches('/');
     let is_specific = u.contains("/watch?")
         || u.contains("/live/")
@@ -5464,7 +5464,7 @@ async fn rename_companion_sidecars(dir: &Path, old_stem: &str, new_stem: &str) {
 }
 
 /// The configured quality selector with the `best` default applied.
-fn resolved_quality(q: &str) -> String {
+pub(crate) fn resolved_quality(q: &str) -> String {
     if q.trim().is_empty() {
         "best".to_string()
     } else {
@@ -5771,7 +5771,7 @@ fn sabr_dvr_window_exceeded(log: &str) -> bool {
 }
 
 /// Minimal whitespace arg splitter (double-quoted segments kept together).
-fn split_args(s: &str) -> Vec<String> {
+pub(crate) fn split_args(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut in_quotes = false;

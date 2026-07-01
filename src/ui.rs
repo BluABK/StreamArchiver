@@ -4306,6 +4306,8 @@ struct RowActions {
     reorganize_channel: Option<i64>,    // channel id
     /// Path to open in the configured media player (set by "Stream in player").
     stream_in_player: Option<std::path::PathBuf>,
+    /// Monitor id to open a live stream in the player without recording (set by "Play new instance").
+    play_new_instance: Option<i64>,
 }
 
 /// Render one capture-instance (monitor) row across all columns, with the Name
@@ -4390,6 +4392,18 @@ fn render_instance_row(
             }
             ui.close();
         }
+        if ui
+            .add_enabled(!media_player.is_empty(), egui::Button::new("▷  Play new instance"))
+            .on_hover_text(if media_player.is_empty() {
+                "Set a media player in Settings → Defaults first"
+            } else {
+                "Open a live stream directly in the media player (does not record)"
+            })
+            .clicked()
+        {
+            a.play_new_instance = Some(m.id);
+            ui.close();
+        }
         if ui.button("📋  Copy URL").clicked() {
             ui.ctx().copy_text(row.monitor.url.clone());
             ui.close();
@@ -4440,7 +4454,7 @@ fn render_instance_row(
     if show_actions {
         tr.col(|ui| {
             ui.push_id(m.id, |ui| {
-                let mut btns: Vec<egui::Response> = Vec::with_capacity(5);
+                let mut btns: Vec<egui::Response> = Vec::with_capacity(6);
                 if recording {
                     let b = ui.small_button("⏹").on_hover_text("Stop / abort recording");
                     if b.clicked() {
@@ -4471,6 +4485,19 @@ fn render_instance_row(
                         if let Some(p) = stream_target {
                             a.stream_in_player = Some(p.to_path_buf());
                         }
+                    }
+                    btns.push(b);
+                }
+                {
+                    let b = ui
+                        .add_enabled(!media_player.is_empty(), egui::Button::new("▷").small())
+                        .on_hover_text(if media_player.is_empty() {
+                            "Set a media player in Settings → Defaults first"
+                        } else {
+                            "Play new instance in media player (live, does not record)"
+                        });
+                    if b.clicked() {
+                        a.play_new_instance = Some(m.id);
                     }
                     btns.push(b);
                 }
@@ -9542,6 +9569,7 @@ impl StreamArchiverApp {
         let mut toggle_stream: Option<String> = None;
         let mut open_path: Option<std::path::PathBuf> = None;
         let mut open_in_player: Option<std::path::PathBuf> = None;
+        let mut play_new_instance_mid: Option<i64> = None;
         let mut copy_text: Option<String> = None;
         let mut delete_recording: Option<i64> = None;
         let mut open_recording_props: Option<i64> = None;
@@ -10311,6 +10339,20 @@ impl StreamArchiverApp {
                                             {
                                                 open_in_player = grp_stream_path.clone();
                                             }
+                                            if ui
+                                                .add_enabled(
+                                                    !media_player.is_empty(),
+                                                    egui::Button::new("▷").small(),
+                                                )
+                                                .on_hover_text(if media_player.is_empty() {
+                                                    "Set a media player in Settings → Defaults first"
+                                                } else {
+                                                    "Play new instance in media player (live, does not record)"
+                                                })
+                                                .clicked()
+                                            {
+                                                play_new_instance_mid = Some(mid);
+                                            }
                                         });
                                     }
                                     tr.col(|_ui| {}); // platform
@@ -10461,6 +10503,21 @@ impl StreamArchiverApp {
                                         }
                                         if ui
                                             .add_enabled(
+                                                !media_player.is_empty(),
+                                                egui::Button::new("▷  Play new instance"),
+                                            )
+                                            .on_hover_text(if media_player.is_empty() {
+                                                "Set a media player in Settings → Defaults first"
+                                            } else {
+                                                "Open a live stream directly in the media player (does not record)"
+                                            })
+                                            .clicked()
+                                        {
+                                            play_new_instance_mid = Some(mid);
+                                            ui.close();
+                                        }
+                                        if ui
+                                            .add_enabled(
                                                 dir.is_some(),
                                                 egui::Button::new("📋  Copy folder path"),
                                             )
@@ -10523,6 +10580,20 @@ impl StreamArchiverApp {
                                                     .clicked()
                                                 {
                                                     open_in_player = stream_target;
+                                                }
+                                                if ui
+                                                    .add_enabled(
+                                                        !media_player.is_empty(),
+                                                        egui::Button::new("▷").small(),
+                                                    )
+                                                    .on_hover_text(if media_player.is_empty() {
+                                                        "Set a media player in Settings → Defaults first"
+                                                    } else {
+                                                        "Play new instance in media player (live, does not record)"
+                                                    })
+                                                    .clicked()
+                                                {
+                                                    play_new_instance_mid = Some(t.monitor_id);
                                                 }
                                                 let dir_ok =
                                                     dir.as_ref().map(|d| d.is_dir()).unwrap_or(false);
@@ -10748,6 +10819,21 @@ impl StreamArchiverApp {
                                                 .clicked()
                                             {
                                                 open_in_player = stream_target;
+                                                ui.close();
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    !media_player.is_empty(),
+                                                    egui::Button::new("▷  Play new instance"),
+                                                )
+                                                .on_hover_text(if media_player.is_empty() {
+                                                    "Set a media player in Settings → Defaults first"
+                                                } else {
+                                                    "Open a live stream directly in the media player (does not record)"
+                                                })
+                                                .clicked()
+                                            {
+                                                play_new_instance_mid = Some(t.monitor_id);
                                                 ui.close();
                                             }
                                         }
@@ -10979,6 +11065,14 @@ impl StreamArchiverApp {
                 let _ = std::process::Command::new(&player).arg(&p).spawn();
             } else {
                 crate::platform::open_path(&p);
+            }
+        }
+        if let Some(mid) = play_new_instance_mid.or(acts.play_new_instance.take()) {
+            let player = self.settings.media_player_path.trim().to_string();
+            if !player.is_empty() {
+                if let Some(row) = self.rows.iter().find(|r| r.monitor.id == mid) {
+                    spawn_play_new_instance(row, &player, &self.settings);
+                }
             }
         }
         if let Some(t) = copy_text {
@@ -17200,6 +17294,125 @@ fn capture_file_for_active(output_path: &str) -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+/// Spawn a "play new instance" command — opens the live stream directly in the
+/// configured media player without recording it.
+///
+/// - Streamlink: uses `--player <path>` to route output to the player.
+/// - yt-dlp non-SABR: pipes `-o -` stdout to the player's stdin.
+/// - yt-dlp SABR: SABR writes fragmented MKV and can't pipe cleanly; falls
+///   back to passing the URL directly (mpv handles it via its yt-dlp integration).
+/// - ffmpeg source: passes URL directly.
+fn spawn_play_new_instance(
+    row: &crate::models::MonitorWithChannel,
+    player: &str,
+    settings: &SettingsForm,
+) {
+    use crate::downloader::{
+        push_track_args, resolve_auth, resolved_quality, split_args, youtube_live_url, AuthSource,
+    };
+    use crate::models::{Platform, Tool};
+
+    let m = &row.monitor;
+    let auth = resolve_auth(row, &settings.download_auth_method, &settings.cookies_browser);
+    let extra: Vec<String> = split_args(&m.extra_args);
+
+    match m.tool {
+        Tool::Streamlink => {
+            let mut args: Vec<String> = Vec::new();
+            if m.platform() == Platform::Twitch {
+                args.push("--twitch-supported-codecs=h264,h265,av1".into());
+                if let AuthSource::Token(ref t) = auth {
+                    args.push(format!("--twitch-api-header=Authorization=OAuth {t}"));
+                }
+            }
+            if m.capture_from_start {
+                args.push("--hls-live-restart".into());
+            }
+            args.push("--retry-streams".into());
+            args.push("3".into());
+            args.push("--retry-max".into());
+            args.push("5".into());
+            push_track_args(&mut args, Tool::Streamlink, &m.audio_tracks, &m.subtitle_tracks, false);
+            args.extend(extra);
+            args.push("--player".into());
+            args.push(player.to_string());
+            args.push(m.url.clone());
+            args.push(resolved_quality(&m.quality));
+            let _ = std::process::Command::new("streamlink").args(&args).spawn();
+        }
+        Tool::YtDlp => {
+            let is_sabr = settings.sabr_enabled
+                && !settings.sabr_binary_path.trim().is_empty()
+                && m.platform() == Platform::YouTube
+                && m.capture_from_start;
+            if is_sabr {
+                // SABR writes fragmented MKV — stdout pipe not viable.
+                // mpv (and most players) handle YouTube URLs natively via yt-dlp.
+                let _ = std::process::Command::new(player).arg(&m.url).spawn();
+            } else {
+                let ytdlp_bin = if settings.ytdlp_binary_path.trim().is_empty() {
+                    "yt-dlp".to_string()
+                } else {
+                    settings.ytdlp_binary_path.trim().to_string()
+                };
+                let global_args = split_args(&settings.ytdlp_default_args);
+                let mut args = vec![
+                    "--no-part".to_string(),
+                    "--hls-use-mpegts".into(),
+                    "-o".into(),
+                    "-".into(),
+                ];
+                if m.capture_from_start {
+                    args.push("--live-from-start".into());
+                } else {
+                    args.push("--no-live-from-start".into());
+                }
+                match &auth {
+                    AuthSource::CookiesBrowser(b) => {
+                        args.push("--cookies-from-browser".into());
+                        args.push(b.clone());
+                    }
+                    AuthSource::CookiesFile(p) => {
+                        args.push("--cookies".into());
+                        args.push(p.clone());
+                    }
+                    _ => {}
+                }
+                args.extend(global_args);
+                if m.platform() == Platform::YouTube && !settings.sabr_pot_args.trim().is_empty() {
+                    args.push("--extractor-args".into());
+                    args.push(settings.sabr_pot_args.trim().to_string());
+                }
+                push_track_args(&mut args, Tool::YtDlp, &m.audio_tracks, &m.subtitle_tracks, false);
+                args.extend(extra);
+                let url = if m.platform() == Platform::YouTube {
+                    youtube_live_url(&m.url)
+                } else {
+                    m.url.clone()
+                };
+                args.push(url);
+                use std::process::Stdio;
+                if let Ok(mut child) = std::process::Command::new(&ytdlp_bin)
+                    .args(&args)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()
+                {
+                    if let Some(pipe) = child.stdout.take() {
+                        let _ = std::process::Command::new(player)
+                            .arg("-")
+                            .stdin(Stdio::from(pipe))
+                            .spawn();
+                    }
+                }
+            }
+        }
+        Tool::Ffmpeg => {
+            let _ = std::process::Command::new(player).arg(&m.url).spawn();
+        }
+    }
 }
 
 /// Copy an image file's raw bytes to the Windows clipboard under the `PNG` format.
