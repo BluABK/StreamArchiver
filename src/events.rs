@@ -258,7 +258,10 @@ pub enum UiCommand {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ManualCommand {
     /// Check the channel now and, if live, start recording (bypassing backoff).
-    Start(i64),
+    /// `notify_offline`: toast an error when the channel turns out not to be
+    /// live. Set to true for explicit UI button clicks; false for automatic
+    /// triggers (WebSub events) so a "not live" outcome is silently discarded.
+    Start { id: i64, notify_offline: bool },
     /// Abort the channel's active recording.
     Stop(i64),
     /// Begin downloading a queued on-demand video (by `video` id).

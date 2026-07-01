@@ -1104,9 +1104,9 @@ impl Supervisor {
                     self.try_begin(signal.monitor_id, signal.went_live_at, signal.approximate, signal.stream_id, signal.thumbnail_url, signal.broadcaster_id, signal.stream_title, false);
                 }
                 Some(cmd) = manual_rx.recv() => match cmd {
-                    ManualCommand::Start(id) => {
+                    ManualCommand::Start { id, notify_offline } => {
                         let this = self.clone();
-                        tokio::spawn(async move { this.manual_start(id).await });
+                        tokio::spawn(async move { this.manual_start(id, notify_offline).await });
                     }
                     ManualCommand::Stop(id) => self.manual_stop(id),
                     ManualCommand::StartVideo(id) => {
@@ -1799,7 +1799,7 @@ impl Supervisor {
     }
 
     /// Manual "Start": check the channel now and record if live.
-    async fn manual_start(&self, monitor_id: i64) {
+    async fn manual_start(&self, monitor_id: i64, notify_offline: bool) {
         if self.active.lock().unwrap().contains_key(&monitor_id) {
             return; // already recording
         }
@@ -1822,7 +1822,7 @@ impl Supervisor {
                 // channels we're monitoring passively via push notifications.
                 let _ = self.store.set_monitor_check_result(monitor_id, "live", now_unix());
             }
-        } else if enabled {
+        } else if enabled && notify_offline {
             let message = if outcome.error && !outcome.detail.is_empty() {
                 format!("{name}: {}", outcome.detail)
             } else {

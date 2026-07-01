@@ -8171,7 +8171,7 @@ impl StreamArchiverApp {
             .ctx()
             .data_mut(|d| d.remove_temp::<i64>(egui::Id::new("sched_start")))
         {
-            self.core.manual(ManualCommand::Start(mid));
+            self.core.manual(ManualCommand::Start { id: mid, notify_offline: true });
             self.status = "Checking channel… will record if live.".into();
         }
         if let Some(sid) = ui
@@ -10763,7 +10763,7 @@ impl StreamArchiverApp {
             self.channel_asset_status.remove(&cid);
         }
         if let Some(id) = acts.start {
-            self.core.manual(ManualCommand::Start(id));
+            self.core.manual(ManualCommand::Start { id, notify_offline: true });
             self.status = "Checking channel… will record if live.".into();
         }
         if let Some(id) = acts.stop {
