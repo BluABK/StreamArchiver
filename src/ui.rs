@@ -5357,6 +5357,14 @@ impl StreamArchiverApp {
             self.view = View::Settings;
         }
         if ctx.input_mut(|i| i.consume_shortcut(&REFRESH)) {
+            // Drop all per-monitor recording/ad/meta/schedule caches so the next
+            // render re-reads them from DB. Normally these are preserved across
+            // reload_rows to avoid per-frame DB queries, but F5 is an explicit
+            // user request to see current state (e.g. after an external DB edit).
+            self.rec_cache.clear();
+            self.ad_break_cache.clear();
+            self.meta_change_cache.clear();
+            self.schedule_cache.clear();
             self.spawn_pending_reload();
             if self.view == View::Schedule {
                 // Force a network re-fetch (not just a DB reload) + show current data.
