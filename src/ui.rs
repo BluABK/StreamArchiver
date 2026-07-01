@@ -17374,8 +17374,11 @@ enum StreamTarget {
     /// it plainly (playable, but they stop at the current end).
     Growing(std::path::PathBuf),
     /// Mid-SABR capture: separate still-growing per-format files (video +
-    /// audio), largest first. Playable only in mpv (merged via an `edl://`
-    /// argument of `appending://` sub-URLs).
+    /// audio), largest first. Playable only in mpv: the largest (video) file
+    /// opens as `appending://` main file, the rest attach via
+    /// `--audio-file=appending://…`. (An `edl://` merge also loads both
+    /// tracks but keeps zero seconds of demuxer readahead and bakes the
+    /// total duration at open — video freezes and growth is not followed.)
     SplitAv(Vec<std::path::PathBuf>),
 }
 
@@ -17515,21 +17518,6 @@ fn fwd_slashes(p: &std::path::Path) -> String {
     p.to_string_lossy().replace('\\', "/")
 }
 
-/// Build the mpv `edl://` argument that merges the still-growing SABR
-/// per-format files into one virtual multi-track file. Each part becomes its
-/// own `!new_stream` so mpv sees all tracks and auto-selects video + audio
-/// (no need to know which file is which). Sub-URLs use `appending://` so mpv
-/// follows growth, and are `%N%` byte-length-quoted so `;`/`,` in filenames
-/// can't break the EDL parser.
-fn sabr_edl_arg(parts: &[std::path::PathBuf]) -> String {
-    let mut s = String::from("edl://");
-    for p in parts {
-        let url = format!("appending://{}", fwd_slashes(p));
-        s.push_str(&format!("!new_stream;%{}%{};", url.len(), url));
-    }
-    s
-}
-
 /// Build the player invocation for a stream target. mpv gets live-view flags
 /// and `appending://` URLs for growing files; other players get plain paths.
 fn build_player_command(player: &str, t: &StreamTarget) -> std::process::Command {
@@ -17549,8 +17537,18 @@ fn build_player_command(player: &str, t: &StreamTarget) -> std::process::Command
         }
         StreamTarget::SplitAv(parts) => {
             // Gated to mpv by playable_with; build the mpv form regardless.
+            // Largest file (video) is the main file; the rest join as
+            // external audio tracks. Each source is its own appending://
+            // demuxer, so readahead and growth-following work normally
+            // (unlike an edl:// merge, which starves the video stream).
             cmd.args(MPV_LIVE_FLAGS);
-            cmd.arg(sabr_edl_arg(parts));
+            let mut parts = parts.iter();
+            if let Some(main) = parts.next() {
+                cmd.arg(format!("appending://{}", fwd_slashes(main)));
+            }
+            for p in parts {
+                cmd.arg(format!("--audio-file=appending://{}", fwd_slashes(p)));
+            }
         }
     }
     cmd
@@ -18594,7 +18592,7 @@ mod tests {
         aggregate_stream_changes, build_twitch_segments, chat_file_for_recording,
         compose_browser_profile, contrast_ratio, fmt_polled, hsl_to_rgb, meta_change_lines,
         monitor_import_identity, parse_first_party_spans, playable_with, player_is_mpv,
-        readable_color, rgb_to_hsl, sabr_edl_arg, set_active_date_fmt, split_browser_profile,
+        readable_color, rgb_to_hsl, set_active_date_fmt, split_browser_profile,
         stream_target_for_active, strip_ctcp_action, twitch_username_color, word_match_segments,
         yt_channel_id,
     };
@@ -19141,22 +19139,35 @@ mod tests {
     }
 
     #[test]
-    fn sabr_edl_arg_quotes_by_byte_length() {
-        // Stems with spaces, semicolons, and multi-byte unicode must be
-        // byte-length quoted (%N%) so the EDL parser can't misparse them.
+    fn split_av_player_command_uses_appending_and_audio_file() {
         let parts = vec![
-            PathBuf::from(r"A:\streams\Nitya Ch. 【Phase】\.cache\a; b.f303.mkv.sq0.part"),
-            PathBuf::from(r"A:\streams\Nitya Ch. 【Phase】\.cache\a; b.f140.mkv.sq0.part"),
+            PathBuf::from(r"A:\streams\Nitya Ch. 【Phase】\.cache\a b.f303.mkv.sq0.part"),
+            PathBuf::from(r"A:\streams\Nitya Ch. 【Phase】\.cache\a b.f140.mkv.sq0.part"),
         ];
-        let arg = sabr_edl_arg(&parts);
-        assert!(arg.starts_with("edl://!new_stream;%"));
-        // Backslashes converted; both parts present with appending:// and a
-        // correct byte-length prefix.
-        for p in &parts {
-            let url = format!("appending://{}", p.to_string_lossy().replace('\\', "/"));
-            assert!(arg.contains(&format!("%{}%{url}", url.len())), "missing {url} in {arg}");
-        }
-        assert_eq!(arg.matches("!new_stream").count(), 2);
+        let cmd = super::build_player_command(
+            r"C:\Progs\mpv\mpv.exe",
+            &StreamTarget::SplitAv(parts.clone()),
+        );
+        assert_eq!(cmd.get_program().to_string_lossy(), r"C:\Progs\mpv\mpv.exe");
+        let args: Vec<String> =
+            cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        // Live-view flags, then the largest (video) file as the appending://
+        // main file, then the audio as an external appending:// track.
+        // Backslashes are converted to forward slashes inside the URLs.
+        assert!(args.contains(&"--keep-open=yes".to_string()));
+        let fwd = |p: &PathBuf| p.to_string_lossy().replace('\\', "/");
+        assert_eq!(args.last().unwrap(), &format!("--audio-file=appending://{}", fwd(&parts[1])));
+        assert!(args.contains(&format!("appending://{}", fwd(&parts[0]))));
+
+        // Growing single file under mpv also uses appending://; other players
+        // and finished files get the plain path.
+        let g = StreamTarget::Growing(PathBuf::from(r"A:\x\.cache\y.ts"));
+        let cmd = super::build_player_command(r"C:\Progs\mpv\mpv.exe", &g);
+        assert!(cmd.get_args().any(|a| a.to_string_lossy() == "appending://A:/x/.cache/y.ts"));
+        let cmd = super::build_player_command(r"C:\VLC\vlc.exe", &g);
+        let args: Vec<String> =
+            cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, vec![r"A:\x\.cache\y.ts".to_string()]);
     }
 
     #[test]
