@@ -92,6 +92,8 @@ const K_RENDER_EMOTES: &str = "render_emotes_in_chat";
 /// Whether animated emotes play (off ⇒ a static first frame). Default on; only an
 /// explicit `"0"` disables. Off is the perf/RAM escape hatch for heavy channels.
 const K_ANIMATE_EMOTES: &str = "animate_emotes_in_chat";
+/// Path to the media player binary used by "Stream in player" on recording rows.
+const K_MEDIA_PLAYER: &str = "media_player_path";
 
 /// Browsers yt-dlp can read cookies from (for the Settings dropdown).
 const COOKIE_BROWSERS: [&str; 8] = [
@@ -462,6 +464,8 @@ struct SettingsForm {
     maintenance_filename_preset: String,
     /// Apply the preset to all existing monitors when "Set as Default" is clicked.
     maintenance_apply_all: bool,
+    /// Path to the media player binary (e.g. `C:\Progs\mpv\mpv.exe`).
+    media_player_path: String,
 }
 
 /// Background load state of an import fetch (followed/subscriptions).
@@ -994,6 +998,10 @@ impl StreamArchiverApp {
             fetch_thumb_embed: false,
             maintenance_filename_preset: String::new(),
             maintenance_apply_all: false,
+            media_player_path: {
+                let v = setting_or_empty(&core, K_MEDIA_PLAYER);
+                if v.is_empty() { r"C:\Progs\mpv\mpv.exe".into() } else { v }
+            },
         };
         // Apply the loaded date format + short-timestamp pattern before the first render.
         set_active_date_fmt(settings.date_fmt);
@@ -1942,6 +1950,7 @@ impl StreamArchiverApp {
             (K_FILE_SPLIT_CHAT,   s.file_split_chat.trim()),
             (K_FILE_SPLIT_THUMBS, s.file_split_thumbs.trim()),
             (K_FILE_SPLIT_LOGS,   s.file_split_logs.trim()),
+            (K_MEDIA_PLAYER, s.media_player_path.trim()),
         ];
         for (k, v) in pairs {
             if let Err(e) = self.core.store.set_setting(k, v) {
@@ -9490,6 +9499,7 @@ impl StreamArchiverApp {
         let mut toggle_instance: Option<i64> = None;
         let mut toggle_stream: Option<String> = None;
         let mut open_path: Option<std::path::PathBuf> = None;
+        let mut open_in_player: Option<std::path::PathBuf> = None;
         let mut copy_text: Option<String> = None;
         let mut delete_recording: Option<i64> = None;
         let mut open_recording_props: Option<i64> = None;
@@ -10349,13 +10359,14 @@ impl StreamArchiverApp {
                                 let dir = std::path::Path::new(&t.output_path)
                                     .parent()
                                     .map(|p| p.to_path_buf());
+                                let file_ok = !t.output_path.is_empty()
+                                    && std::path::Path::new(&t.output_path).is_file();
+                                let media_player = self.settings.media_player_path.trim().to_string();
                                 body.row(24.0, |mut tr| {
                                     tr.col(|_ui| {}); // on
                                     if show_actions {
                                         tr.col(|ui| {
                                             ui.push_id(t.id, |ui| {
-                                                let file_ok = !t.output_path.is_empty()
-                                                    && std::path::Path::new(&t.output_path).is_file();
                                                 if ui
                                                     .add_enabled(file_ok, egui::Button::new("▶").small())
                                                     .on_hover_text("Open file")
@@ -10363,6 +10374,31 @@ impl StreamArchiverApp {
                                                 {
                                                     open_path =
                                                         Some(std::path::PathBuf::from(&t.output_path));
+                                                }
+                                                let stream_target = if t.is_active() {
+                                                    capture_file_for_active(&t.output_path)
+                                                } else if file_ok {
+                                                    Some(std::path::PathBuf::from(&t.output_path))
+                                                } else {
+                                                    None
+                                                };
+                                                let player_ok = !media_player.is_empty()
+                                                    && stream_target.is_some();
+                                                if ui
+                                                    .add_enabled(
+                                                        player_ok,
+                                                        egui::Button::new("⏵").small(),
+                                                    )
+                                                    .on_hover_text(if media_player.is_empty() {
+                                                        "Set a media player in Settings → Defaults first"
+                                                    } else if t.is_active() {
+                                                        "Stream in player (opens live capture file)"
+                                                    } else {
+                                                        "Open in player"
+                                                    })
+                                                    .clicked()
+                                                {
+                                                    open_in_player = stream_target;
                                                 }
                                                 let dir_ok =
                                                     dir.as_ref().map(|d| d.is_dir()).unwrap_or(false);
@@ -10526,8 +10562,6 @@ impl StreamArchiverApp {
                                     tr.col(|_ui| {}); // added
                                     tr.response().context_menu(|ui| {
                                         ui.set_min_width(180.0);
-                                        let file_ok = !t.output_path.is_empty()
-                                            && std::path::Path::new(&t.output_path).is_file();
                                         // Offer re-remux when the finalized file is still a .ts
                                         // (the automatic remux failed at recording end).
                                         let needs_remux = t.output_path.ends_with(".ts")
@@ -10565,6 +10599,33 @@ impl StreamArchiverApp {
                                             open_path =
                                                 Some(std::path::PathBuf::from(&t.output_path));
                                             ui.close();
+                                        }
+                                        {
+                                            let stream_target = if t.is_active() {
+                                                capture_file_for_active(&t.output_path)
+                                            } else if file_ok {
+                                                Some(std::path::PathBuf::from(&t.output_path))
+                                            } else {
+                                                None
+                                            };
+                                            if ui
+                                                .add_enabled(
+                                                    !media_player.is_empty()
+                                                        && stream_target.is_some(),
+                                                    egui::Button::new("⏵  Stream in player"),
+                                                )
+                                                .on_hover_text(if media_player.is_empty() {
+                                                    "Set a media player in Settings → Defaults first"
+                                                } else if t.is_active() {
+                                                    "Open live capture file in the configured media player"
+                                                } else {
+                                                    "Open in the configured media player"
+                                                })
+                                                .clicked()
+                                            {
+                                                open_in_player = stream_target;
+                                                ui.close();
+                                            }
                                         }
                                         let dir_ok =
                                             dir.as_ref().map(|d| d.is_dir()).unwrap_or(false);
@@ -10787,6 +10848,14 @@ impl StreamArchiverApp {
         }
         if let Some(p) = open_path {
             crate::platform::open_path(&p);
+        }
+        if let Some(p) = open_in_player {
+            let player = self.settings.media_player_path.trim().to_string();
+            if !player.is_empty() {
+                let _ = std::process::Command::new(&player).arg(&p).spawn();
+            } else {
+                crate::platform::open_path(&p);
+            }
         }
         if let Some(t) = copy_text {
             ui.ctx().copy_text(t);
@@ -11971,6 +12040,24 @@ impl StreamArchiverApp {
                             self.pending_browse = Some(spawn_browse_folder(
                                 &self.settings.default_output_dir,
                                 |app, p| app.settings.default_output_dir = p,
+                            ));
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("Media player path").on_hover_text(
+                        "Path to the media player used by \"Stream in player\" on recording rows. \
+                         Passed the file path as the only argument (e.g. mpv.exe, vlc.exe).",
+                    );
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings.media_player_path)
+                                .hint_text(r"C:\Progs\mpv\mpv.exe")
+                                .desired_width(360.0),
+                        );
+                        if ui.button("Browse…").clicked() {
+                            self.pending_browse = Some(spawn_browse_file(
+                                &self.settings.media_player_path,
+                                |app, p| app.settings.media_player_path = p,
                             ));
                         }
                     });
@@ -16973,6 +17060,22 @@ fn emote_cdn_url(provider: EmoteProvider, id: &str, ext: &str) -> String {
 /// Open a path (file or directory) with the default associated application.
 fn open_path(path: &std::path::Path) {
     let _ = std::process::Command::new("explorer").arg(path).spawn();
+}
+
+/// Find the in-progress capture file for an active recording by checking `.cache/`
+/// for the common capture extensions yt-dlp and streamlink produce.
+/// Returns `None` when no recognizable file is present (e.g. mid-SABR fragment phase).
+fn capture_file_for_active(output_path: &str) -> Option<std::path::PathBuf> {
+    let final_path = std::path::Path::new(output_path);
+    let stem = final_path.file_stem()?.to_string_lossy();
+    let cache_dir = final_path.parent()?.join(".cache");
+    for ext in [".ts", ".mkv", ".mkv.mp4"] {
+        let candidate = cache_dir.join(format!("{stem}{ext}"));
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// Copy an image file's raw bytes to the Windows clipboard under the `PNG` format.
