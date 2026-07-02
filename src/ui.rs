@@ -17360,6 +17360,18 @@ enum StreamTarget {
 /// they're openable; also filters out the tiny `.state` sidecars (~50 B).
 const SPLIT_AV_MIN_BYTES: u64 = 64 * 1024;
 
+/// True current size of a possibly-being-written file, or `None` if it can't
+/// be opened / isn't a file. The size that `fs::metadata` / `read_dir`
+/// metadata report comes from the DIRECTORY ENTRY, which NTFS only updates
+/// lazily while another process holds the file open for writing — a capture
+/// started seconds ago reads as 0 bytes there even with megabytes written
+/// (verified against a live download: dir entry 0, handle size 5 MB).
+/// Opening the file queries the handle, which is always current.
+fn live_file_len(p: &std::path::Path) -> Option<u64> {
+    let md = std::fs::File::open(p).ok()?.metadata().ok()?;
+    md.is_file().then(|| md.len())
+}
+
 /// Find what an active recording's in-progress capture can be played from, by
 /// probing `.cache\` next to its final output path.
 ///
@@ -17382,7 +17394,7 @@ fn stream_target_for_active(output_path: &str) -> Option<StreamTarget> {
     let cache_dir = final_path.parent()?.join(".cache");
     for ext in [".ts", ".mkv", ".mkv.mp4"] {
         let candidate = cache_dir.join(format!("{stem}{ext}"));
-        if candidate.metadata().map(|m| m.is_file() && m.len() > 0).unwrap_or(false) {
+        if live_file_len(&candidate).unwrap_or(0) > 0 {
             return Some(StreamTarget::Growing(candidate));
         }
     }
@@ -17430,11 +17442,11 @@ fn stream_target_for_active(output_path: &str) -> Option<StreamTarget> {
             [.., ext] if matches!(*ext, "mp4" | "m4a" | "webm" | "mkv") => None,
             _ => continue,
         };
-        let Ok(md) = entry.metadata() else { continue };
-        if !md.is_file() || md.len() < SPLIT_AV_MIN_BYTES {
+        let Some(len) = live_file_len(&entry.path()) else { continue };
+        if len < SPLIT_AV_MIN_BYTES {
             continue;
         }
-        let candidate = (seq, entry.path(), md.len());
+        let candidate = (seq, entry.path(), len);
         match best.entry(format_id) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert(candidate);
@@ -17602,7 +17614,11 @@ fn spawn_live_preview(
         return Some(format!("Failed to create preview dir: {e}"));
     }
 
-    let auth = resolve_auth(row, &settings.download_auth_method, &settings.cookies_browser);
+    // The settings form splits browser and profile; downloads need the
+    // composed "browser:profile" form (a bare "firefox" would hit the
+    // default profile, not the one holding the YouTube login).
+    let cookies = compose_browser_profile(&settings.cookies_browser, &settings.cookies_profile);
+    let auth = resolve_auth(row, &settings.download_auth_method, &cookies);
     let extra = split_args(&m.extra_args);
     let global_args = split_args(&settings.ytdlp_default_args);
     // Downloader writes into <tmp>\.cache\preview.*, matching the app's capture
@@ -17695,10 +17711,24 @@ fn spawn_live_preview(
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
         };
+        // Lossy read: yt-dlp's console output isn't guaranteed UTF-8.
         let log_tail = |tmp: &std::path::Path| -> String {
-            std::fs::read_to_string(tmp.join("preview.log"))
-                .map(|s| s.chars().rev().take(600).collect::<Vec<_>>().iter().rev().collect())
-                .unwrap_or_default()
+            let bytes = std::fs::read(tmp.join("preview.log")).unwrap_or_default();
+            let s = String::from_utf8_lossy(&bytes);
+            let cut = s.char_indices().rev().nth(599).map(|(i, _)| i).unwrap_or(0);
+            s[cut..].to_string()
+        };
+        // What the downloader has produced so far (true handle sizes — the
+        // dir-entry sizes are stale for open files), for timeout diagnostics.
+        let cache_listing = |tmp: &std::path::Path| -> String {
+            let Ok(rd) = std::fs::read_dir(tmp.join(".cache")) else { return String::new() };
+            rd.flatten()
+                .map(|e| {
+                    let len = live_file_len(&e.path()).unwrap_or(0);
+                    format!("{} ({len} B)", e.file_name().to_string_lossy())
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
         };
 
         // Wait for a playable target: SABR needs both A/V parts (SplitAv), but
@@ -17734,7 +17764,12 @@ fn spawn_live_preview(
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
         let Some(target) = target else {
-            warn!(%channel, tail = %log_tail(&tmp), "live-preview: no playable stream within 2 minutes");
+            warn!(
+                %channel,
+                cache = %cache_listing(&tmp),
+                tail = %log_tail(&tmp),
+                "live-preview: no playable stream within 2 minutes"
+            );
             cleanup(&mut dl, &tmp);
             return;
         };
@@ -17775,7 +17810,11 @@ fn spawn_play_new_instance(
     use crate::models::{Platform, Tool};
 
     let m = &row.monitor;
-    let auth = resolve_auth(row, &settings.download_auth_method, &settings.cookies_browser);
+    // The settings form splits browser and profile; downloads need the
+    // composed "browser:profile" form (a bare "firefox" would hit the
+    // default profile, not the one holding the YouTube login).
+    let cookies = compose_browser_profile(&settings.cookies_browser, &settings.cookies_profile);
+    let auth = resolve_auth(row, &settings.download_auth_method, &cookies);
     let extra: Vec<String> = split_args(&m.extra_args);
 
     match m.tool {
