@@ -17774,12 +17774,80 @@ fn spawn_live_preview(
             return;
         };
         tracing::info!(%channel, ?target, "live-preview: buffered, launching player");
-        match build_player_command(&player, &target).spawn() {
-            Ok(mut p) => {
+        // Split SABR previews are served through a generated live HLS playlist
+        // — the only transport that follows the growing files at the live edge
+        // indefinitely (appending:// latches EOF after one lost race against
+        // the segment cadence). Non-ISOBMFF variants and single files fall
+        // back to direct appending:// playback.
+        let launched: Option<(std::process::Child, Option<crate::hls_preview::HlsPreview>)> =
+            (|| {
+                if let StreamTarget::SplitAv(parts) = &target
+                    && parts.len() >= 2
+                    && let Some(mut hp) =
+                        crate::hls_preview::HlsPreview::open(&parts[0], &parts[1], &tmp)
+                {
+                    // Playlists need ≥2 coalesced segments per track
+                    // (~10 s of media) before there's anything to play.
+                    let mut ready = hp.tick(false);
+                    for _ in 0..60 {
+                        if ready {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        ready = hp.tick(false);
+                    }
+                    if ready {
+                        tracing::info!(%channel, "live-preview: serving live HLS playlist");
+                        let mut cmd = std::process::Command::new(&player);
+                        cmd.args(MPV_LIVE_FLAGS);
+                        // Segments end in ".part", which lavf's HLS demuxer
+                        // blocks by default for local files.
+                        cmd.arg("--demuxer-lavf-o=allowed_extensions=ALL");
+                        cmd.arg(fwd_slashes(&hp.master_path()));
+                        match cmd.spawn() {
+                            Ok(p) => return Some((p, Some(hp))),
+                            Err(e) => {
+                                warn!(%channel, "live-preview: failed to launch player: {e}");
+                                return None;
+                            }
+                        }
+                    }
+                    warn!(%channel, "live-preview: HLS playlists not ready in time, falling back to appending://");
+                }
+                match build_player_command(&player, &target).spawn() {
+                    Ok(p) => Some((p, None)),
+                    Err(e) => {
+                        warn!(%channel, "live-preview: failed to launch player: {e}");
+                        None
+                    }
+                }
+            })();
+        match launched {
+            Some((mut p, Some(mut hp))) => {
+                // Keep the playlists fresh while the player runs. When the
+                // preview download ends (stream over / killed), write final
+                // playlists with ENDLIST so the player finishes cleanly
+                // instead of polling forever.
+                let mut dl_ended = false;
+                loop {
+                    if !matches!(p.try_wait(), Ok(None)) {
+                        break;
+                    }
+                    if !dl_ended && !matches!(dl.try_wait(), Ok(None)) {
+                        dl_ended = true;
+                        hp.tick(true);
+                    } else if !dl_ended {
+                        hp.tick(false);
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+                tracing::info!(%channel, "live-preview: player closed, stopping preview download");
+            }
+            Some((mut p, None)) => {
                 let _ = p.wait();
                 tracing::info!(%channel, "live-preview: player closed, stopping preview download");
             }
-            Err(e) => warn!(%channel, "live-preview: failed to launch player: {e}"),
+            None => {}
         }
         cleanup(&mut dl, &tmp);
     });

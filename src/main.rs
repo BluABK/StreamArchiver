@@ -16,6 +16,7 @@ mod events;
 mod eventsub;
 mod fonts;
 mod google_oauth;
+mod hls_preview;
 mod imports;
 mod models;
 mod notifications;

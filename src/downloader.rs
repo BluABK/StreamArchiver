@@ -635,7 +635,13 @@ fn sabr_capture_args(
 /// Build the yt-dlp SABR args for a throwaway live-edge preview download
 /// ("Play new instance"): identical to [`sabr_capture_args`] except it joins
 /// at the live edge instead of rewinding to the start — the whole point is
-/// that the preview files BEGIN at the edge, so the player needs no seeking.
+/// that the preview files BEGIN at the edge, so the player needs no seeking —
+/// and it prefers fMP4-compatible formats: the preview is served to the
+/// player through a generated live HLS playlist of byteranges
+/// ([`crate::hls_preview`]), which requires ISOBMFF per-format files (a VP9
+/// pick lands in a Matroska container HLS can't address). Falls back to the
+/// configured selector when no mp4+m4a pair exists (playback then degrades
+/// to `appending://`, which stalls once caught up to the live edge).
 pub(crate) fn sabr_preview_args(
     out_mkv: &Path,
     auth: &AuthSource,
@@ -649,6 +655,11 @@ pub(crate) fn sabr_preview_args(
         if a == "--live-from-start" {
             *a = "--no-live-from-start".into();
         }
+    }
+    if let Some(pos) = args.iter().position(|a| a == "-f")
+        && let Some(v) = args.get_mut(pos + 1)
+    {
+        *v = format!("bv[protocol=sabr][ext=mp4]+ba[protocol=sabr][ext=m4a]/{v}");
     }
     args
 }
@@ -6629,7 +6640,9 @@ mod tests {
     #[test]
     fn sabr_preview_args_join_at_live_edge() {
         // The live-edge preview ("Play new instance") must be the capture
-        // command with from-start swapped for live-edge — nothing else.
+        // command with from-start swapped for live-edge and an fMP4-first
+        // format selector (HLS-playlist playback needs ISOBMFF files) —
+        // nothing else.
         let bins = sabr_bins();
         let out = PathBuf::from(r"C:\tmp\.cache\preview.mkv");
         let preview = sabr_preview_args(
@@ -6637,11 +6650,19 @@ mod tests {
         );
         assert!(preview.iter().any(|a| a == "--no-live-from-start"));
         assert!(!preview.iter().any(|a| a == "--live-from-start"));
+        let fpos = preview.iter().position(|a| a == "-f").unwrap();
+        assert_eq!(
+            preview[fpos + 1],
+            format!("bv[protocol=sabr][ext=mp4]+ba[protocol=sabr][ext=m4a]/{SABR_DEFAULT_FORMAT}")
+        );
         let capture = sabr_capture_args(
             &out, &AuthSource::None, &[], &bins.sabr, &[], "https://www.youtube.com/@chan",
         );
         let normalize = |v: &[String]| {
-            v.iter().filter(|a| !a.contains("live-from-start")).cloned().collect::<Vec<_>>()
+            v.iter()
+                .filter(|a| !a.contains("live-from-start") && !a.contains("[protocol=sabr]"))
+                .cloned()
+                .collect::<Vec<_>>()
         };
         assert_eq!(normalize(&preview), normalize(&capture));
     }
