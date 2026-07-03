@@ -886,7 +886,9 @@ pub fn build_video_plan(
     channel: &str,
     video_id: &str,
     auth: &AuthSource,
+    ytdlp_global_args: &[String],
     media: Option<&MediaInfo>,
+    ytdlp: &YtDlpBins,
 ) -> DownloadPlan {
     let dir = PathBuf::from(&v.output_dir);
     let quality = resolved_quality(&v.quality);
@@ -937,6 +939,27 @@ pub fn build_video_plan(
                 }
                 _ => {}
             }
+            // The stock build's default client mix is broken for YouTube VODs
+            // (2026-07): tv_downgraded 403s even with a valid PO token, tv
+            // serves DRM formats, web/web_safari are SABR-only (dropped as
+            // unsupported), ios/android serve nothing — mweb + a GVS PO token
+            // is the mix that downloads. First in the args so later
+            // --extractor-args youtube:… entries (Settings global defaults or
+            // per-video extra args) can override it if the landscape shifts.
+            if platform == Platform::YouTube {
+                args.push("--extractor-args".into());
+                args.push("youtube:player_client=mweb".into());
+            }
+            // Global defaults from Settings → yt-dlp default arguments.
+            args.extend_from_slice(ytdlp_global_args);
+            // PO-token provider (bgutil HTTP) — YouTube 403s googlevideo media
+            // URLs fetched without a proof-of-origin token, so VOD downloads
+            // need it exactly like live captures do (the extraction step alone
+            // still succeeds, which made these failures easy to miss).
+            if platform == Platform::YouTube && !ytdlp.sabr.pot_args.is_empty() {
+                args.push("--extractor-args".into());
+                args.push(ytdlp.sabr.pot_args.clone());
+            }
             // Subtitle + chat (live_chat) sidecars; the post-rename step moves them
             // with the file. audio_tracks is a no-op for yt-dlp (it keeps the
             // chosen format's tracks).
@@ -950,7 +973,7 @@ pub fn build_video_plan(
             args.extend(extra);
             args.push(v.url.clone());
             DownloadPlan {
-                program: "yt-dlp".to_string(),
+                program: ytdlp.system_program(),
                 args,
                 // yt-dlp writes the final MKV into .cache; promoted up via a move.
                 capture_path: cache.join(format!("{stem}.mkv")),
@@ -2161,8 +2184,18 @@ impl Supervisor {
         } else {
             None
         };
-        let plan =
-            build_video_plan(&video, started_at, &title, &channel, &video_id, &auth, pre_media.as_ref());
+        let ytdlp_global_raw = self
+            .store
+            .get_setting("ytdlp_default_args")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let ytdlp_global_args = split_args(&ytdlp_global_raw);
+        let ytdlp_bins = load_ytdlp_bins(&self.store);
+        let plan = build_video_plan(
+            &video, started_at, &title, &channel, &video_id, &auth, &ytdlp_global_args,
+            pre_media.as_ref(), &ytdlp_bins,
+        );
         if let Some(parent) = plan.capture_path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
             crate::platform::set_hidden(parent); // mark the .cache\ working dir hidden
@@ -6886,7 +6919,9 @@ mod tests {
             "",
             "",
             &AuthSource::None,
+            &[],
             None,
+            &YtDlpBins::default(),
         );
         assert!(vplan.capture_path.parent().unwrap().ends_with(".cache"));
         assert_eq!(vplan.final_path.parent().unwrap(), std::path::Path::new("C:/vids"));
@@ -6948,7 +6983,9 @@ mod tests {
             "",
             "",
             &AuthSource::None,
+            &[],
             None,
+            &YtDlpBins::default(),
         );
         assert_eq!(plan.program, "yt-dlp");
         assert!(plan.final_path.to_string_lossy().ends_with(".mkv"));
@@ -6969,11 +7006,18 @@ mod tests {
             "",
             "",
             &AuthSource::CookiesBrowser("edge".into()),
+            &[],
             None,
+            &sabr_bins(),
         );
         let joined = plan.args.join(" ");
         assert!(joined.contains("-f bv*+ba"));
         assert!(joined.contains("--cookies-from-browser edge"));
+        // YouTube VOD media URLs 403 without a PO token — the provider args
+        // must be present just like on live captures — and need a client mix
+        // that still serves downloadable formats (mweb).
+        assert!(joined.contains(SABR_DEFAULT_POT_ARGS));
+        assert!(joined.contains("youtube:player_client=mweb"));
     }
 
     #[test]
@@ -6985,7 +7029,9 @@ mod tests {
             "",
             "",
             &AuthSource::None,
+            &[],
             None,
+            &YtDlpBins::default(),
         );
         assert_eq!(plan.program, "streamlink");
         assert!(plan.capture_path.to_string_lossy().ends_with(".ts"));
@@ -7001,7 +7047,7 @@ mod tests {
         let mut v = video(Tool::YtDlp, "https://youtube.com/watch?v=abc");
         v.subtitle_tracks = "all".into();
         v.chat_log = true;
-        let plan = build_video_plan(&v, 1_700_000_000, "", "", "", &AuthSource::None, None);
+        let plan = build_video_plan(&v, 1_700_000_000, "", "", "", &AuthSource::None, &[], None, &YtDlpBins::default());
         let joined = plan.args.join(" ");
         assert!(joined.contains("--sub-langs=all,live_chat"), "{joined}");
         assert!(plan.args.iter().any(|a| a == "--write-subs"), "{joined}");
@@ -7011,7 +7057,7 @@ mod tests {
         // streamlink: audio-track selection -> --hls-audio-select (subtitles n/a).
         let mut s = video(Tool::Streamlink, "https://twitch.tv/videos/123");
         s.audio_tracks = "en,de".into();
-        let plan = build_video_plan(&s, 1_700_000_000, "", "", "", &AuthSource::None, None);
+        let plan = build_video_plan(&s, 1_700_000_000, "", "", "", &AuthSource::None, &[], None, &YtDlpBins::default());
         let joined = plan.args.join(" ");
         assert!(joined.contains("--hls-audio-select=en,de"), "{joined}");
     }
