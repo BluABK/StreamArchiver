@@ -8,3 +8,4 @@
 /assets/samples/
 # Personal VS Code workspace (machine-specific folder paths).
 /streamarchiver.code-workspace
+doc/.lock
