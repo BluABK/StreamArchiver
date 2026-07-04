@@ -1205,6 +1205,11 @@ impl Supervisor {
                         let tx2 = tx.clone();
                         tokio::spawn(async move {
                             info!("re-remux start: {}", capture.display());
+                            // ffmpeg writes the destination directly, so shorten
+                            // proactively — this also covers a Re-remux retry after
+                            // the FIRST attempt failed because this exact name was
+                            // too long (see path_with_safe_stem).
+                            let final_ = path_with_safe_stem(&final_);
                             match remux_ts_to_mkv(&capture, &final_, Some((tx2, task_id)), &Default::default()).await {
                                 Ok(()) => {
                                     let _ = tokio::fs::remove_file(&capture).await;
@@ -1258,13 +1263,16 @@ impl Supervisor {
                             let mut done = 0usize;
                             let opts = store.remux_opts();
                             for (rec_id, output_path) in &recs {
-                                let mkv = PathBuf::from(output_path);
-                                // Only re-remux if the TS source is still present.
-                                let ts = mkv.with_extension("ts");
+                                let planned_mkv = PathBuf::from(output_path);
+                                // The sibling .ts (the actual source to remux) lives
+                                // under the ORIGINAL stem — only the destination we're
+                                // about to write gets proactively shortened.
+                                let ts = planned_mkv.with_extension("ts");
                                 if !ts.exists() {
                                     done += 1;
                                     continue;
                                 }
+                                let mkv = path_with_safe_stem(&planned_mkv);
                                 let _ = tx.send(AppEvent::BackgroundTaskProgress {
                                     id: task_id,
                                     progress: Some(done as f32 / total as f32),
@@ -1273,6 +1281,9 @@ impl Supervisor {
                                 match remux_ts_to_mkv(&ts, &mkv, None, &opts).await {
                                     Ok(()) => {
                                         let _ = tokio::fs::remove_file(&ts).await;
+                                        if mkv != planned_mkv {
+                                            let _ = store.update_recording_output_path(*rec_id, &mkv.to_string_lossy());
+                                        }
                                         let _ = tx.send(AppEvent::RecordingUpdated { recording_id: *rec_id });
                                     }
                                     Err(e) => warn!("re-remux-all failed for rec_id={rec_id}: {e:#}"),
@@ -1283,6 +1294,35 @@ impl Supervisor {
                                 id: task_id,
                                 outcome: crate::events::TaskOutcome::CompletedWithNote(format!("{total} checked")),
                             });
+                        });
+                    }
+                    ManualCommand::RecoverStuckCapture { rec_id, capture, output_dir } => {
+                        let store = self.store.clone();
+                        let tx = self.events.clone();
+                        tokio::spawn(async move {
+                            let Some(stem) =
+                                capture.file_stem().map(|s| s.to_string_lossy().into_owned())
+                            else {
+                                warn!(rec_id, "recover stuck capture: no file stem for {}", capture.display());
+                                return;
+                            };
+                            let ext = capture
+                                .extension()
+                                .map(|e| e.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            let _ = tokio::fs::create_dir_all(&output_dir).await;
+                            match rename_or_shorten(&capture, &output_dir, &stem, &ext).await {
+                                Ok(actual) => {
+                                    if let Err(e) = store
+                                        .update_recording_output_path(rec_id, &actual.to_string_lossy())
+                                    {
+                                        warn!(rec_id, "recover stuck capture: DB update failed: {e:#}");
+                                    }
+                                    info!(rec_id, "recovered stuck capture -> {}", actual.display());
+                                    let _ = tx.send(AppEvent::RecordingUpdated { recording_id: rec_id });
+                                }
+                                Err(e) => warn!(rec_id, "recover stuck capture failed: {e:#}"),
+                            }
                         });
                     }
                     ManualCommand::EmbedMissingThumbnails => {
@@ -5465,10 +5505,14 @@ async fn promote_capture(plan: &DownloadPlan) -> PathBuf {
         return plan.capture_path.clone(); // failed: leave the partial for the sweep
     }
     if plan.remux_to_mkv {
-        match remux_ts_to_mkv(&effective, &plan.final_path, None, &Default::default()).await {
+        // ffmpeg writes the destination directly — there's no OS rename to
+        // react to on a name-too-long failure, so shorten proactively before
+        // the write instead of reactively after it (see path_with_safe_stem).
+        let dest = path_with_safe_stem(&plan.final_path);
+        match remux_ts_to_mkv(&effective, &dest, None, &Default::default()).await {
             Ok(()) => {
                 let _ = tokio::fs::remove_file(&effective).await;
-                plan.final_path.clone()
+                dest
             }
             Err(e) => {
                 warn!("remux failed, keeping {}: {e:#}", effective.display());
@@ -6242,6 +6286,30 @@ async fn rename_or_shorten(
     }
 }
 
+/// Proactively shorten `path`'s file stem (see [`stem_fitting_budget`]) if
+/// it's long enough to risk NTFS's per-component limit, returning the
+/// original path unchanged if it's already safe. Unlike [`rename_or_shorten`],
+/// this never touches the filesystem — it's for callers that WRITE to their
+/// destination directly (ffmpeg-based remux) rather than renaming an existing
+/// file, so there's no OS error to react to; the only option is to make sure
+/// the destination is safe *before* the write is attempted.
+fn path_with_safe_stem(path: &Path) -> PathBuf {
+    let (Some(dir), Some(stem)) = (
+        path.parent(),
+        path.file_stem().map(|s| s.to_string_lossy().into_owned()),
+    ) else {
+        return path.to_path_buf();
+    };
+    let safe_stem = stem_fitting_budget(&stem, MAX_STEM_UTF16_LEN);
+    if safe_stem == stem {
+        return path.to_path_buf();
+    }
+    match path.extension().map(|e| e.to_string_lossy().into_owned()) {
+        Some(ext) if !ext.is_empty() => dir.join(format!("{safe_stem}.{ext}")),
+        _ => dir.join(safe_stem),
+    }
+}
+
 /// Convert a unix timestamp to a UTC civil date/time (Howard Hinnant's algorithm).
 fn civil_from_unix_utc(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
     let days = secs.div_euclid(86_400);
@@ -6575,6 +6643,28 @@ mod tests {
             .await
             .expect_err("a missing source must fail, not silently succeed");
         assert!(!is_name_too_long(&err));
+    }
+
+    #[test]
+    fn path_with_safe_stem_is_a_noop_when_already_safe() {
+        let short = std::path::Path::new(r"C:\rec\short.mkv");
+        assert_eq!(path_with_safe_stem(short), short);
+    }
+
+    #[test]
+    fn path_with_safe_stem_shortens_an_overlong_stem_proactively() {
+        // Used to pre-shorten a ffmpeg REMUX destination before the write is
+        // even attempted (ffmpeg writes directly — there's no OS rename error
+        // to react to afterward the way rename_or_shorten reacts to one).
+        let long_stem = "z".repeat(260);
+        let path = std::path::PathBuf::from(format!(r"C:\rec\{long_stem}.mkv"));
+        let safe = path_with_safe_stem(&path);
+        assert_ne!(safe, path);
+        assert_eq!(safe.parent(), path.parent());
+        assert_eq!(safe.extension().unwrap(), "mkv");
+        let name = safe.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.contains("..."), "must mark the cut: {name}");
+        assert!(name.encode_utf16().count() <= NTFS_MAX_COMPONENT_UTF16);
     }
 
     #[tokio::test]

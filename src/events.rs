@@ -285,6 +285,16 @@ pub enum ManualCommand {
     },
     /// Re-remux all recordings that still have a `.ts` source file.
     ReRemuxAll,
+    /// Move a recording whose promote-to-output-dir step failed (a non-`.ts`
+    /// file, e.g. a SABR/DASH `.mkv`, still sitting in `.cache\`) out to its
+    /// output directory, shortening the name if that's what blocked it the
+    /// first time (see `downloader::rename_or_shorten`). On success
+    /// `recording.output_path` is updated to the new location.
+    RecoverStuckCapture {
+        rec_id: i64,
+        capture: std::path::PathBuf,
+        output_dir: std::path::PathBuf,
+    },
     /// Embed the thumbnail sidecar into all MKV files that don't already have one.
     EmbedMissingThumbnails,
     /// Download missing thumbnails for recordings; if `embed` is true, immediately

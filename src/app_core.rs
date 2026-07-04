@@ -287,6 +287,12 @@ impl AppCore {
             let s = supervisor.clone();
             self.rt.spawn(async move { s.resume_recording(rec, row).await });
         }
+        // Also protect every recording whose CURRENT output_path still points
+        // into a `.cache\` dir — e.g. a fully-successful capture that's merely
+        // stuck there because its promote-to-output-dir move failed (surfaced
+        // in the Issues panel, recoverable from there). The sweep can't tell
+        // that apart from genuine leftover garbage by file age alone.
+        skip_stems.extend(self.store.stems_in_cache().unwrap_or_default());
         let sweep_sup = supervisor.clone();
         self.rt
             .spawn(async move { sweep_sup.sweep_caches(skip_stems).await });

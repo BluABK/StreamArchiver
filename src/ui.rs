@@ -571,6 +571,11 @@ pub struct StreamArchiverApp {
     /// Failed/aborted/orphaned recordings whose output path is set but the file is gone from disk.
     /// Partitioned out of issues_errors at load time; rendered alongside the missing-file section.
     issues_errors_no_file: Vec<crate::models::Recording>,
+    /// Completed recordings whose promote-to-output-dir move never finished (a
+    /// non-`.ts` file, e.g. a SABR/DASH `.mkv`, still sitting in `.cache\`) —
+    /// most commonly because the filename overflowed the filesystem's length
+    /// limit. Distinct from issues_recs (a `.ts` awaiting a remux).
+    issues_stuck: Vec<crate::models::Recording>,
     /// In-flight background load of missing-output-file recordings (spawned off
     /// the UI thread because `path.exists()` can block on network/slow drives).
     issues_missing_load: Option<std::sync::mpsc::Receiver<Vec<crate::models::Recording>>>,
@@ -1105,6 +1110,7 @@ impl StreamArchiverApp {
             issues_missing: Vec::new(),
             issues_errors: Vec::new(),
             issues_errors_no_file: Vec::new(),
+            issues_stuck: Vec::new(),
             issues_missing_load: None,
             issues_refreshed: None,
             issues_confirm_clear: false,
@@ -5223,7 +5229,7 @@ impl eframe::App for StreamArchiverApp {
                             let quota_warnings = self.active_quota_warnings();
                             let n = self.issues_recs.len() + self.issues_missing.len()
                                 + self.issues_errors.len() + self.issues_errors_no_file.len()
-                                + quota_warnings.len();
+                                + self.issues_stuck.len() + quota_warnings.len();
                             let label = if n > 0 {
                                 format!("⚠ Issues ({})", n)
                             } else {
@@ -13854,6 +13860,7 @@ impl StreamArchiverApp {
         if stale && self.issues_missing_load.is_none() {
             // Both queries are small and fast — run them synchronously.
             self.issues_recs = self.core.store.recordings_needing_remux().unwrap_or_default();
+            self.issues_stuck = self.core.store.recordings_stuck_in_cache().unwrap_or_default();
             // Partition errors: those whose output file is gone from disk go to
             // issues_errors_no_file (treated as missing), the rest stay in issues_errors.
             let all_errors = self.core.store.recordings_with_errors().unwrap_or_default();
@@ -13911,6 +13918,7 @@ impl StreamArchiverApp {
         let n_missing = self.issues_missing.len();
         let n_errors = self.issues_errors.len();
         let n_missing_errors = self.issues_errors_no_file.len();
+        let n_stuck = self.issues_stuck.len();
         let confirm_clear = self.issues_confirm_clear;
         let quota_warnings = self.active_quota_warnings();
 
@@ -13927,6 +13935,7 @@ impl StreamArchiverApp {
             ClearAllMissing,
             ClearAllErrors,
             ClearFilelessErrors,
+            RecoverStuck(usize),
             ConfirmClear,
             ClearAll,
             DismissWarning(String),
@@ -13978,7 +13987,7 @@ impl StreamArchiverApp {
                         ui.separator();
                     }
                     ui.horizontal(|ui| {
-                        ui.label(format!("{} recording(s) need attention", self.issues_recs.len() + n_missing + n_errors));
+                        ui.label(format!("{} recording(s) need attention", self.issues_recs.len() + n_missing + n_errors + n_stuck));
                         if ui.button("⟳ Refresh").clicked() {
                             self.issues_refreshed = None;
                         }
@@ -14036,7 +14045,7 @@ impl StreamArchiverApp {
                         }
                     });
                     ui.separator();
-                    if self.issues_recs.is_empty() && n_missing == 0 && n_errors == 0 && n_missing_errors == 0 {
+                    if self.issues_recs.is_empty() && n_missing == 0 && n_errors == 0 && n_missing_errors == 0 && n_stuck == 0 {
                         ui.weak("No recording issues found — all recordings are in their final format.");
                         return;
                     }
@@ -14194,6 +14203,72 @@ impl StreamArchiverApp {
                                             {
                                                 act = Some(Act::Delete(i));
                                             }
+                                        }
+                                    });
+                                });
+                            }
+                            // Stuck-in-cache rows: capture succeeded but the promote-to-
+                            // output-dir move never completed (non-.ts, so distinct from
+                            // the re-remux rows above) — most commonly a filename-length
+                            // overflow. "Recover" retries the move with a shortened name
+                            // if that's what's blocking it.
+                            for (k, rec) in self.issues_stuck.iter().enumerate() {
+                                let (ch_name, platform) = mon_info
+                                    .get(&rec.monitor_id)
+                                    .map(|(n, p)| (n.as_str(), *p))
+                                    .unwrap_or(("?", crate::models::Platform::Generic));
+                                let path = std::path::Path::new(&rec.output_path);
+                                let fname = path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                let file_bytes = path.metadata().map(|m| m.len()).unwrap_or(0);
+                                let mode = parse_capture_mode(&fname).unwrap_or_default();
+                                body.row(22.0, |mut row| {
+                                    row.col(|ui| {
+                                        if let Some(ref ptex) = ptex {
+                                            platform_icon(ui, ptex, platform);
+                                        } else {
+                                            ui.label(platform.label());
+                                        }
+                                    });
+                                    row.col(|ui| { ui.label(ch_name); });
+                                    row.col(|ui| { ui.label(fmt_datetime_short(rec.started_at)); });
+                                    row.col(|ui| {
+                                        ui.label(&fname).on_hover_text(&rec.output_path);
+                                    });
+                                    row.col(|ui| { ui.label(fmt_bytes(file_bytes as i64)); });
+                                    row.col(|ui| {
+                                        let ext = path
+                                            .extension()
+                                            .map(|e| e.to_string_lossy().to_uppercase())
+                                            .unwrap_or_else(|| "?".into());
+                                        let type_str = if mode.is_empty() {
+                                            ext
+                                        } else {
+                                            format!("{ext} · {mode}")
+                                        };
+                                        ui.label(type_str).on_hover_text(format!("status: {}", rec.status));
+                                    });
+                                    row.col(|ui| {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(200, 150, 60),
+                                            "⚠ stuck in .cache",
+                                        ).on_hover_text(
+                                            "The recording finished successfully, but moving it out \
+                                             of the hidden .cache\\ working folder failed — most \
+                                             commonly because the filename was too long for the \
+                                             filesystem. The file is safe; it just isn't where it \
+                                             should be yet.",
+                                        );
+                                    });
+                                    row.col(|ui| {
+                                        if ui
+                                            .button("📦")
+                                            .on_hover_text("Recover: move it to its output folder, shortening the name if needed.")
+                                            .clicked()
+                                        {
+                                            act = Some(Act::RecoverStuck(k));
                                         }
                                     });
                                 });
@@ -14443,6 +14518,22 @@ impl StreamArchiverApp {
                     });
                     self.status = format!("Re-remux started for recording {}…", rec.id);
                 }
+            }
+        }
+        if let Some(Act::RecoverStuck(k)) = act
+            && let Some(rec) = self.issues_stuck.get(k)
+        {
+            let capture = std::path::PathBuf::from(&rec.output_path);
+            // output_path is "<output_dir>\.cache\<stem>.<ext>" — the grandparent
+            // of the .cache file is the actual output dir it should move to.
+            let output_dir = capture.parent().and_then(|p| p.parent()).map(Path::to_path_buf);
+            if let Some(output_dir) = output_dir {
+                self.core.manual(crate::events::ManualCommand::RecoverStuckCapture {
+                    rec_id: rec.id,
+                    capture,
+                    output_dir,
+                });
+                self.status = format!("Recovering recording {}…", rec.id);
             }
         }
         if let Some(Act::Delete(i)) = act {

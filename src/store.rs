@@ -2136,6 +2136,82 @@ impl Store {
         Ok(rows)
     }
 
+    /// Recordings whose capture fully succeeded but whose promote-to-output-dir
+    /// move never completed — the file is a non-`.ts` container (`.mkv`, e.g. a
+    /// SABR/DASH direct-write) still sitting in the source `.cache\`. Distinct
+    /// from [`Self::recordings_needing_remux`] (a `.ts` awaiting a remux to
+    /// MKV) — this is a plain move that failed, most commonly because the
+    /// filename overflowed the filesystem's length limit (see
+    /// `downloader::rename_or_shorten`).
+    pub fn recordings_stuck_in_cache(&self) -> Result<Vec<crate::models::Recording>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id, monitor_id, started_at, ended_at, status,
+                    COALESCE(output_path, ''), went_live_at, went_live_approx,
+                    take_group, COALESCE(log_excerpt, '')
+             FROM recording
+             WHERE status = 'completed'
+               AND output_path LIKE '%.cache%'
+               AND output_path NOT LIKE '%.ts'
+             ORDER BY started_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(crate::models::Recording {
+                    id: r.get(0)?,
+                    monitor_id: r.get(1)?,
+                    started_at: r.get(2)?,
+                    ended_at: r.get(3)?,
+                    status: r.get(4)?,
+                    output_path: r.get(5)?,
+                    went_live_at: r.get(6)?,
+                    went_live_approx: r.get::<_, Option<i64>>(7)?.unwrap_or(0) != 0,
+                    take_group: r.get(8)?,
+                    log_excerpt: r.get(9)?,
+                    bytes: 0,
+                    exit_code: None,
+                    lost_secs: None,
+                    stream_id: None,
+                    ad_count: 0,
+                    ad_secs: 0,
+                    meta_change_count: 0,
+                    title: String::new(),
+                    category: String::new(),
+                    notes: String::new(),
+                    vod_id: None,
+                    vod_state: None,
+                    vod_muted_secs: None,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// File stems of every recording whose CURRENT `output_path` still points
+    /// into a `.cache\` working dir, regardless of status or extension — used
+    /// to protect them from [`crate::downloader::Supervisor::sweep_caches`]'s
+    /// age-based cleanup. That sweep can't distinguish genuine leftover
+    /// garbage from a fully-valid, successfully-captured recording that's
+    /// merely stuck there because its promote-to-output-dir move failed (see
+    /// [`Self::recordings_stuck_in_cache`]) — without this exclusion, such a
+    /// recording would be silently deleted after 24 hours.
+    pub fn stems_in_cache(&self) -> Result<Vec<String>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT output_path FROM recording WHERE output_path LIKE '%.cache%'",
+        )?;
+        let stems = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .filter_map(|p| p.ok())
+            .filter_map(|p| {
+                std::path::Path::new(&p)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+            })
+            .collect();
+        Ok(stems)
+    }
+
     /// Recordings that have a non-TS final output path but whose file no longer
     /// exists on disk — e.g. the user manually deleted the file. Returns the most
     /// recent 500 candidates; caller filters with `path.exists()`.
@@ -2941,6 +3017,56 @@ mod tests {
         store.finish_recording(rid, 2_000, 1, Some(0), "completed", "C:/rec/out.mkv", "").unwrap();
         store.delete_recording(rid).unwrap();
         assert!(store.ad_breaks_for_recording(rid).unwrap().is_empty());
+    }
+
+    #[test]
+    fn stuck_in_cache_detection_and_sweep_protection() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        // A completed SABR/DASH capture whose promote move failed: a non-.ts
+        // file still sitting in .cache\.
+        let stuck = store
+            .insert_recording(mid, 1_000, "C:/rec/.cache/stuck.mkv", Some(1_000), false, None, None)
+            .unwrap();
+        store.finish_recording(stuck, 2_000, 500, Some(0), "completed", "C:/rec/.cache/stuck.mkv", "").unwrap();
+
+        // A .ts-in-cache failure is a DIFFERENT, pre-existing category
+        // (needs re-remux) and must NOT double-count here.
+        let ts_stuck = store
+            .insert_recording(mid, 1_000, "C:/rec/.cache/tsstuck.ts", Some(1_000), false, None, None)
+            .unwrap();
+        store.finish_recording(ts_stuck, 2_000, 500, Some(0), "completed", "C:/rec/.cache/tsstuck.ts", "").unwrap();
+
+        // A normal, successfully-promoted recording (not in .cache at all).
+        let ok = store
+            .insert_recording(mid, 3_000, "C:/rec/fine.mkv", Some(3_000), false, None, None)
+            .unwrap();
+        store.finish_recording(ok, 4_000, 500, Some(0), "completed", "C:/rec/fine.mkv", "").unwrap();
+
+        // A capture that's in .cache because it's still ACTIVELY recording —
+        // must not be treated as "stuck" (status isn't 'completed').
+        let active = store
+            .insert_recording(mid, 5_000, "C:/rec/.cache/active.mkv", Some(5_000), false, None, None)
+            .unwrap();
+        let _ = active;
+
+        let stuck_recs = store.recordings_stuck_in_cache().unwrap();
+        assert_eq!(stuck_recs.len(), 1, "only the non-.ts completed .cache recording counts");
+        assert_eq!(stuck_recs[0].id, stuck);
+
+        // stems_in_cache protects EVERY .cache-pointing recording from the
+        // sweep, regardless of status — the .ts-in-cache and still-recording
+        // rows must be covered too, since deleting either would also be a
+        // real loss (the ts awaits a manual re-remux; the active one is mid-capture).
+        let stems = store.stems_in_cache().unwrap();
+        assert!(stems.contains(&"stuck".to_string()));
+        assert!(stems.contains(&"tsstuck".to_string()));
+        assert!(stems.contains(&"active".to_string()));
+        assert!(!stems.contains(&"fine".to_string()));
     }
 
     #[test]
