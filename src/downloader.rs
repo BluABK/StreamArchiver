@@ -2259,8 +2259,19 @@ impl Supervisor {
                     if let Some(p) = dest.parent() {
                         let _ = tokio::fs::create_dir_all(p).await;
                     }
-                    match tokio::fs::rename(&src, &dest).await {
-                        Ok(()) => final_path = dest,
+                    // The download landing on disk matters more than a fully-
+                    // descriptive name — see rename_or_shorten.
+                    let dest_dir = dest.parent().unwrap_or_else(|| Path::new("."));
+                    let dest_stem = dest
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let dest_ext = dest
+                        .extension()
+                        .map(|e| e.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    match rename_or_shorten(&src, dest_dir, &dest_stem, &dest_ext).await {
+                        Ok(actual) => final_path = actual,
                         Err(e) => {
                             warn!(video = id, "promote move failed, keeping in cache: {e:#}");
                             final_path = src;
@@ -3477,8 +3488,19 @@ impl Supervisor {
                     if let Some(p) = dest.parent() {
                         let _ = tokio::fs::create_dir_all(p).await;
                     }
-                    match tokio::fs::rename(&src, &dest).await {
-                        Ok(()) => dest,
+                    // The download landing on disk matters more than a fully-
+                    // descriptive name — see rename_or_shorten.
+                    let dest_dir = dest.parent().unwrap_or_else(|| Path::new("."));
+                    let dest_stem = dest
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let dest_ext = dest
+                        .extension()
+                        .map(|e| e.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    match rename_or_shorten(&src, dest_dir, &dest_stem, &dest_ext).await {
+                        Ok(actual) => actual,
                         Err(_) => src,
                     }
                 }
@@ -5327,15 +5349,21 @@ async fn rename_for_media(final_path: PathBuf, new_stem: &str) -> PathBuf {
     let old_stem = final_path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned());
-    match tokio::fs::rename(&final_path, &new_path).await {
-        Ok(()) => {
+    match rename_or_shorten(&final_path, &dir, &unique, &ext).await {
+        Ok(actual) => {
             // Move subtitle / chat sidecars (e.g. `{stem}.en.vtt`,
             // `{stem}.chat.jsonl`, `{stem}.live_chat.json`) so they stay matched
             // to the renamed video instead of orphaning under the old stem.
+            // Follow with the video's ACTUAL stem (rename_or_shorten may have
+            // had to shorten it further) so sidecars never mismatch it.
             if let Some(old) = old_stem {
-                rename_companion_sidecars(&dir, &old, &unique).await;
+                let actual_stem = actual
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| unique.clone());
+                rename_companion_sidecars(&dir, &old, &actual_stem).await;
             }
-            new_path
+            actual
         }
         Err(e) => {
             warn!("media rename failed, keeping {}: {e:#}", final_path.display());
@@ -5448,12 +5476,27 @@ async fn promote_capture(plan: &DownloadPlan) -> PathBuf {
             }
         }
     } else {
-        // Already the final container — move it up to the output dir.
+        // Already the final container — move it up to the output dir. The
+        // finished recording landing here matters more than a fully-
+        // descriptive name: on a too-long name, rename_or_shorten falls back
+        // to a shortened one rather than leaving a completed capture stuck
+        // (and, after 24h, swept as stale) in the hidden `.cache\`.
         if let Some(parent) = plan.final_path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
-        match tokio::fs::rename(&effective, &plan.final_path).await {
-            Ok(()) => plan.final_path.clone(),
+        let dir = plan.final_path.parent().unwrap_or_else(|| Path::new("."));
+        let stem = plan
+            .final_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let ext = plan
+            .final_path
+            .extension()
+            .map(|e| e.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match rename_or_shorten(&effective, dir, &stem, &ext).await {
+            Ok(actual) => actual,
             Err(e) => {
                 warn!("promote move failed, keeping {}: {e:#}", effective.display());
                 effective
@@ -5483,8 +5526,14 @@ async fn move_companions(from_dir: &Path, to_dir: &Path, stem: &str) {
         if to.exists() {
             continue;
         }
-        if let Err(e) = tokio::fs::rename(entry.path(), &to).await {
-            warn!("companion promote failed for {name}: {e:#}");
+        match tokio::fs::rename(entry.path(), &to).await {
+            Ok(()) => {}
+            Err(e) if is_name_too_long(&e) => {
+                if let Err(e) = rename_or_shorten(&entry.path(), to_dir, stem, rest).await {
+                    warn!("companion promote failed for {name}: {e:#}");
+                }
+            }
+            Err(e) => warn!("companion promote failed for {name}: {e:#}"),
         }
     }
 }
@@ -5538,17 +5587,33 @@ async fn rename_companion_sidecars(dir: &Path, old_stem: &str, new_stem: &str) {
         let src = entry.path();
         let mut delay_ms = 500u64;
         let mut last_err: Option<std::io::Error> = None;
+        let mut renamed = false;
         for attempt in 0u32..5 {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 delay_ms *= 2; // 500 → 1000 → 2000 → 4000 ms
             }
             match tokio::fs::rename(&src, &to).await {
-                Ok(()) => { last_err = None; break; }
+                Ok(()) => { last_err = None; renamed = true; break; }
                 Err(e) if e.raw_os_error() == Some(32)  // Windows: SHARING_VIOLATION
                        || e.raw_os_error() == Some(16)  // Unix: EBUSY
                 => { last_err = Some(e); }
                 Err(e) => { last_err = Some(e); break; } // non-retryable error
+            }
+        }
+        if renamed {
+            continue;
+        }
+        // The name itself may be the problem (most commonly NTFS's
+        // 255-UTF-16-unit-per-component limit — see `MAX_STEM_UTF16_LEN`).
+        // Following the video's rename matters more than a fully-descriptive
+        // sidecar name, so shorten `new_stem` (never touching `rest`, which
+        // identifies the sidecar's role) and retry, rather than leaving this
+        // companion permanently orphaned under its old name.
+        if last_err.as_ref().is_some_and(is_name_too_long) {
+            match rename_or_shorten(&src, dir, new_stem, rest).await {
+                Ok(_) => continue,
+                Err(e) => last_err = Some(e),
             }
         }
         if let Some(e) = last_err {
@@ -6059,6 +6124,124 @@ fn truncate_utf16(s: &str, max_units: usize) -> &str {
     s
 }
 
+/// OS-level "the filename itself is invalid/too long" errors — the reactive
+/// backstop behind the proactive [`MAX_STEM_UTF16_LEN`] cap, for anything that
+/// slips past it regardless (a filesystem with a tighter limit, an unusually
+/// long companion suffix, `unique_stem`'s collision suffix tipping it over).
+/// Distinguished from a transient problem (sharing violation, missing
+/// directory, permissions) that retrying with a *different name* wouldn't fix:
+/// - Windows: `ERROR_INVALID_NAME` (123 — NTFS's 255-unit-per-component limit,
+///   or an illegal trailing `.`/` ` that slipped past sanitization) and
+///   `ERROR_FILENAME_EXCED_RANGE` (206).
+/// - Unix: `ENAMETOOLONG` (36 on Linux, 63 on macOS/BSD).
+fn is_name_too_long(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(123 | 206 | 36 | 63))
+}
+
+/// Replace the trailing `remove_units` **UTF-16 code units** of `s` with
+/// `"..."` — a visible marker that the OS rejected the full name and it was
+/// shortened to fit — without splitting a character (e.g. an emoji surrogate
+/// pair). `remove_units` is how much to strip *before* the 3-unit marker is
+/// appended, not a target length — see [`stem_fitting_budget`], which does
+/// that arithmetic.
+fn ellipsize_utf16(s: &str, remove_units: usize) -> String {
+    let total = s.encode_utf16().count();
+    if remove_units >= total {
+        return "...".to_string();
+    }
+    format!("{}...", truncate_utf16(s, total - remove_units))
+}
+
+/// Shorten `stem` (marking the cut with `"..."`, see [`ellipsize_utf16`]) so
+/// its UTF-16 length is at most `budget` — a no-op if it already fits.
+/// Deterministic: the same `(stem, budget)` always produces the same result.
+fn stem_fitting_budget(stem: &str, budget: usize) -> String {
+    let stem_units = stem.encode_utf16().count();
+    if stem_units <= budget {
+        return stem.to_string();
+    }
+    // ellipsize_utf16 removes `remove_units` THEN appends "..." (3 units), so
+    // ask for exactly enough removal that the total after appending lands at
+    // `budget`, not `budget - 3`.
+    ellipsize_utf16(stem, stem_units + 3 - budget)
+}
+
+/// Stem-length budgets tried when a name overflows, deterministic and
+/// **independent of which specific suffix** (`.mkv`, `.chat.jsonl`,
+/// `.en.vtt`, …) triggered the retry. That independence is the whole point:
+/// a take's video and every one of its companions each call
+/// [`rename_or_shorten`] starting from the SAME original stem, so whichever
+/// budget rung first makes it fit is the SAME rung for all of them — they
+/// converge on one identical shortened stem instead of each laddering to a
+/// length sized only for its own suffix (which would desync sibling files
+/// that must share a prefix — the original design's mistake). The first
+/// budget is [`MAX_STEM_UTF16_LEN`], the proactive cap that already leaves
+/// room for the longest companion suffix, so it succeeds on the first try in
+/// the overwhelming majority of real overflows; the smaller ones are a
+/// backstop for a total-path-length problem the per-component math alone
+/// can't see (e.g. a deeply nested output directory).
+const STEM_SHORTEN_BUDGETS: [usize; 3] = [MAX_STEM_UTF16_LEN, 120, 40];
+
+/// Attempt `tokio::fs::rename(from, dir.join(format!("{stem}.{suffix}")))`.
+/// If the OS rejects the destination name (see [`is_name_too_long`]) —
+/// overwhelmingly NTFS's 255-UTF-16-unit-per-component limit — deterministically
+/// shorten `stem` (see [`stem_fitting_budget`]/[`STEM_SHORTEN_BUDGETS`]) and
+/// retry. `suffix` (e.g. `"mkv"`, `"chat.jsonl"`, `"en.vtt"`) is never
+/// touched — it's what identifies the file's role, and companion-matching
+/// logic elsewhere depends on it staying intact.
+///
+/// A recording actually landing on disk matters more than a fully-descriptive
+/// name, so this is the *last-resort* backstop behind the proactive stem cap
+/// in `expand_template` (`MAX_STEM_UTF16_LEN`), which should make this rare in
+/// practice — it exists for whatever that cap didn't anticipate.
+///
+/// Returns the path the file actually ended up at (`dir/{stem}.{suffix}`, or
+/// a shortened sibling), or the original error if even the shortest attempt
+/// still fails for an unrelated reason (e.g. a missing directory), or if a
+/// shortened candidate would collide with an unrelated existing file (rather
+/// than risk clobbering it, or a numeric disambiguator that would desync this
+/// file from siblings independently computing the same candidate).
+async fn rename_or_shorten(
+    from: &Path,
+    dir: &Path,
+    stem: &str,
+    suffix: &str,
+) -> std::io::Result<PathBuf> {
+    let to = dir.join(format!("{stem}.{suffix}"));
+    match tokio::fs::rename(from, &to).await {
+        Ok(()) => Ok(to),
+        Err(e) if !is_name_too_long(&e) => Err(e),
+        Err(first_err) => {
+            for budget in STEM_SHORTEN_BUDGETS {
+                let short_stem = stem_fitting_budget(stem, budget);
+                if short_stem == stem {
+                    continue; // this budget doesn't shorten it any further
+                }
+                let candidate = dir.join(format!("{short_stem}.{suffix}"));
+                if candidate.exists() {
+                    // Don't clobber it, and don't disambiguate with a numeric
+                    // suffix here — that would itself desync this file from
+                    // siblings that independently compute the same candidate.
+                    return Err(first_err);
+                }
+                match tokio::fs::rename(from, &candidate).await {
+                    Ok(()) => {
+                        warn!(
+                            "shortened an over-long filename to fit the filesystem: {} -> {}",
+                            to.display(),
+                            candidate.display()
+                        );
+                        return Ok(candidate);
+                    }
+                    Err(e) if is_name_too_long(&e) => continue, // still too long, shrink further
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(first_err)
+        }
+    }
+}
+
 /// Convert a unix timestamp to a UTC civil date/time (Howard Hinnant's algorithm).
 fn civil_from_unix_utc(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
     let days = secs.div_euclid(86_400);
@@ -6316,6 +6499,174 @@ mod tests {
         assert!(!dir.join(format!("{old}.chat.jsonl")).exists());
         assert!(dir.join(format!("{old}.notes.txt")).exists());
         assert!(!dir.join(format!("{new}.notes.txt")).exists());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn is_name_too_long_matches_known_codes_only() {
+        let too_long = |code: i32| std::io::Error::from_raw_os_error(code);
+        assert!(is_name_too_long(&too_long(123))); // Windows ERROR_INVALID_NAME
+        assert!(is_name_too_long(&too_long(206))); // Windows ERROR_FILENAME_EXCED_RANGE
+        assert!(is_name_too_long(&too_long(36))); // Linux ENAMETOOLONG
+        assert!(is_name_too_long(&too_long(63))); // macOS/BSD ENAMETOOLONG
+        // A transient/unrelated error must NOT trigger the shortening path —
+        // retrying with a different name wouldn't fix a sharing violation,
+        // a missing directory, or a permissions problem.
+        assert!(!is_name_too_long(&too_long(32))); // ERROR_SHARING_VIOLATION
+        assert!(!is_name_too_long(&too_long(5))); // ERROR_ACCESS_DENIED
+        assert!(!is_name_too_long(&std::io::Error::new(std::io::ErrorKind::Other, "x")));
+    }
+
+    #[test]
+    fn ellipsize_utf16_marks_truncation_without_splitting_chars() {
+        assert_eq!(ellipsize_utf16("abcdef", 3), "abc...");
+        // Removing more than the whole string still yields a valid marker.
+        assert_eq!(ellipsize_utf16("ab", 50), "...");
+        // A surrogate pair ('🥹', 2 units) must never be split: removing
+        // exactly 2 units lands right at its boundary (kept whole); removing
+        // 3 would split it mid-pair, so the whole emoji is dropped instead of
+        // producing a corrupt lone surrogate (constructing the `String` at
+        // all is proof the result stayed valid UTF-8).
+        let s = "ab🥹cd"; // a(1) b(1) 🥹(2) c(1) d(1) = 6 units total
+        assert_eq!(ellipsize_utf16(s, 2), "ab🥹...");
+        assert_eq!(ellipsize_utf16(s, 3), "ab...");
+    }
+
+    #[tokio::test]
+    async fn rename_or_shorten_falls_back_on_overflow_and_preserves_content() {
+        let dir = std::env::temp_dir()
+            .join(format!("sa_shorten_{}_{}", std::process::id(), now_unix()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let src = dir.join("source.tmp");
+        tokio::fs::write(&src, b"payload").await.unwrap();
+
+        // Deliberately overflow NTFS's 255-UTF-16-unit-per-component limit:
+        // 300 'x's + ".mkv" (4) = 304 units.
+        let huge_stem = "x".repeat(300);
+        let result = rename_or_shorten(&src, &dir, &huge_stem, "mkv").await;
+
+        let actual = result.expect("must fall back to a shortened name, not fail outright");
+        assert!(actual.is_file(), "the file must actually exist at the returned path");
+        assert_eq!(tokio::fs::read(&actual).await.unwrap(), b"payload");
+        assert!(!src.exists(), "the source must be gone (this was a rename, not a copy)");
+
+        let name = actual.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.contains("..."), "shortened name must visibly mark the cut: {name}");
+        assert!(name.ends_with(".mkv"), "the suffix must never be touched: {name}");
+        assert!(
+            name.encode_utf16().count() <= NTFS_MAX_COMPONENT_UTF16,
+            "shortened name must actually fit: {} units",
+            name.encode_utf16().count()
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn rename_or_shorten_passes_through_unrelated_errors() {
+        // A source that doesn't exist fails with NotFound, not a
+        // name-too-long condition — must propagate as-is, no retry loop.
+        let dir = std::env::temp_dir()
+            .join(format!("sa_shorten_missing_{}_{}", std::process::id(), now_unix()));
+        let missing_src = dir.join("does_not_exist.tmp");
+        let err = rename_or_shorten(&missing_src, &dir, "stem", "mkv")
+            .await
+            .expect_err("a missing source must fail, not silently succeed");
+        assert!(!is_name_too_long(&err));
+    }
+
+    #[tokio::test]
+    async fn companion_sidecar_rename_shortens_instead_of_orphaning() {
+        // Reproduces the exact CottontailVA-class failure: the main video's
+        // stem fits under its own extension but overflows once combined with
+        // a companion's longer suffix. The sidecar must still follow the
+        // rename (under a shortened, "..."-marked name) instead of being
+        // silently left behind under `old_stem`.
+        let dir = std::env::temp_dir()
+            .join(format!("sa_shorten_sidecar_{}_{}", std::process::id(), now_unix()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let old_stem = "old";
+        // 250 'x's: old="old" -> new_stem+".mkv" is fine (254 units), but
+        // new_stem+".chat.jsonl" (261 units) overflows 255.
+        let new_stem = "x".repeat(250);
+        tokio::fs::write(dir.join(format!("{old_stem}.chat.jsonl")), b"chat-data").await.unwrap();
+
+        rename_companion_sidecars(&dir, old_stem, &new_stem).await;
+
+        assert!(
+            !dir.join(format!("{old_stem}.chat.jsonl")).exists(),
+            "must not still be sitting under the old placeholder name"
+        );
+        let mut rd = tokio::fs::read_dir(&dir).await.unwrap();
+        let mut found = None;
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".chat.jsonl") {
+                found = Some(name);
+            }
+        }
+        let name = found.expect("the sidecar must have followed the rename under some name");
+        assert!(name.contains("..."), "the shortened name must mark the cut: {name}");
+        assert!(name.encode_utf16().count() <= NTFS_MAX_COMPONENT_UTF16);
+        assert_eq!(
+            tokio::fs::read(dir.join(&name)).await.unwrap(),
+            b"chat-data",
+            "content must be preserved, not just the name"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn shortened_stem_is_deterministic_across_different_suffix_lengths() {
+        // The exact regression an adversarial review caught in an earlier
+        // version of this fix: shortening must be a PURE function of the
+        // stem alone, independent of which suffix triggered it — otherwise
+        // the video (short ".mkv" suffix) and its companions (longer
+        // ".chat.jsonl"/".live_chat.json" suffixes) can each independently
+        // choose a DIFFERENT shortened stem and end up mismatched, which is
+        // exactly the "sidecar orphaned under a name that no longer matches
+        // the video" failure this whole feature exists to prevent.
+        let dir = std::env::temp_dir()
+            .join(format!("sa_shorten_converge_{}_{}", std::process::id(), now_unix()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // Long enough that EVERY suffix below needs shortening (so we're
+        // actually exercising the fallback for all of them, not just the
+        // longest), independent of what triggered it first — even combined
+        // with the shortest suffix here ("mkv", 4 units incl. the dot),
+        // 260 + 4 = 264 > 255.
+        let stem = "y".repeat(260);
+
+        let mut shortened_stems = Vec::new();
+        for suffix in ["mkv", "en.vtt", "chat.jsonl", "live_chat.json"] {
+            let src = dir.join(format!("src_{suffix}.tmp"));
+            tokio::fs::write(&src, b"x").await.unwrap();
+            let actual = rename_or_shorten(&src, &dir, &stem, suffix)
+                .await
+                .unwrap_or_else(|e| panic!("rename for suffix {suffix} must succeed: {e:#}"));
+            let actual_stem = actual.file_stem().unwrap().to_string_lossy().into_owned();
+            // .en.vtt / .chat.jsonl further split on their own internal dots
+            // via Path::file_stem() (it only strips the LAST component), so
+            // recover the true shared stem by stripping the known suffix
+            // from the full file name instead.
+            let full_name = actual.file_name().unwrap().to_string_lossy().into_owned();
+            let true_stem = full_name.strip_suffix(&format!(".{suffix}")).unwrap_or(&actual_stem).to_string();
+            shortened_stems.push((suffix, true_stem));
+        }
+
+        let first = &shortened_stems[0].1;
+        for (suffix, s) in &shortened_stems {
+            assert_eq!(
+                s, first,
+                "suffix {suffix} converged on a DIFFERENT stem than {}: {s} vs {first}",
+                shortened_stems[0].0
+            );
+        }
+        assert!(first.contains("..."), "convergence check is only meaningful if shortening actually happened");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
