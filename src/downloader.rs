@@ -582,8 +582,10 @@ fn sabr_state_exists(output_path: &str) -> bool {
 /// Build the yt-dlp SABR capture args, shared by [`build_plan`]'s SABR branch and
 /// resume. Writes the final MKV directly to `out_mkv`; forces the SABR formats +
 /// extractor-args (or the manual raw override); applies cookies, the global Settings
-/// args, and the PO-token provider args. Deterministic for a given `out_mkv`, so a
-/// resume re-runs byte-identically and yt-dlp continues from the surviving `.state`.
+/// args, and the PO-token provider args. `from_start` selects `--live-from-start`
+/// (rewind to the broadcast start) vs `--no-live-from-start` (join at the live
+/// edge). Deterministic for a given `(out_mkv, from_start)`, so a resume re-runs
+/// byte-identically and yt-dlp continues from the surviving `.state`.
 fn sabr_capture_args(
     out_mkv: &Path,
     auth: &AuthSource,
@@ -591,12 +593,13 @@ fn sabr_capture_args(
     sabr: &SabrConfig,
     extra: &[String],
     url: &str,
+    from_start: bool,
 ) -> Vec<String> {
     let mut args = vec![
         "--no-part".to_string(),
         "-o".into(),
         out_mkv.to_string_lossy().into_owned(),
-        "--live-from-start".into(),
+        if from_start { "--live-from-start" } else { "--no-live-from-start" }.into(),
     ];
     match auth {
         AuthSource::CookiesBrowser(b) => {
@@ -650,18 +653,25 @@ pub(crate) fn sabr_preview_args(
     extra: &[String],
     url: &str,
 ) -> Vec<String> {
-    let mut args = sabr_capture_args(out_mkv, auth, ytdlp_global_args, sabr, extra, url);
-    for a in args.iter_mut() {
-        if a == "--live-from-start" {
-            *a = "--no-live-from-start".into();
-        }
-    }
+    // Live edge (`from_start=false`): the preview files BEGIN at the edge.
+    let mut args = sabr_capture_args(out_mkv, auth, ytdlp_global_args, sabr, extra, url, false);
     if let Some(pos) = args.iter().position(|a| a == "-f")
         && let Some(v) = args.get_mut(pos + 1)
     {
         *v = format!("bv[protocol=sabr][ext=mp4]+ba[protocol=sabr][ext=m4a]/{v}");
     }
     args
+}
+
+/// Whether a monitor's YouTube live capture goes through the SABR dev build.
+///
+/// SABR is used for **all** YouTube yt-dlp live captures (from-start AND live
+/// edge), not just from-start: YouTube now serves live via SABR, and the system
+/// build's default clients return "No video formats found" at the live edge.
+/// `capture_from_start` controls only from-start-vs-edge (see `sabr_capture_args`),
+/// not whether SABR is used. Requires the SABR dev build to be configured.
+fn sabr_selected(m: &Monitor, ytdlp: &YtDlpBins) -> bool {
+    m.tool == Tool::YtDlp && m.platform() == Platform::YouTube && ytdlp.sabr.usable()
 }
 
 /// Compute the download mode string for a monitor recording.
@@ -699,10 +709,7 @@ pub fn build_plan(
     let ch = &row.channel;
     let dir = PathBuf::from(&m.output_dir);
     let quality = resolved_quality(&m.quality);
-    let use_sabr = m.tool == Tool::YtDlp
-        && m.platform() == Platform::YouTube
-        && m.capture_from_start
-        && ytdlp.sabr.usable();
+    let use_sabr = sabr_selected(m, ytdlp);
     let mode = recording_mode(m, use_sabr, false);
     let platform = m.platform().as_str().to_string();
     let tool_label = m.tool.label();
@@ -786,6 +793,7 @@ pub fn build_plan(
             // — keep its surface minimal): no --write-thumbnail / --sub-langs here.
             let args = sabr_capture_args(
                 &capture_path, auth, ytdlp_global_args, &ytdlp.sabr, &extra, &m.url,
+                m.capture_from_start,
             );
             (ytdlp.sabr.binary.clone(), args)
         }
@@ -2425,7 +2433,16 @@ impl Supervisor {
                 until: Instant::now(),
             });
             entry.fails = entry.fails.saturating_add(1);
-            let wait = (30u64 * entry.fails as u64).min(600);
+            let mut wait = (30u64 * entry.fails as u64).min(600);
+            // A capture that died almost immediately having produced nothing (a
+            // few seconds — e.g. "No video formats found" during a transient
+            // no-format window / pre-roll ad, or an unrecordable configuration)
+            // shouldn't re-spawn every ~30s and tight-loop for the whole stream.
+            // Apply a higher floor for these instant failures.
+            const INSTANT_FAIL_SECS: i64 = 10;
+            if duration_secs < INSTANT_FAIL_SECS {
+                wait = wait.max(300);
+            }
             entry.until = Instant::now() + Duration::from_secs(wait);
             warn!(
                 monitor_id,
@@ -3583,10 +3600,7 @@ impl Supervisor {
                 };
                 let quality = resolved_quality(&mrow.monitor.quality);
                 let ytdlp_bins_fa = load_ytdlp_bins(&self.store);
-                let use_sabr_fa = mrow.monitor.tool == Tool::YtDlp
-                    && mrow.monitor.platform() == Platform::YouTube
-                    && mrow.monitor.capture_from_start
-                    && ytdlp_bins_fa.sabr.usable();
+                let use_sabr_fa = sabr_selected(&mrow.monitor, &ytdlp_bins_fa);
                 let mode_fa = recording_mode(&mrow.monitor, use_sabr_fa, row.secondary);
                 let stem = monitor_stem(
                     &mrow.monitor,
@@ -3757,8 +3771,16 @@ impl Supervisor {
         let ytdlp_global_args = split_args(&ytdlp_global_raw);
         let ytdlp_bins = load_ytdlp_bins(&self.store);
         let extra = split_args(&row.monitor.extra_args);
+        // Only from-start takes leave resumable SABR `.state` (the resume gates
+        // in `resume_inflight`/`reconcile_detached` still require capture_from_start),
+        // so every take reaching here is from-start → this reproduces the original
+        // `--live-from-start` byte-for-byte. (A from-start monitor whose *take* was
+        // downgraded to the edge by the DVR fallback still persists
+        // capture_from_start=1; yt-dlp's SABR resume continues from the `.state`
+        // sequence cursor regardless of this flag, so it's safe.)
         let args = sabr_capture_args(
             &capture, &auth, &ytdlp_global_args, &ytdlp_bins.sabr, &extra, &row.monitor.url,
+            row.monitor.capture_from_start,
         );
         let use_sabr_resume = true; // resume is always SABR
         let mode_resume = recording_mode(&row.monitor, use_sabr_resume, false);
@@ -3854,10 +3876,7 @@ impl Supervisor {
                     String::new()
                 };
                 let quality = resolved_quality(&row.monitor.quality);
-                let use_sabr_res = row.monitor.tool == Tool::YtDlp
-                    && row.monitor.platform() == Platform::YouTube
-                    && row.monitor.capture_from_start
-                    && ytdlp_bins.sabr.usable();
+                let use_sabr_res = sabr_selected(&row.monitor, &ytdlp_bins);
                 let mode_res = recording_mode(&row.monitor, use_sabr_res, false);
                 let stem = monitor_stem(
                     &row.monitor,
@@ -7276,7 +7295,7 @@ mod tests {
             format!("bv[protocol=sabr][ext=mp4]+ba[protocol=sabr][ext=m4a]/{SABR_DEFAULT_FORMAT}")
         );
         let capture = sabr_capture_args(
-            &out, &AuthSource::None, &[], &bins.sabr, &[], "https://www.youtube.com/@chan",
+            &out, &AuthSource::None, &[], &bins.sabr, &[], "https://www.youtube.com/@chan", true,
         );
         let normalize = |v: &[String]| {
             v.iter()
@@ -7415,8 +7434,11 @@ mod tests {
     }
 
     #[test]
-    fn sabr_skipped_when_disabled_or_not_from_start() {
-        // Disabled SABR → normal system yt-dlp path (.ts + mpegts).
+    fn sabr_used_for_live_edge_when_enabled() {
+        // Disabled SABR → normal system yt-dlp path (.ts + mpegts). This is the
+        // only case that still uses the system build (no dev build configured);
+        // YouTube live is unrecordable via the default clients, but that's the
+        // pre-existing "SABR not set up" limitation.
         let mut bins = sabr_bins();
         bins.sabr.enabled = false;
         let plan = build_plan(
@@ -7433,15 +7455,25 @@ mod tests {
         assert_eq!(plan.program, "yt-dlp");
         assert!(plan.args.iter().any(|a| a == "--hls-use-mpegts"));
 
-        // Enabled SABR but capture_from_start = false → still the normal path.
+        // Enabled SABR + capture_from_start = false → SABR at the LIVE EDGE.
+        // (YouTube live is SABR-only now; the old default-client "dash" path
+        // returned "No video formats found" and crash-looped.)
         let mut r = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
         r.monitor.capture_from_start = false;
         let plan2 = build_plan(
             &r, 1_700_000_000, &AuthSource::None, &[], None, "", None, 0, &sabr_bins(),
         );
-        assert_eq!(plan2.program, "yt-dlp");
+        assert_eq!(plan2.program, "C:/git/yt-dlp-dev/dist/yt-dlp.exe");
         assert!(plan2.args.iter().any(|a| a == "--no-live-from-start"));
-        assert!(plan2.args.iter().any(|a| a == "--hls-use-mpegts"));
+        assert!(!plan2.args.iter().any(|a| a == "--live-from-start"));
+        assert!(!plan2.args.iter().any(|a| a == "--hls-use-mpegts"));
+        assert!(plan2.args.iter().any(|a| a == "-f"));
+        assert!(plan2.args.iter().any(|a| a == SABR_DEFAULT_FORMAT));
+        assert!(plan2.args.iter().any(|a| a == SABR_DEFAULT_EXTRACTOR_ARGS));
+        // Direct-MKV (no .ts remux) at the edge, same as from-start SABR.
+        assert!(plan2.capture_path.to_string_lossy().ends_with(".mkv"));
+        assert!(plan2.final_path.to_string_lossy().ends_with(".mkv"));
+        assert!(!plan2.remux_to_mkv);
     }
 
     #[test]
@@ -7528,6 +7560,7 @@ mod tests {
             &bins.sabr,
             &[],
             &r.monitor.url,
+            r.monitor.capture_from_start,
         );
         assert_eq!(plan.args, resume_args);
     }

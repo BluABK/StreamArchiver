@@ -2642,7 +2642,11 @@ fn build_preview_filename(
         Tool::Ffmpeg => "direct".to_string(),
         Tool::YtDlp => {
             if monitor.monitor.platform() == Platform::YouTube {
-                if monitor.monitor.capture_from_start { "sabr".to_string() } else { "dash".to_string() }
+                // YouTube live is SABR-only now — both from-start and live-edge
+                // capture go through the SABR path when the dev build is
+                // configured (see downloader::sabr_selected). "dash" only ever
+                // applies as a cosmetic fallback when SABR isn't set up.
+                "sabr".to_string()
             } else {
                 "live".to_string()
             }
