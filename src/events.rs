@@ -102,6 +102,7 @@ pub const TOGGLEABLE_JOBS: &[(&str, &str)] = &[
     ("Ad-free / sub refresh", "job_ad_free_refresh"),
     ("YouTube WebSub poll", "job_websub_poll"),
     ("Channel asset refresh", "job_asset_refresh"),
+    ("YouTube posts refresh", "job_community_posts"),
 ];
 
 pub fn job_registry() -> JobRegistry {

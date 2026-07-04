@@ -122,6 +122,13 @@ fn main() -> Result<()> {
         Ok(_) => {}
         Err(e) => tracing::warn!("video orphan recovery failed: {e:#}"),
     }
+    // Retention: prune notifications older than 90 days on startup so the feed
+    // table doesn't grow unbounded.
+    match store.prune_notifications(90) {
+        Ok(n) if n > 0 => info!("pruned {n} notification(s) older than 90 days"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("notification pruning failed: {e:#}"),
+    }
     let core = AppCore::new(Arc::new(store)).context("starting core runtime")?;
     core.start(); // launch the background scheduler + download supervisor
 

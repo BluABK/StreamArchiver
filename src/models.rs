@@ -769,6 +769,86 @@ impl ContentType {
     }
 }
 
+/// A category of in-app notification (the `notification.kind` column). The `id()`
+/// string is the stable persisted value — never change one once shipped. Drives
+/// the notifications-feed row icon/label and the category filter dropdown.
+/// Modeled on [`crate::events::BackgroundTaskKind`] and `GridTableId::ALL`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotificationKind {
+    /// A monitored channel went live (recording or not).
+    WentLive,
+    /// A recording finished (info; the row carries `error` severity when failed).
+    RecordingFinished,
+    /// A capture/detection error.
+    Error,
+    /// A background task (remux, asset fetch, …) failed.
+    TaskFailed,
+    /// A new upcoming schedule item appeared.
+    ScheduleAdded,
+    /// An existing schedule item changed (time / title / category / canceled).
+    ScheduleUpdated,
+    /// A new YouTube community post was ingested.
+    YoutubePost,
+}
+
+impl NotificationKind {
+    /// Every kind, in feed-filter display order.
+    pub const ALL: [NotificationKind; 7] = [
+        NotificationKind::WentLive,
+        NotificationKind::RecordingFinished,
+        NotificationKind::Error,
+        NotificationKind::TaskFailed,
+        NotificationKind::ScheduleAdded,
+        NotificationKind::ScheduleUpdated,
+        NotificationKind::YoutubePost,
+    ];
+
+    /// Stable persisted id (the `notification.kind` column). NEVER change.
+    pub fn id(self) -> &'static str {
+        match self {
+            NotificationKind::WentLive => "went_live",
+            NotificationKind::RecordingFinished => "recording_finished",
+            NotificationKind::Error => "error",
+            NotificationKind::TaskFailed => "task_failed",
+            NotificationKind::ScheduleAdded => "schedule_added",
+            NotificationKind::ScheduleUpdated => "schedule_updated",
+            NotificationKind::YoutubePost => "youtube_post",
+        }
+    }
+
+    /// Resolve a persisted id back to a kind (`None` for an unknown/stale id).
+    pub fn from_id(s: &str) -> Option<NotificationKind> {
+        NotificationKind::ALL.into_iter().find(|k| k.id() == s)
+    }
+
+    /// Short human-readable label for the feed + filter dropdown.
+    pub fn label(self) -> &'static str {
+        match self {
+            NotificationKind::WentLive => "Went live",
+            NotificationKind::RecordingFinished => "Recording finished",
+            NotificationKind::Error => "Error",
+            NotificationKind::TaskFailed => "Task failed",
+            NotificationKind::ScheduleAdded => "Schedule added",
+            NotificationKind::ScheduleUpdated => "Schedule updated",
+            NotificationKind::YoutubePost => "YouTube post",
+        }
+    }
+
+    /// Font-safe emoji glyph (verified present in egui's NotoEmoji subset —
+    /// see [`ContentType::icon`]).
+    pub fn icon(self) -> &'static str {
+        match self {
+            NotificationKind::WentLive => "🔴",
+            NotificationKind::RecordingFinished => "⏹",
+            NotificationKind::Error => "⚠",
+            NotificationKind::TaskFailed => "❌",
+            NotificationKind::ScheduleAdded => "🗓",
+            NotificationKind::ScheduleUpdated => "🗓",
+            NotificationKind::YoutubePost => "📣",
+        }
+    }
+}
+
 /// A persisted record of a still-running download tool process, written right
 /// after the tool spawns and deleted at finalize/stop. On the next launch the
 /// supervisor reconciles every row: re-attach to the live ones (wait + tail the

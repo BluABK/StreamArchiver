@@ -215,6 +215,17 @@ impl AppCore {
             .await;
         });
 
+        // Periodic YouTube community-posts fetcher (the posts feed) — independent
+        // of schedule OCR. Idle-friendly: one DB query per pass when it has no
+        // YouTube channels to fetch.
+        let cp_ctx = ctx.clone();
+        let cp_events = self.events.clone();
+        let cp_shutdown = self.shutdown.clone();
+        let cp_jobs = self.jobs.clone();
+        self.rt.spawn(async move {
+            crate::detectors::refresh_community_posts(cp_ctx, cp_events, cp_shutdown, cp_jobs).await;
+        });
+
         // Supervisor: live signals + manual commands -> recordings.
         let max_concurrent = self
             .store

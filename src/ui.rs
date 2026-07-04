@@ -106,6 +106,7 @@ enum View {
     Streams,
     Videos,
     Schedule,
+    Posts,
     Background,
     Settings,
     Stats,
@@ -540,6 +541,10 @@ impl FormatDesignerState {
     }
 }
 
+/// Lazy cache of decoded post images, keyed by content hash: an egui texture +
+/// its pixel dimensions, or `None` when the decode failed.
+type PostImageCache = HashMap<String, Option<(egui::TextureHandle, (u32, u32))>>;
+
 pub struct StreamArchiverApp {
     core: Arc<AppCore>,
     _tray: TrayIcon,
@@ -582,6 +587,24 @@ pub struct StreamArchiverApp {
     issues_missing_load: Option<std::sync::mpsc::Receiver<Vec<crate::models::Recording>>>,
     issues_refreshed: Option<std::time::Instant>,
     issues_confirm_clear: bool,
+    /// The notifications feed window: whether it's open, its last-loaded rows,
+    /// the throttle timestamp, an off-thread load, the cached unread count (the
+    /// header badge), and the session-only category + text filters.
+    show_notifications: bool,
+    notifications: Vec<crate::store::NotificationRow>,
+    notif_refreshed: Option<std::time::Instant>,
+    notif_unread: i64,
+    notif_search: String,
+    notif_kind_filter: Option<crate::models::NotificationKind>,
+    /// The YouTube posts feed (a top-level tab AND a pop-out window sharing one
+    /// render fn): loaded rows, load throttle, session-only channel + text
+    /// filters, and a lazy visible-only texture cache keyed by content hash.
+    show_posts_window: bool,
+    posts: Vec<crate::store::CommunityPostRow>,
+    posts_refreshed: Option<std::time::Instant>,
+    posts_search: String,
+    posts_channel_filter: Option<i64>,
+    post_img_cache: PostImageCache,
     quitting: bool,
     /// UI-freeze watchdog heartbeat: stamped each frame so a background thread can
     /// detect (and surface as a native dialog) a hung UI thread. See [`crate::watchdog`].
@@ -1133,6 +1156,18 @@ impl StreamArchiverApp {
             issues_missing_load: None,
             issues_refreshed: None,
             issues_confirm_clear: false,
+            show_notifications: false,
+            notifications: Vec::new(),
+            notif_refreshed: None,
+            notif_unread: 0,
+            notif_search: String::new(),
+            notif_kind_filter: None,
+            show_posts_window: false,
+            posts: Vec::new(),
+            posts_refreshed: None,
+            posts_search: String::new(),
+            posts_channel_filter: None,
+            post_img_cache: HashMap::new(),
             quitting: false,
             heartbeat,
             view: View::Streams,
@@ -1624,6 +1659,28 @@ impl StreamArchiverApp {
                             {
                                 h.reload();
                             }
+                        }
+                        // Record a task_failed notification (the failing task
+                        // carries its kind + label + error here; the event alone
+                        // only has the id + outcome).
+                        if let crate::events::TaskOutcome::Failed(err) = &outcome {
+                            let mut body = task.label.clone();
+                            if !err.is_empty() {
+                                if !body.is_empty() {
+                                    body.push_str(" — ");
+                                }
+                                body.push_str(err);
+                            }
+                            let _ = self.core.store.insert_notification(&crate::store::NewNotification {
+                                kind: crate::models::NotificationKind::TaskFailed.id().to_string(),
+                                severity: "error".to_string(),
+                                title: format!("{} failed", task.kind.label()),
+                                body,
+                                channel: task.label.clone(),
+                                ref_key: format!("taskfail:{}", task.id),
+                                ..Default::default()
+                            });
+                            self.notif_refreshed = None; // surface promptly in the badge
                         }
                         self.finished_tasks.insert(0, (task, outcome, now_unix()));
                         self.finished_tasks.truncate(100);
@@ -5324,6 +5381,9 @@ impl eframe::App for StreamArchiverApp {
                     ui.selectable_value(&mut self.view, View::Streams, "Streams");
                     ui.selectable_value(&mut self.view, View::Videos, "Videos");
                     ui.selectable_value(&mut self.view, View::Schedule, "Schedule");
+                    if ui.selectable_value(&mut self.view, View::Posts, "Posts").clicked() {
+                        self.posts_refreshed = None; // force reload on tab open
+                    }
                     ui.selectable_value(&mut self.view, View::Background, "Background");
                     ui.selectable_value(&mut self.view, View::Settings, "Settings");
                     if ui.selectable_value(&mut self.view, View::Stats, "Stats").clicked() {
@@ -5400,6 +5460,47 @@ impl eframe::App for StreamArchiverApp {
                                 self.issues_refreshed = None;
                             }
                         }
+                        {
+                            // Notifications feed (bell). Mirrors the Issues button:
+                            // the unread badge count is cached (refreshed on the
+                            // Issues-style throttle in `notifications_window`, even
+                            // while the window is closed) so it stays live.
+                            let n = self.notif_unread;
+                            let label = if n > 0 {
+                                format!("🔔 {n}")
+                            } else {
+                                "🔔".to_string()
+                            };
+                            let btn = egui::Button::new(label).small();
+                            let btn = if n > 0 {
+                                btn.fill(egui::Color32::from_rgb(160, 90, 10))
+                            } else {
+                                btn
+                            };
+                            if ui
+                                .add(btn)
+                                .on_hover_text("Notifications: went-live, recordings, errors, schedule changes, YouTube posts")
+                                .clicked()
+                            {
+                                self.show_notifications = true;
+                                self.notif_refreshed = None; // force an immediate refresh
+                                // Mark-all-read on open so the badge clears when you
+                                // look; items arriving while open stay unread.
+                                let _ = self
+                                    .core
+                                    .store
+                                    .mark_notifications_read_before(crate::models::now_unix());
+                                self.notif_unread = 0;
+                            }
+                        }
+                        if ui
+                            .button("📣 Posts")
+                            .on_hover_text("Pop out the YouTube posts feed in its own window")
+                            .clicked()
+                        {
+                            self.show_posts_window = true;
+                            self.posts_refreshed = None;
+                        }
                         if self.view == View::Streams {
                             if ui
                                 .button("➕ Add stream")
@@ -5450,6 +5551,7 @@ impl eframe::App for StreamArchiverApp {
             View::Streams => self.channels_view(ui),
             View::Videos => self.videos_view(ui),
             View::Schedule => self.schedule_view(ui),
+            View::Posts => self.posts_view(ui),
             View::Background => self.background_view(ui),
             View::Settings => self.settings_view(ui),
             View::Stats => self.stats_view(ui),
@@ -5493,7 +5595,7 @@ impl eframe::App for StreamArchiverApp {
                         ui.close();
                     }
                 }
-                View::Videos | View::Stats | View::Debug => {}
+                View::Videos | View::Stats | View::Debug | View::Posts => {}
             }
         });
         if ctx_add_stream {
@@ -5546,6 +5648,8 @@ impl eframe::App for StreamArchiverApp {
         self.recording_properties_window(ui.ctx());
         self.processes_window(ui.ctx());
         self.issues_window(ui.ctx());
+        self.notifications_window(ui.ctx());
+        self.posts_window(ui.ctx());
         self.format_designer_window(ui.ctx());
         self.confirm_quit_stop_window(ui.ctx());
         self.import_window(ui.ctx());
@@ -14105,6 +14209,445 @@ impl StreamArchiverApp {
         warnings
     }
 
+    /// The YouTube posts feed as a top-level tab. Shares [`Self::render_posts_feed`]
+    /// with the pop-out posts window.
+    fn posts_view(&mut self, ui: &mut egui::Ui) {
+        self.render_posts_feed(ui);
+    }
+
+    /// The pop-out YouTube posts window (📣 header button). Renders the same feed
+    /// as the Posts tab via [`Self::render_posts_feed`].
+    #[allow(deprecated)] // CentralPanel::show inside a viewport (matches issues_window)
+    fn posts_window(&mut self, ctx: &egui::Context) {
+        if !self.show_posts_window {
+            return;
+        }
+        let mut open = true;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("posts_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("📣 YouTube posts")
+                .with_inner_size([760.0, 640.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    self.render_posts_feed(ui);
+                });
+            },
+        );
+        if !open {
+            self.show_posts_window = false;
+        }
+    }
+
+    /// Render the YouTube community-posts feed (shared by the tab + the window):
+    /// a throttle-loaded list of post cards (author, timestamp, body with links,
+    /// all images 1:1), with a channel filter + text search. Post rows are moved
+    /// out of `self` during render so the lazy image-texture cache (`self`) and
+    /// the row data (local) don't alias.
+    fn render_posts_feed(&mut self, ui: &mut egui::Ui) {
+        use std::time::{Duration, Instant};
+        let stale = self
+            .posts_refreshed
+            .map(|t| t.elapsed() >= Duration::from_secs(5))
+            .unwrap_or(true);
+        if stale {
+            self.posts = self.core.store.list_community_posts(None, 500).unwrap_or_default();
+            self.posts_refreshed = Some(Instant::now());
+        }
+        let posts = std::mem::take(&mut self.posts);
+
+        // ── Toolbar: channel filter + search + refresh ──
+        ui.horizontal(|ui| {
+            let sel_text = match self.posts_channel_filter {
+                None => "All channels".to_string(),
+                Some(cid) => posts
+                    .iter()
+                    .find(|p| p.channel_id == cid)
+                    .map(|p| p.channel.clone())
+                    .unwrap_or_else(|| "Channel".to_string()),
+            };
+            egui::ComboBox::from_id_salt("posts_channel_filter")
+                .selected_text(sel_text)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.posts_channel_filter, None, "All channels");
+                    let mut chans: Vec<(i64, String)> = {
+                        let mut seen = std::collections::HashSet::new();
+                        posts
+                            .iter()
+                            .filter(|p| seen.insert(p.channel_id))
+                            .map(|p| (p.channel_id, p.channel.clone()))
+                            .collect()
+                    };
+                    chans.sort_by_key(|a| a.1.to_lowercase());
+                    for (cid, name) in chans {
+                        ui.selectable_value(&mut self.posts_channel_filter, Some(cid), name);
+                    }
+                });
+            ui.add(
+                egui::TextEdit::singleline(&mut self.posts_search)
+                    .hint_text("Search…")
+                    .desired_width(180.0),
+            );
+            if !self.posts_search.is_empty() && ui.button("✕").on_hover_text("Clear search").clicked()
+            {
+                self.posts_search.clear();
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("⟳ Refresh")
+                    .on_hover_text("Reload the feed from the database")
+                    .clicked()
+                {
+                    self.posts_refreshed = None;
+                }
+            });
+        });
+        ui.separator();
+
+        let q = self.posts_search.trim().to_lowercase();
+        let cf = self.posts_channel_filter;
+        let visible: Vec<usize> = posts
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                cf.map(|c| p.channel_id == c).unwrap_or(true)
+                    && (q.is_empty()
+                        || p.author.to_lowercase().contains(&q)
+                        || p.body_text.to_lowercase().contains(&q)
+                        || p.channel.to_lowercase().contains(&q))
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        if posts.is_empty() {
+            ui.add_space(24.0);
+            ui.vertical_centered(|ui| {
+                ui.weak("No YouTube posts yet.");
+                ui.weak("Posts are fetched periodically (Background → “YouTube posts refresh”).");
+            });
+            self.posts = posts;
+            return;
+        }
+        if visible.is_empty() {
+            ui.add_space(24.0);
+            ui.vertical_centered(|ui| ui.weak("No posts match the filter."));
+            self.posts = posts;
+            return;
+        }
+
+        let mut open_url: Option<String> = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for &i in &visible {
+                    let p = &posts[i];
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        // Header: avatar + author + timestamp + channel.
+                        ui.horizontal(|ui| {
+                            if !p.author_icon.is_empty() {
+                                self.show_post_avatar(ui, &format!("avatar:{}", p.id), &p.author_icon);
+                            }
+                            ui.vertical(|ui| {
+                                let name = if p.author.is_empty() {
+                                    p.channel.as_str()
+                                } else {
+                                    p.author.as_str()
+                                };
+                                ui.label(egui::RichText::new(name).strong());
+                                ui.horizontal(|ui| {
+                                    if !p.published_text.is_empty() {
+                                        ui.small(&p.published_text);
+                                    }
+                                    if !p.channel.is_empty() && p.channel != p.author {
+                                        ui.small(format!("· {}", p.channel));
+                                    }
+                                });
+                            });
+                        });
+                        // Body (runs with clickable links, else plain).
+                        render_post_body(ui, &p.links_json, &p.body_text);
+                        // Attachment images, 1:1, in order.
+                        for m in p
+                            .media
+                            .iter()
+                            .filter(|m| m.kind == "image" && !m.local_path.is_empty())
+                        {
+                            self.show_post_image(ui, &m.content_hash, &m.local_path);
+                        }
+                        ui.horizontal(|ui| {
+                            if !p.vote_count.is_empty() {
+                                ui.small(format!("👍 {}", p.vote_count));
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("Open post ↗").clicked() {
+                                        open_url = Some(format!(
+                                            "https://www.youtube.com/post/{}",
+                                            p.post_id
+                                        ));
+                                    }
+                                },
+                            );
+                        });
+                    });
+                    ui.add_space(6.0);
+                }
+            });
+
+        if let Some(url) = open_url {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+        }
+        self.posts = posts;
+    }
+
+    /// Render a small (fixed-size) post author avatar from disk, cached in
+    /// `post_img_cache`. Avatars are few (one per post) so no visibility gating.
+    fn show_post_avatar(&mut self, ui: &mut egui::Ui, key: &str, path: &str) {
+        let cached = self.post_img_cache.get(key).cloned();
+        match cached {
+            Some(Some((tex, _))) => {
+                ui.add(
+                    egui::Image::from_texture(&tex)
+                        .fit_to_exact_size(egui::vec2(28.0, 28.0))
+                        .corner_radius(egui::CornerRadius::same(14)),
+                );
+            }
+            Some(None) => {
+                ui.add_space(28.0);
+            }
+            None => {
+                let loaded = load_image_texture(std::path::Path::new(path), ui.ctx(), key);
+                self.post_img_cache.insert(key.to_string(), loaded);
+            }
+        }
+    }
+
+    /// Render a post attachment image from disk at a bounded size, cached in
+    /// `post_img_cache`. Off-screen images are NOT decoded (a fixed-height
+    /// placeholder is reserved and `is_rect_visible` gates the load), so memory
+    /// scales with what's scrolled, not the whole feed. A crude cap clears the
+    /// cache if it grows large.
+    fn show_post_image(&mut self, ui: &mut egui::Ui, hash: &str, path: &str) {
+        const MAX_W: f32 = 520.0;
+        const MAX_H: f32 = 420.0;
+        const PLACEHOLDER_H: f32 = 160.0;
+        if self.post_img_cache.len() > 200 {
+            self.post_img_cache.clear();
+        }
+        let cached = self.post_img_cache.get(hash).cloned();
+        match cached {
+            Some(Some((tex, _))) => {
+                let w = ui.available_width().min(MAX_W);
+                ui.add(egui::Image::from_texture(&tex).max_width(w).max_height(MAX_H));
+            }
+            Some(None) => {} // failed to decode — render nothing
+            None => {
+                let w = ui.available_width().min(MAX_W);
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(w, PLACEHOLDER_H), egui::Sense::hover());
+                if ui.is_rect_visible(rect) {
+                    let loaded = load_image_texture(std::path::Path::new(path), ui.ctx(), hash);
+                    self.post_img_cache.insert(hash.to_string(), loaded);
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
+    }
+
+    /// The notifications feed window (bell button). A persisted, filterable,
+    /// searchable aggregation of went-live / recording / error / schedule /
+    /// YouTube-post / task-failure events. Mirrors `issues_window`: the unread
+    /// badge count is refreshed on a throttle even while closed, so the header
+    /// bell stays live. Both the count and the row list are cheap SQLite reads,
+    /// done synchronously.
+    #[allow(deprecated)] // CentralPanel::show inside a viewport (matches issues_window)
+    fn notifications_window(&mut self, ctx: &egui::Context) {
+        use std::time::{Duration, Instant};
+        let interval = if self.show_notifications {
+            Duration::from_secs(3)
+        } else {
+            Duration::from_secs(60)
+        };
+        let stale = self
+            .notif_refreshed
+            .map(|t| t.elapsed() >= interval)
+            .unwrap_or(true);
+        if stale {
+            self.notif_unread = self.core.store.unread_notification_count().unwrap_or(0);
+            if self.show_notifications {
+                self.notifications = self.core.store.list_notifications(500).unwrap_or_default();
+            }
+            self.notif_refreshed = Some(Instant::now());
+        }
+        if !self.show_notifications {
+            return;
+        }
+
+        let now = crate::models::now_unix();
+        let mut open = true;
+        // Deferred actions (applied after the viewport closure releases &self).
+        enum Act {
+            OpenUrl(String),
+            MarkAllRead,
+        }
+        let mut act: Option<Act> = None;
+
+        // Session-only category + text filter over the loaded rows → surviving
+        // indices (recomputed each frame from last frame's filter values).
+        let q = self.notif_search.trim().to_lowercase();
+        let kind_filter = self.notif_kind_filter;
+        let visible: Vec<usize> = self
+            .notifications
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                kind_filter.map(|k| r.kind == k.id()).unwrap_or(true)
+                    && (q.is_empty()
+                        || r.title.to_lowercase().contains(&q)
+                        || r.body.to_lowercase().contains(&q)
+                        || r.channel.to_lowercase().contains(&q))
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("notifications_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("🔔 Notifications")
+                .with_inner_size([720.0, 520.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    // ── Toolbar: kind filter + search + mark-all-read ──
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("notif_kind_filter")
+                            .selected_text(match self.notif_kind_filter {
+                                None => "All kinds".to_string(),
+                                Some(k) => k.label().to_string(),
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.notif_kind_filter, None, "All kinds");
+                                for k in crate::models::NotificationKind::ALL {
+                                    ui.selectable_value(
+                                        &mut self.notif_kind_filter,
+                                        Some(k),
+                                        format!("{} {}", k.icon(), k.label()),
+                                    );
+                                }
+                            });
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.notif_search)
+                                .hint_text("Filter…")
+                                .desired_width(180.0),
+                        );
+                        if !self.notif_search.is_empty()
+                            && ui.button("✕").on_hover_text("Clear filter").clicked()
+                        {
+                            self.notif_search.clear();
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("✔ Mark all read").clicked() {
+                                act = Some(Act::MarkAllRead);
+                            }
+                        });
+                    });
+                    ui.separator();
+
+                    if self.notifications.is_empty() {
+                        ui.add_space(24.0);
+                        ui.vertical_centered(|ui| ui.weak("No notifications yet."));
+                        return;
+                    }
+                    if visible.is_empty() {
+                        ui.add_space(24.0);
+                        ui.vertical_centered(|ui| ui.weak("No notifications match the filter."));
+                        return;
+                    }
+
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for &i in &visible {
+                                let r = &self.notifications[i];
+                                let accent = match r.severity.as_str() {
+                                    "error" => egui::Color32::from_rgb(220, 90, 90),
+                                    "warn" => egui::Color32::from_rgb(210, 160, 60),
+                                    _ => ui.visuals().hyperlink_color,
+                                };
+                                let icon = crate::models::NotificationKind::from_id(&r.kind)
+                                    .map(|k| k.icon())
+                                    .unwrap_or("•");
+                                egui::Frame::group(ui.style()).show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        // Unread rows show a filled accent dot; read rows a dim one.
+                                        ui.label(
+                                            egui::RichText::new(if r.read { "○" } else { "●" })
+                                                .small()
+                                                .color(accent),
+                                        );
+                                        ui.label(egui::RichText::new(icon).color(accent));
+                                        ui.vertical(|ui| {
+                                            let mut title = egui::RichText::new(&r.title).strong();
+                                            if !r.read {
+                                                title = title.color(accent);
+                                            }
+                                            ui.label(title);
+                                            if !r.body.is_empty() {
+                                                ui.label(egui::RichText::new(&r.body).weak());
+                                            }
+                                            ui.horizontal(|ui| {
+                                                ui.small(fmt_datetime_short(r.created_at));
+                                                if !r.channel.is_empty() {
+                                                    ui.small(format!("· {}", r.channel));
+                                                }
+                                            });
+                                        });
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if !r.action_url.is_empty() {
+                                                    let label = if r.action_label.is_empty() {
+                                                        "Open"
+                                                    } else {
+                                                        r.action_label.as_str()
+                                                    };
+                                                    if ui.button(label).clicked() {
+                                                        act = Some(Act::OpenUrl(r.action_url.clone()));
+                                                    }
+                                                }
+                                            },
+                                        );
+                                    });
+                                });
+                            }
+                        });
+                });
+            },
+        );
+
+        if !open {
+            self.show_notifications = false;
+        }
+        match act {
+            Some(Act::OpenUrl(url)) => ctx.open_url(egui::OpenUrl::new_tab(url)),
+            Some(Act::MarkAllRead) => {
+                let _ = self.core.store.mark_notifications_read_before(now);
+                self.notif_unread = 0;
+                for r in &mut self.notifications {
+                    r.read = true;
+                }
+            }
+            None => {}
+        }
+    }
+
     /// Issues panel: lists all recordings whose output path is still a `.ts`
     /// file inside a `.cache` directory, and lets the user re-remux them to MKV.
     #[allow(deprecated)]
@@ -16969,6 +17512,35 @@ fn decode_rgba_bounded(bytes: &[u8]) -> Option<image::RgbaImage> {
     limits.max_alloc = Some(1 << 30); // 1 GiB
     reader.limits(limits);
     Some(reader.decode().ok()?.to_rgba8())
+}
+
+/// Render a community post's body: if `links_json` (a `[{text,url}]` run array)
+/// parses, render each run as a label or a clickable hyperlink (1:1 with the
+/// source); otherwise fall back to the plain `body_text`.
+fn render_post_body(ui: &mut egui::Ui, links_json: &str, fallback: &str) {
+    if let Ok(runs) = serde_json::from_str::<Vec<serde_json::Value>>(links_json)
+        && !runs.is_empty()
+    {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            for run in &runs {
+                let text = run.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                if text.is_empty() {
+                    continue;
+                }
+                let url = run.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                if url.is_empty() {
+                    ui.label(text);
+                } else {
+                    ui.hyperlink_to(text, url);
+                }
+            }
+        });
+        return;
+    }
+    if !fallback.is_empty() {
+        ui.label(fallback);
+    }
 }
 
 /// Decode an image file into an egui texture, returning the texture and its pixel

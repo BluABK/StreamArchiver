@@ -29,7 +29,7 @@ use crate::browser_ua::{BrowserFingerprint, build_browser_fingerprint};
 use crate::events::{AppEvent, EventTx};
 use crate::models::{
     K_DISCORD_SCHEDULE, K_DISCORD_TOKEN, K_YT_API_DETECT, K_YT_API_SCHEDULE, MonitorWithChannel,
-    Platform, ScheduleSegment, now_unix,
+    NotificationKind, Platform, ScheduleSegment, now_unix,
 };
 use crate::schedule_ocr::{accumulate_ocr_stats, ocr_opts_from_settings, ocr_schedule_image, record_ocr_cache_hit};
 use crate::schedule_source::{
@@ -1329,6 +1329,146 @@ impl DetectContext {
         Some((content_hash, dest))
     }
 
+    /// Download a community-post attachment into the channel's `posts/` asset
+    /// subdir, content-addressed by the fnv64 of the bytes (identical images are
+    /// stored once). Returns `(content_hash, local_path)` or `None` on failure.
+    async fn download_post_image(
+        &self,
+        row: &MonitorWithChannel,
+        img_url: &str,
+    ) -> Option<(String, PathBuf)> {
+        let ext = url_image_ext(img_url);
+        let posts_dir =
+            crate::assets::channel_asset_dir(&row.channel.name, row.monitor.platform()).join("posts");
+        let tmp = posts_dir.join(format!("tmp.{ext}"));
+        crate::assets::download_image(&self.http, img_url, &tmp).await.ok()?;
+        let bytes = tokio::fs::read(&tmp).await.ok()?;
+        let content_hash = fnv64(&bytes).to_string();
+        let dest = posts_dir.join(format!("{content_hash}.{ext}"));
+        if tokio::fs::try_exists(&dest).await.unwrap_or(false) {
+            let _ = tokio::fs::remove_file(&tmp).await;
+        } else if tokio::fs::rename(&tmp, &dest).await.is_err() {
+            let _ = tokio::fs::write(&dest, &bytes).await;
+            let _ = tokio::fs::remove_file(&tmp).await;
+        }
+        Some((content_hash, dest))
+    }
+
+    /// Fetch + parse the channel's community posts, upsert full post rows +
+    /// attachments (images downloaded into `posts/`), and emit a `youtube_post`
+    /// notification for each newly-seen post. Best-effort: a fetch/parse miss is
+    /// a no-op (never destructive). v1 is first-page only (~newest 10–20 posts).
+    async fn fetch_channel_posts(&self, row: &MonitorWithChannel, events: &EventTx) {
+        const MAX_POSTS: usize = 20;
+        let community_url = youtube_community_url(&row.monitor.url);
+        let jitter_ms = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos()
+            % 2000) as u64;
+        tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
+        let rb = self
+            .http
+            .get(&community_url)
+            .query(&[("hl", "en"), ("gl", "US")])
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Cookie", "CONSENT=YES+1; SOCS=CAI");
+        let Ok(resp) = self.fingerprint.apply_yt_nav_headers(rb).send().await else {
+            return;
+        };
+        if !resp.status().is_success() {
+            return;
+        }
+        let Ok(body) = resp.text().await else { return };
+        let Some(data) = extract_json_after(&body, "ytInitialData") else {
+            return;
+        };
+
+        let mut posts = Vec::new();
+        parse_community_posts(&data, &mut posts);
+        posts.truncate(MAX_POSTS);
+
+        for p in &posts {
+            let (pk, is_new) = match self.store.community_post_upsert_full(&crate::store::NewCommunityPost {
+                monitor_id: row.monitor.id,
+                channel_id: row.channel.id,
+                post_id: p.post_id.clone(),
+                author: p.author.clone(),
+                author_icon: String::new(), // filled below once the icon is cached
+                published_text: p.published_text.clone(),
+                body_text: p.body_text.clone(),
+                links_json: p.links_json.clone(),
+                vote_count: p.vote_count.clone(),
+                raw_json: p.raw_json.clone(),
+                ..Default::default()
+            }) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            // Cache the author icon (best-effort) and record it on the row.
+            if !p.author_icon_url.is_empty()
+                && let Some((_, path)) = self.download_post_image(row, &p.author_icon_url).await
+            {
+                let _ = self.store.community_post_upsert_full(&crate::store::NewCommunityPost {
+                    monitor_id: row.monitor.id,
+                    channel_id: row.channel.id,
+                    post_id: p.post_id.clone(),
+                    author: p.author.clone(),
+                    author_icon: path.to_string_lossy().into_owned(),
+                    published_text: p.published_text.clone(),
+                    body_text: p.body_text.clone(),
+                    links_json: p.links_json.clone(),
+                    vote_count: p.vote_count.clone(),
+                    raw_json: p.raw_json.clone(),
+                    ..Default::default()
+                });
+            }
+
+            // Download + record each attachment image, in order.
+            let mut first_image: Option<String> = None;
+            for (ordinal, url) in p.image_urls.iter().enumerate() {
+                if let Some((hash, path)) = self.download_post_image(row, url).await {
+                    let local = path.to_string_lossy().into_owned();
+                    if first_image.is_none() {
+                        first_image = Some(local.clone());
+                    }
+                    let _ = self.store.community_post_media_upsert(
+                        pk,
+                        ordinal as i64,
+                        "image",
+                        url,
+                        &hash,
+                        &local,
+                    );
+                }
+            }
+
+            // A newly-seen post → one notification.
+            if is_new {
+                let snippet: String = p.body_text.chars().take(140).collect();
+                let _ = self.store.insert_notification(&crate::store::NewNotification {
+                    kind: NotificationKind::YoutubePost.id().to_string(),
+                    severity: "info".to_string(),
+                    title: format!("{} posted", row.channel.name),
+                    body: snippet,
+                    monitor_id: Some(row.monitor.id),
+                    channel: row.channel.name.clone(),
+                    action_label: "Open post".to_string(),
+                    action_url: format!("https://www.youtube.com/post/{}", p.post_id),
+                    image_path: first_image.unwrap_or_default(),
+                    ref_key: format!("post:{}:{}", row.monitor.id, p.post_id),
+                    ..Default::default()
+                });
+                // Nudge the UI to reload the posts feed if it's open.
+                let _ = events.send(AppEvent::MonitorState {
+                    monitor_id: row.monitor.id,
+                    state: row.monitor.last_state.clone(),
+                });
+            }
+        }
+    }
+
     /// OCR the image on the channel's pinned tweet. Best-effort: hits the public
     /// syndication timeline endpoint (no auth), grabs the first `pbs.twimg.com`
     /// media image (the pinned tweet renders first), downloads it, then OCRs. X
@@ -2158,6 +2298,60 @@ fn persist_schedule_fetched(store: &Store, map: &HashMap<i64, i64>) {
     }
 }
 
+/// Background task: periodically fetch YouTube community posts for the posts
+/// feed. Independent of the schedule-OCR scan (which only runs when the
+/// community-OCR source is enabled). Runs a full pass over all YouTube channels
+/// every ~6 h; gated by the `job_community_posts` toggle (Background view).
+pub async fn refresh_community_posts(
+    ctx: Arc<DetectContext>,
+    events: EventTx,
+    shutdown: Arc<AtomicBool>,
+    jobs: crate::events::JobRegistry,
+) {
+    const INITIAL_DELAY_SECS: u64 = 45;
+    const TICK_SECS: u64 = 6 * 3600;
+
+    sleep_cancellable(Duration::from_secs(INITIAL_DELAY_SECS), &shutdown).await;
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        if ctx.store.job_enabled("job_community_posts") {
+            refresh_community_posts_once(&ctx, &events, &shutdown).await;
+            crate::events::mark_job(&jobs, "YouTube posts refresh", TICK_SECS as i64);
+        }
+        sleep_cancellable(Duration::from_secs(TICK_SECS), &shutdown).await;
+    }
+}
+
+/// One posts pass: fetch every YouTube channel's community tab (de-duplicated
+/// per community URL), throttled between channels to stay polite.
+async fn refresh_community_posts_once(
+    ctx: &Arc<DetectContext>,
+    events: &EventTx,
+    shutdown: &Arc<AtomicBool>,
+) {
+    let rows = match ctx.store.list_monitors_with_channels() {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for row in &rows {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        if row.monitor.platform() != Platform::YouTube {
+            continue;
+        }
+        // Multiple instances of one channel share a community tab — fetch once.
+        if !seen.insert(youtube_community_url(&row.monitor.url)) {
+            continue;
+        }
+        ctx.fetch_channel_posts(row, events).await;
+        sleep_cancellable(Duration::from_secs(3), shutdown).await;
+    }
+}
+
 /// Background task: periodically refresh upcoming-stream schedules for enabled
 /// Twitch/YouTube monitors. A short poll tick picks up newly-added monitors
 /// quickly; each monitor is re-fetched at most every few hours (tracked
@@ -2500,11 +2694,12 @@ async fn refresh_schedules_once(
                     // Rows already in DB from the last real OCR run — writing them
                     // back would duplicate past segments on every tick.
                     let _ = ctx.store.clear_other_schedule_sources(row.monitor.id, kind.id());
-                } else if ctx
-                    .store
-                    .replace_schedule_source(row.monitor.id, kind.id(), &segs)
-                    .is_ok()
-                {
+                } else if replace_schedule_and_notify(
+                    ctx.store.as_ref(),
+                    row.monitor.id,
+                    kind.id(),
+                    &segs,
+                ) {
                     let _ = ctx.store.clear_other_schedule_sources(row.monitor.id, kind.id());
                     changed = true;
                 }
@@ -2553,7 +2748,7 @@ async fn refresh_schedules_once(
 
     // Store YouTube scrape results (after optional API refinement) under "youtube".
     for (monitor_id, segs) in &yt_pending {
-        if ctx.store.replace_schedule_source(*monitor_id, "youtube", segs).is_ok() {
+        if replace_schedule_and_notify(ctx.store.as_ref(), *monitor_id, "youtube", segs) {
             let _ = ctx.store.clear_other_schedule_sources(*monitor_id, "youtube");
             changed = true;
         }
@@ -2779,6 +2974,71 @@ pub(crate) fn youtube_streams_url(url: &str) -> String {
     format!("{t}/streams")
 }
 
+/// Replace a monitor's schedule for `source` and emit `schedule_added` /
+/// `schedule_updated` notifications for the diff (see
+/// [`Store::replace_schedule_source_diffed`]). Returns whether the DB write
+/// succeeded (the caller's `changed` flag). The channel name is resolved once,
+/// only when there are changes to report.
+fn replace_schedule_and_notify(
+    store: &Store,
+    monitor_id: i64,
+    source: &str,
+    segs: &[ScheduleSegment],
+) -> bool {
+    let changes = match store.replace_schedule_source_diffed(monitor_id, source, segs) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    if !changes.is_empty() {
+        let channel = store
+            .get_monitor_with_channel(monitor_id)
+            .ok()
+            .flatten()
+            .map(|r| r.channel.name)
+            .unwrap_or_default();
+        for ch in &changes {
+            use chrono::TimeZone;
+            let when = chrono::Local
+                .timestamp_opt(ch.start_time, 0)
+                .single()
+                .map(|dt| dt.format("%a %d %b %H:%M").to_string())
+                .unwrap_or_default();
+            let (kind, verb) = if ch.added {
+                (NotificationKind::ScheduleAdded, "New stream scheduled")
+            } else {
+                (NotificationKind::ScheduleUpdated, "Schedule updated")
+            };
+            let title = if ch.title.is_empty() {
+                format!("{channel} — {verb}")
+            } else {
+                format!("{channel} — {}", ch.title)
+            };
+            let mut body = when;
+            if !ch.category.is_empty() {
+                if !body.is_empty() {
+                    body.push_str(" · ");
+                }
+                body.push_str(&ch.category);
+            }
+            let _ = store.insert_notification(&crate::store::NewNotification {
+                kind: kind.id().to_string(),
+                severity: "info".to_string(),
+                title,
+                body,
+                monitor_id: Some(monitor_id),
+                channel: channel.clone(),
+                ref_key: format!(
+                    "sched:{monitor_id}:{}:{}",
+                    ch.start_time,
+                    if ch.added { "add" } else { "upd" }
+                ),
+                ..Default::default()
+            });
+        }
+    }
+    true
+}
+
 /// Build the YouTube `/community` (posts tab) URL for a channel URL.
 pub(crate) fn youtube_community_url(url: &str) -> String {
     let t = url.trim().trim_end_matches('/');
@@ -2830,6 +3090,126 @@ fn community_images(v: &Value, out: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+/// A full YouTube community post parsed from `ytInitialData` (the posts feed).
+/// Distinct from [`community_images`] (schedule-OCR), which extracts only images.
+struct ParsedPost {
+    post_id: String,
+    author: String,
+    author_icon_url: String,
+    published_text: String,
+    body_text: String,
+    /// JSON array of `{text, url}` runs (url `""` = plain) for 1:1 link rendering.
+    links_json: String,
+    vote_count: String,
+    /// Attachment image URLs, in document order (single or multi-image posts).
+    image_urls: Vec<String>,
+    /// The post renderer subtree, serialized for forward-compat re-parsing.
+    raw_json: String,
+}
+
+/// Recursively collect full community posts from `ytInitialData`. Matches both
+/// `backstagePostRenderer` (normal) and `sharedPostRenderer` (a reshare); once a
+/// post subtree is captured we don't recurse into it (a shared post embeds the
+/// original, which would otherwise double-count).
+fn parse_community_posts(v: &Value, out: &mut Vec<ParsedPost>) {
+    match v {
+        Value::Object(map) => {
+            let post = map
+                .get("backstagePostRenderer")
+                .or_else(|| map.get("sharedPostRenderer"));
+            if let Some(post) = post {
+                if let Some(p) = parse_one_post(post) {
+                    out.push(p);
+                }
+                return; // don't recurse into a captured post subtree
+            }
+            for val in map.values() {
+                parse_community_posts(val, out);
+            }
+        }
+        Value::Array(arr) => {
+            for val in arr {
+                parse_community_posts(val, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Parse one `backstagePostRenderer` / `sharedPostRenderer` object. Best-effort:
+/// a missing `postId` disqualifies the post; every other field defaults to empty.
+fn parse_one_post(post: &Value) -> Option<ParsedPost> {
+    let post_id = post.get("postId").and_then(|v| v.as_str())?.to_string();
+    let first_run_text = |node: Option<&Value>| -> String {
+        node.and_then(|n| n.get("runs"))
+            .and_then(|r| r.as_array())
+            .and_then(|a| a.first())
+            .and_then(|r| r.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let author = first_run_text(post.get("authorText"));
+    let author_icon_url = largest_thumbnail(post.get("authorThumbnail")).unwrap_or_default();
+    let published_text = first_run_text(post.get("publishedTimeText"));
+    let vote_count = post
+        .get("voteCount")
+        .and_then(|v| v.get("simpleText").and_then(|s| s.as_str()))
+        .unwrap_or("")
+        .to_string();
+
+    // Content runs → concatenated body text + a {text,url} array for link styling.
+    let mut body_text = String::new();
+    let mut runs_json: Vec<Value> = Vec::new();
+    if let Some(runs) = post
+        .get("contentText")
+        .and_then(|c| c.get("runs"))
+        .and_then(|r| r.as_array())
+    {
+        for run in runs {
+            let text = run.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            let url = run
+                .get("navigationEndpoint")
+                .and_then(|ne| {
+                    ne.get("urlEndpoint")
+                        .and_then(|u| u.get("url"))
+                        .and_then(|u| u.as_str())
+                        .or_else(|| {
+                            ne.get("commandMetadata")
+                                .and_then(|c| c.get("webCommandMetadata"))
+                                .and_then(|w| w.get("url"))
+                                .and_then(|u| u.as_str())
+                        })
+                })
+                .unwrap_or("");
+            body_text.push_str(text);
+            runs_json.push(serde_json::json!({ "text": text, "url": url }));
+        }
+    }
+    let links_json = serde_json::to_string(&runs_json).unwrap_or_else(|_| "[]".to_string());
+
+    // Attachment images (single `backstageImageRenderer` or multi-image) in order —
+    // reuse the schedule-OCR image walk, scoped to this post's attachment subtree.
+    let mut image_urls = Vec::new();
+    if let Some(att) = post.get("backstageAttachment") {
+        community_images(att, &mut image_urls);
+    }
+
+    let raw_json = serde_json::to_string(post).unwrap_or_default();
+
+    Some(ParsedPost {
+        post_id,
+        author,
+        author_icon_url,
+        published_text,
+        body_text,
+        links_json,
+        vote_count,
+        image_urls,
+        raw_json,
+    })
 }
 
 /// The largest (last) thumbnail URL from an `image.thumbnails[]` node,

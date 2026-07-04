@@ -127,13 +127,26 @@ pub async fn run(mut rx: EventRx, store: Arc<Store>) {
     }
 }
 
-/// Build and show the toast for one event (runs on a blocking thread).
+/// Per-event feed metadata that [`ToastContent`] doesn't itself carry.
+struct NotifMeta {
+    kind: crate::models::NotificationKind,
+    severity: &'static str,
+    monitor_id: Option<i64>,
+    channel: String,
+    recording_id: Option<i64>,
+    /// Dedup key for the partial-unique index (`""` = never dedup).
+    ref_key: String,
+}
+
+/// Resolve one event into a toast, record it in the in-app notifications feed,
+/// then show the OS toast. The feed row is recorded **regardless** of the
+/// desktop-notification toggle (Settings promises the in-app views keep
+/// updating with toasts off); only the OS `show_toast` call is gated. Runs on a
+/// blocking thread.
 fn handle(store: &Store, ev: AppEvent) {
-    if !enabled(store) {
-        return;
-    }
-    let content = match ev {
-        AppEvent::RecordingStarted { monitor_id, thumbnail_path, .. } => {
+    use crate::models::NotificationKind;
+    let (content, meta) = match ev {
+        AppEvent::RecordingStarted { monitor_id, recording_id, thumbnail_path, .. } => {
             let Some(row) = store.get_monitor_with_channel(monitor_id).ok().flatten() else {
                 return;
             };
@@ -147,7 +160,15 @@ fn handle(store: &Store, ev: AppEvent) {
                     content.hero = Some(path.clone());
                 }
             }
-            content
+            let meta = NotifMeta {
+                kind: NotificationKind::WentLive,
+                severity: "info",
+                monitor_id: Some(monitor_id),
+                channel: row.channel.name.clone(),
+                recording_id: Some(recording_id),
+                ref_key: format!("went_live:{recording_id}"),
+            };
+            (content, meta)
         }
         AppEvent::RecordingFinished {
             recording_id,
@@ -155,7 +176,7 @@ fn handle(store: &Store, ev: AppEvent) {
             status,
         } => {
             // An "ended" take captured nothing (stream had already concluded) — a
-            // non-event, not worth a toast.
+            // non-event, worth neither a toast nor a feed row.
             if status == "ended" {
                 return;
             }
@@ -163,7 +184,9 @@ fn handle(store: &Store, ev: AppEvent) {
             let row = resolved
                 .as_ref()
                 .and_then(|(mid, _)| store.get_monitor_with_channel(*mid).ok().flatten());
-            match row {
+            let severity = if status == "failed" { "error" } else { "info" };
+            let mid = resolved.as_ref().map(|(mid, _)| *mid);
+            let (content, chan_name) = match row {
                 Some(row) => {
                     let heading = format!("{} — {status}", row.channel.name);
                     let vod_url = match row.monitor.platform() {
@@ -180,21 +203,70 @@ fn handle(store: &Store, ev: AppEvent) {
                         }
                         _ => None,
                     };
-                    content_for_url(&row, heading, "Watch VOD", vod_url)
+                    let name = row.channel.name.clone();
+                    (content_for_url(&row, heading, "Watch VOD", vod_url), name)
                 }
-                None => ToastContent::text(
-                    "Recording finished".to_string(),
-                    format!("{channel} — {status}"),
+                None => (
+                    ToastContent::text(
+                        "Recording finished".to_string(),
+                        format!("{channel} — {status}"),
+                    ),
+                    channel.clone(),
                 ),
-            }
+            };
+            let meta = NotifMeta {
+                kind: NotificationKind::RecordingFinished,
+                severity,
+                monitor_id: mid,
+                channel: chan_name,
+                recording_id: Some(recording_id),
+                ref_key: format!("recfin:{recording_id}"),
+            };
+            (content, meta)
         }
-        AppEvent::Error { context, message } => ToastContent::text(
-            "StreamArchiver error".to_string(),
-            format!("{context}: {message}"),
-        ),
+        AppEvent::Error { context, message } => {
+            let content = ToastContent::text(
+                "StreamArchiver error".to_string(),
+                format!("{context}: {message}"),
+            );
+            let meta = NotifMeta {
+                kind: NotificationKind::Error,
+                severity: "error",
+                monitor_id: None,
+                channel: String::new(),
+                recording_id: None,
+                // Errors are treated as always-distinct (no dedup).
+                ref_key: String::new(),
+            };
+            (content, meta)
+        }
         _ => return,
     };
-    show_toast(content);
+
+    // Record the in-app feed row (idempotent on ref_key) before the OS toast.
+    let n = crate::store::NewNotification {
+        kind: meta.kind.id().to_string(),
+        severity: meta.severity.to_string(),
+        title: content.heading.clone(),
+        body: content.lines.join("\n"),
+        monitor_id: meta.monitor_id,
+        channel: meta.channel,
+        recording_id: meta.recording_id,
+        action_label: content.action.as_ref().map(|a| a.label.clone()).unwrap_or_default(),
+        action_url: content.action.as_ref().map(|a| a.url.clone()).unwrap_or_default(),
+        image_path: content
+            .hero
+            .as_ref()
+            .or(content.logo.as_ref())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        ref_key: meta.ref_key,
+    };
+    let _ = store.insert_notification(&n);
+
+    if enabled(store) {
+        show_toast(content);
+    }
 }
 
 /// Enrich a toast from a monitor+channel row: the channel's profile pic / banner

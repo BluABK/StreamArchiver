@@ -33,7 +33,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 36;
+const SCHEMA_VERSION: i64 = 39;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -54,6 +54,122 @@ pub struct ArchivedPost {
     #[allow(dead_code)]
     pub decoded_events: i64,
     pub decoded_json: String,
+}
+
+/// A notification to insert into the feed (schema v37 `notification`), built at
+/// each emit site (the toast hook, schedule diff, posts fetch, task failure). A
+/// non-empty `ref_key` dedups re-emits via the partial-unique index; `""` never
+/// dedups. `severity` is `"info" | "warn" | "error"` (drives the row tint).
+#[derive(Clone, Debug, Default)]
+pub struct NewNotification {
+    pub kind: String,
+    pub severity: String,
+    pub title: String,
+    pub body: String,
+    pub monitor_id: Option<i64>,
+    pub channel: String,
+    pub recording_id: Option<i64>,
+    pub action_label: String,
+    pub action_url: String,
+    pub image_path: String,
+    pub ref_key: String,
+}
+
+/// A persisted notification feed row, as returned by [`Store::list_notifications`].
+/// Some fields are persistence/click-through metadata not yet read by the feed
+/// UI (mirrors [`ArchivedPost`]'s `#[allow(dead_code)]` convention).
+#[derive(Clone, Debug)]
+pub struct NotificationRow {
+    #[allow(dead_code)]
+    pub id: i64,
+    pub created_at: i64,
+    pub kind: String,
+    pub severity: String,
+    pub title: String,
+    pub body: String,
+    #[allow(dead_code)]
+    pub monitor_id: Option<i64>,
+    pub channel: String,
+    #[allow(dead_code)]
+    pub recording_id: Option<i64>,
+    pub action_label: String,
+    pub action_url: String,
+    /// Resolved hero/logo image on disk (rendered inline in a later phase).
+    #[allow(dead_code)]
+    pub image_path: String,
+    #[allow(dead_code)]
+    pub ref_key: String,
+    pub read: bool,
+}
+
+/// A full YouTube community post to upsert (schema v38 `community_post`), parsed
+/// from the community tab. Keyed on `(monitor_id, post_id)`.
+#[derive(Clone, Debug, Default)]
+pub struct NewCommunityPost {
+    pub monitor_id: i64,
+    pub channel_id: i64,
+    pub post_id: String,
+    pub author: String,
+    pub author_icon: String,
+    pub published_text: String,
+    pub body_text: String,
+    pub links_json: String,
+    pub poll_json: String,
+    pub vote_count: String,
+    pub shared_json: String,
+    pub raw_json: String,
+}
+
+/// A persisted community post feed row with its ordered attachments, as returned
+/// by [`Store::list_community_posts`].
+#[derive(Clone, Debug)]
+pub struct CommunityPostRow {
+    pub id: i64,
+    #[allow(dead_code)]
+    pub monitor_id: i64,
+    #[allow(dead_code)]
+    pub channel_id: i64,
+    #[allow(dead_code)]
+    pub post_id: String,
+    pub author: String,
+    pub author_icon: String,
+    pub published_text: String,
+    pub body_text: String,
+    pub links_json: String,
+    /// Poll options (rendered in a later phase).
+    #[allow(dead_code)]
+    pub poll_json: String,
+    pub vote_count: String,
+    /// Shared-video/post summary (rendered in a later phase).
+    #[allow(dead_code)]
+    pub shared_json: String,
+    /// First-seen timestamp — ordering only (the UI shows `published_text`).
+    #[allow(dead_code)]
+    pub first_seen: i64,
+    pub channel: String,
+    pub media: Vec<PostMediaRow>,
+}
+
+/// One attachment of a community post (image / poll option / shared thumbnail).
+#[derive(Clone, Debug)]
+pub struct PostMediaRow {
+    #[allow(dead_code)]
+    pub ordinal: i64,
+    pub kind: String,
+    #[allow(dead_code)]
+    pub image_url: String,
+    pub content_hash: String,
+    pub local_path: String,
+}
+
+/// One upcoming schedule change detected by [`Store::replace_schedule_source_diffed`]:
+/// a future occurrence that was newly added (`added = true`) or whose title/category
+/// changed (`added = false`). Drives `schedule_added` / `schedule_updated` feed rows.
+pub struct ScheduleChange {
+    pub added: bool,
+    pub start_time: i64,
+    pub title: String,
+    pub category: String,
 }
 
 /// Minimal monitor fields the ad-free (Twitch sub) refresher needs.
@@ -676,7 +792,93 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 36)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 36);
+        if version < 37 {
+            // In-app notifications feed: a persisted, filterable history of
+            // toast-worthy events (recording lifecycle, errors), went-live,
+            // schedule changes, background-task failures, and new YouTube posts.
+            // One row fully reconstructs the item at render (no re-resolution).
+            // `ref_key` (partial-unique) makes "insert if new" a single
+            // ON CONFLICT DO NOTHING; rows that don't dedup use ref_key=''.
+            // FK is SET NULL (not CASCADE): deleting a monitor keeps its history
+            // meaningful via the denormalized `channel` string.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS notification (
+                    id           INTEGER PRIMARY KEY,
+                    created_at   INTEGER NOT NULL,
+                    kind         TEXT NOT NULL,
+                    severity     TEXT NOT NULL DEFAULT 'info',
+                    title        TEXT NOT NULL DEFAULT '',
+                    body         TEXT NOT NULL DEFAULT '',
+                    monitor_id   INTEGER,
+                    channel      TEXT NOT NULL DEFAULT '',
+                    recording_id INTEGER,
+                    action_label TEXT NOT NULL DEFAULT '',
+                    action_url   TEXT NOT NULL DEFAULT '',
+                    image_path   TEXT NOT NULL DEFAULT '',
+                    ref_key      TEXT NOT NULL DEFAULT '',
+                    read         INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY(monitor_id) REFERENCES monitor(id) ON DELETE SET NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_notification_created
+                    ON notification(created_at DESC);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_notification_refkey
+                    ON notification(ref_key) WHERE ref_key <> '';",
+            )?;
+            conn.pragma_update(None, "user_version", 37)?;
+        }
+        if version < 38 {
+            // Full YouTube community posts (the posts feed) — distinct from the
+            // image-only `community_post_archive` (schedule-OCR). One row per
+            // post, keyed by the stable backstage `post_id`. `raw_json` keeps the
+            // renderer subtree for forward-compat re-parsing. `first_seen` drives
+            // the feed order + the "new post" notification.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS community_post (
+                    id             INTEGER PRIMARY KEY,
+                    monitor_id     INTEGER NOT NULL,
+                    channel_id     INTEGER NOT NULL,
+                    post_id        TEXT NOT NULL,
+                    author         TEXT NOT NULL DEFAULT '',
+                    author_icon    TEXT NOT NULL DEFAULT '',
+                    published_text TEXT NOT NULL DEFAULT '',
+                    body_text      TEXT NOT NULL DEFAULT '',
+                    links_json     TEXT NOT NULL DEFAULT '[]',
+                    poll_json      TEXT NOT NULL DEFAULT '',
+                    vote_count     TEXT NOT NULL DEFAULT '',
+                    shared_json    TEXT NOT NULL DEFAULT '',
+                    raw_json       TEXT NOT NULL DEFAULT '',
+                    first_seen     INTEGER NOT NULL,
+                    last_seen      INTEGER NOT NULL,
+                    FOREIGN KEY(monitor_id) REFERENCES monitor(id) ON DELETE CASCADE
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_community_post_uniq
+                    ON community_post(monitor_id, post_id);
+                CREATE INDEX IF NOT EXISTS idx_community_post_seen
+                    ON community_post(monitor_id, first_seen DESC);",
+            )?;
+            conn.pragma_update(None, "user_version", 38)?;
+        }
+        if version < 39 {
+            // Attachments of a community post (posts are 1-to-many): images, poll
+            // options, shared-video thumbnails. `ordinal` preserves display order;
+            // `content_hash`/`local_path` are the content-addressed cached image.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS community_post_media (
+                    id           INTEGER PRIMARY KEY,
+                    post_pk      INTEGER NOT NULL,
+                    ordinal      INTEGER NOT NULL DEFAULT 0,
+                    kind         TEXT NOT NULL DEFAULT 'image',
+                    image_url    TEXT NOT NULL DEFAULT '',
+                    content_hash TEXT NOT NULL DEFAULT '',
+                    local_path   TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY(post_pk) REFERENCES community_post(id) ON DELETE CASCADE
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_community_post_media_uniq
+                    ON community_post_media(post_pk, ordinal);",
+            )?;
+            conn.pragma_update(None, "user_version", 39)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 39);
         Ok(())
     }
 
@@ -824,6 +1026,249 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(n)
+    }
+
+    // ----- notifications feed (schema v37) -----
+
+    /// Insert a notification. Idempotent when `ref_key` is non-empty (the
+    /// partial-unique index makes a re-emit a silent no-op via `INSERT OR
+    /// IGNORE`); `ref_key == ""` always inserts. Returns the new row id, or
+    /// `None` when a dedup conflict swallowed it.
+    pub fn insert_notification(&self, n: &NewNotification) -> Result<Option<i64>> {
+        let conn = self.db();
+        let changed = conn.execute(
+            "INSERT OR IGNORE INTO notification
+                 (created_at, kind, severity, title, body, monitor_id, channel,
+                  recording_id, action_label, action_url, image_path, ref_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                now_unix(),
+                n.kind,
+                n.severity,
+                n.title,
+                n.body,
+                n.monitor_id,
+                n.channel,
+                n.recording_id,
+                n.action_label,
+                n.action_url,
+                n.image_path,
+                n.ref_key,
+            ],
+        )?;
+        Ok((changed == 1).then(|| conn.last_insert_rowid()))
+    }
+
+    /// The most recent `limit` notifications, newest first. Kind/text filtering
+    /// is done in-memory by the UI over this list.
+    pub fn list_notifications(&self, limit: i64) -> Result<Vec<NotificationRow>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id, created_at, kind, severity, title, body, monitor_id, channel,
+                    recording_id, action_label, action_url, image_path, ref_key, read
+             FROM notification
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit], |r| {
+                Ok(NotificationRow {
+                    id: r.get(0)?,
+                    created_at: r.get(1)?,
+                    kind: r.get(2)?,
+                    severity: r.get(3)?,
+                    title: r.get(4)?,
+                    body: r.get(5)?,
+                    monitor_id: r.get(6)?,
+                    channel: r.get(7)?,
+                    recording_id: r.get(8)?,
+                    action_label: r.get(9)?,
+                    action_url: r.get(10)?,
+                    image_path: r.get(11)?,
+                    ref_key: r.get(12)?,
+                    read: r.get::<_, i64>(13)? != 0,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Number of unread notifications (the header badge count).
+    pub fn unread_notification_count(&self) -> Result<i64> {
+        let conn = self.db();
+        let n = conn.query_row(
+            "SELECT COUNT(*) FROM notification WHERE read = 0",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// Mark every notification created at or before `created_at` as read (the
+    /// "mark all read on window open" action — items arriving after open stay
+    /// unread). Returns the number of rows updated.
+    pub fn mark_notifications_read_before(&self, created_at: i64) -> Result<usize> {
+        let conn = self.db();
+        let n = conn.execute(
+            "UPDATE notification SET read = 1 WHERE read = 0 AND created_at <= ?1",
+            params![created_at],
+        )?;
+        Ok(n)
+    }
+
+    /// Delete notifications older than `keep_days` days (startup retention).
+    /// Returns the number of rows pruned.
+    pub fn prune_notifications(&self, keep_days: i64) -> Result<usize> {
+        let conn = self.db();
+        let cutoff = now_unix() - keep_days.max(0) * 86_400;
+        let n = conn.execute(
+            "DELETE FROM notification WHERE created_at < ?1",
+            params![cutoff],
+        )?;
+        Ok(n)
+    }
+
+    // ----- YouTube community posts feed (schema v38/v39) -----
+
+    /// Upsert a full community post, keyed on `(monitor_id, post_id)`. Preserves
+    /// `first_seen` on an existing row (refreshing the other fields + `last_seen`).
+    /// Returns `(post_pk, is_new)`; `is_new == true` drives the `youtube_post`
+    /// notification.
+    pub fn community_post_upsert_full(&self, p: &NewCommunityPost) -> Result<(i64, bool)> {
+        let conn = self.db();
+        let now = now_unix();
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM community_post WHERE monitor_id = ?1 AND post_id = ?2",
+                params![p.monitor_id, p.post_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(pk) = existing {
+            conn.execute(
+                "UPDATE community_post SET
+                     author = ?2, author_icon = ?3, published_text = ?4, body_text = ?5,
+                     links_json = ?6, poll_json = ?7, vote_count = ?8, shared_json = ?9,
+                     raw_json = ?10, last_seen = ?11
+                 WHERE id = ?1",
+                params![
+                    pk, p.author, p.author_icon, p.published_text, p.body_text, p.links_json,
+                    p.poll_json, p.vote_count, p.shared_json, p.raw_json, now,
+                ],
+            )?;
+            Ok((pk, false))
+        } else {
+            conn.execute(
+                "INSERT INTO community_post
+                     (monitor_id, channel_id, post_id, author, author_icon, published_text,
+                      body_text, links_json, poll_json, vote_count, shared_json, raw_json,
+                      first_seen, last_seen)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13)",
+                params![
+                    p.monitor_id, p.channel_id, p.post_id, p.author, p.author_icon,
+                    p.published_text, p.body_text, p.links_json, p.poll_json, p.vote_count,
+                    p.shared_json, p.raw_json, now,
+                ],
+            )?;
+            Ok((conn.last_insert_rowid(), true))
+        }
+    }
+
+    /// Upsert one attachment of a post (idempotent on `(post_pk, ordinal)`).
+    pub fn community_post_media_upsert(
+        &self,
+        post_pk: i64,
+        ordinal: i64,
+        kind: &str,
+        image_url: &str,
+        content_hash: &str,
+        local_path: &str,
+    ) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "INSERT INTO community_post_media
+                 (post_pk, ordinal, kind, image_url, content_hash, local_path)
+             VALUES (?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(post_pk, ordinal) DO UPDATE SET
+                 kind = excluded.kind, image_url = excluded.image_url,
+                 content_hash = excluded.content_hash, local_path = excluded.local_path",
+            params![post_pk, ordinal, kind, image_url, content_hash, local_path],
+        )?;
+        Ok(())
+    }
+
+    /// List community posts (newest `first_seen` first) with their ordered media.
+    /// Global across all channels when `monitor_id` is `None`; per-channel when
+    /// `Some`. Each row carries the denormalized channel name for the feed's
+    /// display + channel filter.
+    pub fn list_community_posts(
+        &self,
+        monitor_id: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<CommunityPostRow>> {
+        let conn = self.db();
+        let map_row = |r: &rusqlite::Row| -> rusqlite::Result<CommunityPostRow> {
+            Ok(CommunityPostRow {
+                id: r.get(0)?,
+                monitor_id: r.get(1)?,
+                channel_id: r.get(2)?,
+                post_id: r.get(3)?,
+                author: r.get(4)?,
+                author_icon: r.get(5)?,
+                published_text: r.get(6)?,
+                body_text: r.get(7)?,
+                links_json: r.get(8)?,
+                poll_json: r.get(9)?,
+                vote_count: r.get(10)?,
+                shared_json: r.get(11)?,
+                first_seen: r.get(12)?,
+                channel: r.get::<_, Option<String>>(13)?.unwrap_or_default(),
+                media: Vec::new(),
+            })
+        };
+        const COLS: &str = "cp.id, cp.monitor_id, cp.channel_id, cp.post_id, cp.author, \
+             cp.author_icon, cp.published_text, cp.body_text, cp.links_json, cp.poll_json, \
+             cp.vote_count, cp.shared_json, cp.first_seen, ch.name";
+        let mut posts: Vec<CommunityPostRow> = match monitor_id {
+            Some(mid) => {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {COLS} FROM community_post cp
+                     LEFT JOIN channel ch ON ch.id = cp.channel_id
+                     WHERE cp.monitor_id = ?1
+                     ORDER BY cp.first_seen DESC, cp.id DESC LIMIT ?2"
+                ))?;
+                stmt.query_map(params![mid, limit], |r| map_row(r))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            None => {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {COLS} FROM community_post cp
+                     LEFT JOIN channel ch ON ch.id = cp.channel_id
+                     ORDER BY cp.first_seen DESC, cp.id DESC LIMIT ?1"
+                ))?;
+                stmt.query_map(params![limit], |r| map_row(r))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+        };
+        // Attach ordered attachments per post (bounded by `limit`, so N+1 is fine).
+        let mut mstmt = conn.prepare(
+            "SELECT ordinal, kind, image_url, content_hash, local_path
+             FROM community_post_media WHERE post_pk = ?1 ORDER BY ordinal",
+        )?;
+        for p in &mut posts {
+            p.media = mstmt
+                .query_map(params![p.id], |r| {
+                    Ok(PostMediaRow {
+                        ordinal: r.get(0)?,
+                        kind: r.get(1)?,
+                        image_url: r.get(2)?,
+                        content_hash: r.get(3)?,
+                        local_path: r.get(4)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+        }
+        Ok(posts)
     }
 
     /// Aggregate counts and byte totals across the whole database for the Stats view.
@@ -1561,6 +2006,63 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Like [`Self::replace_schedule_source`], but also returns what changed among
+    /// the monitor's UPCOMING (future) segments for this source, so the caller can
+    /// emit `schedule_added` / `schedule_updated` notifications. Compares the
+    /// future, non-canceled segments (keyed by `start_time`) before and after the
+    /// replace. Pure title-fill (blank → real title, category unchanged) is
+    /// suppressed as noise. Time-moves surface as an "added" at the new instant
+    /// (the old instant silently drops).
+    pub fn replace_schedule_source_diffed(
+        &self,
+        monitor_id: i64,
+        source: &str,
+        segs: &[ScheduleSegment],
+    ) -> Result<Vec<ScheduleChange>> {
+        let now = now_unix();
+        let snapshot = |store: &Store| -> std::collections::HashMap<i64, (String, String)> {
+            store
+                .schedule_segments_for_source(monitor_id, source)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|s| s.start_time > now) // only future occurrences are notify-worthy
+                .map(|s| (s.start_time, (s.title, s.category)))
+                .collect()
+        };
+        let before = snapshot(self);
+        self.replace_schedule_source(monitor_id, source, segs)?;
+        let after = snapshot(self);
+
+        let mut changes = Vec::new();
+        for (start, (title, category)) in &after {
+            match before.get(start) {
+                None => changes.push(ScheduleChange {
+                    added: true,
+                    start_time: *start,
+                    title: title.clone(),
+                    category: category.clone(),
+                }),
+                Some((old_title, old_cat)) => {
+                    if old_title == title && old_cat == category {
+                        continue; // unchanged
+                    }
+                    // Suppress pure title-fill (a blank title just got filled in,
+                    // category unchanged) — not a user-meaningful "update".
+                    if old_title.is_empty() && old_cat == category {
+                        continue;
+                    }
+                    changes.push(ScheduleChange {
+                        added: false,
+                        start_time: *start,
+                        title: title.clone(),
+                        category: category.clone(),
+                    });
+                }
+            }
+        }
+        Ok(changes)
     }
 
     /// Delete a monitor's UPCOMING (future) schedule segments from every source
@@ -3520,5 +4022,186 @@ mod tests {
         assert!(store.community_post_get(mid, "1111").unwrap().is_none());
         // The other monitor's archive is untouched.
         assert_eq!(store.community_post_count(mid2).unwrap(), 1);
+    }
+
+    #[test]
+    fn notification_insert_dedup_read_and_prune() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        let mk = |kind: &str, ref_key: &str| NewNotification {
+            kind: kind.into(),
+            severity: "info".into(),
+            title: "T".into(),
+            body: "B".into(),
+            monitor_id: Some(mid),
+            channel: "Streamer".into(),
+            ref_key: ref_key.into(),
+            ..Default::default()
+        };
+
+        // First insert of a keyed notification returns an id and is unread.
+        let id = store.insert_notification(&mk("went_live", "wentlive:1:s")).unwrap();
+        assert!(id.is_some());
+        assert_eq!(store.unread_notification_count().unwrap(), 1);
+
+        // Re-inserting the SAME ref_key is a silent no-op (dedup).
+        assert!(store.insert_notification(&mk("went_live", "wentlive:1:s")).unwrap().is_none());
+        assert_eq!(store.list_notifications(100).unwrap().len(), 1);
+
+        // Empty ref_key never dedups — two distinct rows.
+        assert!(store.insert_notification(&mk("error", "")).unwrap().is_some());
+        assert!(store.insert_notification(&mk("error", "")).unwrap().is_some());
+        assert_eq!(store.list_notifications(100).unwrap().len(), 3);
+        assert_eq!(store.unread_notification_count().unwrap(), 3);
+
+        // Round-trip fields + newest-first order.
+        let rows = store.list_notifications(100).unwrap();
+        assert_eq!(rows[0].kind, "error"); // most recent inserts
+        assert_eq!(rows[2].kind, "went_live");
+        assert_eq!(rows[2].channel, "Streamer");
+        assert_eq!(rows[2].monitor_id, Some(mid));
+
+        // Mark-all-read-before(now) zeroes the badge.
+        let updated = store.mark_notifications_read_before(now_unix()).unwrap();
+        assert_eq!(updated, 3);
+        assert_eq!(store.unread_notification_count().unwrap(), 0);
+
+        // Retention: fresh rows (created_at == now) survive a 90-day prune…
+        assert_eq!(store.prune_notifications(90).unwrap(), 0);
+        assert_eq!(store.list_notifications(100).unwrap().len(), 3);
+        // …but a row backdated past the window is deleted (only the old one).
+        let old = now_unix() - 100 * 86_400;
+        store
+            .db()
+            .execute("UPDATE notification SET created_at = ?1 WHERE kind = 'went_live'", params![old])
+            .unwrap();
+        assert_eq!(store.prune_notifications(90).unwrap(), 1);
+        assert_eq!(store.list_notifications(100).unwrap().len(), 2);
+
+        // Deleting a monitor keeps its notifications but nulls the FK (SET NULL),
+        // and the denormalized channel string stays meaningful.
+        let nid = store.insert_notification(&mk("youtube_post", "post:2:s")).unwrap();
+        assert!(nid.is_some());
+        let before = store.list_notifications(100).unwrap().len();
+        store.delete_monitor(mid).unwrap();
+        let rows = store.list_notifications(100).unwrap();
+        assert_eq!(rows.len(), before, "SET NULL keeps rows (not CASCADE)");
+        assert!(rows.iter().all(|r| r.monitor_id.is_none()), "FK nulled");
+        assert!(rows.iter().all(|r| r.channel == "Streamer"), "channel preserved");
+    }
+
+    #[test]
+    fn schedule_diff_reports_added_updated_and_suppresses_title_fill() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        let base = now_unix() + 100_000;
+        let seg = |start: i64, title: &str, cat: &str| ScheduleSegment {
+            id: 0,
+            monitor_id: 0,
+            start_time: start,
+            end_time: None,
+            title: title.into(),
+            category: cat.into(),
+            canceled: false,
+            video_id: None,
+        };
+
+        // First run: everything is new → all "added".
+        let ch = store
+            .replace_schedule_source_diffed(mid, "platform", &[seg(base, "A", "Cat1"), seg(base + 60, "B", "")])
+            .unwrap();
+        assert_eq!(ch.len(), 2);
+        assert!(ch.iter().all(|c| c.added));
+
+        // Second run: retitle the first, leave the second, add a third.
+        let ch = store
+            .replace_schedule_source_diffed(
+                mid,
+                "platform",
+                &[seg(base, "A2", "Cat1"), seg(base + 60, "B", ""), seg(base + 120, "C", "")],
+            )
+            .unwrap();
+        // t=base retitled → updated; t=base+60 unchanged → absent; t=base+120 new → added.
+        assert_eq!(ch.len(), 2);
+        let updated = ch.iter().find(|c| c.start_time == base).unwrap();
+        assert!(!updated.added && updated.title == "A2");
+        let added = ch.iter().find(|c| c.start_time == base + 120).unwrap();
+        assert!(added.added && added.title == "C");
+
+        // Third run: only a blank→real title fill (category unchanged) → suppressed.
+        store
+            .replace_schedule_source_diffed(mid, "platform", &[seg(base + 180, "", "")])
+            .unwrap();
+        let ch = store
+            .replace_schedule_source_diffed(mid, "platform", &[seg(base + 180, "Filled", "")])
+            .unwrap();
+        assert!(ch.is_empty(), "pure title-fill must be suppressed");
+
+        // A category change on top of a fill IS reported (not pure title-fill).
+        let ch = store
+            .replace_schedule_source_diffed(mid, "platform", &[seg(base + 180, "Filled", "NewCat")])
+            .unwrap();
+        assert_eq!(ch.len(), 1);
+        assert!(!ch[0].added && ch[0].category == "NewCat");
+    }
+
+    #[test]
+    fn community_post_full_upsert_media_and_list() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        let post = |id: &str, body: &str| NewCommunityPost {
+            monitor_id: mid,
+            channel_id: cid,
+            post_id: id.into(),
+            author: "Streamer".into(),
+            published_text: "2 days ago".into(),
+            body_text: body.into(),
+            ..Default::default()
+        };
+
+        // First upsert → new; attach two ordered images.
+        let (pk, is_new) = store.community_post_upsert_full(&post("p1", "hello")).unwrap();
+        assert!(is_new);
+        store.community_post_media_upsert(pk, 0, "image", "u0", "h0", "C:/0").unwrap();
+        store.community_post_media_upsert(pk, 1, "image", "u1", "h1", "C:/1").unwrap();
+
+        // Re-upsert same post_id → NOT new (updates body, preserves first_seen).
+        let (pk2, is_new2) = store.community_post_upsert_full(&post("p1", "edited")).unwrap();
+        assert_eq!(pk2, pk);
+        assert!(!is_new2);
+
+        // A different post_id → new.
+        let (_, is_new3) = store.community_post_upsert_full(&post("p2", "second")).unwrap();
+        assert!(is_new3);
+
+        // Global list (newest first): p2 then p1; p1 carries its 2 ordered images.
+        let rows = store.list_community_posts(None, 100).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].post_id, "p2");
+        assert_eq!(rows[1].post_id, "p1");
+        assert_eq!(rows[1].body_text, "edited", "body refreshed on re-upsert");
+        assert_eq!(rows[1].channel, "Streamer", "denormalized channel name via join");
+        assert_eq!(rows[1].media.len(), 2);
+        assert_eq!(rows[1].media[0].local_path, "C:/0");
+        assert_eq!(rows[1].media[1].local_path, "C:/1");
+
+        // Per-channel list filters to that monitor.
+        assert_eq!(store.list_community_posts(Some(mid), 100).unwrap().len(), 2);
+
+        // Deleting the monitor cascades to posts + media.
+        store.delete_monitor(mid).unwrap();
+        assert!(store.list_community_posts(None, 100).unwrap().is_empty());
     }
 }
