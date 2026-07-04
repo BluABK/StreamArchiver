@@ -2195,7 +2195,7 @@ impl Store {
     }
 
     /// Failed, aborted, or orphaned recordings that are not already caught by
-    /// [`recordings_needing_remux`] (ts-in-cache). Returns newest-first, up to 200.
+    /// [`Self::recordings_needing_remux`] (ts-in-cache). Returns newest-first, up to 200.
     ///
     /// Excludes orphaned recordings that have a non-TS final output path — those
     /// are intact files where the app crashed after the capture finished but before
@@ -2346,7 +2346,7 @@ impl Store {
         .optional()
     }
 
-    /// Read the current [`SubdirConfig`] from app settings.
+    /// Read the current [`crate::models::SubdirConfig`] from app settings.
     pub fn subdir_config(&self) -> crate::models::SubdirConfig {
         let enabled = self.get_setting(crate::models::K_FILE_SPLIT_ENABLED)
             .ok().flatten().map_or(false, |v| v == "1");
@@ -2365,7 +2365,7 @@ impl Store {
         }
     }
 
-    /// Read the current [`RemuxOpts`] from app settings.
+    /// Read the current [`crate::models::RemuxOpts`] from app settings.
     pub fn remux_opts(&self) -> crate::models::RemuxOpts {
         let bool_setting = |key: &str| {
             self.get_setting(key).ok().flatten().map_or(false, |v| v == "1")

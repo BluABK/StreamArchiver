@@ -27,6 +27,9 @@ small.
 - **Optional, for YouTube live capture-from-start:** a SABR-capable `yt-dlp` dev
   build, a JS runtime (Node), and a GVS PO-token provider (bgutil). See
   [YouTube live capture-from-start (SABR)](#youtube-live-capture-from-start-sabr).
+- **Optional, for watching recordings while they record:** [mpv](https://mpv.io)
+  as the configured media player. See
+  [Watching in a media player](#watching-in-a-media-player).
 
 ## Build & run
 
@@ -77,6 +80,15 @@ alongside it (**tool**, **quality**, **auth**, output folder, filename template,
 extra args), and click **Download**. Output is always **MKV** (yt-dlp remuxes to
 MKV; streamlink/ffmpeg capture to `.ts` then remux). Downloads share the same
 global concurrency limit as live recordings.
+
+> **YouTube note:** YouTube now refuses VOD media to clients without a **PO
+> token** (downloads would fail with `HTTP Error 403` right after a successful
+> extraction). Video downloads therefore automatically use the bgutil PO-token
+> provider when configured — the same **PO token extractor-args** setting as
+> [SABR](#youtube-live-capture-from-start-sabr) — together with a
+> still-served player client (`mweb`). Both are appended *before* your extra
+> args, so a per-download or global `--extractor-args youtube:…` can override
+> them if YouTube's client landscape shifts again.
 
 **List formats.** Click **List formats** to probe the URL with the selected tool
 (`yt-dlp --list-formats`, streamlink's stream list, or `ffprobe`) and show the
@@ -175,10 +187,12 @@ confirmed.
 
 Left-click a row to select it; **right-click** any row — channel, instance,
 stream, or take — for a context menu with that row's actions. For an instance:
-Start/Stop recording, **Open channel URL** (browser), **Open output folder** (file
-manager), **Copy URL**, Edit…, Add tool instance, Enable/Disable, and Delete. A
-stream/take row's menu offers Open folder / Open file / Copy path (and Delete for
-a take). The inline per-row buttons (▶/⏹ ✏ ➕ 🗑) do the same.
+Start/Stop recording, **Stream in player** / **Play new instance** (see
+[Watching in a media player](#watching-in-a-media-player)), **Open channel URL**
+(browser), **Open output folder** (file manager), **Copy URL**, Edit…, Add tool
+instance, Enable/Disable, and Delete. A stream/take row's menu offers Open folder
+/ Open file / Stream in player / Play new instance / Copy path (and Delete for
+a take). The inline per-row buttons (▶/⏹ ⏵ ▷ ✏ ➕ 🗑) do the same.
 
 The inline **Actions** column can be hidden via **Settings → Display → Show
 Actions column** (applies to the Streams and Videos tables) to reclaim width — the
@@ -196,6 +210,67 @@ Keyboard shortcuts:
 | `Esc` | Close the open dialog |
 
 Deleting always asks for confirmation (the recorded files are kept either way).
+
+### Watching in a media player
+
+Set **Settings → Defaults → Media player path** to a player binary (e.g.
+`C:\Progs\mpv\mpv.exe`) and every recording row — instance, stream, and take —
+gains two playback actions, as inline buttons and context-menu entries:
+
+- **⏵ Stream in player** — open *this* recording in the player. For a finished
+  take that's simply the output file; for an **in-progress** recording it opens
+  the growing capture straight out of `.cache\`, so you can watch a recording
+  **from the start while it is still being captured**. On the instance and
+  stream rows it prefers the active capture and falls back to the most recent
+  finished file.
+- **▷ Play new instance** — tune into the channel **at the live edge**, like
+  opening the stream in a browser, without touching the recording (and without
+  needing one to be running).
+
+[mpv](https://mpv.io) is strongly recommended — the app hands it live-viewing
+flags (`appending://` growing-file URLs, `--keep-open`, a generated live HLS
+playlist for SABR) that other players don't understand; the SABR cases below
+are **mpv-only** and their buttons say so when disabled. Any player opens
+finished files. With no player configured the buttons are disabled and **Open
+file** falls back to the Windows file association.
+
+| Row state | ⏵ Stream in player | ▷ Play new instance |
+|---|---|---|
+| Finished take | opens the output file (any player) | live-edge stream, if the channel is live |
+| Recording — Twitch / HLS (`.ts`) | the growing `.ts`, from the start; mpv follows it as it grows | streamlink pipes the live edge to the player (`--player`) |
+| Recording — YouTube SABR | the two growing SABR files merged in mpv (**mpv only**) | throwaway live-edge download served as live HLS (**mpv only**) |
+| YouTube, not recording | most recent finished file | live-edge preview download (**mpv only**) |
+
+**⏵ during a SABR capture.** Until the stream ends, a SABR capture is not one
+playable file — it's two separate growing per-format files (video + audio; see
+[the SABR section](#watching-sabr-captures--live-edge-previews)). ⏵ detects
+the pair and launches mpv with the video as an `appending://` main file and
+the audio attached as an external track, playing in sync from the capture's
+start. Non-mpv players can't merge the pair, so the button stays disabled for
+them (a dual-capture monitor falls back to its DASH companion's `.ts` instead).
+
+**▷ on YouTube.** SABR live streams can't be piped to a player or opened by
+URL (stock yt-dlp sees no formats for them), and seeking a multi-GB growing
+capture to its end means a minutes-long linear scan — so ▷ starts a small
+**throwaway live-edge download** under `%TEMP%\streamarchiver-preview\` and
+serves it to mpv as a **locally generated live HLS playlist** that follows the
+download as it grows. The player opens once the stream has buffered (~10–30 s;
+the status bar says so). Closing the player stops the download and deletes the
+temp folder. This path reuses the capture-from-start SABR setup (dev build +
+PO-token provider) and downloads the stream a second time while you watch —
+the same bandwidth as watching in a browser. Twitch needs none of this:
+streamlink feeds the player natively.
+
+Caveats:
+
+- Seeking to the live edge of a *long* in-progress capture from ⏵ is slow (a
+  growing file has no seek index, so the player scans linearly). That's what ▷
+  is for — it starts *at* the edge.
+- ▷'s timeline covers only what the preview has downloaded since you clicked,
+  not the whole broadcast; use ⏵ for the recorded-so-far part.
+- The preview download is killed when the player closes. If the app exits
+  first, the downloader ends on its own when the stream does, and stale
+  preview folders are swept on a later preview.
 
 ### Detection methods
 
@@ -765,6 +840,34 @@ formats (configurable via *DASH companion format*) from the live edge — alongs
 the SABR capture. The two produce **two recordings** that belong to the **same
 take** (labelled `· SABR` / `· DASH` in the history tree); a single **Stop** ends
 both. Use it only when the formats you want are split across both protocols.
+
+#### Watching SABR captures & live-edge previews
+
+Mid-capture, a SABR recording on disk is **two separate growing files** — one
+per selected format (video + audio), each a progressively-appended fragmented
+MP4 or Matroska (`….f<id>….sq<N>.part`) — plus small `.state` resume sidecars.
+The single MKV only exists after the stream ends and the merge runs, so there
+is no one file to just "open". The player features handle this
+(full behavior in [Watching in a media player](#watching-in-a-media-player)):
+
+- **⏵ Stream in player** finds the growing pair and merges it *in mpv*: the
+  video file plays via mpv's `appending://` protocol (which follows a growing
+  file) with the audio file attached as an external track — watchable from the
+  capture's very start, including deep-rewound footage, while the download
+  continues.
+- **▷ Play new instance** runs a second, throwaway SABR download from the
+  **live edge** into `%TEMP%\streamarchiver-preview\` and plays it as a
+  **locally generated live HLS playlist**: the app walks the growing files'
+  fragment structure, coalesces it into byte-range segments, and rewrites the
+  playlists every couple of seconds (ending them properly when the stream
+  ends). A live HLS playlist is the one local transport a player follows at
+  the live edge indefinitely — plain growing-file playback stalls once it
+  catches up. The preview prefers H.264/mp4 + m4a formats because HLS can't
+  address Matroska; a VP9-only pick falls back to direct `appending://`
+  playback, which plays but stops at the edge.
+
+Both SABR paths are **mpv-only**; other players get the DASH companion's `.ts`
+(dual capture) or finished files only.
 
 ## Data & locations
 

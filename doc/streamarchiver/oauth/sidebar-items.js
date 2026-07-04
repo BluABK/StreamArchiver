@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["DEVICE_URL","K_EXPIRY","K_LOGIN","K_REFRESH","K_USER_ID","K_USER_TOKEN","SCOPES","TOKEN_URL","USERS_URL"],"enum":["AuthFlow"],"fn":["connected_login","connected_user_id","disconnect","fetch_user","fetch_user_once","poll_token","refresh","start_device","store_tokens","valid_user_token"],"struct":["DeviceCode","Tokens"]};

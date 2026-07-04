@@ -1,4 +1,4 @@
-//! Build identity, baked in at compile time by [`build.rs`].
+//! Build identity, baked in at compile time by `build.rs`.
 //!
 //! [`build_id`] is stamped into every detached download's registry row
 //! (`detached_process.spawn_build`) so a later launch knows exactly which build

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["SINGLE_INSTANCE_PORT"],"fn":["acquire_single_instance","app_icon_rgba","kill_process_tree","open_path","pid_alive","process_start_time","set_hidden","to_wide","tray_icon_image","wait_pid"],"struct":["AutoStart","DetachedJob"]};

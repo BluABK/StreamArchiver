@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["CONNECT_TIMEOUT","WS_URL"],"fn":["log_twitch_chat","parse_privmsg","session","wait_stopped"],"static":["NICK_SEQ"],"struct":["ChatLine"]};

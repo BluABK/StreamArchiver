@@ -411,7 +411,7 @@ impl AppCore {
     /// tools are spawned detached (no `kill_on_drop`, into a job without
     /// kill-on-close) and each one persisted a `detached_process` registry row at
     /// spawn, dropping the supervisor tasks leaves them recording; the next launch
-    /// re-attaches via [`crate::downloader::Supervisor::reattach_inflight`].
+    /// re-attaches via [`crate::downloader::Supervisor::resume_inflight`].
     pub fn detach_all(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
         let n = self.active.lock().unwrap().len()

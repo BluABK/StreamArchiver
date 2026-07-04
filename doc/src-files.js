@@ -1,2 +1,2 @@
-createSrcSidebar('[["rust_out",[""]]]');
-//{"start":19,"fragment_lengths":[17]}
+createSrcSidebar('[["streamarchiver",["",[],["app_core.rs","app_paths.rs","assets.rs","browser_ua.rs","chat.rs","compat.rs","detectors.rs","downloader.rs","emoji.rs","emote_anim.rs","events.rs","eventsub.rs","fonts.rs","google_oauth.rs","hls_preview.rs","imports.rs","main.rs","models.rs","notifications.rs","oauth.rs","platform.rs","schedule_ocr.rs","schedule_source.rs","scheduler.rs","store.rs","ui.rs","version.rs","watchdog.rs","websub.rs"]]],["streamarchiver",["",[],["app_core.rs","app_paths.rs","assets.rs","chat.rs","compat.rs","detectors.rs","downloader.rs","emoji.rs","emote_anim.rs","events.rs","eventsub.rs","fonts.rs","google_oauth.rs","imports.rs","main.rs","models.rs","notifications.rs","oauth.rs","platform.rs","schedule_ocr.rs","schedule_source.rs","scheduler.rs","store.rs","ui.rs","version.rs","watchdog.rs","websub.rs"]]]]');
+//{"start":19,"fragment_lengths":[428,396]}

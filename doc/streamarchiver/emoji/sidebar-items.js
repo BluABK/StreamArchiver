@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["TWEMOJI_VER","VS16","ZWJ"],"fn":["cache_key","codepoints","is_emoji_base","is_modifier","is_regional","is_skin_tone","segment","twemoji_url","twemoji_url_candidates"]};

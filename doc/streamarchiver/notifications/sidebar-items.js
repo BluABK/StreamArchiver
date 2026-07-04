@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["K_NOTIFICATIONS","POWERSHELL_AUMID"],"fn":["content_for","content_for_url","enabled","file_uri","handle","run","send_test_toast","show_toast","xml_escape"],"struct":["ToastAction","ToastContent"]};

@@ -2116,7 +2116,7 @@ async fn refresh_ad_free_once(
     }
 }
 
-/// Load the persisted OCR re-check cadence stamps (see [`K_OCR_LAST_ATTEMPT`])
+/// Load the persisted OCR re-check cadence stamps (see [`crate::models::K_OCR_LAST_ATTEMPT`])
 /// into the in-memory map keyed by `(monitor_id, source_id)`. Mirrors the
 /// byte-hash cache restore so the slow OCR cadence is enforced across restarts,
 /// not just within one session.

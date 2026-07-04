@@ -729,7 +729,7 @@ pub struct StreamArchiverApp {
     /// is (open/rename/refetch/close).
     channel_emote_counts: HashMap<i64, [(EmoteProvider, usize); 4]>,
     /// Per-platform asset-status rows for the open Properties window, keyed by channel
-    /// id. Cached for the same reason as [`channel_emote_counts`]: each row is built from
+    /// id. Cached for the same reason as `channel_emote_counts`: each row is built from
     /// blocking filesystem I/O (`read_dir` + per-file `metadata` + full JSON manifest
     /// parse), and the status grid is rebuilt every frame — so doing the I/O per frame is
     /// dozens of syscalls per repaint and can freeze the UI thread on slow/AV-scanned

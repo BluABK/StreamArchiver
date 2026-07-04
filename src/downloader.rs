@@ -420,7 +420,7 @@ fn extract_yt_video_id(url: &str) -> Option<String> {
 /// Channel URLs (/@handle, /channel/UC…, /c/name, /user/name) are resolved to
 /// their /live variant so yt-dlp goes straight to the active stream instead of
 /// enumerating the whole channel. Specific-video URLs (watch?v=, youtu.be/,
-/// /live/<id>) and already-suffixed /live URLs are left unchanged.
+/// `/live/<id>`) and already-suffixed /live URLs are left unchanged.
 pub(crate) fn youtube_live_url(url: &str) -> String {
     let u = url.trim_end_matches('/');
     let is_specific = u.contains("/watch?")

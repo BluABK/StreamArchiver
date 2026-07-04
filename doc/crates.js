@@ -1,2 +1,2 @@
-window.ALL_CRATES = ["rust_out"];
-//{"start":21,"fragment_lengths":[10]}
+window.ALL_CRATES = ["streamarchiver"];
+//{"start":21,"fragment_lengths":[16]}

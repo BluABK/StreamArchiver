@@ -511,7 +511,7 @@ fn run_headless(secs: u64) -> Result<()> {
 
 /// `--manual-test <monitor_id> <secs>` exercises the on-demand Start/Stop path:
 /// it DISABLES the monitor (so the scheduler won't touch it), then manually
-/// Starts it, records for <secs>, and Stops it.
+/// Starts it, records for `<secs>`, and Stops it.
 fn run_manual_test(id: i64, secs: u64) -> Result<()> {
     use events::ManualCommand;
     let store = Store::open(&app_paths::db_path()).context("opening data store")?;

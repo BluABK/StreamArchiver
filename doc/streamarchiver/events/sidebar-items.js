@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["TOGGLEABLE_JOBS"],"enum":["AppEvent","BackgroundTaskKind","ManualCommand","TaskOutcome","UiCommand"],"fn":["bus","job_registry","mark_job","next_task_id"],"static":["NEXT_TASK_ID"],"struct":["BackgroundTask","LiveSignal","ScheduledJob"],"type":["EventRx","EventTx","JobRegistry"]};

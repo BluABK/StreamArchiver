@@ -290,7 +290,7 @@ pub enum ManualCommand {
     /// Download missing thumbnails for recordings; if `embed` is true, immediately
     /// embed them into the MKV after download.
     FetchMissingThumbnails { embed: bool },
-    /// Reorganize all recordings according to the current [`SubdirConfig`].
+    /// Reorganize all recordings according to the current [`crate::models::SubdirConfig`].
     ReorganizeAll,
     /// Reorganize all recordings belonging to a specific take group (by recording id).
     ReorganizeTake(i64),

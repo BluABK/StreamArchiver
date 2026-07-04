@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["asset_cache_dir","data_dir","db_path","default_output_dir","logs_dir","platform_assets_dir"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MIN_DELAY","TARGET_PX"],"enum":["EmoteLoad"],"fn":["collect_frames","decode","downscale","upload"],"struct":["EmoteAnim"]};

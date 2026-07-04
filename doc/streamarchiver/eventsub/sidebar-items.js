@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["HELIX","IDLE_RETRY","WS_URL"],"fn":["app_credentials","app_token","bind_shard","ensure_conduit","existing_online_subs","handle_message","load_eventsub_monitors","parse_ts","read_welcome","reconcile","resolve_user_ids","run","run_session","subscribe_online","subscribe_online_ws","twitch_login","user_credentials"]};
