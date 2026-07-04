@@ -1406,41 +1406,55 @@ impl DetectContext {
                 Err(_) => continue,
             };
 
-            // Cache the author icon (best-effort) and record it on the row.
-            if !p.author_icon_url.is_empty()
-                && let Some((_, path)) = self.download_post_image(row, &p.author_icon_url).await
-            {
-                let _ = self.store.community_post_upsert_full(&crate::store::NewCommunityPost {
-                    monitor_id: row.monitor.id,
-                    channel_id: row.channel.id,
-                    post_id: p.post_id.clone(),
-                    author: p.author.clone(),
-                    author_icon: path.to_string_lossy().into_owned(),
-                    published_text: p.published_text.clone(),
-                    body_text: p.body_text.clone(),
-                    links_json: p.links_json.clone(),
-                    vote_count: p.vote_count.clone(),
-                    raw_json: p.raw_json.clone(),
-                    ..Default::default()
-                });
-            }
-
-            // Download + record each attachment image, in order.
+            // Download the images/avatar only for a newly-seen post (or one whose
+            // media somehow wasn't cached yet). `download_post_image` always
+            // re-fetches the bytes to hash them, so re-downloading an existing
+            // post's images on every 6 h re-scan would be pure wasted traffic —
+            // gate it so steady-state re-scans make no image requests at all.
+            let need_media =
+                is_new || self.store.community_post_media_count(pk).unwrap_or(0) == 0;
             let mut first_image: Option<String> = None;
-            for (ordinal, url) in p.image_urls.iter().enumerate() {
-                if let Some((hash, path)) = self.download_post_image(row, url).await {
-                    let local = path.to_string_lossy().into_owned();
-                    if first_image.is_none() {
-                        first_image = Some(local.clone());
+            if need_media {
+                // Cache the author icon (best-effort) and record it on the row.
+                if !p.author_icon_url.is_empty()
+                    && let Some((_, path)) = self.download_post_image(row, &p.author_icon_url).await
+                {
+                    let _ = self.store.community_post_upsert_full(&crate::store::NewCommunityPost {
+                        monitor_id: row.monitor.id,
+                        channel_id: row.channel.id,
+                        post_id: p.post_id.clone(),
+                        author: p.author.clone(),
+                        author_icon: path.to_string_lossy().into_owned(),
+                        published_text: p.published_text.clone(),
+                        body_text: p.body_text.clone(),
+                        links_json: p.links_json.clone(),
+                        vote_count: p.vote_count.clone(),
+                        raw_json: p.raw_json.clone(),
+                        ..Default::default()
+                    });
+                }
+
+                // Download + record each attachment image, in order. A small
+                // randomized delay between images makes an image-heavy post's
+                // first fetch look like a page loading its images progressively
+                // rather than a scripted download loop.
+                for (ordinal, url) in p.image_urls.iter().enumerate() {
+                    if let Some((hash, path)) = self.download_post_image(row, url).await {
+                        let local = path.to_string_lossy().into_owned();
+                        if first_image.is_none() {
+                            first_image = Some(local.clone());
+                        }
+                        let _ = self.store.community_post_media_upsert(
+                            pk,
+                            ordinal as i64,
+                            "image",
+                            url,
+                            &hash,
+                            &local,
+                        );
+                        tokio::time::sleep(Duration::from_millis(150 + spread_rand_u64() % 500))
+                            .await;
                     }
-                    let _ = self.store.community_post_media_upsert(
-                        pk,
-                        ordinal as i64,
-                        "image",
-                        url,
-                        &hash,
-                        &local,
-                    );
                 }
             }
 
@@ -2298,57 +2312,112 @@ fn persist_schedule_fetched(store: &Store, map: &HashMap<i64, i64>) {
     }
 }
 
-/// Background task: periodically fetch YouTube community posts for the posts
-/// feed. Independent of the schedule-OCR scan (which only runs when the
-/// community-OCR source is enabled). Runs a full pass over all YouTube channels
-/// every ~6 h; gated by the `job_community_posts` toggle (Background view).
+/// Background task: fetch YouTube community posts for the posts feed. Gated by
+/// the `job_community_posts` toggle (Background view); independent of the
+/// schedule-OCR scan.
+///
+/// The fetches are **trickled one channel at a time, spread across the whole
+/// cycle** (with a randomized start and jittered gaps), rather than bursted.
+/// There is deliberately no "fetch every channel now" pass, so a fresh launch
+/// or a just-flipped toggle never produces a scrape burst — from YouTube's side
+/// it looks like a person occasionally opening a community tab, not a crawler.
+/// A full rotation of all channels takes roughly `CYCLE_SECS`, so each channel
+/// is still revisited about every 6 h on average.
 pub async fn refresh_community_posts(
     ctx: Arc<DetectContext>,
     events: EventTx,
     shutdown: Arc<AtomicBool>,
     jobs: crate::events::JobRegistry,
 ) {
-    const INITIAL_DELAY_SECS: u64 = 45;
-    const TICK_SECS: u64 = 6 * 3600;
+    const CYCLE_SECS: u64 = 6 * 3600; // ~how often each channel is revisited
+    const MIN_GAP_SECS: u64 = 90; // never fetch two channels closer than this
+    const IDLE_POLL_SECS: u64 = 300; // toggle re-check when disabled / no channels
 
-    sleep_cancellable(Duration::from_secs(INITIAL_DELAY_SECS), &shutdown).await;
+    // Randomized settle delay so the first fetch never lands at a fixed offset
+    // after launch.
+    sleep_cancellable(Duration::from_secs(rand_range_secs(90, 420)), &shutdown).await;
+
+    // Round-robin queue of channels, rebuilt + reshuffled each rotation so the
+    // order (and thus the traffic pattern) isn't predictable.
+    let mut queue: Vec<MonitorWithChannel> = Vec::new();
+    let mut total: u64 = 1;
     loop {
         if shutdown.load(Ordering::SeqCst) {
             return;
         }
-        if ctx.store.job_enabled("job_community_posts") {
-            refresh_community_posts_once(&ctx, &events, &shutdown).await;
-            crate::events::mark_job(&jobs, "YouTube posts refresh", TICK_SECS as i64);
+        if !ctx.store.job_enabled("job_community_posts") {
+            sleep_cancellable(Duration::from_secs(IDLE_POLL_SECS), &shutdown).await;
+            continue;
         }
-        sleep_cancellable(Duration::from_secs(TICK_SECS), &shutdown).await;
+        if queue.is_empty() {
+            queue = youtube_channels_deduped(&ctx);
+            shuffle_channels(&mut queue);
+            total = (queue.len() as u64).max(1);
+        }
+        let Some(row) = queue.pop() else {
+            // No YouTube channels at all — nothing to fetch; check back later.
+            sleep_cancellable(Duration::from_secs(IDLE_POLL_SECS), &shutdown).await;
+            continue;
+        };
+
+        ctx.fetch_channel_posts(&row, &events).await;
+
+        // Spread one channel per (CYCLE / N) so a full rotation ≈ CYCLE, with a
+        // polite floor, then jitter ±40% so it isn't a fixed-interval metronome.
+        let base = (CYCLE_SECS / total).max(MIN_GAP_SECS);
+        let gap = jitter_secs(base, 40);
+        crate::events::mark_job(&jobs, "YouTube posts refresh", gap as i64);
+        sleep_cancellable(Duration::from_secs(gap), &shutdown).await;
     }
 }
 
-/// One posts pass: fetch every YouTube channel's community tab (de-duplicated
-/// per community URL), throttled between channels to stay polite.
-async fn refresh_community_posts_once(
-    ctx: &Arc<DetectContext>,
-    events: &EventTx,
-    shutdown: &Arc<AtomicBool>,
-) {
-    let rows = match ctx.store.list_monitors_with_channels() {
-        Ok(r) => r,
-        Err(_) => return,
-    };
+/// The YouTube monitors with channel info, de-duplicated per community URL (so
+/// multiple instances of one channel are fetched once).
+fn youtube_channels_deduped(ctx: &Arc<DetectContext>) -> Vec<MonitorWithChannel> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for row in &rows {
-        if shutdown.load(Ordering::SeqCst) {
-            return;
-        }
-        if row.monitor.platform() != Platform::YouTube {
-            continue;
-        }
-        // Multiple instances of one channel share a community tab — fetch once.
-        if !seen.insert(youtube_community_url(&row.monitor.url)) {
-            continue;
-        }
-        ctx.fetch_channel_posts(row, events).await;
-        sleep_cancellable(Duration::from_secs(3), shutdown).await;
+    ctx.store
+        .list_monitors_with_channels()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.monitor.platform() == Platform::YouTube)
+        .filter(|r| seen.insert(youtube_community_url(&r.monitor.url)))
+        .collect()
+}
+
+/// Cheap non-cryptographic randomness for traffic-spacing jitter (there is no
+/// `rand` crate in the tree). Seeds from the wall clock and runs it through the
+/// splitmix64 finalizer for a well-distributed value even when called close in
+/// time. Adequate for spreading requests; not for anything security-sensitive.
+fn spread_rand_u64() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut z = nanos.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// A random whole-second duration in `[lo, hi]`.
+fn rand_range_secs(lo: u64, hi: u64) -> u64 {
+    if hi <= lo {
+        return lo;
+    }
+    lo + spread_rand_u64() % (hi - lo + 1)
+}
+
+/// `base` seconds jittered by ±`pct`% (e.g. `pct = 40` → 60%..140% of `base`).
+fn jitter_secs(base: u64, pct: u64) -> u64 {
+    let span = base.saturating_mul(pct) / 100;
+    rand_range_secs(base.saturating_sub(span), base.saturating_add(span))
+}
+
+/// In-place Fisher–Yates shuffle using [`spread_rand_u64`].
+fn shuffle_channels(v: &mut [MonitorWithChannel]) {
+    for i in (1..v.len()).rev() {
+        let j = (spread_rand_u64() % (i as u64 + 1)) as usize;
+        v.swap(i, j);
     }
 }
 

@@ -1197,6 +1197,18 @@ impl Store {
         Ok(())
     }
 
+    /// Number of recorded attachments for a post — lets the fetch pass skip
+    /// re-downloading images for a post it has already fully cached.
+    pub fn community_post_media_count(&self, post_pk: i64) -> Result<i64> {
+        let conn = self.db();
+        let n = conn.query_row(
+            "SELECT COUNT(*) FROM community_post_media WHERE post_pk = ?1",
+            params![post_pk],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
     /// List community posts (newest `first_seen` first) with their ordered media.
     /// Global across all channels when `monitor_id` is `None`; per-channel when
     /// `Some`. Each row carries the denormalized channel name for the feed's
@@ -4176,6 +4188,10 @@ mod tests {
         assert!(is_new);
         store.community_post_media_upsert(pk, 0, "image", "u0", "h0", "C:/0").unwrap();
         store.community_post_media_upsert(pk, 1, "image", "u1", "h1", "C:/1").unwrap();
+        assert_eq!(store.community_post_media_count(pk).unwrap(), 2);
+        // Re-upserting the same ordinal is idempotent (no new row).
+        store.community_post_media_upsert(pk, 1, "image", "u1b", "h1", "C:/1b").unwrap();
+        assert_eq!(store.community_post_media_count(pk).unwrap(), 2);
 
         // Re-upsert same post_id → NOT new (updates body, preserves first_seen).
         let (pk2, is_new2) = store.community_post_upsert_full(&post("p1", "edited")).unwrap();
@@ -4195,7 +4211,8 @@ mod tests {
         assert_eq!(rows[1].channel, "Streamer", "denormalized channel name via join");
         assert_eq!(rows[1].media.len(), 2);
         assert_eq!(rows[1].media[0].local_path, "C:/0");
-        assert_eq!(rows[1].media[1].local_path, "C:/1");
+        // Ordinal 1 was re-upserted in place (update-on-conflict), not duplicated.
+        assert_eq!(rows[1].media[1].local_path, "C:/1b");
 
         // Per-channel list filters to that monitor.
         assert_eq!(store.list_community_posts(Some(mid), 100).unwrap().len(), 2);
