@@ -648,9 +648,41 @@ fn diff_emote_manifest(
     out
 }
 
+/// Retry a fallible async file operation up to 4 times with a short delay,
+/// tolerating a transient lock/access error (e.g. Windows Defender scanning a
+/// just-written file — the same CI flakiness `record_manifest_change`'s
+/// manifest-read retry already works around) rather than giving up on the
+/// first attempt. Returns the last error if every attempt fails.
+async fn retry_transient<F, Fut, T>(mut op: F) -> std::io::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
+    let mut last_err = None;
+    for attempt in 0..4u32 {
+        if attempt > 0 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.expect("loop always runs at least once"))
+}
+
 /// Append change records to the channel-platform `asset_changes.jsonl` (one JSON
 /// object per line, append-only). Best-effort: a write failure is swallowed — the
-/// history is a convenience layer and must never abort or fail an asset fetch.
+/// history is a convenience layer and must never abort or fail an asset fetch —
+/// but the *open* is retried a few times first (see [`retry_transient`]), since a
+/// transient lock failing silently here would drop change entries, not just log a
+/// harmless warning. Explicitly flushed before returning: `tokio::fs::File`
+/// dispatches writes to a background blocking-thread-pool task, and without an
+/// explicit flush a caller that immediately reads the file back (e.g. via
+/// `std::fs::read_to_string`, as the UI's synchronous `read_asset_changes` does)
+/// can race ahead of it — the write reports success while the bytes aren't
+/// visible yet, which is exactly what made this function's own test flaky under
+/// heavy parallel load (many tests contending for that same thread pool).
 async fn append_asset_changes(asset_dir: &Path, changes: &[AssetChange]) {
     if changes.is_empty() {
         return;
@@ -666,13 +698,12 @@ async fn append_asset_changes(asset_dir: &Path, changes: &[AssetChange]) {
         return;
     }
     use tokio::io::AsyncWriteExt;
-    if let Ok(mut f) = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(asset_dir.join("asset_changes.jsonl"))
-        .await
-    {
+    let path = asset_dir.join("asset_changes.jsonl");
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    if let Ok(mut f) = retry_transient(|| opts.open(&path)).await {
         let _ = f.write_all(buf.as_bytes()).await;
+        let _ = f.flush().await;
     }
 }
 
@@ -747,7 +778,7 @@ async fn record_manifest_change(asset_dir: &Path, provider: &str, new: &[EmoteMa
             n += 1;
             dest = hist.join(format!("{provider}_{at}_{n}.json"));
         }
-        let _ = tokio::fs::write(&dest, old_json.as_bytes()).await;
+        let _ = retry_transient(|| tokio::fs::write(&dest, old_json.as_bytes())).await;
     }
     append_asset_changes(asset_dir, &changes).await;
 }
