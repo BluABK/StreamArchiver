@@ -1200,6 +1200,16 @@ pub const K_DISCORD_SCHEDULE: &str = "discord_schedule";
 /// top-to-bottom per channel and the first to resolve a non-empty schedule wins.
 pub const K_SCHEDULE_SOURCES: &str = "schedule_sources";
 
+/// `app_settings` key for every grid table's persisted column order/visibility
+/// (JSON `{table_key -> Vec<ColumnEntry>}`); see [`crate::grid_columns`]. One
+/// flat map (not one key per table) so the Settings reset buttons can update
+/// every table atomically in a single row.
+pub const K_GRID_COLUMNS: &str = "grid_columns_v1";
+
+/// `app_settings` key for every grid table's persisted sort (JSON
+/// `{table_key -> PersistedSort}`); see [`crate::grid_columns`].
+pub const K_GRID_SORT: &str = "grid_sort_v1";
+
 /// `app_settings` key for per-channel schedule-source config (JSON map
 /// `{channel_id -> ChannelSourceConfig}`): Twitter/X handle, a manual schedule
 /// image path/URL, and per-channel OCR overrides. See [`crate::schedule_source`].

@@ -33,6 +33,7 @@ use crate::models::{
     group_recordings, now_unix,
 };
 use crate::google_oauth;
+use crate::grid_columns::{self, ColumnEntry, GridCol, GridState, GridTableId};
 use crate::imports::{self, ImportCandidate};
 use crate::oauth::{self, AuthFlow};
 use crate::platform::AutoStart;
@@ -824,6 +825,14 @@ pub struct StreamArchiverApp {
     /// Set to true by the "⇔ Fit columns" button; consumed in `channels_view`
     /// to call `TableBuilder::reset()` so columns revert to content-fit widths.
     reset_streams_columns: bool,
+    /// Persisted column order/visibility for every grid table (Streams, Videos,
+    /// Background Active/Recent, Processes, Issues); see [`crate::grid_columns`].
+    streams_grid: GridState,
+    videos_grid: GridState,
+    bg_active_grid: GridState,
+    bg_recent_grid: GridState,
+    processes_grid: GridState,
+    issues_grid: GridState,
     /// Currently running background tasks (asset fetches, thumbnail downloads).
     background_tasks: Vec<crate::events::BackgroundTask>,
     /// Completed/failed background tasks (task, outcome, finished-at unix), newest
@@ -1091,6 +1100,16 @@ impl StreamArchiverApp {
                 .collect();
         // Load user-defined filename presets before `core` is moved.
         let initial_custom_presets = core.store.get_filename_presets().unwrap_or_default();
+        // Load every grid table's persisted column order/visibility + sort
+        // before `core` is moved; see `crate::grid_columns`.
+        let streams_grid = GridState::load(&core.store, GridTableId::Streams, &STREAM_COLUMNS);
+        let streams_sort_persisted = grid_columns::load_sort(&core.store, GridTableId::Streams);
+        let videos_grid = GridState::load(&core.store, GridTableId::Videos, &VIDEO_COLUMNS);
+        let videos_sort_persisted = grid_columns::load_sort(&core.store, GridTableId::Videos);
+        let bg_active_grid = GridState::load(&core.store, GridTableId::BgActive, &BG_ACTIVE_COLUMNS);
+        let bg_recent_grid = GridState::load(&core.store, GridTableId::BgRecent, &BG_RECENT_COLUMNS);
+        let processes_grid = GridState::load(&core.store, GridTableId::Processes, &PROCESSES_COLUMNS);
+        let issues_grid = GridState::load(&core.store, GridTableId::Issues, &ISSUES_COLUMNS);
 
         let mut app = StreamArchiverApp {
             core,
@@ -1132,7 +1151,10 @@ impl StreamArchiverApp {
             confirm_delete_channel: None,
             confirm_delete_segment: None,
             channel_form: None,
-            streams_sort: SortState::default(),
+            streams_sort: {
+                let (col, ascending) = grid_columns::resolve_sort(&STREAM_COLUMNS, &streams_sort_persisted);
+                SortState { col, ascending }
+            },
             streams_filters: vec![String::new(); STREAM_COLS],
             expanded_channels: HashSet::new(),
             expanded_instances: HashSet::new(),
@@ -1196,7 +1218,10 @@ impl StreamArchiverApp {
             asset_history: None,
             provider_tex: None,
             channel_twitch_colors: HashMap::new(),
-            videos_sort: SortState::default(),
+            videos_sort: {
+                let (col, ascending) = grid_columns::resolve_sort(&VIDEO_COLUMNS, &videos_sort_persisted);
+                SortState { col, ascending }
+            },
             videos_filters: vec![String::new(); VIDEO_COLS],
             twitch_flow,
             google_flow,
@@ -1207,6 +1232,12 @@ impl StreamArchiverApp {
             render_emotes,
             animate_emotes,
             reset_streams_columns: false,
+            streams_grid,
+            videos_grid,
+            bg_active_grid,
+            bg_recent_grid,
+            processes_grid,
+            issues_grid,
             background_tasks: Vec::new(),
             finished_tasks: Vec::new(),
             job_toggles,
@@ -3827,61 +3858,98 @@ fn fmt_speed(bytes_per_sec: f64) -> String {
 // are still drawn by the existing per-row code, indexed by those original indices.
 // (The optional Actions column is skipped at render time, not in the model.)
 
-/// Sortable/filterable Videos columns (Video..File; excludes Actions).
-const VIDEO_COLS: usize = 9;
-
-/// One Streams-table column: header title, hover tooltip, minimum width, and
-/// whether it takes part in sort/filter (the Actions column doesn't). This list
-/// is the single source of truth for the `TableBuilder` columns, the header, and
-/// the per-row sort/filter model, so they can't drift — and an extra cell can't
-/// be emitted against a missing column width (which panics egui_extras).
-struct StreamCol {
-    title: &'static str,
-    tooltip: &'static str,
-    min_width: f32,
-    /// Starting (and clipped) width for content-capped columns whose value can be
-    /// long (the current Title / Game); the cell truncates to it and shows the
-    /// full text on hover. `0.0` = auto-size to content (the default).
-    initial: f32,
-    sortable: bool,
-}
-
-/// The Streams columns in display order: Actions and the platform-icon column sit
-/// just left of Name; the current Game/Title sit just right of State. Widths are
-/// floors — `Column::auto` shrinks tight columns to their content — except the
-/// `initial`-width columns, which start narrow and truncate (full value on hover).
-/// Column order: Auto · Actions · Plat · Name · Tool · Detection · Polled · State ·
-/// Next stream · Game · Title · ✏ (Changes) · 📢 (Ads) · Went Live · Started On ·
-/// Lost time · Duration · Ad-free · Added.
-const STREAM_COLUMNS: [StreamCol; 19] = [
-    StreamCol { title: "Auto",       tooltip: "Enable/disable monitoring. The channel checkbox and each instance checkbox are independent.", min_width: 36.0,  initial: 0.0,   sortable: true },
-    StreamCol { title: "Actions",    tooltip: "Per-row actions: start/stop recording, edit, add instance, open folder, delete.",            min_width: 126.0, initial: 0.0,   sortable: false },
-    StreamCol { title: "Plat",       tooltip: "Source platform (icon): Twitch, YouTube, Kick, or a generic URL. A channel shows every platform among its instances.", min_width: 52.0, initial: 0.0, sortable: true },
-    StreamCol { title: "Name",       tooltip: "Channel (container) name. Expand it to see its instances and recording history.",            min_width: 130.0, initial: 0.0,   sortable: true },
-    StreamCol { title: "Tool",  tooltip: "Capture tool: SL = streamlink, yt-dlp, ff = ffmpeg. Hover a row for the full name.", min_width: 36.0, initial: 0.0, sortable: true },
-    StreamCol { title: "⇄",    tooltip: "Detection method — how liveness is detected: ↺ = API poll, ⚡ = push event, ⌁ = scrape, ◉ = probe, C = CLI. Hover a row for the full method.", min_width: 24.0, initial: 0.0, sortable: true },
-    StreamCol { title: "Polled", tooltip: "When this instance was last checked. Compact mode shows HH:MM only; hover for the full timestamp.", min_width: 64.0, initial: 0.0, sortable: true },
-    StreamCol { title: "●",    tooltip: "Current monitor state. ⏺ = recording, ● = live (not recording), ○ = idle, ⚠ = failed, ⚡ = aborted.", min_width: 26.0, initial: 0.0, sortable: true },
-    StreamCol { title: "Next stream",tooltip: "Next scheduled stream (Twitch schedule / YouTube upcoming). Hover for its title; double-click for the full schedule.", min_width: 96.0, initial: 0.0, sortable: true },
-    StreamCol { title: "Game",       tooltip: "Current game / category of the most recent recording. Truncated — hover for the full name.", min_width: 60.0,  initial: 96.0,  sortable: true },
-    StreamCol { title: "Title",      tooltip: "Current stream title of the most recent recording. Truncated — hover for the full title.",   min_width: 80.0,  initial: 170.0, sortable: true },
-    StreamCol { title: "✏",          tooltip: "Title / game-category changes logged during the recording. Hover or double-click for the log.", min_width: 24.0, initial: 0.0, sortable: true },
-    StreamCol { title: "📢",         tooltip: "Ad breaks detected (Twitch + streamlink); each is a hard cut. Hover for count + total time; double-click for the cut list.", min_width: 24.0, initial: 0.0, sortable: true },
-    StreamCol { title: "Went Live",  tooltip: "When the stream went live on the platform (a trailing \"~\" means it's our approximate time).", min_width: 96.0, initial: 0.0,  sortable: true },
-    StreamCol { title: "Started On", tooltip: "When recording started.",                                                                    min_width: 92.0,  initial: 0.0,   sortable: true },
-    StreamCol { title: "Lost time",  tooltip: "How much of the start was missed. Drops to 0 once a from-start capture catches up to the live edge.", min_width: 52.0, initial: 0.0, sortable: true },
-    StreamCol { title: "Duration",   tooltip: "How long we've recorded (ticks while live).",                                               min_width: 56.0,  initial: 0.0,   sortable: true },
-    StreamCol { title: "Ad-free",    tooltip: "Marked or auto-detected ad-free (sub / Turbo / Premium) — captures have no ad-break cuts.", min_width: 54.0,  initial: 0.0,   sortable: true },
-    StreamCol { title: "Added",      tooltip: "When the channel was added.",                                                               min_width: 84.0,  initial: 0.0,   sortable: true },
+/// The Streams columns, in DEFAULT display order (the user's persisted order
+/// lives in `StreamArchiverApp.streams_grid`; see [`grid_columns::GridCol`]).
+/// Actions and the platform-icon column sit just left of Name by default; the
+/// current Game/Title sit just right of State. Widths are floors —
+/// `Column::auto` shrinks tight columns to their content — except the
+/// `initial`-width columns, which start narrow and truncate (full value on
+/// hover). Each `id` is a stable persistence key: never reuse or change one
+/// once shipped.
+const STREAM_COLUMNS: [GridCol; 19] = [
+    GridCol { id: "auto",        title: "Auto",       tooltip: "Enable/disable monitoring. The channel checkbox and each instance checkbox are independent.", min_width: 36.0,  initial: 0.0,   sortable: true,  stretch: false },
+    GridCol { id: "actions",     title: "Actions",    tooltip: "Per-row actions: start/stop recording, edit, add instance, open folder, delete.",            min_width: 126.0, initial: 0.0,   sortable: false, stretch: false },
+    GridCol { id: "platform",    title: "Plat",       tooltip: "Source platform (icon): Twitch, YouTube, Kick, or a generic URL. A channel shows every platform among its instances.", min_width: 52.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "name",        title: "Name",       tooltip: "Channel (container) name. Expand it to see its instances and recording history.",            min_width: 130.0, initial: 0.0,   sortable: true,  stretch: false },
+    GridCol { id: "tool",        title: "Tool",  tooltip: "Capture tool: SL = streamlink, yt-dlp, ff = ffmpeg. Hover a row for the full name.", min_width: 36.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "detection",   title: "⇄",    tooltip: "Detection method — how liveness is detected: ↺ = API poll, ⚡ = push event, ⌁ = scrape, ◉ = probe, C = CLI. Hover a row for the full method.", min_width: 24.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "polled",      title: "Polled", tooltip: "When this instance was last checked. Compact mode shows HH:MM only; hover for the full timestamp.", min_width: 64.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "state",       title: "●",    tooltip: "Current monitor state. ⏺ = recording, ● = live (not recording), ○ = idle, ⚠ = failed, ⚡ = aborted.", min_width: 26.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "next_stream", title: "Next stream",tooltip: "Next scheduled stream (Twitch schedule / YouTube upcoming). Hover for its title; double-click for the full schedule.", min_width: 96.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "game",        title: "Game",       tooltip: "Current game / category of the most recent recording. Truncated — hover for the full name.", min_width: 60.0,  initial: 96.0,  sortable: true, stretch: false },
+    GridCol { id: "title",       title: "Title",      tooltip: "Current stream title of the most recent recording. Truncated — hover for the full title.",   min_width: 80.0,  initial: 170.0, sortable: true, stretch: false },
+    GridCol { id: "changes",     title: "✏",          tooltip: "Title / game-category changes logged during the recording. Hover or double-click for the log.", min_width: 24.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "ads",         title: "📢",         tooltip: "Ad breaks detected (Twitch + streamlink); each is a hard cut. Hover for count + total time; double-click for the cut list.", min_width: 24.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "went_live",   title: "Went Live",  tooltip: "When the stream went live on the platform (a trailing \"~\" means it's our approximate time).", min_width: 96.0, initial: 0.0,  sortable: true, stretch: false },
+    GridCol { id: "started_on",  title: "Started On", tooltip: "When recording started.",                                                                    min_width: 92.0,  initial: 0.0,   sortable: true, stretch: false },
+    GridCol { id: "lost_time",   title: "Lost time",  tooltip: "How much of the start was missed. Drops to 0 once a from-start capture catches up to the live edge.", min_width: 52.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "duration",    title: "Duration",   tooltip: "How long we've recorded (ticks while live).",                                               min_width: 56.0,  initial: 0.0,   sortable: true, stretch: false },
+    GridCol { id: "ad_free",     title: "Ad-free",    tooltip: "Marked or auto-detected ad-free (sub / Turbo / Premium) — captures have no ad-break cuts.", min_width: 54.0,  initial: 0.0,   sortable: true, stretch: false },
+    GridCol { id: "added",       title: "Added",      tooltip: "When the channel was added.",                                                               min_width: 84.0,  initial: 0.0,   sortable: true, stretch: false },
 ];
 
 /// Total Streams columns (19 total, including the non-sortable Actions slot).
 const STREAM_COLS: usize = STREAM_COLUMNS.len(); // = 19
 
-/// Index of the optional Actions column in [`STREAM_COLUMNS`]. When the Actions
-/// column is hidden, this column is skipped in the builder, header, and every row
-/// renderer (kept in the sort/filter model — it's a non-sortable, empty slot).
-const STREAM_ACTIONS_COL: usize = 1;
+/// The Videos columns, in DEFAULT display order (mirrors `STREAM_COLUMNS`).
+/// The trailing Actions column (index `VIDEO_COLS`, 9) is non-sortable and
+/// gated by the existing Show Actions setting, same as Streams'.
+const VIDEO_COLUMNS: [GridCol; 10] = [
+    GridCol { id: "video",    title: "Video",    tooltip: "The video's title (or the URL until detected). Hover a row for the full URL.", min_width: 180.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "channel",  title: "Channel",  tooltip: "Uploader / channel name (filled when Auto-detect is on).", min_width: 110.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "platform", title: "Platform", tooltip: "Source platform: YouTube, Twitch, Kick, or a generic URL.", min_width: 86.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "tool",     title: "Tool",     tooltip: "Download tool: yt-dlp, streamlink, or ffmpeg.", min_width: 72.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "status",   title: "Status",   tooltip: "queued / downloading / completed / failed / stopped. Hover a failed row to see why.", min_width: 96.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "speed",    title: "Speed",    tooltip: "Current download speed (shown while downloading).", min_width: 82.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "size",     title: "Size",     tooltip: "Size of the output file (grows while downloading).", min_width: 72.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "added",    title: "Added",    tooltip: "When the download was added.", min_width: 80.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "file",     title: "File",     tooltip: "Output file path once written. Hover for the full path.", min_width: 160.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "actions",  title: "Actions",  tooltip: "Per-row actions: stop / retry, open file, open folder, copy URL, delete.", min_width: 150.0, initial: 0.0, sortable: false, stretch: true },
+];
+
+/// Sortable/filterable Videos columns (Video..File; excludes Actions).
+const VIDEO_COLS: usize = 9;
+
+/// Background "Active tasks" columns (no sort/filter — hide/reorder only).
+const BG_ACTIVE_COLUMNS: [GridCol; 4] = [
+    GridCol { id: "channel", title: "Channel / Label", tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
+    GridCol { id: "task",    title: "Task",            tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
+    GridCol { id: "detail",  title: "Detail",          tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: true },
+    GridCol { id: "elapsed", title: "Elapsed",         tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
+];
+
+/// Background "Recent" columns (no sort/filter — hide/reorder only).
+const BG_RECENT_COLUMNS: [GridCol; 4] = [
+    GridCol { id: "channel", title: "Channel / Label", tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
+    GridCol { id: "task",    title: "Task",            tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
+    GridCol { id: "detail",  title: "Detail",          tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: true },
+    GridCol { id: "outcome", title: "Outcome",         tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
+];
+
+/// Processes window columns (no sort/filter — hide/reorder only).
+const PROCESSES_COLUMNS: [GridCol; 7] = [
+    GridCol { id: "pid",     title: "PID",     tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
+    GridCol { id: "type",    title: "Type",    tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
+    GridCol { id: "name",    title: "Name",    tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: true },
+    GridCol { id: "tool",    title: "Tool",    tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
+    GridCol { id: "status",  title: "Status",  tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
+    GridCol { id: "uptime",  title: "Uptime",  tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
+    GridCol { id: "actions", title: "Actions", tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
+];
+
+/// Issues window columns (no sort/filter — hide/reorder only). Shared by all 5
+/// row-rendering blocks (needs-remux, stuck-in-cache, missing, errors-no-file,
+/// errors); the blank-titled `platform` column holds only an icon.
+const ISSUES_COLUMNS: [GridCol; 8] = [
+    GridCol { id: "platform", title: "",        tooltip: "", min_width: 0.0,   initial: 0.0, sortable: false, stretch: false },
+    GridCol { id: "channel",  title: "Channel", tooltip: "", min_width: 100.0, initial: 0.0, sortable: false, stretch: false },
+    GridCol { id: "started",  title: "Started", tooltip: "", min_width: 0.0,   initial: 0.0, sortable: false, stretch: false },
+    GridCol { id: "file",     title: "File",    tooltip: "", min_width: 160.0, initial: 0.0, sortable: false, stretch: true },
+    GridCol { id: "size",     title: "Size",    tooltip: "", min_width: 60.0,  initial: 0.0, sortable: false, stretch: false },
+    GridCol { id: "type",     title: "Type",    tooltip: "", min_width: 80.0,  initial: 0.0, sortable: false, stretch: false },
+    GridCol { id: "status",   title: "Status",  tooltip: "", min_width: 130.0, initial: 0.0, sortable: false, stretch: false },
+    GridCol { id: "actions",  title: "Actions", tooltip: "", min_width: 0.0,   initial: 0.0, sortable: false, stretch: false },
+];
 
 /// Which column a table is sorted by and in what direction. `col == None` keeps
 /// the natural (database) order.
@@ -4003,6 +4071,88 @@ fn sort_filter_header(
                     .desired_width(f32::INFINITY),
             );
         }
+    });
+}
+
+/// Render one grid-table header cell: sortable columns get the existing
+/// click-to-sort + filter box ([`sort_filter_header`]); non-sortable get a
+/// plain strong label. Every cell also gets a right-click column-chooser
+/// context menu shared by every grid table — a quick "Hide this column"
+/// action (skipped for `locked` ids, whose visibility is controlled elsewhere;
+/// see [`ColumnEntry`]/[`grid_columns::column_chooser_editor`]) followed by
+/// the full show/hide + reorder list (adapted from `source_list_inline_editor`).
+/// Reuses the emote-grid re-interact workaround (this file's other
+/// `ctx_resp`/`Sense::click()` sites): the cell's own sort button / filter box
+/// already consume left-click, so the right-click needs a fresh interaction
+/// over the same rect.
+#[allow(clippy::too_many_arguments)]
+fn grid_header_cell(
+    ui: &mut egui::Ui,
+    table: GridTableId,
+    idx: usize,
+    col: &GridCol,
+    filterable: bool,
+    sort: &mut SortState,
+    filter: &mut String,
+    entries: &mut [ColumnEntry],
+    columns: &[GridCol],
+    locked: impl Fn(&str) -> bool,
+) {
+    if col.sortable {
+        sort_filter_header(ui, idx, col.title, col.tooltip, filterable, sort, filter);
+    } else if !col.title.is_empty() {
+        ui.strong(col.title).on_hover_text(col.tooltip);
+    }
+    let ctx_resp = ui.interact(
+        ui.max_rect(),
+        egui::Id::new(("grid_col_ctx", table.key(), col.id)),
+        egui::Sense::click(),
+    );
+    ctx_resp.context_menu(|ui| {
+        ui.set_min_width(200.0);
+        if !locked(col.id) && !col.title.is_empty() {
+            if ui.button(format!("🚫  Hide '{}'", col.title)).clicked() {
+                grid_columns::set_visible(entries, col.id, false);
+                ui.close();
+            }
+            ui.separator();
+        }
+        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+            grid_columns::column_chooser_editor(ui, entries, columns, &locked);
+        });
+    });
+}
+
+/// Simpler variant of [`grid_header_cell`] for tables with no sort/filter (the
+/// 4 "simple" tables: Background Active/Recent, Processes, Issues) — just the
+/// plain label plus the shared column-chooser context menu.
+fn grid_header_cell_plain(
+    ui: &mut egui::Ui,
+    table: GridTableId,
+    col: &GridCol,
+    entries: &mut [ColumnEntry],
+    columns: &[GridCol],
+) {
+    if !col.title.is_empty() {
+        ui.strong(col.title).on_hover_text(col.tooltip);
+    }
+    let ctx_resp = ui.interact(
+        ui.max_rect(),
+        egui::Id::new(("grid_col_ctx", table.key(), col.id)),
+        egui::Sense::click(),
+    );
+    ctx_resp.context_menu(|ui| {
+        ui.set_min_width(200.0);
+        if !col.title.is_empty() {
+            if ui.button(format!("🚫  Hide '{}'", col.title)).clicked() {
+                grid_columns::set_visible(entries, col.id, false);
+                ui.close();
+            }
+            ui.separator();
+        }
+        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+            grid_columns::column_chooser_editor(ui, entries, columns, |_| false);
+        });
     });
 }
 
@@ -4331,10 +4481,10 @@ fn render_instance_row(
     depth: usize,
     has_history: bool,
     expanded: bool,
-    show_actions: bool,
     needs_remux_count: usize,
     stream_target: Option<&StreamTarget>,
     media_player: &str,
+    order: &[usize],
     a: &mut RowActions,
 ) -> bool {
     let m = &row.monitor;
@@ -4447,215 +4597,215 @@ fn render_instance_row(
     };
 
     let mut disclosure_clicked = false;
-    // Column order: On · Actions · Platform · Name · Tool · Detection · Polled ·
-    // State · Next stream · Game · Title · ✏ (Changes) · 📢 (Ads) · Went Live ·
-    // Started On · Lost · Duration · Ad-free · Added.
-    tr.col(|ui| {
-        let mut on = m.enabled;
-        let cb = ui.checkbox(&mut on, "");
-        if cb.changed() {
-            a.toggle_enabled = Some((m.id, on));
-        }
-        cb.context_menu(|ui| add_menu(ui, a));
-    });
-    if show_actions {
-        tr.col(|ui| {
-            ui.push_id(m.id, |ui| {
-                let mut btns: Vec<egui::Response> = Vec::with_capacity(6);
-                if recording {
-                    let b = ui.small_button("⏹").on_hover_text("Stop / abort recording");
-                    if b.clicked() {
-                        a.stop = Some(m.id);
-                    }
-                    btns.push(b);
-                } else {
-                    let b = ui
-                        .small_button("▶")
-                        .on_hover_text("Start recording now (checks if live)");
-                    if b.clicked() {
-                        a.start = Some(m.id);
-                    }
-                    btns.push(b);
+    let (ad_c, ad_s) = (row.last_recording_ad_count, row.last_recording_ad_secs);
+    // One cell per entry in `order` (the frame's persisted, visibility-filtered
+    // column display order — see `effective_order`), dispatched by the
+    // column's stable id so the cell bodies below stay verbatim regardless of
+    // how the user has hidden/reordered columns.
+    for &ci in order {
+        tr.col(|ui| match STREAM_COLUMNS[ci].id {
+            "auto" => {
+                let mut on = m.enabled;
+                let cb = ui.checkbox(&mut on, "");
+                if cb.changed() {
+                    a.toggle_enabled = Some((m.id, on));
                 }
-                {
-                    let player_ok = !media_player.is_empty()
-                        && stream_target.map(|t| playable_with(t, media_player)).unwrap_or(false);
-                    let b = ui
-                        .add_enabled(player_ok, egui::Button::new("⏵").small())
-                        .on_hover_text(if recording {
-                            "Stream in player"
+                cb.context_menu(|ui| add_menu(ui, a));
+            }
+            "actions" => {
+                ui.push_id(m.id, |ui| {
+                    let mut btns: Vec<egui::Response> = Vec::with_capacity(6);
+                    if recording {
+                        let b = ui.small_button("⏹").on_hover_text("Stop / abort recording");
+                        if b.clicked() {
+                            a.stop = Some(m.id);
+                        }
+                        btns.push(b);
+                    } else {
+                        let b = ui
+                            .small_button("▶")
+                            .on_hover_text("Start recording now (checks if live)");
+                        if b.clicked() {
+                            a.start = Some(m.id);
+                        }
+                        btns.push(b);
+                    }
+                    {
+                        let player_ok = !media_player.is_empty()
+                            && stream_target.map(|t| playable_with(t, media_player)).unwrap_or(false);
+                        let b = ui
+                            .add_enabled(player_ok, egui::Button::new("⏵").small())
+                            .on_hover_text(if recording {
+                                "Stream in player"
+                            } else {
+                                "Open in player"
+                            })
+                            .on_disabled_hover_text(if media_player.is_empty() {
+                                "Set a media player in Settings → Defaults first"
+                            } else if stream_target.is_some() {
+                                "In-progress SABR capture needs mpv (separate audio/video files)"
+                            } else {
+                                "No playable capture file found"
+                            });
+                        if b.clicked() {
+                            a.stream_in_player = stream_target.cloned();
+                        }
+                        btns.push(b);
+                    }
+                    {
+                        let b = ui
+                            .add_enabled(!media_player.is_empty(), egui::Button::new("▷").small())
+                            .on_hover_text("Play new instance in media player at the live edge (does not record)")
+                            .on_disabled_hover_text("Set a media player in Settings → Defaults first");
+                        if b.clicked() {
+                            a.play_new_instance = Some(m.id);
+                        }
+                        btns.push(b);
+                    }
+                    let b = ui.small_button("✏").on_hover_text("Edit");
+                    if b.clicked() {
+                        a.edit = Some(m.id);
+                    }
+                    btns.push(b);
+                    let b = ui.small_button("➕").on_hover_text("Add another tool instance");
+                    if b.clicked() {
+                        a.add_instance = Some(row.channel.id);
+                    }
+                    btns.push(b);
+                    let b = ui.small_button("🗑").on_hover_text("Delete this instance");
+                    if b.clicked() {
+                        a.delete = Some((m.id, row.channel.name.clone()));
+                    }
+                    btns.push(b);
+                    for b in &btns {
+                        b.context_menu(|ui| add_menu(ui, a));
+                    }
+                });
+            }
+            "platform" => {
+                platform_icon(ui, ptex, m.platform()).on_hover_text(m.platform().label());
+            }
+            "name" => {
+                let (_, name_color) = state_icon(&m.last_state);
+                disclosure_clicked = tree_name(
+                    ui,
+                    depth,
+                    has_history,
+                    expanded,
+                    egui::RichText::new(instance_label(&row.monitor.url)).color(name_color),
+                );
+                ui.response().on_hover_text(&row.monitor.url);
+            }
+            "tool" => {
+                ui.label(short_tool_label(m.tool)).on_hover_text(m.tool.tooltip());
+            }
+            "detection" => {
+                ui.label(detection_icon(m.detection_method)).on_hover_text(format!(
+                    "{}\n\n{}",
+                    m.detection_method.label(),
+                    m.detection_method.tooltip()
+                ));
+            }
+            "polled" => {
+                ui.label(fmt_polled(m.last_checked_at, m.poll_interval_secs))
+                    .on_hover_text(format!(
+                        "Last checked {} · polled every {}s",
+                        if m.last_checked_at.unwrap_or(0) > 0 {
+                            fmt_datetime_short(m.last_checked_at.unwrap_or(0))
                         } else {
-                            "Open in player"
-                        })
-                        .on_disabled_hover_text(if media_player.is_empty() {
-                            "Set a media player in Settings → Defaults first"
-                        } else if stream_target.is_some() {
-                            "In-progress SABR capture needs mpv (separate audio/video files)"
+                            "never".to_string()
+                        },
+                        m.poll_interval_secs,
+                    ));
+            }
+            "state" => {
+                ui.horizontal(|ui| {
+                    let (icon, color) = state_icon(&m.last_state);
+                    let resp = ui.colored_label(color, icon);
+                    let is_failed = m.last_state == "failed"
+                        || row.last_recording_status.as_deref() == Some("failed");
+                    if is_failed {
+                        resp.on_hover_text(fail_hover(&row.last_recording_log));
+                    } else {
+                        resp.on_hover_text(&m.last_state);
+                    }
+                    if chat_active {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0x4a, 0xc2, 0xff),
+                            egui::RichText::new("💬").small(),
+                        )
+                        .on_hover_text(
+                            "Live-chat download is still running.\n\
+                             Right-click → Stop chat download to abort it.",
+                        );
+                    }
+                    if needs_remux_count > 0 {
+                        let lbl = if needs_remux_count == 1 {
+                            "⚠ needs remux".to_string()
                         } else {
-                            "No playable capture file found"
-                        });
-                    if b.clicked() {
-                        a.stream_in_player = stream_target.cloned();
+                            format!("⚠ {} need remux", needs_remux_count)
+                        };
+                        let tip = if needs_remux_count == 1 {
+                            "1 recording is stuck as .ts — expand and right-click the take to re-remux.".to_string()
+                        } else {
+                            format!("{} recordings are stuck as .ts — expand and right-click each take to re-remux.", needs_remux_count)
+                        };
+                        ui.colored_label(egui::Color32::from_rgb(220, 140, 30), lbl)
+                            .on_hover_text(tip);
                     }
-                    btns.push(b);
+                });
+            }
+            "next_stream" => {
+                if next_stream_cell(ui, row.next_stream_at, &row.next_stream_title, true) {
+                    a.open_schedule = Some(m.id);
                 }
-                {
-                    let b = ui
-                        .add_enabled(!media_player.is_empty(), egui::Button::new("▷").small())
-                        .on_hover_text("Play new instance in media player at the live edge (does not record)")
-                        .on_disabled_hover_text("Set a media player in Settings → Defaults first");
-                    if b.clicked() {
-                        a.play_new_instance = Some(m.id);
-                    }
-                    btns.push(b);
+            }
+            "game" => {
+                if rec.active {
+                    meta_value_cell(ui, &row.last_recording_category);
                 }
-                let b = ui.small_button("✏").on_hover_text("Edit");
-                if b.clicked() {
-                    a.edit = Some(m.id);
+            }
+            "title" => {
+                if rec.active {
+                    meta_value_cell(ui, &row.last_recording_title);
                 }
-                btns.push(b);
-                let b = ui.small_button("➕").on_hover_text("Add another tool instance");
-                if b.clicked() {
-                    a.add_instance = Some(row.channel.id);
+            }
+            "changes" => {
+                meta_cell(ui, row.last_recording_meta_changes, None, false);
+            }
+            "ads" => {
+                combined_ads_cell(ui, ad_c, ad_s, None, None);
+            }
+            "went_live" => {
+                ts_went_live_label(ui, rec.went_live_secs, rec.went_live_approx);
+            }
+            "started_on" => {
+                ts_label(ui, rec.started_secs);
+            }
+            "lost_time" => {
+                let resp = ui.label(&rec.lost);
+                if m.capture_from_start {
+                    resp.on_hover_text(
+                        "How much of the beginning we missed. Capturing from start, so this drops \
+                         to 0 once the capture catches up to the live edge; until then it's an \
+                         estimate (the gap before recording began).",
+                    );
                 }
-                btns.push(b);
-                let b = ui.small_button("🗑").on_hover_text("Delete this instance");
-                if b.clicked() {
-                    a.delete = Some((m.id, row.channel.name.clone()));
+            }
+            "duration" => {
+                ui.label(&rec.duration);
+            }
+            "ad_free" => {
+                if let Some((label, hover)) = ad_free_status(m.ad_free, row.ad_free_sub) {
+                    ui.colored_label(SUCCESS_GREEN, label).on_hover_text(hover);
                 }
-                btns.push(b);
-                for b in &btns {
-                    b.context_menu(|ui| add_menu(ui, a));
-                }
-            });
+            }
+            "added" => {
+                ui.label(fmt_date(row.channel.created_at));
+            }
+            _ => {}
         });
     }
-    tr.col(|ui| {
-        platform_icon(ui, ptex, m.platform()).on_hover_text(m.platform().label());
-    });
-    tr.col(|ui| {
-        let (_, name_color) = state_icon(&m.last_state);
-        disclosure_clicked = tree_name(
-            ui,
-            depth,
-            has_history,
-            expanded,
-            egui::RichText::new(instance_label(&row.monitor.url)).color(name_color),
-        );
-        ui.response().on_hover_text(&row.monitor.url);
-    });
-    tr.col(|ui| {
-        ui.label(short_tool_label(m.tool)).on_hover_text(m.tool.tooltip());
-    });
-    tr.col(|ui| {
-        ui.label(detection_icon(m.detection_method)).on_hover_text(format!(
-            "{}\n\n{}",
-            m.detection_method.label(),
-            m.detection_method.tooltip()
-        ));
-    });
-    tr.col(|ui| {
-        ui.label(fmt_polled(m.last_checked_at, m.poll_interval_secs))
-            .on_hover_text(format!(
-                "Last checked {} · polled every {}s",
-                if m.last_checked_at.unwrap_or(0) > 0 {
-                    fmt_datetime_short(m.last_checked_at.unwrap_or(0))
-                } else {
-                    "never".to_string()
-                },
-                m.poll_interval_secs,
-            ));
-    });
-    tr.col(|ui| {
-        ui.horizontal(|ui| {
-            let (icon, color) = state_icon(&m.last_state);
-            let resp = ui.colored_label(color, icon);
-            let is_failed = m.last_state == "failed"
-                || row.last_recording_status.as_deref() == Some("failed");
-            if is_failed {
-                resp.on_hover_text(fail_hover(&row.last_recording_log));
-            } else {
-                resp.on_hover_text(&m.last_state);
-            }
-            if chat_active {
-                ui.colored_label(
-                    egui::Color32::from_rgb(0x4a, 0xc2, 0xff),
-                    egui::RichText::new("💬").small(),
-                )
-                .on_hover_text(
-                    "Live-chat download is still running.\n\
-                     Right-click → Stop chat download to abort it.",
-                );
-            }
-            if needs_remux_count > 0 {
-                let lbl = if needs_remux_count == 1 {
-                    "⚠ needs remux".to_string()
-                } else {
-                    format!("⚠ {} need remux", needs_remux_count)
-                };
-                let tip = if needs_remux_count == 1 {
-                    "1 recording is stuck as .ts — expand and right-click the take to re-remux.".to_string()
-                } else {
-                    format!("{} recordings are stuck as .ts — expand and right-click each take to re-remux.", needs_remux_count)
-                };
-                ui.colored_label(egui::Color32::from_rgb(220, 140, 30), lbl)
-                    .on_hover_text(tip);
-            }
-        });
-    });
-    tr.col(|ui| {
-        if next_stream_cell(ui, row.next_stream_at, &row.next_stream_title, true) {
-            a.open_schedule = Some(m.id);
-        }
-    });
-    tr.col(|ui| {
-        if rec.active {
-            meta_value_cell(ui, &row.last_recording_category);
-        }
-    });
-    tr.col(|ui| {
-        if rec.active {
-            meta_value_cell(ui, &row.last_recording_title);
-        }
-    });
-    // ✏ Changes (index 11)
-    tr.col(|ui| {
-        meta_cell(ui, row.last_recording_meta_changes, None, false);
-    });
-    // 📢 Ads combined (index 12)
-    let (ad_c, ad_s) = (row.last_recording_ad_count, row.last_recording_ad_secs);
-    tr.col(|ui| {
-        combined_ads_cell(ui, ad_c, ad_s, None, None);
-    });
-    // Went Live (index 13)
-    tr.col(|ui| {
-        ts_went_live_label(ui, rec.went_live_secs, rec.went_live_approx);
-    });
-    // Started On (index 14)
-    tr.col(|ui| {
-        ts_label(ui, rec.started_secs);
-    });
-    tr.col(|ui| {
-        let resp = ui.label(&rec.lost);
-        if m.capture_from_start {
-            resp.on_hover_text(
-                "How much of the beginning we missed. Capturing from start, so this drops \
-                 to 0 once the capture catches up to the live edge; until then it's an \
-                 estimate (the gap before recording began).",
-            );
-        }
-    });
-    tr.col(|ui| {
-        ui.label(&rec.duration);
-    });
-    tr.col(|ui| {
-        if let Some((label, hover)) = ad_free_status(m.ad_free, row.ad_free_sub) {
-            ui.colored_label(SUCCESS_GREEN, label).on_hover_text(hover);
-        }
-    });
-    tr.col(|ui| {
-        ui.label(fmt_date(row.channel.created_at));
-    });
 
     let row_resp = tr.response();
     if row_resp.clicked() || row_resp.secondary_clicked() {
@@ -6097,6 +6247,16 @@ impl StreamArchiverApp {
         // Whether the Actions column is shown (Settings → Display). Skipped in the
         // builder, header, and each row when off so the column counts match.
         let show_actions = self.show_actions;
+        // Persisted column order/visibility, taken as a local copy (mutated by
+        // the header's column-chooser context menu, written back + persisted
+        // once at the tail of this function).
+        let mut entries = self.videos_grid.entries.clone();
+        let col_order = grid_columns::effective_order(&VIDEO_COLUMNS, &entries, |id| {
+            id != "actions" || show_actions
+        });
+        // A pure reorder (column count unchanged) leaves egui_extras' width
+        // cache stale — force one clean re-fit pass when the order just changed.
+        let order_changed = self.videos_grid.note_order(&col_order);
 
         egui::ScrollArea::both()
             .auto_shrink([false, false])
@@ -6105,45 +6265,31 @@ impl StreamArchiverApp {
                 ui.style_mut().interaction.selectable_labels = false;
                 let sel_color = ui.visuals().selection.bg_fill;
                 let mut tb = TableBuilder::new(ui)
+                    .id_salt("videos_table")
                     .striped(true)
                     .resizable(true)
                     .sense(egui::Sense::click())
-                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                    .column(Column::auto().at_least(180.0)) // video
-                    .column(Column::auto().at_least(110.0)) // channel
-                    .column(Column::auto().at_least(86.0)) // platform
-                    .column(Column::auto().at_least(72.0)) // tool
-                    .column(Column::auto().at_least(96.0)) // status
-                    .column(Column::auto().at_least(82.0)) // speed
-                    .column(Column::auto().at_least(72.0)) // size
-                    .column(Column::auto().at_least(80.0)) // added
-                    .column(Column::auto().at_least(160.0)); // file
-                if show_actions {
-                    tb = tb.column(Column::remainder().at_least(150.0)); // actions
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+                if order_changed {
+                    tb.reset();
+                }
+                for &i in &col_order {
+                    let c = &VIDEO_COLUMNS[i];
+                    let col = if c.stretch {
+                        Column::remainder().at_least(c.min_width)
+                    } else {
+                        Column::auto().at_least(c.min_width)
+                    };
+                    tb = tb.column(col);
                 }
                 let table = tb
                     .header(46.0, |mut header| {
-                        // (title, hover tooltip) per sortable column.
-                        let cols: [(&str, &str); 9] = [
-                            ("Video", "The video's title (or the URL until detected). Hover a row for the full URL."),
-                            ("Channel", "Uploader / channel name (filled when Auto-detect is on)."),
-                            ("Platform", "Source platform: YouTube, Twitch, Kick, or a generic URL."),
-                            ("Tool", "Download tool: yt-dlp, streamlink, or ffmpeg."),
-                            ("Status", "queued / downloading / completed / failed / stopped. Hover a failed row to see why."),
-                            ("Speed", "Current download speed (shown while downloading)."),
-                            ("Size", "Size of the output file (grows while downloading)."),
-                            ("Added", "When the download was added."),
-                            ("File", "Output file path once written. Hover for the full path."),
-                        ];
-                        for (i, (t, tip)) in cols.into_iter().enumerate() {
+                        for &i in &col_order {
+                            let c = &VIDEO_COLUMNS[i];
                             header.col(|ui| {
-                                sort_filter_header(ui, i, t, tip, true, &mut sort, &mut filters[i]);
-                            });
-                        }
-                        if show_actions {
-                            header.col(|ui| {
-                                ui.strong("Actions").on_hover_text(
-                                    "Per-row actions: stop / retry, open file, open folder, copy URL, delete.",
+                                grid_header_cell(
+                                    ui, GridTableId::Videos, i, c, true, &mut sort, &mut filters[i],
+                                    &mut entries, &VIDEO_COLUMNS, |id| id == "actions",
                                 );
                             });
                         }
@@ -6223,129 +6369,132 @@ impl StreamArchiverApp {
                                         }
                                     };
 
-                                tr.col(|ui| {
-                                    let label = if v.title.trim().is_empty() {
-                                        v.url.as_str()
-                                    } else {
-                                        v.title.as_str()
-                                    };
-                                    ui.label(label).on_hover_text(&v.url);
-                                });
-                                tr.col(|ui| {
-                                    if !v.channel.is_empty() {
-                                        ui.label(&v.channel).on_hover_text(&v.channel);
-                                    }
-                                });
-                                tr.col(|ui| {
-                                    platform_icon(ui, &ptex, v.platform)
-                                        .on_hover_text(v.platform.label());
-                                    ui.label(v.platform.label());
-                                });
-                                tr.col(|ui| {
-                                    ui.label(v.tool.label()).on_hover_text(v.tool.tooltip());
-                                });
-                                tr.col(|ui| match progress.get(&v.id) {
-                                    Some(&f) if v.status == "downloading" => {
-                                        ui.add(
-                                            egui::ProgressBar::new(f)
-                                                .desired_width(84.0)
-                                                .text(format!("{:.0}%", f * 100.0)),
-                                        );
-                                    }
-                                    _ => {
-                                        let resp = ui
-                                            .colored_label(video_status_color(&v.status), &v.status);
-                                        if v.status == "failed" {
-                                            let mut msg = fail_hover(&v.log_excerpt);
-                                            if let Some(code) = v.exit_code {
-                                                msg = format!("{msg}\n(exit code {code})");
-                                            }
-                                            resp.on_hover_text(msg);
+                                for &ci in &col_order {
+                                    tr.col(|ui| match VIDEO_COLUMNS[ci].id {
+                                        "video" => {
+                                            let label = if v.title.trim().is_empty() {
+                                                v.url.as_str()
+                                            } else {
+                                                v.title.as_str()
+                                            };
+                                            ui.label(label).on_hover_text(&v.url);
                                         }
-                                    }
-                                });
-                                tr.col(|ui| {
-                                    if v.status == "downloading" {
-                                        if let Some(&bps) = speed.get(&v.id) {
-                                            if bps > 0.0 {
-                                                ui.label(fmt_speed(bps));
+                                        "channel" => {
+                                            if !v.channel.is_empty() {
+                                                ui.label(&v.channel).on_hover_text(&v.channel);
                                             }
                                         }
-                                    }
-                                });
-                                tr.col(|ui| {
-                                    if v.bytes > 0 {
-                                        ui.label(fmt_bytes(v.bytes));
-                                    }
-                                });
-                                tr.col(|ui| {
-                                    ui.label(fmt_date(v.created_at));
-                                });
-                                tr.col(|ui| {
-                                    if !v.output_path.is_empty() {
-                                        ui.label(&v.output_path).on_hover_text(&v.output_path);
-                                    }
-                                });
-                                if show_actions {
-                                tr.col(|ui| {
-                                    ui.push_id(v.id, |ui| {
-                                        let mut btns: Vec<egui::Response> = Vec::with_capacity(5);
-                                        if v.is_active() {
-                                            let b =
-                                                ui.small_button("⏹").on_hover_text("Stop download");
-                                            if b.clicked() {
-                                                to_stop = Some(v.id);
+                                        "platform" => {
+                                            platform_icon(ui, &ptex, v.platform)
+                                                .on_hover_text(v.platform.label());
+                                            ui.label(v.platform.label());
+                                        }
+                                        "tool" => {
+                                            ui.label(v.tool.label()).on_hover_text(v.tool.tooltip());
+                                        }
+                                        "status" => match progress.get(&v.id) {
+                                            Some(&f) if v.status == "downloading" => {
+                                                ui.add(
+                                                    egui::ProgressBar::new(f)
+                                                        .desired_width(84.0)
+                                                        .text(format!("{:.0}%", f * 100.0)),
+                                                );
                                             }
-                                            btns.push(b);
-                                        } else {
-                                            let b = ui
-                                                .small_button("↻")
-                                                .on_hover_text("Retry download");
-                                            if b.clicked() {
-                                                to_retry = Some(v.id);
+                                            _ => {
+                                                let resp = ui
+                                                    .colored_label(video_status_color(&v.status), &v.status);
+                                                if v.status == "failed" {
+                                                    let mut msg = fail_hover(&v.log_excerpt);
+                                                    if let Some(code) = v.exit_code {
+                                                        msg = format!("{msg}\n(exit code {code})");
+                                                    }
+                                                    resp.on_hover_text(msg);
+                                                }
                                             }
-                                            btns.push(b);
+                                        },
+                                        "speed" => {
+                                            if v.status == "downloading" {
+                                                if let Some(&bps) = speed.get(&v.id) {
+                                                    if bps > 0.0 {
+                                                        ui.label(fmt_speed(bps));
+                                                    }
+                                                }
+                                            }
                                         }
-                                        let dir_ok = std::path::Path::new(&v.output_dir).is_dir();
-                                        let b = ui
-                                            .add_enabled(dir_ok, egui::Button::new("📂").small())
-                                            .on_hover_text("Open output folder");
-                                        if b.clicked() {
-                                            crate::platform::open_path(std::path::Path::new(
-                                                &v.output_dir,
-                                            ));
+                                        "size" => {
+                                            if v.bytes > 0 {
+                                                ui.label(fmt_bytes(v.bytes));
+                                            }
                                         }
-                                        btns.push(b);
-                                        let file_ok = !v.output_path.is_empty()
-                                            && std::path::Path::new(&v.output_path).is_file();
-                                        let b = ui
-                                            .add_enabled(file_ok, egui::Button::new("▶").small())
-                                            .on_hover_text("Open file");
-                                        if b.clicked() {
-                                            crate::platform::open_path(std::path::Path::new(
-                                                &v.output_path,
-                                            ));
+                                        "added" => {
+                                            ui.label(fmt_date(v.created_at));
                                         }
-                                        btns.push(b);
-                                        let b = ui.small_button("📋").on_hover_text("Copy URL");
-                                        if b.clicked() {
-                                            ui.ctx().copy_text(v.url.clone());
+                                        "file" => {
+                                            if !v.output_path.is_empty() {
+                                                ui.label(&v.output_path).on_hover_text(&v.output_path);
+                                            }
                                         }
-                                        btns.push(b);
-                                        let b = ui
-                                            .small_button("🗑")
-                                            .on_hover_text("Delete from list (keeps the file)");
-                                        if b.clicked() {
-                                            to_delete = Some(v.id);
+                                        "actions" => {
+                                            ui.push_id(v.id, |ui| {
+                                                let mut btns: Vec<egui::Response> = Vec::with_capacity(5);
+                                                if v.is_active() {
+                                                    let b =
+                                                        ui.small_button("⏹").on_hover_text("Stop download");
+                                                    if b.clicked() {
+                                                        to_stop = Some(v.id);
+                                                    }
+                                                    btns.push(b);
+                                                } else {
+                                                    let b = ui
+                                                        .small_button("↻")
+                                                        .on_hover_text("Retry download");
+                                                    if b.clicked() {
+                                                        to_retry = Some(v.id);
+                                                    }
+                                                    btns.push(b);
+                                                }
+                                                let dir_ok = std::path::Path::new(&v.output_dir).is_dir();
+                                                let b = ui
+                                                    .add_enabled(dir_ok, egui::Button::new("📂").small())
+                                                    .on_hover_text("Open output folder");
+                                                if b.clicked() {
+                                                    crate::platform::open_path(std::path::Path::new(
+                                                        &v.output_dir,
+                                                    ));
+                                                }
+                                                btns.push(b);
+                                                let file_ok = !v.output_path.is_empty()
+                                                    && std::path::Path::new(&v.output_path).is_file();
+                                                let b = ui
+                                                    .add_enabled(file_ok, egui::Button::new("▶").small())
+                                                    .on_hover_text("Open file");
+                                                if b.clicked() {
+                                                    crate::platform::open_path(std::path::Path::new(
+                                                        &v.output_path,
+                                                    ));
+                                                }
+                                                btns.push(b);
+                                                let b = ui.small_button("📋").on_hover_text("Copy URL");
+                                                if b.clicked() {
+                                                    ui.ctx().copy_text(v.url.clone());
+                                                }
+                                                btns.push(b);
+                                                let b = ui
+                                                    .small_button("🗑")
+                                                    .on_hover_text("Delete from list (keeps the file)");
+                                                if b.clicked() {
+                                                    to_delete = Some(v.id);
+                                                }
+                                                btns.push(b);
+                                                // Buttons swallow the right-click, so give each
+                                                // the row menu too.
+                                                for b in &btns {
+                                                    b.context_menu(|ui| add_menu(ui, &mut menu_pick));
+                                                }
+                                            });
                                         }
-                                        btns.push(b);
-                                        // Buttons swallow the right-click, so give each
-                                        // the row menu too.
-                                        for b in &btns {
-                                            b.context_menu(|ui| add_menu(ui, &mut menu_pick));
-                                        }
+                                        _ => {}
                                     });
-                                });
                                 }
 
                                 // Right-click anywhere on the row opens the menu.
@@ -6362,8 +6511,16 @@ impl StreamArchiverApp {
                         }
                     });
             });
+        if sort.col != self.videos_sort.col || sort.ascending != self.videos_sort.ascending {
+            let persisted = grid_columns::unresolve_sort(&VIDEO_COLUMNS, sort.col, sort.ascending);
+            grid_columns::save_sort(&self.core.store, GridTableId::Videos, &persisted);
+        }
         self.videos_sort = sort;
         self.videos_filters = filters;
+        if entries != self.videos_grid.entries {
+            self.videos_grid.entries = entries;
+            grid_columns::save_columns(&self.core.store, GridTableId::Videos, &self.videos_grid.entries);
+        }
 
         // Tick while a download is queued/running so the progress bar, status and
         // size update live (a bit faster than 1s for a smoother bar).
@@ -9770,6 +9927,16 @@ impl StreamArchiverApp {
         // Whether the Actions column is shown (Settings → Display). When off it's
         // skipped in the builder, header, and every renderer so the counts match.
         let show_actions = self.show_actions;
+        // Persisted column order/visibility, taken as a local copy (mutated by
+        // the header's column-chooser context menu, written back + persisted
+        // once at the tail of this function).
+        let mut entries = self.streams_grid.entries.clone();
+        let col_order = grid_columns::effective_order(&STREAM_COLUMNS, &entries, |id| {
+            id != "actions" || show_actions
+        });
+        // A pure reorder (column count unchanged) leaves egui_extras' width
+        // cache stale — force one clean re-fit pass when the order just changed.
+        let order_changed = self.streams_grid.note_order(&col_order);
         // Snapshot before the table closure so we can read it inside (which only
         // has an immutable borrow of self) and clear it afterwards.
         let scroll_to_cid = self.scroll_to_channel;
@@ -9792,7 +9959,8 @@ impl StreamArchiverApp {
                     .platform_tex
                     .get_or_insert_with(|| PlatformTextures::load(ui.ctx()))
                     .clone();
-                let reset_cols = std::mem::replace(&mut self.reset_streams_columns, false);
+                let reset_cols =
+                    std::mem::replace(&mut self.reset_streams_columns, false) || order_changed;
                 let mut tb = TableBuilder::new(ui)
                     .id_salt("streams_table")
                     .striped(true)
@@ -9806,14 +9974,12 @@ impl StreamArchiverApp {
                     // fresh sizing pass at the columns' initial widths.
                     tb.reset();
                 }
-                // One column per descriptor — count is guaranteed to match the
-                // header and the per-row cells (all driven by STREAM_COLUMNS). The
-                // Actions column is skipped (here, in the header, and in every
-                // renderer) when hidden, so the counts still match.
-                for (i, c) in STREAM_COLUMNS.iter().enumerate() {
-                    if !show_actions && i == STREAM_ACTIONS_COL {
-                        continue;
-                    }
+                // One column per entry in `col_order` (this frame's persisted,
+                // visibility-filtered display order — see `effective_order`);
+                // the header and every row shape below all iterate the same
+                // `col_order`, so the counts can't drift.
+                for &i in &col_order {
+                    let c = &STREAM_COLUMNS[i];
                     let col = if reset_cols {
                         // Drive a clean sizing pass: auto_with_initial_suggestion
                         // seeds the column at min_width (not 0) so cells render
@@ -9833,18 +9999,13 @@ impl StreamArchiverApp {
                     tb = tb.column(col);
                 }
                 let table = tb.header(46.0, |mut header| {
-                    for (i, c) in STREAM_COLUMNS.iter().enumerate() {
-                        if !show_actions && i == STREAM_ACTIONS_COL {
-                            continue;
-                        }
+                    for &i in &col_order {
+                        let c = &STREAM_COLUMNS[i];
                         header.col(|ui| {
-                            if c.sortable {
-                                sort_filter_header(
-                                    ui, i, c.title, c.tooltip, true, &mut sort, &mut filters[i],
-                                );
-                            } else {
-                                ui.strong(c.title).on_hover_text(c.tooltip);
-                            }
+                            grid_header_cell(
+                                ui, GridTableId::Streams, i, c, true, &mut sort, &mut filters[i],
+                                &mut entries, &STREAM_COLUMNS, |id| id == "actions",
+                            );
                         });
                     }
                 });
@@ -9949,193 +10110,192 @@ impl StreamArchiverApp {
                                 body.row(24.0, |mut tr| {
                                     tr.set_selected(tint.is_some());
                                     let mut disc = false;
-                                    tr.col(|ui| {
-                                        // Scroll the new channel into view on the
-                                        // first render after a save.
-                                        if scroll_to_cid == Some(cid) {
-                                            ui.scroll_to_cursor(Some(egui::Align::Center));
-                                        }
-                                        let mut on = ch.enabled;
-                                        let cb = ui
-                                            .add_enabled(ninst > 0, egui::Checkbox::new(&mut on, ""))
-                                            .on_hover_text("Enable/disable this channel. Independent from each instance's own toggle.");
-                                        if cb.changed() {
-                                            toggle_channel_enabled = Some((cid, on));
-                                        }
-                                    });
-                                    if show_actions {
-                                        tr.col(|ui| {
-                                            ui.push_id(cid, |ui| {
-                                                if ui
-                                                    .small_button("➕")
-                                                    .on_hover_text("Add an instance to this channel")
-                                                    .clicked()
-                                                {
-                                                    acts.add_instance = Some(cid);
+                                    for &ci2 in &col_order {
+                                        tr.col(|ui| match STREAM_COLUMNS[ci2].id {
+                                            "auto" => {
+                                                // Scroll the new channel into view on the
+                                                // first render after a save.
+                                                if scroll_to_cid == Some(cid) {
+                                                    ui.scroll_to_cursor(Some(egui::Align::Center));
                                                 }
-                                                if ui
-                                                    .small_button("✏")
-                                                    .on_hover_text("Rename channel")
-                                                    .clicked()
-                                                {
-                                                    rename_channel = Some(cid);
+                                                let mut on = ch.enabled;
+                                                let cb = ui
+                                                    .add_enabled(ninst > 0, egui::Checkbox::new(&mut on, ""))
+                                                    .on_hover_text("Enable/disable this channel. Independent from each instance's own toggle.");
+                                                if cb.changed() {
+                                                    toggle_channel_enabled = Some((cid, on));
                                                 }
-                                                if ui
-                                                    .small_button("🗑")
-                                                    .on_hover_text("Delete channel and all its instances")
-                                                    .clicked()
-                                                {
-                                                    delete_channel = Some((cid, ch.name.clone()));
+                                            }
+                                            "actions" => {
+                                                ui.push_id(cid, |ui| {
+                                                    if ui
+                                                        .small_button("➕")
+                                                        .on_hover_text("Add an instance to this channel")
+                                                        .clicked()
+                                                    {
+                                                        acts.add_instance = Some(cid);
+                                                    }
+                                                    if ui
+                                                        .small_button("✏")
+                                                        .on_hover_text("Rename channel")
+                                                        .clicked()
+                                                    {
+                                                        rename_channel = Some(cid);
+                                                    }
+                                                    if ui
+                                                        .small_button("🗑")
+                                                        .on_hover_text("Delete channel and all its instances")
+                                                        .clicked()
+                                                    {
+                                                        delete_channel = Some((cid, ch.name.clone()));
+                                                    }
+                                                });
+                                            }
+                                            "platform" => {
+                                                platform_icons(ui, &ptex, &platforms);
+                                            }
+                                            "name" => {
+                                                // Disclosure triangle, then the chosen-platform
+                                                // avatar, then the channel name.
+                                                let mut clicked = false;
+                                                if ninst > 0 {
+                                                    let tri = if expanded { "▼" } else { "▶" };
+                                                    if ui
+                                                        .add(egui::Button::new(tri).small().frame(false))
+                                                        .on_hover_text("Expand / collapse")
+                                                        .clicked()
+                                                    {
+                                                        clicked = true;
+                                                    }
+                                                } else {
+                                                    ui.add_space(16.0);
                                                 }
-                                            });
+                                                if let Some(tex) = channel_avatars.get(&cid) {
+                                                    let resp = ui.add(
+                                                        egui::Image::from_texture(tex)
+                                                            .fit_to_exact_size(egui::vec2(18.0, 18.0))
+                                                            .corner_radius(egui::CornerRadius::same(3)),
+                                                    );
+                                                    queue_alt_image_preview(ui.ctx(), &resp, tex);
+                                                    ui.add_space(3.0);
+                                                }
+                                                let (base, adjust) = channel_name_colors
+                                                    .get(&cid)
+                                                    .copied()
+                                                    .unwrap_or_else(|| {
+                                                        (channel_event_color(cid, &ch.color), false)
+                                                    });
+                                                // Make a fetched Twitch colour readable
+                                                // against the row's actual background (the
+                                                // tint when highlighted, else the panel).
+                                                let name_color = if adjust {
+                                                    let bg =
+                                                        tint.unwrap_or_else(|| ui.visuals().panel_fill);
+                                                    readable_color(base, bg)
+                                                } else {
+                                                    base
+                                                };
+                                                ui.label(
+                                                    egui::RichText::new(&ch.name)
+                                                        .strong()
+                                                        .color(name_color),
+                                                );
+                                                disc = clicked;
+                                            }
+                                            "tool" => {
+                                                ui.weak(ninst.to_string());
+                                            }
+                                            "detection" => {}
+                                            "polled" => {
+                                                ts_label(ui, last_poll);
+                                            }
+                                            "state" => {
+                                                if any_rec {
+                                                    let (icon, color) = state_icon("recording");
+                                                    ui.colored_label(color, icon).on_hover_text("recording");
+                                                } else if let Some(p) = primary {
+                                                    if p.last_recording_status.as_deref() == Some("failed") {
+                                                        let (icon, color) = state_icon("failed");
+                                                        ui.colored_label(color, icon)
+                                                            .on_hover_text(fail_hover(&p.last_recording_log));
+                                                    }
+                                                }
+                                                let chan_needs_remux: usize = e.rows.iter()
+                                                    .filter_map(|&ri| groups.get(&self.rows[ri].monitor.id))
+                                                    .flat_map(|gs| gs.iter())
+                                                    .flat_map(|g| g.takes.iter())
+                                                    .filter(|t| {
+                                                        t.output_path.ends_with(".ts")
+                                                            && t.output_path.contains(".cache")
+                                                    })
+                                                    .count();
+                                                if chan_needs_remux > 0 {
+                                                    let lbl = if chan_needs_remux == 1 {
+                                                        "⚠ needs remux".to_string()
+                                                    } else {
+                                                        format!("⚠ {} need remux", chan_needs_remux)
+                                                    };
+                                                    let tip = if chan_needs_remux == 1 {
+                                                        "1 recording is stuck as .ts — expand to find it.".to_string()
+                                                    } else {
+                                                        format!("{} recordings are stuck as .ts — expand to find them.", chan_needs_remux)
+                                                    };
+                                                    ui.colored_label(egui::Color32::from_rgb(220, 140, 30), lbl)
+                                                        .on_hover_text(tip);
+                                                }
+                                            }
+                                            "next_stream" => {
+                                                if next_stream_cell(ui, next_stream_at, &next_stream_title, true) {
+                                                    open_schedule_popup = next_stream_mid;
+                                                }
+                                            }
+                                            "game" => {
+                                                meta_value_cell(ui, &cur_category);
+                                            }
+                                            "title" => {
+                                                meta_value_cell(ui, &cur_title);
+                                            }
+                                            "changes" => {
+                                                if let Some(c) = meta_changes {
+                                                    meta_cell(ui, c, None, false);
+                                                }
+                                            }
+                                            "ads" => {
+                                                if let Some((c, s)) = ads {
+                                                    combined_ads_cell(ui, c, s, None, None);
+                                                }
+                                            }
+                                            "went_live" => {
+                                                if let Some(r) = &rec {
+                                                    ts_went_live_label(ui, r.went_live_secs, r.went_live_approx);
+                                                }
+                                            }
+                                            "started_on" => {
+                                                if let Some(r) = &rec {
+                                                    ts_label(ui, r.started_secs);
+                                                }
+                                            }
+                                            "lost_time" => {
+                                                if let Some(r) = &rec {
+                                                    ui.label(&r.lost);
+                                                }
+                                            }
+                                            "duration" => {
+                                                if let Some(r) = &rec {
+                                                    ui.label(&r.duration);
+                                                }
+                                            }
+                                            "ad_free" => {
+                                                if !ad_free.0.is_empty() {
+                                                    ui.colored_label(SUCCESS_GREEN, ad_free.0);
+                                                }
+                                            }
+                                            "added" => {
+                                                ui.label(fmt_date(ch.created_at));
+                                            }
+                                            _ => {}
                                         });
                                     }
-                                    tr.col(|ui| {
-                                        platform_icons(ui, &ptex, &platforms);
-                                    });
-                                    tr.col(|ui| {
-                                        // Disclosure triangle, then the chosen-platform
-                                        // avatar, then the channel name.
-                                        let mut clicked = false;
-                                        if ninst > 0 {
-                                            let tri = if expanded { "▼" } else { "▶" };
-                                            if ui
-                                                .add(egui::Button::new(tri).small().frame(false))
-                                                .on_hover_text("Expand / collapse")
-                                                .clicked()
-                                            {
-                                                clicked = true;
-                                            }
-                                        } else {
-                                            ui.add_space(16.0);
-                                        }
-                                        if let Some(tex) = channel_avatars.get(&cid) {
-                                            let resp = ui.add(
-                                                egui::Image::from_texture(tex)
-                                                    .fit_to_exact_size(egui::vec2(18.0, 18.0))
-                                                    .corner_radius(egui::CornerRadius::same(3)),
-                                            );
-                                            queue_alt_image_preview(ui.ctx(), &resp, tex);
-                                            ui.add_space(3.0);
-                                        }
-                                        let (base, adjust) = channel_name_colors
-                                            .get(&cid)
-                                            .copied()
-                                            .unwrap_or_else(|| {
-                                                (channel_event_color(cid, &ch.color), false)
-                                            });
-                                        // Make a fetched Twitch colour readable
-                                        // against the row's actual background (the
-                                        // tint when highlighted, else the panel).
-                                        let name_color = if adjust {
-                                            let bg =
-                                                tint.unwrap_or_else(|| ui.visuals().panel_fill);
-                                            readable_color(base, bg)
-                                        } else {
-                                            base
-                                        };
-                                        ui.label(
-                                            egui::RichText::new(&ch.name)
-                                                .strong()
-                                                .color(name_color),
-                                        );
-                                        disc = clicked;
-                                    });
-                                    tr.col(|ui| {
-                                        ui.weak(ninst.to_string());
-                                    });
-                                    tr.col(|_ui| {}); // detection
-                                    tr.col(|ui| {
-                                        ts_label(ui, last_poll);
-                                    });
-                                    tr.col(|ui| {
-                                        if any_rec {
-                                            let (icon, color) = state_icon("recording");
-                                            ui.colored_label(color, icon).on_hover_text("recording");
-                                        } else if let Some(p) = primary {
-                                            if p.last_recording_status.as_deref() == Some("failed") {
-                                                let (icon, color) = state_icon("failed");
-                                                ui.colored_label(color, icon)
-                                                    .on_hover_text(fail_hover(&p.last_recording_log));
-                                            }
-                                        }
-                                        let chan_needs_remux: usize = e.rows.iter()
-                                            .filter_map(|&ri| groups.get(&self.rows[ri].monitor.id))
-                                            .flat_map(|gs| gs.iter())
-                                            .flat_map(|g| g.takes.iter())
-                                            .filter(|t| {
-                                                t.output_path.ends_with(".ts")
-                                                    && t.output_path.contains(".cache")
-                                            })
-                                            .count();
-                                        if chan_needs_remux > 0 {
-                                            let lbl = if chan_needs_remux == 1 {
-                                                "⚠ needs remux".to_string()
-                                            } else {
-                                                format!("⚠ {} need remux", chan_needs_remux)
-                                            };
-                                            let tip = if chan_needs_remux == 1 {
-                                                "1 recording is stuck as .ts — expand to find it.".to_string()
-                                            } else {
-                                                format!("{} recordings are stuck as .ts — expand to find them.", chan_needs_remux)
-                                            };
-                                            ui.colored_label(egui::Color32::from_rgb(220, 140, 30), lbl)
-                                                .on_hover_text(tip);
-                                        }
-                                    });
-                                    tr.col(|ui| {
-                                        if next_stream_cell(ui, next_stream_at, &next_stream_title, true) {
-                                            open_schedule_popup = next_stream_mid;
-                                        }
-                                    });
-                                    tr.col(|ui| {
-                                        meta_value_cell(ui, &cur_category);
-                                    });
-                                    tr.col(|ui| {
-                                        meta_value_cell(ui, &cur_title);
-                                    });
-                                    // ✏ Changes (index 11)
-                                    tr.col(|ui| {
-                                        if let Some(c) = meta_changes {
-                                            meta_cell(ui, c, None, false);
-                                        }
-                                    });
-                                    // 📢 Ads combined (index 12)
-                                    tr.col(|ui| {
-                                        if let Some((c, s)) = ads {
-                                            combined_ads_cell(ui, c, s, None, None);
-                                        }
-                                    });
-                                    // Went Live (index 13)
-                                    tr.col(|ui| {
-                                        if let Some(r) = &rec {
-                                            ts_went_live_label(ui, r.went_live_secs, r.went_live_approx);
-                                        }
-                                    });
-                                    // Started On (index 14)
-                                    tr.col(|ui| {
-                                        if let Some(r) = &rec {
-                                            ts_label(ui, r.started_secs);
-                                        }
-                                    });
-                                    tr.col(|ui| {
-                                        if let Some(r) = &rec {
-                                            ui.label(&r.lost);
-                                        }
-                                    });
-                                    tr.col(|ui| {
-                                        if let Some(r) = &rec {
-                                            ui.label(&r.duration);
-                                        }
-                                    });
-                                    tr.col(|ui| {
-                                        if !ad_free.0.is_empty() {
-                                            ui.colored_label(SUCCESS_GREEN, ad_free.0);
-                                        }
-                                    });
-                                    tr.col(|ui| {
-                                        ui.label(fmt_date(ch.created_at));
-                                    });
                                     tr.response().context_menu(|ui| {
                                         ui.set_min_width(170.0);
                                         if ui.button("➕  Add instance").clicked() {
@@ -10260,9 +10420,9 @@ impl StreamArchiverApp {
                                     if render_instance_row(
                                         &mut tr, row, &ptex, now, recording, chat_active,
                                         tint.is_some(), depth, has_hist, expanded,
-                                        show_actions, inst_needs_remux,
+                                        inst_needs_remux,
                                         inst_stream_target.as_ref(), &media_player,
-                                        &mut acts,
+                                        &col_order, &mut acts,
                                     ) {
                                         toggle_instance = Some(mid);
                                     }
@@ -10341,157 +10501,150 @@ impl StreamArchiverApp {
                                 };
                                 body.row(24.0, |mut tr| {
                                     let mut disc = false;
-                                    tr.col(|_ui| {}); // on
-                                    if show_actions {
-                                        tr.col(|ui| {
-                                            let ok =
-                                                dir.as_ref().map(|d| d.is_dir()).unwrap_or(false);
-                                            if ui
-                                                .add_enabled(ok, egui::Button::new("📂").small())
-                                                .on_hover_text("Open folder")
-                                                .clicked()
-                                            {
-                                                open_path = dir.clone();
+                                    for &ci2 in &col_order {
+                                        tr.col(|ui| match STREAM_COLUMNS[ci2].id {
+                                            "actions" => {
+                                                let ok =
+                                                    dir.as_ref().map(|d| d.is_dir()).unwrap_or(false);
+                                                if ui
+                                                    .add_enabled(ok, egui::Button::new("📂").small())
+                                                    .on_hover_text("Open folder")
+                                                    .clicked()
+                                                {
+                                                    open_path = dir.clone();
+                                                }
+                                                let player_ok = !media_player.is_empty()
+                                                    && grp_stream_target
+                                                        .as_ref()
+                                                        .map(|t| playable_with(t, &media_player))
+                                                        .unwrap_or(false);
+                                                if ui
+                                                    .add_enabled(
+                                                        player_ok,
+                                                        egui::Button::new("⏵").small(),
+                                                    )
+                                                    .on_hover_text(if g.status() == "recording" {
+                                                        "Stream in player"
+                                                    } else {
+                                                        "Open in player"
+                                                    })
+                                                    .on_disabled_hover_text(if media_player.is_empty() {
+                                                        "Set a media player in Settings → Defaults first"
+                                                    } else if grp_stream_target.is_some() {
+                                                        "In-progress SABR capture needs mpv (separate audio/video files)"
+                                                    } else {
+                                                        "No playable capture file found"
+                                                    })
+                                                    .clicked()
+                                                {
+                                                    open_in_player = grp_stream_target.clone();
+                                                }
+                                                if ui
+                                                    .add_enabled(
+                                                        !media_player.is_empty(),
+                                                        egui::Button::new("▷").small(),
+                                                    )
+                                                    .on_hover_text("Play new instance in media player at the live edge (does not record)")
+                                                    .on_disabled_hover_text("Set a media player in Settings → Defaults first")
+                                                    .clicked()
+                                                {
+                                                    play_new_instance_mid = Some(mid);
+                                                }
                                             }
-                                            let player_ok = !media_player.is_empty()
-                                                && grp_stream_target
-                                                    .as_ref()
-                                                    .map(|t| playable_with(t, &media_player))
-                                                    .unwrap_or(false);
-                                            if ui
-                                                .add_enabled(
-                                                    player_ok,
-                                                    egui::Button::new("⏵").small(),
-                                                )
-                                                .on_hover_text(if g.status() == "recording" {
-                                                    "Stream in player"
+                                            "name" => {
+                                                disc = tree_name(
+                                                    ui, depth, has_takes, expanded,
+                                                    egui::RichText::new(label.clone()),
+                                                );
+                                                if has_takes {
+                                                    ui.weak(format!("· {} takes", g.takes.len()));
+                                                }
+                                            }
+                                            "state" => {
+                                                let (icon, color) = state_icon(g.status());
+                                                let resp = ui.colored_label(color, icon);
+                                                if g.status() == "failed" {
+                                                    let log = g
+                                                        .takes
+                                                        .last()
+                                                        .map(|t| t.log_excerpt.as_str())
+                                                        .unwrap_or("");
+                                                    resp.on_hover_text(fail_hover(log));
                                                 } else {
-                                                    "Open in player"
-                                                })
-                                                .on_disabled_hover_text(if media_player.is_empty() {
-                                                    "Set a media player in Settings → Defaults first"
-                                                } else if grp_stream_target.is_some() {
-                                                    "In-progress SABR capture needs mpv (separate audio/video files)"
-                                                } else {
-                                                    "No playable capture file found"
-                                                })
-                                                .clicked()
-                                            {
-                                                open_in_player = grp_stream_target.clone();
+                                                    resp.on_hover_text(g.status());
+                                                }
+                                                let nr = g.takes.iter().filter(|t| {
+                                                    t.output_path.ends_with(".ts")
+                                                        && t.output_path.contains(".cache")
+                                                }).count();
+                                                if nr > 0 {
+                                                    let lbl = if nr == 1 {
+                                                        "⚠ needs remux".to_string()
+                                                    } else {
+                                                        format!("⚠ {} need remux", nr)
+                                                    };
+                                                    ui.colored_label(egui::Color32::from_rgb(220, 140, 30), lbl)
+                                                        .on_hover_text("Right-click → Re-remux to MKV.");
+                                                }
                                             }
-                                            if ui
-                                                .add_enabled(
-                                                    !media_player.is_empty(),
-                                                    egui::Button::new("▷").small(),
-                                                )
-                                                .on_hover_text("Play new instance in media player at the live edge (does not record)")
-                                                .on_disabled_hover_text("Set a media player in Settings → Defaults first")
-                                                .clicked()
-                                            {
-                                                play_new_instance_mid = Some(mid);
+                                            "game" => {
+                                                meta_value_cell(ui, g.category());
                                             }
+                                            "title" => {
+                                                meta_value_cell(ui, g.title());
+                                            }
+                                            "changes" => {
+                                                let det = meta_rec.and_then(|id| meta_logs.get(&id));
+                                                if meta_cell(ui, meta_count, det, true) {
+                                                    open_meta_popup = Some(MetaPopup::Stream(
+                                                        g.takes.iter().map(|t| (t.id, t.started_at)).collect(),
+                                                    ));
+                                                }
+                                            }
+                                            "ads" => {
+                                                let det = ad_rec.and_then(|id| ad_breaks.get(&id));
+                                                if let Some(r) = combined_ads_cell(
+                                                    ui, ad_count, ad_secs, det, ad_rec,
+                                                ) {
+                                                    open_ad_popup = Some(r);
+                                                }
+                                            }
+                                            "went_live" => {
+                                                ts_went_live_label(ui, g.went_live_at.unwrap_or(0), g.went_live_approx);
+                                            }
+                                            "started_on" => {
+                                                ts_label(ui, g.started_at());
+                                            }
+                                            "lost_time" => {
+                                                // Resolved lost time when known; else the
+                                                // provisional started - went_live (so the stream
+                                                // row matches the monitor row instead of going
+                                                // blank while a capture is still catching up).
+                                                let lost = match g.lost_secs() {
+                                                    Some(l) => Some(fmt_duration(l.max(0))),
+                                                    None => g
+                                                        .went_live_at
+                                                        .map(|w| fmt_duration((g.started_at() - w).max(0))),
+                                                };
+                                                if let Some(s) = lost {
+                                                    ui.label(s);
+                                                }
+                                            }
+                                            "duration" => {
+                                                ui.label(fmt_duration(g.captured_secs(now))).on_hover_text(
+                                                    format!(
+                                                        "{} captured across {} take(s) · span {}",
+                                                        fmt_bytes(g.total_bytes()),
+                                                        g.takes.len(),
+                                                        fmt_duration(span),
+                                                    ),
+                                                );
+                                            }
+                                            // "on"/"platform"/"tool"/"detection"/"polled"/
+                                            // "next_stream"/"ad_free"/"added" are n/a per stream.
+                                            _ => {}
                                         });
                                     }
-                                    tr.col(|_ui| {}); // platform
-                                    tr.col(|ui| {
-                                        disc = tree_name(
-                                            ui, depth, has_takes, expanded,
-                                            egui::RichText::new(label.clone()),
-                                        );
-                                        if has_takes {
-                                            ui.weak(format!("· {} takes", g.takes.len()));
-                                        }
-                                    });
-                                    tr.col(|_ui| {}); // tool
-                                    tr.col(|_ui| {}); // detection
-                                    tr.col(|_ui| {}); // polled
-                                    tr.col(|ui| {
-                                        let (icon, color) = state_icon(g.status());
-                                        let resp = ui.colored_label(color, icon);
-                                        if g.status() == "failed" {
-                                            let log = g
-                                                .takes
-                                                .last()
-                                                .map(|t| t.log_excerpt.as_str())
-                                                .unwrap_or("");
-                                            resp.on_hover_text(fail_hover(log));
-                                        } else {
-                                            resp.on_hover_text(g.status());
-                                        }
-                                        let nr = g.takes.iter().filter(|t| {
-                                            t.output_path.ends_with(".ts")
-                                                && t.output_path.contains(".cache")
-                                        }).count();
-                                        if nr > 0 {
-                                            let lbl = if nr == 1 {
-                                                "⚠ needs remux".to_string()
-                                            } else {
-                                                format!("⚠ {} need remux", nr)
-                                            };
-                                            ui.colored_label(egui::Color32::from_rgb(220, 140, 30), lbl)
-                                                .on_hover_text("Right-click → Re-remux to MKV.");
-                                        }
-                                    });
-                                    tr.col(|_ui| {}); // next stream (n/a per stream)
-                                    tr.col(|ui| {
-                                        meta_value_cell(ui, g.category());
-                                    });
-                                    tr.col(|ui| {
-                                        meta_value_cell(ui, g.title());
-                                    });
-                                    // ✏ Changes (index 11)
-                                    tr.col(|ui| {
-                                        let det = meta_rec.and_then(|id| meta_logs.get(&id));
-                                        if meta_cell(ui, meta_count, det, true) {
-                                            open_meta_popup = Some(MetaPopup::Stream(
-                                                g.takes.iter().map(|t| (t.id, t.started_at)).collect(),
-                                            ));
-                                        }
-                                    });
-                                    // 📢 Ads combined (index 12)
-                                    tr.col(|ui| {
-                                        let det = ad_rec.and_then(|id| ad_breaks.get(&id));
-                                        if let Some(r) = combined_ads_cell(
-                                            ui, ad_count, ad_secs, det, ad_rec,
-                                        ) {
-                                            open_ad_popup = Some(r);
-                                        }
-                                    });
-                                    // Went Live (index 13)
-                                    tr.col(|ui| {
-                                        ts_went_live_label(ui, g.went_live_at.unwrap_or(0), g.went_live_approx);
-                                    });
-                                    // Started On (index 14)
-                                    tr.col(|ui| {
-                                        ts_label(ui, g.started_at());
-                                    });
-                                    tr.col(|ui| {
-                                        // Resolved lost time when known; else the
-                                        // provisional started - went_live (so the stream
-                                        // row matches the monitor row instead of going
-                                        // blank while a capture is still catching up).
-                                        let lost = match g.lost_secs() {
-                                            Some(l) => Some(fmt_duration(l.max(0))),
-                                            None => g
-                                                .went_live_at
-                                                .map(|w| fmt_duration((g.started_at() - w).max(0))),
-                                        };
-                                        if let Some(s) = lost {
-                                            ui.label(s);
-                                        }
-                                    });
-                                    tr.col(|ui| {
-                                        ui.label(fmt_duration(g.captured_secs(now))).on_hover_text(
-                                            format!(
-                                                "{} captured across {} take(s) · span {}",
-                                                fmt_bytes(g.total_bytes()),
-                                                g.takes.len(),
-                                                fmt_duration(span),
-                                            ),
-                                        );
-                                    });
-                                    tr.col(|_ui| {}); // ad-free (n/a per stream)
-                                    tr.col(|_ui| {}); // added
                                     tr.response().context_menu(|ui| {
                                         ui.set_min_width(180.0);
                                         let dir_ok =
@@ -10586,224 +10739,218 @@ impl StreamArchiverApp {
                                     && std::path::Path::new(&t.output_path).is_file();
                                 let media_player = self.settings.media_player_path.trim().to_string();
                                 body.row(24.0, |mut tr| {
-                                    tr.col(|_ui| {}); // on
-                                    if show_actions {
-                                        tr.col(|ui| {
-                                            ui.push_id(t.id, |ui| {
-                                                if ui
-                                                    .add_enabled(file_ok, egui::Button::new("▶").small())
-                                                    .on_hover_text("Open file")
-                                                    .clicked()
-                                                {
-                                                    open_path =
-                                                        Some(std::path::PathBuf::from(&t.output_path));
-                                                }
-                                                let stream_target = if t.is_active() {
-                                                    stream_target_for_active(&t.output_path)
-                                                } else if file_ok {
-                                                    Some(StreamTarget::Finished(
-                                                        std::path::PathBuf::from(&t.output_path),
-                                                    ))
-                                                } else {
-                                                    None
-                                                };
-                                                let player_ok = !media_player.is_empty()
-                                                    && stream_target
-                                                        .as_ref()
-                                                        .map(|st| playable_with(st, &media_player))
-                                                        .unwrap_or(false);
-                                                if ui
-                                                    .add_enabled(
-                                                        player_ok,
-                                                        egui::Button::new("⏵").small(),
-                                                    )
-                                                    .on_hover_text(if t.is_active() {
-                                                        "Stream in player (opens the live capture)"
+                                    for &ci2 in &col_order {
+                                        tr.col(|ui| match STREAM_COLUMNS[ci2].id {
+                                            "actions" => {
+                                                ui.push_id(t.id, |ui| {
+                                                    if ui
+                                                        .add_enabled(file_ok, egui::Button::new("▶").small())
+                                                        .on_hover_text("Open file")
+                                                        .clicked()
+                                                    {
+                                                        open_path =
+                                                            Some(std::path::PathBuf::from(&t.output_path));
+                                                    }
+                                                    let stream_target = if t.is_active() {
+                                                        stream_target_for_active(&t.output_path)
+                                                    } else if file_ok {
+                                                        Some(StreamTarget::Finished(
+                                                            std::path::PathBuf::from(&t.output_path),
+                                                        ))
                                                     } else {
-                                                        "Open in player"
-                                                    })
-                                                    .on_disabled_hover_text(if media_player.is_empty() {
-                                                        "Set a media player in Settings → Defaults first"
-                                                    } else if stream_target.is_some() {
-                                                        "In-progress SABR capture needs mpv (separate audio/video files)"
+                                                        None
+                                                    };
+                                                    let player_ok = !media_player.is_empty()
+                                                        && stream_target
+                                                            .as_ref()
+                                                            .map(|st| playable_with(st, &media_player))
+                                                            .unwrap_or(false);
+                                                    if ui
+                                                        .add_enabled(
+                                                            player_ok,
+                                                            egui::Button::new("⏵").small(),
+                                                        )
+                                                        .on_hover_text(if t.is_active() {
+                                                            "Stream in player (opens the live capture)"
+                                                        } else {
+                                                            "Open in player"
+                                                        })
+                                                        .on_disabled_hover_text(if media_player.is_empty() {
+                                                            "Set a media player in Settings → Defaults first"
+                                                        } else if stream_target.is_some() {
+                                                            "In-progress SABR capture needs mpv (separate audio/video files)"
+                                                        } else {
+                                                            "No playable capture file found"
+                                                        })
+                                                        .clicked()
+                                                    {
+                                                        open_in_player = stream_target;
+                                                    }
+                                                    if ui
+                                                        .add_enabled(
+                                                            !media_player.is_empty(),
+                                                            egui::Button::new("▷").small(),
+                                                        )
+                                                        .on_hover_text("Play new instance in media player at the live edge (does not record)")
+                                                        .on_disabled_hover_text("Set a media player in Settings → Defaults first")
+                                                        .clicked()
+                                                    {
+                                                        play_new_instance_mid = Some(t.monitor_id);
+                                                    }
+                                                    let dir_ok =
+                                                        dir.as_ref().map(|d| d.is_dir()).unwrap_or(false);
+                                                    if ui
+                                                        .add_enabled(dir_ok, egui::Button::new("📂").small())
+                                                        .on_hover_text("Open folder")
+                                                        .clicked()
+                                                    {
+                                                        open_path = dir.clone();
+                                                    }
+                                                    if ui
+                                                        .add_enabled(
+                                                            !t.output_path.is_empty(),
+                                                            egui::Button::new("📋").small(),
+                                                        )
+                                                        .on_hover_text("Copy file path")
+                                                        .clicked()
+                                                    {
+                                                        copy_text = Some(t.output_path.clone());
+                                                    }
+                                                    let del_hint = if t.is_active() {
+                                                        "Stop the recording before removing this take"
                                                     } else {
-                                                        "No playable capture file found"
-                                                    })
-                                                    .clicked()
-                                                {
-                                                    open_in_player = stream_target;
-                                                }
-                                                if ui
-                                                    .add_enabled(
-                                                        !media_player.is_empty(),
-                                                        egui::Button::new("▷").small(),
-                                                    )
-                                                    .on_hover_text("Play new instance in media player at the live edge (does not record)")
-                                                    .on_disabled_hover_text("Set a media player in Settings → Defaults first")
-                                                    .clicked()
-                                                {
-                                                    play_new_instance_mid = Some(t.monitor_id);
-                                                }
-                                                let dir_ok =
-                                                    dir.as_ref().map(|d| d.is_dir()).unwrap_or(false);
-                                                if ui
-                                                    .add_enabled(dir_ok, egui::Button::new("📂").small())
-                                                    .on_hover_text("Open folder")
-                                                    .clicked()
-                                                {
-                                                    open_path = dir.clone();
-                                                }
-                                                if ui
-                                                    .add_enabled(
-                                                        !t.output_path.is_empty(),
-                                                        egui::Button::new("📋").small(),
-                                                    )
-                                                    .on_hover_text("Copy file path")
-                                                    .clicked()
-                                                {
-                                                    copy_text = Some(t.output_path.clone());
-                                                }
-                                                let del_hint = if t.is_active() {
-                                                    "Stop the recording before removing this take"
-                                                } else {
-                                                    "Remove this take from the list (keeps the file)"
+                                                        "Remove this take from the list (keeps the file)"
+                                                    };
+                                                    if ui
+                                                        .add_enabled(
+                                                            !t.is_active(),
+                                                            egui::Button::new("🗑").small(),
+                                                        )
+                                                        .on_hover_text(del_hint)
+                                                        .clicked()
+                                                    {
+                                                        delete_recording = Some(t.id);
+                                                    }
+                                                });
+                                            }
+                                            "name" => {
+                                                let label = match take_variant {
+                                                    Some(v) => format!("Take {} · {}", ti + 1, v),
+                                                    None => format!("Take {}", ti + 1),
                                                 };
-                                                if ui
-                                                    .add_enabled(
-                                                        !t.is_active(),
-                                                        egui::Button::new("🗑").small(),
-                                                    )
-                                                    .on_hover_text(del_hint)
-                                                    .clicked()
-                                                {
-                                                    delete_recording = Some(t.id);
+                                                tree_name(
+                                                    ui, depth, false, false,
+                                                    egui::RichText::new(label).weak(),
+                                                );
+                                            }
+                                            "state" => {
+                                                let (icon, color) = state_icon(&t.status);
+                                                let resp = ui.colored_label(color, icon);
+                                                if t.status == "failed" {
+                                                    let mut msg = fail_hover(&t.log_excerpt);
+                                                    if let Some(code) = t.exit_code {
+                                                        msg = format!("{msg}\n(exit code {code})");
+                                                    }
+                                                    resp.on_hover_text(msg);
+                                                } else if t.status == "ended" {
+                                                    resp.on_hover_text(
+                                                        "The stream had already ended or wasn't live when we \
+                                                         tried — nothing to capture (not a failure).",
+                                                    );
+                                                } else if let Some(code) = t.exit_code {
+                                                    resp.on_hover_text(format!("exit code {code}"));
+                                                } else {
+                                                    resp.on_hover_text(&t.status);
                                                 }
-                                            });
+                                                // VOD state badge (Twitch only)
+                                                match t.vod_state.as_deref() {
+                                                    Some("not_published") => {
+                                                        ui.colored_label(
+                                                            egui::Color32::from_rgb(220, 80, 80),
+                                                            "⚠ no VOD",
+                                                        ).on_hover_text("No VOD was published — this local recording may be the only surviving copy.");
+                                                    }
+                                                    Some("found") if t.vod_muted_secs.unwrap_or(0) > 0 => {
+                                                        ui.colored_label(
+                                                            egui::Color32::from_rgb(220, 160, 30),
+                                                            "✂ muted",
+                                                        ).on_hover_text(format!(
+                                                            "VOD has {} of muted content (DMCA) — local recording is the authoritative archive.",
+                                                            fmt_duration(t.vod_muted_secs.unwrap_or(0))
+                                                        ));
+                                                    }
+                                                    _ => {}
+                                                }
+                                                // In-progress / needs-attention badges
+                                                let needs_remux = t.output_path.ends_with(".ts")
+                                                    && t.output_path.contains(".cache");
+                                                let remuxing = self.background_tasks.iter().any(|bt| {
+                                                    bt.kind == crate::events::BackgroundTaskKind::Remux
+                                                        && bt.id == t.id as u64
+                                                });
+                                                if remuxing {
+                                                    ui.colored_label(
+                                                        egui::Color32::from_rgb(80, 160, 220),
+                                                        "⏳ Remuxing…",
+                                                    ).on_hover_text("Converting .ts capture to .mkv — check the Background tab for progress.");
+                                                } else if needs_remux {
+                                                    ui.colored_label(
+                                                        egui::Color32::from_rgb(220, 140, 30),
+                                                        "⚠ needs remux",
+                                                    ).on_hover_text("Automatic remux failed — right-click → Re-remux to MKV.");
+                                                }
+                                            }
+                                            "game" => {
+                                                meta_value_cell(ui, &t.category);
+                                            }
+                                            "title" => {
+                                                meta_value_cell(ui, &t.title);
+                                            }
+                                            "changes" => {
+                                                let det = meta_logs.get(&t.id);
+                                                if meta_cell(ui, t.meta_change_count, det, true) {
+                                                    open_meta_popup = Some(MetaPopup::Take(t.id));
+                                                }
+                                            }
+                                            "ads" => {
+                                                let det = ad_breaks.get(&t.id);
+                                                if let Some(r) = combined_ads_cell(
+                                                    ui, t.ad_count, t.ad_secs, det, Some(t.id),
+                                                ) {
+                                                    open_ad_popup = Some(r);
+                                                }
+                                            }
+                                            // Went Live is n/a per take (blank).
+                                            "started_on" => {
+                                                ts_label(ui, t.started_at);
+                                            }
+                                            "lost_time" => {
+                                                // Resolved lost time when known; else the
+                                                // provisional started - went_live (matches the
+                                                // monitor row, so a re-attached/in-progress take
+                                                // isn't blank while it's still catching up).
+                                                let lost = match t.lost_secs {
+                                                    Some(l) => Some(fmt_duration(l.max(0))),
+                                                    None => t
+                                                        .went_live_at
+                                                        .map(|w| fmt_duration((t.started_at - w).max(0))),
+                                                };
+                                                if let Some(s) = lost {
+                                                    ui.label(s);
+                                                }
+                                            }
+                                            "duration" => {
+                                                let d = ui.label(fmt_duration(t.duration_secs(now)));
+                                                if t.bytes > 0 {
+                                                    d.on_hover_text(fmt_bytes(t.bytes));
+                                                }
+                                            }
+                                            // "on"/"platform"/"tool"/"detection"/"polled"/
+                                            // "next_stream"/"went_live"/"ad_free"/"added" are
+                                            // n/a per take.
+                                            _ => {}
                                         });
                                     }
-                                    tr.col(|_ui| {}); // platform
-                                    tr.col(|ui| {
-                                        let label = match take_variant {
-                                            Some(v) => format!("Take {} · {}", ti + 1, v),
-                                            None => format!("Take {}", ti + 1),
-                                        };
-                                        tree_name(
-                                            ui, depth, false, false,
-                                            egui::RichText::new(label).weak(),
-                                        );
-                                    });
-                                    tr.col(|_ui| {}); // tool
-                                    tr.col(|_ui| {}); // detection
-                                    tr.col(|_ui| {}); // polled
-                                    tr.col(|ui| {
-                                        let (icon, color) = state_icon(&t.status);
-                                        let resp = ui.colored_label(color, icon);
-                                        if t.status == "failed" {
-                                            let mut msg = fail_hover(&t.log_excerpt);
-                                            if let Some(code) = t.exit_code {
-                                                msg = format!("{msg}\n(exit code {code})");
-                                            }
-                                            resp.on_hover_text(msg);
-                                        } else if t.status == "ended" {
-                                            resp.on_hover_text(
-                                                "The stream had already ended or wasn't live when we \
-                                                 tried — nothing to capture (not a failure).",
-                                            );
-                                        } else if let Some(code) = t.exit_code {
-                                            resp.on_hover_text(format!("exit code {code}"));
-                                        } else {
-                                            resp.on_hover_text(&t.status);
-                                        }
-                                        // VOD state badge (Twitch only)
-                                        match t.vod_state.as_deref() {
-                                            Some("not_published") => {
-                                                ui.colored_label(
-                                                    egui::Color32::from_rgb(220, 80, 80),
-                                                    "⚠ no VOD",
-                                                ).on_hover_text("No VOD was published — this local recording may be the only surviving copy.");
-                                            }
-                                            Some("found") if t.vod_muted_secs.unwrap_or(0) > 0 => {
-                                                ui.colored_label(
-                                                    egui::Color32::from_rgb(220, 160, 30),
-                                                    "✂ muted",
-                                                ).on_hover_text(format!(
-                                                    "VOD has {} of muted content (DMCA) — local recording is the authoritative archive.",
-                                                    fmt_duration(t.vod_muted_secs.unwrap_or(0))
-                                                ));
-                                            }
-                                            _ => {}
-                                        }
-                                        // In-progress / needs-attention badges
-                                        let needs_remux = t.output_path.ends_with(".ts")
-                                            && t.output_path.contains(".cache");
-                                        let remuxing = self.background_tasks.iter().any(|bt| {
-                                            bt.kind == crate::events::BackgroundTaskKind::Remux
-                                                && bt.id == t.id as u64
-                                        });
-                                        if remuxing {
-                                            ui.colored_label(
-                                                egui::Color32::from_rgb(80, 160, 220),
-                                                "⏳ Remuxing…",
-                                            ).on_hover_text("Converting .ts capture to .mkv — check the Background tab for progress.");
-                                        } else if needs_remux {
-                                            ui.colored_label(
-                                                egui::Color32::from_rgb(220, 140, 30),
-                                                "⚠ needs remux",
-                                            ).on_hover_text("Automatic remux failed — right-click → Re-remux to MKV.");
-                                        }
-                                    });
-                                    tr.col(|_ui| {}); // next stream (n/a per take)
-                                    tr.col(|ui| {
-                                        meta_value_cell(ui, &t.category);
-                                    });
-                                    tr.col(|ui| {
-                                        meta_value_cell(ui, &t.title);
-                                    });
-                                    // ✏ Changes (index 11)
-                                    tr.col(|ui| {
-                                        let det = meta_logs.get(&t.id);
-                                        if meta_cell(ui, t.meta_change_count, det, true) {
-                                            open_meta_popup = Some(MetaPopup::Take(t.id));
-                                        }
-                                    });
-                                    // 📢 Ads combined (index 12)
-                                    tr.col(|ui| {
-                                        let det = ad_breaks.get(&t.id);
-                                        if let Some(r) = combined_ads_cell(
-                                            ui, t.ad_count, t.ad_secs, det, Some(t.id),
-                                        ) {
-                                            open_ad_popup = Some(r);
-                                        }
-                                    });
-                                    // Went Live (index 13 — n/a per take, blank)
-                                    tr.col(|_ui| {});
-                                    // Started On (index 14)
-                                    tr.col(|ui| {
-                                        ts_label(ui, t.started_at);
-                                    });
-                                    tr.col(|ui| {
-                                        // Resolved lost time when known; else the
-                                        // provisional started - went_live (matches the
-                                        // monitor row, so a re-attached/in-progress take
-                                        // isn't blank while it's still catching up).
-                                        let lost = match t.lost_secs {
-                                            Some(l) => Some(fmt_duration(l.max(0))),
-                                            None => t
-                                                .went_live_at
-                                                .map(|w| fmt_duration((t.started_at - w).max(0))),
-                                        };
-                                        if let Some(s) = lost {
-                                            ui.label(s);
-                                        }
-                                    });
-                                    tr.col(|ui| {
-                                        let d = ui.label(fmt_duration(t.duration_secs(now)));
-                                        if t.bytes > 0 {
-                                            d.on_hover_text(fmt_bytes(t.bytes));
-                                        }
-                                    });
-                                    tr.col(|_ui| {}); // ad-free (n/a per take)
-                                    tr.col(|_ui| {}); // added
                                     tr.response().context_menu(|ui| {
                                         ui.set_min_width(180.0);
                                         // Offer re-remux when the finalized file is still a .ts
@@ -10972,8 +11119,16 @@ impl StreamArchiverApp {
                     }
                 });
             });
+        if sort.col != self.streams_sort.col || sort.ascending != self.streams_sort.ascending {
+            let persisted = grid_columns::unresolve_sort(&STREAM_COLUMNS, sort.col, sort.ascending);
+            grid_columns::save_sort(&self.core.store, GridTableId::Streams, &persisted);
+        }
         self.streams_sort = sort;
         self.streams_filters = filters;
+        if entries != self.streams_grid.entries {
+            self.streams_grid.entries = entries;
+            grid_columns::save_columns(&self.core.store, GridTableId::Streams, &self.streams_grid.entries);
+        }
         // Consume the scroll target: it fired (or the channel was filtered out)
         // — either way, clear it so we don't keep requesting scroll every frame.
         if scroll_to_cid.is_some() {
@@ -11664,6 +11819,15 @@ impl StreamArchiverApp {
             .map(|(name, key)| (*name, *key, self.job_toggles.get(*key).copied().unwrap_or(true)))
             .collect();
         let before: Vec<bool> = toggles.iter().map(|t| t.2).collect();
+        // Persisted column order/visibility for the two Background tables, taken
+        // as local copies (mutated by each header's column-chooser context
+        // menu, written back + persisted once after the ScrollArea below).
+        let mut bg_active_entries = self.bg_active_grid.entries.clone();
+        let bg_active_order = grid_columns::effective_order(&BG_ACTIVE_COLUMNS, &bg_active_entries, |_| true);
+        let bg_active_reset = self.bg_active_grid.note_order(&bg_active_order);
+        let mut bg_recent_entries = self.bg_recent_grid.entries.clone();
+        let bg_recent_order = grid_columns::effective_order(&BG_RECENT_COLUMNS, &bg_recent_entries, |_| true);
+        let bg_recent_reset = self.bg_recent_grid.note_order(&bg_recent_order);
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add_space(8.0);
@@ -11719,43 +11883,55 @@ impl StreamArchiverApp {
                 ui.weak("No tasks running.");
             } else {
                 ui.push_id("bg_active", |ui| {
-                    TableBuilder::new(ui)
+                    let mut tb = TableBuilder::new(ui)
+                        .id_salt(GridTableId::BgActive.key())
                         .striped(true)
-                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                        .column(Column::auto())                  // Channel
-                        .column(Column::auto())                  // Task
-                        .column(Column::remainder().clip(true))  // Detail
-                        .column(Column::auto())                  // Elapsed
-                        .header(20.0, |mut h| {
-                            h.col(|ui| { ui.strong("Channel / Label"); });
-                            h.col(|ui| { ui.strong("Task"); });
-                            h.col(|ui| { ui.strong("Detail"); });
-                            h.col(|ui| { ui.strong("Elapsed"); });
-                        })
-                        .body(|mut body| {
-                            for task in &self.background_tasks {
-                                body.row(20.0, |mut row| {
-                                    row.col(|ui| { ui.label(&task.label); });
-                                    row.col(|ui| { ui.label(task.kind.label()); });
-                                    row.col(|ui| {
-                                        // Show live ffmpeg stats when available; fall back to static detail.
-                                        let text = task.progress_info.as_deref().unwrap_or(&task.detail);
-                                        if let Some(p) = task.progress {
-                                            ui.add(egui::ProgressBar::new(p).show_percentage().desired_width(90.0));
-                                            ui.label(text);
-                                        } else {
-                                            ui.label(text);
+                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+                    if bg_active_reset {
+                        tb.reset();
+                    }
+                    for &i in &bg_active_order {
+                        let c = &BG_ACTIVE_COLUMNS[i];
+                        let col = if c.stretch { Column::remainder().clip(true) } else { Column::auto() };
+                        tb = tb.column(col);
+                    }
+                    tb.header(20.0, |mut h| {
+                        for &i in &bg_active_order {
+                            let c = &BG_ACTIVE_COLUMNS[i];
+                            h.col(|ui| {
+                                grid_header_cell_plain(ui, GridTableId::BgActive, c, &mut bg_active_entries, &BG_ACTIVE_COLUMNS);
+                            });
+                        }
+                    })
+                    .body(|mut body| {
+                        for task in &self.background_tasks {
+                            body.row(20.0, |mut row| {
+                                for &i in &bg_active_order {
+                                    row.col(|ui| match BG_ACTIVE_COLUMNS[i].id {
+                                        "channel" => { ui.label(&task.label); }
+                                        "task" => { ui.label(task.kind.label()); }
+                                        "detail" => {
+                                            // Show live ffmpeg stats when available; fall back to static detail.
+                                            let text = task.progress_info.as_deref().unwrap_or(&task.detail);
+                                            if let Some(p) = task.progress {
+                                                ui.add(egui::ProgressBar::new(p).show_percentage().desired_width(90.0));
+                                                ui.label(text);
+                                            } else {
+                                                ui.label(text);
+                                            }
                                         }
+                                        "elapsed" => {
+                                            ui.label(format!(
+                                                "⏳ {}",
+                                                fmt_duration_secs(now - task.started_at)
+                                            ));
+                                        }
+                                        _ => {}
                                     });
-                                    row.col(|ui| {
-                                        ui.label(format!(
-                                            "⏳ {}",
-                                            fmt_duration_secs(now - task.started_at)
-                                        ));
-                                    });
-                                });
-                            }
-                        });
+                                }
+                            });
+                        }
+                    });
                 });
             }
 
@@ -11769,59 +11945,71 @@ impl StreamArchiverApp {
                 ui.weak("No completed tasks yet.");
             } else {
                 ui.push_id("bg_recent", |ui| {
-                    TableBuilder::new(ui)
+                    let mut tb = TableBuilder::new(ui)
+                        .id_salt(GridTableId::BgRecent.key())
                         .striped(true)
-                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                        .column(Column::auto())
-                        .column(Column::auto())
-                        .column(Column::remainder().clip(true))
-                        .column(Column::auto())
-                        .header(20.0, |mut h| {
-                            h.col(|ui| { ui.strong("Channel / Label"); });
-                            h.col(|ui| { ui.strong("Task"); });
-                            h.col(|ui| { ui.strong("Detail"); });
-                            h.col(|ui| { ui.strong("Outcome"); });
-                        })
-                        .body(|mut body| {
-                            for (task, outcome, finished_at) in &self.finished_tasks {
-                                let dur = fmt_duration_secs(finished_at - task.started_at);
-                                body.row(20.0, |mut row| {
-                                    row.col(|ui| { ui.label(&task.label); });
-                                    row.col(|ui| { ui.label(task.kind.label()); });
-                                    row.col(|ui| { ui.label(&task.detail); });
-                                    row.col(|ui| {
-                                        match outcome {
-                                            crate::events::TaskOutcome::Completed => {
-                                                ui.label(format!("✔ OK ({dur})"));
-                                            }
-                                            crate::events::TaskOutcome::CompletedWithNote(note) => {
-                                                // "0 events" is a soft-warn (OCR ran but found
-                                                // nothing); anything else is a normal success.
-                                                let zero = note.starts_with("0 ");
-                                                let text = format!("{} ({dur})", note);
-                                                if zero {
+                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+                    if bg_recent_reset {
+                        tb.reset();
+                    }
+                    for &i in &bg_recent_order {
+                        let c = &BG_RECENT_COLUMNS[i];
+                        let col = if c.stretch { Column::remainder().clip(true) } else { Column::auto() };
+                        tb = tb.column(col);
+                    }
+                    tb.header(20.0, |mut h| {
+                        for &i in &bg_recent_order {
+                            let c = &BG_RECENT_COLUMNS[i];
+                            h.col(|ui| {
+                                grid_header_cell_plain(ui, GridTableId::BgRecent, c, &mut bg_recent_entries, &BG_RECENT_COLUMNS);
+                            });
+                        }
+                    })
+                    .body(|mut body| {
+                        for (task, outcome, finished_at) in &self.finished_tasks {
+                            let dur = fmt_duration_secs(finished_at - task.started_at);
+                            body.row(20.0, |mut row| {
+                                for &i in &bg_recent_order {
+                                    row.col(|ui| match BG_RECENT_COLUMNS[i].id {
+                                        "channel" => { ui.label(&task.label); }
+                                        "task" => { ui.label(task.kind.label()); }
+                                        "detail" => { ui.label(&task.detail); }
+                                        "outcome" => {
+                                            match outcome {
+                                                crate::events::TaskOutcome::Completed => {
+                                                    ui.label(format!("✔ OK ({dur})"));
+                                                }
+                                                crate::events::TaskOutcome::CompletedWithNote(note) => {
+                                                    // "0 events" is a soft-warn (OCR ran but found
+                                                    // nothing); anything else is a normal success.
+                                                    let zero = note.starts_with("0 ");
+                                                    let text = format!("{} ({dur})", note);
+                                                    if zero {
+                                                        ui.colored_label(
+                                                            egui::Color32::from_rgb(200, 160, 50),
+                                                            format!("⚠ {text}"),
+                                                        );
+                                                    } else {
+                                                        ui.colored_label(
+                                                            egui::Color32::from_rgb(80, 200, 120),
+                                                            format!("✔ {text}"),
+                                                        );
+                                                    }
+                                                }
+                                                crate::events::TaskOutcome::Failed(e) => {
                                                     ui.colored_label(
-                                                        egui::Color32::from_rgb(200, 160, 50),
-                                                        format!("⚠ {text}"),
-                                                    );
-                                                } else {
-                                                    ui.colored_label(
-                                                        egui::Color32::from_rgb(80, 200, 120),
-                                                        format!("✔ {text}"),
+                                                        egui::Color32::from_rgb(220, 80, 80),
+                                                        format!("✘ {e}"),
                                                     );
                                                 }
                                             }
-                                            crate::events::TaskOutcome::Failed(e) => {
-                                                ui.colored_label(
-                                                    egui::Color32::from_rgb(220, 80, 80),
-                                                    format!("✘ {e}"),
-                                                );
-                                            }
                                         }
+                                        _ => {}
                                     });
-                                });
-                            }
-                        });
+                                }
+                            });
+                        }
+                    });
                 });
             }
 
@@ -11835,6 +12023,34 @@ impl StreamArchiverApp {
                 let _ = self.core.store.set_setting(key, if *en { "1" } else { "0" });
             }
         }
+        if bg_active_entries != self.bg_active_grid.entries {
+            self.bg_active_grid.entries = bg_active_entries;
+            grid_columns::save_columns(&self.core.store, GridTableId::BgActive, &self.bg_active_grid.entries);
+        }
+        if bg_recent_entries != self.bg_recent_grid.entries {
+            self.bg_recent_grid.entries = bg_recent_entries;
+            grid_columns::save_columns(&self.core.store, GridTableId::BgRecent, &self.bg_recent_grid.entries);
+        }
+    }
+
+    /// Reload every grid table's in-memory column entries from the store —
+    /// used after the Settings "Reset all columns" / "Reset all column
+    /// positions" buttons write new values directly to the store, so the
+    /// running app reflects the reset immediately rather than waiting for
+    /// each table's own next save-on-change cycle.
+    fn reload_all_grid_entries(&mut self) {
+        self.streams_grid.entries =
+            grid_columns::load_columns(&self.core.store, GridTableId::Streams, &STREAM_COLUMNS);
+        self.videos_grid.entries =
+            grid_columns::load_columns(&self.core.store, GridTableId::Videos, &VIDEO_COLUMNS);
+        self.bg_active_grid.entries =
+            grid_columns::load_columns(&self.core.store, GridTableId::BgActive, &BG_ACTIVE_COLUMNS);
+        self.bg_recent_grid.entries =
+            grid_columns::load_columns(&self.core.store, GridTableId::BgRecent, &BG_RECENT_COLUMNS);
+        self.processes_grid.entries =
+            grid_columns::load_columns(&self.core.store, GridTableId::Processes, &PROCESSES_COLUMNS);
+        self.issues_grid.entries =
+            grid_columns::load_columns(&self.core.store, GridTableId::Issues, &ISSUES_COLUMNS);
     }
 
     fn settings_view(&mut self, ui: &mut egui::Ui) {
@@ -12444,6 +12660,57 @@ impl StreamArchiverApp {
                 .small()
                 .weak(),
             );
+
+            ui.add_space(12.0);
+            ui.heading("Table columns");
+            ui.label(
+                egui::RichText::new(
+                    "Column visibility, order, and sort persist per table — right-click any \
+                     table header to hide/show or reorder columns. These three buttons reset \
+                     every table at once; they're kept here, away from the grids, so a stray \
+                     click while customizing a table can't wipe it out by accident.",
+                )
+                .small()
+                .weak(),
+            );
+            ui.horizontal(|ui| {
+                let all_columns: [(GridTableId, &[GridCol]); 6] = [
+                    (GridTableId::Streams, &STREAM_COLUMNS),
+                    (GridTableId::Videos, &VIDEO_COLUMNS),
+                    (GridTableId::BgActive, &BG_ACTIVE_COLUMNS),
+                    (GridTableId::BgRecent, &BG_RECENT_COLUMNS),
+                    (GridTableId::Processes, &PROCESSES_COLUMNS),
+                    (GridTableId::Issues, &ISSUES_COLUMNS),
+                ];
+                if ui
+                    .button("Reset all columns")
+                    .on_hover_text("Show every column, in its default order, on every table.")
+                    .clicked()
+                {
+                    grid_columns::reset_all_columns(&self.core.store, &all_columns);
+                    self.reload_all_grid_entries();
+                    self.status = "Reset all table columns to default.".into();
+                }
+                if ui
+                    .button("Reset column sort")
+                    .on_hover_text("Clear sort on every table (Streams, Videos are the only sortable ones).")
+                    .clicked()
+                {
+                    grid_columns::reset_all_sort(&self.core.store, &GridTableId::ALL);
+                    self.streams_sort = SortState::default();
+                    self.videos_sort = SortState::default();
+                    self.status = "Reset table sort.".into();
+                }
+                if ui
+                    .button("Reset all column positions")
+                    .on_hover_text("Restore default column order on every table — keeps your show/hide choices.")
+                    .clicked()
+                {
+                    grid_columns::reset_all_positions(&self.core.store, &all_columns);
+                    self.reload_all_grid_entries();
+                    self.status = "Reset all table column positions.".into();
+                }
+            });
 
             ui.add_space(12.0);
             ui.heading("Download authentication");
@@ -13630,6 +13897,12 @@ impl StreamArchiverApp {
             RevealDir(usize),
         }
         let mut act: Option<Act> = None;
+        // Persisted column order/visibility, taken as a local copy (mutated by
+        // the header's column-chooser context menu, written back + persisted
+        // once after the viewport closure below).
+        let mut processes_entries = self.processes_grid.entries.clone();
+        let processes_order = grid_columns::effective_order(&PROCESSES_COLUMNS, &processes_entries, |_| true);
+        let processes_reset = self.processes_grid.note_order(&processes_order);
 
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("processes_vp"),
@@ -13653,106 +13926,116 @@ impl StreamArchiverApp {
                         ui.weak("No download tool processes are running.");
                         return;
                     }
-                    TableBuilder::new(ui)
+                    let mut tb = TableBuilder::new(ui)
+                        .id_salt(GridTableId::Processes.key())
                         .striped(true)
-                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                        .column(Column::auto()) // PID
-                        .column(Column::auto()) // Type
-                        .column(Column::remainder().clip(true)) // Name
-                        .column(Column::auto()) // Tool
-                        .column(Column::auto()) // Status
-                        .column(Column::auto()) // Uptime
-                        .column(Column::auto()) // Actions
-                        .header(20.0, |mut h| {
-                            h.col(|ui| { ui.strong("PID"); });
-                            h.col(|ui| { ui.strong("Type"); });
-                            h.col(|ui| { ui.strong("Name"); });
-                            h.col(|ui| { ui.strong("Tool"); });
-                            h.col(|ui| { ui.strong("Status"); });
-                            h.col(|ui| { ui.strong("Uptime"); });
-                            h.col(|ui| { ui.strong("Actions"); });
-                        })
-                        .body(|mut body| {
-                            for (i, p) in self.processes.iter().enumerate() {
-                                body.row(22.0, |mut row| {
-                                    row.col(|ui| { ui.monospace(p.pid.to_string()); });
-                                    row.col(|ui| {
-                                        // Map the process role to a content-type icon + label.
-                                        // A live capture is "🎥 video"; its DASH companion leg
-                                        // gets a "· dash" suffix. An on-demand download is the
-                                        // "📼 VOD" so the two video kinds stay distinguishable.
-                                        let t = match p.kind {
-                                            DetachedKind::Recording => {
-                                                let base = ContentType::Video.tag();
-                                                if p.secondary {
-                                                    format!("{base} · dash")
-                                                } else {
-                                                    base
+                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+                    if processes_reset {
+                        tb.reset();
+                    }
+                    for &i in &processes_order {
+                        let c = &PROCESSES_COLUMNS[i];
+                        let col = if c.stretch { Column::remainder().clip(true) } else { Column::auto() };
+                        tb = tb.column(col);
+                    }
+                    tb.header(20.0, |mut h| {
+                        for &i in &processes_order {
+                            let c = &PROCESSES_COLUMNS[i];
+                            h.col(|ui| {
+                                grid_header_cell_plain(ui, GridTableId::Processes, c, &mut processes_entries, &PROCESSES_COLUMNS);
+                            });
+                        }
+                    })
+                    .body(|mut body| {
+                        for (i, p) in self.processes.iter().enumerate() {
+                            body.row(22.0, |mut row| {
+                                for &ci in &processes_order {
+                                    row.col(|ui| match PROCESSES_COLUMNS[ci].id {
+                                        "pid" => { ui.monospace(p.pid.to_string()); }
+                                        "type" => {
+                                            // Map the process role to a content-type icon + label.
+                                            // A live capture is "🎥 video"; its DASH companion leg
+                                            // gets a "· dash" suffix. An on-demand download is the
+                                            // "📼 VOD" so the two video kinds stay distinguishable.
+                                            let t = match p.kind {
+                                                DetachedKind::Recording => {
+                                                    let base = ContentType::Video.tag();
+                                                    if p.secondary {
+                                                        format!("{base} · dash")
+                                                    } else {
+                                                        base
+                                                    }
                                                 }
+                                                DetachedKind::Video => ContentType::Vod.tag(),
+                                                DetachedKind::Chat => ContentType::Chat.tag(),
+                                            };
+                                            ui.label(t);
+                                        }
+                                        "name" => {
+                                            ui.label(&p.name).on_hover_text(&p.capture_path);
+                                        }
+                                        "tool" => { ui.label(&p.tool); }
+                                        "status" => {
+                                            if p.reattached {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(0x6c, 0xb0, 0xe0),
+                                                    "⛓ re-attached",
+                                                )
+                                                .on_hover_text(format!(
+                                                    "running under a prior build: {}",
+                                                    p.spawn_build
+                                                ));
+                                            } else {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(0x6c, 0xe0, 0x8c),
+                                                    "● running",
+                                                );
                                             }
-                                            DetachedKind::Video => ContentType::Vod.tag(),
-                                            DetachedKind::Chat => ContentType::Chat.tag(),
-                                        };
-                                        ui.label(t);
-                                    });
-                                    row.col(|ui| {
-                                        ui.label(&p.name).on_hover_text(&p.capture_path);
-                                    });
-                                    row.col(|ui| { ui.label(&p.tool); });
-                                    row.col(|ui| {
-                                        if p.reattached {
-                                            ui.colored_label(
-                                                egui::Color32::from_rgb(0x6c, 0xb0, 0xe0),
-                                                "⛓ re-attached",
-                                            )
-                                            .on_hover_text(format!(
-                                                "running under a prior build: {}",
-                                                p.spawn_build
-                                            ));
-                                        } else {
-                                            ui.colored_label(
-                                                egui::Color32::from_rgb(0x6c, 0xe0, 0x8c),
-                                                "● running",
-                                            );
                                         }
+                                        "uptime" => {
+                                            ui.label(fmt_duration_secs((now - p.started_at).max(0)));
+                                        }
+                                        "actions" => {
+                                            if ui
+                                                .small_button("Stop")
+                                                .on_hover_text(
+                                                    "Graceful: stop the tool and let the app finalize \
+                                                     (remux + mark the take stopped).",
+                                                )
+                                                .clicked()
+                                            {
+                                                act = Some(Act::Stop(i));
+                                            }
+                                            if ui
+                                                .small_button("Kill")
+                                                .on_hover_text(
+                                                    "Force-terminate the whole process tree now — the \
+                                                     capture may be left un-finalized.",
+                                                )
+                                                .clicked()
+                                            {
+                                                act = Some(Act::Kill(i));
+                                            }
+                                            if ui.small_button("Log").on_hover_text(&p.log_path).clicked() {
+                                                act = Some(Act::RevealLog(i));
+                                            }
+                                            if ui.small_button("Folder").clicked() {
+                                                act = Some(Act::RevealDir(i));
+                                            }
+                                        }
+                                        _ => {}
                                     });
-                                    row.col(|ui| {
-                                        ui.label(fmt_duration_secs((now - p.started_at).max(0)));
-                                    });
-                                    row.col(|ui| {
-                                        if ui
-                                            .small_button("Stop")
-                                            .on_hover_text(
-                                                "Graceful: stop the tool and let the app finalize \
-                                                 (remux + mark the take stopped).",
-                                            )
-                                            .clicked()
-                                        {
-                                            act = Some(Act::Stop(i));
-                                        }
-                                        if ui
-                                            .small_button("Kill")
-                                            .on_hover_text(
-                                                "Force-terminate the whole process tree now — the \
-                                                 capture may be left un-finalized.",
-                                            )
-                                            .clicked()
-                                        {
-                                            act = Some(Act::Kill(i));
-                                        }
-                                        if ui.small_button("Log").on_hover_text(&p.log_path).clicked() {
-                                            act = Some(Act::RevealLog(i));
-                                        }
-                                        if ui.small_button("Folder").clicked() {
-                                            act = Some(Act::RevealDir(i));
-                                        }
-                                    });
-                                });
-                            }
-                        });
+                                }
+                            });
+                        }
+                    });
                 });
             },
         );
+        if processes_entries != self.processes_grid.entries {
+            self.processes_grid.entries = processes_entries;
+            grid_columns::save_columns(&self.core.store, GridTableId::Processes, &self.processes_grid.entries);
+        }
 
         if !open {
             self.show_processes = false;
@@ -13825,6 +14108,12 @@ impl StreamArchiverApp {
     /// Issues panel: lists all recordings whose output path is still a `.ts`
     /// file inside a `.cache` directory, and lets the user re-remux them to MKV.
     #[allow(deprecated)]
+    // The per-column `match ISSUES_COLUMNS[ci].id { "actions" => { if ... } }`
+    // arms below are single-`if` bodies by nature of the column-dispatch
+    // pattern; collapsing into a match-guard (clippy's suggestion) would mean
+    // evaluating UI-drawing/click checks as match guards, which is far less
+    // readable here than the small lint it avoids.
+    #[allow(clippy::collapsible_match)]
     fn issues_window(&mut self, ctx: &egui::Context) {
         use egui_extras::{Column, TableBuilder};
         use std::time::{Duration, Instant};
@@ -13941,6 +14230,15 @@ impl StreamArchiverApp {
             DismissWarning(String),
         }
         let mut act: Option<Act> = None;
+        // Persisted column order/visibility, taken as a local copy (mutated by
+        // the header's column-chooser context menu, written back + persisted
+        // once after the viewport closure below). Shared by all 5 row-shape
+        // blocks below (needs-remux / stuck / missing / errors-no-file /
+        // errors) — all must use this SAME order to stay aligned with the
+        // header and with each other.
+        let mut issues_entries = self.issues_grid.entries.clone();
+        let issues_order = grid_columns::effective_order(&ISSUES_COLUMNS, &issues_entries, |_| true);
+        let issues_reset = self.issues_grid.note_order(&issues_order);
 
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("issues_vp"),
@@ -14049,27 +14347,30 @@ impl StreamArchiverApp {
                         ui.weak("No recording issues found — all recordings are in their final format.");
                         return;
                     }
-                    TableBuilder::new(ui)
+                    let mut tb = TableBuilder::new(ui)
+                        .id_salt(GridTableId::Issues.key())
                         .striped(true)
-                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                        .column(Column::auto())                                    // Platform icon
-                        .column(Column::auto().at_least(100.0))                    // Channel
-                        .column(Column::auto())                                    // Started
-                        .column(Column::remainder().clip(true).at_least(160.0))   // File
-                        .column(Column::auto().at_least(60.0))                     // Size
-                        .column(Column::auto().at_least(80.0))                     // Mode/type
-                        .column(Column::auto().at_least(130.0))                    // Status
-                        .column(Column::auto())                                    // Actions
-                        .header(20.0, |mut h| {
-                            h.col(|_ui| {});
-                            h.col(|ui| { ui.strong("Channel"); });
-                            h.col(|ui| { ui.strong("Started"); });
-                            h.col(|ui| { ui.strong("File"); });
-                            h.col(|ui| { ui.strong("Size"); });
-                            h.col(|ui| { ui.strong("Type"); });
-                            h.col(|ui| { ui.strong("Status"); });
-                            h.col(|ui| { ui.strong("Actions"); });
-                        })
+                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+                    if issues_reset {
+                        tb.reset();
+                    }
+                    for &i in &issues_order {
+                        let c = &ISSUES_COLUMNS[i];
+                        let col = if c.stretch {
+                            Column::remainder().clip(true).at_least(c.min_width)
+                        } else {
+                            Column::auto().at_least(c.min_width)
+                        };
+                        tb = tb.column(col);
+                    }
+                    tb.header(20.0, |mut h| {
+                        for &i in &issues_order {
+                            let c = &ISSUES_COLUMNS[i];
+                            h.col(|ui| {
+                                grid_header_cell_plain(ui, GridTableId::Issues, c, &mut issues_entries, &ISSUES_COLUMNS);
+                            });
+                        }
+                    })
                         .body(|mut body| {
                             for (i, rec) in self.issues_recs.iter().enumerate() {
                                 let (ch_name, platform) = mon_info
@@ -14102,109 +14403,114 @@ impl StreamArchiverApp {
                                     None
                                 });
                                 body.row(22.0, |mut row| {
-                                    row.col(|ui| {
-                                        if let Some(ref ptex) = ptex {
-                                            platform_icon(ui, ptex, platform);
-                                        } else {
-                                            ui.label(platform.label());
-                                        }
-                                    });
-                                    row.col(|ui| { ui.label(ch_name); });
-                                    row.col(|ui| { ui.label(fmt_datetime_short(rec.started_at)); });
-                                    row.col(|ui| {
-                                        ui.label(&fname)
-                                            .on_hover_text(&rec.output_path);
-                                    });
-                                    row.col(|ui| {
-                                        if empty {
-                                            ui.colored_label(
-                                                egui::Color32::from_rgb(180, 60, 60),
-                                                "empty",
-                                            );
-                                        } else {
-                                            ui.label(fmt_bytes(file_bytes as i64));
-                                        }
-                                    });
-                                    row.col(|ui| {
-                                        // "TS" is implicit for all rows; show the mode qualifier if present.
-                                        let type_str = if mode.is_empty() {
-                                            "TS".to_string()
-                                        } else {
-                                            format!("TS · {mode}")
-                                        };
-                                        ui.label(type_str)
-                                            .on_hover_text(format!("status: {}", rec.status));
-                                    });
-                                    row.col(|ui| {
-                                        if let Some(bt) = remux_task {
-                                            let elapsed = (now - bt.started_at).max(0);
-                                            let hover = bt.progress_info.as_deref()
-                                                .map(|i| format!("{}\nElapsed: {}", i, fmt_duration(elapsed)))
-                                                .unwrap_or_else(|| fmt_duration(elapsed));
-                                            if let Some(p) = bt.progress {
-                                                ui.add(
-                                                    egui::ProgressBar::new(p)
-                                                        .show_percentage()
-                                                        .desired_width(110.0),
-                                                )
-                                                .on_hover_text(hover);
-                                            } else if let Some(ref info) = bt.progress_info {
-                                                ui.colored_label(
-                                                    egui::Color32::from_rgb(80, 160, 220),
-                                                    info,
-                                                )
-                                                .on_hover_text(format!("Elapsed: {}", fmt_duration(elapsed)));
-                                            } else {
-                                                ui.colored_label(
-                                                    egui::Color32::from_rgb(80, 160, 220),
-                                                    format!("⏳ remuxing… {}", fmt_duration(elapsed)),
-                                                );
+                                    for &ci in &issues_order {
+                                        row.col(|ui| match ISSUES_COLUMNS[ci].id {
+                                            "platform" => {
+                                                if let Some(ref ptex) = ptex {
+                                                    platform_icon(ui, ptex, platform);
+                                                } else {
+                                                    ui.label(platform.label());
+                                                }
                                             }
-                                        } else if empty {
-                                            ui.colored_label(
-                                                egui::Color32::from_rgb(180, 60, 60),
-                                                "✗ empty — no data",
-                                            ).on_hover_text("Capture wrote 0 bytes. Delete this file.");
-                                        } else if let Some(ref err) = remux_err {
-                                            ui.colored_label(
-                                                egui::Color32::from_rgb(180, 60, 60),
-                                                "✗ remux failed",
-                                            ).on_hover_text(err.as_str());
-                                        } else {
-                                            let (icon, color) = state_icon(&rec.status);
-                                            ui.colored_label(color, icon)
-                                                .on_hover_text(&rec.status);
-                                        }
-                                    });
-                                    row.col(|ui| {
-                                        if !remuxing {
-                                            if empty {
-                                                ui.add_enabled(false, egui::Button::new("🔄").small())
-                                                    .on_hover_text("Empty capture — nothing to remux.");
-                                            } else if remux_err.is_some() {
-                                                ui.add_enabled(false, egui::Button::new("🔄").small())
-                                                    .on_hover_text("Remux failed — see status cell.");
-                                            } else if ui
-                                                .button("🔄")
-                                                .on_hover_text("Re-remux: convert .ts → .mkv via ffmpeg.")
-                                                .clicked()
-                                            {
-                                                act = Some(Act::Remux(i));
+                                            "channel" => { ui.label(ch_name); }
+                                            "started" => { ui.label(fmt_datetime_short(rec.started_at)); }
+                                            "file" => {
+                                                ui.label(&fname)
+                                                    .on_hover_text(&rec.output_path);
                                             }
-                                            if ui.button("🗑")
-                                                .on_hover_text(
-                                                    if empty {
-                                                        "Delete this empty capture file."
+                                            "size" => {
+                                                if empty {
+                                                    ui.colored_label(
+                                                        egui::Color32::from_rgb(180, 60, 60),
+                                                        "empty",
+                                                    );
+                                                } else {
+                                                    ui.label(fmt_bytes(file_bytes as i64));
+                                                }
+                                            }
+                                            "type" => {
+                                                // "TS" is implicit for all rows; show the mode qualifier if present.
+                                                let type_str = if mode.is_empty() {
+                                                    "TS".to_string()
+                                                } else {
+                                                    format!("TS · {mode}")
+                                                };
+                                                ui.label(type_str)
+                                                    .on_hover_text(format!("status: {}", rec.status));
+                                            }
+                                            "status" => {
+                                                if let Some(bt) = remux_task {
+                                                    let elapsed = (now - bt.started_at).max(0);
+                                                    let hover = bt.progress_info.as_deref()
+                                                        .map(|i| format!("{}\nElapsed: {}", i, fmt_duration(elapsed)))
+                                                        .unwrap_or_else(|| fmt_duration(elapsed));
+                                                    if let Some(p) = bt.progress {
+                                                        ui.add(
+                                                            egui::ProgressBar::new(p)
+                                                                .show_percentage()
+                                                                .desired_width(110.0),
+                                                        )
+                                                        .on_hover_text(hover);
+                                                    } else if let Some(ref info) = bt.progress_info {
+                                                        ui.colored_label(
+                                                            egui::Color32::from_rgb(80, 160, 220),
+                                                            info,
+                                                        )
+                                                        .on_hover_text(format!("Elapsed: {}", fmt_duration(elapsed)));
                                                     } else {
-                                                        "Delete the .ts capture file and remove from list."
+                                                        ui.colored_label(
+                                                            egui::Color32::from_rgb(80, 160, 220),
+                                                            format!("⏳ remuxing… {}", fmt_duration(elapsed)),
+                                                        );
                                                     }
-                                                )
-                                                .clicked()
-                                            {
-                                                act = Some(Act::Delete(i));
+                                                } else if empty {
+                                                    ui.colored_label(
+                                                        egui::Color32::from_rgb(180, 60, 60),
+                                                        "✗ empty — no data",
+                                                    ).on_hover_text("Capture wrote 0 bytes. Delete this file.");
+                                                } else if let Some(ref err) = remux_err {
+                                                    ui.colored_label(
+                                                        egui::Color32::from_rgb(180, 60, 60),
+                                                        "✗ remux failed",
+                                                    ).on_hover_text(err.as_str());
+                                                } else {
+                                                    let (icon, color) = state_icon(&rec.status);
+                                                    ui.colored_label(color, icon)
+                                                        .on_hover_text(&rec.status);
+                                                }
                                             }
-                                        }
-                                    });
+                                            "actions" => {
+                                                if !remuxing {
+                                                    if empty {
+                                                        ui.add_enabled(false, egui::Button::new("🔄").small())
+                                                            .on_hover_text("Empty capture — nothing to remux.");
+                                                    } else if remux_err.is_some() {
+                                                        ui.add_enabled(false, egui::Button::new("🔄").small())
+                                                            .on_hover_text("Remux failed — see status cell.");
+                                                    } else if ui
+                                                        .button("🔄")
+                                                        .on_hover_text("Re-remux: convert .ts → .mkv via ffmpeg.")
+                                                        .clicked()
+                                                    {
+                                                        act = Some(Act::Remux(i));
+                                                    }
+                                                    if ui.button("🗑")
+                                                        .on_hover_text(
+                                                            if empty {
+                                                                "Delete this empty capture file."
+                                                            } else {
+                                                                "Delete the .ts capture file and remove from list."
+                                                            }
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        act = Some(Act::Delete(i));
+                                                    }
+                                                }
+                                            }
+                                            _ => {}
+                                        });
+                                    }
                                 });
                             }
                             // Stuck-in-cache rows: capture succeeded but the promote-to-
@@ -14225,52 +14531,57 @@ impl StreamArchiverApp {
                                 let file_bytes = path.metadata().map(|m| m.len()).unwrap_or(0);
                                 let mode = parse_capture_mode(&fname).unwrap_or_default();
                                 body.row(22.0, |mut row| {
-                                    row.col(|ui| {
-                                        if let Some(ref ptex) = ptex {
-                                            platform_icon(ui, ptex, platform);
-                                        } else {
-                                            ui.label(platform.label());
-                                        }
-                                    });
-                                    row.col(|ui| { ui.label(ch_name); });
-                                    row.col(|ui| { ui.label(fmt_datetime_short(rec.started_at)); });
-                                    row.col(|ui| {
-                                        ui.label(&fname).on_hover_text(&rec.output_path);
-                                    });
-                                    row.col(|ui| { ui.label(fmt_bytes(file_bytes as i64)); });
-                                    row.col(|ui| {
-                                        let ext = path
-                                            .extension()
-                                            .map(|e| e.to_string_lossy().to_uppercase())
-                                            .unwrap_or_else(|| "?".into());
-                                        let type_str = if mode.is_empty() {
-                                            ext
-                                        } else {
-                                            format!("{ext} · {mode}")
-                                        };
-                                        ui.label(type_str).on_hover_text(format!("status: {}", rec.status));
-                                    });
-                                    row.col(|ui| {
-                                        ui.colored_label(
-                                            egui::Color32::from_rgb(200, 150, 60),
-                                            "⚠ stuck in .cache",
-                                        ).on_hover_text(
-                                            "The recording finished successfully, but moving it out \
-                                             of the hidden .cache\\ working folder failed — most \
-                                             commonly because the filename was too long for the \
-                                             filesystem. The file is safe; it just isn't where it \
-                                             should be yet.",
-                                        );
-                                    });
-                                    row.col(|ui| {
-                                        if ui
-                                            .button("📦")
-                                            .on_hover_text("Recover: move it to its output folder, shortening the name if needed.")
-                                            .clicked()
-                                        {
-                                            act = Some(Act::RecoverStuck(k));
-                                        }
-                                    });
+                                    for &ci in &issues_order {
+                                        row.col(|ui| match ISSUES_COLUMNS[ci].id {
+                                            "platform" => {
+                                                if let Some(ref ptex) = ptex {
+                                                    platform_icon(ui, ptex, platform);
+                                                } else {
+                                                    ui.label(platform.label());
+                                                }
+                                            }
+                                            "channel" => { ui.label(ch_name); }
+                                            "started" => { ui.label(fmt_datetime_short(rec.started_at)); }
+                                            "file" => {
+                                                ui.label(&fname).on_hover_text(&rec.output_path);
+                                            }
+                                            "size" => { ui.label(fmt_bytes(file_bytes as i64)); }
+                                            "type" => {
+                                                let ext = path
+                                                    .extension()
+                                                    .map(|e| e.to_string_lossy().to_uppercase())
+                                                    .unwrap_or_else(|| "?".into());
+                                                let type_str = if mode.is_empty() {
+                                                    ext
+                                                } else {
+                                                    format!("{ext} · {mode}")
+                                                };
+                                                ui.label(type_str).on_hover_text(format!("status: {}", rec.status));
+                                            }
+                                            "status" => {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(200, 150, 60),
+                                                    "⚠ stuck in .cache",
+                                                ).on_hover_text(
+                                                    "The recording finished successfully, but moving it out \
+                                                     of the hidden .cache\\ working folder failed — most \
+                                                     commonly because the filename was too long for the \
+                                                     filesystem. The file is safe; it just isn't where it \
+                                                     should be yet.",
+                                                );
+                                            }
+                                            "actions" => {
+                                                if ui
+                                                    .button("📦")
+                                                    .on_hover_text("Recover: move it to its output folder, shortening the name if needed.")
+                                                    .clicked()
+                                                {
+                                                    act = Some(Act::RecoverStuck(k));
+                                                }
+                                            }
+                                            _ => {}
+                                        });
+                                    }
                                 });
                             }
                             // Missing-output-file rows (completed/failed/ended but file gone from disk).
@@ -14289,42 +14600,47 @@ impl StreamArchiverApp {
                                     .map(|e| e.to_string_lossy().to_uppercase())
                                     .unwrap_or_else(|| "?".into());
                                 body.row(22.0, |mut row| {
-                                    row.col(|ui| {
-                                        if let Some(ref ptex) = ptex {
-                                            platform_icon(ui, ptex, platform);
-                                        } else {
-                                            ui.label(platform.label());
-                                        }
-                                    });
-                                    row.col(|ui| { ui.label(ch_name); });
-                                    row.col(|ui| { ui.label(fmt_datetime_short(rec.started_at)); });
-                                    row.col(|ui| {
-                                        ui.label(&fname).on_hover_text(&rec.output_path);
-                                    });
-                                    row.col(|ui| {
-                                        ui.colored_label(
-                                            egui::Color32::from_rgb(200, 130, 30),
-                                            "gone",
-                                        );
-                                    });
-                                    row.col(|ui| { ui.label(ext.as_str()); });
-                                    row.col(|ui| {
-                                        ui.colored_label(
-                                            egui::Color32::from_rgb(200, 130, 30),
-                                            "✗ file missing",
-                                        ).on_hover_text(format!(
-                                            "Output file was deleted from disk.\nDB status: {}\nPath: {}",
-                                            rec.status, rec.output_path
-                                        ));
-                                    });
-                                    row.col(|ui| {
-                                        if ui.button("🔗 Clear path")
-                                            .on_hover_text("Remove the stale path from the database record.")
-                                            .clicked()
-                                        {
-                                            act = Some(Act::ClearPath(j));
-                                        }
-                                    });
+                                    for &ci in &issues_order {
+                                        row.col(|ui| match ISSUES_COLUMNS[ci].id {
+                                            "platform" => {
+                                                if let Some(ref ptex) = ptex {
+                                                    platform_icon(ui, ptex, platform);
+                                                } else {
+                                                    ui.label(platform.label());
+                                                }
+                                            }
+                                            "channel" => { ui.label(ch_name); }
+                                            "started" => { ui.label(fmt_datetime_short(rec.started_at)); }
+                                            "file" => {
+                                                ui.label(&fname).on_hover_text(&rec.output_path);
+                                            }
+                                            "size" => {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(200, 130, 30),
+                                                    "gone",
+                                                );
+                                            }
+                                            "type" => { ui.label(ext.as_str()); }
+                                            "status" => {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(200, 130, 30),
+                                                    "✗ file missing",
+                                                ).on_hover_text(format!(
+                                                    "Output file was deleted from disk.\nDB status: {}\nPath: {}",
+                                                    rec.status, rec.output_path
+                                                ));
+                                            }
+                                            "actions" => {
+                                                if ui.button("🔗 Clear path")
+                                                    .on_hover_text("Remove the stale path from the database record.")
+                                                    .clicked()
+                                                {
+                                                    act = Some(Act::ClearPath(j));
+                                                }
+                                            }
+                                            _ => {}
+                                        });
+                                    }
                                 });
                             }
                             // ── Failed but file gone (treated as missing) ─────────────────
@@ -14343,48 +14659,53 @@ impl StreamArchiverApp {
                                     .map(|e| e.to_string_lossy().to_uppercase())
                                     .unwrap_or_else(|| "?".to_string());
                                 body.row(22.0, |mut row| {
-                                    row.col(|ui| {
-                                        if let Some(ref ptex) = ptex {
-                                            platform_icon(ui, ptex, platform);
-                                        } else {
-                                            ui.label(platform.label());
-                                        }
-                                    });
-                                    row.col(|ui| { ui.label(ch_name); });
-                                    row.col(|ui| { ui.label(fmt_datetime_short(rec.started_at)); });
-                                    row.col(|ui| {
-                                        ui.label(&fname).on_hover_text(&rec.output_path);
-                                    });
-                                    row.col(|ui| {
-                                        ui.colored_label(egui::Color32::from_rgb(200, 130, 30), "gone");
-                                    });
-                                    row.col(|ui| { ui.label(ext.as_str()); });
-                                    row.col(|ui| {
-                                        let exit_str = rec.exit_code
-                                            .map(|c| format!(" (exit {c})"))
-                                            .unwrap_or_default();
-                                        ui.colored_label(
-                                            egui::Color32::from_rgb(200, 80, 80),
-                                            format!("✗ {}{} — file missing", rec.status, exit_str),
-                                        ).on_hover_text({
-                                            let mut parts = vec![
-                                                format!("status: {}", rec.status),
-                                                format!("path: {}", rec.output_path),
-                                            ];
-                                            if !rec.log_excerpt.is_empty() {
-                                                parts.push(rec.log_excerpt.trim().to_string());
+                                    for &ci in &issues_order {
+                                        row.col(|ui| match ISSUES_COLUMNS[ci].id {
+                                            "platform" => {
+                                                if let Some(ref ptex) = ptex {
+                                                    platform_icon(ui, ptex, platform);
+                                                } else {
+                                                    ui.label(platform.label());
+                                                }
                                             }
-                                            parts.join("\n")
+                                            "channel" => { ui.label(ch_name); }
+                                            "started" => { ui.label(fmt_datetime_short(rec.started_at)); }
+                                            "file" => {
+                                                ui.label(&fname).on_hover_text(&rec.output_path);
+                                            }
+                                            "size" => {
+                                                ui.colored_label(egui::Color32::from_rgb(200, 130, 30), "gone");
+                                            }
+                                            "type" => { ui.label(ext.as_str()); }
+                                            "status" => {
+                                                let exit_str = rec.exit_code
+                                                    .map(|c| format!(" (exit {c})"))
+                                                    .unwrap_or_default();
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(200, 80, 80),
+                                                    format!("✗ {}{} — file missing", rec.status, exit_str),
+                                                ).on_hover_text({
+                                                    let mut parts = vec![
+                                                        format!("status: {}", rec.status),
+                                                        format!("path: {}", rec.output_path),
+                                                    ];
+                                                    if !rec.log_excerpt.is_empty() {
+                                                        parts.push(rec.log_excerpt.trim().to_string());
+                                                    }
+                                                    parts.join("\n")
+                                                });
+                                            }
+                                            "actions" => {
+                                                if ui.button("✕ Clear")
+                                                    .on_hover_text("Permanently remove this failed recording from the database.")
+                                                    .clicked()
+                                                {
+                                                    act = Some(Act::ClearMissingError(j2));
+                                                }
+                                            }
+                                            _ => {}
                                         });
-                                    });
-                                    row.col(|ui| {
-                                        if ui.button("✕ Clear")
-                                            .on_hover_text("Permanently remove this failed recording from the database.")
-                                            .clicked()
-                                        {
-                                            act = Some(Act::ClearMissingError(j2));
-                                        }
-                                    });
+                                    }
                                 });
                             }
                             // ── Failed / aborted / orphaned rows ─────────────────────────
@@ -14422,80 +14743,89 @@ impl StreamArchiverApp {
                                     parts.join("\n")
                                 };
                                 body.row(22.0, |mut row| {
-                                    row.col(|ui| {
-                                        if let Some(ref ptex) = ptex {
-                                            platform_icon(ui, ptex, platform);
-                                        } else {
-                                            ui.label(platform.label());
-                                        }
-                                    });
-                                    row.col(|ui| { ui.label(ch_name); });
-                                    row.col(|ui| { ui.label(fmt_datetime_short(rec.started_at)); });
-                                    row.col(|ui| {
-                                        ui.label(&fname).on_hover_text(&rec.output_path);
-                                    });
-                                    row.col(|ui| {
-                                        if has_file && file_size > 0 {
-                                            ui.label(fmt_bytes(file_size as i64));
-                                        } else if has_file {
-                                            ui.colored_label(egui::Color32::from_rgb(180, 60, 60), "empty");
-                                        } else {
-                                            ui.weak("—");
-                                        }
-                                    });
-                                    row.col(|ui| {
-                                        let ext = if rec.output_path.is_empty() {
-                                            "—".to_string()
-                                        } else {
-                                            path.extension()
-                                                .map(|e| e.to_string_lossy().to_uppercase())
-                                                .unwrap_or_else(|| "?".to_string())
-                                        };
-                                        ui.label(ext);
-                                    });
-                                    row.col(|ui| {
-                                        let color = egui::Color32::from_rgb(200, 80, 80);
-                                        let label = if exit_str.is_empty() {
-                                            format!("✗ {}", rec.status)
-                                        } else {
-                                            format!("✗ {} ({})", rec.status, exit_str)
-                                        };
-                                        ui.colored_label(color, label)
-                                            .on_hover_text(&hover);
-                                    });
-                                    row.col(|ui| {
-                                        // Remux if there's a .ts file on disk.
-                                        if has_file && has_ts {
-                                            if ui.button("🔄")
-                                                .on_hover_text("Attempt to remux this partial .ts to MKV.")
-                                                .clicked()
-                                            {
-                                                act = Some(Act::RemuxError(k));
+                                    for &ci in &issues_order {
+                                        row.col(|ui| match ISSUES_COLUMNS[ci].id {
+                                            "platform" => {
+                                                if let Some(ref ptex) = ptex {
+                                                    platform_icon(ui, ptex, platform);
+                                                } else {
+                                                    ui.label(platform.label());
+                                                }
                                             }
-                                        }
-                                        // Delete file + clear path.
-                                        if has_file {
-                                            if ui.button("🗑")
-                                                .on_hover_text("Delete the output file and clear it from the database.")
-                                                .clicked()
-                                            {
-                                                act = Some(Act::DeleteError(k));
+                                            "channel" => { ui.label(ch_name); }
+                                            "started" => { ui.label(fmt_datetime_short(rec.started_at)); }
+                                            "file" => {
+                                                ui.label(&fname).on_hover_text(&rec.output_path);
                                             }
-                                        }
-                                        // Remove DB record entirely.
-                                        if ui.button("✕ Clear")
-                                            .on_hover_text("Permanently remove this failed recording from the database.")
-                                            .clicked()
-                                        {
-                                            act = Some(Act::ClearError(k));
-                                        }
-                                    });
+                                            "size" => {
+                                                if has_file && file_size > 0 {
+                                                    ui.label(fmt_bytes(file_size as i64));
+                                                } else if has_file {
+                                                    ui.colored_label(egui::Color32::from_rgb(180, 60, 60), "empty");
+                                                } else {
+                                                    ui.weak("—");
+                                                }
+                                            }
+                                            "type" => {
+                                                let ext = if rec.output_path.is_empty() {
+                                                    "—".to_string()
+                                                } else {
+                                                    path.extension()
+                                                        .map(|e| e.to_string_lossy().to_uppercase())
+                                                        .unwrap_or_else(|| "?".to_string())
+                                                };
+                                                ui.label(ext);
+                                            }
+                                            "status" => {
+                                                let color = egui::Color32::from_rgb(200, 80, 80);
+                                                let label = if exit_str.is_empty() {
+                                                    format!("✗ {}", rec.status)
+                                                } else {
+                                                    format!("✗ {} ({})", rec.status, exit_str)
+                                                };
+                                                ui.colored_label(color, label)
+                                                    .on_hover_text(&hover);
+                                            }
+                                            "actions" => {
+                                                // Remux if there's a .ts file on disk.
+                                                if has_file && has_ts {
+                                                    if ui.button("🔄")
+                                                        .on_hover_text("Attempt to remux this partial .ts to MKV.")
+                                                        .clicked()
+                                                    {
+                                                        act = Some(Act::RemuxError(k));
+                                                    }
+                                                }
+                                                // Delete file + clear path.
+                                                if has_file {
+                                                    if ui.button("🗑")
+                                                        .on_hover_text("Delete the output file and clear it from the database.")
+                                                        .clicked()
+                                                    {
+                                                        act = Some(Act::DeleteError(k));
+                                                    }
+                                                }
+                                                // Remove DB record entirely.
+                                                if ui.button("✕ Clear")
+                                                    .on_hover_text("Permanently remove this failed recording from the database.")
+                                                    .clicked()
+                                                {
+                                                    act = Some(Act::ClearError(k));
+                                                }
+                                            }
+                                            _ => {}
+                                        });
+                                    }
                                 });
                             }
                         });
                 });
             },
         );
+        if issues_entries != self.issues_grid.entries {
+            self.issues_grid.entries = issues_entries;
+            grid_columns::save_columns(&self.core.store, GridTableId::Issues, &self.issues_grid.entries);
+        }
 
         if !open {
             self.show_issues = false;
@@ -19227,13 +19557,14 @@ mod tests {
     }
 
     #[test]
-    fn actions_col_index_is_actions() {
-        // The optional-Actions logic skips this index in the builder/header/rows;
-        // guard that it actually points at the Actions column.
-        assert_eq!(
-            super::STREAM_COLUMNS[super::STREAM_ACTIONS_COL].title,
-            "Actions"
-        );
+    fn actions_col_id_is_actions() {
+        // The Show-Actions gate (`effective_order`'s `extra_gate`) keys off this
+        // id; guard that it actually resolves to the Actions column.
+        let col = super::STREAM_COLUMNS
+            .iter()
+            .find(|c| c.id == "actions")
+            .expect("STREAM_COLUMNS must have an \"actions\" entry");
+        assert_eq!(col.title, "Actions");
     }
 
     #[test]
