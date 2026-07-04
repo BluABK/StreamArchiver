@@ -5090,6 +5090,35 @@ fn title_for_recording(store: &Store, rec_id: i64) -> String {
 /// Max length of the expanded `{games}` value, to keep paths sane.
 const GAMES_MAX_LEN: usize = 100;
 
+/// NTFS enforces a 255 **UTF-16 code-unit** limit per path component — Windows
+/// counts a surrogate pair (any character outside the Basic Multilingual
+/// Plane, e.g. most emoji) as 2 units, not 1. Exceeding it fails file
+/// operations with `ERROR_INVALID_NAME` ("The filename, directory name, or
+/// volume label syntax is incorrect", os error 123) rather than a
+/// length-specific error. See [`MAX_STEM_UTF16_LEN`].
+const NTFS_MAX_COMPONENT_UTF16: usize = 255;
+
+/// The shared filename stem is combined with several different suffixes: the
+/// main recording (`.ts`/`.mkv`) and, later, companion sidecars
+/// (`rename_companion_sidecars`/`move_companions`) — subtitle `.<lang>.vtt`,
+/// thumbnail `.thumbnail.jpg`, chat `.chat.jsonl`/`.live_chat.json`.
+/// `.live_chat.json` is the longest, so it sets the reservable budget.
+const LONGEST_COMPANION_SUFFIX_LEN: usize = ".live_chat.json".len(); // 16, ASCII
+
+/// Reserve for `unique_stem`'s collision suffix (` (2)`, ` (3)`, …).
+const COLLISION_SUFFIX_RESERVE: usize = 10;
+
+/// Hard cap on an expanded filename stem, in UTF-16 code units, so the stem
+/// plus ANY companion suffix plus a collision suffix always stays under
+/// [`NTFS_MAX_COMPONENT_UTF16`]. A long stream title combined with several
+/// logged categories (`{games}`) is the realistic way to hit this: a
+/// 2026-07-04 incident had a 251-unit stem that fit fine with `.mkv` (4 units)
+/// but its `.chat.jsonl` sidecar (11 units) pushed it to 258 and the
+/// post-capture rename silently failed, orphaning the sidecar under the old
+/// `title-tba`/`games-tba` name.
+const MAX_STEM_UTF16_LEN: usize =
+    NTFS_MAX_COMPONENT_UTF16 - LONGEST_COMPANION_SUFFIX_LEN - COLLISION_SUFFIX_RESERVE; // 229
+
 /// Build the `{games}` value from the categories played: distinct names in order
 /// of first appearance (case-insensitive dedup), joined with `, ` and capped to
 /// [`GAMES_MAX_LEN`] characters. Illegal filename characters are handled later by
@@ -5952,6 +5981,18 @@ fn expand_template(template: &str, v: &TemplateVars) -> String {
         .replace("{ts}", &v.secs.to_string())
         .replace("{category}", v.games);
     let cleaned = sanitize_filename(&expanded);
+    // Bound the stem so it plus any companion suffix (the longest is
+    // `.live_chat.json`) plus a collision suffix never exceeds NTFS's
+    // per-component limit — see `MAX_STEM_UTF16_LEN`. Re-sanitize the trailing
+    // edge: a cut can land on a space/period, which `sanitize_filename`'s trim
+    // already handled for the untruncated end but not for a newly-created one.
+    let cleaned = if cleaned.encode_utf16().count() > MAX_STEM_UTF16_LEN {
+        truncate_utf16(&cleaned, MAX_STEM_UTF16_LEN)
+            .trim_end_matches([' ', '.'])
+            .to_string()
+    } else {
+        cleaned
+    };
     if cleaned.is_empty() {
         format!("{}_{date}_{time}", sanitize_filename(v.name))
     } else {
@@ -5983,7 +6024,8 @@ fn unique_stem(dir: &Path, stem: &str, ext: &str, ignore: Option<&Path>) -> Stri
 }
 
 pub(crate) fn sanitize_filename(s: &str) -> String {
-    s.chars()
+    let cleaned: String = s
+        .chars()
         .map(|c| {
             if "<>:\"/\\|?*".contains(c) || c.is_control() {
                 '_'
@@ -5991,9 +6033,30 @@ pub(crate) fn sanitize_filename(s: &str) -> String {
                 c
             }
         })
-        .collect::<String>()
-        .trim()
-        .to_string()
+        .collect();
+    // Windows also forbids a path component ending in a space or a period
+    // (e.g. a stream title like "Chatting late tonight." would otherwise
+    // produce a filename Windows refuses with the same ERROR_INVALID_NAME as
+    // the length overflow above) — trim repeatedly, since removing one can
+    // reveal another underneath.
+    cleaned.trim().trim_end_matches([' ', '.']).to_string()
+}
+
+/// Truncate `s` to at most `max_units` **UTF-16 code units** — what NTFS and
+/// Win32 file APIs actually count for a path component's length (a character
+/// outside the Basic Multilingual Plane, e.g. most emoji, is a surrogate pair
+/// = 2 units) — without splitting a character. A plain byte- or
+/// char-count-based truncation would systematically undercount any title/
+/// category containing emoji and could still overflow the true NTFS limit.
+fn truncate_utf16(s: &str, max_units: usize) -> &str {
+    let mut acc = 0usize;
+    for (i, ch) in s.char_indices() {
+        acc += ch.len_utf16();
+        if acc > max_units {
+            return &s[..i];
+        }
+    }
+    s
 }
 
 /// Convert a unix timestamp to a UTC civil date/time (Howard Hinnant's algorithm).
@@ -6329,6 +6392,89 @@ mod tests {
             },
         );
         assert_eq!(name, "Bad_Name__20231114");
+    }
+
+    #[test]
+    fn sanitize_filename_strips_trailing_dots_and_spaces() {
+        // Windows forbids a path component ending in '.' or ' ' — a stream
+        // title ending in a period (very plausible) must not silently produce
+        // an unrenameable/uncreatable filename.
+        assert_eq!(sanitize_filename("Chatting late tonight."), "Chatting late tonight");
+        assert_eq!(sanitize_filename("Trailing space "), "Trailing space");
+        // Repeated trailing dots/spaces are all stripped, not just one layer.
+        assert_eq!(sanitize_filename("Ellipsis... "), "Ellipsis");
+        // Illegal chars still map to '_' as before.
+        assert_eq!(sanitize_filename("a:b"), "a_b");
+    }
+
+    #[test]
+    fn truncate_utf16_counts_surrogate_pairs_not_chars() {
+        // 'a' (1 unit) + '🥹' (U+1F979, outside the BMP -> 2 units).
+        let s = "a🥹b";
+        assert_eq!(truncate_utf16(s, 1), "a");
+        // Cutting after the emoji's first unit must not split the surrogate
+        // pair (and thus must not panic / produce invalid UTF-8) — the whole
+        // emoji is dropped instead.
+        assert_eq!(truncate_utf16(s, 2), "a");
+        assert_eq!(truncate_utf16(s, 3), "a🥹");
+        assert_eq!(truncate_utf16(s, 100), "a🥹b");
+    }
+
+    #[test]
+    fn expand_template_caps_stem_for_the_longest_companion_suffix() {
+        // Reproduces the 2026-07-04 CottontailVA incident: a long, emoji-laden
+        // title plus several logged categories produced a stem that fit under
+        // `.mkv` but overflowed NTFS's 255-UTF-16-unit limit once combined
+        // with `.chat.jsonl` — the companion sidecar rename then failed with
+        // os error 123 and was silently left behind under the old name.
+        let categories: Vec<String> =
+            ["Just Chatting", "Golf With Your Friends", "Super Battle Golf", "Left 4 Dead 2", "Overwatch"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        let games = format_games(&categories);
+        let title = "🥹 MOMMAS BEEN DEPRESSED BUT SHES BACK WITH MILKIES !!!💋_ !spotify !gg !soap";
+        let out = expand_template(
+            "{name} - {date} {time} - {title} [{games}] ({quality} {mode} {vcodec} {acodec}) - [{platform} {video_id}]",
+            &TemplateVars {
+                name: "CottontailVA",
+                title,
+                games: &games,
+                quality: "1080p60",
+                mode: "live",
+                vcodec: "h264",
+                acodec: "aac",
+                platform: "twitch",
+                video_id: "318342459223",
+                secs: 1_751_663_194,
+                ..Default::default()
+            },
+        );
+        let out_units = out.encode_utf16().count();
+        assert!(out_units <= MAX_STEM_UTF16_LEN, "stem itself must respect the cap: {out_units}");
+        // The property that actually matters: EVERY companion suffix, applied
+        // on top of this stem, must still fit under NTFS's per-component limit.
+        for suffix in [".ts", ".mkv", ".chat.jsonl", ".live_chat.json", ".en.vtt", ".thumbnail.jpg"] {
+            let full = format!("{out}{suffix}");
+            let units = full.encode_utf16().count();
+            assert!(
+                units <= NTFS_MAX_COMPONENT_UTF16,
+                "{suffix} pushes the filename to {units} UTF-16 units (limit {NTFS_MAX_COMPONENT_UTF16})"
+            );
+        }
+        // Must not have been chopped mid-surrogate-pair (would be invalid
+        // UTF-8 / panic on construction) and must not end in a bare '.'/' '.
+        assert!(!out.ends_with('.') && !out.ends_with(' '));
+    }
+
+    #[test]
+    fn expand_template_leaves_short_stems_untouched() {
+        // Non-regression: ordinary templates/values must not be truncated at all.
+        let out = expand_template(
+            "{name}_{date}_{time}",
+            &TemplateVars { name: "Layna", secs: 1_700_000_000, ..Default::default() },
+        );
+        assert_eq!(out, "Layna_20231114_221320");
     }
 
     #[test]
