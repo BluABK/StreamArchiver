@@ -28,12 +28,12 @@ fn quota_date_today() -> String {
 
 use crate::models::{
     AdBreak, AuthKind, Channel, Container, DetachedKind, DetachedRow, DetectionMethod, GlobalStats,
-    Monitor, MonitorWithChannel, Platform, ScheduleSegment, StreamMetaChange, Tool, UpcomingStream,
-    Video, now_unix,
+    Monitor, MonitorWithChannel, Platform, SabrCodecPref, ScheduleSegment, StreamMetaChange, Tool,
+    UpcomingStream, Video, now_unix,
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 39;
+const SCHEMA_VERSION: i64 = 40;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -878,7 +878,18 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 39)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 39);
+        if version < 40 {
+            // Per-monitor YouTube SABR codec/quality preference (a yt-dlp `-S`
+            // sort). `inherit` = use the global Settings default; `sabr_codec_custom`
+            // holds the raw `-S` string when the pref is `custom`. Mirrors the
+            // auth_kind/auth_value inherit pattern.
+            conn.execute_batch(
+                "ALTER TABLE monitor ADD COLUMN sabr_codec_pref   TEXT NOT NULL DEFAULT 'inherit';
+                 ALTER TABLE monitor ADD COLUMN sabr_codec_custom TEXT NOT NULL DEFAULT '';",
+            )?;
+            conn.pragma_update(None, "user_version", 40)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 40);
         Ok(())
     }
 
@@ -1435,8 +1446,9 @@ impl Store {
             "INSERT INTO monitor(channel_id, url, enabled, tool, detection_method, poll_interval_secs,
                 quality, output_dir, filename_template, container, capture_from_start, auth_kind,
                 auth_value, extra_args, max_concurrent, last_state, ad_free, audio_tracks, subtitle_tracks,
-                chat_log, fetch_thumbnail, fetch_chat_assets, dual_capture, thumbnail_in_toast)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                chat_log, fetch_thumbnail, fetch_chat_assets, dual_capture, thumbnail_in_toast,
+                sabr_codec_pref, sabr_codec_custom)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
             params![
                 m.channel_id,
                 m.url,
@@ -1462,6 +1474,8 @@ impl Store {
                 m.fetch_chat_assets as i64,
                 m.dual_capture as i64,
                 m.thumbnail_in_toast as i64,
+                m.sabr_codec_pref.id(),
+                m.sabr_codec_custom,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -1475,7 +1489,7 @@ impl Store {
                 auth_kind=?12, auth_value=?13, extra_args=?14, max_concurrent=?15, ad_free=?16,
                 audio_tracks=?17, subtitle_tracks=?18, chat_log=?19,
                 fetch_thumbnail=?20, fetch_chat_assets=?21, dual_capture=?22,
-                thumbnail_in_toast=?23 WHERE id=?1",
+                thumbnail_in_toast=?23, sabr_codec_pref=?24, sabr_codec_custom=?25 WHERE id=?1",
             params![
                 m.id,
                 m.url,
@@ -1500,6 +1514,8 @@ impl Store {
                 m.fetch_chat_assets as i64,
                 m.dual_capture as i64,
                 m.thumbnail_in_toast as i64,
+                m.sabr_codec_pref.id(),
+                m.sabr_codec_custom,
             ],
         )?;
         Ok(())
@@ -2478,7 +2494,8 @@ impl Store {
                 m.dual_capture,
                 c.preferred_platform,
                 m.thumbnail_in_toast,
-                c.enabled
+                c.enabled,
+                m.sabr_codec_pref, m.sabr_codec_custom
              FROM monitor m
              JOIN channel c ON c.id = m.channel_id
              LEFT JOIN recording r
@@ -2511,6 +2528,8 @@ impl Store {
                     container: Container::parse(&r.get::<_, String>(14)?),
                     capture_from_start: r.get::<_, i64>(15)? != 0,
                     dual_capture: r.get::<_, i64>(44)? != 0,
+                    sabr_codec_pref: SabrCodecPref::parse(&r.get::<_, String>(48)?),
+                    sabr_codec_custom: r.get(49)?,
                     ad_free: r.get::<_, i64>(32)? != 0,
                     auth_kind: AuthKind::parse(&r.get::<_, String>(16)?),
                     auth_value: r.get(17)?,
@@ -3291,6 +3310,8 @@ mod tests {
             max_concurrent: 1,
             last_checked_at: None,
             last_state: "idle".into(),
+            sabr_codec_pref: SabrCodecPref::Inherit,
+            sabr_codec_custom: String::new(),
         }
     }
 
@@ -3312,6 +3333,10 @@ mod tests {
         let m1 = store.insert_monitor(&m).unwrap();
         m.tool = Tool::YtDlp;
         m.container = Container::Ts;
+        // Exercise the SABR codec-pref columns round-tripping through the
+        // positional read in list_monitors_with_channels (idx 48/49).
+        m.sabr_codec_pref = SabrCodecPref::Custom;
+        m.sabr_codec_custom = "res,fps,br".into();
         let m2 = store.insert_monitor(&m).unwrap();
         assert_ne!(m1, m2);
 
@@ -3319,6 +3344,12 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r.channel.id == c1));
         assert!(rows.iter().any(|r| r.monitor.container == Container::Ts));
+        let r2 = rows.iter().find(|r| r.monitor.id == m2).unwrap();
+        assert_eq!(r2.monitor.sabr_codec_pref, SabrCodecPref::Custom);
+        assert_eq!(r2.monitor.sabr_codec_custom, "res,fps,br");
+        // The other instance keeps the default Inherit.
+        let r1 = rows.iter().find(|r| r.monitor.id == m1).unwrap();
+        assert_eq!(r1.monitor.sabr_codec_pref, SabrCodecPref::Inherit);
 
         store.set_monitor_enabled(m1, false).unwrap();
         let rows = store.list_monitors_with_channels().unwrap();

@@ -341,6 +341,8 @@ fn run_add(args: &[String], pos: usize) -> Result<()> {
         max_concurrent: 1,
         last_checked_at: None,
         last_state: "idle".into(),
+        sabr_codec_pref: models::SabrCodecPref::Inherit,
+        sabr_codec_custom: String::new(),
     };
     let monitor_id = store.insert_monitor(&monitor)?;
     println!("added monitor {monitor_id} (channel {channel_id}, {platform:?}, {method:?})");
@@ -417,6 +419,8 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
             max_concurrent: 1,
             last_checked_at: None,
             last_state: "idle".into(),
+            sabr_codec_pref: models::SabrCodecPref::Inherit,
+            sabr_codec_custom: String::new(),
         },
         last_recording_started: None,
         last_recording_ended: None,

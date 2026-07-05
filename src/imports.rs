@@ -239,6 +239,8 @@ pub fn create_monitor(
         max_concurrent: 1,
         last_checked_at: None,
         last_state: "idle".into(),
+        sabr_codec_pref: crate::models::SabrCodecPref::Inherit,
+        sabr_codec_custom: String::new(),
     };
     store.insert_monitor(&monitor)?;
     if !channel_enabled {

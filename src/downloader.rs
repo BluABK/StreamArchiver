@@ -24,7 +24,8 @@ use crate::detectors::{DetectContext, DetectItem, DetectOutcome};
 use crate::events::{AppEvent, EventTx, LiveSignal, ManualCommand};
 use crate::models::{
     AuthKind, Container, DetachedKind, DetachedRow, DetectionMethod, K_FILENAME_MEDIA,
-    MediaInfoMode, Monitor, MonitorWithChannel, Platform, Recording, Tool, Video, now_unix,
+    MediaInfoMode, Monitor, MonitorWithChannel, Platform, Recording, SabrCodecPref, Tool, Video,
+    now_unix,
 };
 use crate::platform::DetachedJob;
 use crate::store::Store;
@@ -170,6 +171,11 @@ pub struct SabrConfig {
     /// Applied regardless of the preset/`raw_args` choice (it's orthogonal to
     /// format selection).
     pub pot_args: String,
+    /// GLOBAL default video codec/quality preference (a `-S` sort layered on the
+    /// selector). A monitor's own pref overrides this unless it's `Inherit`.
+    pub codec_pref: SabrCodecPref,
+    /// GLOBAL raw `-S` string when `codec_pref == Custom`.
+    pub codec_custom: String,
 }
 
 impl SabrConfig {
@@ -233,6 +239,12 @@ pub(crate) fn load_ytdlp_bins(store: &Store) -> YtDlpBins {
         Ok(Some(v)) => v,
         _ => SABR_DEFAULT_POT_ARGS.to_string(),
     };
+    // Global codec/quality preference. Absent/unknown ⇒ Auto (yt-dlp default),
+    // preserving prior behavior. (Only the per-monitor field uses `Inherit`.)
+    let codec_pref = match SabrCodecPref::parse(&setting_str(store, "ytdlp_sabr_codec_pref")) {
+        SabrCodecPref::Inherit => SabrCodecPref::Auto,
+        other => other,
+    };
     YtDlpBins {
         system: setting_str(store, "ytdlp_binary_path"),
         sabr: SabrConfig {
@@ -256,8 +268,22 @@ pub(crate) fn load_ytdlp_bins(store: &Store) -> YtDlpBins {
             },
             raw_args: setting_str(store, "ytdlp_sabr_raw_args"),
             pot_args,
+            codec_pref,
+            codec_custom: setting_str(store, "ytdlp_sabr_codec_custom"),
         },
     }
+}
+
+/// Resolve a monitor's effective SABR format-sort (`-S` value): the monitor's own
+/// codec preference, or the global default when the monitor is set to `Inherit`.
+/// `""` = add no `-S` (yt-dlp's default codec preference).
+fn resolve_sabr_sort(m: &Monitor, sabr: &SabrConfig) -> String {
+    let (pref, custom) = if m.sabr_codec_pref == SabrCodecPref::Inherit {
+        (sabr.codec_pref, sabr.codec_custom.as_str())
+    } else {
+        (m.sabr_codec_pref, m.sabr_codec_custom.as_str())
+    };
+    pref.sort_arg(custom)
 }
 
 /// Load the DASH-companion format selector (dual capture), with fallback.
@@ -584,8 +610,10 @@ fn sabr_state_exists(output_path: &str) -> bool {
 /// extractor-args (or the manual raw override); applies cookies, the global Settings
 /// args, and the PO-token provider args. `from_start` selects `--live-from-start`
 /// (rewind to the broadcast start) vs `--no-live-from-start` (join at the live
-/// edge). Deterministic for a given `(out_mkv, from_start)`, so a resume re-runs
-/// byte-identically and yt-dlp continues from the surviving `.state`.
+/// edge). `sort` is the resolved codec/quality `-S` value (`""` = none). All
+/// inputs deterministic, so a resume re-runs byte-identically and yt-dlp
+/// continues from the surviving `.state`.
+#[allow(clippy::too_many_arguments)]
 fn sabr_capture_args(
     out_mkv: &Path,
     auth: &AuthSource,
@@ -594,6 +622,7 @@ fn sabr_capture_args(
     extra: &[String],
     url: &str,
     from_start: bool,
+    sort: &str,
 ) -> Vec<String> {
     let mut args = vec![
         "--no-part".to_string(),
@@ -630,6 +659,13 @@ fn sabr_capture_args(
     } else {
         args.extend(raw);
     }
+    // Codec/quality preference: a `-S` sort layered on the `-f` selector, so it
+    // only decides which format each `b*` selector resolves to. Before `extra`
+    // so the dropdown wins over any user `-S` in the monitor's extra args.
+    if !sort.is_empty() {
+        args.push("-S".into());
+        args.push(sort.to_string());
+    }
     args.extend_from_slice(extra);
     args.push(youtube_live_url(url));
     args
@@ -653,8 +689,10 @@ pub(crate) fn sabr_preview_args(
     extra: &[String],
     url: &str,
 ) -> Vec<String> {
-    // Live edge (`from_start=false`): the preview files BEGIN at the edge.
-    let mut args = sabr_capture_args(out_mkv, auth, ytdlp_global_args, sabr, extra, url, false);
+    // Live edge (`from_start=false`): the preview files BEGIN at the edge. No
+    // codec `-S` here — the preview forces its own fMP4 `-f` for HLS-playlist
+    // playback below, which a codec sort could fight.
+    let mut args = sabr_capture_args(out_mkv, auth, ytdlp_global_args, sabr, extra, url, false, "");
     if let Some(pos) = args.iter().position(|a| a == "-f")
         && let Some(v) = args.get_mut(pos + 1)
     {
@@ -793,7 +831,7 @@ pub fn build_plan(
             // — keep its surface minimal): no --write-thumbnail / --sub-langs here.
             let args = sabr_capture_args(
                 &capture_path, auth, ytdlp_global_args, &ytdlp.sabr, &extra, &m.url,
-                m.capture_from_start,
+                m.capture_from_start, &resolve_sabr_sort(m, &ytdlp.sabr),
             );
             (ytdlp.sabr.binary.clone(), args)
         }
@@ -3780,7 +3818,7 @@ impl Supervisor {
         // sequence cursor regardless of this flag, so it's safe.)
         let args = sabr_capture_args(
             &capture, &auth, &ytdlp_global_args, &ytdlp_bins.sabr, &extra, &row.monitor.url,
-            row.monitor.capture_from_start,
+            row.monitor.capture_from_start, &resolve_sabr_sort(&row.monitor, &ytdlp_bins.sabr),
         );
         let use_sabr_resume = true; // resume is always SABR
         let mode_resume = recording_mode(&row.monitor, use_sabr_resume, false);
@@ -6517,6 +6555,8 @@ mod tests {
                 max_concurrent: 1,
                 last_checked_at: None,
                 last_state: "idle".into(),
+                sabr_codec_pref: SabrCodecPref::Inherit,
+                sabr_codec_custom: String::new(),
             },
             last_recording_started: None,
             last_recording_ended: None,
@@ -7272,6 +7312,8 @@ mod tests {
                 extractor_args: SABR_DEFAULT_EXTRACTOR_ARGS.into(),
                 raw_args: String::new(),
                 pot_args: SABR_DEFAULT_POT_ARGS.into(),
+                codec_pref: SabrCodecPref::Auto,
+                codec_custom: String::new(),
             },
         }
     }
@@ -7295,7 +7337,7 @@ mod tests {
             format!("bv[protocol=sabr][ext=mp4]+ba[protocol=sabr][ext=m4a]/{SABR_DEFAULT_FORMAT}")
         );
         let capture = sabr_capture_args(
-            &out, &AuthSource::None, &[], &bins.sabr, &[], "https://www.youtube.com/@chan", true,
+            &out, &AuthSource::None, &[], &bins.sabr, &[], "https://www.youtube.com/@chan", true, "",
         );
         let normalize = |v: &[String]| {
             v.iter()
@@ -7561,8 +7603,45 @@ mod tests {
             &[],
             &r.monitor.url,
             r.monitor.capture_from_start,
+            &resolve_sabr_sort(&r.monitor, &bins.sabr),
         );
         assert_eq!(plan.args, resume_args);
+    }
+
+    /// The value of a `-S` arg (the token after `-S`), or `None` if absent.
+    fn sort_of(args: &[String]) -> Option<String> {
+        args.iter().position(|a| a == "-S").map(|i| args[i + 1].clone())
+    }
+
+    #[test]
+    fn sabr_codec_pref_injects_format_sort() {
+        let bins = sabr_bins();
+
+        // Default (Inherit → global Auto) emits no -S, so existing captures are
+        // byte-identical.
+        let auto = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
+        let plan = build_plan(&auto, 1_700_000_000, &AuthSource::None, &[], None, "", None, 0, &bins);
+        assert_eq!(sort_of(&plan.args), None);
+
+        // A per-instance H.264 preference injects `-S res,fps,vcodec:h264`.
+        let mut h264 = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
+        h264.monitor.sabr_codec_pref = SabrCodecPref::H264;
+        let plan = build_plan(&h264, 1_700_000_000, &AuthSource::None, &[], None, "", None, 0, &bins);
+        assert_eq!(sort_of(&plan.args).as_deref(), Some("res,fps,vcodec:h264"));
+
+        // Inherit falls through to the global default — here Best quality → `br`.
+        let mut inh = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
+        inh.monitor.sabr_codec_pref = SabrCodecPref::Inherit;
+        let mut bins_best = sabr_bins();
+        bins_best.sabr.codec_pref = SabrCodecPref::BestQuality;
+        let plan = build_plan(&inh, 1_700_000_000, &AuthSource::None, &[], None, "", None, 0, &bins_best);
+        assert_eq!(sort_of(&plan.args).as_deref(), Some("res,fps,br"));
+
+        // A per-instance override wins over the global default.
+        let mut over = row(Tool::YtDlp, Container::Mkv, Platform::YouTube);
+        over.monitor.sabr_codec_pref = SabrCodecPref::Vp9;
+        let plan = build_plan(&over, 1_700_000_000, &AuthSource::None, &[], None, "", None, 0, &bins_best);
+        assert_eq!(sort_of(&plan.args).as_deref(), Some("res,fps,vcodec:vp9"));
     }
 
     fn video(tool: Tool, url: &str) -> Video {

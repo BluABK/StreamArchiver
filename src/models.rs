@@ -380,6 +380,107 @@ impl AuthKind {
     }
 }
 
+/// YouTube SABR video codec/quality preference. YouTube serves the same 1080p60
+/// source as several SABR renditions (H.264, VP9, AV1) at different bitrates;
+/// yt-dlp's default sort prefers the smaller VP9/AV1. This maps to a yt-dlp
+/// format-sort (`-S`) layered on the SABR `-f` selector, so it only changes which
+/// rendition each `b*` selector resolves to. `Inherit` (per-instance only) uses
+/// the global Settings default; the others are concrete presets or a raw custom
+/// `-S` string. Mirrors [`AuthKind`]'s Inherit/global pattern.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SabrCodecPref {
+    /// Per-instance: use the global default from Settings.
+    Inherit,
+    /// yt-dlp's default codec preference (efficiency — VP9/AV1). No `-S` added.
+    #[default]
+    Auto,
+    /// Highest bitrate at the best resolution/fps, regardless of codec.
+    BestQuality,
+    /// Prefer H.264 (AVC) as the codec tiebreaker.
+    H264,
+    /// Prefer VP9.
+    Vp9,
+    /// Prefer AV1.
+    Av1,
+    /// A raw `-S` sort string supplied by the user (see `sabr_codec_custom`).
+    Custom,
+}
+
+impl SabrCodecPref {
+    /// Every variant, in dropdown display order (Inherit first for per-instance).
+    pub const ALL: [SabrCodecPref; 7] = [
+        SabrCodecPref::Inherit,
+        SabrCodecPref::Auto,
+        SabrCodecPref::BestQuality,
+        SabrCodecPref::H264,
+        SabrCodecPref::Vp9,
+        SabrCodecPref::Av1,
+        SabrCodecPref::Custom,
+    ];
+
+    /// The presets offered at the GLOBAL level (no `Inherit` — nothing to inherit).
+    pub const GLOBAL: [SabrCodecPref; 6] = [
+        SabrCodecPref::Auto,
+        SabrCodecPref::BestQuality,
+        SabrCodecPref::H264,
+        SabrCodecPref::Vp9,
+        SabrCodecPref::Av1,
+        SabrCodecPref::Custom,
+    ];
+
+    /// Stable persisted id (never change once shipped).
+    pub fn id(self) -> &'static str {
+        match self {
+            SabrCodecPref::Inherit => "inherit",
+            SabrCodecPref::Auto => "auto",
+            SabrCodecPref::BestQuality => "best",
+            SabrCodecPref::H264 => "h264",
+            SabrCodecPref::Vp9 => "vp9",
+            SabrCodecPref::Av1 => "av01",
+            SabrCodecPref::Custom => "custom",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SabrCodecPref::Inherit => "Inherit (global)",
+            SabrCodecPref::Auto => "Auto (efficiency — VP9/AV1)",
+            SabrCodecPref::BestQuality => "Best quality (highest bitrate)",
+            SabrCodecPref::H264 => "Prefer H.264",
+            SabrCodecPref::Vp9 => "Prefer VP9",
+            SabrCodecPref::Av1 => "Prefer AV1",
+            SabrCodecPref::Custom => "Custom (-S sort)",
+        }
+    }
+
+    /// Resolve a persisted id back to a variant (unknown ⇒ `Inherit`).
+    pub fn parse(s: &str) -> SabrCodecPref {
+        match s {
+            "auto" => SabrCodecPref::Auto,
+            "best" => SabrCodecPref::BestQuality,
+            "h264" => SabrCodecPref::H264,
+            "vp9" => SabrCodecPref::Vp9,
+            "av01" => SabrCodecPref::Av1,
+            "custom" => SabrCodecPref::Custom,
+            _ => SabrCodecPref::Inherit,
+        }
+    }
+
+    /// The yt-dlp `-S` format-sort value for this preference (`""` = add no `-S`).
+    /// `res,fps` lead so resolution/fps always dominate and codec/bitrate is only
+    /// the tiebreaker. `custom` is the raw string for [`SabrCodecPref::Custom`].
+    pub fn sort_arg(self, custom: &str) -> String {
+        match self {
+            SabrCodecPref::BestQuality => "res,fps,br".to_string(),
+            SabrCodecPref::H264 => "res,fps,vcodec:h264".to_string(),
+            SabrCodecPref::Vp9 => "res,fps,vcodec:vp9".to_string(),
+            SabrCodecPref::Av1 => "res,fps,vcodec:av01".to_string(),
+            SabrCodecPref::Custom => custom.trim().to_string(),
+            SabrCodecPref::Auto | SabrCodecPref::Inherit => String::new(),
+        }
+    }
+}
+
 /// When to probe a capture for **actual** media info (resolution/fps/codec) used
 /// by the filename `{resolution}`/`{height}`/`{width}`/`{fps}`/`{vcodec}`
 /// variables. These aren't known when the name is first chosen (before capture),
@@ -551,6 +652,11 @@ pub struct Monitor {
     /// formats span both SABR and DASH. Produces a second recording in the same
     /// take. See the SABR settings + the DASH companion format selector.
     pub dual_capture: bool,
+    /// YouTube SABR video codec/quality preference (a yt-dlp `-S` sort layered on
+    /// the SABR selector). `Inherit` = use the global Settings default.
+    pub sabr_codec_pref: SabrCodecPref,
+    /// Raw `-S` sort string used when `sabr_codec_pref == Custom` (else ignored).
+    pub sabr_codec_custom: String,
     /// Manually marked ad-free for our account (YouTube membership/Premium,
     /// Twitch Turbo/sub) — captures won't have ad-break hard cuts. Auto Twitch-sub
     /// detection can also set the displayed status; see `MonitorWithChannel`.

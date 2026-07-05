@@ -29,7 +29,7 @@ use crate::models::{
     K_FILE_SPLIT_ENABLED, K_FILE_SPLIT_VIDEOS, K_FILE_SPLIT_SUBS, K_FILE_SPLIT_CHAT,
     K_FILE_SPLIT_THUMBS, K_FILE_SPLIT_LOGS,
     MediaInfoMode, Monitor, MonitorDefaults, MonitorWithChannel, OcrStats, Platform, Recording,
-    ScheduleSegment, StreamGroup, StreamMetaChange, Tool, UpcomingStream, Video,
+    SabrCodecPref, ScheduleSegment, StreamGroup, StreamMetaChange, Tool, UpcomingStream, Video,
     group_recordings, now_unix,
 };
 use crate::google_oauth;
@@ -73,6 +73,11 @@ const K_SABR_POT_ARGS: &str = "ytdlp_sabr_pot_args";
 const K_SABR_DEEP_REWIND: &str = "ytdlp_sabr_deep_rewind";
 /// DASH-companion format selector for dual capture.
 const K_DASH_FORMAT: &str = "ytdlp_dash_format";
+/// GLOBAL default SABR video codec/quality preference (a [`SabrCodecPref`] id,
+/// e.g. `auto`/`best`/`h264`). Per-monitor `Inherit` falls through to this.
+const K_SABR_CODEC_PREF: &str = "ytdlp_sabr_codec_pref";
+/// GLOBAL raw `-S` string used when `K_SABR_CODEC_PREF == custom`.
+const K_SABR_CODEC_CUSTOM: &str = "ytdlp_sabr_codec_custom";
 const K_WEBSUB_URL: &str = "websub_vps_url";
 const K_WEBSUB_TOKEN: &str = "websub_token";
 const K_WEBSUB_POLL: &str = "websub_poll_secs";
@@ -189,6 +194,10 @@ struct MonitorForm {
     /// into channel_assets/ alongside recordings.
     fetch_chat_assets: bool,
     extra_args: String,
+    /// YouTube SABR video codec/quality preference (Inherit ⇒ follow the global
+    /// default) + its raw `-S` sort when `Custom`.
+    sabr_codec_pref: SabrCodecPref,
+    sabr_codec_custom: String,
     /// Platform the tool/detection defaults were last set for; a URL change to a
     /// different platform re-applies that platform's defaults.
     last_platform: Option<Platform>,
@@ -227,6 +236,8 @@ impl MonitorForm {
             thumbnail_in_toast: false,
             fetch_chat_assets: true,
             extra_args: String::new(),
+            sabr_codec_pref: SabrCodecPref::Inherit,
+            sabr_codec_custom: String::new(),
             last_platform: None,
         }
     }
@@ -258,6 +269,8 @@ impl MonitorForm {
             thumbnail_in_toast: m.thumbnail_in_toast,
             fetch_chat_assets: m.fetch_chat_assets,
             extra_args: m.extra_args.clone(),
+            sabr_codec_pref: m.sabr_codec_pref,
+            sabr_codec_custom: m.sabr_codec_custom.clone(),
             // Don't override the saved tool/detection just because the form opened.
             last_platform: Some(m.platform()),
         }
@@ -294,6 +307,8 @@ impl MonitorForm {
             thumbnail_in_toast: false,
             fetch_chat_assets: true,
             extra_args: String::new(),
+            sabr_codec_pref: SabrCodecPref::Inherit,
+            sabr_codec_custom: String::new(),
             last_platform: None,
         }
     }
@@ -411,6 +426,9 @@ struct SettingsForm {
     sabr_raw_args: String,
     /// PO-token-provider `--extractor-args` (e.g. bgutil) for the SABR command.
     sabr_pot_args: String,
+    /// GLOBAL default video codec/quality preference + its raw `-S` (when Custom).
+    sabr_codec_pref: SabrCodecPref,
+    sabr_codec_custom: String,
     /// DASH-companion format selector used by dual (SABR+DASH) capture.
     dash_format: String,
     /// Discord user token + whether to import stream schedules from Discord events
@@ -997,6 +1015,13 @@ impl StreamArchiverApp {
                 Ok(Some(v)) => v,
                 _ => crate::downloader::SABR_DEFAULT_POT_ARGS.to_string(),
             },
+            // GLOBAL codec/quality default: unknown/absent ⇒ Auto (never Inherit —
+            // there is nothing above the global to inherit from).
+            sabr_codec_pref: match SabrCodecPref::parse(&setting_or_empty(&core, K_SABR_CODEC_PREF)) {
+                SabrCodecPref::Inherit => SabrCodecPref::Auto,
+                other => other,
+            },
+            sabr_codec_custom: setting_or_empty(&core, K_SABR_CODEC_CUSTOM),
             dash_format: {
                 let v = setting_or_empty(&core, K_DASH_FORMAT);
                 if v.is_empty() {
@@ -1756,6 +1781,8 @@ impl StreamArchiverApp {
             max_concurrent: 1,
             last_checked_at: None,
             last_state: "idle".into(),
+            sabr_codec_pref: form.sabr_codec_pref,
+            sabr_codec_custom: form.sabr_codec_custom.trim().to_string(),
         };
         let monitor_id = form.monitor_id;
 
@@ -2009,6 +2036,8 @@ impl StreamArchiverApp {
             (K_SABR_DEEP_REWIND, if s.sabr_deep_rewind { "1" } else { "0" }),
             (K_SABR_RAW_ARGS, s.sabr_raw_args.trim()),
             (K_SABR_POT_ARGS, s.sabr_pot_args.trim()),
+            (K_SABR_CODEC_PREF, s.sabr_codec_pref.id()),
+            (K_SABR_CODEC_CUSTOM, s.sabr_codec_custom.trim()),
             (K_DASH_FORMAT, s.dash_format.trim()),
             (K_DISCORD_TOKEN, s.discord_token.trim()),
             // Only persist the import as on when a token actually backs it, so the
@@ -13008,6 +13037,33 @@ impl StreamArchiverApp {
                     );
                     ui.end_row();
 
+                    ui.label("Video codec / quality");
+                    egui::ComboBox::from_id_salt("settings_sabr_codec_pref")
+                        .selected_text(self.settings.sabr_codec_pref.label())
+                        .show_ui(ui, |ui| {
+                            for &p in &SabrCodecPref::GLOBAL {
+                                ui.selectable_value(
+                                    &mut self.settings.sabr_codec_pref,
+                                    p,
+                                    p.label(),
+                                );
+                            }
+                        });
+                    ui.end_row();
+                    if self.settings.sabr_codec_pref == SabrCodecPref::Custom {
+                        ui.label("Custom -S sort");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings.sabr_codec_custom)
+                                .hint_text("res,fps,vcodec:h264")
+                                .desired_width(f32::INFINITY),
+                        )
+                        .on_hover_text(
+                            "Raw yt-dlp -S format-sort applied to the SABR selector. Lead with \
+                             res,fps so resolution/fps win and codec/bitrate is only the tiebreak.",
+                        );
+                        ui.end_row();
+                    }
+
                     ui.label("DASH companion format");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.settings.dash_format)
@@ -15724,6 +15780,39 @@ impl StreamArchiverApp {
                                  Needs Capture-from-start and a configured SABR build.",
                             );
                             ui.end_row();
+
+                            ui.label("Video codec / quality");
+                            egui::ComboBox::from_id_salt("form_sabr_codec_pref")
+                                .selected_text(form.sabr_codec_pref.label())
+                                .show_ui(ui, |ui| {
+                                    for &p in &SabrCodecPref::ALL {
+                                        ui.selectable_value(
+                                            &mut form.sabr_codec_pref,
+                                            p,
+                                            p.label(),
+                                        );
+                                    }
+                                })
+                                .response
+                                .on_hover_text(
+                                    "SABR video codec/quality for this instance. Inherit follows \
+                                     the global default in Settings. Best-quality/H.264 avoid the \
+                                     lower-bitrate VP9/AV1 rendition of the same resolution.",
+                                );
+                            ui.end_row();
+                            if form.sabr_codec_pref == SabrCodecPref::Custom {
+                                ui.label("Custom -S sort");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut form.sabr_codec_custom)
+                                        .hint_text("res,fps,vcodec:h264")
+                                        .desired_width(f32::INFINITY),
+                                )
+                                .on_hover_text(
+                                    "Raw yt-dlp -S format-sort. Lead with res,fps so \
+                                     resolution/fps win and codec/bitrate is only the tiebreak.",
+                                );
+                                ui.end_row();
+                            }
                         }
 
                         ui.label("Ad-free");
