@@ -349,6 +349,77 @@ The Issues panel refreshes every 5 s while open and every 30 s while closed, so 
 
 > The active re-remux job is a background tokio task and does not survive an app restart. The source `.ts` is always preserved, so after a restart the file reappears in the Issues panel and can be re-triggered.
 
+### Twitch VOD recovery (deleted & muted VODs)
+
+Twitch DMCA-**mutes** VODs (silencing flagged segments) and, on deletion,
+**unpublishes** them — but the underlying `.ts`/`.mp4` segments linger on Twitch's
+CDN for roughly **60 days**. StreamArchiver can reconstruct a muted or deleted VOD
+from those surviving segments and mux them into an MKV, entirely from metadata (no
+Twitch login required).
+
+**How it finds a VOD.** A VOD's playlist URL is derivable from the streamer login,
+the **broadcast/stream id** (the number in a `/streams/<id>` tracker URL — *not* the
+`/videos/<id>` archive id), and the stream's UTC start second:
+`sha1("{login}_{broadcast}_{start}")[:20]` names its CDN folder, which the app probes
+across a self-updating list of CDN hosts (a symmetric ±window absorbs start-time
+imprecision). For a VOD that's still published (merely muted), the app takes a more
+robust shortcut: it asks Twitch's public API for the VOD's *exact* CDN folder, so it
+never depends on the host list.
+
+**Un-muting & salvage.** A muted VOD lists its flagged segments under a dead
+`-unmuted` pointer; the app rewrites each to the segment that actually survives —
+preferring the pre-mute **original** (a true un-mute, when Twitch hasn't purged it)
+and otherwise the silenced `-muted` copy (silence over a hole). Deleted VODs are
+salvaged segment-by-segment, dropping any that are gone, so a partially-expired VOD
+still yields everything that remains.
+
+**Recording badges.** In the recording-history tree, a Twitch take shows its VOD
+state: **⚠ no VOD** (never published), **✂ muted** (the published VOD has DMCA-muted
+content — your local recording is the authoritative copy), and after a recovery
+**🛟 recovered** / **🛟 partial** (some segments were gone) / **🛟 gone** (past the
+~60-day window).
+
+**Recovering one:**
+
+- **From a tracked recording** — right-click a Twitch take (especially one badged
+  **⚠ no VOD** or **✂ muted**) → **🛟 Recover VOD…**. The dialog is pre-filled from
+  the recording's stored broadcast id + go-live time, and the recovered MKV is
+  attached back onto that recording (open it via **🛟 Open recovered file**).
+- **Manually / any VOD** — the **🛟 Recover Twitch VOD…** button on the **Videos**
+  tab opens the same dialog blank. Enter the streamer login + broadcast id + UTC
+  start, or **paste a URL**: a `twitch.tv/videos/<id>` link resolves everything via
+  Twitch's API in one click, or a TwitchTracker / StreamsCharts / SullyGnome
+  `/streams/<id>` link is parsed (with a best-effort start-time scrape). A recovery
+  that isn't tied to a tracked recording lands in the **Videos** list.
+- **Probe first** — the dialog's **🔎 Probe** button checks availability before
+  downloading, reporting the host, the resolved true start, the available qualities,
+  and a `present / total · un-muted · missing` segment count (warning when the
+  recovery would be partial).
+
+**Automatic & bulk recovery** (Settings → *Twitch VOD recovery*):
+
+- **Auto-recover muted / deleted VODs** — when the background VOD checker finds a
+  tracked stream's VOD muted or unpublished, recover it automatically (off by
+  default — it's network-heavy).
+- **Recover deleted/muted VODs** — a one-shot bulk sweep of every eligible recording
+  inside the ~60-day window.
+- **Default quality**, **max concurrent probes**, and **extra CDN hosts** are
+  configurable.
+
+**Keeping the CDN host list current.** Twitch rotates its CDN distributions, so a
+fixed host list goes stale. The list is **self-updating**: it seeds from a built-in
+set, learns the serving host from every successful recovery, and a **Refresh CDN
+hosts** button harvests the currently-active hosts from your own published VODs via
+Twitch's API. (For the common muted case the host list is moot anyway — the API
+returns the exact host.)
+
+> Recovery is Twitch-only and needs a broadcast/stream id, so it's offered on takes
+> the app detected with an id (Helix/EventSub) or via manual entry. Twitch usually
+> purges the pre-mute **original** audio quickly, so muted recoveries typically yield
+> the silenced copy — a complete, playable file with silence over the muted stretch —
+> rather than restored audio; the `un-muted` count in the probe tells you which you
+> got. The public-API lookups use Twitch's read-only web client id (no account).
+
 ### Audio & subtitle tracks
 
 To archive as much of a stream as possible, each instance has **Audio tracks** and
