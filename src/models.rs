@@ -1669,6 +1669,9 @@ pub struct RecoverableTake {
     /// `true` when the VOD is deleted (`not_published`) — probe every segment;
     /// `false` when merely muted (still online) — probe only muted segments.
     pub deleted: bool,
+    /// The `/videos/<id>` archive id when known (muted-but-online VOD) — enables the
+    /// GQL fast-path. `None` for a deleted VOD.
+    pub vod_id: Option<String>,
 }
 
 impl Recording {

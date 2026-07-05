@@ -60,6 +60,7 @@ pub const CDN_HOSTS: &[&str] = &[
     "https://d1mhjrowxxagfy.cloudfront.net/",
     "https://ddacn6pr5v0tl.cloudfront.net/",
     "https://d3aqoihi2n8ty8.cloudfront.net/",
+    "https://d2vi6trrdongqn.cloudfront.net/",
 ];
 
 /// Quality path components to probe, source-first.
@@ -107,6 +108,10 @@ pub struct RecoveryInputs {
     pub start_epoch: i64,
     /// True when `start_epoch` came from the detection clock (widen the search).
     pub went_live_approx: bool,
+    /// The `/videos/<id>` archive id, when known (a published/muted VOD). Enables
+    /// the GQL fast-path (exact host+folder, no CDN host-list guessing). `None` for
+    /// a deleted VOD — those fall back to the hash-derived host probe.
+    pub vod_id: Option<String>,
 }
 
 /// Where a completed recovery is filed.
@@ -209,6 +214,113 @@ pub async fn find_live_playlist(
         }
     }
     None
+}
+
+/// Twitch's public web client-id (read-only GQL). Used only to look up a published
+/// VOD's exact CDN folder via `seekPreviewsURL` — no auth or user data involved.
+const GQL_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
+
+/// A published VOD's exact CDN location, resolved from Twitch GQL — no host-list
+/// guessing. Also yields the login/broadcast/start the derivation would need.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VodInfo {
+    pub login: String,
+    pub broadcast_id: String,
+    pub start_epoch: i64,
+    pub host: String,
+    pub folder: String,
+}
+
+/// Split a `seekPreviewsURL` into `(host, folder)`, where folder is the
+/// `{hash}_{login}_{broadcast}_{epoch}` path segment.
+fn parse_seek_previews(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
+    let (host, path) = rest.split_once('/')?;
+    let folder = path.split("/storyboards/").next()?.trim_matches('/');
+    if host.is_empty() || folder.is_empty() {
+        return None;
+    }
+    Some((host.to_string(), folder.to_string()))
+}
+
+/// Extract `(login, broadcast_id, epoch)` from a CDN folder name. The login can
+/// itself contain underscores (e.g. `yuy_ix`), so peel the fixed head (hash) and
+/// tail (broadcast, epoch) and re-join the middle.
+fn folder_parts(folder: &str) -> Option<(String, String, i64)> {
+    let parts: Vec<&str> = folder.split('_').collect();
+    if parts.len() < 4 {
+        return None;
+    }
+    let epoch = parts[parts.len() - 1].parse::<i64>().ok()?;
+    let broadcast = parts[parts.len() - 2];
+    if broadcast.is_empty() || !broadcast.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let login = parts[1..parts.len() - 2].join("_");
+    if login.is_empty() {
+        return None;
+    }
+    Some((login, broadcast.to_string(), epoch))
+}
+
+/// Look up a published VOD's exact CDN folder via Twitch GQL (`seekPreviewsURL`).
+/// `vod_id` must be the numeric `/videos/<id>`. Errors for deleted/private VODs.
+pub async fn gql_vod_info(client: &reqwest::Client, vod_id: &str) -> anyhow::Result<VodInfo> {
+    if vod_id.is_empty() || !vod_id.chars().all(|c| c.is_ascii_digit()) {
+        anyhow::bail!("vod id must be numeric");
+    }
+    let body = serde_json::json!({
+        "query": format!("query{{video(id:\"{vod_id}\"){{seekPreviewsURL}}}}")
+    });
+    let resp = client
+        .post("https://gql.twitch.tv/gql")
+        .header("Client-Id", GQL_CLIENT_ID)
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?;
+    let v: serde_json::Value = resp.json().await?;
+    let seek = v["data"]["video"]["seekPreviewsURL"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("no seekPreviewsURL (VOD deleted, private, or sub-only?)"))?;
+    let (host, folder) =
+        parse_seek_previews(seek).ok_or_else(|| anyhow::anyhow!("unparseable seekPreviewsURL"))?;
+    let (login, broadcast_id, start_epoch) =
+        folder_parts(&folder).ok_or_else(|| anyhow::anyhow!("unexpected CDN folder shape"))?;
+    Ok(VodInfo { login, broadcast_id, start_epoch, host, folder })
+}
+
+/// GQL fast-path: resolve a published VOD's live playlist by its `/videos/` id,
+/// bypassing the CDN host-list entirely. `None` when GQL has nothing (deleted VOD)
+/// or the derived playlist doesn't actually respond.
+async fn resolve_via_gql(client: &reqwest::Client, vod_id: &str) -> Option<FoundPlaylist> {
+    let info = gql_vod_info(client, vod_id).await.ok()?;
+    let url = format!("https://{}/{}/chunked/index-dvr.m3u8", info.host, info.folder);
+    head_ok(client, &url).await.then(|| FoundPlaylist {
+        url,
+        host: format!("https://{}/", info.host),
+        matched_epoch: info.start_epoch,
+    })
+}
+
+/// Locate a VOD's live playlist: try the GQL fast-path first when a `/videos/` id
+/// is known (exact, host-list-independent — the robust path for muted-but-online
+/// VODs), then fall back to hash-probing the CDN host list (for deleted VODs).
+pub async fn resolve_playlist(
+    client: &reqwest::Client,
+    inputs: &RecoveryInputs,
+    hosts: &[String],
+    max_conc: usize,
+) -> Option<FoundPlaylist> {
+    let gql = match inputs.vod_id.as_deref().filter(|s| !s.is_empty()) {
+        Some(vid) => resolve_via_gql(client, vid).await,
+        None => None,
+    };
+    match gql {
+        Some(found) => Some(found),
+        None => find_live_playlist(client, inputs, hosts, max_conc).await,
+    }
 }
 
 /// Swap the `chunked` quality path component for `quality` (identity when equal).
@@ -608,7 +720,7 @@ pub async fn run_recovery(
 
     let hosts = load_hosts(&store);
     let max_conc = load_max_conc(&store);
-    let found = match find_live_playlist(&client, &inputs, &hosts, max_conc).await {
+    let found = match resolve_playlist(&client, &inputs, &hosts, max_conc).await {
         Some(f) => f,
         None => {
             finish_fail("no live playlist found (past the ~60-day CDN window?)".into());
@@ -773,10 +885,21 @@ pub mod scrape {
         pub site: Site,
     }
 
+    /// Extract the numeric `/videos/<id>` archive id from a Twitch VOD URL — the
+    /// id the GQL fast-path (`gql_vod_info`) needs.
+    pub fn twitch_vod_id(url: &str) -> Option<String> {
+        let lower = url.to_lowercase();
+        let pos = lower.find("twitch.tv/videos/")?;
+        let rest = &url[pos + "twitch.tv/videos/".len()..];
+        let id: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        (!id.is_empty()).then_some(id)
+    }
+
     /// Extract `(login, broadcast_id, site)` from a stream URL's path. Accepts
     /// `…/streams/<id>` (TwitchTracker/StreamsCharts) and `…/stream/<id>`
     /// (SullyGnome); **rejects** `twitch.tv/videos/<vod_id>` (that's the archive
-    /// id, not the broadcast id the CDN hash needs).
+    /// id, not the broadcast id the CDN hash needs — use [`twitch_vod_id`] +
+    /// [`super::gql_vod_info`] for those).
     pub fn parse_vod_url(url: &str) -> Option<ParsedVodUrl> {
         let u = url.trim();
         let lower = u.to_lowercase();
@@ -962,6 +1085,7 @@ mod tests {
             broadcast_id: "123456".into(),
             start_epoch: 1_700_000_000,
             went_live_approx: false,
+            vod_id: None,
         };
         let hosts = vec!["https://vod-secure.twitch.tv/".to_string()];
         let urls = candidate_urls(&inp, 0, &hosts);
@@ -1033,48 +1157,71 @@ mod tests {
         assert_eq!(resolve_quality("720p60", &[]), "chunked");
     }
 
+    #[test]
+    fn seek_previews_and_folder_parse() {
+        // Real seekPreviewsURL (login without underscore).
+        let (host, folder) = parse_seek_previews(
+            "https://d2nvs31859zcd8.cloudfront.net/d8727012be77965c38bc_camila_318354228567_1783193802/storyboards/2812222223-info.json",
+        )
+        .unwrap();
+        assert_eq!(host, "d2nvs31859zcd8.cloudfront.net");
+        assert_eq!(folder, "d8727012be77965c38bc_camila_318354228567_1783193802");
+        assert_eq!(
+            folder_parts(&folder),
+            Some(("camila".to_string(), "318354228567".to_string(), 1_783_193_802))
+        );
+        // Login WITH an underscore must be re-joined (peel hash head + broadcast/epoch tail).
+        assert_eq!(
+            folder_parts("ec758f66a255b6df912f_yuy_ix_318355078359_1783199285"),
+            Some(("yuy_ix".to_string(), "318355078359".to_string(), 1_783_199_285))
+        );
+    }
+
     /// End-to-end against real DMCA-muted Twitch VODs. Network-gated — run explicitly:
     /// `cargo test --bin streamarchiver -- --ignored --nocapture recovery_network`.
-    /// Covers both segment formats: `yuy_ix` (fMP4 `.mp4`) and `camila` (MPEG-TS `.ts`).
+    /// Covers both segment formats (`.mp4`/`.ts`), the GQL fast-path (via vod_id),
+    /// the hash-probe fallback (vod_id=None), and a VOD whose host needed adding.
     #[tokio::test]
-    #[ignore = "hits the Twitch CDN"]
+    #[ignore = "hits the Twitch CDN + GQL"]
     async fn recovery_network_end_to_end() {
-        // (login, broadcast_id, seeded_start (createdAt), true_folder_epoch, muted-ext)
+        // (login, broadcast_id, vod_id, createdAt, true_folder_epoch, muted-ext)
         let cases = [
-            ("yuy_ix", "318355078359", 1_783_199_290i64, 1_783_199_285i64, "-muted.mp4"),
-            ("camila", "318354228567", 1_783_193_806, 1_783_193_802, "-muted.ts"),
+            ("yuy_ix", "318355078359", "2812280160", 1_783_199_290i64, 1_783_199_285i64, "-muted.mp4"),
+            ("camila", "318354228567", "2812222223", 1_783_193_806, 1_783_193_802, "-muted.ts"),
+            ("vinesauce", "319375842272", "2812178289", 1_783_190_086, 1_783_190_081, "-muted.ts"),
         ];
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(20))
             .build()
             .unwrap();
         let hosts: Vec<String> = CDN_HOSTS.iter().map(|h| h.to_string()).collect();
-        for (login, bid, seeded, true_epoch, muted_ext) in cases {
-            let inputs = RecoveryInputs {
-                login: login.into(),
-                broadcast_id: bid.into(),
-                // Seed the VOD `createdAt` (a few secs after the true folder second)
-                // so the symmetric search must resolve the real start.
-                start_epoch: seeded,
-                went_live_approx: false,
-            };
-            let found = find_live_playlist(&client, &inputs, &hosts, 16)
-                .await
-                .unwrap_or_else(|| panic!("{login}: live playlist should be found"));
-            assert_eq!(found.matched_epoch, true_epoch, "{login}: resolved the true start second");
-            // The VOD is mirrored across several CDN hosts; any built-in one is valid.
-            assert!(CDN_HOSTS.contains(&found.host.as_str()), "{login}: host {} known", found.host);
+        for (login, bid, vod_id, seeded, true_epoch, muted_ext) in cases {
+            // First via the GQL fast-path (vod_id set), then the hash-probe fallback.
+            for use_gql in [true, false] {
+                let inputs = RecoveryInputs {
+                    login: login.into(),
+                    broadcast_id: bid.into(),
+                    // Seed the VOD `createdAt` (a few secs after the true folder second)
+                    // so the symmetric hash search must resolve the real start.
+                    start_epoch: seeded,
+                    went_live_approx: false,
+                    vod_id: use_gql.then(|| vod_id.to_string()),
+                };
+                let found = resolve_playlist(&client, &inputs, &hosts, 16)
+                    .await
+                    .unwrap_or_else(|| panic!("{login} (gql={use_gql}): playlist should resolve"));
+                assert_eq!(found.matched_epoch, true_epoch, "{login} (gql={use_gql}): true start");
 
-            let recovered = build_playlist(&client, &found.url, 16, false).await.unwrap();
-            eprintln!(
-                "{login}: {}/{} present, {} un-muted, {} missing",
-                recovered.present, recovered.total, recovered.unmuted_recovered, recovered.missing
-            );
-            assert!(recovered.total > 0, "{login}: playlist has media segments");
-            assert_eq!(recovered.missing, 0, "{login}: every muted segment resolved to a -muted copy");
-            // Dead `-unmuted` pointers must be rewritten to the surviving `-muted` files.
-            assert!(!recovered.text.contains("-unmuted"), "{login}: no dead -unmuted pointers remain");
-            assert!(recovered.text.contains(muted_ext), "{login}: muted copies substituted ({muted_ext})");
+                let recovered = build_playlist(&client, &found.url, 16, false).await.unwrap();
+                eprintln!(
+                    "{login} (gql={use_gql}): {}/{} present, {} un-muted, {} missing",
+                    recovered.present, recovered.total, recovered.unmuted_recovered, recovered.missing
+                );
+                assert!(recovered.total > 0, "{login}: has media segments");
+                assert_eq!(recovered.missing, 0, "{login}: every muted segment resolved");
+                assert!(!recovered.text.contains("-unmuted"), "{login}: no dead -unmuted pointers");
+                assert!(recovered.text.contains(muted_ext), "{login}: muted copies substituted");
+            }
         }
     }
 
@@ -1098,5 +1245,17 @@ mod tests {
         assert!(parse_vod_url("https://www.twitch.tv/videos/123456789").is_none());
         // Non-numeric id rejected.
         assert!(parse_vod_url("https://twitchtracker.com/streamer/streams/abc").is_none());
+    }
+
+    #[test]
+    fn twitch_vod_id_extracts_numeric_archive_id() {
+        use scrape::twitch_vod_id;
+        assert_eq!(
+            twitch_vod_id("https://www.twitch.tv/videos/2812178289?filter=archives&sort=time"),
+            Some("2812178289".to_string())
+        );
+        assert_eq!(twitch_vod_id("twitch.tv/videos/123"), Some("123".to_string()));
+        assert_eq!(twitch_vod_id("https://twitch.tv/streamer/streams/999"), None);
+        assert_eq!(twitch_vod_id("https://twitchtracker.com/x/streams/999"), None);
     }
 }

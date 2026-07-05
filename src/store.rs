@@ -1797,7 +1797,7 @@ impl Store {
                 "SELECT r.id, m.url, COALESCE(r.stream_id, ''),
                         COALESCE(r.went_live_at, r.started_at),
                         COALESCE(r.went_live_approx, 0),
-                        (r.vod_state = 'not_published')
+                        (r.vod_state = 'not_published'), r.vod_id
                  FROM recording r JOIN monitor m ON m.id = r.monitor_id
                  WHERE r.id = ?1",
                 params![id],
@@ -1809,6 +1809,7 @@ impl Store {
                         start_epoch: r.get(3)?,
                         went_live_approx: r.get::<_, i64>(4)? != 0,
                         deleted: r.get::<_, i64>(5)? != 0,
+                        vod_id: r.get(6)?,
                     })
                 },
             )
@@ -1828,7 +1829,7 @@ impl Store {
             "SELECT r.id, m.url, r.stream_id,
                     COALESCE(r.went_live_at, r.started_at),
                     COALESCE(r.went_live_approx, 0),
-                    (r.vod_state = 'not_published')
+                    (r.vod_state = 'not_published'), r.vod_id
              FROM recording r JOIN monitor m ON m.id = r.monitor_id
              WHERE r.stream_id IS NOT NULL AND r.stream_id != ''
                AND (r.vod_state = 'not_published'
@@ -1848,6 +1849,7 @@ impl Store {
                     start_epoch: r.get(3)?,
                     went_live_approx: r.get::<_, i64>(4)? != 0,
                     deleted: r.get::<_, i64>(5)? != 0,
+                    vod_id: r.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

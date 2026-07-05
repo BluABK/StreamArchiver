@@ -1399,6 +1399,7 @@ impl Supervisor {
                                         broadcast_id: take.stream_id,
                                         start_epoch: take.start_epoch,
                                         went_live_approx: take.went_live_approx,
+                                        vod_id: take.vod_id,
                                     };
                                     crate::recovery::run_recovery(
                                         client,
@@ -6570,6 +6571,7 @@ fn spawn_auto_recovery(ctx: &Arc<DetectContext>, store: &Arc<Store>, events: &Ev
         broadcast_id: seed.stream_id,
         start_epoch: seed.start_epoch,
         went_live_approx: seed.went_live_approx,
+        vod_id: seed.vod_id,
     };
     let quality = store
         .get_setting(crate::recovery::K_RECOVERY_QUALITY)

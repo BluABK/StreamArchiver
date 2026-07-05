@@ -162,6 +162,8 @@ struct RecoverVodForm {
     output_dir: String,
     /// Deleted VOD (probe every segment) vs merely muted (probe only muted ones).
     deleted: bool,
+    /// The `/videos/<id>` archive id when known (enables the GQL fast-path).
+    vod_id: Option<String>,
 }
 
 /// State of the async Recover-VOD CDN probe (the dry-run before downloading).
@@ -182,13 +184,16 @@ enum RecoverProbe {
     Failed(String),
 }
 
-/// State of the async third-party start-time scrape ("Parse URL").
+/// State of the async "Parse URL" lookup (third-party start-time scrape, or the
+/// Twitch GQL fast-path for a pasted `/videos/` URL).
 #[derive(Clone)]
 enum RecoverScrape {
     Idle,
     Running,
-    /// Resolved start epoch (UTC seconds) to write into `start_utc`.
+    /// Tracker scrape resolved just the start epoch (UTC seconds).
     Filled(i64),
+    /// GQL resolved the whole VOD (login + broadcast id + start).
+    FilledFull { login: String, broadcast_id: String, start_epoch: i64 },
     Failed(String),
 }
 
@@ -7310,6 +7315,7 @@ impl StreamArchiverApp {
             rec_id: Some(rec_id),
             output_dir: String::new(),
             deleted: seed.deleted,
+            vod_id: seed.vod_id,
         });
     }
 
@@ -7328,6 +7334,7 @@ impl StreamArchiverApp {
             rec_id: None,
             output_dir: self.settings.default_output_dir.clone(),
             deleted: true,
+            vod_id: None,
         });
     }
 
@@ -7348,6 +7355,7 @@ impl StreamArchiverApp {
             broadcast_id: f.broadcast_id.trim().to_string(),
             start_epoch,
             went_live_approx: f.went_live_approx,
+            vod_id: f.vod_id.clone(),
         };
         let probe_all = f.deleted;
         let probe = self.recover_probe.clone();
@@ -7358,7 +7366,7 @@ impl StreamArchiverApp {
         self.core.rt.spawn(async move {
             let hosts = crate::recovery::load_hosts(&store);
             let max_conc = crate::recovery::load_max_conc(&store);
-            let state = match crate::recovery::find_live_playlist(&client, &inputs, &hosts, max_conc)
+            let state = match crate::recovery::resolve_playlist(&client, &inputs, &hosts, max_conc)
                 .await
             {
                 None => RecoverProbe::NotFound(
@@ -7390,13 +7398,47 @@ impl StreamArchiverApp {
         });
     }
 
-    /// Parse the pasted URL: fill login + broadcast id synchronously, and scrape
-    /// the start time asynchronously into `recover_scrape`.
+    /// Parse the pasted URL. A Twitch `/videos/<id>` URL takes the robust GQL
+    /// fast-path (fills login + broadcast id + start + vod_id, no host guessing);
+    /// a TwitchTracker/StreamsCharts/SullyGnome URL fills login + broadcast id
+    /// synchronously and scrapes the start time. Result lands in `recover_scrape`.
     fn parse_recover_url(&mut self, ctx: egui::Context) {
+        let url = self
+            .recover_form
+            .as_ref()
+            .map(|f| f.url_paste.trim().to_string())
+            .unwrap_or_default();
+
+        // Twitch VOD URL → GQL (exact folder, works for muted-but-online VODs).
+        if let Some(vid) = crate::recovery::scrape::twitch_vod_id(&url) {
+            if let Some(f) = self.recover_form.as_mut() {
+                f.vod_id = Some(vid.clone());
+                f.deleted = false; // a resolvable /videos/ id means it's still online
+            }
+            let scrape = self.recover_scrape.clone();
+            let client = Self::recover_http_client();
+            *scrape.lock().unwrap() = RecoverScrape::Running;
+            self.status = "Looking up VOD via Twitch…".into();
+            self.core.rt.spawn(async move {
+                let state = match crate::recovery::gql_vod_info(&client, &vid).await {
+                    Ok(info) => RecoverScrape::FilledFull {
+                        login: info.login,
+                        broadcast_id: info.broadcast_id,
+                        start_epoch: info.start_epoch,
+                    },
+                    Err(e) => RecoverScrape::Failed(format!("VOD lookup failed: {e}")),
+                };
+                *scrape.lock().unwrap() = state;
+                ctx.request_repaint();
+            });
+            return;
+        }
+
+        // Third-party tracker URL → parse ids from the path + scrape the start time.
         let Some(f) = self.recover_form.as_mut() else { return };
-        let Some(parsed) = crate::recovery::scrape::parse_vod_url(f.url_paste.trim()) else {
+        let Some(parsed) = crate::recovery::scrape::parse_vod_url(&url) else {
             self.status =
-                "Unrecognized URL — use a TwitchTracker/StreamsCharts/SullyGnome /streams/<id> link."
+                "Unrecognized URL — paste a twitch.tv/videos/<id> or a TwitchTracker/StreamsCharts/SullyGnome /streams/<id> link."
                     .into();
             return;
         };
@@ -7423,13 +7465,25 @@ impl StreamArchiverApp {
         if self.recover_form.is_none() {
             return;
         }
-        // Apply an async "Parse URL" scrape result into the form.
+        // Apply an async "Parse URL" result into the form.
         let scrape = self.recover_scrape.lock().unwrap().clone();
-        if let RecoverScrape::Filled(epoch) = scrape {
-            if let Some(f) = self.recover_form.as_mut() {
-                f.start_utc = Self::fmt_utc(epoch);
+        match scrape {
+            RecoverScrape::Filled(epoch) => {
+                if let Some(f) = self.recover_form.as_mut() {
+                    f.start_utc = Self::fmt_utc(epoch);
+                }
+                *self.recover_scrape.lock().unwrap() = RecoverScrape::Idle;
             }
-            *self.recover_scrape.lock().unwrap() = RecoverScrape::Idle;
+            RecoverScrape::FilledFull { login, broadcast_id, start_epoch } => {
+                if let Some(f) = self.recover_form.as_mut() {
+                    f.login = login;
+                    f.broadcast_id = broadcast_id;
+                    f.start_utc = Self::fmt_utc(start_epoch);
+                    f.went_live_approx = false;
+                }
+                *self.recover_scrape.lock().unwrap() = RecoverScrape::Idle;
+            }
+            _ => {}
         }
         let scrape_note = match self.recover_scrape.lock().unwrap().clone() {
             RecoverScrape::Running => Some(("Fetching start time…".to_string(), false)),
@@ -7474,7 +7528,7 @@ impl StreamArchiverApp {
                             ui.horizontal(|ui| {
                                 ui.add(
                                     egui::TextEdit::singleline(&mut f.url_paste)
-                                        .hint_text("twitchtracker.com/<login>/streams/<id>")
+                                        .hint_text("twitch.tv/videos/<id> or twitchtracker.com/<login>/streams/<id>")
                                         .desired_width(280.0),
                                 );
                                 if ui.button("Parse").clicked() {
@@ -7659,6 +7713,7 @@ impl StreamArchiverApp {
             broadcast_id: f.broadcast_id.trim().to_string(),
             start_epoch,
             went_live_approx: f.went_live_approx,
+            vod_id: f.vod_id.clone(),
         };
         let sink = match f.rec_id {
             Some(id) => crate::recovery::RecoverySink::Recording(id),
