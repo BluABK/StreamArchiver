@@ -1033,42 +1033,49 @@ mod tests {
         assert_eq!(resolve_quality("720p60", &[]), "chunked");
     }
 
-    /// End-to-end against a real DMCA-muted Twitch VOD (yuy_ix, broadcast
-    /// 318355078359, muted ~03:53). Network-gated — run explicitly:
+    /// End-to-end against real DMCA-muted Twitch VODs. Network-gated — run explicitly:
     /// `cargo test --bin streamarchiver -- --ignored --nocapture recovery_network`.
+    /// Covers both segment formats: `yuy_ix` (fMP4 `.mp4`) and `camila` (MPEG-TS `.ts`).
     #[tokio::test]
     #[ignore = "hits the Twitch CDN"]
     async fn recovery_network_end_to_end() {
+        // (login, broadcast_id, seeded_start (createdAt), true_folder_epoch, muted-ext)
+        let cases = [
+            ("yuy_ix", "318355078359", 1_783_199_290i64, 1_783_199_285i64, "-muted.mp4"),
+            ("camila", "318354228567", 1_783_193_806, 1_783_193_802, "-muted.ts"),
+        ];
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(20))
             .build()
             .unwrap();
-        let inputs = RecoveryInputs {
-            login: "yuy_ix".into(),
-            broadcast_id: "318355078359".into(),
-            // The VOD `createdAt` is 1783199290; the true folder second is 5s earlier
-            // — deliberately seed the later value so the symmetric search must find it.
-            start_epoch: 1_783_199_290,
-            went_live_approx: false,
-        };
         let hosts: Vec<String> = CDN_HOSTS.iter().map(|h| h.to_string()).collect();
-        let found = find_live_playlist(&client, &inputs, &hosts, 16)
-            .await
-            .expect("live playlist should be found");
-        assert_eq!(found.matched_epoch, 1_783_199_285, "resolved the true start second");
-        // The VOD is mirrored across several CDN hosts; any built-in one is valid.
-        assert!(CDN_HOSTS.contains(&found.host.as_str()), "host {} is a known CDN", found.host);
+        for (login, bid, seeded, true_epoch, muted_ext) in cases {
+            let inputs = RecoveryInputs {
+                login: login.into(),
+                broadcast_id: bid.into(),
+                // Seed the VOD `createdAt` (a few secs after the true folder second)
+                // so the symmetric search must resolve the real start.
+                start_epoch: seeded,
+                went_live_approx: false,
+            };
+            let found = find_live_playlist(&client, &inputs, &hosts, 16)
+                .await
+                .unwrap_or_else(|| panic!("{login}: live playlist should be found"));
+            assert_eq!(found.matched_epoch, true_epoch, "{login}: resolved the true start second");
+            // The VOD is mirrored across several CDN hosts; any built-in one is valid.
+            assert!(CDN_HOSTS.contains(&found.host.as_str()), "{login}: host {} known", found.host);
 
-        let recovered = build_playlist(&client, &found.url, 16, false).await.unwrap();
-        eprintln!(
-            "recovered: {}/{} present, {} un-muted, {} missing",
-            recovered.present, recovered.total, recovered.unmuted_recovered, recovered.missing
-        );
-        assert!(recovered.total > 0, "playlist has media segments");
-        assert_eq!(recovered.missing, 0, "every muted segment resolved to a -muted copy");
-        // Dead `-unmuted` pointers must be rewritten to the surviving `-muted` files.
-        assert!(!recovered.text.contains("-unmuted"), "no dead -unmuted pointers remain");
-        assert!(recovered.text.contains("-muted.mp4"), "muted copies were substituted");
+            let recovered = build_playlist(&client, &found.url, 16, false).await.unwrap();
+            eprintln!(
+                "{login}: {}/{} present, {} un-muted, {} missing",
+                recovered.present, recovered.total, recovered.unmuted_recovered, recovered.missing
+            );
+            assert!(recovered.total > 0, "{login}: playlist has media segments");
+            assert_eq!(recovered.missing, 0, "{login}: every muted segment resolved to a -muted copy");
+            // Dead `-unmuted` pointers must be rewritten to the surviving `-muted` files.
+            assert!(!recovered.text.contains("-unmuted"), "{login}: no dead -unmuted pointers remain");
+            assert!(recovered.text.contains(muted_ext), "{login}: muted copies substituted ({muted_ext})");
+        }
     }
 
     #[test]
