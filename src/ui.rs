@@ -14189,13 +14189,29 @@ impl StreamArchiverApp {
                     );
                     ui.end_row();
 
-                    ui.label("CDN host override");
+                    ui.label("Extra CDN hosts");
                     ui.add(
                         egui::TextEdit::multiline(&mut self.settings.recovery_cdn_hosts)
                             .desired_rows(2)
                             .desired_width(360.0)
-                            .hint_text("one https host per line — empty = built-in list"),
+                            .hint_text("extra https hosts, one per line — added to the built-in + learned sets"),
                     );
+                    ui.end_row();
+
+                    let refresh_running = self
+                        .background_tasks
+                        .iter()
+                        .any(|t| t.kind == crate::events::BackgroundTaskKind::RefreshCdnHosts);
+                    if ui
+                        .add_enabled(!refresh_running, egui::Button::new("Refresh CDN hosts"))
+                        .on_hover_text("Harvest the current Twitch CDN hosts from your published VODs (via Twitch's public API) and remember any new ones. The host list also learns automatically from every successful recovery.")
+                        .clicked()
+                    {
+                        self.core.manual(ManualCommand::RefreshCdnHosts);
+                        self.status = "Refreshing CDN hosts…".into();
+                    }
+                    let known = crate::recovery::load_hosts(&self.core.store).len();
+                    ui.label(format!("{known} CDN hosts known (built-in + learned + extra)."));
                     ui.end_row();
 
                     let scan_running = self

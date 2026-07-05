@@ -40,27 +40,35 @@ use crate::events::{AppEvent, EventTx};
 use crate::models::now_unix;
 use crate::store::Store;
 
-/// Twitch VOD CDN hosts (all https, trailing slash). Overridable per user via the
-/// `recovery_cdn_hosts` setting — the distributions rotate over time.
+/// Twitch VOD CDN hosts (all https, trailing slash). The distributions rotate, so
+/// this is only a *seed*: [`load_hosts`] unions it with hosts learned from GQL
+/// (`seekPreviewsURL`) at runtime plus the user's override. The first block is the
+/// set observed actively serving VODs (2026, sampled across ~110 global channels);
+/// the rest are historical fallbacks (cheap DNS-fail if gone) that may still hold
+/// older/deleted VODs.
 pub const CDN_HOSTS: &[&str] = &[
+    // Currently active (observed serving VODs).
+    "https://d2nvs31859zcd8.cloudfront.net/",
+    "https://d1m7jfoe9zdc1j.cloudfront.net/",
+    "https://d3vd9lfkzbru3h.cloudfront.net/",
+    "https://d2vi6trrdongqn.cloudfront.net/",
+    "https://d3stzm2eumvgb4.cloudfront.net/",
+    "https://d3fi1amfgojobc.cloudfront.net/",
+    "https://dgeft87wbj63p.cloudfront.net/",
+    // Historical / regional fallbacks.
     "https://vod-secure.twitch.tv/",
     "https://vod-metro.twitch.tv/",
     "https://vod-pop-secure.twitch.tv/",
     "https://d2e2de1etea730.cloudfront.net/",
     "https://dqrpb9wgowsf5.cloudfront.net/",
     "https://ds0h3roq6wcgc.cloudfront.net/",
-    "https://d2nvs31859zcd8.cloudfront.net/",
     "https://d2aba1wr3818hz.cloudfront.net/",
     "https://d3c27h4odz752x.cloudfront.net/",
-    "https://dgeft87wbj63p.cloudfront.net/",
-    "https://d1m7jfoe9zdc1j.cloudfront.net/",
-    "https://d3vd9lfkzbru3h.cloudfront.net/",
+    "https://d3aqoihi2n8ty8.cloudfront.net/",
     "https://d2vjef5jvl6bfs.cloudfront.net/",
     "https://d1ymi26ma8va5x.cloudfront.net/",
     "https://d1mhjrowxxagfy.cloudfront.net/",
     "https://ddacn6pr5v0tl.cloudfront.net/",
-    "https://d3aqoihi2n8ty8.cloudfront.net/",
-    "https://d2vi6trrdongqn.cloudfront.net/",
 ];
 
 /// Quality path components to probe, source-first.
@@ -85,8 +93,11 @@ pub const DEFAULT_MAX_CONC: usize = 8;
 pub const K_AUTO_RECOVER_MUTED: &str = "auto_recover_muted";
 /// Auto-recover a Twitch VOD when the VOD checker finds it was never published.
 pub const K_AUTO_RECOVER_DELETED: &str = "auto_recover_deleted";
-/// Newline/comma-separated CDN host override (empty = built-in [`CDN_HOSTS`]).
+/// Newline/comma-separated EXTRA CDN hosts (added to the built-in + learned sets).
 pub const K_RECOVERY_CDN_HOSTS: &str = "recovery_cdn_hosts";
+/// Persisted set of CDN hosts learned at runtime from GQL `seekPreviewsURL` — this
+/// is how the host list stays current as Twitch rotates distributions.
+pub const K_RECOVERY_LEARNED_HOSTS: &str = "recovery_learned_hosts";
 /// Default recovery quality (`""`/`chunked` = source, else e.g. `720p60`).
 pub const K_RECOVERY_QUALITY: &str = "recovery_default_quality";
 /// Concurrent-HEAD cap override for the segment/playlist probes.
@@ -658,21 +669,77 @@ pub fn load_max_conc(store: &Store) -> usize {
         .unwrap_or(DEFAULT_MAX_CONC)
 }
 
-/// Load the CDN host list from the `recovery_cdn_hosts` setting (newline/comma
-/// separated), falling back to the built-in [`CDN_HOSTS`].
-pub fn load_hosts(store: &Store) -> Vec<String> {
-    let raw = store.get_setting(K_RECOVERY_CDN_HOSTS).ok().flatten().unwrap_or_default();
-    let custom: Vec<String> = raw
-        .split(['\n', ','])
+/// Normalize a newline/comma-separated host blob into trailing-slash URLs.
+fn parse_host_list(raw: &str) -> Vec<String> {
+    raw.split(['\n', ','])
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
-        .map(|s| if s.ends_with('/') { s.to_string() } else { format!("{s}/") })
-        .collect();
-    if custom.is_empty() {
-        CDN_HOSTS.iter().map(|h| h.to_string()).collect()
-    } else {
-        custom
+        .map(normalize_host)
+        .collect()
+}
+
+/// A host string as an `https://…/` URL (accepts a bare host or a full URL).
+fn normalize_host(h: &str) -> String {
+    let h = h.trim();
+    let with_scheme =
+        if h.starts_with("http://") || h.starts_with("https://") { h.to_string() } else { format!("https://{h}") };
+    if with_scheme.ends_with('/') { with_scheme } else { format!("{with_scheme}/") }
+}
+
+/// The full host set to probe: built-in seed ∪ runtime-learned ∪ user override,
+/// deduped, active hosts first. This is what keeps recovery working as Twitch
+/// rotates CDN distributions (learned hosts accrue from every GQL resolve).
+pub fn load_hosts(store: &Store) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for h in CDN_HOSTS {
+        if seen.insert((*h).to_string()) {
+            out.push((*h).to_string());
+        }
     }
+    for key in [K_RECOVERY_LEARNED_HOSTS, K_RECOVERY_CDN_HOSTS] {
+        let raw = store.get_setting(key).ok().flatten().unwrap_or_default();
+        for h in parse_host_list(&raw) {
+            if seen.insert(h.clone()) {
+                out.push(h);
+            }
+        }
+    }
+    out
+}
+
+/// Remember a confirmed-live CDN host (from a successful recovery or a harvest) in
+/// the persisted learned set. No-op if already known. Returns true if it was new.
+pub fn record_learned_host(store: &Store, host: &str) -> bool {
+    let host = normalize_host(host);
+    if CDN_HOSTS.contains(&host.as_str()) {
+        return false;
+    }
+    let raw = store.get_setting(K_RECOVERY_LEARNED_HOSTS).ok().flatten().unwrap_or_default();
+    let mut hosts = parse_host_list(&raw);
+    if hosts.iter().any(|h| h == &host) {
+        return false;
+    }
+    hosts.push(host);
+    let _ = store.set_setting(K_RECOVERY_LEARNED_HOSTS, &hosts.join("\n"));
+    true
+}
+
+/// Harvest the CDN host of each published VOD via GQL and record any new ones.
+/// Returns `(newly_learned, checked)`. Used by the "Refresh CDN hosts" action to
+/// proactively learn hosts from the user's own recordings.
+pub async fn harvest_hosts(store: &Store, client: &reqwest::Client, vod_ids: &[String]) -> (usize, usize) {
+    let mut learned = 0usize;
+    let mut checked = 0usize;
+    for vid in vod_ids {
+        if let Ok(info) = gql_vod_info(client, vid).await {
+            checked += 1;
+            if record_learned_host(store, &format!("https://{}/", info.host)) {
+                learned += 1;
+            }
+        }
+    }
+    (learned, checked)
 }
 
 /// End-to-end recovery: derive → probe → rewrite → mux → file the result.
@@ -727,6 +794,9 @@ pub async fn run_recovery(
             return;
         }
     };
+    // The host that served this VOD is confirmed-live — learn it so future probes
+    // stay current as Twitch rotates CDN distributions.
+    record_learned_host(&store, &found.host);
 
     let quals = enumerate_qualities(&client, &found, max_conc).await;
     let chosen = resolve_quality(&quality, &quals);
@@ -1155,6 +1225,17 @@ mod tests {
         assert_eq!(resolve_quality("1080p60", &avail), "chunked"); // unavailable → best (first)
         assert_eq!(resolve_quality("", &avail), "chunked");
         assert_eq!(resolve_quality("720p60", &[]), "chunked");
+    }
+
+    #[test]
+    fn host_normalization() {
+        assert_eq!(normalize_host("d3stzm2eumvgb4.cloudfront.net"), "https://d3stzm2eumvgb4.cloudfront.net/");
+        assert_eq!(normalize_host("https://d3stzm2eumvgb4.cloudfront.net"), "https://d3stzm2eumvgb4.cloudfront.net/");
+        assert_eq!(normalize_host("  https://x/  "), "https://x/");
+        assert_eq!(
+            parse_host_list("a.net\nb.net, c.net\n\n"),
+            vec!["https://a.net/", "https://b.net/", "https://c.net/"]
+        );
     }
 
     #[test]

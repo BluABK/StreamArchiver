@@ -1856,6 +1856,21 @@ impl Store {
         Ok(rows)
     }
 
+    /// Distinct published Twitch VOD ids (most recent first), for harvesting the
+    /// current CDN host set via GQL.
+    pub fn published_vod_ids(&self, limit: i64) -> Result<Vec<String>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT vod_id FROM recording
+             WHERE vod_id IS NOT NULL AND vod_id != '' AND vod_state = 'found'
+             ORDER BY COALESCE(went_live_at, started_at) DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Return whether a recording's go-live time is approximate (detection-clock,
     /// not platform-reported). `false` on any error or missing row.
     pub fn recording_went_live_approx(&self, id: i64) -> bool {

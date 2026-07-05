@@ -1423,6 +1423,33 @@ impl Supervisor {
                             });
                         });
                     }
+                    ManualCommand::RefreshCdnHosts => {
+                        let store = self.store.clone();
+                        let tx = self.events.clone();
+                        let client = self.ctx.http_client();
+                        tokio::spawn(async move {
+                            let task_id = crate::events::next_task_id();
+                            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
+                                id: task_id,
+                                kind: crate::events::BackgroundTaskKind::RefreshCdnHosts,
+                                label: "Refresh CDN hosts".into(),
+                                detail: String::new(),
+                                started_at: now_unix(),
+                                progress: Some(0.0),
+                                progress_info: None,
+                            }));
+                            let vod_ids = store.published_vod_ids(300).unwrap_or_default();
+                            let (learned, checked) =
+                                crate::recovery::harvest_hosts(&store, &client, &vod_ids).await;
+                            let total = crate::recovery::load_hosts(&store).len();
+                            let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                                id: task_id,
+                                outcome: crate::events::TaskOutcome::CompletedWithNote(format!(
+                                    "{learned} new host(s) from {checked} VOD(s) · {total} known"
+                                )),
+                            });
+                        });
+                    }
                     ManualCommand::RecoverStuckCapture { rec_id, capture, output_dir } => {
                         let store = self.store.clone();
                         let tx = self.events.clone();

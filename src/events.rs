@@ -37,6 +37,8 @@ pub enum BackgroundTaskKind {
     RecoverVod,
     /// A bulk sweep recovering all eligible deleted/muted recordings.
     RecoverVodScan,
+    /// Harvesting current CDN hosts from published VODs via GQL.
+    RefreshCdnHosts,
 }
 
 impl BackgroundTaskKind {
@@ -55,6 +57,7 @@ impl BackgroundTaskKind {
             BackgroundTaskKind::ReorganizeChannel(_) => "Re-organize channel",
             BackgroundTaskKind::RecoverVod => "VOD recovery",
             BackgroundTaskKind::RecoverVodScan => "VOD recovery scan",
+            BackgroundTaskKind::RefreshCdnHosts => "Refresh CDN hosts",
         }
     }
 }
@@ -329,4 +332,7 @@ pub enum ManualCommand {
     /// Sweep all deleted/muted recordings inside `window_days` of the CDN window
     /// and recover each (bounded outer concurrency).
     ScanRecoverableVods { window_days: i64, quality: String },
+    /// Harvest current Twitch CDN hosts from published VODs (via GQL) and persist
+    /// any newly-seen ones, keeping the recovery host list current.
+    RefreshCdnHosts,
 }
