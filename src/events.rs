@@ -33,6 +33,10 @@ pub enum BackgroundTaskKind {
     ReorganizeTake(i64),
     ReorganizeMonitor(i64),
     ReorganizeChannel(i64),
+    /// A single Twitch VOD recovery (CDN probe + segment salvage + mux).
+    RecoverVod,
+    /// A bulk sweep recovering all eligible deleted/muted recordings.
+    RecoverVodScan,
 }
 
 impl BackgroundTaskKind {
@@ -49,6 +53,8 @@ impl BackgroundTaskKind {
             BackgroundTaskKind::ReorganizeTake(_) => "Re-organize take",
             BackgroundTaskKind::ReorganizeMonitor(_) => "Re-organize monitor",
             BackgroundTaskKind::ReorganizeChannel(_) => "Re-organize channel",
+            BackgroundTaskKind::RecoverVod => "VOD recovery",
+            BackgroundTaskKind::RecoverVodScan => "VOD recovery scan",
         }
     }
 }
@@ -311,4 +317,16 @@ pub enum ManualCommand {
     ReorganizeChannel(i64),
     /// Rename a recording's output file using the given new filename stem.
     RenameRecording { rec_id: i64, new_stem: String },
+    /// Recover a Twitch VOD from surviving CDN segments and file the muxed MKV per
+    /// `sink` (attach to a recording, or add to the Videos list). `probe_all` HEAD-
+    /// validates every segment (deleted VOD) vs only the muted ones (muted VOD).
+    RecoverVod {
+        inputs: crate::recovery::RecoveryInputs,
+        quality: String,
+        sink: crate::recovery::RecoverySink,
+        probe_all: bool,
+    },
+    /// Sweep all deleted/muted recordings inside `window_days` of the CDN window
+    /// and recover each (bounded outer concurrency).
+    ScanRecoverableVods { window_days: i64, quality: String },
 }

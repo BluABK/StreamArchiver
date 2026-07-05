@@ -33,7 +33,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 40;
+const SCHEMA_VERSION: i64 = 41;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -889,7 +889,18 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 40)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 40);
+        if version < 41 {
+            // Twitch VOD recovery: attach a recovered MKV + a distinct status onto
+            // a recording take. NULL = never attempted (all legacy/non-Twitch rows).
+            // `recovery_state` is a namespace disjoint from `status` and `vod_state`:
+            // recovering | recovered | partial | failed | unavailable.
+            conn.execute_batch(
+                "ALTER TABLE recording ADD COLUMN recovery_state TEXT;
+                 ALTER TABLE recording ADD COLUMN recovered_path TEXT;",
+            )?;
+            conn.pragma_update(None, "user_version", 41)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 41);
         Ok(())
     }
 
@@ -1752,6 +1763,97 @@ impl Store {
         Ok(())
     }
 
+    /// Set a recording's CDN VOD-recovery status (`recovering`/`failed`/`unavailable`).
+    pub fn set_recording_recovery_state(&self, id: i64, state: &str) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE recording SET recovery_state=?2 WHERE id=?1",
+            params![id, state],
+        )?;
+        Ok(())
+    }
+
+    /// Attach a recovered MKV to a recording with a terminal recovery status
+    /// (`recovered` for a complete timeline, `partial` when segments were gone).
+    pub fn set_recording_recovered(&self, id: i64, path: &str, state: &str) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE recording SET recovered_path=?2, recovery_state=?3 WHERE id=?1",
+            params![id, path, state],
+        )?;
+        Ok(())
+    }
+
+    /// Fields needed to build a recovery for one recording (login derived from the
+    /// monitor URL). `None` if the row is missing. Callers gate on a non-empty
+    /// `stream_id` (id-less detection can't derive the CDN URL).
+    pub fn recording_recovery_seed(
+        &self,
+        id: i64,
+    ) -> Result<Option<crate::models::RecoverableTake>> {
+        let conn = self.db();
+        let row = conn
+            .query_row(
+                "SELECT r.id, m.url, COALESCE(r.stream_id, ''),
+                        COALESCE(r.went_live_at, r.started_at),
+                        COALESCE(r.went_live_approx, 0),
+                        (r.vod_state = 'not_published')
+                 FROM recording r JOIN monitor m ON m.id = r.monitor_id
+                 WHERE r.id = ?1",
+                params![id],
+                |r| {
+                    Ok(crate::models::RecoverableTake {
+                        rec_id: r.get(0)?,
+                        monitor_url: r.get(1)?,
+                        stream_id: r.get(2)?,
+                        start_epoch: r.get(3)?,
+                        went_live_approx: r.get::<_, i64>(4)? != 0,
+                        deleted: r.get::<_, i64>(5)? != 0,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Deleted/muted Twitch takes that still have a stream id, fall inside the CDN
+    /// retention window, and haven't already been recovered — the bulk-scan set.
+    pub fn recordings_recoverable(
+        &self,
+        within_secs: i64,
+        now: i64,
+    ) -> Result<Vec<crate::models::RecoverableTake>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT r.id, m.url, r.stream_id,
+                    COALESCE(r.went_live_at, r.started_at),
+                    COALESCE(r.went_live_approx, 0),
+                    (r.vod_state = 'not_published')
+             FROM recording r JOIN monitor m ON m.id = r.monitor_id
+             WHERE r.stream_id IS NOT NULL AND r.stream_id != ''
+               AND (r.vod_state = 'not_published'
+                    OR (r.vod_state = 'found' AND COALESCE(r.vod_muted_secs, 0) > 0))
+               AND COALESCE(r.went_live_at, r.started_at) >= ?1
+               AND (r.recovery_state IS NULL OR r.recovery_state = 'failed')
+               AND r.status != 'recording'
+             ORDER BY COALESCE(r.went_live_at, r.started_at) DESC",
+        )?;
+        let cutoff = now - within_secs;
+        let rows = stmt
+            .query_map(params![cutoff], |r| {
+                Ok(crate::models::RecoverableTake {
+                    rec_id: r.get(0)?,
+                    monitor_url: r.get(1)?,
+                    stream_id: r.get(2)?,
+                    start_epoch: r.get(3)?,
+                    went_live_approx: r.get::<_, i64>(4)? != 0,
+                    deleted: r.get::<_, i64>(5)? != 0,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Return whether a recording's go-live time is approximate (detection-clock,
     /// not platform-reported). `false` on any error or missing row.
     pub fn recording_went_live_approx(&self, id: i64) -> bool {
@@ -2588,7 +2690,8 @@ impl Store {
                               WHERE smc.recording_id = recording.id AND smc.kind = 'category'
                               ORDER BY smc.at_secs DESC, smc.id DESC LIMIT 1), ''),
                     take_group, COALESCE(notes, ''),
-                    vod_id, vod_state, vod_muted_secs
+                    vod_id, vod_state, vod_muted_secs,
+                    recovery_state, recovered_path
              FROM recording WHERE monitor_id = ?1 ORDER BY started_at, id",
         )?;
         let rows = stmt
@@ -2617,6 +2720,8 @@ impl Store {
                     vod_id: r.get(20)?,
                     vod_state: r.get(21)?,
                     vod_muted_secs: r.get(22)?,
+                    recovery_state: r.get(23)?,
+                    recovered_path: r.get(24)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2663,6 +2768,8 @@ impl Store {
                     vod_id: None,
                     vod_state: None,
                     vod_muted_secs: None,
+                    recovery_state: None,
+                    recovered_path: None,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2714,6 +2821,8 @@ impl Store {
                     vod_id: None,
                     vod_state: None,
                     vod_muted_secs: None,
+                    recovery_state: None,
+                    recovered_path: None,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2787,6 +2896,8 @@ impl Store {
                     vod_id: None,
                     vod_state: None,
                     vod_muted_secs: None,
+                    recovery_state: None,
+                    recovered_path: None,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2851,6 +2962,8 @@ impl Store {
                     vod_id: None,
                     vod_state: None,
                     vod_muted_secs: None,
+                    recovery_state: None,
+                    recovered_path: None,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3031,6 +3144,8 @@ impl Store {
                     vod_id: None,
                     vod_state: None,
                     vod_muted_secs: None,
+                    recovery_state: None,
+                    recovered_path: None,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

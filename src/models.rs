@@ -1647,6 +1647,28 @@ pub struct Recording {
     /// N/A). `0` = clean copy online; `> 0` = damaged — the online copy is missing
     /// content, making the local recording the authoritative archive.
     pub vod_muted_secs: Option<i64>,
+    /// CDN VOD-recovery status — a namespace disjoint from `status`/`vod_state`.
+    /// `None` = never attempted. `"recovering"` = in progress; `"recovered"` =
+    /// full timeline muxed; `"partial"` = some segments were gone; `"failed"` =
+    /// error; `"unavailable"` = past the ~60-day CDN retention window.
+    pub recovery_state: Option<String>,
+    /// Path to the recovered MKV once `recovery_state` is `recovered`/`partial`.
+    pub recovered_path: Option<String>,
+}
+
+/// A recording eligible for CDN VOD recovery, with just the fields the recovery
+/// engine needs (login is derived from `monitor_url`). Returned by the store's
+/// recovery queries so the bulk scan / auto-hook can build [`crate::recovery::RecoveryInputs`].
+#[derive(Clone, Debug)]
+pub struct RecoverableTake {
+    pub rec_id: i64,
+    pub monitor_url: String,
+    pub stream_id: String,
+    pub start_epoch: i64,
+    pub went_live_approx: bool,
+    /// `true` when the VOD is deleted (`not_published`) — probe every segment;
+    /// `false` when merely muted (still online) — probe only muted segments.
+    pub deleted: bool,
 }
 
 impl Recording {
@@ -1872,6 +1894,8 @@ mod tests {
             vod_id: None,
             vod_state: None,
             vod_muted_secs: None,
+            recovery_state: None,
+            recovered_path: None,
         }
     }
 

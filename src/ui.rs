@@ -144,6 +144,54 @@ enum VideoMenuChoice {
     Delete,
 }
 
+/// Backing state for the "Recover VOD" dialog (CDN-derive a deleted/muted Twitch
+/// VOD). Opened auto-filled from a tracked recording, or blank for manual entry.
+struct RecoverVodForm {
+    login: String,
+    broadcast_id: String,
+    /// "YYYY-MM-DD HH:MM:SS", interpreted as UTC.
+    start_utc: String,
+    went_live_approx: bool,
+    /// Optional pasted twitch / twitchtracker / streamscharts / sullygnome URL.
+    url_paste: String,
+    /// "" = auto/source, else a resolution like "720p60".
+    quality: String,
+    /// `Some(rec_id)` = attach to that recording; `None` = standalone (Videos list).
+    rec_id: Option<i64>,
+    /// Standalone output dir (ignored when `rec_id` is `Some`).
+    output_dir: String,
+    /// Deleted VOD (probe every segment) vs merely muted (probe only muted ones).
+    deleted: bool,
+}
+
+/// State of the async Recover-VOD CDN probe (the dry-run before downloading).
+#[derive(Clone)]
+enum RecoverProbe {
+    Idle,
+    Running,
+    Found {
+        host: String,
+        matched_epoch: i64,
+        qualities: Vec<String>,
+        total: usize,
+        present: usize,
+        unmuted: usize,
+        missing: usize,
+    },
+    NotFound(String),
+    Failed(String),
+}
+
+/// State of the async third-party start-time scrape ("Parse URL").
+#[derive(Clone)]
+enum RecoverScrape {
+    Idle,
+    Running,
+    /// Resolved start epoch (UTC seconds) to write into `start_utc`.
+    Filled(i64),
+    Failed(String),
+}
+
 /// Backing state for the create/rename channel-container dialog.
 struct ChannelForm {
     /// `Some(id)` = renaming an existing channel; `None` = creating a new one.
@@ -486,6 +534,17 @@ struct SettingsForm {
     maintenance_apply_all: bool,
     /// Path to the media player binary (e.g. `C:\Progs\mpv\mpv.exe`).
     media_player_path: String,
+    // --- Twitch VOD recovery ---
+    /// Auto-recover a Twitch VOD when the VOD checker finds it DMCA-muted.
+    auto_recover_muted: bool,
+    /// Auto-recover a Twitch VOD when the VOD checker finds it was never published.
+    auto_recover_deleted: bool,
+    /// Newline/comma CDN host override (empty = built-in list).
+    recovery_cdn_hosts: String,
+    /// Default recovery quality (empty/`chunked` = source, else e.g. `720p60`).
+    recovery_quality: String,
+    /// Concurrent-HEAD cap for the CDN probes (empty = default 8).
+    recovery_max_conc: String,
 }
 
 /// Background load state of an import fetch (followed/subscriptions).
@@ -641,6 +700,12 @@ pub struct StreamArchiverApp {
     monitor_defaults: MonitorDefaults,
     /// Shared state of the async "List formats" probe (Videos tab).
     format_probe: Arc<Mutex<FormatProbe>>,
+    /// Backing state for the "Recover VOD" dialog (`None` = closed).
+    recover_form: Option<RecoverVodForm>,
+    /// Shared state of the async Recover-VOD CDN probe.
+    recover_probe: Arc<Mutex<RecoverProbe>>,
+    /// Shared state of the async "Parse URL" start-time scrape.
+    recover_scrape: Arc<Mutex<RecoverScrape>>,
     settings: SettingsForm,
     status: String,
     /// Monitor id of the currently selected row (target for keyboard shortcuts).
@@ -1064,6 +1129,11 @@ impl StreamArchiverApp {
                 let v = setting_or_empty(&core, K_MEDIA_PLAYER);
                 if v.is_empty() { r"C:\Progs\mpv\mpv.exe".into() } else { v }
             },
+            auto_recover_muted: setting_or_empty(&core, crate::recovery::K_AUTO_RECOVER_MUTED) == "1",
+            auto_recover_deleted: setting_or_empty(&core, crate::recovery::K_AUTO_RECOVER_DELETED) == "1",
+            recovery_cdn_hosts: setting_or_empty(&core, crate::recovery::K_RECOVERY_CDN_HOSTS),
+            recovery_quality: setting_or_empty(&core, crate::recovery::K_RECOVERY_QUALITY),
+            recovery_max_conc: setting_or_empty(&core, crate::recovery::K_RECOVERY_MAX_CONC),
         };
         // Apply the loaded date format + short-timestamp pattern before the first render.
         set_active_date_fmt(settings.date_fmt);
@@ -1204,6 +1274,9 @@ impl StreamArchiverApp {
             download_defaults,
             monitor_defaults,
             format_probe: Arc::new(Mutex::new(FormatProbe::Idle)),
+            recover_form: None,
+            recover_probe: Arc::new(Mutex::new(RecoverProbe::Idle)),
+            recover_scrape: Arc::new(Mutex::new(RecoverScrape::Idle)),
             settings,
             status: String::new(),
             selected_monitor: None,
@@ -2078,6 +2151,11 @@ impl StreamArchiverApp {
             (K_FILE_SPLIT_THUMBS, s.file_split_thumbs.trim()),
             (K_FILE_SPLIT_LOGS,   s.file_split_logs.trim()),
             (K_MEDIA_PLAYER, s.media_player_path.trim()),
+            (crate::recovery::K_AUTO_RECOVER_MUTED, if s.auto_recover_muted { "1" } else { "0" }),
+            (crate::recovery::K_AUTO_RECOVER_DELETED, if s.auto_recover_deleted { "1" } else { "0" }),
+            (crate::recovery::K_RECOVERY_CDN_HOSTS, s.recovery_cdn_hosts.trim()),
+            (crate::recovery::K_RECOVERY_QUALITY, s.recovery_quality.trim()),
+            (crate::recovery::K_RECOVERY_MAX_CONC, s.recovery_max_conc.trim()),
         ];
         for (k, v) in pairs {
             if let Err(e) = self.core.store.set_setting(k, v) {
@@ -5750,6 +5828,7 @@ impl eframe::App for StreamArchiverApp {
         self.confirm_delete_segments_window(ui.ctx());
         self.save_preset_window(ui.ctx());
         self.format_probe_window(ui.ctx());
+        self.recover_vod_window(ui.ctx());
         self.ad_popup_window(ui.ctx());
         self.meta_popup_window(ui.ctx());
         self.schedule_popup_window(ui.ctx());
@@ -6799,6 +6878,7 @@ impl StreamArchiverApp {
 
         let mut do_download = false;
         let mut do_list_formats = false;
+        let mut do_recover_vod = false;
         let mut open_vf_designer = false;
         let mut vf_preset_delete: Option<i64> = None;
         let mut vf_preset_save_tmpl: Option<String> = None;
@@ -6993,6 +7073,17 @@ impl StreamArchiverApp {
                 {
                     do_list_formats = true;
                 }
+                if ui
+                    .button("🛟  Recover Twitch VOD…")
+                    .on_hover_text(
+                        "Recover a deleted or DMCA-muted Twitch VOD from surviving CDN \
+                         segments (streamer + broadcast id + start time, or a \
+                         TwitchTracker/StreamsCharts/SullyGnome URL).",
+                    )
+                    .clicked()
+                {
+                    do_recover_vod = true;
+                }
             });
             ui.add_space(6.0);
         }
@@ -7002,6 +7093,9 @@ impl StreamArchiverApp {
         }
         if do_list_formats {
             self.start_format_probe(ui.ctx().clone());
+        }
+        if do_recover_vod {
+            self.open_recover_vod_manual();
         }
         if open_vf_designer {
             let tmpl = self.video_form.filename_template.clone();
@@ -7156,6 +7250,430 @@ impl StreamArchiverApp {
         if !open {
             *self.format_probe.lock().unwrap() = FormatProbe::Idle;
         }
+    }
+
+    // ── Twitch VOD recovery ──────────────────────────────────────────────────
+
+    /// Format a UTC epoch as the dialog's `"YYYY-MM-DD HH:MM:SS"` string.
+    fn fmt_utc(epoch: i64) -> String {
+        chrono::DateTime::from_timestamp(epoch, 0)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_default()
+    }
+
+    /// Parse the dialog's `"YYYY-MM-DD HH:MM:SS"` (UTC) into an epoch.
+    fn parse_utc(s: &str) -> Option<i64> {
+        chrono::NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%d %H:%M:%S")
+            .ok()
+            .map(|dt| dt.and_utc().timestamp())
+    }
+
+    /// A reqwest client for recovery probes/scrapes: a browser UA (helps the
+    /// third-party sites) and a generous timeout. Clones share the connection pool.
+    fn recover_http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .user_agent(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+            )
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    }
+
+    /// Open the Recover-VOD dialog auto-filled from a tracked recording.
+    fn open_recover_vod_from_seed(&mut self, rec_id: i64) {
+        let seed = match self.core.store.recording_recovery_seed(rec_id) {
+            Ok(Some(s)) => s,
+            _ => {
+                self.status = "Could not load recording for recovery.".into();
+                return;
+            }
+        };
+        let Some(login) = crate::detectors::twitch_login(&seed.monitor_url) else {
+            self.status = "VOD recovery is Twitch-only.".into();
+            return;
+        };
+        if seed.stream_id.is_empty() {
+            self.status = "This recording has no stream id — use manual entry.".into();
+            return;
+        }
+        *self.recover_probe.lock().unwrap() = RecoverProbe::Idle;
+        *self.recover_scrape.lock().unwrap() = RecoverScrape::Idle;
+        self.recover_form = Some(RecoverVodForm {
+            login,
+            broadcast_id: seed.stream_id,
+            start_utc: Self::fmt_utc(seed.start_epoch),
+            went_live_approx: seed.went_live_approx,
+            url_paste: String::new(),
+            quality: setting_or_empty(&self.core, crate::recovery::K_RECOVERY_QUALITY),
+            rec_id: Some(rec_id),
+            output_dir: String::new(),
+            deleted: seed.deleted,
+        });
+    }
+
+    /// Open a blank Recover-VOD dialog for a VOD the app never tracked (the result
+    /// lands in the Videos list).
+    fn open_recover_vod_manual(&mut self) {
+        *self.recover_probe.lock().unwrap() = RecoverProbe::Idle;
+        *self.recover_scrape.lock().unwrap() = RecoverScrape::Idle;
+        self.recover_form = Some(RecoverVodForm {
+            login: String::new(),
+            broadcast_id: String::new(),
+            start_utc: String::new(),
+            went_live_approx: false,
+            url_paste: String::new(),
+            quality: setting_or_empty(&self.core, crate::recovery::K_RECOVERY_QUALITY),
+            rec_id: None,
+            output_dir: self.settings.default_output_dir.clone(),
+            deleted: true,
+        });
+    }
+
+    /// Kick off the async CDN probe (dry-run): locate the live playlist, list the
+    /// available qualities, and count present/muted/missing segments.
+    fn start_recover_probe(&mut self, ctx: egui::Context) {
+        let Some(f) = self.recover_form.as_ref() else { return };
+        let Some(start_epoch) = Self::parse_utc(&f.start_utc) else {
+            self.status = "Start time must be YYYY-MM-DD HH:MM:SS (UTC).".into();
+            return;
+        };
+        if f.login.trim().is_empty() || f.broadcast_id.trim().is_empty() {
+            self.status = "Enter a streamer login and broadcast id.".into();
+            return;
+        }
+        let inputs = crate::recovery::RecoveryInputs {
+            login: f.login.trim().to_lowercase(),
+            broadcast_id: f.broadcast_id.trim().to_string(),
+            start_epoch,
+            went_live_approx: f.went_live_approx,
+        };
+        let probe_all = f.deleted;
+        let probe = self.recover_probe.clone();
+        let client = Self::recover_http_client();
+        let store = Arc::clone(&self.core.store);
+        *probe.lock().unwrap() = RecoverProbe::Running;
+        self.status = "Probing Twitch CDN…".into();
+        self.core.rt.spawn(async move {
+            let hosts = crate::recovery::load_hosts(&store);
+            let max_conc = crate::recovery::load_max_conc(&store);
+            let state = match crate::recovery::find_live_playlist(&client, &inputs, &hosts, max_conc)
+                .await
+            {
+                None => RecoverProbe::NotFound(
+                    "No live playlist found — the VOD may be past the ~60-day CDN window, or \
+                     the start time / broadcast id is off."
+                        .into(),
+                ),
+                Some(found) => {
+                    let qualities =
+                        crate::recovery::enumerate_qualities(&client, &found, max_conc).await;
+                    let chosen = qualities.first().cloned().unwrap_or_else(|| "chunked".into());
+                    let url = found.url.replacen("chunked", &chosen, 1);
+                    match crate::recovery::build_playlist(&client, &url, max_conc, probe_all).await {
+                        Ok(r) => RecoverProbe::Found {
+                            host: found.host,
+                            matched_epoch: found.matched_epoch,
+                            qualities,
+                            total: r.total,
+                            present: r.present,
+                            unmuted: r.unmuted_recovered,
+                            missing: r.missing,
+                        },
+                        Err(e) => RecoverProbe::Failed(format!("playlist read failed: {e}")),
+                    }
+                }
+            };
+            *probe.lock().unwrap() = state;
+            ctx.request_repaint();
+        });
+    }
+
+    /// Parse the pasted URL: fill login + broadcast id synchronously, and scrape
+    /// the start time asynchronously into `recover_scrape`.
+    fn parse_recover_url(&mut self, ctx: egui::Context) {
+        let Some(f) = self.recover_form.as_mut() else { return };
+        let Some(parsed) = crate::recovery::scrape::parse_vod_url(f.url_paste.trim()) else {
+            self.status =
+                "Unrecognized URL — use a TwitchTracker/StreamsCharts/SullyGnome /streams/<id> link."
+                    .into();
+            return;
+        };
+        f.login = parsed.login.clone();
+        f.broadcast_id = parsed.broadcast_id.clone();
+        f.went_live_approx = false;
+        let scrape = self.recover_scrape.clone();
+        let client = Self::recover_http_client();
+        *scrape.lock().unwrap() = RecoverScrape::Running;
+        self.status = "Fetching stream start time…".into();
+        self.core.rt.spawn(async move {
+            let state = match crate::recovery::scrape::scrape_start_time(&client, &parsed).await {
+                Ok(epoch) => RecoverScrape::Filled(epoch),
+                Err(e) => RecoverScrape::Failed(format!("Could not read start time: {e}")),
+            };
+            *scrape.lock().unwrap() = state;
+            ctx.request_repaint();
+        });
+    }
+
+    /// The Recover-VOD dialog window.
+    #[allow(deprecated)]
+    fn recover_vod_window(&mut self, ctx: &egui::Context) {
+        if self.recover_form.is_none() {
+            return;
+        }
+        // Apply an async "Parse URL" scrape result into the form.
+        let scrape = self.recover_scrape.lock().unwrap().clone();
+        if let RecoverScrape::Filled(epoch) = scrape {
+            if let Some(f) = self.recover_form.as_mut() {
+                f.start_utc = Self::fmt_utc(epoch);
+            }
+            *self.recover_scrape.lock().unwrap() = RecoverScrape::Idle;
+        }
+        let scrape_note = match self.recover_scrape.lock().unwrap().clone() {
+            RecoverScrape::Running => Some(("Fetching start time…".to_string(), false)),
+            RecoverScrape::Failed(e) => Some((e, true)),
+            _ => None,
+        };
+        let probe = self.recover_probe.lock().unwrap().clone();
+
+        let mut open = true;
+        let mut do_probe = false;
+        let mut do_parse = false;
+        let mut do_recover = false;
+        let mut do_cancel = false;
+
+        // Snapshot form fields for editing (written back after the closure).
+        let mut f = self.recover_form.take().unwrap();
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("recover_vod_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("Recover Twitch VOD")
+                .with_inner_size([560.0, 480.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "Reconstruct a deleted or DMCA-muted Twitch VOD from segments still \
+                             on the CDN (~60-day window).",
+                        )
+                        .weak(),
+                    );
+                    ui.add_space(6.0);
+
+                    egui::Grid::new("recover_vod_grid")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Paste URL");
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut f.url_paste)
+                                        .hint_text("twitchtracker.com/<login>/streams/<id>")
+                                        .desired_width(280.0),
+                                );
+                                if ui.button("Parse").clicked() {
+                                    do_parse = true;
+                                }
+                            });
+                            ui.end_row();
+
+                            ui.label("Streamer login");
+                            ui.text_edit_singleline(&mut f.login);
+                            ui.end_row();
+
+                            ui.label("Broadcast id");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut f.broadcast_id)
+                                    .hint_text("the /streams/<id> number, not /videos/<id>"),
+                            );
+                            ui.end_row();
+
+                            ui.label("Start (UTC)");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut f.start_utc)
+                                    .hint_text("YYYY-MM-DD HH:MM:SS"),
+                            );
+                            ui.end_row();
+
+                            ui.label("Quality");
+                            let quals: Vec<String> = match &probe {
+                                RecoverProbe::Found { qualities, .. } => qualities.clone(),
+                                _ => Vec::new(),
+                            };
+                            if quals.is_empty() {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut f.quality)
+                                        .hint_text("auto / source (probe to list)"),
+                                );
+                            } else {
+                                egui::ComboBox::from_id_salt("recover_quality")
+                                    .selected_text(if f.quality.is_empty() {
+                                        "auto (source)".to_string()
+                                    } else {
+                                        f.quality.clone()
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut f.quality, String::new(), "auto (source)");
+                                        for q in &quals {
+                                            ui.selectable_value(&mut f.quality, q.clone(), q);
+                                        }
+                                    });
+                            }
+                            ui.end_row();
+
+                            ui.label("Options");
+                            ui.vertical(|ui| {
+                                ui.checkbox(
+                                    &mut f.deleted,
+                                    "Deleted VOD (validate every segment)",
+                                )
+                                .on_hover_text(
+                                    "On: HEAD-probe every segment (needed for deleted VODs). \
+                                     Off: only muted segments are probed — much faster for a \
+                                     VOD that still exists but is muted.",
+                                );
+                                ui.checkbox(
+                                    &mut f.went_live_approx,
+                                    "Start time is approximate (widen search)",
+                                );
+                            });
+                            ui.end_row();
+                        });
+
+                    if let Some((note, is_err)) = &scrape_note {
+                        ui.add_space(2.0);
+                        let color = if *is_err {
+                            egui::Color32::from_rgb(220, 140, 30)
+                        } else {
+                            egui::Color32::GRAY
+                        };
+                        ui.colored_label(color, note);
+                    }
+
+                    ui.add_space(8.0);
+                    ui.separator();
+
+                    // Probe result.
+                    match &probe {
+                        RecoverProbe::Idle => {
+                            ui.label(
+                                egui::RichText::new("Probe to check availability before recovering.")
+                                    .weak(),
+                            );
+                        }
+                        RecoverProbe::Running => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Probing Twitch CDN…");
+                            });
+                        }
+                        RecoverProbe::NotFound(msg) | RecoverProbe::Failed(msg) => {
+                            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), msg);
+                        }
+                        RecoverProbe::Found {
+                            host,
+                            matched_epoch,
+                            total,
+                            present,
+                            unmuted,
+                            missing,
+                            ..
+                        } => {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(70, 180, 90),
+                                "✔ VOD found on the CDN",
+                            );
+                            ui.label(format!("Host: {host}"));
+                            ui.label(format!("True start (UTC): {}", Self::fmt_utc(*matched_epoch)));
+                            ui.label(format!(
+                                "Segments: {present}/{total} present · {unmuted} un-muted · {missing} missing",
+                            ));
+                            if *missing > 0 {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(220, 160, 30),
+                                    "⚠ Partial recovery — gaps will appear in the timeline.",
+                                );
+                            }
+                        }
+                    }
+
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("🔎  Probe").clicked() {
+                            do_probe = true;
+                        }
+                        let found = matches!(probe, RecoverProbe::Found { .. });
+                        if ui
+                            .add_enabled(found, egui::Button::new("🛟  Recover"))
+                            .on_hover_text("Download & mux the surviving segments into an MKV")
+                            .clicked()
+                        {
+                            do_recover = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
+                });
+            },
+        );
+
+        // Write the (possibly edited) form back.
+        self.recover_form = Some(f);
+
+        if do_parse {
+            self.parse_recover_url(ctx.clone());
+        }
+        if do_probe {
+            self.start_recover_probe(ctx.clone());
+        }
+        if do_recover {
+            self.submit_recover_vod();
+            open = false;
+        }
+        if do_cancel {
+            open = false;
+        }
+        if !open {
+            self.recover_form = None;
+            *self.recover_probe.lock().unwrap() = RecoverProbe::Idle;
+            *self.recover_scrape.lock().unwrap() = RecoverScrape::Idle;
+        }
+    }
+
+    /// Fire the recovery download for the current form and close the dialog.
+    fn submit_recover_vod(&mut self) {
+        let Some(f) = self.recover_form.as_ref() else { return };
+        let Some(start_epoch) = Self::parse_utc(&f.start_utc) else {
+            self.status = "Start time must be YYYY-MM-DD HH:MM:SS (UTC).".into();
+            return;
+        };
+        let inputs = crate::recovery::RecoveryInputs {
+            login: f.login.trim().to_lowercase(),
+            broadcast_id: f.broadcast_id.trim().to_string(),
+            start_epoch,
+            went_live_approx: f.went_live_approx,
+        };
+        let sink = match f.rec_id {
+            Some(id) => crate::recovery::RecoverySink::Recording(id),
+            None => crate::recovery::RecoverySink::Standalone {
+                output_dir: f.output_dir.clone(),
+                filename: format!("Recovered_{}_{}", inputs.login, inputs.broadcast_id),
+            },
+        };
+        self.core.manual(ManualCommand::RecoverVod {
+            inputs,
+            quality: f.quality.trim().to_string(),
+            sink,
+            probe_all: f.deleted,
+        });
+        self.status = "VOD recovery started — see the Background tab.".into();
     }
 
     // ── Format Designer ──────────────────────────────────────────────────────
@@ -9960,6 +10478,7 @@ impl StreamArchiverApp {
         let mut copy_text: Option<String> = None;
         let mut delete_recording: Option<i64> = None;
         let mut open_recording_props: Option<i64> = None;
+        let mut open_recover_take: Option<i64> = None;
         // Container-level actions.
         let mut toggle_channel_enabled: Option<(i64, bool)> = None; // set all instances
         let mut rename_channel: Option<i64> = None;
@@ -11103,6 +11622,34 @@ impl StreamArchiverApp {
                                                     }
                                                     _ => {}
                                                 }
+                                                // CDN VOD-recovery badge.
+                                                match t.recovery_state.as_deref() {
+                                                    Some("recovering") => {
+                                                        ui.colored_label(
+                                                            egui::Color32::from_rgb(80, 160, 220),
+                                                            "🛟 recovering…",
+                                                        ).on_hover_text("Reconstructing the VOD from CDN segments — see the Background tab.");
+                                                    }
+                                                    Some("recovered") => {
+                                                        ui.colored_label(
+                                                            egui::Color32::from_rgb(70, 180, 90),
+                                                            "🛟 recovered",
+                                                        ).on_hover_text("A full VOD was recovered from the CDN — right-click → Open recovered file.");
+                                                    }
+                                                    Some("partial") => {
+                                                        ui.colored_label(
+                                                            egui::Color32::from_rgb(220, 160, 30),
+                                                            "🛟 partial",
+                                                        ).on_hover_text("A partial VOD was recovered (some segments were gone) — right-click → Open recovered file.");
+                                                    }
+                                                    Some("unavailable") => {
+                                                        ui.colored_label(
+                                                            egui::Color32::from_rgb(150, 150, 150),
+                                                            "🛟 gone",
+                                                        ).on_hover_text("No segments survived on the CDN — past the ~60-day recovery window.");
+                                                    }
+                                                    _ => {}
+                                                }
                                                 // In-progress / needs-attention badges
                                                 let needs_remux = t.output_path.ends_with(".ts")
                                                     && t.output_path.contains(".cache");
@@ -11278,6 +11825,27 @@ impl StreamArchiverApp {
                                                 ui.close();
                                             }
                                         }
+                                        // Recover a deleted/muted VOD from the CDN (Twitch takes
+                                        // that carry a broadcast/stream id).
+                                        if t.stream_id.is_some()
+                                            && ui
+                                                .button("🛟  Recover VOD…")
+                                                .on_hover_text("Reconstruct this VOD from segments still on the Twitch CDN (deleted or DMCA-muted).")
+                                                .clicked()
+                                        {
+                                            open_recover_take = Some(t.id);
+                                            ui.close();
+                                        }
+                                        if let Some(rp) = t.recovered_path.as_ref().filter(|p| !p.is_empty()) {
+                                            let rp_ok = std::path::Path::new(rp).is_file();
+                                            if ui
+                                                .add_enabled(rp_ok, egui::Button::new("🛟  Open recovered file"))
+                                                .clicked()
+                                            {
+                                                open_path = Some(std::path::PathBuf::from(rp));
+                                                ui.close();
+                                            }
+                                        }
                                         if ui
                                             .add_enabled(
                                                 !t.output_path.is_empty(),
@@ -11362,6 +11930,9 @@ impl StreamArchiverApp {
         }
         if let Some(p) = open_meta_popup {
             self.meta_popup = Some(p);
+        }
+        if let Some(rec_id) = open_recover_take {
+            self.open_recover_vod_from_seed(rec_id);
         }
         // Next stream double-click: a channel/stream/take row sets the local; an
         // instance row routes through RowActions.
@@ -13523,6 +14094,69 @@ impl StreamArchiverApp {
                     ui.end_row();
                     ui.label("Logs dir");
                     ui.add_enabled(enabled, egui::TextEdit::singleline(&mut self.settings.file_split_logs).desired_width(140.0).hint_text("logs"));
+                    ui.end_row();
+                });
+
+            // ── Twitch VOD recovery ────────────────────────────────────────────
+            ui.add_space(12.0);
+            ui.heading("Twitch VOD recovery 🛟");
+            ui.label(
+                "Reconstruct deleted or DMCA-muted Twitch VODs from segments still on the CDN \
+                 (~60-day window). Recovery is derived from a recording's broadcast id + go-live \
+                 time — no Twitch login required.",
+            );
+            ui.add_space(6.0);
+            egui::Grid::new("vod_recovery_grid")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.checkbox(&mut self.settings.auto_recover_muted, "Auto-recover muted VODs");
+                    ui.label("When the VOD checker finds a DMCA-muted VOD, recover it automatically.");
+                    ui.end_row();
+
+                    ui.checkbox(&mut self.settings.auto_recover_deleted, "Auto-recover deleted VODs");
+                    ui.label("When a stream never publishes a VOD, try to recover it from the CDN automatically.");
+                    ui.end_row();
+
+                    ui.label("Default quality");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.recovery_quality)
+                            .desired_width(140.0)
+                            .hint_text("chunked (source)"),
+                    );
+                    ui.end_row();
+
+                    ui.label("Max concurrent probes");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.recovery_max_conc)
+                            .desired_width(80.0)
+                            .hint_text("8"),
+                    );
+                    ui.end_row();
+
+                    ui.label("CDN host override");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.settings.recovery_cdn_hosts)
+                            .desired_rows(2)
+                            .desired_width(360.0)
+                            .hint_text("one https host per line — empty = built-in list"),
+                    );
+                    ui.end_row();
+
+                    let scan_running = self
+                        .background_tasks
+                        .iter()
+                        .any(|t| t.kind == crate::events::BackgroundTaskKind::RecoverVodScan);
+                    if ui
+                        .add_enabled(!scan_running, egui::Button::new("Recover deleted/muted VODs"))
+                        .on_hover_text("Scan all recordings within the ~60-day window that are deleted or muted and recover each.")
+                        .clicked()
+                    {
+                        let quality = self.settings.recovery_quality.trim().to_string();
+                        self.core.manual(ManualCommand::ScanRecoverableVods { window_days: 60, quality });
+                        self.status = "VOD recovery scan started — see the Background tab.".into();
+                    }
+                    ui.label("Bulk-recover every eligible recording (deleted or muted) inside the CDN retention window.");
                     ui.end_row();
                 });
 
@@ -20320,6 +20954,8 @@ mod tests {
             vod_id: None,
             vod_state: None,
             vod_muted_secs: None,
+            recovery_state: None,
+            recovered_path: None,
         }
     }
 

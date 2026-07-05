@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use tokio::process::Command;
 use tokio::sync::{Semaphore, mpsc};
+use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 use crate::detectors::{DetectContext, DetectItem, DetectOutcome};
@@ -1339,6 +1340,85 @@ impl Supervisor {
                             let _ = tx.send(AppEvent::BackgroundTaskFinished {
                                 id: task_id,
                                 outcome: crate::events::TaskOutcome::CompletedWithNote(format!("{total} checked")),
+                            });
+                        });
+                    }
+                    ManualCommand::RecoverVod { inputs, quality, sink, probe_all } => {
+                        let store = self.store.clone();
+                        let tx = self.events.clone();
+                        let client = self.ctx.http_client();
+                        tokio::spawn(async move {
+                            let task_id = crate::events::next_task_id();
+                            crate::recovery::run_recovery(
+                                client, store, tx, inputs, quality, sink, probe_all, task_id,
+                            )
+                            .await;
+                        });
+                    }
+                    ManualCommand::ScanRecoverableVods { window_days, quality } => {
+                        let store = self.store.clone();
+                        let tx = self.events.clone();
+                        let client = self.ctx.http_client();
+                        tokio::spawn(async move {
+                            let task_id = crate::events::next_task_id();
+                            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
+                                id: task_id,
+                                kind: crate::events::BackgroundTaskKind::RecoverVodScan,
+                                label: "VOD recovery scan".into(),
+                                detail: String::new(),
+                                started_at: now_unix(),
+                                progress: Some(0.0),
+                                progress_info: None,
+                            }));
+                            let within = window_days.max(1) * 86_400;
+                            let takes = store
+                                .recordings_recoverable(within, now_unix())
+                                .unwrap_or_default();
+                            let total = takes.len();
+                            // Bound concurrent recoveries; each keeps its own inner
+                            // segment-HEAD semaphore, so total load stays sane.
+                            let sem = Arc::new(Semaphore::new(2));
+                            let mut set: JoinSet<()> = JoinSet::new();
+                            for take in takes {
+                                let Some(login) = crate::detectors::twitch_login(&take.monitor_url)
+                                else {
+                                    continue;
+                                };
+                                let (client, sem, store, tx, quality) = (
+                                    client.clone(),
+                                    sem.clone(),
+                                    store.clone(),
+                                    tx.clone(),
+                                    quality.clone(),
+                                );
+                                set.spawn(async move {
+                                    let _permit = sem.acquire().await.expect("semaphore");
+                                    let sub = crate::events::next_task_id();
+                                    let inputs = crate::recovery::RecoveryInputs {
+                                        login,
+                                        broadcast_id: take.stream_id,
+                                        start_epoch: take.start_epoch,
+                                        went_live_approx: take.went_live_approx,
+                                    };
+                                    crate::recovery::run_recovery(
+                                        client,
+                                        store,
+                                        tx,
+                                        inputs,
+                                        quality,
+                                        crate::recovery::RecoverySink::Recording(take.rec_id),
+                                        take.deleted,
+                                        sub,
+                                    )
+                                    .await;
+                                });
+                            }
+                            while set.join_next().await.is_some() {}
+                            let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                                id: task_id,
+                                outcome: crate::events::TaskOutcome::CompletedWithNote(format!(
+                                    "{total} recording(s) processed"
+                                )),
                             });
                         });
                     }
@@ -4357,6 +4437,8 @@ fn recording_from_detached(row: &DetachedRow) -> Recording {
         vod_id: None,
         vod_state: None,
         vod_muted_secs: None,
+        recovery_state: None,
+        recovered_path: None,
     }
 }
 
@@ -6171,7 +6253,7 @@ fn expand_template(template: &str, v: &TemplateVars) -> String {
 /// matching the file-manager convention. A missing `dir` can't collide. `ignore`
 /// (the file being renamed, if any) is treated as free so a post-rename to the
 /// same/own name isn't pushed to a new suffix.
-fn unique_stem(dir: &Path, stem: &str, ext: &str, ignore: Option<&Path>) -> String {
+pub(crate) fn unique_stem(dir: &Path, stem: &str, ext: &str, ignore: Option<&Path>) -> String {
     let taken = |s: &str| {
         let p = dir.join(format!("{s}.{ext}"));
         Some(p.as_path()) != ignore && p.exists()
@@ -6439,6 +6521,10 @@ async fn check_twitch_vod(
                 let _ = store.set_recording_vod_found(rec_id, &vod_id, muted_secs);
                 let _ = events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
                 info!(rec_id, vod_id, muted_secs, "Twitch VOD found");
+                // Auto-recover a muted VOD (the online copy is damaged) when enabled.
+                if muted_secs > 0 && setting_true(&store, crate::recovery::K_AUTO_RECOVER_MUTED) {
+                    spawn_auto_recovery(&ctx, &store, &events, rec_id);
+                }
                 return;
             }
             Ok(None) => {} // not yet available
@@ -6449,6 +6535,62 @@ async fn check_twitch_vod(
     let _ = store.set_recording_vod_not_published(rec_id);
     let _ = events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
     info!(rec_id, login, "Twitch VOD not published after polling timeout");
+    // Auto-recover a deleted VOD (no published archive) when enabled.
+    if setting_true(&store, crate::recovery::K_AUTO_RECOVER_DELETED) {
+        spawn_auto_recovery(&ctx, &store, &events, rec_id);
+    }
+}
+
+/// Read a boolean setting (`"true"`/`"1"` = on), defaulting to `false`.
+fn setting_true(store: &Store, key: &str) -> bool {
+    matches!(
+        store.get_setting(key).ok().flatten().as_deref(),
+        Some("true") | Some("1")
+    )
+}
+
+/// Spawn a recovery for a tracked recording, seeded from its stored broadcast id +
+/// go-live time. No-op when the recording lacks a stream id (can't derive the URL)
+/// or is past the ~60-day CDN window.
+fn spawn_auto_recovery(ctx: &Arc<DetectContext>, store: &Arc<Store>, events: &EventTx, rec_id: i64) {
+    let Ok(Some(seed)) = store.recording_recovery_seed(rec_id) else {
+        return;
+    };
+    if seed.stream_id.is_empty() {
+        return;
+    }
+    if now_unix() - seed.start_epoch > 60 * 86_400 {
+        return; // past the CDN retention window
+    }
+    let Some(login) = crate::detectors::twitch_login(&seed.monitor_url) else {
+        return;
+    };
+    let inputs = crate::recovery::RecoveryInputs {
+        login,
+        broadcast_id: seed.stream_id,
+        start_epoch: seed.start_epoch,
+        went_live_approx: seed.went_live_approx,
+    };
+    let quality = store
+        .get_setting(crate::recovery::K_RECOVERY_QUALITY)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let (client, store, events) = (ctx.http_client(), store.clone(), events.clone());
+    tokio::spawn(async move {
+        let task_id = crate::events::next_task_id();
+        crate::recovery::run_recovery(
+            client,
+            store,
+            events,
+            inputs,
+            quality,
+            crate::recovery::RecoverySink::Recording(rec_id),
+            seed.deleted,
+            task_id,
+        )
+        .await;
+    });
 }
 
 /// Query Helix `/helix/videos` for the streamer's most recent archive VODs and
