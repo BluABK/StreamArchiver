@@ -1211,9 +1211,11 @@ impl StreamArchiverApp {
             confirm_delete_channel: None,
             confirm_delete_segment: None,
             channel_form: None,
-            streams_sort: {
-                let (col, ascending) = grid_columns::resolve_sort(&STREAM_COLUMNS, &streams_sort_persisted);
-                SortState { col, ascending }
+            streams_sort: SortState {
+                keys: grid_columns::resolve_sort(&STREAM_COLUMNS, &streams_sort_persisted)
+                    .into_iter()
+                    .map(|(col, ascending)| SortLevel { col, ascending })
+                    .collect(),
             },
             streams_filters: vec![String::new(); STREAM_COLS],
             expanded_channels: HashSet::new(),
@@ -1278,9 +1280,11 @@ impl StreamArchiverApp {
             asset_history: None,
             provider_tex: None,
             channel_twitch_colors: HashMap::new(),
-            videos_sort: {
-                let (col, ascending) = grid_columns::resolve_sort(&VIDEO_COLUMNS, &videos_sort_persisted);
-                SortState { col, ascending }
+            videos_sort: SortState {
+                keys: grid_columns::resolve_sort(&VIDEO_COLUMNS, &videos_sort_persisted)
+                    .into_iter()
+                    .map(|(col, ascending)| SortLevel { col, ascending })
+                    .collect(),
             },
             videos_filters: vec![String::new(); VIDEO_COLS],
             twitch_flow,
@@ -4041,12 +4045,48 @@ const ISSUES_COLUMNS: [GridCol; 8] = [
     GridCol { id: "actions",  title: "Actions", tooltip: "", min_width: 0.0,   initial: 0.0, sortable: false, stretch: false },
 ];
 
-/// Which column a table is sorted by and in what direction. `col == None` keeps
-/// the natural (database) order.
-#[derive(Clone, Copy, Default)]
-struct SortState {
-    col: Option<usize>,
+/// One sort level: a column index (into the table's static `*_COLUMNS` array) +
+/// direction. `SortState.keys` is the priority list, primary first.
+#[derive(Clone, Copy, PartialEq)]
+struct SortLevel {
+    col: usize,
     ascending: bool,
+}
+
+/// A table's multi-level sort. An empty `keys` list keeps the natural (database)
+/// order. Not `Copy` (holds a `Vec`); `PartialEq` drives the save-back
+/// "changed?" check.
+#[derive(Clone, Default, PartialEq)]
+struct SortState {
+    keys: Vec<SortLevel>,
+}
+
+impl SortState {
+    /// Position of `col` in the priority list, if it's an active sort key.
+    fn level_of(&self, col: usize) -> Option<usize> {
+        self.keys.iter().position(|l| l.col == col)
+    }
+    /// Plain header click: make `col` the sole key (ascending). If it's already
+    /// the sole key, just flip its direction.
+    fn set_sole(&mut self, col: usize) {
+        if self.keys.len() == 1 && self.keys[0].col == col {
+            self.keys[0].ascending = !self.keys[0].ascending;
+        } else {
+            self.keys = vec![SortLevel { col, ascending: true }];
+        }
+    }
+    /// Shift-click / "Add as secondary": flip direction if already a key, else
+    /// append it as a new lowest-priority level (ascending).
+    fn toggle_or_append(&mut self, col: usize) {
+        match self.level_of(col) {
+            Some(p) => self.keys[p].ascending = !self.keys[p].ascending,
+            None => self.keys.push(SortLevel { col, ascending: true }),
+        }
+    }
+    /// Drop `col` from the priority list (no-op if absent).
+    fn remove_col(&mut self, col: usize) {
+        self.keys.retain(|l| l.col != col);
+    }
 }
 
 /// A cell's sort key: numeric columns sort numerically, text columns sort
@@ -4105,21 +4145,30 @@ fn ordered_rows(rows: &[Vec<Cell>], sort: &SortState, filters: &[String]) -> Vec
             })
         })
         .collect();
-    if let Some(c) = sort.col {
-        // `sort_by` is stable, so equal keys keep their natural order.
+    if !sort.keys.is_empty() {
+        // Fold the priority list into a short-circuiting comparator chain: each
+        // level breaks ties left by the higher-priority ones. `sort_by` is
+        // stable, so rows equal on every key keep their natural (DB) order — so
+        // equal-primary rows cluster together with no divider rows needed.
         idx.sort_by(|&a, &b| {
-            let o = match (rows[a].get(c), rows[b].get(c)) {
-                (Some(x), Some(y)) => cmp_sort_key(&x.key, &y.key),
-                _ => std::cmp::Ordering::Equal,
-            };
-            if sort.ascending { o } else { o.reverse() }
+            sort.keys.iter().fold(std::cmp::Ordering::Equal, |acc, level| {
+                acc.then_with(|| {
+                    let o = match (rows[a].get(level.col), rows[b].get(level.col)) {
+                        (Some(x), Some(y)) => cmp_sort_key(&x.key, &y.key),
+                        _ => std::cmp::Ordering::Equal,
+                    };
+                    if level.ascending { o } else { o.reverse() }
+                })
+            })
         });
     }
     idx
 }
 
 /// Render one sortable + optionally filterable header cell for column `idx`: a
-/// click-to-sort title (with ▲/▼ when active) above a filter box.
+/// click-to-sort title (with ▲/▼ when active, plus a plain-digit level ordinal
+/// when the sort is multi-level) above a filter box. Plain click = sole key;
+/// Shift-click = add/toggle an additional level (matching the context menu).
 fn sort_filter_header(
     ui: &mut egui::Ui,
     idx: usize,
@@ -4130,28 +4179,37 @@ fn sort_filter_header(
     filter: &mut String,
 ) {
     ui.vertical(|ui| {
-        let active = sort.col == Some(idx);
-        let arrow = if active {
-            if sort.ascending { " ▲" } else { " ▼" }
-        } else {
-            ""
+        // Arrow shows direction; when there are ≥2 keys, a plain digit shows this
+        // column's 1-based priority ("▲1" primary, "▲2" secondary, …). Plain
+        // digits (not superscripts) to avoid font/tofu risk for ordinals ≥4.
+        let arrow = match sort.level_of(idx) {
+            Some(p) => {
+                let dir = if sort.keys[p].ascending { "▲" } else { "▼" };
+                if sort.keys.len() >= 2 {
+                    format!(" {dir}{}", p + 1)
+                } else {
+                    format!(" {dir}")
+                }
+            }
+            None => String::new(),
         };
-        let hover = if tooltip.is_empty() {
-            "Click to sort (click again to reverse)".to_string()
+        let hover_base = if tooltip.is_empty() {
+            String::new()
         } else {
-            format!("{tooltip}\n\n(click to sort; click again to reverse)")
+            format!("{tooltip}\n\n")
         };
+        let hover = format!(
+            "{hover_base}Click to sort (again to reverse) · Shift-click to add a \
+             sort level · Right-click for options."
+        );
         let resp = ui
             .add(egui::Button::new(egui::RichText::new(format!("{title}{arrow}")).strong()).frame(false))
             .on_hover_text(hover);
         if resp.clicked() {
-            if active {
-                sort.ascending = !sort.ascending;
+            if ui.input(|i| i.modifiers.shift) {
+                sort.toggle_or_append(idx);
             } else {
-                *sort = SortState {
-                    col: Some(idx),
-                    ascending: true,
-                };
+                sort.set_sole(idx);
             }
         }
         if filterable {
@@ -4200,6 +4258,25 @@ fn grid_header_cell(
     );
     ctx_resp.context_menu(|ui| {
         ui.set_min_width(200.0);
+        if col.sortable {
+            if ui.button("⬍  Sort by this column").clicked() {
+                sort.keys = vec![SortLevel { col: idx, ascending: true }];
+                ui.close();
+            }
+            if ui.button("➕  Add as secondary sort").clicked() {
+                sort.toggle_or_append(idx);
+                ui.close();
+            }
+            if sort.level_of(idx).is_some() && ui.button("➖  Remove from sort").clicked() {
+                sort.remove_col(idx);
+                ui.close();
+            }
+            if !sort.keys.is_empty() && ui.button("✖  Clear sort").clicked() {
+                sort.keys.clear();
+                ui.close();
+            }
+            ui.separator();
+        }
         if !locked(col.id) && !col.title.is_empty() {
             if ui.button(format!("🚫  Hide '{}'", col.title)).clicked() {
                 grid_columns::set_visible(entries, col.id, false);
@@ -6369,7 +6446,7 @@ impl StreamArchiverApp {
         // Build the sort/filter model and take the persisted sort/filter state
         // into locals (written back after the table is drawn).
         let model: Vec<Vec<Cell>> = self.videos.iter().map(|v| video_cells(v, &speed)).collect();
-        let mut sort = self.videos_sort;
+        let mut sort = self.videos_sort.clone();
         let mut filters = self.videos_filters.clone();
         if filters.len() != VIDEO_COLS {
             filters = vec![String::new(); VIDEO_COLS];
@@ -6648,8 +6725,9 @@ impl StreamArchiverApp {
                         }
                     });
             });
-        if sort.col != self.videos_sort.col || sort.ascending != self.videos_sort.ascending {
-            let persisted = grid_columns::unresolve_sort(&VIDEO_COLUMNS, sort.col, sort.ascending);
+        if sort != self.videos_sort {
+            let keys: Vec<(usize, bool)> = sort.keys.iter().map(|l| (l.col, l.ascending)).collect();
+            let persisted = grid_columns::unresolve_sort(&VIDEO_COLUMNS, &keys);
             grid_columns::save_sort(&self.core.store, GridTableId::Videos, &persisted);
         }
         self.videos_sort = sort;
@@ -10054,7 +10132,7 @@ impl StreamArchiverApp {
                 channel_cells(&e.channel, &mons, now)
             })
             .collect();
-        let mut sort = self.streams_sort;
+        let mut sort = self.streams_sort.clone();
         let mut filters = self.streams_filters.clone();
         if filters.len() != STREAM_COLS {
             filters = vec![String::new(); STREAM_COLS];
@@ -11256,8 +11334,9 @@ impl StreamArchiverApp {
                     }
                 });
             });
-        if sort.col != self.streams_sort.col || sort.ascending != self.streams_sort.ascending {
-            let persisted = grid_columns::unresolve_sort(&STREAM_COLUMNS, sort.col, sort.ascending);
+        if sort != self.streams_sort {
+            let keys: Vec<(usize, bool)> = sort.keys.iter().map(|l| (l.col, l.ascending)).collect();
+            let persisted = grid_columns::unresolve_sort(&STREAM_COLUMNS, &keys);
             grid_columns::save_sort(&self.core.store, GridTableId::Streams, &persisted);
         }
         self.streams_sort = sort;
@@ -19944,17 +20023,55 @@ fn parse_twitch_chat(
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatSegment, DateFmt, StreamMetaChange, StreamTarget, active_date_fmt,
-        aggregate_stream_changes, build_twitch_segments, chat_file_for_recording,
+        Cell, ChatSegment, DateFmt, SortLevel, SortState, StreamMetaChange, StreamTarget,
+        active_date_fmt, aggregate_stream_changes, build_twitch_segments, chat_file_for_recording,
         compose_browser_profile, contrast_ratio, fmt_polled, hsl_to_rgb, meta_change_lines,
-        monitor_import_identity, parse_first_party_spans, playable_with, player_is_mpv,
-        readable_color, rgb_to_hsl, set_active_date_fmt, split_browser_profile,
+        monitor_import_identity, ordered_rows, parse_first_party_spans, playable_with,
+        player_is_mpv, readable_color, rgb_to_hsl, set_active_date_fmt, split_browser_profile,
         stream_target_for_active, strip_ctcp_action, twitch_username_color, word_match_segments,
         yt_channel_id,
     };
     use eframe::egui;
     use std::collections::HashMap;
     use std::path::PathBuf;
+
+    // ----- multi-level table sort (ordered_rows) -----
+
+    #[test]
+    fn ordered_rows_two_level_auto_then_name() {
+        // (Auto 1/0 numeric, Name text). Rows deliberately out of order; Name
+        // uses mixed case to prove the secondary sort is case-insensitive.
+        let mk = |auto: f64, name: &str| vec![Cell::num(auto, ""), Cell::text(name)];
+        let rows = vec![
+            mk(1.0, "Charlie"), // 0
+            mk(0.0, "Alice"),   // 1
+            mk(1.0, "alpha"),   // 2  (sorts before Charlie, case-insensitively)
+            mk(0.0, "bob"),     // 3
+        ];
+
+        // Empty keys → natural (input) order.
+        assert_eq!(ordered_rows(&rows, &SortState::default(), &[]), vec![0, 1, 2, 3]);
+
+        // Primary Auto asc, secondary Name asc: auto=0 cluster (Alice, bob) then
+        // auto=1 cluster (alpha, Charlie), each alphabetized within the cluster.
+        let asc = SortState {
+            keys: vec![
+                SortLevel { col: 0, ascending: true },
+                SortLevel { col: 1, ascending: true },
+            ],
+        };
+        assert_eq!(ordered_rows(&rows, &asc, &[]), vec![1, 3, 2, 0]);
+
+        // Flipping ONLY the secondary reverses within each primary cluster, not
+        // across clusters: auto=0 (bob, Alice) then auto=1 (Charlie, alpha).
+        let sec_desc = SortState {
+            keys: vec![
+                SortLevel { col: 0, ascending: true },
+                SortLevel { col: 1, ascending: false },
+            ],
+        };
+        assert_eq!(ordered_rows(&rows, &sec_desc, &[]), vec![3, 1, 0, 2]);
+    }
 
     // ----- first-party emote offset parsing (IRC `emotes` tag) -----
 

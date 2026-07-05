@@ -46,12 +46,45 @@ pub struct ColumnEntry {
     pub visible: bool,
 }
 
-/// A table's persisted sort, by stable column id rather than runtime index, so
-/// it survives a `GridCol` array being reordered/extended across builds.
+/// One persisted sort level: a stable column id + direction.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SortKeyEntry {
+    pub col: String,
+    #[serde(default)]
+    pub ascending: bool,
+}
+
+/// A table's persisted multi-level sort, by stable column id rather than runtime
+/// index, so it survives a `GridCol` array being reordered/extended across
+/// builds. `keys` is the priority list (primary first); empty == unsorted.
+///
+/// The legacy `col`/`ascending` fields exist ONLY so pre-multi-sort
+/// `grid_sort_v1` JSON (`{"col":"auto","ascending":true}`) still deserializes;
+/// [`PersistedSort::normalize`] folds them into `keys`, and they are never
+/// written back (`skip_serializing`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PersistedSort {
+    #[serde(default)]
+    pub keys: Vec<SortKeyEntry>,
+    #[serde(default, skip_serializing)]
     pub col: Option<String>,
+    #[serde(default, skip_serializing)]
     pub ascending: bool,
+}
+
+impl PersistedSort {
+    /// Migrate a legacy single-key value into `keys`; idempotent. New-form
+    /// values (already-populated `keys`, no legacy `col`) pass through unchanged.
+    fn normalize(mut self) -> Self {
+        // Snapshot the legacy fields before `take()` so the `.filter` guard can
+        // read `keys` without a borrow clash, then clear them (never re-serialized).
+        let (ascending, empty) = (self.ascending, self.keys.is_empty());
+        self.ascending = false;
+        if let Some(col) = self.col.take().filter(|_| empty) {
+            self.keys.push(SortKeyEntry { col, ascending });
+        }
+        self
+    }
 }
 
 /// Which of the six grid tables an operation applies to; also the JSON-map key
@@ -182,7 +215,12 @@ fn all_sort_map(store: &Store) -> HashMap<String, PersistedSort> {
         .ok()
         .flatten()
         .filter(|s| !s.trim().is_empty())
-        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .and_then(|raw| serde_json::from_str::<HashMap<String, PersistedSort>>(&raw).ok())
+        // Migrate legacy single-key values on EVERY read, not just `load_sort`:
+        // `save_sort`/`reset_all_sort` rewrite the whole map, and the legacy
+        // `col`/`ascending` fields are `skip_serializing`, so an un-normalized
+        // value for another table would be silently dropped on the next save.
+        .map(|m| m.into_iter().map(|(k, v)| (k, v.normalize())).collect())
         .unwrap_or_default()
 }
 
@@ -204,24 +242,34 @@ pub fn save_sort(store: &Store, table: GridTableId, sort: &PersistedSort) {
     save_sort_map(store, &map);
 }
 
-/// `PersistedSort` (id-based) -> `(index, ascending)` against `columns`, for
-/// feeding into a table's runtime `SortState`. `None` index when nothing is
-/// persisted or the saved id no longer resolves (same as today's "unsorted"
-/// default) — the caller assembles its own `SortState { col, ascending }`.
-pub fn resolve_sort(columns: &[GridCol], persisted: &PersistedSort) -> (Option<usize>, bool) {
-    let idx = persisted
-        .col
-        .as_ref()
-        .and_then(|id| columns.iter().position(|c| c.id == id.as_str()));
-    (idx, persisted.ascending)
+/// `PersistedSort` (id-based) -> ordered runtime `(index, ascending)` levels
+/// against `columns`, for feeding into a table's runtime `SortState`. Ids that
+/// no longer resolve are dropped (order preserved); an empty result == unsorted.
+pub fn resolve_sort(columns: &[GridCol], persisted: &PersistedSort) -> Vec<(usize, bool)> {
+    persisted
+        .keys
+        .iter()
+        .filter_map(|k| {
+            columns
+                .iter()
+                .position(|c| c.id == k.col.as_str())
+                .map(|i| (i, k.ascending))
+        })
+        .collect()
 }
 
-/// `(index, ascending)` -> `PersistedSort` (id-based), for saving a table's
-/// runtime `SortState` back.
-pub fn unresolve_sort(columns: &[GridCol], col: Option<usize>, ascending: bool) -> PersistedSort {
+/// Ordered runtime `(index, ascending)` levels -> `PersistedSort` (id-based),
+/// for saving a table's runtime `SortState` back. Out-of-range indices dropped.
+pub fn unresolve_sort(columns: &[GridCol], keys: &[(usize, bool)]) -> PersistedSort {
     PersistedSort {
-        col: col.and_then(|i| columns.get(i)).map(|c| c.id.to_string()),
-        ascending,
+        keys: keys
+            .iter()
+            .filter_map(|&(i, ascending)| {
+                columns.get(i).map(|c| SortKeyEntry { col: c.id.to_string(), ascending })
+            })
+            .collect(),
+        col: None,
+        ascending: false,
     }
 }
 
@@ -429,26 +477,86 @@ mod tests {
 
     #[test]
     fn sort_resolve_unresolve_roundtrip() {
-        let persisted = PersistedSort { col: Some("b".into()), ascending: false };
-        let (idx, asc) = resolve_sort(&COLS, &persisted);
-        assert_eq!(idx, Some(1));
-        assert!(!asc);
-        let back = unresolve_sort(&COLS, idx, asc);
+        // A two-level sort: primary "a" ascending, secondary "b" descending.
+        let persisted = PersistedSort {
+            keys: vec![
+                SortKeyEntry { col: "a".into(), ascending: true },
+                SortKeyEntry { col: "b".into(), ascending: false },
+            ],
+            ..Default::default()
+        };
+        let resolved = resolve_sort(&COLS, &persisted);
+        assert_eq!(resolved, vec![(0, true), (1, false)]);
+        let back = unresolve_sort(&COLS, &resolved);
         assert_eq!(back, persisted);
-        // An unknown/stale id resolves to "unsorted".
-        let stale = PersistedSort { col: Some("zzz".into()), ascending: true };
-        assert_eq!(resolve_sort(&COLS, &stale).0, None);
+    }
+
+    #[test]
+    fn sort_resolve_drops_unknown_ids_preserving_order() {
+        let persisted = PersistedSort {
+            keys: vec![
+                SortKeyEntry { col: "zzz".into(), ascending: true }, // stale -> dropped
+                SortKeyEntry { col: "b".into(), ascending: true },
+                SortKeyEntry { col: "a".into(), ascending: false },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(resolve_sort(&COLS, &persisted), vec![(1, true), (0, false)]);
+    }
+
+    #[test]
+    fn sort_legacy_single_key_json_migrates_to_keys() {
+        // A raw pre-multi-sort value deserializes then normalizes into one key.
+        let p: PersistedSort =
+            serde_json::from_str(r#"{"col":"auto","ascending":true}"#).unwrap();
+        let p = p.normalize();
+        assert_eq!(p.keys, vec![SortKeyEntry { col: "auto".into(), ascending: true }]);
+        assert!(p.col.is_none());
+
+        // End-to-end through the store, exercising all_sort_map's normalize.
+        let store = Store::open_in_memory().unwrap();
+        store
+            .set_setting(K_GRID_SORT, r#"{"streams_table":{"col":"auto","ascending":true}}"#)
+            .unwrap();
+        let loaded = load_sort(&store, GridTableId::Streams);
+        assert_eq!(loaded.keys, vec![SortKeyEntry { col: "auto".into(), ascending: true }]);
     }
 
     #[test]
     fn sort_save_load_roundtrip_and_reset() {
         let store = Store::open_in_memory().unwrap();
         assert_eq!(load_sort(&store, GridTableId::Issues), PersistedSort::default());
-        let s = PersistedSort { col: Some("a".into()), ascending: true };
+        let s = PersistedSort {
+            keys: vec![SortKeyEntry { col: "a".into(), ascending: true }],
+            ..Default::default()
+        };
         save_sort(&store, GridTableId::Issues, &s);
         assert_eq!(load_sort(&store, GridTableId::Issues), s);
         reset_all_sort(&store, &[GridTableId::Issues]);
         assert_eq!(load_sort(&store, GridTableId::Issues), PersistedSort::default());
+    }
+
+    #[test]
+    fn sort_save_of_one_table_preserves_anothers_legacy_sort() {
+        // Regression guard: legacy fields are skip_serializing, so saving one
+        // table's sort must not wipe another table's still-legacy sort — the
+        // migration in all_sort_map is what prevents that.
+        let store = Store::open_in_memory().unwrap();
+        store
+            .set_setting(
+                K_GRID_SORT,
+                r#"{"streams_table":{"col":"auto","ascending":true},"videos_table":{"col":"name","ascending":false}}"#,
+            )
+            .unwrap();
+        // Touch only Streams.
+        let s = PersistedSort {
+            keys: vec![SortKeyEntry { col: "a".into(), ascending: true }],
+            ..Default::default()
+        };
+        save_sort(&store, GridTableId::Streams, &s);
+        // Videos' legacy sort survived (migrated to a 1-key list).
+        let videos = load_sort(&store, GridTableId::Videos);
+        assert_eq!(videos.keys, vec![SortKeyEntry { col: "name".into(), ascending: false }]);
     }
 
     #[test]
