@@ -420,6 +420,55 @@ returns the exact host.)
 > rather than restored audio; the `un-muted` count in the probe tells you which you
 > got. The public-API lookups use Twitch's read-only web client id (no account).
 
+### Post-stream VOD download (archive the published VOD)
+
+After a stream ends the platform publishes its own **post-processed VOD** — Twitch's
+clean transcode, YouTube's finished recording, Kick's VOD — often higher quality /
+gap-free vs. the real-time capture. StreamArchiver can **download that VOD after the
+stream ends** to sit *alongside* the live recording, and — as a separate option —
+**replace the live recording with the VOD, but only if the download succeeded** (so a
+failed or unavailable VOD never costs you the footage you already captured).
+
+**Three-level control.** Both options resolve through an inheritance chain —
+**global default < per-channel < per-instance** — so you can turn archiving on
+everywhere and off for one noisy channel, or on for a single instance. Each level is a
+tri-state **Inherit / On / Off**:
+
+- **Global** (Settings → *Post-stream VOD download*): two checkboxes — *Download the
+  published VOD after a stream ends*, and *Replace the live recording when the download
+  succeeds*.
+- **Per-channel** (right-click a channel → **Properties/rename**): *Download VOD after
+  end* and *Replace with VOD* dropdowns (Inherit follows global).
+- **Per-instance** (edit an instance): the same two dropdowns (Inherit follows the
+  channel, then global).
+
+**How it works.** When a recording ends and the platform's VOD becomes available, a
+detached **yt-dlp** download is queued (it shows in the Videos tab with a progress bar,
+survives an app restart, and is stoppable) and lands next to the live file as
+`{stem}.vod.mkv`. If **Replace** is on and the download succeeds (and, for Twitch, the
+VOD isn't DMCA-muted), the live capture is swapped out: the VOD is renamed to the live
+file's name — so the recording's chat/thumbnail sidecars stay matched — and the old file
+is deleted only *after* the VOD is confirmed good.
+
+**Muted VODs are handled specially.** A DMCA-muted Twitch VOD is silenced, so it's
+**never** downloaded as-is and **never** replaces the live recording (which has the full
+audio). Instead the [CDN recovery](#twitch-vod-recovery-deleted--muted-vods) runs to
+un-mute what it can, a desktop notification fires, and the take is listed in the **⚠
+Issues** panel under *DMCA-muted VODs* with buttons to **Open live recording**, **Open
+recovered VOD**, **Re-run recovery**, or **Keep live / dismiss**.
+
+**Badges & actions.** A take shows its archive state in the history tree: **📼 VOD**
+(downloaded alongside), **📼 replaced**, **✂ muted VOD**, **📼 VOD…** (downloading), or
+**📼 VOD failed**. Right-click a take for **📥 Download VOD now** (on-demand / retry) and
+**📼 Open downloaded VOD**.
+
+> **Notes.** This re-downloads the whole stream, so it doubles storage/bandwidth — hence
+> it's opt-in and granular. Twitch is the most reliable path (it reuses the existing
+> VOD-availability poller). YouTube/Kick VOD readiness after a stream is less
+> deterministic — the download retries for up to ~1 hour and, if the VOD still isn't
+> available, marks the archive `failed` without ever touching the live recording (use
+> **📥 Download VOD now** to retry later).
+
 ### Audio & subtitle tracks
 
 To archive as much of a stream as possible, each instance has **Audio tracks** and
