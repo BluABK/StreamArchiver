@@ -4229,10 +4229,10 @@ fn sort_filter_header(
 /// action (skipped for `locked` ids, whose visibility is controlled elsewhere;
 /// see [`ColumnEntry`]/[`grid_columns::column_chooser_editor`]) followed by
 /// the full show/hide + reorder list (adapted from `source_list_inline_editor`).
-/// Reuses the emote-grid re-interact workaround (this file's other
-/// `ctx_resp`/`Sense::click()` sites): the cell's own sort button / filter box
-/// already consume left-click, so the right-click needs a fresh interaction
-/// over the same rect.
+/// The whole-cell `ctx_resp`/`Sense::click()` interaction (emote-grid re-interact
+/// pattern) is created FIRST so the sort button / filter box, added afterwards,
+/// sit on top and win their own left-clicks (see the ordering note in the body);
+/// the ctx_resp then catches right-clicks over the rest of the cell.
 #[allow(clippy::too_many_arguments)]
 fn grid_header_cell(
     ui: &mut egui::Ui,
@@ -4246,16 +4246,23 @@ fn grid_header_cell(
     columns: &[GridCol],
     locked: impl Fn(&str) -> bool,
 ) {
-    if col.sortable {
-        sort_filter_header(ui, idx, col.title, col.tooltip, filterable, sort, filter);
-    } else if !col.title.is_empty() {
-        ui.strong(col.title).on_hover_text(col.tooltip);
-    }
+    // Register the whole-cell right-click interaction BEFORE rendering the sort
+    // button / filter box, so those (added afterwards) sit ON TOP and win their
+    // own clicks. egui's hit-test breaks overlap ties in favor of the
+    // last-added widget (egui-0.34 `hit_test::find_closest_within`: "in case of
+    // a tie, take the last one = the one on top"). If this ctx_resp were created
+    // *after* the frameless sort button, it would swallow every left-click and
+    // the header would never sort — while the right-click menu still worked.
     let ctx_resp = ui.interact(
         ui.max_rect(),
         egui::Id::new(("grid_col_ctx", table.key(), col.id)),
         egui::Sense::click(),
     );
+    if col.sortable {
+        sort_filter_header(ui, idx, col.title, col.tooltip, filterable, sort, filter);
+    } else if !col.title.is_empty() {
+        ui.strong(col.title).on_hover_text(col.tooltip);
+    }
     ctx_resp.context_menu(|ui| {
         ui.set_min_width(200.0);
         if col.sortable {
