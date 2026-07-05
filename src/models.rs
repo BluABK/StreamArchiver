@@ -895,11 +895,13 @@ pub enum NotificationKind {
     ScheduleUpdated,
     /// A new YouTube community post was ingested.
     YoutubePost,
+    /// A recording's published Twitch VOD came back DMCA-muted.
+    VodMuted,
 }
 
 impl NotificationKind {
     /// Every kind, in feed-filter display order.
-    pub const ALL: [NotificationKind; 7] = [
+    pub const ALL: [NotificationKind; 8] = [
         NotificationKind::WentLive,
         NotificationKind::RecordingFinished,
         NotificationKind::Error,
@@ -907,6 +909,7 @@ impl NotificationKind {
         NotificationKind::ScheduleAdded,
         NotificationKind::ScheduleUpdated,
         NotificationKind::YoutubePost,
+        NotificationKind::VodMuted,
     ];
 
     /// Stable persisted id (the `notification.kind` column). NEVER change.
@@ -919,6 +922,7 @@ impl NotificationKind {
             NotificationKind::ScheduleAdded => "schedule_added",
             NotificationKind::ScheduleUpdated => "schedule_updated",
             NotificationKind::YoutubePost => "youtube_post",
+            NotificationKind::VodMuted => "vod_muted",
         }
     }
 
@@ -937,6 +941,7 @@ impl NotificationKind {
             NotificationKind::ScheduleAdded => "Schedule added",
             NotificationKind::ScheduleUpdated => "Schedule updated",
             NotificationKind::YoutubePost => "YouTube post",
+            NotificationKind::VodMuted => "VOD muted",
         }
     }
 
@@ -951,6 +956,7 @@ impl NotificationKind {
             NotificationKind::ScheduleAdded => "🗓",
             NotificationKind::ScheduleUpdated => "🗓",
             NotificationKind::YoutubePost => "📣",
+            NotificationKind::VodMuted => "✂",
         }
     }
 }
@@ -1654,6 +1660,31 @@ pub struct Recording {
     pub recovery_state: Option<String>,
     /// Path to the recovered MKV once `recovery_state` is `recovered`/`partial`.
     pub recovered_path: Option<String>,
+    /// Post-stream published-VOD download status (the "archive the VOD after end"
+    /// feature). `None` = not attempted. `"downloading"` = in progress; `"archived"`
+    /// = downloaded alongside; `"replaced"` = the VOD replaced the live capture;
+    /// `"muted"` = the Twitch VOD was DMCA-muted (recovery run, never replaced,
+    /// pending acknowledgement); `"failed"`/`"skipped"`/`"acknowledged"`.
+    pub vod_dl_state: Option<String>,
+    /// Path to the downloaded published VOD once `vod_dl_state` is `archived`.
+    pub vod_dl_path: Option<String>,
+    /// The `video.id` of the in-flight/finished archive download job, when linked.
+    /// Round-tripped through the store (the completion hook reverse-looks-up by the
+    /// `vod_dl_video_id` column via SQL); not read off the struct today.
+    #[allow(dead_code)]
+    pub vod_dl_video_id: Option<i64>,
+}
+
+/// A recording whose published VOD came back DMCA-muted — a row of the Issues
+/// panel's muted-VOD category (with the recovered copy, when recovery produced one).
+#[derive(Clone, Debug)]
+pub struct MutedVodIssue {
+    pub rec_id: i64,
+    pub channel: String,
+    pub output_path: String,
+    pub recovered_path: Option<String>,
+    pub recovery_state: Option<String>,
+    pub muted_secs: i64,
 }
 
 /// A recording eligible for CDN VOD recovery, with just the fields the recovery
@@ -1899,6 +1930,9 @@ mod tests {
             vod_muted_secs: None,
             recovery_state: None,
             recovered_path: None,
+            vod_dl_state: None,
+            vod_dl_path: None,
+            vod_dl_video_id: None,
         }
     }
 

@@ -1118,6 +1118,9 @@ pub struct Supervisor {
     /// monitor_ids whose chat download was asked to stop.
     stopping_chats: Arc<Mutex<HashSet<i64>>>,
     shutdown: Arc<AtomicBool>,
+    /// A clone of the manual-command sender, so background poller tasks (the VOD
+    /// archivers) can enqueue+start a Video download without a Supervisor handle.
+    manual_tx: mpsc::UnboundedSender<ManualCommand>,
     /// Shared detection context for on-demand (manual Start) liveness checks.
     ctx: Arc<DetectContext>,
     /// monitor_id -> unix time the current ad break ends (for the UI row tint).
@@ -1164,6 +1167,7 @@ impl Supervisor {
         video_speed: VideoSpeed,
         active_chats: Arc<Mutex<HashMap<i64, u32>>>,
         shutdown: Arc<AtomicBool>,
+        manual_tx: mpsc::UnboundedSender<ManualCommand>,
         ctx: Arc<DetectContext>,
         ad_active: AdActive,
         max_concurrent: usize,
@@ -1181,6 +1185,7 @@ impl Supervisor {
             active_chats,
             stopping_chats: Arc::new(Mutex::new(HashSet::new())),
             shutdown,
+            manual_tx,
             ctx,
             ad_active,
             sem: Arc::new(Semaphore::new(max_concurrent.max(1))),
@@ -1421,6 +1426,46 @@ impl Supervisor {
                                     "{total} recording(s) processed"
                                 )),
                             });
+                        });
+                    }
+                    ManualCommand::ArchiveVodNow(rec_id) => {
+                        let store = self.store.clone();
+                        let manual_tx = self.manual_tx.clone();
+                        let ctx = self.ctx.clone();
+                        tokio::spawn(async move {
+                            let Ok(Some((murl, vod_id, stream_id, went_live))) =
+                                store.recording_archive_now(rec_id)
+                            else {
+                                return;
+                            };
+                            let url = match Platform::detect(&murl) {
+                                Platform::Twitch => vod_id
+                                    .filter(|v| !v.is_empty())
+                                    .map(|v| crate::vod_archive::twitch_vod_url(&v)),
+                                Platform::YouTube => stream_id
+                                    .filter(|s| !s.is_empty())
+                                    .map(|s| crate::vod_archive::youtube_vod_url(&s)),
+                                Platform::Kick => match crate::vod_archive::kick_slug(&murl) {
+                                    Some(slug) => {
+                                        crate::vod_archive::resolve_kick_vod(
+                                            &ctx.http_client(),
+                                            &slug,
+                                            went_live,
+                                        )
+                                        .await
+                                    }
+                                    None => None,
+                                },
+                                _ => None,
+                            };
+                            match url {
+                                Some(u) => {
+                                    enqueue_vod_archive(&store, &manual_tx, rec_id, &u);
+                                }
+                                None => {
+                                    let _ = store.set_recording_vod_dl(rec_id, "failed", None);
+                                }
+                            }
                         });
                     }
                     ManualCommand::RefreshCdnHosts => {
@@ -2516,6 +2561,9 @@ impl Supervisor {
                 message: format!("{label}: download failed"),
             });
         }
+        // If this download was a post-stream VOD archive, file it on the recording
+        // (alongside) and optionally replace the live capture. No-op otherwise.
+        self.finalize_vod_archive(id, &final_path, status).await;
         info!(video = id, bytes, status, "video download finished");
     }
 
@@ -3116,6 +3164,7 @@ impl Supervisor {
             status: status.into(),
         });
         self.schedule_vod_check(rec_id, row.monitor.platform(), status, &row.monitor.url, went_live_at, approximate);
+        self.schedule_vod_archive(rec_id, &row, went_live_at, status);
         info!(monitor_id, bytes, status, "recording finished");
         if status == "failed" && !outcome.log.is_empty() {
             warn!(monitor_id, "recording stderr:\n{}", outcome.log);
@@ -4159,10 +4208,121 @@ impl Supervisor {
             Arc::clone(&self.ctx),
             Arc::clone(&self.store),
             self.events.clone(),
+            self.manual_tx.clone(),
             rec_id,
             login,
             anchor,
         ));
+    }
+
+    /// Post-stream published-VOD download for a **YouTube/Kick** recording (Twitch
+    /// is handled inside [`check_twitch_vod`]). No-op unless the feature resolves ON
+    /// (global < channel < instance). Waits for the platform's VOD to be ready, then
+    /// enqueues a detached yt-dlp download linked to the recording.
+    fn schedule_vod_archive(
+        &self,
+        rec_id: i64,
+        row: &MonitorWithChannel,
+        went_live_at: Option<i64>,
+        status: &str,
+    ) {
+        if status == "ended" {
+            return;
+        }
+        let platform = row.monitor.platform();
+        if !matches!(platform, Platform::YouTube | Platform::Kick) {
+            return;
+        }
+        if !crate::vod_archive::effective_vod_download(&self.store, row.monitor.channel_id, row.monitor.id) {
+            return;
+        }
+        // stream_id (== the YouTube video id) travels on the recording row.
+        let stream_id = self
+            .store
+            .monitor_id_for_recording(rec_id)
+            .ok()
+            .flatten()
+            .and_then(|(_, sid)| sid);
+        let _ = self.store.set_recording_vod_dl(rec_id, "downloading", None);
+        let (store, manual_tx, ctx) = (self.store.clone(), self.manual_tx.clone(), self.ctx.clone());
+        let monitor_url = row.monitor.url.clone();
+        tokio::spawn(async move {
+            let url = match platform {
+                Platform::YouTube => {
+                    // The VOD is the same video; give post-live processing some time.
+                    tokio::time::sleep(Duration::from_secs(VOD_POLL_INTERVAL_SECS)).await;
+                    stream_id.as_deref().map(crate::vod_archive::youtube_vod_url)
+                }
+                Platform::Kick => {
+                    let Some(slug) = crate::vod_archive::kick_slug(&monitor_url) else {
+                        let _ = store.set_recording_vod_dl(rec_id, "failed", None);
+                        return;
+                    };
+                    let client = ctx.http_client();
+                    let mut found = None;
+                    for _ in 0..VOD_MAX_POLLS {
+                        tokio::time::sleep(Duration::from_secs(VOD_POLL_INTERVAL_SECS)).await;
+                        if let Some(u) = crate::vod_archive::resolve_kick_vod(&client, &slug, went_live_at).await {
+                            found = Some(u);
+                            break;
+                        }
+                    }
+                    found
+                }
+                _ => None,
+            };
+            match url {
+                Some(u) => {
+                    enqueue_vod_archive(&store, &manual_tx, rec_id, &u);
+                }
+                None => {
+                    let _ = store.set_recording_vod_dl(rec_id, "failed", None);
+                }
+            }
+        });
+    }
+
+    /// Completion hook for a VOD-archive download: record the file on the recording
+    /// and, when replace-on-success resolves ON and the VOD isn't muted, swap it in
+    /// for the live capture. A no-op for ordinary (non-archive) video downloads.
+    async fn finalize_vod_archive(&self, video_id: i64, final_path: &Path, status: &str) {
+        let Ok(Some(rec_id)) = self.store.recording_for_vod_video(video_id) else {
+            return;
+        };
+        if status != "completed" {
+            let _ = self.store.set_recording_vod_dl(rec_id, "failed", Some(video_id));
+            let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
+            return;
+        }
+        let vod_path = final_path.to_string_lossy().into_owned();
+        let _ = self.store.set_recording_vod_archived(rec_id, &vod_path, "archived");
+
+        let Ok(Some((channel_id, monitor_id, live_path, muted_secs))) =
+            self.store.recording_replace_info(rec_id)
+        else {
+            let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
+            return;
+        };
+        let muted = muted_secs.unwrap_or(0) > 0;
+        let replace = !muted
+            && !live_path.is_empty()
+            && crate::vod_archive::effective_vod_replace(&self.store, channel_id, monitor_id);
+        if replace {
+            // Only now that the VOD is confirmed good do we touch the live file.
+            // Rename the VOD to the live stem so the live sidecars stay matched.
+            let live = PathBuf::from(&live_path);
+            let _ = tokio::fs::remove_file(&live).await;
+            match tokio::fs::rename(final_path, &live).await {
+                Ok(()) => {
+                    let live_s = live.to_string_lossy().into_owned();
+                    let _ = self.store.update_recording_output_path(rec_id, &live_s);
+                    let _ = self.store.set_recording_vod_archived(rec_id, &live_s, "replaced");
+                    info!(rec_id, "vod archive: replaced live recording with the published VOD");
+                }
+                Err(e) => warn!(rec_id, "vod archive: replace rename failed: {e:#} (kept alongside)"),
+            }
+        }
+        let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
     }
 
     async fn run_process(
@@ -4467,6 +4627,9 @@ fn recording_from_detached(row: &DetachedRow) -> Recording {
         vod_muted_secs: None,
         recovery_state: None,
         recovered_path: None,
+        vod_dl_state: None,
+        vod_dl_path: None,
+        vod_dl_video_id: None,
     }
 }
 
@@ -6518,6 +6681,7 @@ async fn check_twitch_vod(
     ctx: Arc<DetectContext>,
     store: Arc<Store>,
     events: EventTx,
+    manual_tx: mpsc::UnboundedSender<ManualCommand>,
     rec_id: i64,
     login: String,
     went_live_at: Option<i64>,
@@ -6549,9 +6713,25 @@ async fn check_twitch_vod(
                 let _ = store.set_recording_vod_found(rec_id, &vod_id, muted_secs);
                 let _ = events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
                 info!(rec_id, vod_id, muted_secs, "Twitch VOD found");
-                // Auto-recover a muted VOD (the online copy is damaged) when enabled.
-                if muted_secs > 0 && setting_true(&store, crate::recovery::K_AUTO_RECOVER_MUTED) {
-                    spawn_auto_recovery(&ctx, &store, &events, rec_id);
+                let archive_on = archive_download_enabled(&store, rec_id);
+                if muted_secs > 0 {
+                    // A muted VOD is silenced — never a plain download. Un-mute via
+                    // the CDN recovery, flag it, and (archive case) raise an issue.
+                    if archive_on {
+                        let _ = store.set_recording_vod_dl(rec_id, "muted", None);
+                        let channel = archive_channel_name(&store, rec_id).unwrap_or_else(|| login.clone());
+                        let _ = events.send(AppEvent::VodMuted {
+                            recording_id: rec_id,
+                            channel,
+                            muted_secs,
+                        });
+                        spawn_auto_recovery(&ctx, &store, &events, rec_id);
+                    } else if setting_true(&store, crate::recovery::K_AUTO_RECOVER_MUTED) {
+                        spawn_auto_recovery(&ctx, &store, &events, rec_id);
+                    }
+                } else if archive_on {
+                    // Clean published VOD — download it (alongside / replace).
+                    enqueue_vod_archive(&store, &manual_tx, rec_id, &crate::vod_archive::twitch_vod_url(&vod_id));
                 }
                 return;
             }
@@ -6575,6 +6755,97 @@ fn setting_true(store: &Store, key: &str) -> bool {
         store.get_setting(key).ok().flatten().as_deref(),
         Some("true") | Some("1")
     )
+}
+
+/// Whether the post-stream VOD-download feature resolves ON for a recording
+/// (global < channel < instance).
+fn archive_download_enabled(store: &Store, rec_id: i64) -> bool {
+    store
+        .recording_replace_info(rec_id)
+        .ok()
+        .flatten()
+        .map(|(channel_id, monitor_id, _, _)| {
+            crate::vod_archive::effective_vod_download(store, channel_id, monitor_id)
+        })
+        .unwrap_or(false)
+}
+
+/// The display channel name for a recording (for the muted-VOD notification).
+fn archive_channel_name(store: &Store, rec_id: i64) -> Option<String> {
+    let (monitor_id, _) = store.get_recording_paths(rec_id).ok().flatten()?;
+    store
+        .get_monitor_with_channel(monitor_id)
+        .ok()
+        .flatten()
+        .map(|mw| mw.channel.name)
+}
+
+/// Enqueue a detached yt-dlp download of a recording's published VOD (yt-dlp →
+/// MKV) as `{live_stem}.vod.mkv` in the recording's output dir, link it to the
+/// recording (`vod_dl_video_id`), and start it via the command bus. The completion
+/// hook ([`Supervisor::finalize_vod_archive`]) handles alongside/replace.
+fn enqueue_vod_archive(
+    store: &Store,
+    manual_tx: &mpsc::UnboundedSender<ManualCommand>,
+    rec_id: i64,
+    vod_url: &str,
+) -> bool {
+    let Ok(Some((monitor_id, output_path))) = store.get_recording_paths(rec_id) else {
+        return false;
+    };
+    let Ok(Some(mw)) = store.get_monitor_with_channel(monitor_id) else {
+        return false;
+    };
+    let out = Path::new(&output_path);
+    let Some(dir) = out.parent().map(|p| p.to_string_lossy().into_owned()).filter(|d| !d.is_empty())
+    else {
+        warn!(rec_id, "vod archive: recording has no output dir");
+        return false;
+    };
+    let live_stem = out
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| format!("rec_{rec_id}"));
+    let m = &mw.monitor;
+    let video = crate::models::Video {
+        id: 0,
+        url: vod_url.to_string(),
+        title: format!("VOD · {} · rec #{rec_id}", mw.channel.name),
+        channel: mw.channel.name.clone(),
+        platform: m.platform(),
+        tool: crate::models::Tool::YtDlp,
+        quality: if m.quality.trim().is_empty() { "best".into() } else { m.quality.clone() },
+        output_dir: dir,
+        // Literal stem (no tokens) → the file is `{live_stem}.vod.mkv`, distinct
+        // from the live `{live_stem}.mkv`.
+        filename_template: format!("{live_stem}.vod"),
+        auth_kind: m.auth_kind,
+        auth_value: m.auth_value.clone(),
+        audio_tracks: String::new(),
+        subtitle_tracks: String::new(),
+        chat_log: false,
+        extra_args: String::new(),
+        auto_title: false,
+        status: "queued".into(),
+        output_path: String::new(),
+        bytes: 0,
+        created_at: now_unix(),
+        exit_code: None,
+        log_excerpt: String::new(),
+        started_at: None,
+        ended_at: None,
+    };
+    match store.insert_video(&video) {
+        Ok(id) => {
+            let _ = store.set_recording_vod_dl(rec_id, "downloading", Some(id));
+            let _ = manual_tx.send(ManualCommand::StartVideo(id));
+            true
+        }
+        Err(e) => {
+            warn!(rec_id, "vod archive: insert_video failed: {e:#}");
+            false
+        }
+    }
 }
 
 /// Spawn a recovery for a tracked recording, seeded from its stored broadcast id +

@@ -244,6 +244,7 @@ impl AppCore {
             self.video_speed.clone(),
             self.active_chats.clone(),
             self.shutdown.clone(),
+            manual_tx.clone(),
             ctx,
             self.ad_active.clone(),
             max_concurrent,

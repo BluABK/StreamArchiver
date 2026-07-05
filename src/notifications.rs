@@ -224,6 +224,31 @@ fn handle(store: &Store, ev: AppEvent) {
             };
             (content, meta)
         }
+        AppEvent::VodMuted { recording_id, channel, muted_secs } => {
+            let mins = muted_secs / 60;
+            let dur = if mins > 0 { format!("{mins} min") } else { format!("{muted_secs}s") };
+            let content = ToastContent::text(
+                "VOD is DMCA-muted".to_string(),
+                format!(
+                    "{channel}'s published VOD has {dur} of muted content — recovering the audio; \
+                     the live recording is kept."
+                ),
+            );
+            let mid = store
+                .monitor_id_for_recording(recording_id)
+                .ok()
+                .flatten()
+                .map(|(mid, _)| mid);
+            let meta = NotifMeta {
+                kind: NotificationKind::VodMuted,
+                severity: "error",
+                monitor_id: mid,
+                channel,
+                recording_id: Some(recording_id),
+                ref_key: format!("vodmuted:{recording_id}"),
+            };
+            (content, meta)
+        }
         AppEvent::Error { context, message } => {
             let content = ToastContent::text(
                 "StreamArchiver error".to_string(),

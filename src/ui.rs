@@ -204,6 +204,9 @@ struct ChannelForm {
     name: String,
     /// Hex color string (e.g. `"#ff9800"` or `"ff9800"`). Empty = auto palette.
     color: String,
+    /// Post-stream VOD-download overrides for this channel (`None` = inherit global).
+    vod_download: Option<bool>,
+    vod_replace: Option<bool>,
 }
 
 /// Backing state for the add/edit dialog. `name` is the channel (container) name;
@@ -254,6 +257,10 @@ struct MonitorForm {
     /// Platform the tool/detection defaults were last set for; a URL change to a
     /// different platform re-applies that platform's defaults.
     last_platform: Option<Platform>,
+    /// Post-stream VOD-download overrides for this instance (`None` = inherit the
+    /// channel/global default). Loaded from / saved to the monitor scope map.
+    vod_download: Option<bool>,
+    vod_replace: Option<bool>,
 }
 
 impl MonitorForm {
@@ -292,6 +299,8 @@ impl MonitorForm {
             sabr_codec_pref: SabrCodecPref::Inherit,
             sabr_codec_custom: String::new(),
             last_platform: None,
+            vod_download: None,
+            vod_replace: None,
         }
     }
 
@@ -326,6 +335,9 @@ impl MonitorForm {
             sabr_codec_custom: m.sabr_codec_custom.clone(),
             // Don't override the saved tool/detection just because the form opened.
             last_platform: Some(m.platform()),
+            // Overridden by the caller from the monitor scope map (needs the store).
+            vod_download: None,
+            vod_replace: None,
         }
     }
 
@@ -363,8 +375,28 @@ impl MonitorForm {
             sabr_codec_pref: SabrCodecPref::Inherit,
             sabr_codec_custom: String::new(),
             last_platform: None,
+            vod_download: None,
+            vod_replace: None,
         }
     }
+}
+
+/// A three-state **Inherit / On / Off** dropdown for an `Option<bool>` override
+/// (`None` = inherit the level above). Returns the combo's response for hovers.
+fn tristate_combo(ui: &mut egui::Ui, id: &str, value: &mut Option<bool>) -> egui::Response {
+    let text = match value {
+        None => "Inherit",
+        Some(true) => "On",
+        Some(false) => "Off",
+    };
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(text)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(value, None, "Inherit");
+            ui.selectable_value(value, Some(true), "On");
+            ui.selectable_value(value, Some(false), "Off");
+        })
+        .response
 }
 
 /// Backing state for the always-visible "download a video" form on the Videos tab.
@@ -550,6 +582,11 @@ struct SettingsForm {
     recovery_quality: String,
     /// Concurrent-HEAD cap for the CDN probes (empty = default 8).
     recovery_max_conc: String,
+    // --- Post-stream VOD download (global defaults for the 3-level chain) ---
+    /// Download the platform's published VOD after a stream ends (alongside).
+    vod_dl_enabled: bool,
+    /// Replace the live recording with the VOD when the download succeeds.
+    vod_dl_replace: bool,
 }
 
 /// Background load state of an import fetch (followed/subscriptions).
@@ -664,6 +701,9 @@ pub struct StreamArchiverApp {
     /// most commonly because the filename overflowed the filesystem's length
     /// limit. Distinct from issues_recs (a `.ts` awaiting a remux).
     issues_stuck: Vec<crate::models::Recording>,
+    /// Recordings whose published VOD came back DMCA-muted (post-stream archive) —
+    /// un-muted via recovery, awaiting acknowledgement.
+    issues_muted_vod: Vec<crate::models::MutedVodIssue>,
     /// In-flight background load of missing-output-file recordings (spawned off
     /// the UI thread because `path.exists()` can block on network/slow drives).
     issues_missing_load: Option<std::sync::mpsc::Receiver<Vec<crate::models::Recording>>>,
@@ -1139,6 +1179,8 @@ impl StreamArchiverApp {
             recovery_cdn_hosts: setting_or_empty(&core, crate::recovery::K_RECOVERY_CDN_HOSTS),
             recovery_quality: setting_or_empty(&core, crate::recovery::K_RECOVERY_QUALITY),
             recovery_max_conc: setting_or_empty(&core, crate::recovery::K_RECOVERY_MAX_CONC),
+            vod_dl_enabled: setting_or_empty(&core, crate::vod_archive::K_VOD_DL_ENABLED) == "1",
+            vod_dl_replace: setting_or_empty(&core, crate::vod_archive::K_VOD_DL_REPLACE) == "1",
         };
         // Apply the loaded date format + short-timestamp pattern before the first render.
         set_active_date_fmt(settings.date_fmt);
@@ -1253,6 +1295,7 @@ impl StreamArchiverApp {
             issues_errors: Vec::new(),
             issues_errors_no_file: Vec::new(),
             issues_stuck: Vec::new(),
+            issues_muted_vod: Vec::new(),
             issues_missing_load: None,
             issues_refreshed: None,
             issues_confirm_clear: false,
@@ -1867,6 +1910,10 @@ impl StreamArchiverApp {
             sabr_codec_custom: form.sabr_codec_custom.trim().to_string(),
         };
         let monitor_id = form.monitor_id;
+        let vod_scope = crate::vod_archive::VodArchiveScope {
+            download: form.vod_download,
+            replace: form.vod_replace,
+        };
 
         // Close the form immediately so the UI stays responsive while the DB
         // work runs. On a background-thread error the status bar shows the error;
@@ -1889,12 +1936,14 @@ impl StreamArchiverApp {
                     };
                     let mut m = monitor;
                     m.channel_id = channel_id;
-                    match monitor_id {
-                        Some(_) => store.update_monitor(&m).map_err(|e| e.to_string())?,
-                        None => {
-                            store.insert_monitor(&m).map_err(|e| e.to_string())?;
+                    let mid = match monitor_id {
+                        Some(id) => {
+                            store.update_monitor(&m).map_err(|e| e.to_string())?;
+                            id
                         }
-                    }
+                        None => store.insert_monitor(&m).map_err(|e| e.to_string())?,
+                    };
+                    let _ = crate::vod_archive::save_monitor_vod_scope(&store, mid, &vod_scope);
                     let rows = store.list_monitors_with_channels().map_err(|e| e.to_string())?;
                     let next_streams =
                         store.next_scheduled_streams(now_unix()).map_err(|e| e.to_string())?;
@@ -2161,6 +2210,8 @@ impl StreamArchiverApp {
             (crate::recovery::K_RECOVERY_CDN_HOSTS, s.recovery_cdn_hosts.trim()),
             (crate::recovery::K_RECOVERY_QUALITY, s.recovery_quality.trim()),
             (crate::recovery::K_RECOVERY_MAX_CONC, s.recovery_max_conc.trim()),
+            (crate::vod_archive::K_VOD_DL_ENABLED, if s.vod_dl_enabled { "1" } else { "0" }),
+            (crate::vod_archive::K_VOD_DL_REPLACE, if s.vod_dl_replace { "1" } else { "0" }),
         ];
         for (k, v) in pairs {
             if let Err(e) = self.core.store.set_setting(k, v) {
@@ -5639,7 +5690,8 @@ impl eframe::App for StreamArchiverApp {
                             let quota_warnings = self.active_quota_warnings();
                             let n = self.issues_recs.len() + self.issues_missing.len()
                                 + self.issues_errors.len() + self.issues_errors_no_file.len()
-                                + self.issues_stuck.len() + quota_warnings.len();
+                                + self.issues_stuck.len() + self.issues_muted_vod.len()
+                                + quota_warnings.len();
                             let label = if n > 0 {
                                 format!("⚠ Issues ({})", n)
                             } else {
@@ -5721,6 +5773,8 @@ impl eframe::App for StreamArchiverApp {
                                     id: None,
                                     name: String::new(),
                                     color: String::new(),
+                                    vod_download: None,
+                                    vod_replace: None,
                                 });
                             }
                             if ui
@@ -5809,6 +5863,8 @@ impl eframe::App for StreamArchiverApp {
                 id: None,
                 name: String::new(),
                 color: String::new(),
+                vod_download: None,
+                vod_replace: None,
             });
         }
         if ctx_refresh_schedule {
@@ -5927,7 +5983,11 @@ impl StreamArchiverApp {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
                 if let Some(id) = self.selected_monitor {
                     if let Some(idx) = self.rows.iter().position(|r| r.monitor.id == id) {
-                        self.form = Some(MonitorForm::from_existing(&self.rows[idx]));
+                        let mut mf = MonitorForm::from_existing(&self.rows[idx]);
+                        let sc = crate::vod_archive::load_monitor_vod_scope(&self.core.store, self.rows[idx].monitor.id);
+                        mf.vod_download = sc.download;
+                        mf.vod_replace = sc.replace;
+                        self.form = Some(mf);
                     }
                 }
             }
@@ -6217,6 +6277,22 @@ impl StreamArchiverApp {
                                 }
                             });
                             ui.end_row();
+
+                            ui.label("Download VOD after end");
+                            tristate_combo(ui, "chform_vod_download", &mut f.vod_download)
+                                .on_hover_text(
+                                    "Post-stream VOD download for every instance in this channel. \
+                                     Inherit follows the global default (Settings).",
+                                );
+                            ui.end_row();
+
+                            ui.label("Replace with VOD");
+                            tristate_combo(ui, "chform_vod_replace", &mut f.vod_replace)
+                                .on_hover_text(
+                                    "Replace the live recording with the VOD on success (never for \
+                                     a muted Twitch VOD). Inherit follows the global default.",
+                                );
+                            ui.end_row();
                         });
                     if !renaming {
                         ui.label(
@@ -6248,16 +6324,26 @@ impl StreamArchiverApp {
             } else {
                 let id_opt = f.id;
                 let color = f.color.trim().to_string();
+                let vod_scope = crate::vod_archive::VodArchiveScope {
+                    download: f.vod_download,
+                    replace: f.vod_replace,
+                };
                 let res = match id_opt {
                     Some(id) => self
                         .core
                         .store
                         .rename_channel(id, &name)
-                        .and_then(|()| self.core.store.set_channel_color(id, &color)),
-                    None => self.core.store.create_container(&name).map(|_| ()),
+                        .and_then(|()| self.core.store.set_channel_color(id, &color))
+                        .map(|()| id),
+                    None => self.core.store.create_container(&name),
                 };
                 match res {
-                    Ok(()) => {
+                    Ok(cid) => {
+                        let _ = crate::vod_archive::save_channel_vod_scope(
+                            &self.core.store,
+                            cid,
+                            &vod_scope,
+                        );
                         self.status = "Saved.".into();
                         self.channel_form = None;
                         // A rename changes the asset-dir path these name-derived
@@ -10534,6 +10620,7 @@ impl StreamArchiverApp {
         let mut delete_recording: Option<i64> = None;
         let mut open_recording_props: Option<i64> = None;
         let mut open_recover_take: Option<i64> = None;
+        let mut archive_vod_now: Option<i64> = None;
         // Container-level actions.
         let mut toggle_channel_enabled: Option<(i64, bool)> = None; // set all instances
         let mut rename_channel: Option<i64> = None;
@@ -11705,6 +11792,40 @@ impl StreamArchiverApp {
                                                     }
                                                     _ => {}
                                                 }
+                                                // Post-stream published-VOD download badge.
+                                                match t.vod_dl_state.as_deref() {
+                                                    Some("downloading") => {
+                                                        ui.colored_label(
+                                                            egui::Color32::from_rgb(80, 160, 220),
+                                                            "📼 VOD…",
+                                                        ).on_hover_text("Downloading the published VOD — see the Videos tab.");
+                                                    }
+                                                    Some("archived") => {
+                                                        ui.colored_label(
+                                                            egui::Color32::from_rgb(70, 180, 90),
+                                                            "📼 VOD",
+                                                        ).on_hover_text("The published VOD was downloaded alongside — right-click → Open downloaded VOD.");
+                                                    }
+                                                    Some("replaced") => {
+                                                        ui.colored_label(
+                                                            egui::Color32::from_rgb(70, 180, 90),
+                                                            "📼 replaced",
+                                                        ).on_hover_text("The live capture was replaced by the published VOD.");
+                                                    }
+                                                    Some("muted") => {
+                                                        ui.colored_label(
+                                                            egui::Color32::from_rgb(220, 120, 30),
+                                                            "✂ muted VOD",
+                                                        ).on_hover_text("The published VOD is DMCA-muted — un-muting via recovery; see the Issues panel.");
+                                                    }
+                                                    Some("failed") => {
+                                                        ui.colored_label(
+                                                            egui::Color32::from_rgb(200, 90, 90),
+                                                            "📼 VOD failed",
+                                                        ).on_hover_text("The published-VOD download failed — right-click → Download VOD now to retry.");
+                                                    }
+                                                    _ => {}
+                                                }
                                                 // In-progress / needs-attention badges
                                                 let needs_remux = t.output_path.ends_with(".ts")
                                                     && t.output_path.contains(".cache");
@@ -11901,6 +12022,26 @@ impl StreamArchiverApp {
                                                 ui.close();
                                             }
                                         }
+                                        // Post-stream published-VOD download (manual trigger / open).
+                                        if t.stream_id.is_some()
+                                            && ui
+                                                .button("📥  Download VOD now")
+                                                .on_hover_text("Download the platform's published VOD for this recording now (also retries a failed archive).")
+                                                .clicked()
+                                        {
+                                            archive_vod_now = Some(t.id);
+                                            ui.close();
+                                        }
+                                        if let Some(vp) = t.vod_dl_path.as_ref().filter(|p| !p.is_empty()) {
+                                            let vp_ok = std::path::Path::new(vp).is_file();
+                                            if ui
+                                                .add_enabled(vp_ok, egui::Button::new("📼  Open downloaded VOD"))
+                                                .clicked()
+                                            {
+                                                open_path = Some(std::path::PathBuf::from(vp));
+                                                ui.close();
+                                            }
+                                        }
                                         if ui
                                             .add_enabled(
                                                 !t.output_path.is_empty(),
@@ -11989,6 +12130,10 @@ impl StreamArchiverApp {
         if let Some(rec_id) = open_recover_take {
             self.open_recover_vod_from_seed(rec_id);
         }
+        if let Some(rec_id) = archive_vod_now {
+            self.core.manual(ManualCommand::ArchiveVodNow(rec_id));
+            self.status = "Downloading published VOD…".into();
+        }
         // Next stream double-click: a channel/stream/take row sets the local; an
         // instance row routes through RowActions.
         if let Some(mid) = open_schedule_popup.or(acts.open_schedule) {
@@ -12018,7 +12163,11 @@ impl StreamArchiverApp {
         }
         if let Some(mid) = acts.edit {
             if let Some(r) = self.rows.iter().find(|r| r.monitor.id == mid) {
-                self.form = Some(MonitorForm::from_existing(r));
+                let mut mf = MonitorForm::from_existing(r);
+                let sc = crate::vod_archive::load_monitor_vod_scope(&self.core.store, r.monitor.id);
+                mf.vod_download = sc.download;
+                mf.vod_replace = sc.replace;
+                self.form = Some(mf);
             }
         }
         if let Some(mid) = acts.properties {
@@ -12066,10 +12215,13 @@ impl StreamArchiverApp {
         }
         if let Some(cid) = rename_channel {
             if let Some(c) = self.channels.iter().find(|c| c.id == cid) {
+                let sc = crate::vod_archive::load_channel_vod_scope(&self.core.store, cid);
                 self.channel_form = Some(ChannelForm {
                     id: Some(cid),
                     name: c.name.clone(),
                     color: c.color.clone(),
+                    vod_download: sc.download,
+                    vod_replace: sc.replace,
                 });
             }
         }
@@ -14152,6 +14304,30 @@ impl StreamArchiverApp {
                     ui.end_row();
                 });
 
+            // ── Post-stream VOD download ────────────────────────────────────────
+            ui.add_space(12.0);
+            ui.heading("Post-stream VOD download 📼");
+            ui.label(
+                "After a stream ends, download the platform's published (post-processed) VOD — \
+                 Twitch/YouTube/Kick — alongside the live recording. These are the GLOBAL \
+                 defaults; override per-channel (channel Properties) or per-instance (edit \
+                 instance). A muted Twitch VOD is un-muted via recovery and never replaces the \
+                 live copy.",
+            );
+            ui.add_space(6.0);
+            ui.checkbox(
+                &mut self.settings.vod_dl_enabled,
+                "Download the published VOD after a stream ends",
+            );
+            ui.checkbox(
+                &mut self.settings.vod_dl_replace,
+                "Replace the live recording with the VOD when the download succeeds",
+            )
+            .on_hover_text(
+                "Only when the download succeeds and (Twitch) the VOD isn't DMCA-muted. The live \
+                 recording's chat/thumbnail sidecars are kept.",
+            );
+
             // ── Twitch VOD recovery ────────────────────────────────────────────
             ui.add_space(12.0);
             ui.heading("Twitch VOD recovery 🛟");
@@ -15544,6 +15720,7 @@ impl StreamArchiverApp {
             // Both queries are small and fast — run them synchronously.
             self.issues_recs = self.core.store.recordings_needing_remux().unwrap_or_default();
             self.issues_stuck = self.core.store.recordings_stuck_in_cache().unwrap_or_default();
+            self.issues_muted_vod = self.core.store.recordings_muted_vod_unresolved().unwrap_or_default();
             // Partition errors: those whose output file is gone from disk go to
             // issues_errors_no_file (treated as missing), the rest stay in issues_errors.
             let all_errors = self.core.store.recordings_with_errors().unwrap_or_default();
@@ -15622,6 +15799,10 @@ impl StreamArchiverApp {
             ConfirmClear,
             ClearAll,
             DismissWarning(String),
+            OpenMutedLive(usize),
+            OpenMutedRecovered(usize),
+            RerunMuted(usize),
+            DismissMuted(usize),
         }
         let mut act: Option<Act> = None;
         // Persisted column order/visibility, taken as a local copy (mutated by
@@ -15678,8 +15859,53 @@ impl StreamArchiverApp {
                     if !quota_warnings.is_empty() {
                         ui.separator();
                     }
+                    // ── DMCA-muted published VODs ────────────────────────────────
+                    if !self.issues_muted_vod.is_empty() {
+                        ui.label(
+                            egui::RichText::new("✂ DMCA-muted VODs (live recording kept)").strong(),
+                        );
+                        for (i, m) in self.issues_muted_vod.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                let mins = (m.muted_secs / 60).max(1);
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(220, 120, 30),
+                                    format!("{} — ~{mins} min muted", m.channel),
+                                );
+                                let live_ok =
+                                    !m.output_path.is_empty() && std::path::Path::new(&m.output_path).is_file();
+                                if ui
+                                    .add_enabled(live_ok, egui::Button::new("▶ Open live recording"))
+                                    .clicked()
+                                {
+                                    act = Some(Act::OpenMutedLive(i));
+                                }
+                                let rec = m.recovered_path.as_deref().unwrap_or("");
+                                let rec_ok = !rec.is_empty() && std::path::Path::new(rec).is_file();
+                                if ui
+                                    .add_enabled(rec_ok, egui::Button::new("📼 Open recovered VOD"))
+                                    .clicked()
+                                {
+                                    act = Some(Act::OpenMutedRecovered(i));
+                                }
+                                if ui.button("♻ Re-run recovery").clicked() {
+                                    act = Some(Act::RerunMuted(i));
+                                }
+                                if ui
+                                    .button("✓ Keep live / dismiss")
+                                    .on_hover_text("Acknowledge — the live recording has the full audio.")
+                                    .clicked()
+                                {
+                                    act = Some(Act::DismissMuted(i));
+                                }
+                                if let Some(state) = m.recovery_state.as_deref() {
+                                    ui.weak(format!("recovery: {state}"));
+                                }
+                            });
+                        }
+                        ui.separator();
+                    }
                     ui.horizontal(|ui| {
-                        ui.label(format!("{} recording(s) need attention", self.issues_recs.len() + n_missing + n_errors + n_stuck));
+                        ui.label(format!("{} recording(s) need attention", self.issues_recs.len() + n_missing + n_errors + n_stuck + self.issues_muted_vod.len()));
                         if ui.button("⟳ Refresh").clicked() {
                             self.issues_refreshed = None;
                         }
@@ -16312,6 +16538,35 @@ impl StreamArchiverApp {
         if let Some(Act::DismissWarning(ref key)) = act {
             self.dismissed_quota_warnings.insert(key.clone());
         }
+        if let Some(Act::OpenMutedLive(i)) = act
+            && let Some(p) = self
+                .issues_muted_vod
+                .get(i)
+                .map(|m| m.output_path.clone())
+                .filter(|p| !p.is_empty())
+        {
+            open_path(std::path::Path::new(&p));
+        }
+        if let Some(Act::OpenMutedRecovered(i)) = act
+            && let Some(rp) = self
+                .issues_muted_vod
+                .get(i)
+                .and_then(|m| m.recovered_path.clone())
+                .filter(|p| !p.is_empty())
+        {
+            open_path(std::path::Path::new(&rp));
+        }
+        if let Some(Act::RerunMuted(i)) = act
+            && let Some(rec_id) = self.issues_muted_vod.get(i).map(|m| m.rec_id)
+        {
+            self.open_recover_vod_from_seed(rec_id);
+        }
+        if let Some(Act::DismissMuted(i)) = act
+            && let Some(rec_id) = self.issues_muted_vod.get(i).map(|m| m.rec_id)
+        {
+            let _ = self.core.store.recording_vod_dl_acknowledge(rec_id);
+            self.issues_refreshed = None; // force the list to refresh
+        }
         if let Some(Act::RemuxError(k)) = act {
             if let Some(rec) = self.issues_errors.get(k) {
                 let dest = std::path::Path::new(&rec.output_path)
@@ -16613,6 +16868,23 @@ impl StreamArchiverApp {
                              ad-break hard cuts. For Twitch with a connected account, sub \
                              status is also detected automatically.",
                         );
+                        ui.end_row();
+
+                        ui.label("Download VOD after end");
+                        tristate_combo(ui, "form_vod_download", &mut form.vod_download)
+                            .on_hover_text(
+                                "Download the platform's published VOD after this instance's \
+                                 stream ends. Inherit follows the channel, then the global default.",
+                            );
+                        ui.end_row();
+
+                        ui.label("Replace with VOD");
+                        tristate_combo(ui, "form_vod_replace", &mut form.vod_replace)
+                            .on_hover_text(
+                                "Replace the live recording with the downloaded VOD when it \
+                                 succeeds (never for a muted Twitch VOD). Inherit follows the \
+                                 channel, then the global default.",
+                            );
                         ui.end_row();
 
                         ui.label("Enabled");
@@ -21027,6 +21299,9 @@ mod tests {
             vod_muted_secs: None,
             recovery_state: None,
             recovered_path: None,
+            vod_dl_state: None,
+            vod_dl_path: None,
+            vod_dl_video_id: None,
         }
     }
 

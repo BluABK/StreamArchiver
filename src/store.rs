@@ -33,7 +33,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 41;
+const SCHEMA_VERSION: i64 = 42;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -232,6 +232,13 @@ impl Drop for DbGuard<'_> {
         }
     }
 }
+
+/// `(channel_id, monitor_id, live output_path, muted_secs)` — the archive-replace
+/// decision inputs for a recording.
+type VodReplaceInfo = (i64, i64, String, Option<i64>);
+/// `(monitor_url, vod_id, stream_id, went_live_at)` — inputs to resolve a
+/// recording's published-VOD URL for a manual "download VOD now".
+type VodArchiveNowInfo = (String, Option<String>, Option<String>, Option<i64>);
 
 impl Store {
     /// Acquire the DB connection. Logs a warning when contention caused a wait
@@ -900,7 +907,18 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 41)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 41);
+        if version < 42 {
+            // Post-stream published-VOD download ("archive the VOD after end").
+            // Tracks the download job on the recording take, parallel to the
+            // recovery columns. NULL = not attempted.
+            conn.execute_batch(
+                "ALTER TABLE recording ADD COLUMN vod_dl_state    TEXT;
+                 ALTER TABLE recording ADD COLUMN vod_dl_path     TEXT;
+                 ALTER TABLE recording ADD COLUMN vod_dl_video_id INTEGER;",
+            )?;
+            conn.pragma_update(None, "user_version", 42)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 42);
         Ok(())
     }
 
@@ -1782,6 +1800,112 @@ impl Store {
             params![id, path, state],
         )?;
         Ok(())
+    }
+
+    // ----- post-stream published-VOD download ("archive the VOD after end") -----
+
+    /// Set the archive-download state + link the download job (`video.id`).
+    pub fn set_recording_vod_dl(&self, id: i64, state: &str, video_id: Option<i64>) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE recording SET vod_dl_state=?2, vod_dl_video_id=?3 WHERE id=?1",
+            params![id, state, video_id],
+        )?;
+        Ok(())
+    }
+
+    /// Record a downloaded published VOD file with a terminal archive state
+    /// (`archived`/`replaced`).
+    pub fn set_recording_vod_archived(&self, id: i64, path: &str, state: &str) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE recording SET vod_dl_path=?2, vod_dl_state=?3 WHERE id=?1",
+            params![id, path, state],
+        )?;
+        Ok(())
+    }
+
+    /// Which recording (if any) an archive-download job belongs to.
+    pub fn recording_for_vod_video(&self, video_id: i64) -> Result<Option<i64>> {
+        let conn = self.db();
+        let id = conn
+            .query_row(
+                "SELECT id FROM recording WHERE vod_dl_video_id = ?1",
+                params![video_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?;
+        Ok(id)
+    }
+
+    /// Resolve a muted-VOD issue (Issues panel "Dismiss"/"Keep live recording").
+    pub fn recording_vod_dl_acknowledge(&self, id: i64) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE recording SET vod_dl_state='acknowledged' WHERE id=?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// `(monitor_url, vod_id, stream_id, went_live_at)` for a manual "download VOD
+    /// now" — enough to resolve the published-VOD URL per platform.
+    pub fn recording_archive_now(&self, rec_id: i64) -> Result<Option<VodArchiveNowInfo>> {
+        let conn = self.db();
+        let row = conn
+            .query_row(
+                "SELECT m.url, r.vod_id, r.stream_id, r.went_live_at
+                 FROM recording r JOIN monitor m ON m.id = r.monitor_id
+                 WHERE r.id = ?1",
+                params![rec_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// `(channel_id, monitor_id, live output_path, muted_secs)` for a recording —
+    /// what the archive-completion hook needs to decide/perform a replace.
+    pub fn recording_replace_info(&self, rec_id: i64) -> Result<Option<VodReplaceInfo>> {
+        let conn = self.db();
+        let row = conn
+            .query_row(
+                "SELECT m.channel_id, r.monitor_id, COALESCE(r.output_path, ''), r.vod_muted_secs
+                 FROM recording r JOIN monitor m ON m.id = r.monitor_id
+                 WHERE r.id = ?1",
+                params![rec_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Recordings whose published VOD was DMCA-muted and not yet acknowledged —
+    /// the muted-VOD category of the Issues panel.
+    pub fn recordings_muted_vod_unresolved(&self) -> Result<Vec<crate::models::MutedVodIssue>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT r.id, c.name, COALESCE(r.output_path, ''), r.recovered_path, r.recovery_state,
+                    COALESCE(r.vod_muted_secs, 0)
+             FROM recording r
+             JOIN monitor m ON m.id = r.monitor_id
+             JOIN channel c ON c.id = m.channel_id
+             WHERE r.vod_dl_state = 'muted'
+             ORDER BY COALESCE(r.went_live_at, r.started_at) DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(crate::models::MutedVodIssue {
+                    rec_id: r.get(0)?,
+                    channel: r.get(1)?,
+                    output_path: r.get(2)?,
+                    recovered_path: r.get(3)?,
+                    recovery_state: r.get(4)?,
+                    muted_secs: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Fields needed to build a recovery for one recording (login derived from the
@@ -2708,7 +2832,8 @@ impl Store {
                               ORDER BY smc.at_secs DESC, smc.id DESC LIMIT 1), ''),
                     take_group, COALESCE(notes, ''),
                     vod_id, vod_state, vod_muted_secs,
-                    recovery_state, recovered_path
+                    recovery_state, recovered_path,
+                    vod_dl_state, vod_dl_path, vod_dl_video_id
              FROM recording WHERE monitor_id = ?1 ORDER BY started_at, id",
         )?;
         let rows = stmt
@@ -2739,6 +2864,9 @@ impl Store {
                     vod_muted_secs: r.get(22)?,
                     recovery_state: r.get(23)?,
                     recovered_path: r.get(24)?,
+                    vod_dl_state: r.get(25)?,
+                    vod_dl_path: r.get(26)?,
+                    vod_dl_video_id: r.get(27)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2787,6 +2915,9 @@ impl Store {
                     vod_muted_secs: None,
                     recovery_state: None,
                     recovered_path: None,
+                    vod_dl_state: None,
+                    vod_dl_path: None,
+                    vod_dl_video_id: None,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2840,6 +2971,9 @@ impl Store {
                     vod_muted_secs: None,
                     recovery_state: None,
                     recovered_path: None,
+                    vod_dl_state: None,
+                    vod_dl_path: None,
+                    vod_dl_video_id: None,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2915,6 +3049,9 @@ impl Store {
                     vod_muted_secs: None,
                     recovery_state: None,
                     recovered_path: None,
+                    vod_dl_state: None,
+                    vod_dl_path: None,
+                    vod_dl_video_id: None,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2981,6 +3118,9 @@ impl Store {
                     vod_muted_secs: None,
                     recovery_state: None,
                     recovered_path: None,
+                    vod_dl_state: None,
+                    vod_dl_path: None,
+                    vod_dl_video_id: None,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3163,6 +3303,9 @@ impl Store {
                     vod_muted_secs: None,
                     recovery_state: None,
                     recovered_path: None,
+                    vod_dl_state: None,
+                    vod_dl_path: None,
+                    vod_dl_video_id: None,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

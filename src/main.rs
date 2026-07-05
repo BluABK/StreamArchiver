@@ -30,6 +30,7 @@ mod scheduler;
 mod store;
 mod ui;
 mod version;
+mod vod_archive;
 mod watchdog;
 mod websub;
 

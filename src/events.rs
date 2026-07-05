@@ -170,6 +170,14 @@ pub enum AppEvent {
     RecordingUpdated {
         recording_id: i64,
     },
+    /// A recording's published Twitch VOD came back DMCA-muted: the post-stream
+    /// archive feature ran recovery instead of a plain download and never replaces
+    /// the live capture. Surfaced as a toast + an Issues-panel entry.
+    VodMuted {
+        recording_id: i64,
+        channel: String,
+        muted_secs: i64,
+    },
     Error {
         context: String,
         message: String,
@@ -335,4 +343,7 @@ pub enum ManualCommand {
     /// Harvest current Twitch CDN hosts from published VODs (via GQL) and persist
     /// any newly-seen ones, keeping the recovery host list current.
     RefreshCdnHosts,
+    /// Download the published VOD for a recording now (manual trigger / retry of the
+    /// post-stream archive feature), by recording id.
+    ArchiveVodNow(i64),
 }
