@@ -10741,6 +10741,8 @@ impl StreamArchiverApp {
         let mut open_recording_props: Option<i64> = None;
         let mut open_recover_take: Option<i64> = None;
         let mut archive_vod_now: Option<i64> = None;
+        // (monitor id, recording id) — "View chat" on a stream/take row.
+        let mut view_chat_rec: Option<(i64, i64)> = None;
         // Container-level actions.
         let mut toggle_channel_enabled: Option<(i64, bool)> = None; // set all instances
         let mut rename_channel: Option<i64> = None;
@@ -11714,6 +11716,29 @@ impl StreamArchiverApp {
                                             play_new_instance_mid = Some(mid);
                                             ui.close();
                                         }
+                                        {
+                                            // Latest take with a chat sidecar drives the
+                                            // stream's chat view.
+                                            let chat_rec = g
+                                                .takes
+                                                .iter()
+                                                .rev()
+                                                .find(|t| chat_file_for_recording(t).is_some())
+                                                .map(|t| t.id);
+                                            if ui
+                                                .add_enabled(
+                                                    chat_rec.is_some(),
+                                                    egui::Button::new("💬  View chat"),
+                                                )
+                                                .on_disabled_hover_text(
+                                                    "No chat log file found for this stream",
+                                                )
+                                                .clicked()
+                                            {
+                                                view_chat_rec = chat_rec.map(|rid| (mid, rid));
+                                                ui.close();
+                                            }
+                                        }
                                         if ui
                                             .add_enabled(
                                                 dir.is_some(),
@@ -12115,6 +12140,19 @@ impl StreamArchiverApp {
                                             open_path = dir.clone();
                                             ui.close();
                                         }
+                                        if ui
+                                            .add_enabled(
+                                                chat_file_for_recording(t).is_some(),
+                                                egui::Button::new("💬  View chat"),
+                                            )
+                                            .on_disabled_hover_text(
+                                                "No chat log file found for this take",
+                                            )
+                                            .clicked()
+                                        {
+                                            view_chat_rec = Some((t.monitor_id, t.id));
+                                            ui.close();
+                                        }
                                         if let Some(vod_url) = t.vod_url() {
                                             if ui.button("🌐  Open VOD").clicked() {
                                                 ui.ctx().open_url(egui::OpenUrl::new_tab(vod_url));
@@ -12387,7 +12425,10 @@ impl StreamArchiverApp {
             self.status = "Re-organizing channel recordings…".into();
         }
         if let Some(mid) = acts.view_chat {
-            self.open_chat_popup(mid, ui.ctx());
+            self.open_chat_popup(mid, None, ui.ctx());
+        }
+        if let Some((mid, rid)) = view_chat_rec {
+            self.open_chat_popup(mid, Some(rid), ui.ctx());
         }
         if let Some(p) = open_path {
             crate::platform::open_path(&p);
@@ -17245,7 +17286,10 @@ impl StreamArchiverApp {
 
     // ── Chat log viewer ──────────────────────────────────────────────────────
 
-    fn open_chat_popup(&mut self, monitor_id: i64, ctx: &egui::Context) {
+    /// Open the chat popup for a monitor. `rec_id` picks a specific recording
+    /// (a take/stream row's "View chat"); `None` falls back to the most recent
+    /// recording that has a chat file.
+    fn open_chat_popup(&mut self, monitor_id: i64, rec_id: Option<i64>, ctx: &egui::Context) {
         let row = self.rows.iter().find(|r| r.monitor.id == monitor_id);
         let monitor_name = row.map(|r| r.channel.name.clone()).unwrap_or_default();
         let platform = row.map(|r| r.monitor.platform());
@@ -17266,10 +17310,9 @@ impl StreamArchiverApp {
             .store
             .recordings_for_monitor(monitor_id)
             .unwrap_or_default();
-        let rec = recs
-            .iter()
-            .rev()
-            .find(|r| chat_file_for_recording(r).is_some())
+        let rec = rec_id
+            .and_then(|id| recs.iter().find(|r| r.id == id))
+            .or_else(|| recs.iter().rev().find(|r| chat_file_for_recording(r).is_some()))
             .or_else(|| recs.last())
             .cloned();
 
