@@ -3668,8 +3668,21 @@ impl Supervisor {
             done.clone(),
         ));
 
+        // Stall watchdog for the adopted process too — a re-attached capture
+        // whose tool wedged after the stream ended would otherwise sit
+        // "recording" with a growing uptime until the app is restarted.
+        let stall = self.spawn_stall_watchdog(
+            row.kind,
+            key,
+            row.pid,
+            PathBuf::from(&row.log_path),
+            PathBuf::from(&row.capture_path),
+            done.clone(),
+        );
+
         let exited = self.wait_for_exit(row.pid).await;
         done.store(true, Ordering::SeqCst);
+        stall.abort();
         watcher_done.store(true, Ordering::SeqCst);
         let _ = tail.await;
         if let Some(t) = ad_task {
@@ -3690,6 +3703,79 @@ impl Supervisor {
     /// Block until `pid` truly exits, returning false if shutdown was requested
     /// first. Re-checks liveness after each wait so a spurious `WaitForSingleObject`
     /// failure can't trigger a premature finalize while the tool is still writing.
+    /// Kill a capture/download whose output has completely stopped changing.
+    ///
+    /// Recovery for tools that wedge instead of exiting — yt-dlp hanging at the
+    /// live edge after a stream ends, streamlink on a dead HLS session, a stuck
+    /// VOD download. Without this, `child.wait()` / `wait_for_exit` blocks
+    /// forever and the row shows "recording"/"live" with a growing uptime for
+    /// hours after the stream ended.
+    ///
+    /// Every 60s it samples an activity signature — the log file's handle size
+    /// plus the handle sizes of every capture-stem file in the capture dir
+    /// (covers SABR `.part` files and ffmpeg merge temps; handle sizes because
+    /// NTFS dir entries are stale for open files). If NOTHING changes for
+    /// [`STALL_KILL_SECS`], it marks the id via the same stop-tombstone a user
+    /// stop uses (so classification lands on completed/stopped — never a bogus
+    /// "completed" for a truncated VOD download) and kills the process tree;
+    /// the normal wait → finalize path then runs. If the channel is actually
+    /// still live, the next detection poll simply starts a fresh take.
+    fn spawn_stall_watchdog(
+        &self,
+        kind: DetachedKind,
+        key: i64,
+        pid: u32,
+        log_path: PathBuf,
+        capture_path: PathBuf,
+        done: Arc<AtomicBool>,
+    ) -> tokio::task::JoinHandle<()> {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let mut last_sig = u64::MAX;
+            let mut last_change = Instant::now();
+            loop {
+                crate::app_core::sleep_cancellable(Duration::from_secs(60), &this.shutdown).await;
+                if done.load(Ordering::SeqCst) || this.shutdown.load(Ordering::SeqCst) {
+                    return;
+                }
+                let sig = stall_signature(&log_path, &capture_path).await;
+                if sig != last_sig {
+                    last_sig = sig;
+                    last_change = Instant::now();
+                    continue;
+                }
+                if last_change.elapsed() < Duration::from_secs(STALL_KILL_SECS) {
+                    continue;
+                }
+                warn!(
+                    ?kind,
+                    key,
+                    pid,
+                    "no output for {} min — killing stalled process tree",
+                    STALL_KILL_SECS / 60
+                );
+                match kind {
+                    DetachedKind::Video => {
+                        this.stopping_videos.lock().unwrap().insert(key);
+                    }
+                    DetachedKind::Recording => {
+                        this.stopping_monitors.lock().unwrap().insert(key);
+                    }
+                    DetachedKind::Chat => {}
+                }
+                let _ = this.events.send(AppEvent::Error {
+                    context: "Stall watchdog".into(),
+                    message: format!(
+                        "Download produced no output for {} minutes — stopping the stuck process (pid {pid}) and finalizing.",
+                        STALL_KILL_SECS / 60
+                    ),
+                });
+                crate::platform::kill_process_tree(pid);
+                return;
+            }
+        })
+    }
+
     async fn wait_for_exit(&self, pid: u32) -> bool {
         loop {
             let shutdown = self.shutdown.clone();
@@ -4446,11 +4532,24 @@ impl Supervisor {
             done.clone(),
         ));
 
+        // Stall watchdog: a wedged tool (hung live capture after stream end, a
+        // stuck VOD download) never exits — kill it once output stops so this
+        // wait returns and the normal finalize runs.
+        let stall = self.spawn_stall_watchdog(
+            detach.kind,
+            id,
+            pid,
+            log_path.clone(),
+            plan.capture_path.clone(),
+            done.clone(),
+        );
+
         let status = child.wait().await;
         // The process exited *within this session* (we weren't dropped/detached):
         // let the tailer drain the log to EOF, then the ad processor finish, so
         // every line and ad break is recorded before the caller touches the file.
         done.store(true, Ordering::SeqCst);
+        stall.abort();
         let _ = tail.await;
         if let Some(t) = ad_task {
             let _ = t.await;
@@ -5093,6 +5192,45 @@ async fn file_len(path: &Path) -> u64 {
         .await
         .map(|m| m.len())
         .unwrap_or(0)
+}
+
+/// How long a download's output (log + capture files) may stay completely
+/// unchanged before the stall watchdog kills its process tree. Generous on
+/// purpose: a live capture writes continuously, reconnect attempts produce log
+/// lines, and post-download merges grow stem-sibling temp files — 15 minutes of
+/// total silence means a wedged tool, not a slow one.
+const STALL_KILL_SECS: u64 = 15 * 60;
+
+/// Handle-based file size (0 if missing/unopenable). `fs::metadata` reads the
+/// directory entry, which NTFS updates lazily while a writer holds the file
+/// open — opening the file queries the handle, which is always current.
+async fn open_len(p: &Path) -> u64 {
+    match tokio::fs::File::open(p).await {
+        Ok(f) => f.metadata().await.map(|m| m.len()).unwrap_or(0),
+        Err(_) => 0,
+    }
+}
+
+/// Activity signature for the stall watchdog: the log's size plus the sizes
+/// (and names, to catch file-set changes) of every file in the capture dir
+/// sharing the capture stem — SABR per-format `.part` files, merge temps, the
+/// bare capture itself. Any write anywhere changes the sum.
+async fn stall_signature(log_path: &Path, capture_path: &Path) -> u64 {
+    let mut sig = open_len(log_path).await;
+    if let (Some(dir), Some(stem)) = (capture_path.parent(), capture_path.file_stem()) {
+        let stem = stem.to_string_lossy().into_owned();
+        if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
+            while let Ok(Some(e)) = rd.next_entry().await {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with(&stem) {
+                    sig = sig
+                        .wrapping_add(open_len(&e.path()).await)
+                        .wrapping_add(name.len() as u64);
+                }
+            }
+        }
+    }
+    sig
 }
 
 /// Media duration of `path` in whole seconds via `ffprobe`, or `None` if it
