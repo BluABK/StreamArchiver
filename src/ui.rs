@@ -986,6 +986,8 @@ pub struct StreamArchiverApp {
     /// update the DB (e.g. `last_checked_at`) without emitting an event, so a
     /// slow cadence reload keeps sorted columns correct without F5.
     last_auto_reload: i64,
+    /// TTL cache for per-row filesystem probes (see [`FsProbes`]).
+    fs_probes: FsProbes,
     /// Cached YouTube Data API quota for today and the configured daily cutoff.
     /// Updated by the background reload-rows thread; never read from DB on the
     /// render thread (which would block if the DB mutex is held elsewhere).
@@ -1466,6 +1468,7 @@ impl StreamArchiverApp {
             pending_reload: None,
             reload_queued: false,
             last_auto_reload: now_unix(),
+            fs_probes: FsProbes::default(),
             yt_quota_today: 0,
             yt_quota_cutoff: 9000,
             yt_search_today: 0,
@@ -5727,6 +5730,9 @@ impl eframe::App for StreamArchiverApp {
         if now - self.last_auto_reload >= 30 {
             self.last_auto_reload = now;
             self.spawn_pending_reload();
+            // Bound the probe cache: drop everything so paths for deleted
+            // rows don't accumulate (entries re-fill lazily on render).
+            self.fs_probes.clear();
         }
 
         // Keep repainting at 50ms while a background DB load is in-flight so
@@ -6995,7 +7001,9 @@ impl StreamArchiverApp {
                                                     }
                                                     btns.push(b);
                                                 }
-                                                let dir_ok = std::path::Path::new(&v.output_dir).is_dir();
+                                                let dir_ok = self
+                                                    .fs_probes
+                                                    .is_dir(std::path::Path::new(&v.output_dir));
                                                 let b = ui
                                                     .add_enabled(dir_ok, egui::Button::new("📂").small())
                                                     .on_hover_text("Open output folder");
@@ -7006,7 +7014,9 @@ impl StreamArchiverApp {
                                                 }
                                                 btns.push(b);
                                                 let file_ok = !v.output_path.is_empty()
-                                                    && std::path::Path::new(&v.output_path).is_file();
+                                                    && self
+                                                        .fs_probes
+                                                        .is_file(std::path::Path::new(&v.output_path));
                                                 let b = ui
                                                     .add_enabled(file_ok, egui::Button::new("▶").small())
                                                     .on_hover_text("Open file");
@@ -11418,7 +11428,10 @@ impl StreamArchiverApp {
                                 // can actually play (a dual-capture monitor falls through to
                                 // the DASH companion under non-mpv players); fall back to the
                                 // most recent finished recording's output file.
-                                let inst_stream_target: Option<StreamTarget> =
+                                // Probes go through the TTL cache (`fs_probes`) —
+                                // this runs per row per frame.
+                                let inst_stream_target: Option<StreamTarget> = {
+                                    let fs = &mut self.fs_probes;
                                     groups.get(&mid).and_then(|gs| {
                                         // Active takes first: prefer a target the
                                         // configured player can play (dual capture falls
@@ -11429,7 +11442,7 @@ impl StreamArchiverApp {
                                             .iter()
                                             .flat_map(|g| g.takes.iter())
                                             .filter(|t| t.is_active())
-                                            .filter_map(|t| stream_target_for_active(&t.output_path))
+                                            .filter_map(|t| fs.target(&t.output_path))
                                             .collect();
                                         if let Some(t) = active
                                             .iter()
@@ -11442,7 +11455,7 @@ impl StreamArchiverApp {
                                         for g in gs {
                                             for t in &g.takes {
                                                 if !t.output_path.is_empty()
-                                                    && std::path::Path::new(&t.output_path).is_file()
+                                                    && fs.is_file(std::path::Path::new(&t.output_path))
                                                 {
                                                     return Some(StreamTarget::Finished(
                                                         std::path::PathBuf::from(&t.output_path),
@@ -11451,7 +11464,8 @@ impl StreamArchiverApp {
                                             }
                                         }
                                         None
-                                    });
+                                    })
+                                };
                                 body.row(24.0, |mut tr| {
                                     if render_instance_row(
                                         &mut tr, row, &ptex, now, recording, chat_active,
@@ -11515,9 +11529,10 @@ impl StreamArchiverApp {
                                 // button can explain itself), then any existing output
                                 // file across the takes.
                                 let grp_stream_target: Option<StreamTarget> = {
+                                    let fs = &mut self.fs_probes;
                                     let active: Vec<StreamTarget> = g.takes.iter()
                                         .filter(|t| t.is_active())
-                                        .filter_map(|t| stream_target_for_active(&t.output_path))
+                                        .filter_map(|t| fs.target(&t.output_path))
                                         .collect();
                                     active
                                         .iter()
@@ -11528,7 +11543,7 @@ impl StreamArchiverApp {
                                             g.takes.iter()
                                                 .find(|t| {
                                                     !t.output_path.is_empty()
-                                                        && std::path::Path::new(&t.output_path).is_file()
+                                                        && fs.is_file(std::path::Path::new(&t.output_path))
                                                 })
                                                 .map(|t| StreamTarget::Finished(
                                                     std::path::PathBuf::from(&t.output_path),
@@ -11541,7 +11556,7 @@ impl StreamArchiverApp {
                                         tr.col(|ui| match STREAM_COLUMNS[ci2].id {
                                             "actions" => {
                                                 let ok =
-                                                    dir.as_ref().map(|d| d.is_dir()).unwrap_or(false);
+                                                    dir.as_ref().is_some_and(|d| self.fs_probes.is_dir(d));
                                                 if ui
                                                     .add_enabled(ok, egui::Button::new("📂").small())
                                                     .on_hover_text("Open folder")
@@ -11684,7 +11699,7 @@ impl StreamArchiverApp {
                                     tr.response().context_menu(|ui| {
                                         ui.set_min_width(180.0);
                                         let dir_ok =
-                                            dir.as_ref().map(|d| d.is_dir()).unwrap_or(false);
+                                            dir.as_ref().is_some_and(|d| self.fs_probes.is_dir(d));
                                         if ui
                                             .add_enabled(dir_ok, egui::Button::new("📂  Open folder"))
                                             .clicked()
@@ -11795,7 +11810,7 @@ impl StreamArchiverApp {
                                     .parent()
                                     .map(|p| p.to_path_buf());
                                 let file_ok = !t.output_path.is_empty()
-                                    && std::path::Path::new(&t.output_path).is_file();
+                                    && self.fs_probes.is_file(std::path::Path::new(&t.output_path));
                                 let media_player = self.settings.media_player_path.trim().to_string();
                                 body.row(24.0, |mut tr| {
                                     for &ci2 in &col_order {
@@ -11811,7 +11826,7 @@ impl StreamArchiverApp {
                                                             Some(std::path::PathBuf::from(&t.output_path));
                                                     }
                                                     let stream_target = if t.is_active() {
-                                                        stream_target_for_active(&t.output_path)
+                                                        self.fs_probes.target(&t.output_path)
                                                     } else if file_ok {
                                                         Some(StreamTarget::Finished(
                                                             std::path::PathBuf::from(&t.output_path),
@@ -11857,7 +11872,7 @@ impl StreamArchiverApp {
                                                         play_new_instance_mid = Some(t.monitor_id);
                                                     }
                                                     let dir_ok =
-                                                        dir.as_ref().map(|d| d.is_dir()).unwrap_or(false);
+                                                        dir.as_ref().is_some_and(|d| self.fs_probes.is_dir(d));
                                                     if ui
                                                         .add_enabled(dir_ok, egui::Button::new("📂").small())
                                                         .on_hover_text("Open folder")
@@ -12114,7 +12129,7 @@ impl StreamArchiverApp {
                                         }
                                         {
                                             let stream_target = if t.is_active() {
-                                                stream_target_for_active(&t.output_path)
+                                                self.fs_probes.target(&t.output_path)
                                             } else if file_ok {
                                                 Some(StreamTarget::Finished(
                                                     std::path::PathBuf::from(&t.output_path),
@@ -12163,7 +12178,7 @@ impl StreamArchiverApp {
                                             }
                                         }
                                         let dir_ok =
-                                            dir.as_ref().map(|d| d.is_dir()).unwrap_or(false);
+                                            dir.as_ref().is_some_and(|d| self.fs_probes.is_dir(d));
                                         if ui
                                             .add_enabled(dir_ok, egui::Button::new("📂  Open folder"))
                                             .clicked()
@@ -16074,8 +16089,11 @@ impl StreamArchiverApp {
             .iter()
             .any(|bt| bt.kind == crate::events::BackgroundTaskKind::Remux);
 
+        // Sizes go through the TTL probe cache — this runs every frame while
+        // the Issues window is open.
+        let fs = &mut self.fs_probes;
         let n_empty = self.issues_recs.iter().filter(|r| {
-            std::path::Path::new(&r.output_path).metadata().map(|m| m.len()).unwrap_or(0) == 0
+            fs.len(std::path::Path::new(&r.output_path)) == 0
         }).count();
         let n_missing = self.issues_missing.len();
         let n_errors = self.issues_errors.len();
@@ -16173,8 +16191,8 @@ impl StreamArchiverApp {
                                     egui::Color32::from_rgb(220, 120, 30),
                                     format!("{} — ~{mins} min muted", m.channel),
                                 );
-                                let live_ok =
-                                    !m.output_path.is_empty() && std::path::Path::new(&m.output_path).is_file();
+                                let live_ok = !m.output_path.is_empty()
+                                    && self.fs_probes.is_file(std::path::Path::new(&m.output_path));
                                 if ui
                                     .add_enabled(live_ok, egui::Button::new("▶ Open live recording"))
                                     .clicked()
@@ -16182,7 +16200,8 @@ impl StreamArchiverApp {
                                     act = Some(Act::OpenMutedLive(i));
                                 }
                                 let rec = m.recovered_path.as_deref().unwrap_or("");
-                                let rec_ok = !rec.is_empty() && std::path::Path::new(rec).is_file();
+                                let rec_ok = !rec.is_empty()
+                                    && self.fs_probes.is_file(std::path::Path::new(rec));
                                 if ui
                                     .add_enabled(rec_ok, egui::Button::new("📼 Open recovered VOD"))
                                     .clicked()
@@ -16304,7 +16323,7 @@ impl StreamArchiverApp {
                                     .file_name()
                                     .map(|n| n.to_string_lossy().into_owned())
                                     .unwrap_or_default();
-                                let file_bytes = path.metadata().map(|m| m.len()).unwrap_or(0);
+                                let file_bytes = self.fs_probes.len(path);
                                 let empty = file_bytes == 0;
                                 // Parse the recording mode from "(p <mode>  )" in the filename.
                                 let mode = parse_capture_mode(&fname).unwrap_or_default();
@@ -16450,7 +16469,7 @@ impl StreamArchiverApp {
                                     .file_name()
                                     .map(|n| n.to_string_lossy().into_owned())
                                     .unwrap_or_default();
-                                let file_bytes = path.metadata().map(|m| m.len()).unwrap_or(0);
+                                let file_bytes = self.fs_probes.len(path);
                                 let mode = parse_capture_mode(&fname).unwrap_or_default();
                                 body.row(22.0, |mut row| {
                                     for &ci in &issues_order {
@@ -16637,7 +16656,7 @@ impl StreamArchiverApp {
                                     .map(|(n, p)| (n.as_str(), *p))
                                     .unwrap_or(("?", crate::models::Platform::Generic));
                                 let has_file = !rec.output_path.is_empty()
-                                    && std::path::Path::new(&rec.output_path).exists();
+                                    && self.fs_probes.is_file(std::path::Path::new(&rec.output_path));
                                 let has_ts = rec.output_path.ends_with(".ts");
                                 let path = std::path::Path::new(&rec.output_path);
                                 let fname = if rec.output_path.is_empty() {
@@ -16648,7 +16667,7 @@ impl StreamArchiverApp {
                                         .unwrap_or_else(|| rec.output_path.clone())
                                 };
                                 let file_size = if has_file {
-                                    path.metadata().map(|m| m.len()).unwrap_or(0)
+                                    self.fs_probes.len(path)
                                 } else {
                                     0
                                 };
@@ -19894,6 +19913,85 @@ enum StreamTarget {
 /// SABR growing per-format files only need moderately-sized init data before
 /// they're openable; also filters out the tiny `.state` sidecars (~50 B).
 const SPLIT_AV_MIN_BYTES: u64 = 64 * 1024;
+
+/// How long a cached [`FsProbes`] result stays valid.
+const FS_PROBE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// TTL cache for the per-row filesystem probes the tables re-run every frame
+/// (in-progress capture scans, Open file/folder button enablement). egui
+/// repaints at full refresh rate under mouse movement, and a synchronous
+/// `File::open` / `read_dir` per row per frame stalls the whole frame — badly
+/// on a sleeping HDD or network share, where a single stat can block for
+/// seconds (and every immediate-viewport window shares the frame). Entries
+/// refresh lazily after [`FS_PROBE_TTL`]; `logic()` clears the maps on its
+/// slow background tick so paths for deleted rows don't accumulate.
+#[derive(Default)]
+struct FsProbes {
+    files: HashMap<std::path::PathBuf, (std::time::Instant, bool)>,
+    dirs: HashMap<std::path::PathBuf, (std::time::Instant, bool)>,
+    sizes: HashMap<std::path::PathBuf, (std::time::Instant, u64)>,
+    targets: HashMap<String, (std::time::Instant, Option<StreamTarget>)>,
+}
+
+impl FsProbes {
+    fn is_file(&mut self, p: &std::path::Path) -> bool {
+        Self::cached(&mut self.files, p, |p| p.is_file())
+    }
+
+    fn is_dir(&mut self, p: &std::path::Path) -> bool {
+        Self::cached(&mut self.dirs, p, |p| p.is_dir())
+    }
+
+    /// Cached directory-entry size (fine for finished files); 0 when missing.
+    fn len(&mut self, p: &std::path::Path) -> u64 {
+        let now = std::time::Instant::now();
+        if let Some((at, v)) = self.sizes.get(p)
+            && now.duration_since(*at) < FS_PROBE_TTL
+        {
+            return *v;
+        }
+        let v = p.metadata().map(|m| m.len()).unwrap_or(0);
+        self.sizes.insert(p.to_path_buf(), (now, v));
+        v
+    }
+
+    /// Cached [`stream_target_for_active`] (a `.cache` dir scan plus a
+    /// `File::open` per candidate — by far the heaviest per-row probe).
+    fn target(&mut self, output_path: &str) -> Option<StreamTarget> {
+        let now = std::time::Instant::now();
+        if let Some((at, t)) = self.targets.get(output_path)
+            && now.duration_since(*at) < FS_PROBE_TTL
+        {
+            return t.clone();
+        }
+        let t = stream_target_for_active(output_path);
+        self.targets.insert(output_path.to_string(), (now, t.clone()));
+        t
+    }
+
+    fn cached(
+        map: &mut HashMap<std::path::PathBuf, (std::time::Instant, bool)>,
+        p: &std::path::Path,
+        probe: impl Fn(&std::path::Path) -> bool,
+    ) -> bool {
+        let now = std::time::Instant::now();
+        if let Some((at, v)) = map.get(p)
+            && now.duration_since(*at) < FS_PROBE_TTL
+        {
+            return *v;
+        }
+        let v = probe(p);
+        map.insert(p.to_path_buf(), (now, v));
+        v
+    }
+
+    fn clear(&mut self) {
+        self.files.clear();
+        self.dirs.clear();
+        self.sizes.clear();
+        self.targets.clear();
+    }
+}
 
 /// True current size of a possibly-being-written file, or `None` if it can't
 /// be opened / isn't a file. The size that `fs::metadata` / `read_dir`
