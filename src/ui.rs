@@ -978,6 +978,15 @@ pub struct StreamArchiverApp {
     /// `pending_save` but no write — avoids blocking the UI thread on the store
     /// mutex while a schedule-refresh Tokio task holds it.
     pending_reload: Option<std::sync::mpsc::Receiver<Option<SaveRows>>>,
+    /// A reload was requested while one was already in flight. The in-flight
+    /// thread may have read the DB *before* the change that triggered the new
+    /// request, so drop-and-forget would leave the UI stale (until F5) — run
+    /// one more reload as soon as the current one lands instead.
+    reload_queued: bool,
+    /// Unix time of the last timer-driven background reload. Routine polls
+    /// update the DB (e.g. `last_checked_at`) without emitting an event, so a
+    /// slow cadence reload keeps sorted columns correct without F5.
+    last_auto_reload: i64,
     /// Cached YouTube Data API quota for today and the configured daily cutoff.
     /// Updated by the background reload-rows thread; never read from DB on the
     /// render thread (which would block if the DB mutex is held elsewhere).
@@ -1456,6 +1465,8 @@ impl StreamArchiverApp {
             pending_browse: None,
             pending_save: None,
             pending_reload: None,
+            reload_queued: false,
+            last_auto_reload: now_unix(),
             yt_quota_today: 0,
             yt_quota_cutoff: 9000,
             yt_search_today: 0,
@@ -2089,10 +2100,12 @@ impl StreamArchiverApp {
     /// Spawn a background thread that reads the current rows/channels from the
     /// store without writing anything.  The result is drained by
     /// `drain_pending_reload` inside `logic()`.  If a reload is already in
-    /// flight, the new request is silently dropped (the in-flight one will
-    /// provide up-to-date data).
+    /// flight, one follow-up reload is queued instead (the in-flight thread may
+    /// have read the DB before the change that triggered this request, so
+    /// dropping it could leave the UI stale until the next event).
     fn spawn_pending_reload(&mut self) {
         if self.pending_reload.is_some() {
+            self.reload_queued = true;
             return;
         }
         let store = self.core.store.clone();
@@ -2142,7 +2155,11 @@ impl StreamArchiverApp {
             Ok(Some(save)) => {
                 debug!(rows = save.rows.len(), "reload-rows result installed");
                 self.install_save_rows(save);
-                self.status = "Refreshed.".into();
+                // Only announce explicit refreshes (F5 sets "Refreshing…") —
+                // background event/timer reloads shouldn't stomp the status line.
+                if self.status == "Refreshing…" {
+                    self.status = "Refreshed.".into();
+                }
                 self.pending_reload = None;
             }
             Ok(None) => {
@@ -2155,6 +2172,12 @@ impl StreamArchiverApp {
                 self.pending_reload = None;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        // A request arrived while the (now finished) reload was in flight: its
+        // data may predate the triggering change, so run one more pass now.
+        if self.pending_reload.is_none() && self.reload_queued {
+            self.reload_queued = false;
+            self.spawn_pending_reload();
         }
     }
 
@@ -4573,6 +4596,8 @@ struct RecordingCells {
     started_secs: i64,
     /// How long we've recorded (ticks while active; final length otherwise).
     duration: String,
+    /// Raw seconds behind `duration` — numeric sort key (0 when unknown).
+    duration_secs: i64,
     /// When the stream went live on the platform (`~`-prefixed if approximate, formatted).
     went_live: String,
     /// Raw unix seconds for "Went Live" — used by [`ts_went_live_label`].
@@ -4581,6 +4606,8 @@ struct RecordingCells {
     went_live_approx: bool,
     /// How much of the beginning we missed.
     lost: String,
+    /// Raw seconds behind `lost` — numeric sort key (0 when unknown).
+    lost_secs: i64,
 }
 
 fn recording_cells(row: &MonitorWithChannel, now: i64) -> RecordingCells {
@@ -4607,11 +4634,11 @@ fn recording_cells(row: &MonitorWithChannel, now: i64) -> RecordingCells {
     };
     // Prefer the resolved lost time (0 once a from-start capture caught up, or
     // the exact residual) when known; else fall back to started - went_live.
-    let lost = match row.last_recording_lost_secs {
-        Some(s) => fmt_duration(s.max(0)),
+    let lost_val: Option<i64> = match row.last_recording_lost_secs {
+        Some(s) => Some(s.max(0)),
         None => match (started, row.last_recording_went_live) {
-            (Some(s), Some(w)) => fmt_duration((s - w).max(0)),
-            _ => String::new(),
+            (Some(s), Some(w)) => Some((s - w).max(0)),
+            _ => None,
         },
     };
     RecordingCells {
@@ -4619,10 +4646,12 @@ fn recording_cells(row: &MonitorWithChannel, now: i64) -> RecordingCells {
         started_on: started.map(fmt_datetime_short).unwrap_or_default(),
         started_secs,
         duration: dur.map(fmt_duration).unwrap_or_default(),
+        duration_secs: dur.unwrap_or(0).max(0),
         went_live,
         went_live_secs,
         went_live_approx,
-        lost,
+        lost: lost_val.map(fmt_duration).unwrap_or_default(),
+        lost_secs: lost_val.unwrap_or(0),
     }
 }
 
@@ -4735,7 +4764,16 @@ fn channel_ad_free_count(monitors: &[&MonitorWithChannel]) -> usize {
 /// Sort/filter cells for a channel container's top-level row (matches the table
 /// columns). `channel` is the container; `monitors` are its instances (possibly
 /// none, for an empty container).
-fn channel_cells(channel: &Channel, monitors: &[&MonitorWithChannel], now: i64) -> Vec<Cell> {
+/// `active` is the live set of monitor ids with a capture process running —
+/// the same source the row render uses for its state dot — so sorting by the
+/// State column reorders the moment a recording starts/stops instead of
+/// waiting for the next DB reload to land.
+fn channel_cells(
+    channel: &Channel,
+    monitors: &[&MonitorWithChannel],
+    active: &HashSet<i64>,
+    now: i64,
+) -> Vec<Cell> {
     if monitors.is_empty() {
         // Empty container: just the name + "added"; everything else blank. Index
         // order matches STREAM_COLUMNS: On=0, Name=3, Added=last.
@@ -4745,9 +4783,8 @@ fn channel_cells(channel: &Channel, monitors: &[&MonitorWithChannel], now: i64) 
         cells[STREAM_COLS - 1] = Cell::num(channel.created_at as f64, fmt_date(channel.created_at));
         return cells;
     }
-    let any_recording = monitors
-        .iter()
-        .any(|m| m.last_recording_status.as_deref() == Some("recording"));
+    // Live process state, not the DB snapshot — matches the rendered state dot.
+    let any_recording = monitors.iter().any(|m| active.contains(&m.monitor.id));
     // The most recent recording across instances drives the time columns.
     let primary = channel_primary(monitors).unwrap_or(monitors[0]);
     let rec = recording_cells(primary, now);
@@ -4776,7 +4813,14 @@ fn channel_cells(channel: &Channel, monitors: &[&MonitorWithChannel], now: i64) 
         Cell::text(tool),
         Cell::text(String::new()), // detection
         Cell::num(last as f64, fmt_datetime_short(last)), // polled (datetime only)
-        Cell::text(if any_recording { "recording".to_string() } else { String::new() }),
+        // Mirrors the rendered state cell: recording (live) > failed > blank.
+        Cell::text(if any_recording {
+            "recording".to_string()
+        } else if primary.last_recording_status.as_deref() == Some("failed") {
+            "failed".to_string()
+        } else {
+            String::new()
+        }),
         {
             // Sort/show the channel's SOONEST upcoming stream across its instances.
             let next_at = monitors.iter().filter_map(|m| m.next_stream_at).min();
@@ -4807,8 +4851,8 @@ fn channel_cells(channel: &Channel, monitors: &[&MonitorWithChannel], now: i64) 
             primary.last_recording_started.unwrap_or(0) as f64,
             rec.started_on.clone(),
         ),
-        Cell::num(0.0, rec.lost.clone()),
-        Cell::num(0.0, rec.duration.clone()),
+        Cell::num(rec.lost_secs as f64, rec.lost.clone()),
+        Cell::num(rec.duration_secs as f64, rec.duration.clone()),
         {
             let (label, key) =
                 ad_free_summary(channel_ad_free_count(monitors), monitors.len());
@@ -5643,6 +5687,16 @@ impl eframe::App for StreamArchiverApp {
         self.drain_pending_save();
         self.drain_pending_reload();
         self.drain_pending_schedule();
+
+        // Slow-cadence background reload: routine polls update the DB (last
+        // checked, recording metadata) without emitting an event, so sorted
+        // columns would drift stale until F5. A 30s re-read keeps the grid —
+        // and therefore its sort order — current without user action.
+        let now = now_unix();
+        if now - self.last_auto_reload >= 30 {
+            self.last_auto_reload = now;
+            self.spawn_pending_reload();
+        }
 
         // Keep repainting at 50ms while a background DB load is in-flight so
         // the result is shown as soon as it arrives, not after the 1s heartbeat.
@@ -10856,6 +10910,11 @@ impl StreamArchiverApp {
         // Snapshot which monitors currently have an ad playing (for the row tint).
         let ad_active = self.core.ad_active.lock().unwrap().clone();
         let ad_running = |mid: i64| ad_active.get(&mid).is_some_and(|&end| now < end);
+        // Snapshot which monitors have a live capture process — shared by the
+        // sort/filter model and the row render so the State sort can't lag the
+        // rendered state dot within a frame.
+        let active_ids: HashSet<i64> =
+            self.core.active.lock().unwrap().keys().copied().collect();
 
         // Channel-level sort/filter model (one entry per top-level channel row).
         let model: Vec<Vec<Cell>> = chan_entries
@@ -10863,7 +10922,7 @@ impl StreamArchiverApp {
             .map(|e| {
                 let mons: Vec<&MonitorWithChannel> =
                     e.rows.iter().map(|&i| &self.rows[i]).collect();
-                channel_cells(&e.channel, &mons, now)
+                channel_cells(&e.channel, &mons, &active_ids, now)
             })
             .collect();
         let mut sort = self.streams_sort.clone();
@@ -11007,9 +11066,9 @@ impl StreamArchiverApp {
                                 let mons: Vec<&MonitorWithChannel> =
                                     e.rows.iter().map(|&ri| &self.rows[ri]).collect();
                                 let ninst = mons.len();
-                                let any_rec = mons.iter().any(|m| {
-                                    self.core.active.lock().unwrap().contains_key(&m.monitor.id)
-                                });
+                                let any_rec = mons
+                                    .iter()
+                                    .any(|m| active_ids.contains(&m.monitor.id));
                                 let expanded = exp_channels.contains(&cid);
                                 let platforms = channel_platforms(&mons);
                                 let last_poll = mons
@@ -11286,12 +11345,7 @@ impl StreamArchiverApp {
                             Vis::Instance { row: ri, depth } => {
                                 let row = &self.rows[ri];
                                 let mid = row.monitor.id;
-                                let recording = self
-                                    .core
-                                    .active
-                                    .lock()
-                                    .unwrap()
-                                    .contains_key(&mid);
+                                let recording = active_ids.contains(&mid);
                                 let chat_active = self
                                     .core
                                     .active_chats
