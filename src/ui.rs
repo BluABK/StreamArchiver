@@ -3681,6 +3681,24 @@ const HL_ERROR: egui::Color32 = egui::Color32::from_rgb(0x6e, 0x2f, 0x2f);
 /// too dark to read as a foreground colour).
 const HL_ERROR_TEXT: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x6c, 0x6c);
 
+/// Paint a row-tint background for one table cell + apply the selected-row
+/// text colour. Call at the TOP of a cell closure so widgets draw on top.
+///
+/// Replaces the pre-virtualization trick of mutating the body `Ui`'s
+/// `selection.bg_fill` between `body.row()` calls: with the virtualized
+/// `body.rows()` the body `Ui` isn't reachable per row, so each cell paints
+/// its own background instead (the half-item-spacing expansion mirrors
+/// egui_extras' gapless stripe/selection fill).
+fn tint_cell(ui: &mut egui::Ui, tint: Option<egui::Color32>) {
+    let Some(c) = tint else { return };
+    let rect = ui.max_rect().expand2(0.5 * ui.spacing().item_spacing);
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::ZERO, c);
+    // Same text treatment egui_extras applies to `set_selected` rows.
+    let stroke = ui.style().visuals.selection.stroke.color;
+    ui.style_mut().visuals.override_text_color = Some(stroke);
+}
+
 /// Background tint for a Streams row, by state (highest priority first): an ad is
 /// playing > recording > last poll/recording errored > keyboard-selected.
 /// `accent` is the theme's selection color (so recording/selected keep the
@@ -4347,7 +4365,8 @@ impl SortState {
 }
 
 /// A cell's sort key: numeric columns sort numerically, text columns sort
-/// case-insensitively. (Filtering always uses the cell's displayed `text`.)
+/// case-insensitively — `Text` is stored PRE-LOWERCASED so the per-frame sort
+/// compares without allocating. (Filtering always uses the displayed `text`.)
 enum SortKey {
     Num(f64),
     Text(String),
@@ -4365,7 +4384,7 @@ impl Cell {
     fn text(s: impl Into<String>) -> Cell {
         let s = s.into();
         Cell {
-            key: SortKey::Text(s.clone()),
+            key: SortKey::Text(s.to_lowercase()),
             text: s,
         }
     }
@@ -4382,7 +4401,8 @@ fn cmp_sort_key(a: &SortKey, b: &SortKey) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (a, b) {
         (SortKey::Num(x), SortKey::Num(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
-        (SortKey::Text(x), SortKey::Text(y)) => x.to_lowercase().cmp(&y.to_lowercase()),
+        // Both sides pre-lowercased at construction — no per-comparison allocs.
+        (SortKey::Text(x), SortKey::Text(y)) => x.cmp(y),
         _ => Ordering::Equal,
     }
 }
@@ -4390,18 +4410,31 @@ fn cmp_sort_key(a: &SortKey, b: &SortKey) -> std::cmp::Ordering {
 /// Filter then sort `rows`, returning surviving original indices in display
 /// order. `filters[c]` is a case-insensitive substring filter for column `c`.
 fn ordered_rows(rows: &[Vec<Cell>], sort: &SortState, filters: &[String]) -> Vec<usize> {
-    let mut idx: Vec<usize> = (0..rows.len())
-        .filter(|&i| {
-            filters.iter().enumerate().all(|(c, f)| {
-                let f = f.trim().to_lowercase();
-                f.is_empty()
-                    || rows[i]
-                        .get(c)
-                        .map(|cell| cell.text.to_lowercase().contains(&f))
-                        .unwrap_or(true)
-            })
+    // Lowercase the filters ONCE (this used to run per row × per column, every
+    // frame — thousands of allocations just to find out the filters are empty)
+    // and only test the columns that actually have a filter.
+    let active: Vec<(usize, String)> = filters
+        .iter()
+        .enumerate()
+        .filter_map(|(c, f)| {
+            let f = f.trim().to_lowercase();
+            (!f.is_empty()).then_some((c, f))
         })
         .collect();
+    let mut idx: Vec<usize> = if active.is_empty() {
+        (0..rows.len()).collect()
+    } else {
+        (0..rows.len())
+            .filter(|&i| {
+                active.iter().all(|(c, f)| {
+                    rows[i]
+                        .get(*c)
+                        .map(|cell| cell.text.to_lowercase().contains(f))
+                        .unwrap_or(true)
+                })
+            })
+            .collect()
+    };
     if !sort.keys.is_empty() {
         // Fold the priority list into a short-circuiting comparator chain: each
         // level breaks ties left by the higher-priority ones. `sort_by` is
@@ -4929,7 +4962,7 @@ fn render_instance_row(
     now: i64,
     recording: bool,
     chat_active: bool,
-    highlight: bool,
+    tint: Option<egui::Color32>,
     depth: usize,
     has_history: bool,
     expanded: bool,
@@ -4941,8 +4974,6 @@ fn render_instance_row(
 ) -> bool {
     let m = &row.monitor;
     let rec = recording_cells(row, now);
-    // The caller set the row's tint color (recording/ad/error/selected); paint it.
-    tr.set_selected(highlight);
 
     // Right-click context menu (shared with the inline action buttons).
     let add_menu = |ui: &mut egui::Ui, a: &mut RowActions| {
@@ -5055,7 +5086,7 @@ fn render_instance_row(
     // column's stable id so the cell bodies below stay verbatim regardless of
     // how the user has hidden/reordered columns.
     for &ci in order {
-        tr.col(|ui| match STREAM_COLUMNS[ci].id {
+        tr.col(|ui| { tint_cell(ui, tint); match STREAM_COLUMNS[ci].id {
             "auto" => {
                 let mut on = m.enabled;
                 let cb = ui.checkbox(&mut on, "");
@@ -5256,7 +5287,7 @@ fn render_instance_row(
                 ui.label(fmt_date(row.channel.created_at));
             }
             _ => {}
-        });
+        }});
     }
 
     let row_resp = tr.response();
@@ -6842,18 +6873,16 @@ impl StreamArchiverApp {
                             });
                         }
                     });
-                table.body(|mut body| {
+                table.body(|body| {
                         let order = ordered_rows(&model, &sort, &filters);
-                        for &vi in &order {
-                            let v = &self.videos[vi];
-                            // Tint by status (in-flight = accent, failed = red),
-                            // honoring the top-bar "Status bgcolor" toggle.
-                            let tint = video_row_tint(&v.status, sel_color, status_bgcolor);
-                            if let Some(c) = tint {
-                                body.ui_mut().visuals_mut().selection.bg_fill = c;
-                            }
-                            body.row(24.0, |mut tr| {
-                                tr.set_selected(tint.is_some());
+                        // Virtualized: only the rows in view are laid out.
+                        body.rows(24.0, order.len(), |mut tr| {
+                                let vi = order[tr.index()];
+                                let v = &self.videos[vi];
+                                // Tint by status (in-flight = accent, failed = red),
+                                // honoring the top-bar "Status bgcolor" toggle
+                                // (painted per cell — see `tint_cell`).
+                                let tint = video_row_tint(&v.status, sel_color, status_bgcolor);
                                 // Reusable menu body (a `Fn`), attached to the row and
                                 // each inline action button so right-clicking anywhere
                                 // on the row opens it. Open/copy are handled inline;
@@ -6918,7 +6947,7 @@ impl StreamArchiverApp {
                                     };
 
                                 for &ci in &col_order {
-                                    tr.col(|ui| match VIDEO_COLUMNS[ci].id {
+                                    tr.col(|ui| { tint_cell(ui, tint); match VIDEO_COLUMNS[ci].id {
                                         "video" => {
                                             let label = if v.title.trim().is_empty() {
                                                 v.url.as_str()
@@ -7046,7 +7075,7 @@ impl StreamArchiverApp {
                                             });
                                         }
                                         _ => {}
-                                    });
+                                    }});
                                 }
 
                                 // Right-click anywhere on the row opens the menu.
@@ -7059,8 +7088,7 @@ impl StreamArchiverApp {
                                     Some(VideoMenuChoice::Delete) => to_delete = Some(v.id),
                                     None => {}
                                 }
-                            });
-                        }
+                        });
                     });
             });
         if sort != self.videos_sort {
@@ -11049,6 +11077,56 @@ impl StreamArchiverApp {
                     };
                     tb = tb.column(col);
                 }
+                // Flatten the channel -> (instance) -> stream -> take tree into
+                // the rows currently visible (respecting expansion state).
+                // Built BEFORE the table so scroll-to-row can target an index
+                // (the sort/filter state is last frame's when a header was
+                // clicked this frame — corrected on the immediate repaint).
+                #[derive(Clone, Copy)]
+                enum Vis {
+                    Channel(usize),
+                    Instance { row: usize, depth: usize },
+                    Stream { mid: i64, gi: usize, depth: usize },
+                    Take { mid: i64, gi: usize, ti: usize, depth: usize },
+                }
+                let order = ordered_rows(&model, &sort, &filters);
+                let mut vis: Vec<Vis> = Vec::new();
+                for &ci in &order {
+                    let e = &chan_entries[ci];
+                    vis.push(Vis::Channel(ci));
+                    if !exp_channels.contains(&e.channel.id) {
+                        continue;
+                    }
+                    // Channel container -> its instances -> each instance's
+                    // stream history -> takes.
+                    for &ri in &e.rows {
+                        let mid = self.rows[ri].monitor.id;
+                        vis.push(Vis::Instance { row: ri, depth: 1 });
+                        if !exp_instances.contains(&mid) {
+                            continue;
+                        }
+                        if let Some(grps) = groups.get(&mid) {
+                            for (gi, g) in grps.iter().enumerate() {
+                                vis.push(Vis::Stream { mid, gi, depth: 2 });
+                                if g.takes.len() > 1 && exp_streams.contains(&g.key) {
+                                    for ti in 0..g.takes.len() {
+                                        vis.push(Vis::Take { mid, gi, ti, depth: 3 });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Scroll a newly-added channel into view (rows are virtualized,
+                // so the in-cell scroll_to_cursor approach can't work — the
+                // target row may not even be laid out this frame).
+                if let Some(cid) = scroll_to_cid
+                    && let Some(i) = vis.iter().position(|v| {
+                        matches!(v, Vis::Channel(ci) if chan_entries[*ci].channel.id == cid)
+                    })
+                {
+                    tb = tb.scroll_to_row(i, Some(egui::Align::Center));
+                }
                 let table = tb.header(46.0, |mut header| {
                     for &i in &col_order {
                         let c = &STREAM_COLUMNS[i];
@@ -11060,48 +11138,11 @@ impl StreamArchiverApp {
                         });
                     }
                 });
-                table.body(|mut body| {
-                    let order = ordered_rows(&model, &sort, &filters);
-
-                    // Flatten the channel -> (instance) -> stream -> take tree into
-                    // the rows currently visible (respecting expansion state).
-                    #[derive(Clone, Copy)]
-                    enum Vis {
-                        Channel(usize),
-                        Instance { row: usize, depth: usize },
-                        Stream { mid: i64, gi: usize, depth: usize },
-                        Take { mid: i64, gi: usize, ti: usize, depth: usize },
-                    }
-                    let mut vis: Vec<Vis> = Vec::new();
-                    for &ci in &order {
-                        let e = &chan_entries[ci];
-                        vis.push(Vis::Channel(ci));
-                        if !exp_channels.contains(&e.channel.id) {
-                            continue;
-                        }
-                        // Channel container -> its instances -> each instance's
-                        // stream history -> takes.
-                        for &ri in &e.rows {
-                            let mid = self.rows[ri].monitor.id;
-                            vis.push(Vis::Instance { row: ri, depth: 1 });
-                            if !exp_instances.contains(&mid) {
-                                continue;
-                            }
-                            if let Some(grps) = groups.get(&mid) {
-                                for (gi, g) in grps.iter().enumerate() {
-                                    vis.push(Vis::Stream { mid, gi, depth: 2 });
-                                    if g.takes.len() > 1 && exp_streams.contains(&g.key) {
-                                        for ti in 0..g.takes.len() {
-                                            vis.push(Vis::Take { mid, gi, ti, depth: 3 });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    for v in &vis {
-                        match *v {
+                table.body(|body| {
+                    // Virtualized: only the rows in view are laid out — the old
+                    // per-row loop rebuilt every widget of every row each frame.
+                    body.rows(24.0, vis.len(), |mut tr| {
+                        match vis[tr.index()] {
                             Vis::Channel(ci) => {
                                 let e = &chan_entries[ci];
                                 let ch = &e.channel;
@@ -11155,20 +11196,11 @@ impl StreamArchiverApp {
                                 let any_err = mons.iter().copied().any(monitor_errored);
                                 let tint =
                                     row_tint(any_rec, any_ad, any_err, false, sel_color, status_bgcolor);
-                                if let Some(c) = tint {
-                                    body.ui_mut().visuals_mut().selection.bg_fill = c;
-                                }
-                                body.row(24.0, |mut tr| {
-                                    tr.set_selected(tint.is_some());
+                                {
                                     let mut disc = false;
                                     for &ci2 in &col_order {
-                                        tr.col(|ui| match STREAM_COLUMNS[ci2].id {
+                                        tr.col(|ui| { tint_cell(ui, tint); match STREAM_COLUMNS[ci2].id {
                                             "auto" => {
-                                                // Scroll the new channel into view on the
-                                                // first render after a save.
-                                                if scroll_to_cid == Some(cid) {
-                                                    ui.scroll_to_cursor(Some(egui::Align::Center));
-                                                }
                                                 let mut on = ch.enabled;
                                                 let cb = ui
                                                     .add_enabled(ninst > 0, egui::Checkbox::new(&mut on, ""))
@@ -11345,7 +11377,7 @@ impl StreamArchiverApp {
                                                 ui.label(fmt_date(ch.created_at));
                                             }
                                             _ => {}
-                                        });
+                                        }});
                                     }
                                     tr.response().context_menu(|ui| {
                                         ui.set_min_width(170.0);
@@ -11383,7 +11415,7 @@ impl StreamArchiverApp {
                                     if disc {
                                         toggle_channel = Some(cid);
                                     }
-                                });
+                                }
                             }
                             Vis::Instance { row: ri, depth } => {
                                 let row = &self.rows[ri];
@@ -11408,9 +11440,6 @@ impl StreamArchiverApp {
                                     sel_color,
                                     status_bgcolor,
                                 );
-                                if let Some(c) = tint {
-                                    body.ui_mut().visuals_mut().selection.bg_fill = c;
-                                }
                                 let inst_needs_remux = groups.get(&mid)
                                     .map(|gs| {
                                         gs.iter()
@@ -11466,17 +11495,15 @@ impl StreamArchiverApp {
                                         None
                                     })
                                 };
-                                body.row(24.0, |mut tr| {
-                                    if render_instance_row(
-                                        &mut tr, row, &ptex, now, recording, chat_active,
-                                        tint.is_some(), depth, has_hist, expanded,
-                                        inst_needs_remux,
-                                        inst_stream_target.as_ref(), &media_player,
-                                        &col_order, &mut acts,
-                                    ) {
-                                        toggle_instance = Some(mid);
-                                    }
-                                });
+                                if render_instance_row(
+                                    &mut tr, row, &ptex, now, recording, chat_active,
+                                    tint, depth, has_hist, expanded,
+                                    inst_needs_remux,
+                                    inst_stream_target.as_ref(), &media_player,
+                                    &col_order, &mut acts,
+                                ) {
+                                    toggle_instance = Some(mid);
+                                }
                             }
                             Vis::Stream { mid, gi, depth } => {
                                 let g = &groups[&mid][gi];
@@ -11550,7 +11577,7 @@ impl StreamArchiverApp {
                                                 ))
                                         })
                                 };
-                                body.row(24.0, |mut tr| {
+                                {
                                     let mut disc = false;
                                     for &ci2 in &col_order {
                                         tr.col(|ui| match STREAM_COLUMNS[ci2].id {
@@ -11800,7 +11827,7 @@ impl StreamArchiverApp {
                                     if disc {
                                         toggle_stream = Some(g.key.clone());
                                     }
-                                });
+                                }
                             }
                             Vis::Take { mid, gi, ti, depth } => {
                                 let g = &groups[&mid][gi];
@@ -11812,7 +11839,7 @@ impl StreamArchiverApp {
                                 let file_ok = !t.output_path.is_empty()
                                     && self.fs_probes.is_file(std::path::Path::new(&t.output_path));
                                 let media_player = self.settings.media_player_path.trim().to_string();
-                                body.row(24.0, |mut tr| {
+                                {
                                     for &ci2 in &col_order {
                                         tr.col(|ui| match STREAM_COLUMNS[ci2].id {
                                             "actions" => {
@@ -12303,10 +12330,10 @@ impl StreamArchiverApp {
                                             ui.close();
                                         }
                                     });
-                                });
+                                }
                             }
                         }
-                    }
+                    });
                 });
             });
         if sort != self.streams_sort {
