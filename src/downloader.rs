@@ -3731,29 +3731,8 @@ impl Supervisor {
     ) -> tokio::task::JoinHandle<()> {
         let this = self.clone();
         tokio::spawn(async move {
-            let mut last_sig = u64::MAX;
-            let mut last_change = Instant::now();
-            loop {
-                crate::app_core::sleep_cancellable(Duration::from_secs(60), &this.shutdown).await;
-                if done.load(Ordering::SeqCst) || this.shutdown.load(Ordering::SeqCst) {
-                    return;
-                }
-                let sig = stall_signature(&log_path, &capture_path).await;
-                if sig != last_sig {
-                    last_sig = sig;
-                    last_change = Instant::now();
-                    continue;
-                }
-                if last_change.elapsed() < Duration::from_secs(STALL_KILL_SECS) {
-                    continue;
-                }
-                warn!(
-                    ?kind,
-                    key,
-                    pid,
-                    "no output for {} min — killing stalled process tree",
-                    STALL_KILL_SECS / 60
-                );
+            let kill = |why: String| {
+                warn!(?kind, key, pid, "{why} — killing stalled process tree");
                 match kind {
                     DetachedKind::Video => {
                         this.stopping_videos.lock().unwrap().insert(key);
@@ -3766,12 +3745,67 @@ impl Supervisor {
                 let _ = this.events.send(AppEvent::Error {
                     context: "Stall watchdog".into(),
                     message: format!(
-                        "Download produced no output for {} minutes — stopping the stuck process (pid {pid}) and finalizing.",
-                        STALL_KILL_SECS / 60
+                        "{why} — stopping the stuck process (pid {pid}) and finalizing."
                     ),
                 });
                 crate::platform::kill_process_tree(pid);
+            };
+
+            // First sample after a short settle: if the newest write on disk is
+            // ALREADY older than the threshold, the tool wedged long ago (the
+            // app was restarted hours after the stream ended) — kill right
+            // away instead of observing another 15 minutes of silence.
+            crate::app_core::sleep_cancellable(Duration::from_secs(10), &this.shutdown).await;
+            if done.load(Ordering::SeqCst) || this.shutdown.load(Ordering::SeqCst) {
                 return;
+            }
+            let s = stall_sample(&log_path, &capture_path).await;
+            let stale_secs = now_unix().saturating_sub(s.newest_mtime);
+            if s.newest_mtime > 0 && stale_secs >= STALL_KILL_SECS as i64 {
+                kill(format!(
+                    "Last output was {} min ago (before this session)",
+                    stale_secs / 60
+                ));
+                return;
+            }
+            let mut last = (s.log_sig, s.capture_sig);
+            let mut any_changed_at = Instant::now();
+            let mut capture_changed_at = Instant::now();
+            loop {
+                crate::app_core::sleep_cancellable(Duration::from_secs(60), &this.shutdown).await;
+                if done.load(Ordering::SeqCst) || this.shutdown.load(Ordering::SeqCst) {
+                    return;
+                }
+                let s = stall_sample(&log_path, &capture_path).await;
+                let now = Instant::now();
+                if s.log_sig != last.0 || s.capture_sig != last.1 {
+                    any_changed_at = now;
+                }
+                if s.capture_sig != last.1 {
+                    capture_changed_at = now;
+                }
+                last = (s.log_sig, s.capture_sig);
+                if now.duration_since(any_changed_at) >= Duration::from_secs(STALL_KILL_SECS) {
+                    kill(format!(
+                        "Download produced no output for {} minutes",
+                        STALL_KILL_SECS / 60
+                    ));
+                    return;
+                }
+                // A tool endlessly retry-logging against a dead stream keeps
+                // its log moving while the capture stays frozen — longer leash
+                // (metadata/waiting phases write no media and are exempt via
+                // has_capture), but not forever.
+                if s.has_capture
+                    && now.duration_since(capture_changed_at)
+                        >= Duration::from_secs(CAPTURE_STALL_KILL_SECS)
+                {
+                    kill(format!(
+                        "Capture file hasn't grown for {} minutes (log still active)",
+                        CAPTURE_STALL_KILL_SECS / 60
+                    ));
+                    return;
+                }
             }
         })
     }
@@ -5201,36 +5235,62 @@ async fn file_len(path: &Path) -> u64 {
 /// total silence means a wedged tool, not a slow one.
 const STALL_KILL_SECS: u64 = 15 * 60;
 
-/// Handle-based file size (0 if missing/unopenable). `fs::metadata` reads the
+/// How long the CAPTURE files alone may stay frozen while the log keeps
+/// moving. A tool endlessly retry-logging against a dead stream never trips
+/// the total-silence rule (its log grows forever), but a capture that already
+/// has bytes and hasn't gained one in an hour is wedged. Metadata-only phases
+/// (format probing, waiting) are exempt via `has_capture`.
+const CAPTURE_STALL_KILL_SECS: u64 = 60 * 60;
+
+/// Handle-based (size, modified-unix-secs) — `fs::metadata` reads the
 /// directory entry, which NTFS updates lazily while a writer holds the file
-/// open — opening the file queries the handle, which is always current.
-async fn open_len(p: &Path) -> u64 {
-    match tokio::fs::File::open(p).await {
-        Ok(f) => f.metadata().await.map(|m| m.len()).unwrap_or(0),
-        Err(_) => 0,
-    }
+/// open; opening the file queries the handle, which is always current.
+async fn open_len_mtime(p: &Path) -> Option<(u64, i64)> {
+    let f = tokio::fs::File::open(p).await.ok()?;
+    let md = f.metadata().await.ok()?;
+    let mtime = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Some((md.len(), mtime))
 }
 
-/// Activity signature for the stall watchdog: the log's size plus the sizes
-/// (and names, to catch file-set changes) of every file in the capture dir
-/// sharing the capture stem — SABR per-format `.part` files, merge temps, the
-/// bare capture itself. Any write anywhere changes the sum.
-async fn stall_signature(log_path: &Path, capture_path: &Path) -> u64 {
-    let mut sig = open_len(log_path).await;
+/// One stall-watchdog sample over the log + every capture-stem file.
+struct StallSample {
+    /// Log size (any write changes it).
+    log_sig: u64,
+    /// Sum of sizes + names of capture-stem files (SABR `.part`s, merge temps,
+    /// the bare capture) — any media write anywhere changes it.
+    capture_sig: u64,
+    /// Newest handle-based modified time across all of the above (unix secs;
+    /// 0 when nothing exists).
+    newest_mtime: i64,
+    /// True when at least one capture-stem file has bytes.
+    has_capture: bool,
+}
+
+async fn stall_sample(log_path: &Path, capture_path: &Path) -> StallSample {
+    let (log_sig, mut newest_mtime) = open_len_mtime(log_path).await.unwrap_or((0, 0));
+    let mut capture_sig = 0u64;
+    let mut has_capture = false;
     if let (Some(dir), Some(stem)) = (capture_path.parent(), capture_path.file_stem()) {
         let stem = stem.to_string_lossy().into_owned();
         if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
             while let Ok(Some(e)) = rd.next_entry().await {
                 let name = e.file_name().to_string_lossy().into_owned();
-                if name.starts_with(&stem) {
-                    sig = sig
-                        .wrapping_add(open_len(&e.path()).await)
-                        .wrapping_add(name.len() as u64);
+                if !name.starts_with(&stem) {
+                    continue;
                 }
+                let (len, mtime) = open_len_mtime(&e.path()).await.unwrap_or((0, 0));
+                capture_sig = capture_sig.wrapping_add(len).wrapping_add(name.len() as u64);
+                has_capture |= len > 0;
+                newest_mtime = newest_mtime.max(mtime);
             }
         }
     }
-    sig
+    StallSample { log_sig, capture_sig, newest_mtime, has_capture }
 }
 
 /// Media duration of `path` in whole seconds via `ffprobe`, or `None` if it
