@@ -6,7 +6,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::sync::mpsc::Receiver;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -3915,6 +3914,11 @@ enum ChatSegment {
     Emote {
         name: String,
         file: Option<std::path::PathBuf>,
+        /// Where a queued image download will land when `file` is `None` —
+        /// [`upgrade_pending_emotes`] promotes it to `file` once it exists on
+        /// disk, replacing the old "re-parse the whole file after the emoji
+        /// download" upgrade pass.
+        pending: Option<std::path::PathBuf>,
         /// For emoji: the Unicode glyph to show when there's no image, so it
         /// degrades to a (mono) glyph rather than a code. `None` for code emotes.
         fallback_text: Option<String>,
@@ -3942,10 +3946,32 @@ struct ChatMessage {
     platform: ChatPlatform,
 }
 
-#[derive(Clone)]
+/// Height estimate for a chat row that hasn't been drawn yet (≈ one line).
+const CHAT_ROW_EST: f32 = 20.0;
+
+/// A loaded chat log plus the state the incremental loaders and the
+/// virtualized renderer need. Lives behind `ChatPopup::load_state`'s mutex;
+/// the UI renders straight from the guard (no per-frame clone) while the
+/// background tasks append/prepend under the same lock.
+struct ChatLog {
+    messages: Vec<ChatMessage>,
+    /// Measured row heights, parallel to `messages` (estimates until a row has
+    /// actually been drawn once). Drives the virtualized scroll offsets.
+    row_heights: Vec<f32>,
+    /// The width `row_heights` was measured at — a resize changes wrapping, so
+    /// the cache resets to estimates.
+    measured_width: f32,
+    /// Byte offset just past the last fully-parsed line of the chat file; the
+    /// live tail reload resumes here instead of re-parsing the whole file.
+    parsed_to: u64,
+    /// True while the pre-tail (older) part of the file is still parsing in
+    /// the background — the newest messages are already shown.
+    loading_older: bool,
+}
+
 enum ChatLoadState {
     Loading,
-    Loaded(Vec<ChatMessage>),
+    Loaded(ChatLog),
     NoFile,
     Error(String),
 }
@@ -3975,6 +4001,11 @@ struct ChatPopup {
     /// True while a background emoji-download pass is running, so the 3s tail-reload
     /// doesn't pile up overlapping download passes for the same chat.
     loading: Arc<AtomicBool>,
+    /// Cached search-filter result: (lowercased query, message count when
+    /// computed, matching message indices). Recomputed only when the query or
+    /// the message count changes — the filter used to lowercase every message
+    /// every frame.
+    filter_cache: Option<(String, usize, Vec<u32>)>,
 }
 
 /// Merge a stream's takes into one chronological change list. Each take's offsets
@@ -17343,6 +17374,7 @@ impl StreamArchiverApp {
             emote_map,
             twitch_emote_dir,
             loading,
+            filter_cache: None,
         });
     }
 
@@ -17479,8 +17511,11 @@ impl StreamArchiverApp {
                     ui.separator();
 
                     // ── Content ──────────────────────────────────────────────
-                    let state = popup.load_state.lock().unwrap().clone();
-                    match state {
+                    // Render straight from the mutex guard — the old code
+                    // cloned the entire parsed log (every message + segments)
+                    // every single frame.
+                    let mut guard = popup.load_state.lock().unwrap();
+                    match &mut *guard {
                         ChatLoadState::Loading => {
                             ui.horizontal(|ui| {
                                 ui.spinner();
@@ -17493,59 +17528,135 @@ impl StreamArchiverApp {
                             ui.label("No chat file found for this recording.");
                             ui.weak("Chat logging must be enabled and a recording must exist.");
                         }
-                        ChatLoadState::Error(ref e) => {
+                        ChatLoadState::Error(e) => {
                             ui.colored_label(egui::Color32::RED, format!("Failed to load: {e}"));
                         }
-                        ChatLoadState::Loaded(ref msgs) => {
-                            let q = popup.search.to_lowercase();
-                            let all_filtered: Vec<&ChatMessage> = msgs
-                                .iter()
-                                .filter(|m| {
-                                    q.is_empty()
-                                        || m.text.to_lowercase().contains(&q)
-                                        || m.author.to_lowercase().contains(&q)
-                                })
-                                .collect();
-
-                            const DEFAULT_CAP: usize = 500;
-                            let (visible, capped) =
-                                if popup.full_view || all_filtered.len() <= DEFAULT_CAP {
-                                    (all_filtered.as_slice(), false)
-                                } else {
-                                    (&all_filtered[all_filtered.len() - DEFAULT_CAP..], true)
-                                };
-
-                            if capped {
-                                ui.horizontal(|ui| {
-                                    ui.weak(format!(
-                                        "Showing last {DEFAULT_CAP} of {} messages",
-                                        all_filtered.len()
-                                    ));
-                                    if ui.small_button("View full").clicked() {
-                                        popup.full_view = true;
-                                    }
-                                });
-                            } else {
-                                ui.weak(format!("{} messages", all_filtered.len()));
+                        ChatLoadState::Loaded(log) => {
+                            // Keep the height cache aligned with the message
+                            // list: tail appends get estimates at the end; a
+                            // shrink (recording switch) resets everything.
+                            let n = log.messages.len();
+                            if log.row_heights.len() > n {
+                                log.row_heights.clear();
                             }
+                            log.row_heights.resize(n, CHAT_ROW_EST);
+
+                            // Search filter, recomputed only when the query or
+                            // the message count changes — not every frame.
+                            let q = popup.search.to_lowercase();
+                            if q.is_empty() {
+                                popup.filter_cache = None;
+                            } else {
+                                let stale = popup
+                                    .filter_cache
+                                    .as_ref()
+                                    .is_none_or(|(cq, cn, _)| *cq != q || *cn != n);
+                                if stale {
+                                    let idx: Vec<u32> = log
+                                        .messages
+                                        .iter()
+                                        .enumerate()
+                                        .filter(|(_, m)| {
+                                            m.text.to_lowercase().contains(&q)
+                                                || m.author.to_lowercase().contains(&q)
+                                        })
+                                        .map(|(i, _)| i as u32)
+                                        .collect();
+                                    popup.filter_cache = Some((q.clone(), n, idx));
+                                }
+                            }
+                            let filtered: Option<&[u32]> =
+                                popup.filter_cache.as_ref().map(|(_, _, v)| v.as_slice());
+                            let count = filtered.map_or(n, |v| v.len());
+
+                            ui.horizontal(|ui| {
+                                ui.weak(format!("{count} messages"));
+                                if log.loading_older {
+                                    ui.spinner();
+                                    ui.weak("loading older messages…");
+                                }
+                            });
 
                             let stick = q.is_empty() && !popup.full_view;
+                            const GAP: f32 = 2.0;
+                            const OVERSCAN: f32 = 300.0;
                             egui::ScrollArea::vertical()
                                 .auto_shrink([false, false])
                                 .stick_to_bottom(stick)
-                                .show(ui, |ui| {
-                                    ui.spacing_mut().item_spacing.y = 2.0;
-                                    for msg in visible {
-                                        render_chat_message(
-                                            ui,
-                                            msg,
-                                            &anim_cache,
-                                            render_emotes,
-                                            animate_emotes,
-                                            now,
-                                            &mut decode_misses,
-                                            ctx,
-                                        );
+                                .show_viewport(ui, |ui, viewport| {
+                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                    // Wrapping depends on width — a resize
+                                    // re-measures everything.
+                                    let w = ui.available_width();
+                                    if (w - log.measured_width).abs() > 0.5 {
+                                        log.measured_width = w;
+                                        for h in &mut log.row_heights {
+                                            *h = CHAT_ROW_EST;
+                                        }
+                                    }
+                                    // One cheap pass over the cached heights
+                                    // finds the on-screen window; only rows
+                                    // within the viewport (± overscan) are
+                                    // laid out — everything else is two
+                                    // spacers, so a 6-hour log renders a few
+                                    // dozen rows per frame, not all of them.
+                                    let top = viewport.min.y - OVERSCAN;
+                                    let bottom = viewport.max.y + OVERSCAN;
+                                    let mut y = 0.0f32;
+                                    let mut first = count;
+                                    let mut offset = 0.0f32;
+                                    let mut last = count;
+                                    let mut last_y = 0.0f32;
+                                    for di in 0..count {
+                                        let mi = filtered.map_or(di, |v| v[di] as usize);
+                                        let h = log.row_heights[mi] + GAP;
+                                        if first == count && y + h > top {
+                                            first = di;
+                                            offset = y;
+                                        }
+                                        if last == count && y > bottom {
+                                            last = di;
+                                            last_y = y;
+                                        }
+                                        y += h;
+                                    }
+                                    if last == count {
+                                        last_y = y;
+                                    }
+                                    let total = y;
+                                    ui.add_space(offset);
+                                    let mut mismeasured = false;
+                                    for di in first..last {
+                                        let mi = filtered.map_or(di, |v| v[di] as usize);
+                                        let r = ui.scope(|ui| {
+                                            render_chat_message(
+                                                ui,
+                                                &log.messages[mi],
+                                                &anim_cache,
+                                                render_emotes,
+                                                animate_emotes,
+                                                now,
+                                                &mut decode_misses,
+                                                ctx,
+                                            );
+                                        });
+                                        let h = r.response.rect.height();
+                                        if (h - log.row_heights[mi]).abs() > 0.5 {
+                                            log.row_heights[mi] = h;
+                                            mismeasured = true;
+                                        }
+                                        ui.add_space(GAP);
+                                    }
+                                    // Reserve the space of everything below
+                                    // the rendered window so the scrollbar
+                                    // spans the whole log.
+                                    if total > last_y {
+                                        ui.add_space(total - last_y);
+                                    }
+                                    if mismeasured {
+                                        // Offsets were computed from estimates
+                                        // — redo with real heights next frame.
+                                        ctx.request_repaint();
                                     }
                                 });
                         }
@@ -17557,16 +17668,17 @@ impl StreamArchiverApp {
         // Decode any newly-seen emotes off the UI thread, then LRU-evict the cache.
         self.pump_emote_decodes(decode_misses, now, ctx);
 
-        // Tail-reload: re-parse the chat file in the background while the
-        // recording is still live so new messages appear without re-opening.
+        // Tail-reload: while the recording is live, parse only the bytes
+        // appended since the last pass and push them onto the shown log —
+        // the whole file is never re-read.
         if let Some((path, start_ts, state, emap, tdir, loading)) = reload_info {
             if let Some(p) = &mut self.chat_popup {
                 p.last_reload = std::time::Instant::now();
             }
-            self.core.rt.spawn(load_chat(
+            self.core.rt.spawn(tail_chat(
                 state,
                 loading,
-                Some(path),
+                path,
                 start_ts,
                 emap,
                 tdir,
@@ -19204,7 +19316,7 @@ fn build_twitch_segments(
         // First-party files are `{id}.png` (static) or `{id}.gif` (animated — we
         // render its first frame). Probe both so animated channel emotes show too.
         let file = twitch_dir.and_then(|d| find_emote_file(d, &id));
-        out.push(ChatSegment::Emote { name, file, fallback_text: None });
+        out.push(ChatSegment::Emote { name, file, fallback_text: None, pending: None });
         cursor = b1;
     }
     if cursor < text.len() {
@@ -19329,6 +19441,7 @@ fn word_match_segments(
                 name: token.to_string(),
                 file: Some(path.clone()),
                 fallback_text: None,
+                pending: None,
             });
         } else {
             pending.push_str(token);
@@ -19716,7 +19829,7 @@ fn render_chat_message(
                     // internal/leading/trailing whitespace verbatim.
                     ui.label(t);
                 }
-                ChatSegment::Emote { name, file, fallback_text } => {
+                ChatSegment::Emote { name, file, fallback_text, .. } => {
                     let drawn = render_emotes
                         && file.as_ref().is_some_and(|f| {
                             match draw_cached_emote(ui, cache, f, animate, emote_h, now, misses, ctx)
@@ -20879,10 +20992,13 @@ struct EmojiFetch {
     urls: Vec<String>,
 }
 
-/// Result of parsing a chat file: the messages plus the emoji images to fetch.
-struct ParsedChat {
+/// One parsed slice of a chat file: the messages, the emoji images to fetch,
+/// and the byte offset just past the last complete line — the resume point for
+/// the next incremental pass.
+struct ChatChunk {
     messages: Vec<ChatMessage>,
     fetches: Vec<EmojiFetch>,
+    parsed_to: u64,
 }
 
 /// Split a text run into [`ChatSegment`]s, turning each Unicode-emoji cluster into
@@ -20906,14 +21022,16 @@ fn emoji_split(text: &str, fetches: &mut Vec<EmojiFetch>) -> Vec<ChatSegment> {
             // on every live tail-reload.
             if file.is_none() && !emoji_dir.join(format!("{key}.404")).exists() {
                 fetches.push(EmojiFetch {
-                    dest,
+                    dest: dest.clone(),
                     urls: crate::emoji::twemoji_url_candidates(slice),
                 });
             }
+            let pending = file.is_none().then_some(dest);
             out.push(ChatSegment::Emote {
                 name: slice.to_string(),
                 file,
                 fallback_text: Some(slice.to_string()),
+                pending,
             });
         } else if !slice.is_empty() {
             out.push(ChatSegment::Text(slice.to_string()));
@@ -20952,39 +21070,114 @@ fn url_ext(url: &str) -> &str {
         .unwrap_or("png")
 }
 
-fn parse_chat_file(
+/// How much of the file's tail the phase-1 (instant) parse covers. Enough for
+/// hundreds of Twitch lines / dozens of (much fatter) YouTube lines.
+const CHAT_TAIL_BYTES: u64 = 512 * 1024;
+
+/// Parse the byte range `[from, to)` of a chat file (`to == None` reads to the
+/// current EOF). Only complete (newline-terminated) lines are parsed; a
+/// trailing partial line — the logger may be mid-write — is left for the next
+/// pass via `parsed_to`, so incremental tail reads never split a message. Both
+/// formats (Twitch `.chat.jsonl`, YouTube `.live_chat.json`) are line-delimited
+/// JSON, so byte-offset resumption is exact.
+fn parse_chat_chunk(
     path: &Path,
+    from: u64,
+    to: Option<u64>,
     start_unix_secs: i64,
     emote_map: &HashMap<String, std::path::PathBuf>,
     twitch_dir: Option<&Path>,
-) -> anyhow::Result<ParsedChat> {
-    let s = path.to_string_lossy();
-    let mut fetches: Vec<EmojiFetch> = Vec::new();
-    let messages = if s.ends_with("live_chat.json") {
-        parse_yt_live_chat(path, &mut fetches)?
-    } else {
-        parse_twitch_chat(path, start_unix_secs, emote_map, twitch_dir, &mut fetches)?
+) -> anyhow::Result<ChatChunk> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = File::open(path)?;
+    let len = f.metadata()?.len();
+    let end = to.unwrap_or(len).min(len);
+    if from >= end {
+        return Ok(ChatChunk { messages: Vec::new(), fetches: Vec::new(), parsed_to: from });
+    }
+    f.seek(SeekFrom::Start(from))?;
+    let mut buf = vec![0u8; (end - from) as usize];
+    f.read_exact(&mut buf)?;
+    let cut = match buf.iter().rposition(|&b| b == b'\n') {
+        Some(i) => i + 1,
+        // A bounded chunk ends on a known line boundary; an unbounded tail
+        // with no newline at all is one still-growing partial line.
+        None if to.is_some() => buf.len(),
+        None => 0,
     };
+    let text = String::from_utf8_lossy(&buf[..cut]);
+    let is_yt = path.to_string_lossy().ends_with("live_chat.json");
+    let start_ms = start_unix_secs as f64 * 1000.0;
+    let mut messages = Vec::new();
+    let mut fetches: Vec<EmojiFetch> = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        if is_yt {
+            parse_yt_chat_line(line, &mut messages, &mut fetches);
+        } else if let Some(m) =
+            parse_twitch_chat_line(line, start_ms, emote_map, twitch_dir, &mut fetches)
+        {
+            messages.push(m);
+        }
+    }
     // De-duplicate so the same emoji isn't downloaded once per occurrence.
     fetches.sort_by(|a, b| a.dest.cmp(&b.dest));
     fetches.dedup();
-    Ok(ParsedChat { messages, fetches })
+    Ok(ChatChunk { messages, fetches, parsed_to: from + cut as u64 })
 }
 
-/// Parse a chat file off the UI thread, mapping both join and parse errors to a
-/// string for [`ChatLoadState::Error`].
-async fn parse_chat_blocking(
+/// The first line boundary within the file's last [`CHAT_TAIL_BYTES`] — where
+/// the phase-1 tail parse starts. 0 for small files (just parse everything).
+fn chat_tail_start(path: &Path) -> anyhow::Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = File::open(path)?;
+    let len = f.metadata()?.len();
+    if len <= CHAT_TAIL_BYTES {
+        return Ok(0);
+    }
+    f.seek(SeekFrom::Start(len - CHAT_TAIL_BYTES))?;
+    let mut buf = vec![0u8; CHAT_TAIL_BYTES as usize];
+    f.read_exact(&mut buf)?;
+    Ok(match buf.iter().position(|&b| b == b'\n') {
+        Some(i) => len - CHAT_TAIL_BYTES + i as u64 + 1,
+        None => 0, // no boundary in the tail (one giant line) — parse it all
+    })
+}
+
+/// Parse a chunk of a chat file off the UI thread, mapping both join and parse
+/// errors to a string for [`ChatLoadState::Error`].
+async fn parse_chunk_blocking(
     path: std::path::PathBuf,
+    from: u64,
+    to: Option<u64>,
     start_ts: i64,
     emote_map: Arc<HashMap<String, std::path::PathBuf>>,
     twitch_dir: Option<std::path::PathBuf>,
-) -> Result<ParsedChat, String> {
+) -> Result<ChatChunk, String> {
     tokio::task::spawn_blocking(move || {
-        parse_chat_file(&path, start_ts, &emote_map, twitch_dir.as_deref())
+        parse_chat_chunk(&path, from, to, start_ts, &emote_map, twitch_dir.as_deref())
     })
     .await
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())
+}
+
+/// Fill in `file` for emote segments whose queued image download has since
+/// landed on disk — replaces the old "re-parse the entire file after the emoji
+/// download" upgrade pass with an in-memory walk.
+fn upgrade_pending_emotes(messages: &mut [ChatMessage]) {
+    for m in messages {
+        for seg in &mut m.segments {
+            if let ChatSegment::Emote { file, pending, .. } = seg
+                && file.is_none()
+                && pending.as_ref().is_some_and(|p| p.exists())
+            {
+                *file = pending.take();
+            }
+        }
+    }
 }
 
 /// Download missing emoji/emoji-emote images (sequential, best-effort; 404s for a
@@ -21035,9 +21228,11 @@ async fn download_emoji_images(fetches: &[EmojiFetch]) {
     }
 }
 
-/// Load a chat file into `state`: parse + show immediately (emoji may still be
-/// glyphs), then — when `fetch_emoji` — download any missing emoji images and
-/// re-parse once so they upgrade to colour images. Runs entirely off the UI thread.
+/// Load a chat file into `state`, tail-first: the newest [`CHAT_TAIL_BYTES`]
+/// parse and display immediately, then the rest of the file parses in the
+/// background and is spliced in front (`loading_older` marks the gap). Then —
+/// when `fetch_emoji` — missing emoji images download once and upgrade the
+/// in-memory segments in place. Runs entirely off the UI thread.
 async fn load_chat(
     state: Arc<Mutex<ChatLoadState>>,
     loading: Arc<AtomicBool>,
@@ -21053,19 +21248,44 @@ async fn load_chat(
         ctx.request_repaint();
         return;
     };
-    let fetches = match parse_chat_blocking(
+    // Phase 1: the file's tail — the newest messages show instantly instead of
+    // waiting for a full-file parse.
+    let head_end = {
+        let p = path.clone();
+        match tokio::task::spawn_blocking(move || chat_tail_start(&p)).await {
+            Ok(Ok(off)) => off,
+            Ok(Err(e)) => {
+                *state.lock().unwrap() = ChatLoadState::Error(e.to_string());
+                ctx.request_repaint();
+                return;
+            }
+            Err(e) => {
+                *state.lock().unwrap() = ChatLoadState::Error(e.to_string());
+                ctx.request_repaint();
+                return;
+            }
+        }
+    };
+    let mut fetches = match parse_chunk_blocking(
         path.clone(),
+        head_end,
+        None,
         start_ts,
         emote_map.clone(),
         twitch_dir.clone(),
     )
     .await
     {
-        Ok(parsed) => {
-            let fetches = parsed.fetches;
-            *state.lock().unwrap() = ChatLoadState::Loaded(parsed.messages);
+        Ok(chunk) => {
+            *state.lock().unwrap() = ChatLoadState::Loaded(ChatLog {
+                messages: chunk.messages,
+                row_heights: Vec::new(),
+                measured_width: 0.0,
+                parsed_to: chunk.parsed_to,
+                loading_older: head_end > 0,
+            });
             ctx.request_repaint();
-            fetches
+            chunk.fetches
         }
         Err(e) => {
             *state.lock().unwrap() = ChatLoadState::Error(e);
@@ -21073,52 +21293,114 @@ async fn load_chat(
             return;
         }
     };
-    // Messages are already shown; only one download+upgrade pass runs at a time
-    // (a concurrent tail-reload still shows new messages via the parse above, it
-    // just skips kicking off a second overlapping download).
+    // Phase 2: everything before the tail, spliced in front when ready.
+    if head_end > 0 {
+        match parse_chunk_blocking(
+            path.clone(),
+            0,
+            Some(head_end),
+            start_ts,
+            emote_map.clone(),
+            twitch_dir.clone(),
+        )
+        .await
+        {
+            Ok(older) => {
+                fetches.extend(older.fetches);
+                if let ChatLoadState::Loaded(log) = &mut *state.lock().unwrap() {
+                    log.messages.splice(0..0, older.messages);
+                    log.loading_older = false;
+                }
+            }
+            Err(_) => {
+                if let ChatLoadState::Loaded(log) = &mut *state.lock().unwrap() {
+                    log.loading_older = false;
+                }
+            }
+        }
+        ctx.request_repaint();
+    }
+    // Phase 3: emoji downloads + in-place upgrade. Only one download pass runs
+    // at a time (a concurrent tail reload just skips kicking off another).
+    fetches.sort_by(|a, b| a.dest.cmp(&b.dest));
+    fetches.dedup();
     if fetch_emoji && !fetches.is_empty() && !loading.swap(true, Ordering::SeqCst) {
         download_emoji_images(&fetches).await;
         loading.store(false, Ordering::SeqCst);
-        if let Ok(parsed) = parse_chat_blocking(path, start_ts, emote_map, twitch_dir).await {
-            *state.lock().unwrap() = ChatLoadState::Loaded(parsed.messages);
-            ctx.request_repaint();
+        if let ChatLoadState::Loaded(log) = &mut *state.lock().unwrap() {
+            upgrade_pending_emotes(&mut log.messages);
         }
+        ctx.request_repaint();
     }
 }
 
-fn parse_yt_live_chat(
-    path: &Path,
-    fetches: &mut Vec<EmojiFetch>,
-) -> anyhow::Result<Vec<ChatMessage>> {
-    let mut out = Vec::new();
-    let reader = BufReader::new(File::open(path)?);
-    for line in reader.lines() {
-        let line = line?;
-        if line.is_empty() {
-            continue;
+/// Incremental tail reload for a live recording: parse only the bytes appended
+/// since the last pass and push them onto the existing log. (The previous
+/// implementation re-parsed the entire file every few seconds.)
+#[allow(clippy::too_many_arguments)]
+async fn tail_chat(
+    state: Arc<Mutex<ChatLoadState>>,
+    loading: Arc<AtomicBool>,
+    path: std::path::PathBuf,
+    start_ts: i64,
+    emote_map: Arc<HashMap<String, std::path::PathBuf>>,
+    twitch_dir: Option<std::path::PathBuf>,
+    fetch_emoji: bool,
+    ctx: egui::Context,
+) {
+    let from = match &*state.lock().unwrap() {
+        ChatLoadState::Loaded(log) => log.parsed_to,
+        // Initial load still running (or failed) — let it finish first.
+        _ => return,
+    };
+    let Ok(chunk) = parse_chunk_blocking(path, from, None, start_ts, emote_map, twitch_dir).await
+    else {
+        return;
+    };
+    if !chunk.messages.is_empty() {
+        if let ChatLoadState::Loaded(log) = &mut *state.lock().unwrap() {
+            // Overlapping reloads on a slow read could double-append; only the
+            // pass that still matches the resume offset lands.
+            if log.parsed_to == from {
+                log.messages.extend(chunk.messages);
+                log.parsed_to = chunk.parsed_to;
+            }
         }
-        let v: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if let Some(replay) = v.get("replayChatItemAction") {
-            // VOD replay format: replayChatItemAction.{videoOffsetTimeMsec, actions[]}
-            let offset_ms = replay
-                .get("videoOffsetTimeMsec")
-                .and_then(|x| x.as_str().and_then(|s| s.parse::<i64>().ok()).or_else(|| x.as_i64()));
-            if let Some(actions) = replay.get("actions").and_then(|a| a.as_array()) {
-                for action in actions {
-                    if let Some(msg) = yt_action_to_msg(action, offset_ms, fetches) {
-                        out.push(msg);
-                    }
+        ctx.request_repaint();
+    }
+    if fetch_emoji && !chunk.fetches.is_empty() && !loading.swap(true, Ordering::SeqCst) {
+        download_emoji_images(&chunk.fetches).await;
+        loading.store(false, Ordering::SeqCst);
+        if let ChatLoadState::Loaded(log) = &mut *state.lock().unwrap() {
+            upgrade_pending_emotes(&mut log.messages);
+        }
+        ctx.request_repaint();
+    }
+}
+
+/// Parse one line of a YouTube `.live_chat.json` file (a line can carry several
+/// messages in the VOD-replay format), appending to `out`.
+fn parse_yt_chat_line(line: &str, out: &mut Vec<ChatMessage>, fetches: &mut Vec<EmojiFetch>) {
+    let v: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    if let Some(replay) = v.get("replayChatItemAction") {
+        // VOD replay format: replayChatItemAction.{videoOffsetTimeMsec, actions[]}
+        let offset_ms = replay
+            .get("videoOffsetTimeMsec")
+            .and_then(|x| x.as_str().and_then(|s| s.parse::<i64>().ok()).or_else(|| x.as_i64()));
+        if let Some(actions) = replay.get("actions").and_then(|a| a.as_array()) {
+            for action in actions {
+                if let Some(msg) = yt_action_to_msg(action, offset_ms, fetches) {
+                    out.push(msg);
                 }
             }
-        } else if let Some(msg) = yt_action_to_msg(&v, None, fetches) {
-            // Live format: addChatItemAction directly at the top level of each line.
-            out.push(msg);
         }
+    } else if let Some(msg) = yt_action_to_msg(&v, None, fetches) {
+        // Live format: addChatItemAction directly at the top level of each line.
+        out.push(msg);
     }
-    Ok(out)
 }
 
 fn yt_action_to_msg(
@@ -21170,6 +21452,7 @@ fn yt_action_to_msg(
                         .and_then(|t| t.as_array())
                         .and_then(|a| a.last())
                         .and_then(|t| t["url"].as_str());
+                    let mut pending = None;
                     let file = emoji_id.zip(url).and_then(|(id, url)| {
                         let dest = crate::app_paths::asset_cache_dir()
                             .join("emotes")
@@ -21182,7 +21465,11 @@ fn yt_action_to_msg(
                         if dest.exists() {
                             Some(dest)
                         } else {
-                            fetches.push(EmojiFetch { dest, urls: vec![url.to_string()] });
+                            fetches.push(EmojiFetch {
+                                dest: dest.clone(),
+                                urls: vec![url.to_string()],
+                            });
+                            pending = Some(dest);
                             None
                         }
                     });
@@ -21190,6 +21477,7 @@ fn yt_action_to_msg(
                         name: label.to_string(),
                         file,
                         fallback_text: None,
+                        pending,
                     });
                 } else {
                     // Standard unicode emoji: `emojiId` is the actual char(s) → route
@@ -21223,58 +21511,47 @@ fn yt_action_to_msg(
     })
 }
 
-fn parse_twitch_chat(
-    path: &Path,
-    start_unix_secs: i64,
+/// Parse one line of a Twitch `.chat.jsonl` file. `start_ms` is the stream
+/// start in unix milliseconds (timestamps become offsets from it).
+fn parse_twitch_chat_line(
+    line: &str,
+    start_ms: f64,
     emote_map: &HashMap<String, std::path::PathBuf>,
     twitch_dir: Option<&Path>,
     fetches: &mut Vec<EmojiFetch>,
-) -> anyhow::Result<Vec<ChatMessage>> {
-    let start_ms = start_unix_secs as f64 * 1000.0;
-    let mut out = Vec::new();
-    let reader = BufReader::new(File::open(path)?);
-    for line in reader.lines() {
-        let line = line?;
-        if line.is_empty() {
-            continue;
-        }
-        let v: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let ts_ms = v["ts"].as_f64().unwrap_or(0.0);
-        let author = v["name"]
-            .as_str()
-            .or_else(|| v["login"].as_str())
-            .unwrap_or("")
-            .to_string();
-        // Unwrap `/me` CTCP actions so the emote offsets (which index the inner
-        // body) align and the raw control chars don't show in the replay/search.
-        let text = strip_ctcp_action(v["text"].as_str().unwrap_or("")).to_string();
-        let color_override = v["color"].as_str().and_then(parse_chat_hex_color);
-        // Split raw badge tag "subscriber/12,moderator/1" into one entry per badge.
-        let badges = v["badges"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.split(',').map(str::to_string).collect::<Vec<_>>())
-            .unwrap_or_default();
-        // `emotes` tag is absent on pre-feature logs → empty → first-party emotes
-        // simply don't render (third-party word-matching still applies).
-        let emotes_tag = v["emotes"].as_str().unwrap_or("");
-        let segments = build_twitch_segments(&text, emotes_tag, emote_map, twitch_dir);
-        // Split literal unicode emoji out of the text segments into colour images.
-        let segments = expand_emoji(segments, fetches);
-        out.push(ChatMessage {
-            timestamp_secs: (ts_ms - start_ms) / 1000.0,
-            author,
-            text,
-            segments,
-            badges,
-            color_override,
-            platform: ChatPlatform::Twitch,
-        });
-    }
-    Ok(out)
+) -> Option<ChatMessage> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let ts_ms = v["ts"].as_f64().unwrap_or(0.0);
+    let author = v["name"]
+        .as_str()
+        .or_else(|| v["login"].as_str())
+        .unwrap_or("")
+        .to_string();
+    // Unwrap `/me` CTCP actions so the emote offsets (which index the inner
+    // body) align and the raw control chars don't show in the replay/search.
+    let text = strip_ctcp_action(v["text"].as_str().unwrap_or("")).to_string();
+    let color_override = v["color"].as_str().and_then(parse_chat_hex_color);
+    // Split raw badge tag "subscriber/12,moderator/1" into one entry per badge.
+    let badges = v["badges"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.split(',').map(str::to_string).collect::<Vec<_>>())
+        .unwrap_or_default();
+    // `emotes` tag is absent on pre-feature logs → empty → first-party emotes
+    // simply don't render (third-party word-matching still applies).
+    let emotes_tag = v["emotes"].as_str().unwrap_or("");
+    let segments = build_twitch_segments(&text, emotes_tag, emote_map, twitch_dir);
+    // Split literal unicode emoji out of the text segments into colour images.
+    let segments = expand_emoji(segments, fetches);
+    Some(ChatMessage {
+        timestamp_secs: (ts_ms - start_ms) / 1000.0,
+        author,
+        text,
+        segments,
+        badges,
+        color_override,
+        platform: ChatPlatform::Twitch,
+    })
 }
 
 #[cfg(test)]
@@ -21388,7 +21665,7 @@ mod tests {
     // ----- third-party word matching -----
 
     fn emote(name: &str, file: &Option<PathBuf>) -> ChatSegment {
-        ChatSegment::Emote { name: name.into(), file: file.clone(), fallback_text: None }
+        ChatSegment::Emote { name: name.into(), file: file.clone(), fallback_text: None, pending: None }
     }
 
     #[test]
