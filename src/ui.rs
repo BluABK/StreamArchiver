@@ -92,6 +92,8 @@ const K_SHOW_ACTIONS: &str = "show_actions";
 const K_SHORT_TIMESTAMPS: &str = "short_timestamps";
 /// chrono format pattern used for the compact timestamp display; default `%d/%m %H:%M`.
 const K_SHORT_TS_FMT: &str = "short_ts_fmt";
+/// Last-selected Settings category tab (restored on launch).
+const K_SETTINGS_TAB: &str = "settings_tab";
 /// Whether chat-replay emote codes render as inline images (off ⇒ show the code
 /// text). Default on; only an explicit `"0"` disables. Needs "Fetch chat assets".
 const K_RENDER_EMOTES: &str = "render_emotes_in_chat";
@@ -125,6 +127,62 @@ enum ScheduleMode {
     Week,
     Day,
     Agenda,
+}
+
+/// Settings category tabs — the flat Settings page is grouped into these.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsTab {
+    Accounts,
+    Recording,
+    Downloads,
+    Schedule,
+    Interface,
+    System,
+    Maintenance,
+}
+
+impl SettingsTab {
+    const ALL: [SettingsTab; 7] = [
+        SettingsTab::Accounts,
+        SettingsTab::Recording,
+        SettingsTab::Downloads,
+        SettingsTab::Schedule,
+        SettingsTab::Interface,
+        SettingsTab::System,
+        SettingsTab::Maintenance,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            SettingsTab::Accounts => "Accounts",
+            SettingsTab::Recording => "Recording",
+            SettingsTab::Downloads => "Downloads",
+            SettingsTab::Schedule => "Schedule",
+            SettingsTab::Interface => "Interface",
+            SettingsTab::System => "System",
+            SettingsTab::Maintenance => "Maintenance",
+        }
+    }
+
+    /// Stable persisted id (the `K_SETTINGS_TAB` setting value).
+    fn id(self) -> &'static str {
+        match self {
+            SettingsTab::Accounts => "accounts",
+            SettingsTab::Recording => "recording",
+            SettingsTab::Downloads => "downloads",
+            SettingsTab::Schedule => "schedule",
+            SettingsTab::Interface => "interface",
+            SettingsTab::System => "system",
+            SettingsTab::Maintenance => "maintenance",
+        }
+    }
+
+    fn from_id(s: &str) -> SettingsTab {
+        SettingsTab::ALL
+            .into_iter()
+            .find(|t| t.id() == s)
+            .unwrap_or(SettingsTab::Accounts)
+    }
 }
 
 /// State of the on-demand "List formats" probe (Videos tab), shown in a window.
@@ -743,6 +801,11 @@ pub struct StreamArchiverApp {
     download_defaults: DownloadDefaults,
     /// Per-platform monitor-creation defaults editable in Settings (persisted JSON).
     monitor_defaults: MonitorDefaults,
+    /// Active Settings category tab (persisted via `K_SETTINGS_TAB`).
+    settings_tab: SettingsTab,
+    /// Settings search-box query — when non-empty, matching sections across all
+    /// categories are shown instead of the selected tab.
+    settings_search: String,
     /// Shared state of the async "List formats" probe (Videos tab).
     format_probe: Arc<Mutex<FormatProbe>>,
     /// Backing state for the "Recover VOD" dialog (`None` = closed).
@@ -1275,6 +1338,7 @@ impl StreamArchiverApp {
         let bg_recent_grid = GridState::load(&core.store, GridTableId::BgRecent, &BG_RECENT_COLUMNS);
         let processes_grid = GridState::load(&core.store, GridTableId::Processes, &PROCESSES_COLUMNS);
         let issues_grid = GridState::load(&core.store, GridTableId::Issues, &ISSUES_COLUMNS);
+        let settings_tab = SettingsTab::from_id(&setting_or_empty(&core, K_SETTINGS_TAB));
 
         let mut app = StreamArchiverApp {
             core,
@@ -1321,6 +1385,8 @@ impl StreamArchiverApp {
             video_form: VideoForm::new(),
             download_defaults,
             monitor_defaults,
+            settings_tab,
+            settings_search: String::new(),
             format_probe: Arc::new(Mutex::new(FormatProbe::Idle)),
             recover_form: None,
             recover_probe: Arc::new(Mutex::new(RecoverProbe::Idle)),
@@ -13054,8 +13120,54 @@ impl StreamArchiverApp {
             grid_columns::load_columns(&self.core.store, GridTableId::Issues, &ISSUES_COLUMNS);
     }
 
+    /// Whether a settings section should render: when the search box is empty, only
+    /// the selected category tab's sections show; when searching, any section whose
+    /// title or keywords match the query shows (across all categories).
+    fn section_shown(&self, tab: SettingsTab, title: &str, keywords: &[&str]) -> bool {
+        let q = self.settings_search.trim().to_lowercase();
+        if q.is_empty() {
+            return self.settings_tab == tab;
+        }
+        title.to_lowercase().contains(&q) || keywords.iter().any(|k| k.contains(q.as_str()))
+    }
+
     fn settings_view(&mut self, ui: &mut egui::Ui) {
+        // Fixed header (search + category tabs + always-visible Save) above the scroll.
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("🔎");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.settings_search)
+                    .hint_text("Search settings…")
+                    .desired_width(200.0),
+            );
+            if !self.settings_search.is_empty() && ui.small_button("✕").clicked() {
+                self.settings_search.clear();
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("💾 Save settings").clicked() {
+                    self.save_settings();
+                }
+            });
+        });
+        if self.settings_search.trim().is_empty() {
+            ui.horizontal(|ui| {
+                for tab in SettingsTab::ALL {
+                    if ui
+                        .selectable_value(&mut self.settings_tab, tab, tab.label())
+                        .clicked()
+                    {
+                        let _ = self.core.store.set_setting(K_SETTINGS_TAB, tab.id());
+                    }
+                }
+            });
+        }
+        ui.separator();
+        // Each section below is gated by `section_shown(category, …)`: only the
+        // active tab's sections render (or search matches). Inner code keeps its
+        // original indentation to avoid a whole-file reflow.
         egui::ScrollArea::vertical().show(ui, |ui| {
+            if self.section_shown(SettingsTab::Accounts, "Detection credentials", &["twitch", "youtube", "kick", "client id", "secret", "api key", "credentials", "detection"]) {
             ui.add_space(8.0);
             ui.heading("Detection credentials (optional)");
             ui.label("Used only by monitors set to an API detection method.");
@@ -13089,6 +13201,9 @@ impl StreamArchiverApp {
                     ui.end_row();
                 });
 
+            }
+
+            if self.section_shown(SettingsTab::Accounts, "YouTube Data API usage", &["youtube", "data api", "quota", "search"]) {
             ui.add_space(12.0);
             ui.heading("YouTube Data API usage");
             let key_set = !self.settings.youtube_api_key.trim().is_empty();
@@ -13165,6 +13280,9 @@ impl StreamArchiverApp {
                 });
             });
 
+            }
+
+            if self.section_shown(SettingsTab::Schedule, "Discord schedule import", &["discord", "schedule", "import", "token", "events"]) {
             ui.add_space(12.0);
             ui.heading("Discord schedule import");
             ui.label(
@@ -13205,6 +13323,9 @@ impl StreamArchiverApp {
                 );
             });
 
+            }
+
+            if self.section_shown(SettingsTab::Schedule, "Schedule sources", &["schedule", "sources", "ocr", "banner", "twitter", "priority"]) {
             ui.add_space(12.0);
             ui.heading("Schedule sources");
             ui.label(
@@ -13362,6 +13483,9 @@ impl StreamArchiverApp {
                     ui.end_row();
                 });
 
+            }
+
+            if self.section_shown(SettingsTab::Accounts, "Twitch account (OAuth)", &["twitch", "account", "oauth", "connect", "login", "sub", "turbo"]) {
             ui.add_space(12.0);
             ui.heading("Twitch account (OAuth)");
             ui.label("Connect to use a user token for detection (Client Secret then optional).");
@@ -13420,6 +13544,9 @@ impl StreamArchiverApp {
                 }
             }
 
+            }
+
+            if self.section_shown(SettingsTab::Accounts, "YouTube account (Google OAuth)", &["youtube", "google", "oauth", "account", "connect", "subscriptions"]) {
             ui.add_space(12.0);
             ui.heading("YouTube account (Google OAuth)");
             ui.label(
@@ -13492,6 +13619,9 @@ impl StreamArchiverApp {
                 }
             }
 
+            }
+
+            if self.section_shown(SettingsTab::Accounts, "YouTube WebSub (push via VPS)", &["youtube", "websub", "vps", "push", "relay", "pubsubhubbub"]) {
             ui.add_space(12.0);
             ui.heading("YouTube WebSub (push via VPS)");
             ui.label(
@@ -13522,6 +13652,9 @@ impl StreamArchiverApp {
                     ui.end_row();
                 });
 
+            }
+
+            if self.section_shown(SettingsTab::Recording, "Defaults", &["default", "output", "folder", "media player", "concurrent", "filename", "date", "timestamp"]) {
             ui.add_space(12.0);
             ui.heading("Defaults");
             egui::Grid::new("defaults_grid")
@@ -13605,6 +13738,9 @@ impl StreamArchiverApp {
                     ui.end_row();
                 });
 
+            }
+
+            if self.section_shown(SettingsTab::Interface, "Display", &["display", "actions", "emotes", "animate", "columns", "theme"]) {
             ui.add_space(12.0);
             ui.heading("Display");
             if ui
@@ -13662,6 +13798,9 @@ impl StreamArchiverApp {
                 .weak(),
             );
 
+            }
+
+            if self.section_shown(SettingsTab::Interface, "Table columns", &["table", "columns", "reset", "grid", "sort"]) {
             ui.add_space(12.0);
             ui.heading("Table columns");
             ui.label(
@@ -13713,6 +13852,9 @@ impl StreamArchiverApp {
                 }
             });
 
+            }
+
+            if self.section_shown(SettingsTab::Downloads, "Download authentication", &["download", "auth", "cookies", "browser", "token", "profile", "login"]) {
             ui.add_space(12.0);
             ui.heading("Download authentication");
             ui.label("Default for capturing sub-only / members-only / ad-reduced streams. Per-channel settings override this.");
@@ -13767,6 +13909,9 @@ impl StreamArchiverApp {
                     }
                 });
 
+            }
+
+            if self.section_shown(SettingsTab::Downloads, "yt-dlp default arguments", &["yt-dlp", "ytdlp", "arguments", "args", "binary", "path"]) {
             ui.add_space(12.0);
             ui.heading("yt-dlp default arguments");
             ui.label("Prepended to every yt-dlp invocation. Per-channel extra args are appended after and override these.");
@@ -13789,6 +13934,9 @@ impl StreamArchiverApp {
                     ui.end_row();
                 });
 
+            }
+
+            if self.section_shown(SettingsTab::Downloads, "YouTube SABR (live-from-start)", &["youtube", "sabr", "live-from-start", "po token", "dash", "codec", "capture from start"]) {
             ui.add_space(12.0);
             ui.heading("YouTube SABR (live-from-start)");
             ui.label(
@@ -13941,6 +14089,9 @@ impl StreamArchiverApp {
                     ui.end_row();
                 });
 
+            }
+
+            if self.section_shown(SettingsTab::Recording, "Stream monitor defaults", &["monitor", "defaults", "platform", "quality", "tool", "container", "detection"]) {
             ui.add_space(12.0);
             ui.heading("Stream monitor defaults");
             ui.label(
@@ -14172,6 +14323,9 @@ impl StreamArchiverApp {
                 });
             }
 
+            }
+
+            if self.section_shown(SettingsTab::System, "Startup", &["startup", "start at login", "autostart", "boot"]) {
             ui.add_space(12.0);
             ui.heading("Startup");
             let mut on = self.autostart_on;
@@ -14192,6 +14346,9 @@ impl StreamArchiverApp {
                 }
             }
 
+            }
+
+            if self.section_shown(SettingsTab::Interface, "Notifications", &["notifications", "desktop", "toast", "alerts"]) {
             ui.add_space(12.0);
             ui.heading("Notifications");
             let mut notify_on = self.notifications_enabled;
@@ -14219,6 +14376,9 @@ impl StreamArchiverApp {
                 };
             }
 
+            }
+
+            if self.section_shown(SettingsTab::System, "Shutdown", &["shutdown", "quit", "close", "keep downloads", "exit"]) {
             ui.add_space(12.0);
             ui.heading("Shutdown");
             let mut keep = self.keep_downloads_on_quit;
@@ -14248,6 +14408,9 @@ impl StreamArchiverApp {
 
             ui.add_space(12.0);
             // ── Remux ──────────────────────────────────────────────────────────
+            }
+
+            if self.section_shown(SettingsTab::Recording, "Remux", &["remux", "mkv", "thumbnail", "title", "subtitles", "embed", "cover"]) {
             ui.add_space(12.0);
             ui.heading("Remux");
             ui.label("Controls what gets embedded into MKV files when a recording is finalized (TS→MKV remux).");
@@ -14275,6 +14438,9 @@ impl StreamArchiverApp {
                 });
 
             // ── File Management ────────────────────────────────────────────────
+            }
+
+            if self.section_shown(SettingsTab::Recording, "File Management", &["file", "management", "subdirectories", "organize", "split", "folders"]) {
             ui.add_space(12.0);
             ui.heading("File Management");
             ui.label("Split captured files into per-type subdirectories under the monitor output directory.");
@@ -14305,6 +14471,9 @@ impl StreamArchiverApp {
                 });
 
             // ── Post-stream VOD download ────────────────────────────────────────
+            }
+
+            if self.section_shown(SettingsTab::Downloads, "Post-stream VOD download", &["vod", "download", "archive", "replace", "post-stream", "published"]) {
             ui.add_space(12.0);
             ui.heading("Post-stream VOD download 📼");
             ui.label(
@@ -14329,6 +14498,9 @@ impl StreamArchiverApp {
             );
 
             // ── Twitch VOD recovery ────────────────────────────────────────────
+            }
+
+            if self.section_shown(SettingsTab::Downloads, "Twitch VOD recovery", &["vod", "recovery", "muted", "deleted", "cdn", "recover", "unmute"]) {
             ui.add_space(12.0);
             ui.heading("Twitch VOD recovery 🛟");
             ui.label(
@@ -14408,6 +14580,9 @@ impl StreamArchiverApp {
                 });
 
             // ── Maintenance ────────────────────────────────────────────────────
+            }
+
+            if self.section_shown(SettingsTab::Maintenance, "Maintenance", &["maintenance", "re-remux", "remux all", "thumbnails", "reorganize", "batch", "preset"]) {
             ui.add_space(12.0);
             ui.heading("Maintenance 🔧");
             ui.label("One-time batch jobs — each runs in the background and reports progress in the Background tab.");
@@ -14501,6 +14676,9 @@ impl StreamArchiverApp {
                 });
             }
 
+            }
+
+            if self.section_shown(SettingsTab::System, "Diagnostics", &["diagnostics", "crash", "freeze", "dialog", "icon", "logs"]) {
             ui.add_space(12.0);
 
             // ── Diagnostics ────────────────────────────────────────────────────
@@ -14538,11 +14716,9 @@ impl StreamArchiverApp {
                     });
                     ui.end_row();
                 });
+            } // end Diagnostics section guard
 
             ui.add_space(16.0);
-            if ui.button("💾 Save settings").clicked() {
-                self.save_settings();
-            }
         });
     }
 
