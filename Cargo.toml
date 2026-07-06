@@ -41,8 +41,19 @@ image = { version = "0.25.8", default-features = false, features = ["png"] }
 # ships in the binary. resvg re-exports usvg + tiny-skia, so this is the only dep.
 resvg = { version = "0.45", default-features = false }
 
+# Debug builds: optimize dependencies (egui/image are 5-20x slower fully
+# unoptimized — enough to judder scrolling and window drags on their own)
+# while keeping our own crate at opt-level 1 for fast incremental compiles.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
 [profile.release]
-opt-level = "z"
+# Speed over size: "z" (size) visibly slows egui's per-frame layout and
+# tessellation; the binary grows some, but the UI is what we ship.
+opt-level = 3
 lto = true
 codegen-units = 1
 strip = true

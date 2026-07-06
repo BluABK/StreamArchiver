@@ -988,6 +988,13 @@ pub struct StreamArchiverApp {
     last_auto_reload: i64,
     /// TTL cache for per-row filesystem probes (see [`FsProbes`]).
     fs_probes: FsProbes,
+    /// Frame-invariant Streams-view data (see [`StreamsViewCache`]); rebuilt
+    /// once per second or when `streams_cache_rev` bumps.
+    streams_cache: Option<StreamsViewCache>,
+    /// Bumped whenever data feeding the Streams view changes NOW (reload
+    /// installed, expansion toggled, F5, settings saved) so the cache rebuilds
+    /// immediately instead of waiting for the next second tick.
+    streams_cache_rev: u64,
     /// Cached YouTube Data API quota for today and the configured daily cutoff.
     /// Updated by the background reload-rows thread; never read from DB on the
     /// render thread (which would block if the DB mutex is held elsewhere).
@@ -1469,6 +1476,8 @@ impl StreamArchiverApp {
             reload_queued: false,
             last_auto_reload: now_unix(),
             fs_probes: FsProbes::default(),
+            streams_cache: None,
+            streams_cache_rev: 0,
             yt_quota_today: 0,
             yt_quota_cutoff: 9000,
             yt_search_today: 0,
@@ -1585,6 +1594,7 @@ impl StreamArchiverApp {
         // Stream keys are "s<mid>:…" / "t<mid>:…"; keep only live monitors'.
         self.expanded_streams
             .retain(|k| stream_key_monitor(k).is_some_and(|mid| live_monitors.contains(&mid)));
+        self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
         let elapsed_ms = _t.elapsed().as_millis();
         if elapsed_ms >= 100 {
             warn!(elapsed_ms, rows = self.rows.len(), "reload_rows slow");
@@ -2187,6 +2197,27 @@ impl StreamArchiverApp {
     fn install_save_rows(&mut self, save: SaveRows) {
         // Capture existing channel ids before replacing, to detect the new one.
         let old_channel_ids: HashSet<i64> = self.channels.iter().map(|c| c.id).collect();
+        // A monitor whose latest-recording summary changed has new/updated rows
+        // in its history — drop its cached recordings so expanded history rows
+        // refresh on the next rebuild (they used to stay stale until F5).
+        {
+            let sig = |r: &MonitorWithChannel| {
+                (
+                    r.recording_count,
+                    r.last_recording_started,
+                    r.last_recording_ended,
+                    r.last_recording_status.clone(),
+                    r.last_recording_ad_count,
+                    r.last_recording_meta_changes,
+                )
+            };
+            let old: HashMap<i64, _> = self.rows.iter().map(|r| (r.monitor.id, sig(r))).collect();
+            for r in &save.rows {
+                if old.get(&r.monitor.id).is_some_and(|s| *s != sig(r)) {
+                    self.rec_cache.remove(&r.monitor.id);
+                }
+            }
+        }
         self.rows = save.rows;
         let by_mid: HashMap<i64, (i64, String)> = save
             .next_streams
@@ -2219,9 +2250,12 @@ impl StreamArchiverApp {
         self.expanded_instances.retain(|id| live_monitors.contains(id));
         self.expanded_streams
             .retain(|k| stream_key_monitor(k).is_some_and(|mid| live_monitors.contains(&mid)));
+        self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
     }
 
     fn save_settings(&mut self) {
+        // Settings (e.g. the date format) feed the cached Streams-view model.
+        self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
         let s = &self.settings;
         // Discord import counts as on only when a token backs the toggle.
         let discord_on = s.discord_schedule && !s.discord_token.trim().is_empty();
@@ -4397,6 +4431,24 @@ impl Cell {
     }
 }
 
+/// One Streams-table channel container + its instance-row indices into
+/// `StreamArchiverApp::rows`.
+struct ChanEntry {
+    channel: Channel,
+    rows: Vec<usize>,
+}
+
+/// The Streams view's frame-invariant data, cached across repaints (see the
+/// rebuild block in `channels_view`). `stamp` is (unix second, cache rev).
+struct StreamsViewCache {
+    stamp: (i64, u64),
+    chan_entries: Vec<ChanEntry>,
+    channel_avatars: HashMap<i64, egui::TextureHandle>,
+    channel_name_colors: HashMap<i64, (egui::Color32, bool)>,
+    groups: HashMap<i64, Vec<StreamGroup>>,
+    model: Vec<Vec<Cell>>,
+}
+
 fn cmp_sort_key(a: &SortKey, b: &SortKey) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (a, b) {
@@ -6150,6 +6202,7 @@ impl StreamArchiverApp {
             self.ad_break_cache.clear();
             self.meta_change_cache.clear();
             self.schedule_cache.clear();
+            self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
             self.spawn_pending_reload();
             if self.view == View::Schedule {
                 // Force a network re-fetch (not just a DB reload) + show current data.
@@ -10788,6 +10841,7 @@ impl StreamArchiverApp {
 
     fn channels_view(&mut self, ui: &mut egui::Ui) {
         if self.channels.is_empty() {
+            self.streams_cache = None;
             ui.add_space(24.0);
             ui.vertical_centered(|ui| {
                 ui.label("No channels yet.");
@@ -10826,148 +10880,6 @@ impl StreamArchiverApp {
             .iter()
             .any(|r| r.last_recording_status.as_deref() == Some("recording"));
 
-        // Build one entry per channel container (including empty ones), attaching
-        // its instance rows (indices into self.rows).
-        struct ChanEntry {
-            channel: Channel,
-            rows: Vec<usize>,
-        }
-        let mut rows_by_channel: HashMap<i64, Vec<usize>> = HashMap::new();
-        for (i, row) in self.rows.iter().enumerate() {
-            rows_by_channel.entry(row.channel.id).or_default().push(i);
-        }
-        let chan_entries: Vec<ChanEntry> = self
-            .channels
-            .iter()
-            .map(|c| ChanEntry {
-                channel: c.clone(),
-                rows: rows_by_channel.get(&c.id).cloned().unwrap_or_default(),
-            })
-            .collect();
-
-        // Resolve each container's avatar (its chosen-platform profile pic) and its
-        // name colour up front — both need `&mut self` (caches), so the read-only
-        // table closure below can just look them up by channel id.
-        let mut channel_avatars: HashMap<i64, egui::TextureHandle> = HashMap::new();
-        // Per-container name colour as (base, adjust): `adjust` marks a fetched
-        // Twitch broadcaster colour that should be made readable against the row's
-        // *effective* background at render time (rows tint when recording/ad/error).
-        // Manual + auto-palette colours are used as-is (already curated).
-        let mut channel_name_colors: HashMap<i64, (egui::Color32, bool)> = HashMap::new();
-        for e in &chan_entries {
-            let cid = e.channel.id;
-            let platforms = {
-                let mons: Vec<&MonitorWithChannel> =
-                    e.rows.iter().map(|&i| &self.rows[i]).collect();
-                channel_platforms(&mons)
-            };
-            let tex = self
-                .channel_icons_small
-                .entry(cid)
-                .or_insert_with(|| resolve_channel_icon_small(&e.channel, &platforms, ui.ctx()))
-                .clone();
-            if let Some(t) = tex {
-                channel_avatars.insert(cid, t);
-            }
-            // Name colour: a manual custom colour wins; otherwise tint Twitch
-            // channels with the streamer's own (cached) name colour; otherwise the
-            // automatic palette.
-            let name_color = if !e.channel.color.is_empty() {
-                (channel_event_color(cid, &e.channel.color), false)
-            } else if platforms.contains(&Platform::Twitch) {
-                match *self
-                    .channel_twitch_colors
-                    .entry(cid)
-                    .or_insert_with(|| load_twitch_name_color(&e.channel.name))
-                {
-                    Some(c) => (c, true), // raw broadcaster colour → readability at render
-                    None => (channel_event_color(cid, ""), false),
-                }
-            } else {
-                (channel_event_color(cid, ""), false)
-            };
-            channel_name_colors.insert(cid, name_color);
-        }
-
-        // Lazily load + cache recordings for currently-expanded monitors, then
-        // group each monitor's takes into streams.
-        // A channel always shows its instances when expanded; an instance shows
-        // its stream history when *it* is expanded — so we only need recordings
-        // for expanded instances inside expanded channels.
-        let mut expanded_monitors: Vec<i64> = Vec::new();
-        for e in &chan_entries {
-            if !self.expanded_channels.contains(&e.channel.id) {
-                continue;
-            }
-            for &ri in &e.rows {
-                let mid = self.rows[ri].monitor.id;
-                if self.expanded_instances.contains(&mid) {
-                    expanded_monitors.push(mid);
-                }
-            }
-        }
-        for &mid in &expanded_monitors {
-            if !self.rec_cache.contains_key(&mid) {
-                let recs = self
-                    .core
-                    .store
-                    .recordings_for_monitor(mid)
-                    .unwrap_or_default();
-                self.rec_cache.insert(mid, recs);
-            }
-        }
-        let groups: HashMap<i64, Vec<StreamGroup>> = expanded_monitors
-            .iter()
-            .map(|&mid| {
-                let recs = self.rec_cache.get(&mid).map(Vec::as_slice).unwrap_or(&[]);
-                (mid, group_recordings(recs))
-            })
-            .collect();
-
-        // Per-recording ad-break detail (offsets) for the cut-list tooltips on
-        // expanded history rows. Cached (cleared on reload) so we issue the SELECT
-        // once per take with ads, not every frame; bounded by what's expanded.
-        for &mid in &expanded_monitors {
-            let need: Vec<i64> = match self.rec_cache.get(&mid) {
-                Some(recs) => recs
-                    .iter()
-                    .filter(|r| r.ad_count > 0 && !self.ad_break_cache.contains_key(&r.id))
-                    .map(|r| r.id)
-                    .collect(),
-                None => Vec::new(),
-            };
-            for rid in need {
-                let v = self
-                    .core
-                    .store
-                    .ad_breaks_for_recording(rid)
-                    .unwrap_or_default();
-                self.ad_break_cache.insert(rid, v);
-            }
-        }
-        let ad_breaks = &self.ad_break_cache;
-        // Same lazy caching for per-recording title/category change logs.
-        for &mid in &expanded_monitors {
-            let need: Vec<i64> = match self.rec_cache.get(&mid) {
-                Some(recs) => recs
-                    .iter()
-                    .filter(|r| {
-                        r.meta_change_count > 0 && !self.meta_change_cache.contains_key(&r.id)
-                    })
-                    .map(|r| r.id)
-                    .collect(),
-                None => Vec::new(),
-            };
-            for rid in need {
-                let v = self
-                    .core
-                    .store
-                    .meta_changes_for_recording(rid)
-                    .unwrap_or_default();
-                self.meta_change_cache.insert(rid, v);
-            }
-        }
-        let meta_logs = &self.meta_change_cache;
         // Collected in the table closure (which borrows `self` immutably), applied
         // afterwards: a double-click on an ad / changes cell opens that take's popup.
         let mut open_ad_popup: Option<i64> = None;
@@ -10981,21 +10893,182 @@ impl StreamArchiverApp {
         // Snapshot which monitors currently have an ad playing (for the row tint).
         let ad_active = self.core.ad_active.lock().unwrap().clone();
         let ad_running = |mid: i64| ad_active.get(&mid).is_some_and(|&end| now < end);
-        // Snapshot which monitors have a live capture process — shared by the
-        // sort/filter model and the row render so the State sort can't lag the
-        // rendered state dot within a frame.
+        // Snapshot which monitors have a live capture process (state dots/tints).
         let active_ids: HashSet<i64> =
             self.core.active.lock().unwrap().keys().copied().collect();
 
-        // Channel-level sort/filter model (one entry per top-level channel row).
-        let model: Vec<Vec<Cell>> = chan_entries
-            .iter()
-            .map(|e| {
-                let mons: Vec<&MonitorWithChannel> =
-                    e.rows.iter().map(|&i| &self.rows[i]).collect();
-                channel_cells(&e.channel, &mons, &active_ids, now)
-            })
-            .collect();
+        // ── Frame-invariant view data, cached across repaints ────────────────
+        // Rebuilding this every frame — cloning every Channel, re-grouping every
+        // expanded monitor's recordings and re-formatting the whole sort model —
+        // dominated frame time under mouse-move repaint rates. Rebuilt when the
+        // second ticks (durations / sort keys) or `streams_cache_rev` bumps
+        // (reload installed, expansion toggled, F5, settings saved).
+        let stamp = (now, self.streams_cache_rev);
+        if self.streams_cache.as_ref().map(|c| c.stamp) != Some(stamp) {
+            // One entry per channel container (including empty ones), attaching
+            // its instance rows (indices into self.rows).
+            let mut rows_by_channel: HashMap<i64, Vec<usize>> = HashMap::new();
+            for (i, row) in self.rows.iter().enumerate() {
+                rows_by_channel.entry(row.channel.id).or_default().push(i);
+            }
+            let chan_entries: Vec<ChanEntry> = self
+                .channels
+                .iter()
+                .map(|c| ChanEntry {
+                    channel: c.clone(),
+                    rows: rows_by_channel.get(&c.id).cloned().unwrap_or_default(),
+                })
+                .collect();
+
+            // Resolve each container's avatar (its chosen-platform profile pic)
+            // and its name colour up front — both need `&mut self` (caches), so
+            // the read-only table closure below can just look them up by id.
+            let mut channel_avatars: HashMap<i64, egui::TextureHandle> = HashMap::new();
+            // Per-container name colour as (base, adjust): `adjust` marks a fetched
+            // Twitch broadcaster colour that should be made readable against the row's
+            // *effective* background at render time (rows tint when recording/ad/error).
+            // Manual + auto-palette colours are used as-is (already curated).
+            let mut channel_name_colors: HashMap<i64, (egui::Color32, bool)> = HashMap::new();
+            for e in &chan_entries {
+                let cid = e.channel.id;
+                let platforms = {
+                    let mons: Vec<&MonitorWithChannel> =
+                        e.rows.iter().map(|&i| &self.rows[i]).collect();
+                    channel_platforms(&mons)
+                };
+                let tex = self
+                    .channel_icons_small
+                    .entry(cid)
+                    .or_insert_with(|| resolve_channel_icon_small(&e.channel, &platforms, ui.ctx()))
+                    .clone();
+                if let Some(t) = tex {
+                    channel_avatars.insert(cid, t);
+                }
+                // Name colour: a manual custom colour wins; otherwise tint Twitch
+                // channels with the streamer's own (cached) name colour; otherwise the
+                // automatic palette.
+                let name_color = if !e.channel.color.is_empty() {
+                    (channel_event_color(cid, &e.channel.color), false)
+                } else if platforms.contains(&Platform::Twitch) {
+                    match *self
+                        .channel_twitch_colors
+                        .entry(cid)
+                        .or_insert_with(|| load_twitch_name_color(&e.channel.name))
+                    {
+                        Some(c) => (c, true), // raw broadcaster colour → readability at render
+                        None => (channel_event_color(cid, ""), false),
+                    }
+                } else {
+                    (channel_event_color(cid, ""), false)
+                };
+                channel_name_colors.insert(cid, name_color);
+            }
+
+            // Lazily load + cache recordings for currently-expanded monitors, then
+            // group each monitor's takes into streams.
+            // A channel always shows its instances when expanded; an instance shows
+            // its stream history when *it* is expanded — so we only need recordings
+            // for expanded instances inside expanded channels.
+            let mut expanded_monitors: Vec<i64> = Vec::new();
+            for e in &chan_entries {
+                if !self.expanded_channels.contains(&e.channel.id) {
+                    continue;
+                }
+                for &ri in &e.rows {
+                    let mid = self.rows[ri].monitor.id;
+                    if self.expanded_instances.contains(&mid) {
+                        expanded_monitors.push(mid);
+                    }
+                }
+            }
+            for &mid in &expanded_monitors {
+                if !self.rec_cache.contains_key(&mid) {
+                    let recs = self
+                        .core
+                        .store
+                        .recordings_for_monitor(mid)
+                        .unwrap_or_default();
+                    self.rec_cache.insert(mid, recs);
+                }
+            }
+            let groups: HashMap<i64, Vec<StreamGroup>> = expanded_monitors
+                .iter()
+                .map(|&mid| {
+                    let recs = self.rec_cache.get(&mid).map(Vec::as_slice).unwrap_or(&[]);
+                    (mid, group_recordings(recs))
+                })
+                .collect();
+
+            // Per-recording ad-break detail (offsets) for the cut-list tooltips on
+            // expanded history rows. Cached (cleared on reload) so we issue the SELECT
+            // once per take with ads, not every rebuild; bounded by what's expanded.
+            for &mid in &expanded_monitors {
+                let need: Vec<i64> = match self.rec_cache.get(&mid) {
+                    Some(recs) => recs
+                        .iter()
+                        .filter(|r| r.ad_count > 0 && !self.ad_break_cache.contains_key(&r.id))
+                        .map(|r| r.id)
+                        .collect(),
+                    None => Vec::new(),
+                };
+                for rid in need {
+                    let v = self
+                        .core
+                        .store
+                        .ad_breaks_for_recording(rid)
+                        .unwrap_or_default();
+                    self.ad_break_cache.insert(rid, v);
+                }
+            }
+            // Same lazy caching for per-recording title/category change logs.
+            for &mid in &expanded_monitors {
+                let need: Vec<i64> = match self.rec_cache.get(&mid) {
+                    Some(recs) => recs
+                        .iter()
+                        .filter(|r| {
+                            r.meta_change_count > 0 && !self.meta_change_cache.contains_key(&r.id)
+                        })
+                        .map(|r| r.id)
+                        .collect(),
+                    None => Vec::new(),
+                };
+                for rid in need {
+                    let v = self
+                        .core
+                        .store
+                        .meta_changes_for_recording(rid)
+                        .unwrap_or_default();
+                    self.meta_change_cache.insert(rid, v);
+                }
+            }
+
+            // Channel-level sort/filter model (one entry per top-level channel row).
+            let model: Vec<Vec<Cell>> = chan_entries
+                .iter()
+                .map(|e| {
+                    let mons: Vec<&MonitorWithChannel> =
+                        e.rows.iter().map(|&i| &self.rows[i]).collect();
+                    channel_cells(&e.channel, &mons, &active_ids, now)
+                })
+                .collect();
+
+            self.streams_cache = Some(StreamsViewCache {
+                stamp,
+                chan_entries,
+                channel_avatars,
+                channel_name_colors,
+                groups,
+                model,
+            });
+        }
+        let cache = self.streams_cache.as_ref().unwrap();
+        let chan_entries = &cache.chan_entries;
+        let channel_avatars = &cache.channel_avatars;
+        let channel_name_colors = &cache.channel_name_colors;
+        let groups = &cache.groups;
+        let model = &cache.model;
+        let ad_breaks = &self.ad_break_cache;
+        let meta_logs = &self.meta_change_cache;
         let mut sort = self.streams_sort.clone();
         let mut filters = self.streams_filters.clone();
         if filters.len() != STREAM_COLS {
@@ -11089,7 +11162,7 @@ impl StreamArchiverApp {
                     Stream { mid: i64, gi: usize, depth: usize },
                     Take { mid: i64, gi: usize, ti: usize, depth: usize },
                 }
-                let order = ordered_rows(&model, &sort, &filters);
+                let order = ordered_rows(model, &sort, &filters);
                 let mut vis: Vec<Vis> = Vec::new();
                 for &ci in &order {
                     let e = &chan_entries[ci];
@@ -12377,6 +12450,10 @@ impl StreamArchiverApp {
                 .request_repaint_after(std::time::Duration::from_secs(1));
         }
 
+        if toggle_channel.is_some() || toggle_instance.is_some() || toggle_stream.is_some() {
+            // Expansion feeds the cached view data — rebuild it right away.
+            self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
+        }
         if let Some(id) = toggle_channel {
             if !self.expanded_channels.remove(&id) {
                 self.expanded_channels.insert(id);
@@ -12531,6 +12608,11 @@ impl StreamArchiverApp {
         if let Some(rid) = delete_recording {
             if let Err(e) = self.core.store.delete_recording(rid) {
                 self.status = format!("Error: {e}");
+            }
+            // Drop it from the cached history immediately — reload_rows keeps
+            // per-monitor caches, so the row would otherwise linger until F5.
+            for recs in self.rec_cache.values_mut() {
+                recs.retain(|r| r.id != rid);
             }
             // The take (and its cascaded ad breaks / meta changes) is gone; close
             // any popup that referenced it (a take popup for it, or a stream popup
@@ -18107,8 +18189,12 @@ impl StreamArchiverApp {
             self.channel_properties_popup = None;
             self.props_load = None;
         }
-        // Keep frames coming so we poll the loader (the spinner also animates).
-        ctx.request_repaint();
+        // Keep frames coming while a load is in flight so we poll the loader
+        // (the spinner animates too) — but NOT unconditionally: that busy-looped
+        // the whole app at max FPS for as long as the window stayed open.
+        if self.props_load.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
         false
     }
 
