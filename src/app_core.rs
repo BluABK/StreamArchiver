@@ -257,6 +257,19 @@ impl AppCore {
         //   2) resume_inflight for any legacy in-flight recording WITHOUT a registry
         //      row (registry-backed ones are excluded so they aren't double-handled).
         // Then sweep stale `.cache\` working files, protecting every still-needed stem.
+        // CDN recoveries are in-process tasks — none survive a restart. Reset
+        // any row a crash left stuck in 'recovering' (permanent badge +
+        // excluded from bulk scans otherwise).
+        match self.store.reset_stale_recovering() {
+            Ok(n) if n > 0 => warn!(n, "reset stale 'recovering' takes from a previous session"),
+            _ => {}
+        }
+        // Same for VOD archives whose pre-download wait died with the app —
+        // an adopted detached download re-archives over the 'failed' on finish.
+        match self.store.reset_stale_vod_downloading() {
+            Ok(n) if n > 0 => warn!(n, "reset stale 'downloading' VOD archives from a previous session"),
+            _ => {}
+        }
         let (reattach_items, mut skip_stems) = supervisor.reconcile_detached();
         // Surface what we recovered: name the PIDs we're re-attaching to (still
         // running from a previous session); fall back to a count for ones that only

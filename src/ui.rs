@@ -988,6 +988,20 @@ pub struct StreamArchiverApp {
     last_auto_reload: i64,
     /// TTL cache for per-row filesystem probes (see [`FsProbes`]).
     fs_probes: FsProbes,
+    /// When the Videos list was last re-read from the store. The tab shows
+    /// live progress, but a 1s TTL replaces the old full SELECT every frame.
+    videos_refreshed: Option<std::time::Instant>,
+    /// Bumped whenever `self.videos` is reloaded — keys the sort-model cache.
+    videos_rev: u64,
+    /// Videos sort/filter model cache: (videos_rev, unix second, model).
+    /// Second granularity keeps speed cells ticking without per-frame rebuild.
+    videos_model_cache: Option<(u64, i64, Vec<Vec<Cell>>)>,
+    /// Lowercased `settings_search`, kept in sync on edit — `section_shown`
+    /// runs per section per frame and must not re-lowercase each call.
+    settings_search_lc: String,
+    /// Cached recovery CDN host count for the Settings label (5s TTL) — the
+    /// old code re-read + re-parsed the host list from the store every frame.
+    recovery_host_count: Option<(std::time::Instant, usize)>,
     /// Frame-invariant Streams-view data (see [`StreamsViewCache`]); rebuilt
     /// once per second or when `streams_cache_rev` bumps.
     streams_cache: Option<StreamsViewCache>,
@@ -1476,6 +1490,11 @@ impl StreamArchiverApp {
             reload_queued: false,
             last_auto_reload: now_unix(),
             fs_probes: FsProbes::default(),
+            videos_refreshed: None,
+            videos_rev: 0,
+            videos_model_cache: None,
+            settings_search_lc: String::new(),
+            recovery_host_count: None,
             streams_cache: None,
             streams_cache_rev: 0,
             yt_quota_today: 0,
@@ -1608,6 +1627,8 @@ impl StreamArchiverApp {
             Ok(v) => self.videos = v,
             Err(e) => warn!("failed to load videos: {e:#}"),
         }
+        self.videos_refreshed = Some(std::time::Instant::now());
+        self.videos_rev = self.videos_rev.wrapping_add(1);
     }
 
     /// Spawn a background thread to reload the Schedule calendar.  The result is
@@ -1924,6 +1945,17 @@ impl StreamArchiverApp {
                         self.finished_tasks.insert(0, (task, outcome, now_unix()));
                         self.finished_tasks.truncate(100);
                     }
+                    dirty = true;
+                }
+                Ok(crate::events::AppEvent::RecordingUpdated { recording_id }) => {
+                    // Recovery/VOD-archive updates change per-recording fields
+                    // the reload's change-summary can't see (recovery_state,
+                    // vod_dl_*), so drop the owning monitor's cached history —
+                    // the 🛟/📼 badges refresh on the next rebuild instead of
+                    // waiting for F5.
+                    self.rec_cache
+                        .retain(|_, recs| !recs.iter().any(|r| r.id == recording_id));
+                    self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
                     dirty = true;
                 }
                 Ok(_) => dirty = true,
@@ -4439,7 +4471,8 @@ struct ChanEntry {
 }
 
 /// The Streams view's frame-invariant data, cached across repaints (see the
-/// rebuild block in `channels_view`). `stamp` is (unix second, cache rev).
+/// rebuild block in `channels_view`). `stamp` is (unix second — 0 while no
+/// capture is active, so an idle grid never rebuilds on time alone; cache rev).
 struct StreamsViewCache {
     stamp: (i64, u64),
     chan_entries: Vec<ChanEntry>,
@@ -4481,7 +4514,13 @@ fn ordered_rows(rows: &[Vec<Cell>], sort: &SortState, filters: &[String]) -> Vec
                 active.iter().all(|(c, f)| {
                     rows[i]
                         .get(*c)
-                        .map(|cell| cell.text.to_lowercase().contains(f))
+                        .map(|cell| match &cell.key {
+                            // Text cells store a pre-lowercased sort key —
+                            // match it instead of re-lowercasing the display
+                            // text per row per frame.
+                            SortKey::Text(k) => k.contains(f.as_str()),
+                            SortKey::Num(_) => cell.text.to_lowercase().contains(f.as_str()),
+                        })
                         .unwrap_or(true)
                 })
             })
@@ -5015,6 +5054,8 @@ fn render_instance_row(
     recording: bool,
     chat_active: bool,
     tint: Option<egui::Color32>,
+    // TTL-cached `output_dir` existence (menus re-run per frame while open).
+    output_dir_ok: bool,
     depth: usize,
     has_history: bool,
     expanded: bool,
@@ -5056,7 +5097,7 @@ fn render_instance_row(
             ui.ctx().open_url(egui::OpenUrl::new_tab(row.monitor.url.clone()));
             ui.close();
         }
-        let folder_exists = std::path::Path::new(&m.output_dir).is_dir();
+        let folder_exists = output_dir_ok;
         if ui
             .add_enabled(folder_exists, egui::Button::new("📂  Open output folder"))
             .clicked()
@@ -6838,8 +6879,15 @@ impl StreamArchiverApp {
     }
 
     fn videos_list(&mut self, ui: &mut egui::Ui) {
-        // Reflect background progress whenever the list is shown.
-        self.reload_videos();
+        // Reflect background progress while the list is shown — on a 1s TTL,
+        // not the old full list_videos() SELECT every frame (events also
+        // reload directly, so changes still land promptly).
+        if self
+            .videos_refreshed
+            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1))
+        {
+            self.reload_videos();
+        }
 
         if self.videos.is_empty() {
             ui.add_space(24.0);
@@ -6863,7 +6911,20 @@ impl StreamArchiverApp {
 
         // Build the sort/filter model and take the persisted sort/filter state
         // into locals (written back after the table is drawn).
-        let model: Vec<Vec<Cell>> = self.videos.iter().map(|v| video_cells(v, &speed)).collect();
+        // Model cache: rebuilt when the list reloads or (while anything is
+        // downloading) the second ticks for the speed cells — not every frame.
+        let now_sec = crate::models::now_unix();
+        let model_sec = if speed.is_empty() { 0 } else { now_sec };
+        let model_stale = self
+            .videos_model_cache
+            .as_ref()
+            .map(|(rev, sec, _)| *rev != self.videos_rev || *sec != model_sec)
+            .unwrap_or(true);
+        if model_stale {
+            let m: Vec<Vec<Cell>> = self.videos.iter().map(|v| video_cells(v, &speed)).collect();
+            self.videos_model_cache = Some((self.videos_rev, model_sec, m));
+        }
+        let model = &self.videos_model_cache.as_ref().unwrap().2;
         let mut sort = self.videos_sort.clone();
         let mut filters = self.videos_filters.clone();
         if filters.len() != VIDEO_COLS {
@@ -6927,7 +6988,7 @@ impl StreamArchiverApp {
                         }
                     });
                 table.body(|body| {
-                        let order = ordered_rows(&model, &sort, &filters);
+                        let order = ordered_rows(model, &sort, &filters);
                         // Virtualized: only the rows in view are laid out.
                         body.rows(24.0, order.len(), |mut tr| {
                                 let vi = order[tr.index()];
@@ -6936,6 +6997,17 @@ impl StreamArchiverApp {
                                 // honoring the top-bar "Status bgcolor" toggle
                                 // (painted per cell — see `tint_cell`).
                                 let tint = video_row_tint(&v.status, sel_color, status_bgcolor);
+                                // Probed once per row through the TTL cache —
+                                // an open context menu re-runs its closure
+                                // every frame, and direct stats can block for
+                                // seconds on a sleeping/network drive.
+                                let row_file_ok = !v.output_path.is_empty()
+                                    && self
+                                        .fs_probes
+                                        .is_file(std::path::Path::new(&v.output_path));
+                                let row_dir_ok = self
+                                    .fs_probes
+                                    .is_dir(std::path::Path::new(&v.output_dir));
                                 // Reusable menu body (a `Fn`), attached to the row and
                                 // each inline action button so right-clicking anywhere
                                 // on the row opens it. Open/copy are handled inline;
@@ -6954,8 +7026,7 @@ impl StreamArchiverApp {
                                             ui.close();
                                         }
                                         ui.separator();
-                                        let file_ok = !v.output_path.is_empty()
-                                            && std::path::Path::new(&v.output_path).is_file();
+                                        let file_ok = row_file_ok;
                                         if ui
                                             .add_enabled(file_ok, egui::Button::new("▶  Open file"))
                                             .clicked()
@@ -6965,7 +7036,7 @@ impl StreamArchiverApp {
                                             ));
                                             ui.close();
                                         }
-                                        let dir_ok = std::path::Path::new(&v.output_dir).is_dir();
+                                        let dir_ok = row_dir_ok;
                                         if ui
                                             .add_enabled(
                                                 dir_ok,
@@ -7083,9 +7154,7 @@ impl StreamArchiverApp {
                                                     }
                                                     btns.push(b);
                                                 }
-                                                let dir_ok = self
-                                                    .fs_probes
-                                                    .is_dir(std::path::Path::new(&v.output_dir));
+                                                let dir_ok = row_dir_ok;
                                                 let b = ui
                                                     .add_enabled(dir_ok, egui::Button::new("📂").small())
                                                     .on_hover_text("Open output folder");
@@ -7095,10 +7164,7 @@ impl StreamArchiverApp {
                                                     ));
                                                 }
                                                 btns.push(b);
-                                                let file_ok = !v.output_path.is_empty()
-                                                    && self
-                                                        .fs_probes
-                                                        .is_file(std::path::Path::new(&v.output_path));
+                                                let file_ok = row_file_ok;
                                                 let b = ui
                                                     .add_enabled(file_ok, egui::Button::new("▶").small())
                                                     .on_hover_text("Open file");
@@ -7773,6 +7839,12 @@ impl StreamArchiverApp {
         f.login = parsed.login.clone();
         f.broadcast_id = parsed.broadcast_id.clone();
         f.went_live_approx = false;
+        // A tracker link identifies a (possibly different) broadcast — drop any
+        // vod_id left from a recording seed or an earlier /videos/ paste, or the
+        // GQL fast-path would confidently resolve the WRONG VOD; and go back to
+        // the safe full-probe mode.
+        f.vod_id = None;
+        f.deleted = true;
         let scrape = self.recover_scrape.clone();
         let client = Self::recover_http_client();
         *scrape.lock().unwrap() = RecoverScrape::Running;
@@ -10901,9 +10973,14 @@ impl StreamArchiverApp {
         // Rebuilding this every frame — cloning every Channel, re-grouping every
         // expanded monitor's recordings and re-formatting the whole sort model —
         // dominated frame time under mouse-move repaint rates. Rebuilt when the
-        // second ticks (durations / sort keys) or `streams_cache_rev` bumps
-        // (reload installed, expansion toggled, F5, settings saved).
-        let stamp = (now, self.streams_cache_rev);
+        // second ticks (durations / sort keys — but those only move while a
+        // capture is active, so a fully idle grid doesn't rebuild at all) or
+        // when `streams_cache_rev` bumps (reload installed, expansion toggled,
+        // F5, settings saved).
+        let stamp = (
+            if active_ids.is_empty() { 0 } else { now },
+            self.streams_cache_rev,
+        );
         if self.streams_cache.as_ref().map(|c| c.stamp) != Some(stamp) {
             // One entry per channel container (including empty ones), attaching
             // its instance rows (indices into self.rows).
@@ -11568,9 +11645,12 @@ impl StreamArchiverApp {
                                         None
                                     })
                                 };
+                                let output_dir_ok = self
+                                    .fs_probes
+                                    .is_dir(std::path::Path::new(&row.monitor.output_dir));
                                 if render_instance_row(
                                     &mut tr, row, &ptex, now, recording, chat_active,
-                                    tint, depth, has_hist, expanded,
+                                    tint, output_dir_ok, depth, has_hist, expanded,
                                     inst_needs_remux,
                                     inst_stream_target.as_ref(), &media_player,
                                     &col_order, &mut acts,
@@ -11808,7 +11888,9 @@ impl StreamArchiverApp {
                                             ui.close();
                                         }
                                         if let Some(f) = &single_file {
-                                            let file_ok = std::path::Path::new(f).is_file();
+                                            // TTL-cached: menus re-run per frame while open.
+                                            let file_ok =
+                                                self.fs_probes.is_file(std::path::Path::new(f));
                                             if ui
                                                 .add_enabled(
                                                     file_ok,
@@ -12317,7 +12399,8 @@ impl StreamArchiverApp {
                                             ui.close();
                                         }
                                         if let Some(rp) = t.recovered_path.as_ref().filter(|p| !p.is_empty()) {
-                                            let rp_ok = std::path::Path::new(rp).is_file();
+                                            let rp_ok =
+                                                self.fs_probes.is_file(std::path::Path::new(rp));
                                             if ui
                                                 .add_enabled(rp_ok, egui::Button::new("🛟  Open recovered file"))
                                                 .clicked()
@@ -12337,7 +12420,8 @@ impl StreamArchiverApp {
                                             ui.close();
                                         }
                                         if let Some(vp) = t.vod_dl_path.as_ref().filter(|p| !p.is_empty()) {
-                                            let vp_ok = std::path::Path::new(vp).is_file();
+                                            let vp_ok =
+                                                self.fs_probes.is_file(std::path::Path::new(vp));
                                             if ui
                                                 .add_enabled(vp_ok, egui::Button::new("📼  Open downloaded VOD"))
                                                 .clicked()
@@ -13374,11 +13458,13 @@ impl StreamArchiverApp {
     /// the selected category tab's sections show; when searching, any section whose
     /// title or keywords match the query shows (across all categories).
     fn section_shown(&self, tab: SettingsTab, title: &str, keywords: &[&str]) -> bool {
-        let q = self.settings_search.trim().to_lowercase();
+        // Runs per section per frame — the lowercased query is maintained on
+        // edit (`settings_search_lc`), never recomputed here.
+        let q = &self.settings_search_lc;
         if q.is_empty() {
             return self.settings_tab == tab;
         }
-        title.to_lowercase().contains(&q) || keywords.iter().any(|k| k.contains(q.as_str()))
+        title.to_lowercase().contains(q.as_str()) || keywords.iter().any(|k| k.contains(q.as_str()))
     }
 
     fn settings_view(&mut self, ui: &mut egui::Ui) {
@@ -13386,13 +13472,19 @@ impl StreamArchiverApp {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label("🔎");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.settings_search)
-                    .hint_text("Search settings…")
-                    .desired_width(200.0),
-            );
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.settings_search)
+                        .hint_text("Search settings…")
+                        .desired_width(200.0),
+                )
+                .changed()
+            {
+                self.settings_search_lc = self.settings_search.trim().to_lowercase();
+            }
             if !self.settings_search.is_empty() && ui.small_button("✕").clicked() {
                 self.settings_search.clear();
+                self.settings_search_lc.clear();
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("💾 Save settings").clicked() {
@@ -14808,7 +14900,16 @@ impl StreamArchiverApp {
                         self.core.manual(ManualCommand::RefreshCdnHosts);
                         self.status = "Refreshing CDN hosts…".into();
                     }
-                    let known = crate::recovery::load_hosts(&self.core.store).len();
+                    // Cached: re-reading + re-parsing the host list from the
+                    // store every frame stalls rendering on the DB mutex.
+                    let known = match self.recovery_host_count {
+                        Some((at, n)) if at.elapsed() < std::time::Duration::from_secs(5) => n,
+                        _ => {
+                            let n = crate::recovery::load_hosts(&self.core.store).len();
+                            self.recovery_host_count = Some((std::time::Instant::now(), n));
+                            n
+                        }
+                    };
                     ui.label(format!("{known} CDN hosts known (built-in + learned + extra)."));
                     ui.end_row();
 
@@ -17605,6 +17706,10 @@ impl StreamArchiverApp {
                                             popup.load_state = state.clone();
                                             popup.recording = Some(new_rec);
                                             popup.last_reload = std::time::Instant::now();
+                                            // Keyed on (query, count) only — a
+                                            // different log with the same count
+                                            // would reuse stale match indices.
+                                            popup.filter_cache = None;
                                             self.core.rt.spawn(load_chat(
                                                 state,
                                                 popup.loading.clone(),
@@ -17728,16 +17833,20 @@ impl StreamArchiverApp {
                                     // laid out — everything else is two
                                     // spacers, so a 6-hour log renders a few
                                     // dozen rows per frame, not all of them.
-                                    let top = viewport.min.y - OVERSCAN;
-                                    let bottom = viewport.max.y + OVERSCAN;
-                                    let mut y = 0.0f32;
+                                    // f64 accumulation: an f32 running sum
+                                    // drifts past ~2M px (100k+ rows), which
+                                    // desyncs offsets from rendered heights
+                                    // and can retrigger repaints forever.
+                                    let top = f64::from(viewport.min.y - OVERSCAN);
+                                    let bottom = f64::from(viewport.max.y + OVERSCAN);
+                                    let mut y = 0.0f64;
                                     let mut first = count;
-                                    let mut offset = 0.0f32;
+                                    let mut offset = 0.0f64;
                                     let mut last = count;
-                                    let mut last_y = 0.0f32;
+                                    let mut last_y = 0.0f64;
                                     for di in 0..count {
                                         let mi = filtered.map_or(di, |v| v[di] as usize);
-                                        let h = log.row_heights[mi] + GAP;
+                                        let h = f64::from(log.row_heights[mi] + GAP);
                                         if first == count && y + h > top {
                                             first = di;
                                             offset = y;
@@ -17752,7 +17861,7 @@ impl StreamArchiverApp {
                                         last_y = y;
                                     }
                                     let total = y;
-                                    ui.add_space(offset);
+                                    ui.add_space(offset as f32);
                                     let mut mismeasured = false;
                                     for di in first..last {
                                         let mi = filtered.map_or(di, |v| v[di] as usize);
@@ -17779,7 +17888,7 @@ impl StreamArchiverApp {
                                     // the rendered window so the scrollbar
                                     // spans the whole log.
                                     if total > last_y {
-                                        ui.add_space(total - last_y);
+                                        ui.add_space((total - last_y) as f32);
                                     }
                                     if mismeasured {
                                         // Offsets were computed from estimates
@@ -21300,6 +21409,10 @@ fn parse_chat_chunk(
     twitch_dir: Option<&Path>,
 ) -> anyhow::Result<ChatChunk> {
     use std::io::{Read, Seek, SeekFrom};
+    // Read window: bounds peak memory on huge logs — the previous whole-range
+    // slurp held roughly 2x the file size in RAM for a marathon stream's
+    // phase-2 parse.
+    const WINDOW: usize = 8 * 1024 * 1024;
     let mut f = File::open(path)?;
     let len = f.metadata()?.len();
     let end = to.unwrap_or(len).min(len);
@@ -21307,36 +21420,52 @@ fn parse_chat_chunk(
         return Ok(ChatChunk { messages: Vec::new(), fetches: Vec::new(), parsed_to: from });
     }
     f.seek(SeekFrom::Start(from))?;
-    let mut buf = vec![0u8; (end - from) as usize];
-    f.read_exact(&mut buf)?;
-    let cut = match buf.iter().rposition(|&b| b == b'\n') {
-        Some(i) => i + 1,
-        // A bounded chunk ends on a known line boundary; an unbounded tail
-        // with no newline at all is one still-growing partial line.
-        None if to.is_some() => buf.len(),
-        None => 0,
-    };
-    let text = String::from_utf8_lossy(&buf[..cut]);
     let is_yt = path.to_string_lossy().ends_with("live_chat.json");
     let start_ms = start_unix_secs as f64 * 1000.0;
     let mut messages = Vec::new();
     let mut fetches: Vec<EmojiFetch> = Vec::new();
-    for line in text.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        if is_yt {
-            parse_yt_chat_line(line, &mut messages, &mut fetches);
-        } else if let Some(m) =
-            parse_twitch_chat_line(line, start_ms, emote_map, twitch_dir, &mut fetches)
+    let mut parsed_to = from;
+    let mut pos = from;
+    // Carries a partial line across window boundaries.
+    let mut buf: Vec<u8> = Vec::new();
+    while pos < end {
+        let take = WINDOW.min((end - pos) as usize);
+        let old_len = buf.len();
+        buf.resize(old_len + take, 0);
+        f.read_exact(&mut buf[old_len..])?;
+        pos += take as u64;
+        let complete = match buf.iter().rposition(|&b| b == b'\n') {
+            Some(i) => i + 1,
+            // No boundary yet — a single line larger than the window; grow
+            // the buffer with the next window.
+            None if pos < end => continue,
+            // A bounded chunk ends on a known line boundary; an unbounded
+            // tail can end mid-line while the logger is writing.
+            None if to.is_some() => buf.len(),
+            None => 0,
+        };
         {
-            messages.push(m);
+            let text = String::from_utf8_lossy(&buf[..complete]);
+            for line in text.lines() {
+                if line.is_empty() {
+                    continue;
+                }
+                if is_yt {
+                    parse_yt_chat_line(line, &mut messages, &mut fetches);
+                } else if let Some(m) =
+                    parse_twitch_chat_line(line, start_ms, emote_map, twitch_dir, &mut fetches)
+                {
+                    messages.push(m);
+                }
+            }
         }
+        buf.drain(..complete);
+        parsed_to = pos - buf.len() as u64;
     }
     // De-duplicate so the same emoji isn't downloaded once per occurrence.
     fetches.sort_by(|a, b| a.dest.cmp(&b.dest));
     fetches.dedup();
-    Ok(ChatChunk { messages, fetches, parsed_to: from + cut as u64 })
+    Ok(ChatChunk { messages, fetches, parsed_to })
 }
 
 /// The first line boundary within the file's last [`CHAT_TAIL_BYTES`] — where
@@ -21375,17 +21504,44 @@ async fn parse_chunk_blocking(
     .map_err(|e| e.to_string())
 }
 
-/// Fill in `file` for emote segments whose queued image download has since
-/// landed on disk — replaces the old "re-parse the entire file after the emoji
-/// download" upgrade pass with an in-memory walk.
-fn upgrade_pending_emotes(messages: &mut [ChatMessage]) {
-    for m in messages {
-        for seg in &mut m.segments {
-            if let ChatSegment::Emote { file, pending, .. } = seg
-                && file.is_none()
-                && pending.as_ref().is_some_and(|p| p.exists())
-            {
-                *file = pending.take();
+/// Promote pending emote images that have landed on disk since the parse.
+/// The existence checks run OUTSIDE the chat mutex and off the async threads
+/// (`spawn_blocking`) — stat-ing thousands of segments while holding the lock
+/// the renderer takes every frame froze the whole app.
+async fn upgrade_pending_emotes(state: &Arc<Mutex<ChatLoadState>>) {
+    let pending: Vec<std::path::PathBuf> = {
+        let st = state.lock().unwrap();
+        let ChatLoadState::Loaded(log) = &*st else { return };
+        let mut set: HashSet<std::path::PathBuf> = HashSet::new();
+        for m in &log.messages {
+            for seg in &m.segments {
+                if let ChatSegment::Emote { file: None, pending: Some(p), .. } = seg {
+                    set.insert(p.clone());
+                }
+            }
+        }
+        set.into_iter().collect()
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let on_disk: HashSet<std::path::PathBuf> = tokio::task::spawn_blocking(move || {
+        pending.into_iter().filter(|p| p.exists()).collect()
+    })
+    .await
+    .unwrap_or_default();
+    if on_disk.is_empty() {
+        return;
+    }
+    if let ChatLoadState::Loaded(log) = &mut *state.lock().unwrap() {
+        for m in &mut log.messages {
+            for seg in &mut m.segments {
+                if let ChatSegment::Emote { file, pending, .. } = seg
+                    && file.is_none()
+                    && pending.as_ref().is_some_and(|p| on_disk.contains(p))
+                {
+                    *file = pending.take();
+                }
             }
         }
     }
@@ -21519,6 +21675,15 @@ async fn load_chat(
             Ok(older) => {
                 fetches.extend(older.fetches);
                 if let ChatLoadState::Loaded(log) = &mut *state.lock().unwrap() {
+                    // Heights are index-parallel to messages: prepend matching
+                    // estimates, or every measured tail height would be
+                    // re-attributed to the oldest rows and the virtualized
+                    // offsets/scrollbar would scramble.
+                    if !log.row_heights.is_empty() {
+                        let n = older.messages.len();
+                        log.row_heights
+                            .splice(0..0, std::iter::repeat_n(CHAT_ROW_EST, n));
+                    }
                     log.messages.splice(0..0, older.messages);
                     log.loading_older = false;
                 }
@@ -21538,9 +21703,7 @@ async fn load_chat(
     if fetch_emoji && !fetches.is_empty() && !loading.swap(true, Ordering::SeqCst) {
         download_emoji_images(&fetches).await;
         loading.store(false, Ordering::SeqCst);
-        if let ChatLoadState::Loaded(log) = &mut *state.lock().unwrap() {
-            upgrade_pending_emotes(&mut log.messages);
-        }
+        upgrade_pending_emotes(&state).await;
         ctx.request_repaint();
     }
 }
@@ -21559,16 +21722,30 @@ async fn tail_chat(
     fetch_emoji: bool,
     ctx: egui::Context,
 ) {
-    let from = match &*state.lock().unwrap() {
-        ChatLoadState::Loaded(log) => log.parsed_to,
-        // Initial load still running (or failed) — let it finish first.
-        _ => return,
+    let from = {
+        match &*state.lock().unwrap() {
+            ChatLoadState::Loaded(log) => Some(log.parsed_to),
+            // Initial load still in flight — let it finish first.
+            ChatLoadState::Loading => return,
+            // The sidecar may have appeared since (opened seconds after the
+            // recording started) or a transient read error cleared — retry the
+            // full tail-first load instead of staying broken forever.
+            ChatLoadState::NoFile | ChatLoadState::Error(_) => None,
+        }
+    };
+    let Some(from) = from else {
+        load_chat(state, loading, Some(path), start_ts, emote_map, twitch_dir, fetch_emoji, ctx)
+            .await;
+        return;
     };
     let Ok(chunk) = parse_chunk_blocking(path, from, None, start_ts, emote_map, twitch_dir).await
     else {
         return;
     };
-    if !chunk.messages.is_empty() {
+    // Always advance past parsed complete lines — a chunk of non-message lines
+    // (tickers, moderation events) must not freeze the resume offset, or every
+    // 3s pass re-reads an ever-growing suffix.
+    if chunk.parsed_to > from || !chunk.messages.is_empty() {
         if let ChatLoadState::Loaded(log) = &mut *state.lock().unwrap() {
             // Overlapping reloads on a slow read could double-append; only the
             // pass that still matches the resume offset lands.
@@ -21582,9 +21759,7 @@ async fn tail_chat(
     if fetch_emoji && !chunk.fetches.is_empty() && !loading.swap(true, Ordering::SeqCst) {
         download_emoji_images(&chunk.fetches).await;
         loading.store(false, Ordering::SeqCst);
-        if let ChatLoadState::Loaded(log) = &mut *state.lock().unwrap() {
-            upgrade_pending_emotes(&mut log.messages);
-        }
+        upgrade_pending_emotes(&state).await;
         ctx.request_repaint();
     }
 }

@@ -334,9 +334,12 @@ pub async fn resolve_playlist(
     }
 }
 
-/// Swap the `chunked` quality path component for `quality` (identity when equal).
+/// Swap the `chunked` quality PATH COMPONENT for `quality` (identity when
+/// equal). Matches `/chunked/` with its slashes so a login that happens to
+/// contain the word "chunked" (part of the preceding `{hash}_{login}_…` folder
+/// segment) can't be corrupted — logins can't contain `/`.
 fn swap_quality(chunked_url: &str, quality: &str) -> String {
-    chunked_url.replacen("chunked", quality, 1)
+    chunked_url.replacen("/chunked/", &format!("/{quality}/"), 1)
 }
 
 /// HEAD-probe which quality variants of a found playlist exist, source-first.

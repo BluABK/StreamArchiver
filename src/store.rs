@@ -1921,7 +1921,7 @@ impl Store {
                 "SELECT r.id, m.url, COALESCE(r.stream_id, ''),
                         COALESCE(r.went_live_at, r.started_at),
                         COALESCE(r.went_live_approx, 0),
-                        (r.vod_state = 'not_published'), r.vod_id
+                        COALESCE(r.vod_state = 'not_published', 0), r.vod_id
                  FROM recording r JOIN monitor m ON m.id = r.monitor_id
                  WHERE r.id = ?1",
                 params![id],
@@ -1941,6 +1941,48 @@ impl Store {
         Ok(row)
     }
 
+    /// Current CDN-recovery state of one recording (`None` = never attempted).
+    pub fn recording_recovery_state(&self, id: i64) -> Result<Option<String>> {
+        let conn = self.db();
+        let v = conn
+            .query_row(
+                "SELECT recovery_state FROM recording WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(v)
+    }
+
+    /// Reset takes stuck in `recovery_state = 'recovering'` to `'failed'`.
+    /// Recoveries are in-process tasks — none survive a restart — so any row
+    /// still marked 'recovering' at startup crashed mid-run and would
+    /// otherwise show the "recovering…" badge forever and be excluded from
+    /// bulk scans (which only retry NULL/'failed').
+    pub fn reset_stale_recovering(&self) -> Result<usize> {
+        let conn = self.db();
+        let n = conn.execute(
+            "UPDATE recording SET recovery_state = 'failed' WHERE recovery_state = 'recovering'",
+            [],
+        )?;
+        Ok(n)
+    }
+
+    /// Reset takes stuck in `vod_dl_state = 'downloading'` to `'failed'`.
+    /// The pre-download wait (YouTube ~5 min, Kick up to ~60 min of polls) is a
+    /// plain in-process task — a quit/crash in that window leaves the state
+    /// stranded with no video row to adopt. A detached download that DID
+    /// survive re-archives on its adopted completion, overwriting the 'failed'.
+    pub fn reset_stale_vod_downloading(&self) -> Result<usize> {
+        let conn = self.db();
+        let n = conn.execute(
+            "UPDATE recording SET vod_dl_state = 'failed' WHERE vod_dl_state = 'downloading'",
+            [],
+        )?;
+        Ok(n)
+    }
+
     /// Deleted/muted Twitch takes that still have a stream id, fall inside the CDN
     /// retention window, and haven't already been recovered — the bulk-scan set.
     pub fn recordings_recoverable(
@@ -1953,7 +1995,7 @@ impl Store {
             "SELECT r.id, m.url, r.stream_id,
                     COALESCE(r.went_live_at, r.started_at),
                     COALESCE(r.went_live_approx, 0),
-                    (r.vod_state = 'not_published'), r.vod_id
+                    COALESCE(r.vod_state = 'not_published', 0), r.vod_id
              FROM recording r JOIN monitor m ON m.id = r.monitor_id
              WHERE r.stream_id IS NOT NULL AND r.stream_id != ''
                AND (r.vod_state = 'not_published'

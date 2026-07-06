@@ -1112,6 +1112,12 @@ pub struct Supervisor {
     /// monitor_ids whose live recording was manually stopped (so it finalizes as
     /// `stopped` rather than `failed` even when bytes = 0).
     stopping_monitors: Arc<Mutex<HashSet<i64>>>,
+    /// `(kind, ref_id)` pairs the stall watchdog killed — consumed at finalize
+    /// for classification. Deliberately NOT the user-stop tombstones: reusing
+    /// those broke the SABR live-edge fallback, skipped backoff, and (via the
+    /// secondary finalize's `contains`) could leave a permanent tombstone that
+    /// silently skipped the channel's next take.
+    stall_killed: Arc<Mutex<HashSet<(DetachedKind, i64)>>>,
     /// monitor_id -> child PID of in-flight live-chat sidecar downloads.
     /// Shared with AppCore so the UI can show the chat-active indicator.
     pub active_chats: Arc<Mutex<HashMap<i64, u32>>>,
@@ -1182,6 +1188,7 @@ impl Supervisor {
             video_speed,
             stopping_videos: Arc::new(Mutex::new(HashSet::new())),
             stopping_monitors: Arc::new(Mutex::new(HashSet::new())),
+            stall_killed: Arc::new(Mutex::new(HashSet::new())),
             active_chats,
             stopping_chats: Arc::new(Mutex::new(HashSet::new())),
             shutdown,
@@ -1398,6 +1405,17 @@ impl Supervisor {
                                 );
                                 set.spawn(async move {
                                     let _permit = sem.acquire().await.expect("semaphore");
+                                    // Re-check under the permit: the take may
+                                    // have queued for a long time and been
+                                    // recovered meanwhile by the auto-recovery
+                                    // hook (avoids a duplicate multi-GB pull).
+                                    let state = store
+                                        .recording_recovery_state(take.rec_id)
+                                        .ok()
+                                        .flatten();
+                                    if !matches!(state.as_deref(), None | Some("failed")) {
+                                        return;
+                                    }
                                     let sub = crate::events::next_task_id();
                                     let inputs = crate::recovery::RecoveryInputs {
                                         login,
@@ -2344,11 +2362,21 @@ impl Supervisor {
     fn finalize_video(&self, id: i64, bytes: i64, shutting_down: bool) -> &'static str {
         let mut active = self.active_videos.lock().unwrap();
         let stopped = self.stopping_videos.lock().unwrap().remove(&id);
+        let stalled = self
+            .stall_killed
+            .lock()
+            .unwrap()
+            .remove(&(DetachedKind::Video, id));
         active.remove(&id);
         self.video_progress.lock().unwrap().remove(&id);
         self.video_speed.lock().unwrap().remove(&id);
         if stopped {
             "stopped"
+        } else if stalled {
+            // Watchdog-killed mid-download: possibly-truncated bytes must not
+            // classify as "completed" (a completed VOD archive may replace the
+            // live capture) — surface as a retryable failure instead.
+            "failed"
         } else if shutting_down {
             // We're quitting and killed the tree; treat any in-flight download as
             // incomplete regardless of how many bytes landed.
@@ -3133,6 +3161,11 @@ impl Supervisor {
         // nothing to capture but isn't an error. Classify those as `ended` so they
         // don't show as red failures. (`ok` still drives backoff, so we don't
         // hammer an ended broadcast.)
+        let stall_killed = self
+            .stall_killed
+            .lock()
+            .unwrap()
+            .remove(&(DetachedKind::Recording, rec_id));
         let status = if manually_stopped {
             // User explicitly stopped the recording; never show it as `failed`.
             if ok { "completed" } else { "stopped" }
@@ -3141,6 +3174,11 @@ impl Supervisor {
             "aborted"
         } else if ok {
             "completed"
+        } else if stall_killed {
+            // Watchdog-reaped with nothing captured: the tool wedged. Not a
+            // manual stop (so backoff + the SABR fallback still apply), not a
+            // red failure either.
+            "ended"
         } else if sabr_stall || stream_ended_or_unavailable(&outcome.log) {
             "ended"
         } else {
@@ -3265,6 +3303,11 @@ impl Supervisor {
         let bytes = file_len(&final_path).await as i64;
         let ok = bytes > 0;
         let manually_stopped = self.stopping_monitors.lock().unwrap().contains(&monitor_id);
+        let stall_killed = self
+            .stall_killed
+            .lock()
+            .unwrap()
+            .remove(&(DetachedKind::Recording, rec_id));
         let shutting_down = self.shutdown.load(Ordering::SeqCst);
         let status = if manually_stopped {
             if ok { "completed" } else { "stopped" }
@@ -3272,7 +3315,7 @@ impl Supervisor {
             "aborted"
         } else if ok {
             "completed"
-        } else if stream_ended_or_unavailable(&outcome.log) {
+        } else if stall_killed || stream_ended_or_unavailable(&outcome.log) {
             "ended"
         } else {
             "failed"
@@ -3673,8 +3716,9 @@ impl Supervisor {
         // "recording" with a growing uptime until the app is restarted.
         let stall = self.spawn_stall_watchdog(
             row.kind,
-            key,
+            row.ref_id,
             row.pid,
+            row.proc_start,
             PathBuf::from(&row.log_path),
             PathBuf::from(&row.capture_path),
             done.clone(),
@@ -3715,16 +3759,25 @@ impl Supervisor {
     /// plus the handle sizes of every capture-stem file in the capture dir
     /// (covers SABR `.part` files and ffmpeg merge temps; handle sizes because
     /// NTFS dir entries are stale for open files). If NOTHING changes for
-    /// [`STALL_KILL_SECS`], it marks the id via the same stop-tombstone a user
-    /// stop uses (so classification lands on completed/stopped — never a bogus
-    /// "completed" for a truncated VOD download) and kills the process tree;
-    /// the normal wait → finalize path then runs. If the channel is actually
-    /// still live, the next detection poll simply starts a fresh take.
+    /// [`STALL_KILL_SECS`], it records `(kind, ref_id)` in `stall_killed` (the
+    /// finalize paths consume it for classification — a truncated stall-killed
+    /// VOD download must never classify "completed" and trigger a replace) and
+    /// kills the process tree; the normal wait → finalize path then runs. If
+    /// the channel is actually still live, the next detection poll simply
+    /// starts a fresh take.
+    ///
+    /// `proc_start` is the process's recorded start time: together with a
+    /// last-instant `done` re-check it guards the kill against firing after a
+    /// natural exit (the sample I/O can take seconds; `abort()` only lands at
+    /// an await point) — without it a recycled PID could kill an unrelated
+    /// process tree.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_stall_watchdog(
         &self,
         kind: DetachedKind,
-        key: i64,
+        ref_id: i64,
         pid: u32,
+        proc_start: u64,
         log_path: PathBuf,
         capture_path: PathBuf,
         done: Arc<AtomicBool>,
@@ -3732,15 +3785,18 @@ impl Supervisor {
         let this = self.clone();
         tokio::spawn(async move {
             let kill = |why: String| {
-                warn!(?kind, key, pid, "{why} — killing stalled process tree");
-                match kind {
-                    DetachedKind::Video => {
-                        this.stopping_videos.lock().unwrap().insert(key);
-                    }
-                    DetachedKind::Recording => {
-                        this.stopping_monitors.lock().unwrap().insert(key);
-                    }
-                    DetachedKind::Chat => {}
+                // Last-instant guards: the process may have exited naturally
+                // while the (possibly slow) sample ran, and Windows recycles
+                // PIDs aggressively.
+                if done.load(Ordering::SeqCst)
+                    || !crate::platform::pid_alive(pid)
+                    || crate::platform::process_start_time(pid).unwrap_or(0) != proc_start
+                {
+                    return;
+                }
+                warn!(?kind, ref_id, pid, "{why} — killing stalled process tree");
+                if kind != DetachedKind::Chat {
+                    this.stall_killed.lock().unwrap().insert((kind, ref_id));
                 }
                 let _ = this.events.send(AppEvent::Error {
                     context: "Stall watchdog".into(),
@@ -3969,11 +4025,16 @@ impl Supervisor {
                     .monitor_id
                     .map(|mid| self.stopping_monitors.lock().unwrap().remove(&mid))
                     .unwrap_or(false);
+                let stall_killed = self
+                    .stall_killed
+                    .lock()
+                    .unwrap()
+                    .remove(&(DetachedKind::Recording, row.ref_id));
                 let status = if manually_stopped {
                     if bytes > 0 { "completed" } else { "stopped" }
                 } else if bytes > 0 {
                     "completed"
-                } else if stream_ended_or_unavailable(&log) {
+                } else if stall_killed || stream_ended_or_unavailable(&log) {
                     "ended"
                 } else {
                     "failed"
@@ -3990,6 +4051,12 @@ impl Supervisor {
                 active.lock().unwrap().remove(&key);
                 let vod_platform = mrow.as_ref().map(|r| r.monitor.platform());
                 let vod_url = mrow.as_ref().map(|r| r.monitor.url.clone()).unwrap_or_default();
+                // Post-stream VOD archive (YouTube/Kick) for takes that
+                // survived a restart — the in-session finalize schedules this,
+                // adopted/re-attached ones used to silently miss it.
+                if let Some(m) = &mrow {
+                    self.schedule_vod_archive(row.ref_id, m, row.went_live_at, status);
+                }
                 let channel = mrow.map(|r| r.channel.name).unwrap_or_default();
                 let _ = self.events.send(AppEvent::RecordingFinished {
                     recording_id: row.ref_id,
@@ -4010,8 +4077,18 @@ impl Supervisor {
             }
             DetachedKind::Video => {
                 let stopped = self.stopping_videos.lock().unwrap().remove(&row.ref_id);
+                let stalled = self
+                    .stall_killed
+                    .lock()
+                    .unwrap()
+                    .remove(&(DetachedKind::Video, row.ref_id));
                 let status = if stopped {
                     "stopped"
+                } else if stalled {
+                    // Watchdog-killed mid-download: bytes may be present but
+                    // the file is truncated — never classify it "completed"
+                    // (a completed VOD archive may replace the live capture).
+                    "failed"
                 } else if bytes > 0 {
                     "completed"
                 } else {
@@ -4029,6 +4106,10 @@ impl Supervisor {
                 active.lock().unwrap().remove(&key);
                 self.video_progress.lock().unwrap().remove(&key);
                 self.video_speed.lock().unwrap().remove(&key);
+                // File a VOD-archive download onto its recording (alongside /
+                // replace) — the in-session finalize runs this hook, adopted
+                // ones used to leave vod_dl_state stuck at "downloading".
+                self.finalize_vod_archive(row.ref_id, &final_path, status).await;
                 info!(video = row.ref_id, bytes, status, "re-attached video finalized");
             }
             DetachedKind::Chat => {
@@ -4227,6 +4308,11 @@ impl Supervisor {
         }
         let ok = bytes > 0;
         let manually_stopped = self.stopping_monitors.lock().unwrap().remove(&monitor_id);
+        let stall_killed = self
+            .stall_killed
+            .lock()
+            .unwrap()
+            .remove(&(DetachedKind::Recording, rec_id));
         let shutting_down = self.shutdown.load(Ordering::SeqCst);
         let status = if manually_stopped {
             if ok { "completed" } else { "stopped" }
@@ -4234,7 +4320,7 @@ impl Supervisor {
             "aborted"
         } else if ok {
             "completed"
-        } else if stream_ended_or_unavailable(&outcome.log) {
+        } else if stall_killed || stream_ended_or_unavailable(&outcome.log) {
             "ended"
         } else {
             "failed"
@@ -4415,31 +4501,53 @@ impl Supervisor {
             return;
         }
         let vod_path = final_path.to_string_lossy().into_owned();
-        let _ = self.store.set_recording_vod_archived(rec_id, &vod_path, "archived");
+        let replace_info = self.store.recording_replace_info(rec_id).ok().flatten();
+        // A DMCA-muted VOD stays flagged "muted" even after a manual "Download
+        // VOD now": the file is recorded, but the Issues entry must not vanish
+        // as if a clean archive landed (the downloaded copy has silenced audio).
+        let muted = replace_info
+            .as_ref()
+            .is_some_and(|(_, _, _, m)| m.unwrap_or(0) > 0);
+        let _ = self.store.set_recording_vod_archived(
+            rec_id,
+            &vod_path,
+            if muted { "muted" } else { "archived" },
+        );
 
-        let Ok(Some((channel_id, monitor_id, live_path, muted_secs))) =
-            self.store.recording_replace_info(rec_id)
-        else {
+        let Some((channel_id, monitor_id, live_path, _)) = replace_info else {
             let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
             return;
         };
-        let muted = muted_secs.unwrap_or(0) > 0;
         let replace = !muted
             && !live_path.is_empty()
             && crate::vod_archive::effective_vod_replace(&self.store, channel_id, monitor_id);
         if replace {
-            // Only now that the VOD is confirmed good do we touch the live file.
-            // Rename the VOD to the live stem so the live sidecars stay matched.
+            // Only now that the VOD is confirmed good do we touch the live
+            // file — and never destructively until the swap is complete: the
+            // live capture is first RENAMED aside (instantly reversible), the
+            // VOD renamed onto the live stem (so sidecars stay matched), and
+            // only then is the backup deleted. A failure at any step restores
+            // the original layout instead of losing the live capture (the old
+            // delete-then-rename order lost it if the rename failed, e.g. an
+            // AV scanner briefly holding the fresh .vod.mkv).
             let live = PathBuf::from(&live_path);
-            let _ = tokio::fs::remove_file(&live).await;
-            match tokio::fs::rename(final_path, &live).await {
-                Ok(()) => {
-                    let live_s = live.to_string_lossy().into_owned();
-                    let _ = self.store.update_recording_output_path(rec_id, &live_s);
-                    let _ = self.store.set_recording_vod_archived(rec_id, &live_s, "replaced");
-                    info!(rec_id, "vod archive: replaced live recording with the published VOD");
-                }
-                Err(e) => warn!(rec_id, "vod archive: replace rename failed: {e:#} (kept alongside)"),
+            let backup = live.with_extension("pre-vod.bak");
+            match tokio::fs::rename(&live, &backup).await {
+                Ok(()) => match tokio::fs::rename(final_path, &live).await {
+                    Ok(()) => {
+                        let _ = tokio::fs::remove_file(&backup).await;
+                        let live_s = live.to_string_lossy().into_owned();
+                        let _ = self.store.update_recording_output_path(rec_id, &live_s);
+                        let _ = self.store.set_recording_vod_archived(rec_id, &live_s, "replaced");
+                        info!(rec_id, "vod archive: replaced live recording with the published VOD");
+                    }
+                    Err(e) => {
+                        // Put the live capture back; the VOD stays alongside.
+                        let _ = tokio::fs::rename(&backup, &live).await;
+                        warn!(rec_id, "vod archive: replace rename failed: {e:#} (live restored, VOD kept alongside)");
+                    }
+                },
+                Err(e) => warn!(rec_id, "vod archive: could not stage live for replace: {e:#} (kept alongside)"),
             }
         }
         let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
@@ -4507,6 +4615,7 @@ impl Supervisor {
         // Register the real PID so the scheduler skips this work and shutdown
         // can kill the whole process tree.
         let pid = child.id().unwrap_or(0);
+        let proc_start = crate::platform::process_start_time(pid).unwrap_or(0);
         if pid != 0 {
             active.lock().unwrap().insert(id, pid);
         }
@@ -4521,7 +4630,7 @@ impl Supervisor {
                 ref_id: detach.ref_id,
                 monitor_id: detach.monitor_id,
                 pid,
-                proc_start: crate::platform::process_start_time(pid).unwrap_or(0),
+                proc_start,
                 job_name: job_name.clone(),
                 log_path: log_path.to_string_lossy().into_owned(),
                 capture_path: plan.capture_path.to_string_lossy().into_owned(),
@@ -4571,8 +4680,9 @@ impl Supervisor {
         // wait returns and the normal finalize runs.
         let stall = self.spawn_stall_watchdog(
             detach.kind,
-            id,
+            detach.ref_id,
             pid,
+            proc_start,
             log_path.clone(),
             plan.capture_path.clone(),
             done.clone(),
@@ -5280,7 +5390,27 @@ async fn stall_sample(log_path: &Path, capture_path: &Path) -> StallSample {
         if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
             while let Ok(Some(e)) = rd.next_entry().await {
                 let name = e.file_name().to_string_lossy().into_owned();
-                if !name.starts_with(&stem) {
+                // Only THIS capture's own outputs count: the rest after the
+                // stem must be an extension chain (".f303.mp4.part"), which
+                // excludes a retake's "{stem} (2).ts" — its growth must not
+                // reset take 1's stall timers.
+                let Some(rest) = name.strip_prefix(&stem) else {
+                    continue;
+                };
+                if !rest.starts_with('.') {
+                    continue;
+                }
+                // Files other processes write next to the capture must not
+                // count as capture activity either: the tool's own log (X.ts →
+                // X.log) and the chat/subtitle sidecars a separate process
+                // appends — otherwise endless retry-logging / an active chat
+                // keeps `capture_sig` moving and the frozen rules never fire.
+                if e.path() == log_path
+                    || rest.contains("live_chat")
+                    || rest.ends_with(".chat.jsonl")
+                    || rest.ends_with(".chat.log")
+                    || rest.ends_with(".vtt")
+                {
                     continue;
                 }
                 let (len, mtime) = open_len_mtime(&e.path()).await.unwrap_or((0, 0));
@@ -7054,6 +7184,12 @@ fn spawn_auto_recovery(ctx: &Arc<DetectContext>, store: &Arc<Store>, events: &Ev
         return;
     };
     if seed.stream_id.is_empty() {
+        return;
+    }
+    // Don't stack a second recovery on one already running/succeeded (the
+    // bulk scan may have gotten to it first).
+    let state = store.recording_recovery_state(rec_id).ok().flatten();
+    if !matches!(state.as_deref(), None | Some("failed")) {
         return;
     }
     if now_unix() - seed.start_epoch > 60 * 86_400 {

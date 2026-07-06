@@ -778,7 +778,7 @@ pub struct AdBreak {
 /// Which kind of download a [`DetachedRow`] tracks. The registry is shared across
 /// the three process types the supervisor spawns so one startup sweep can
 /// reconcile them all.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DetachedKind {
     /// A live stream capture (`recording` row).
     Recording,
