@@ -838,18 +838,18 @@ pub struct StreamArchiverApp {
     /// cleared on reload. Avoids a per-frame DB query for tooltips/the popup.
     ad_break_cache: HashMap<i64, Vec<AdBreak>>,
     /// Recording id whose ad-break cut list is shown in a popup (None = closed).
-    ad_popup: Option<i64>,
+    ad_popups: Vec<i64>,
     /// Lazy per-recording title/category change log, keyed by recording id;
     /// cleared on reload. Same caching role as `ad_break_cache`.
     meta_change_cache: HashMap<i64, Vec<StreamMetaChange>>,
     /// What the metadata-change popup shows (None = closed): a single take or a
     /// whole stream's aggregated takes.
-    meta_popup: Option<MetaPopup>,
+    meta_popups: Vec<MetaPopup>,
     /// Lazy per-monitor upcoming-schedule detail, keyed by monitor id; cleared on
     /// reload. Backs the Next stream popup.
     schedule_cache: HashMap<i64, Vec<ScheduleSegment>>,
     /// Monitor id whose upcoming schedule is shown in a popup (None = closed).
-    schedule_popup: Option<i64>,
+    schedule_popups: Vec<i64>,
     /// All upcoming scheduled streams (across every monitor), backing the Schedule
     /// calendar. Loaded lazily on first view + on refresh; see [`Self::spawn_reload_schedule`].
     schedule_all: Vec<UpcomingStream>,
@@ -880,15 +880,15 @@ pub struct StreamArchiverApp {
     schedule_sources_draft: Vec<SourceEntry>,
     /// The source id selected in the dialog (drives the →/← / ▲/▼ buttons).
     schedule_sources_selected: Option<String>,
-    /// Editable per-channel schedule-source config shown in the Properties window,
-    /// tagged with its channel id. Loaded when Properties opens; saved on edit.
-    channel_cfg_draft: Option<(i64, crate::schedule_source::ChannelSourceConfig)>,
-    /// Editable per-channel schedule-source *scope* override (custom order +
-    /// title-fill) shown in channel Properties, tagged with its channel id.
-    channel_scope_draft: Option<(i64, crate::schedule_source::SourceScopeConfig)>,
-    /// Editable per-instance (monitor) schedule-source *scope* override shown in
-    /// instance Properties, tagged with its monitor id.
-    instance_scope_draft: Option<(i64, crate::schedule_source::SourceScopeConfig)>,
+    /// Editable per-channel schedule-source configs shown in the Properties
+    /// windows — one draft per open window, keyed by channel id.
+    channel_cfg_drafts: HashMap<i64, crate::schedule_source::ChannelSourceConfig>,
+    /// Editable per-channel schedule-source *scope* overrides (custom order +
+    /// title-fill) shown in channel Properties, keyed by channel id.
+    channel_scope_drafts: HashMap<i64, crate::schedule_source::SourceScopeConfig>,
+    /// Editable per-instance (monitor) schedule-source *scope* overrides shown
+    /// in instance Properties — one draft per open window, keyed by monitor id.
+    instance_scope_drafts: HashMap<i64, crate::schedule_source::SourceScopeConfig>,
     /// Draft for the "Edit schedule item" dialog (None = closed). Saving converts
     /// the row to a protected `"manual"` source so refreshes don't overwrite it.
     edit_schedule: Option<EditScheduleDraft>,
@@ -909,18 +909,17 @@ pub struct StreamArchiverApp {
     /// Open "Save preset" naming dialog (None = closed).
     save_preset_dialog: Option<SavePresetDraft>,
     /// Chat log viewer popup (None = closed).
-    chat_popup: Option<ChatPopup>,
+    /// Open chat windows, one per monitor (each is its own OS viewport).
+    chat_popups: Vec<ChatPopup>,
     /// Platform favicons, uploaded to the GPU on first use (None until then).
     platform_tex: Option<PlatformTextures>,
     /// Which monitor's Properties window is open (None = closed).
-    properties_popup: Option<i64>,
-    /// Which channel's Properties window is open (None = closed).
-    channel_properties_popup: Option<i64>,
-    /// The recording whose properties dialog is open (None = closed).
-    rec_props: Option<i64>,
-    /// Draft notes for the open recording properties dialog; synced from the DB
-    /// when the dialog opens and written back on every keystroke.
-    rec_props_notes: String,
+    properties_popups: Vec<i64>,
+    /// Open channel-Properties windows (one per channel).
+    channel_properties_popups: Vec<i64>,
+    /// Open recording-properties windows, one per take (each carries its own
+    /// notes draft, synced from the DB on open and written back per keystroke).
+    rec_props_popups: Vec<RecPropsPopup>,
     /// Per-channel cached icon textures loaded from disk for the Properties window.
     /// A `None` value means the lookup was attempted but no icon file was found.
     channel_icons: HashMap<i64, Option<egui::TextureHandle>>,
@@ -964,7 +963,7 @@ pub struct StreamArchiverApp {
     /// scan, or the store mutex being held by a background task can't freeze the GUI on
     /// open — the window shows a "Loading…" placeholder until the bundle lands. `None`
     /// when no load is running.
-    props_load: Option<PropsLoad>,
+    props_loads: Vec<PropsLoad>,
     /// In-flight native file/folder picker (background thread). The OS dialog blocks
     /// until the user picks or cancels; running it off the UI thread keeps egui alive.
     /// At most one picker open at a time (a second Browse click replaces any existing).
@@ -1023,16 +1022,12 @@ pub struct StreamArchiverApp {
     /// can hold the DB mutex for several seconds when historical rows accumulate;
     /// running it off the UI thread prevents frame freezes and unblocks the delete action.
     pending_schedule: Option<std::sync::mpsc::Receiver<Option<Vec<UpcomingStream>>>>,
-    /// Open emote-viewer window (None = closed). Reuses the shared `emote_anim`
-    /// decode cache, so its emotes animate against the same clock as chat replay.
-    emote_viewer: Option<EmoteViewer>,
-    /// Set when this channel's assets are refetched while its emote viewer is open:
-    /// the viewer enumerated its list once on open, so it's now stale. Drives a
-    /// "close and reopen" banner; cleared when the viewer is (re)opened or closed.
-    emote_viewer_stale: bool,
+    /// Open emote-viewer windows (one per channel+provider). Reuse the shared
+    /// `emote_anim` decode cache, so emotes animate on the chat-replay clock.
+    emote_viewers: Vec<EmoteViewer>,
     /// Open asset change-history popup (None = closed). Holds the channel's
     /// `asset_changes.jsonl` parsed + formatted once on open (newest first).
-    asset_history: Option<AssetHistoryView>,
+    asset_histories: Vec<AssetHistoryView>,
     /// GPU textures for the third-party emote-provider logos (7TV/BTTV), uploaded
     /// once on first use of the emote launcher buttons.
     provider_tex: Option<ProviderTextures>,
@@ -1441,11 +1436,11 @@ impl StreamArchiverApp {
             expanded_streams: HashSet::new(),
             rec_cache: HashMap::new(),
             ad_break_cache: HashMap::new(),
-            ad_popup: None,
+            ad_popups: Vec::new(),
             meta_change_cache: HashMap::new(),
-            meta_popup: None,
+            meta_popups: Vec::new(),
             schedule_cache: HashMap::new(),
-            schedule_popup: None,
+            schedule_popups: Vec::new(),
             schedule_all: Vec::new(),
             schedule_loaded: false,
             schedule_mode: ScheduleMode::Month,
@@ -1458,9 +1453,9 @@ impl StreamArchiverApp {
             show_schedule_sources: false,
             schedule_sources_draft: Vec::new(),
             schedule_sources_selected: None,
-            channel_cfg_draft: None,
-            channel_scope_draft: None,
-            instance_scope_draft: None,
+            channel_cfg_drafts: HashMap::new(),
+            channel_scope_drafts: HashMap::new(),
+            instance_scope_drafts: HashMap::new(),
             edit_schedule: None,
             schedule_selected: HashSet::new(),
             merge_preview: None,
@@ -1469,12 +1464,11 @@ impl StreamArchiverApp {
             schedule_auto_secondary: HashSet::new(),
             custom_presets: initial_custom_presets,
             save_preset_dialog: None,
-            chat_popup: None,
+            chat_popups: Vec::new(),
             platform_tex: None,
-            properties_popup: None,
-            channel_properties_popup: None,
-            rec_props: None,
-            rec_props_notes: String::new(),
+            properties_popups: Vec::new(),
+            channel_properties_popups: Vec::new(),
+            rec_props_popups: Vec::new(),
             channel_icons: HashMap::new(),
             channel_icons_small: HashMap::new(),
             emote_anim: Arc::new(Mutex::new(HashMap::new())),
@@ -1483,7 +1477,7 @@ impl StreamArchiverApp {
             channel_emote_counts: HashMap::new(),
             channel_asset_status: HashMap::new(),
             props_source_order: Vec::new(),
-            props_load: None,
+            props_loads: Vec::new(),
             pending_browse: None,
             pending_save: None,
             pending_reload: None,
@@ -1503,9 +1497,8 @@ impl StreamArchiverApp {
             yt_search_cutoff: 90,
             dismissed_quota_warnings: HashSet::new(),
             pending_schedule: None,
-            emote_viewer: None,
-            emote_viewer_stale: false,
-            asset_history: None,
+            emote_viewers: Vec::new(),
+            asset_histories: Vec::new(),
             provider_tex: None,
             channel_twitch_colors: HashMap::new(),
             videos_sort: SortState {
@@ -1906,18 +1899,18 @@ impl StreamArchiverApp {
                             // If the emote viewer is open for this channel, its
                             // enumerated list was loaded once on open and is now
                             // stale — flag it so the window can show a re-open banner.
-                            if let Some(v) = &self.emote_viewer
-                                && v.channel_name == task.label
-                            {
-                                self.emote_viewer_stale = true;
+                            for v in &mut self.emote_viewers {
+                                if v.channel_name == task.label {
+                                    v.stale = true;
+                                }
                             }
                             // The asset-history view reads the change logs once on
                             // open; if it's showing this channel, reload it in place
                             // so freshly-recorded changes appear without a reopen.
-                            if let Some(h) = &mut self.asset_history
-                                && h.channel_name == task.label
-                            {
-                                h.reload();
+                            for h in &mut self.asset_histories {
+                                if h.channel_name == task.label {
+                                    h.reload();
+                                }
                             }
                         }
                         // Record a task_failed notification (the failing task
@@ -3938,6 +3931,23 @@ enum MetaPopup {
     Stream(Vec<(i64, i64)>),
 }
 
+impl MetaPopup {
+    /// Stable identity for dedup + the per-window viewport id: the (first)
+    /// recording id it shows.
+    fn key(&self) -> i64 {
+        match self {
+            MetaPopup::Take(rid) => *rid,
+            MetaPopup::Stream(takes) => takes.first().map(|(rid, _)| *rid).unwrap_or(0),
+        }
+    }
+}
+
+/// One open "Recording properties" window + its editable notes draft.
+struct RecPropsPopup {
+    rec_id: i64,
+    notes: String,
+}
+
 /// Draft state for the "Edit schedule item" dialog. Times are edited as local
 /// `YYYY-MM-DD` / `HH:MM` strings; on save they're parsed back to unix seconds and
 /// written via [`Store::update_schedule_segment_manual`](crate::store::Store::update_schedule_segment_manual),
@@ -4064,6 +4074,10 @@ enum ChatLoadState {
 }
 
 struct ChatPopup {
+    /// Monitor this window belongs to — keys the viewport id, so each channel
+    /// gets its OWN chat window (opening another channel's chat no longer
+    /// replaces the one already open).
+    monitor_id: i64,
     monitor_name: String,
     /// Currently-viewed recording (`None` = monitor has no recordings at all).
     recording: Option<Recording>,
@@ -5518,6 +5532,9 @@ struct EmoteViewer {
     active: Vec<ViewerEmote>,
     deprecated: Vec<ViewerEmote>,
     emote_properties: Option<ViewerEmote>,
+    /// Set when this channel's assets were refetched while the window stayed
+    /// open (the lists are an on-open snapshot).
+    stale: bool,
 }
 
 impl EmoteViewer {
@@ -5526,7 +5543,14 @@ impl EmoteViewer {
             enumerate_provider_emotes(&channel_name, provider)
                 .into_iter()
                 .partition(|e| e.exists);
-        EmoteViewer { channel_name, provider, active, deprecated, emote_properties: None }
+        EmoteViewer {
+            channel_name,
+            provider,
+            active,
+            deprecated,
+            emote_properties: None,
+            stale: false,
+        }
     }
 }
 
@@ -5642,7 +5666,7 @@ struct PlatformAssetStatus {
 
 /// Handle to the background thread loading a channel Properties window's per-open data.
 /// Polled each frame the window is open until the [`PropsLoaded`] bundle arrives. See
-/// the `props_load` field for why this work is off the UI thread.
+/// the `props_loads` field for why this work is off the UI thread.
 struct PropsLoad {
     /// The channel being loaded; lets us ignore a bundle that arrives after the user
     /// switched the window to a different channel.
@@ -6171,19 +6195,19 @@ impl eframe::App for StreamArchiverApp {
         self.save_preset_window(ui.ctx());
         self.format_probe_window(ui.ctx());
         self.recover_vod_window(ui.ctx());
-        self.ad_popup_window(ui.ctx());
-        self.meta_popup_window(ui.ctx());
-        self.schedule_popup_window(ui.ctx());
+        self.ad_popup_windows(ui.ctx());
+        self.meta_popup_windows(ui.ctx());
+        self.schedule_popup_windows(ui.ctx());
         self.schedule_sources_window(ui.ctx());
         self.schedule_day_window(ui.ctx());
         self.edit_schedule_window(ui.ctx());
-        self.chat_popup_window(ui.ctx());
-        self.instance_properties_window(ui.ctx());
-        self.channel_properties_window(ui.ctx());
-        self.emote_viewer_window(ui.ctx());
+        self.chat_popup_windows(ui.ctx());
+        self.instance_properties_windows(ui.ctx());
+        self.channel_properties_windows(ui.ctx());
+        self.emote_viewer_windows(ui.ctx());
         self.rename_dialog_window(ui.ctx());
-        self.asset_history_window(ui.ctx());
-        self.recording_properties_window(ui.ctx());
+        self.asset_history_windows(ui.ctx());
+        self.recording_properties_windows(ui.ctx());
         self.processes_window(ui.ctx());
         self.issues_window(ui.ctx());
         self.notifications_window(ui.ctx());
@@ -8471,13 +8495,24 @@ impl StreamArchiverApp {
         }
     }
 
+    /// Render every open ad-breaks window (one per take).
+    fn ad_popup_windows(&mut self, ctx: &egui::Context) {
+        let mut closed: Vec<i64> = Vec::new();
+        for i in 0..self.ad_popups.len() {
+            let rid = self.ad_popups[i];
+            if self.ad_popup_window(ctx, rid) {
+                closed.push(rid);
+            }
+        }
+        if !closed.is_empty() {
+            self.ad_popups.retain(|r| !closed.contains(r));
+        }
+    }
+
     /// Window listing where ad breaks cause hard cuts in a take's finished file.
-    /// Opened by double-clicking an Ads / Ad time cell.
+    /// Opened by double-clicking an Ads / Ad time cell. Returns true on close.
     #[allow(deprecated)]
-    fn ad_popup_window(&mut self, ctx: &egui::Context) {
-        let Some(rid) = self.ad_popup else {
-            return;
-        };
+    fn ad_popup_window(&mut self, ctx: &egui::Context, rid: i64) -> bool {
         // Reuse the cached cut list (cleared on reload) rather than re-querying
         // every frame the popup is open.
         if !self.ad_break_cache.contains_key(&rid) {
@@ -8492,9 +8527,9 @@ impl StreamArchiverApp {
         let total: i64 = breaks.iter().map(|b| b.duration_secs).sum();
         let mut open = true;
         ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("ad_breaks_vp"),
+            egui::ViewportId::from_hash_of(("ad_breaks_vp", rid)),
             egui::ViewportBuilder::default()
-                .with_title("Ad breaks — cut points")
+                .with_title(format!("Ad breaks — cut points (take #{rid})"))
                 .with_inner_size([360.0, 260.0]),
             |ctx, _class| {
                 if ctx.input(|i| i.viewport().close_requested()) {
@@ -8527,9 +8562,7 @@ impl StreamArchiverApp {
                 });
             },
         );
-        if !open {
-            self.ad_popup = None;
-        }
+        !open
     }
 
     /// Load a recording's metadata-change rows into the cache if absent.
@@ -8544,11 +8577,24 @@ impl StreamArchiverApp {
         }
     }
 
+    /// Render every open title/category-changes window (one per take/stream).
+    fn meta_popup_windows(&mut self, ctx: &egui::Context) {
+        let mut closed: Vec<i64> = Vec::new();
+        for i in 0..self.meta_popups.len() {
+            let popup = self.meta_popups[i].clone();
+            let key = popup.key();
+            if self.meta_popup_window(ctx, popup) {
+                closed.push(key);
+            }
+        }
+        if !closed.is_empty() {
+            self.meta_popups.retain(|p| !closed.contains(&p.key()));
+        }
+    }
+
+    /// One title/category-changes window; returns true on close.
     #[allow(deprecated)]
-    fn meta_popup_window(&mut self, ctx: &egui::Context) {
-        let Some(popup) = self.meta_popup.clone() else {
-            return;
-        };
+    fn meta_popup_window(&mut self, ctx: &egui::Context, popup: MetaPopup) -> bool {
         // Build the change list: one take directly, or a stream's takes merged
         // chronologically with the per-take re-baselines dropped.
         let (changes, multi) = match &popup {
@@ -8571,7 +8617,7 @@ impl StreamArchiverApp {
         };
         let mut open = true;
         ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("title_changes_vp"),
+            egui::ViewportId::from_hash_of(("title_changes_vp", popup.key())),
             egui::ViewportBuilder::default()
                 .with_title("Title & category changes")
                 .with_inner_size([460.0, 280.0]),
@@ -8612,18 +8658,29 @@ impl StreamArchiverApp {
                 });
             },
         );
-        if !open {
-            self.meta_popup = None;
+        !open
+    }
+
+    /// Render every open recording-properties window (one per take).
+    fn recording_properties_windows(&mut self, ctx: &egui::Context) {
+        let mut closed: Vec<i64> = Vec::new();
+        for i in 0..self.rec_props_popups.len() {
+            let rid = self.rec_props_popups[i].rec_id;
+            if self.recording_properties_window(ctx, i) {
+                closed.push(rid);
+            }
+        }
+        if !closed.is_empty() {
+            self.rec_props_popups.retain(|p| !closed.contains(&p.rec_id));
         }
     }
 
     /// Properties dialog for a single recording take.
     /// Opened via right-click → Properties on a history-tree take row.
+    /// Returns true when the window should close.
     #[allow(deprecated)]
-    fn recording_properties_window(&mut self, ctx: &egui::Context) {
-        let Some(rid) = self.rec_props else {
-            return;
-        };
+    fn recording_properties_window(&mut self, ctx: &egui::Context, idx: usize) -> bool {
+        let rid = self.rec_props_popups[idx].rec_id;
         // Pull the recording out of the cache; close if the take was deleted.
         let Some(rec) = self
             .rec_cache
@@ -8632,8 +8689,7 @@ impl StreamArchiverApp {
             .find(|r| r.id == rid)
             .cloned()
         else {
-            self.rec_props = None;
-            return;
+            return true;
         };
         let now = crate::models::now_unix();
         let mut open = true;
@@ -8641,10 +8697,10 @@ impl StreamArchiverApp {
         let mut copy_path: Option<String> = None;
         let mut notes_changed: Option<String> = None;
         // Snapshot the draft so the TextEdit can borrow it inside the closure.
-        let mut notes_draft = self.rec_props_notes.clone();
+        let mut notes_draft = self.rec_props_popups[idx].notes.clone();
 
         ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("recording_props_vp"),
+            egui::ViewportId::from_hash_of(("recording_props_vp", rid)),
             egui::ViewportBuilder::default()
                 .with_title(format!("Recording properties — take #{rid}"))
                 .with_inner_size([500.0, 540.0]),
@@ -8857,14 +8913,11 @@ impl StreamArchiverApp {
                 });
             },
         );
-        if !open {
-            self.rec_props = None;
-        }
         if let Some(path) = copy_path {
             ctx.copy_text(path);
         }
         if let Some(notes) = notes_changed {
-            self.rec_props_notes = notes.clone();
+            self.rec_props_popups[idx].notes = notes.clone();
             // Update in-memory cache so the draft stays in sync if the dialog
             // is closed and reopened without a full reload.
             for recs in self.rec_cache.values_mut() {
@@ -8876,15 +8929,27 @@ impl StreamArchiverApp {
             }
             let _ = self.core.store.set_recording_notes(rid, &notes);
         }
+        !open
+    }
+
+    /// Render every open upcoming-streams window (one per monitor).
+    fn schedule_popup_windows(&mut self, ctx: &egui::Context) {
+        let mut closed: Vec<i64> = Vec::new();
+        for i in 0..self.schedule_popups.len() {
+            let mid = self.schedule_popups[i];
+            if self.schedule_popup_window(ctx, mid) {
+                closed.push(mid);
+            }
+        }
+        if !closed.is_empty() {
+            self.schedule_popups.retain(|m| !closed.contains(m));
+        }
     }
 
     /// Window listing a monitor's upcoming scheduled streams (datetime — title).
-    /// Opened by double-clicking a Next stream cell.
+    /// Opened by double-clicking a Next stream cell. Returns true on close.
     #[allow(deprecated)]
-    fn schedule_popup_window(&mut self, ctx: &egui::Context) {
-        let Some(mid) = self.schedule_popup else {
-            return;
-        };
+    fn schedule_popup_window(&mut self, ctx: &egui::Context, mid: i64) -> bool {
         if !self.schedule_cache.contains_key(&mid) {
             let v = self
                 .core
@@ -8896,7 +8961,7 @@ impl StreamArchiverApp {
         let segs = self.schedule_cache.get(&mid).cloned().unwrap_or_default();
         let mut open = true;
         ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("upcoming_streams_vp"),
+            egui::ViewportId::from_hash_of(("upcoming_streams_vp", mid)),
             egui::ViewportBuilder::default()
                 .with_title("Upcoming streams")
                 .with_inner_size([460.0, 280.0]),
@@ -8936,9 +9001,7 @@ impl StreamArchiverApp {
                 });
             },
         );
-        if !open {
-            self.schedule_popup = None;
-        }
+        !open
     }
 
     /// Load the persisted source order into the draft and open the dialog.
@@ -12509,11 +12572,16 @@ impl StreamArchiverApp {
         if scroll_to_cid.is_some() {
             self.scroll_to_channel = None;
         }
-        if let Some(rid) = open_ad_popup {
-            self.ad_popup = Some(rid);
+        if let Some(rid) = open_ad_popup
+            && !self.ad_popups.contains(&rid)
+        {
+            self.ad_popups.push(rid);
         }
         if let Some(p) = open_meta_popup {
-            self.meta_popup = Some(p);
+            let key = p.key();
+            if !self.meta_popups.iter().any(|m| m.key() == key) {
+                self.meta_popups.push(p);
+            }
         }
         if let Some(rec_id) = open_recover_take {
             self.open_recover_vod_from_seed(rec_id);
@@ -12524,8 +12592,10 @@ impl StreamArchiverApp {
         }
         // Next stream double-click: a channel/stream/take row sets the local; an
         // instance row routes through RowActions.
-        if let Some(mid) = open_schedule_popup.or(acts.open_schedule) {
-            self.schedule_popup = Some(mid);
+        if let Some(mid) = open_schedule_popup.or(acts.open_schedule)
+            && !self.schedule_popups.contains(&mid)
+        {
+            self.schedule_popups.push(mid);
         }
 
         // Tick the live Duration column ~1/sec while anything is recording.
@@ -12563,7 +12633,9 @@ impl StreamArchiverApp {
             }
         }
         if let Some(mid) = acts.properties {
-            self.properties_popup = Some(mid);
+            if !self.properties_popups.contains(&mid) {
+                self.properties_popups.push(mid);
+            }
             // Invalidate the full-size icon cache so the Properties window reloads it
             // (assets may have been fetched since last open). We do NOT invalidate
             // channel_icons_small here: the small avatar in the streams table is still
@@ -12628,7 +12700,9 @@ impl StreamArchiverApp {
             }
         }
         if let Some(cid) = open_channel_props {
-            self.channel_properties_popup = Some(cid);
+            if !self.channel_properties_popups.contains(&cid) {
+                self.channel_properties_popups.push(cid);
+            }
             // Same reasoning as acts.properties above: only drop the full-size icon
             // (used inside the child viewport) — not the small avatar (still painted
             // by the main viewport this frame).
@@ -12701,34 +12775,26 @@ impl StreamArchiverApp {
             // The take (and its cascaded ad breaks / meta changes) is gone; close
             // any popup that referenced it (a take popup for it, or a stream popup
             // that included it).
-            if self.ad_popup == Some(rid) {
-                self.ad_popup = None;
-            }
-            let meta_refs_rid = match &self.meta_popup {
-                Some(MetaPopup::Take(id)) => *id == rid,
-                Some(MetaPopup::Stream(takes)) => takes.iter().any(|(id, _)| *id == rid),
-                None => false,
-            };
-            if meta_refs_rid {
-                self.meta_popup = None;
-            }
-            if self.rec_props == Some(rid) {
-                self.rec_props = None;
-            }
+            self.ad_popups.retain(|r| *r != rid);
+            self.meta_popups.retain(|p| match p {
+                MetaPopup::Take(id) => *id != rid,
+                MetaPopup::Stream(takes) => !takes.iter().any(|(id, _)| *id == rid),
+            });
+            self.rec_props_popups.retain(|p| p.rec_id != rid);
             self.reload_rows();
         }
-        if let Some(rid) = open_recording_props {
+        if let Some(rid) = open_recording_props
+            && !self.rec_props_popups.iter().any(|p| p.rec_id == rid)
+        {
             // Seed the notes draft from the cached recording (already loaded).
-            if let Some(notes) = self
+            let notes = self
                 .rec_cache
                 .values()
                 .flat_map(|v| v.iter())
                 .find(|r| r.id == rid)
                 .map(|r| r.notes.clone())
-            {
-                self.rec_props_notes = notes;
-            }
-            self.rec_props = Some(rid);
+                .unwrap_or_default();
+            self.rec_props_popups.push(RecPropsPopup { rec_id: rid, notes });
         }
     }
 
@@ -17592,7 +17658,8 @@ impl StreamArchiverApp {
         } else {
             *state.lock().unwrap() = ChatLoadState::NoFile;
         }
-        self.chat_popup = Some(ChatPopup {
+        let popup = ChatPopup {
+            monitor_id,
             monitor_name,
             recording: rec,
             all_recordings: recs,
@@ -17604,20 +17671,46 @@ impl StreamArchiverApp {
             twitch_emote_dir,
             loading,
             filter_cache: None,
-        });
+        };
+        // One chat window per monitor: re-targeting an already-open window
+        // (e.g. "View chat" on another take) replaces its content in place;
+        // a different monitor gets its own window.
+        match self.chat_popups.iter_mut().find(|p| p.monitor_id == monitor_id) {
+            Some(slot) => *slot = popup,
+            None => self.chat_popups.push(popup),
+        }
     }
 
     #[allow(deprecated)]
-    fn chat_popup_window(&mut self, ctx: &egui::Context) {
+    /// Render every open chat window (one OS viewport per monitor).
+    fn chat_popup_windows(&mut self, ctx: &egui::Context) {
+        let mut closed: Vec<i64> = Vec::new();
+        for idx in 0..self.chat_popups.len() {
+            if self.chat_popup_window(ctx, idx) {
+                closed.push(self.chat_popups[idx].monitor_id);
+            }
+        }
+        if !closed.is_empty() {
+            self.chat_popups.retain(|p| !closed.contains(&p.monitor_id));
+            if self.chat_popups.is_empty() {
+                // Free all decoded emote frame textures once the last chat
+                // window is gone.
+                self.clear_emote_cache();
+            }
+        }
+    }
+
+    /// Render one chat window; returns true when the user closed it.
+    #[allow(deprecated)]
+    fn chat_popup_window(&mut self, ctx: &egui::Context, idx: usize) -> bool {
         const CHAT_RELOAD_SECS: u64 = 3;
-        let Some(popup) = &mut self.chat_popup else {
-            return;
-        };
+        let popup = &mut self.chat_popups[idx];
         // Watchdog: name this phase so a freeze dialog points at the chat popup.
         self.heartbeat.set_context(format!("Chat: {}", popup.monitor_name));
         self.heartbeat.set_activity(crate::watchdog::Activity::Chat);
         let mut open = true;
         let title = format!("💬  Chat — {}", popup.monitor_name);
+        let vp_id = egui::ViewportId::from_hash_of(("chat_popup_vp", popup.monitor_id));
 
         // Whether the selected recording is still in progress (chat file is growing).
         let rec_active = popup.recording.as_ref().map_or(false, |r| r.ended_at.is_none());
@@ -17662,7 +17755,7 @@ impl StreamArchiverApp {
         let mut decode_misses: Vec<std::path::PathBuf> = Vec::new();
 
         ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("chat_popup_vp"),
+            vp_id,
             egui::ViewportBuilder::default()
                 .with_title(title.clone())
                 .with_inner_size([480.0, 600.0]),
@@ -17909,9 +18002,7 @@ impl StreamArchiverApp {
         // appended since the last pass and push them onto the shown log —
         // the whole file is never re-read.
         if let Some((path, start_ts, state, emap, tdir, loading)) = reload_info {
-            if let Some(p) = &mut self.chat_popup {
-                p.last_reload = std::time::Instant::now();
-            }
+            self.chat_popups[idx].last_reload = std::time::Instant::now();
             self.core.rt.spawn(tail_chat(
                 state,
                 loading,
@@ -17929,11 +18020,7 @@ impl StreamArchiverApp {
             ctx.request_repaint_after(std::time::Duration::from_secs(CHAT_RELOAD_SECS));
         }
 
-        if !open {
-            self.chat_popup = None;
-            // Free all decoded emote frame textures now the popup is closed.
-            self.clear_emote_cache();
-        }
+        !open
     }
 
     /// Drop all decoded emote frames and bump the epoch so any in-flight decode
@@ -17992,11 +18079,28 @@ impl StreamArchiverApp {
 
     /// Instance (monitor) properties window — header + monitor-specific info.
     #[allow(deprecated)]
-    fn instance_properties_window(&mut self, ctx: &egui::Context) {
-        let Some(mid) = self.properties_popup else { return };
+    /// Render every open instance-properties window (one per monitor).
+    fn instance_properties_windows(&mut self, ctx: &egui::Context) {
+        let mut closed: Vec<i64> = Vec::new();
+        for i in 0..self.properties_popups.len() {
+            let mid = self.properties_popups[i];
+            if self.instance_properties_window(ctx, mid) {
+                closed.push(mid);
+            }
+        }
+        if !closed.is_empty() {
+            self.properties_popups.retain(|m| !closed.contains(m));
+            for mid in closed {
+                self.instance_scope_drafts.remove(&mid);
+            }
+        }
+    }
+
+    /// One instance-properties window; returns true when it should close.
+    #[allow(deprecated)]
+    fn instance_properties_window(&mut self, ctx: &egui::Context, mid: i64) -> bool {
         let Some(row) = self.rows.iter().find(|r| r.monitor.id == mid).cloned() else {
-            self.properties_popup = None;
-            return;
+            return true;
         };
         let ch = &row.channel;
         let m = &row.monitor;
@@ -18013,15 +18117,15 @@ impl StreamArchiverApp {
             .or_insert_with(|| resolve_channel_icon(ch, &platforms, ctx))
             .clone();
 
-        if self.instance_scope_draft.as_ref().map(|(id, _)| *id) != Some(m.id) {
-            self.instance_scope_draft = Some((m.id, load_monitor_scope(&self.core.store, m.id)));
-        }
+        self.instance_scope_drafts
+            .entry(m.id)
+            .or_insert_with(|| load_monitor_scope(&self.core.store, m.id));
         let global_order = load_source_order(&self.core.store);
         let mut scope_dirty = false;
 
         let mut open = true;
         ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("instance_props_vp"),
+            egui::ViewportId::from_hash_of(("instance_props_vp", mid)),
             egui::ViewportBuilder::default()
                 .with_title(format!("Instance — {}", ch.name))
                 .with_inner_size([480.0, 380.0]),
@@ -18143,7 +18247,7 @@ impl StreamArchiverApp {
                     .small()
                     .weak(),
                 );
-                if let Some((_, scope)) = self.instance_scope_draft.as_mut() {
+                if let Some(scope) = self.instance_scope_drafts.get_mut(&m.id) {
                     if scope_override_editor(ui, scope, &global_order) {
                         scope_dirty = true;
                     }
@@ -18154,8 +18258,8 @@ impl StreamArchiverApp {
         );
 
         if scope_dirty {
-            if let Some((mid, scope)) = &self.instance_scope_draft {
-                if let Err(e) = save_monitor_scope(&self.core.store, *mid, scope) {
+            if let Some(scope) = self.instance_scope_drafts.get(&mid) {
+                if let Err(e) = save_monitor_scope(&self.core.store, mid, scope) {
                     self.status = format!("Error saving instance sources: {e}");
                 } else {
                     self.core.request_schedule_refresh();
@@ -18163,10 +18267,7 @@ impl StreamArchiverApp {
             }
         }
 
-        if !open {
-            self.properties_popup = None;
-            self.instance_scope_draft = None;
-        }
+        !open
     }
 
     /// Drive the off-UI-thread load of the channel Properties window's per-open data,
@@ -18186,9 +18287,9 @@ impl StreamArchiverApp {
         asset_platforms: &[Platform],
         ctx: &egui::Context,
     ) -> bool {
-        // Ensure a load for THIS channel is in flight (replace a stale one left over from
-        // a different channel if the user switched the open window).
-        let need_spawn = !matches!(&self.props_load, Some(pl) if pl.channel_id == cid);
+        // Ensure a load for THIS channel is in flight (other windows' loads run
+        // concurrently in their own entries).
+        let need_spawn = !self.props_loads.iter().any(|pl| pl.channel_id == cid);
         if need_spawn {
             let (tx, rx) = std::sync::mpsc::channel();
             let ch_bg = ch.clone();
@@ -18222,7 +18323,7 @@ impl StreamArchiverApp {
                     ctx_bg.request_repaint();
                 });
             match spawned {
-                Ok(_) => self.props_load = Some(PropsLoad { channel_id: cid, rx }),
+                Ok(_) => self.props_loads.push(PropsLoad { channel_id: cid, rx }),
                 Err(e) => {
                     // Spawn failed (extremely unlikely). Fall back to a synchronous load so
                     // the window still opens rather than spinning forever.
@@ -18244,28 +18345,23 @@ impl StreamArchiverApp {
             }
         }
 
-        // Poll the in-flight load without blocking. Extract the owned `try_recv` result
-        // first so the `&self.props_load` borrow ends before we mutate `self`.
-        let polled = self
-            .props_load
-            .as_ref()
-            .filter(|pl| pl.channel_id == cid)
-            .map(|pl| pl.rx.try_recv());
-        match polled {
-            Some(Ok(loaded)) => {
-                self.install_props_loaded(loaded);
-                self.props_load = None;
-                return true; // caller draws the real window this frame
+        // Poll this channel's in-flight load without blocking.
+        if let Some(i) = self.props_loads.iter().position(|pl| pl.channel_id == cid) {
+            match self.props_loads[i].rx.try_recv() {
+                Ok(loaded) => {
+                    self.props_loads.remove(i);
+                    self.install_props_loaded(loaded);
+                    return true; // caller draws the real window this frame
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Loader vanished without sending (it never panics in practice —
+                    // every step degrades to a default). Drop the handle so the next
+                    // frame respawns; the placeholder stays up meanwhile.
+                    self.props_loads.remove(i);
+                }
+                // Still loading → fall through to the placeholder.
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
-            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
-                // Loader vanished without sending (it never panics in practice — every
-                // step degrades to a default). Drop the handle so the next frame respawns;
-                // the placeholder stays up meanwhile.
-                self.props_load = None;
-            }
-            // `Some(Err(Empty))` (still loading) or `None` (no load for this channel) →
-            // fall through to the placeholder.
-            _ => {}
         }
 
         // Still loading: draw the placeholder. Same viewport id as the real window so it
@@ -18274,7 +18370,7 @@ impl StreamArchiverApp {
         self.heartbeat.set_activity(crate::watchdog::Activity::Properties);
         let mut open = true;
         ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("channel_props_vp"),
+            egui::ViewportId::from_hash_of(("channel_props_vp", cid)),
             egui::ViewportBuilder::default()
                 .with_title(format!("Properties — {}", ch.name))
                 .with_inner_size([480.0, 600.0]),
@@ -18293,15 +18389,15 @@ impl StreamArchiverApp {
             },
         );
         if !open {
-            // Closed mid-load: forget the popup and the in-flight load (a bundle that
-            // still arrives is dropped because the receiver is gone).
-            self.channel_properties_popup = None;
-            self.props_load = None;
+            // Closed mid-load: forget the popup and its in-flight load (a bundle
+            // that still arrives is dropped because the receiver is gone).
+            self.channel_properties_popups.retain(|c| *c != cid);
+            self.props_loads.retain(|pl| pl.channel_id != cid);
         }
         // Keep frames coming while a load is in flight so we poll the loader
         // (the spinner animates too) — but NOT unconditionally: that busy-looped
         // the whole app at max FPS for as long as the window stayed open.
-        if self.props_load.is_some() {
+        if !self.props_loads.is_empty() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
         false
@@ -18312,7 +18408,7 @@ impl StreamArchiverApp {
     /// switched away while the background load ran). In-progress config/scope edits are
     /// preserved: the drafts are only seeded when they don't already belong to this channel.
     fn install_props_loaded(&mut self, loaded: PropsLoaded) {
-        if self.channel_properties_popup != Some(loaded.channel_id) {
+        if !self.channel_properties_popups.contains(&loaded.channel_id) {
             return;
         }
         let id = loaded.channel_id;
@@ -18321,24 +18417,42 @@ impl StreamArchiverApp {
         self.channel_emote_counts.insert(id, loaded.emote_counts);
         self.channel_asset_status.insert(id, loaded.asset_status);
         self.props_source_order = loaded.source_order;
-        if self.channel_cfg_draft.as_ref().map(|(i, _)| *i) != Some(id) {
-            self.channel_cfg_draft = Some((id, loaded.cfg));
+        self.channel_cfg_drafts.entry(id).or_insert(loaded.cfg);
+        self.channel_scope_drafts.entry(id).or_insert(loaded.scope);
+    }
+
+    /// Render every open channel-Properties window (one per channel).
+    fn channel_properties_windows(&mut self, ctx: &egui::Context) {
+        let mut closed: Vec<i64> = Vec::new();
+        // Snapshot: a window closed mid-load removes itself from the list
+        // inside drive_props_load, so indexed iteration could skip/overrun.
+        let ids: Vec<i64> = self.channel_properties_popups.clone();
+        for cid in ids {
+            if !self.channel_properties_popups.contains(&cid) {
+                continue; // removed mid-loop (closed while loading)
+            }
+            if self.channel_properties_window(ctx, cid) {
+                closed.push(cid);
+            }
         }
-        if self.channel_scope_draft.as_ref().map(|(i, _)| *i) != Some(id) {
-            self.channel_scope_draft = Some((id, loaded.scope));
+        for cid in closed {
+            self.channel_properties_popups.retain(|c| *c != cid);
+            self.channel_cfg_drafts.remove(&cid);
+            self.channel_scope_drafts.remove(&cid);
+            // Free the full-resolution thumbnail textures (only this window
+            // uses them); they reload from disk on the next open.
+            self.channel_asset_thumbs.remove(&cid);
+            self.channel_emote_counts.remove(&cid);
+            self.channel_asset_status.remove(&cid);
         }
     }
 
     /// Channel properties window — header + channel info, assets, and schedule-source config.
+    /// Returns true when it should close.
     #[allow(deprecated)]
-    fn channel_properties_window(&mut self, ctx: &egui::Context) {
-        let Some(cid) = self.channel_properties_popup else { return };
-        let ch = match self.channels.iter().find(|c| c.id == cid).cloned() {
-            Some(c) => c,
-            None => {
-                self.channel_properties_popup = None;
-                return;
-            }
+    fn channel_properties_window(&mut self, ctx: &egui::Context, cid: i64) -> bool {
+        let Some(ch) = self.channels.iter().find(|c| c.id == cid).cloned() else {
+            return true;
         };
         // Watchdog: the synchronous first-open work below (icon/thumbnail image decode +
         // GPU upload and the per-platform asset enumeration) is the part that can block
@@ -18370,7 +18484,7 @@ impl StreamArchiverApp {
         if !self.channel_asset_status.contains_key(&ch.id)
             && !self.drive_props_load(cid, &ch, &platforms, &asset_platforms, ctx)
         {
-            return; // still loading — placeholder is on screen
+            return false; // still loading — placeholder is on screen
         }
 
         let icon_tex = self
@@ -18407,15 +18521,16 @@ impl StreamArchiverApp {
         let mut open_emote_viewer: Option<EmoteProvider> = None;
         let mut open_asset_history = false;
 
-        if self.channel_cfg_draft.as_ref().map(|(id, _)| *id) != Some(ch.id) {
-            self.channel_cfg_draft = Some((ch.id, load_channel_cfg(&self.core.store, ch.id)));
+        if !self.channel_cfg_drafts.contains_key(&ch.id) {
+            self.channel_cfg_drafts
+                .insert(ch.id, load_channel_cfg(&self.core.store, ch.id));
             // Snapshot the global source order once per open (read once here, not via a
             // settings DB read every frame inside `scope_override_editor`).
             self.props_source_order = load_source_order(&self.core.store);
         }
-        if self.channel_scope_draft.as_ref().map(|(id, _)| *id) != Some(ch.id) {
-            self.channel_scope_draft =
-                Some((ch.id, load_channel_scope(&self.core.store, ch.id)));
+        if !self.channel_scope_drafts.contains_key(&ch.id) {
+            self.channel_scope_drafts
+                .insert(ch.id, load_channel_scope(&self.core.store, ch.id));
         }
         let global_order = self.props_source_order.clone();
         let mut cfg_dirty = false;
@@ -18429,7 +18544,7 @@ impl StreamArchiverApp {
 
         let mut open = true;
         ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("channel_props_vp"),
+            egui::ViewportId::from_hash_of(("channel_props_vp", cid)),
             egui::ViewportBuilder::default()
                 .with_title(format!("Properties — {}", ch.name))
                 .with_inner_size([480.0, 600.0]),
@@ -18734,7 +18849,7 @@ impl StreamArchiverApp {
                 }
 
                 // ── Schedule sources (per-channel) ───────────────────────
-                if let Some((_, cfg)) = self.channel_cfg_draft.as_mut() {
+                if let Some(cfg) = self.channel_cfg_drafts.get_mut(&ch.id) {
                     ui.add_space(6.0);
                     ui.strong("Schedule sources (this channel)");
                     ui.label(
@@ -18849,7 +18964,7 @@ impl StreamArchiverApp {
 
                     // Per-channel source-order + title-fill override.
                     ui.add_space(6.0);
-                    if let Some((_, scope)) = self.channel_scope_draft.as_mut() {
+                    if let Some(scope) = self.channel_scope_drafts.get_mut(&ch.id) {
                         if scope_override_editor(ui, scope, &global_order) {
                             scope_dirty = true;
                         }
@@ -18874,27 +18989,42 @@ impl StreamArchiverApp {
             },
         );
 
-        // A launcher button was clicked above — open the emote viewer for it.
+        // A launcher button was clicked above — open (or refresh) the emote
+        // viewer for this channel+provider; other channels' viewers stay open.
         if let Some(provider) = open_emote_viewer {
-            self.emote_viewer = Some(EmoteViewer::new(ch.name.clone(), provider));
-            // Fresh enumeration — clear any stale flag left from a prior session.
-            self.emote_viewer_stale = false;
+            let fresh = EmoteViewer::new(ch.name.clone(), provider);
+            match self
+                .emote_viewers
+                .iter_mut()
+                .find(|v| v.channel_name == ch.name && v.provider == provider)
+            {
+                Some(slot) => *slot = fresh, // re-enumerated → stale flag reset
+                None => self.emote_viewers.push(fresh),
+            }
         }
         // The "🕑 History" button was clicked — load and open the asset-history popup.
         if open_asset_history {
-            self.asset_history = Some(AssetHistoryView::new(ch.name.clone(), &asset_platforms));
+            let fresh = AssetHistoryView::new(ch.name.clone(), &asset_platforms);
+            match self
+                .asset_histories
+                .iter_mut()
+                .find(|h| h.channel_name == ch.name)
+            {
+                Some(slot) => *slot = fresh,
+                None => self.asset_histories.push(fresh),
+            }
         }
 
         if cfg_dirty {
-            if let Some((cid, cfg)) = &self.channel_cfg_draft {
-                if let Err(e) = save_channel_cfg(&self.core.store, *cid, cfg) {
+            if let Some(cfg) = self.channel_cfg_drafts.get(&cid) {
+                if let Err(e) = save_channel_cfg(&self.core.store, cid, cfg) {
                     self.status = format!("Error saving channel config: {e}");
                 }
             }
         }
         if scope_dirty {
-            if let Some((cid, scope)) = &self.channel_scope_draft {
-                if let Err(e) = save_channel_scope(&self.core.store, *cid, scope) {
+            if let Some(scope) = self.channel_scope_drafts.get(&cid) {
+                if let Err(e) = save_channel_scope(&self.core.store, cid, scope) {
                     self.status = format!("Error saving channel sources: {e}");
                 } else {
                     self.core.request_schedule_refresh();
@@ -18902,28 +19032,42 @@ impl StreamArchiverApp {
             }
         }
 
-        if !open {
-            self.channel_properties_popup = None;
-            self.channel_cfg_draft = None;
-            self.channel_scope_draft = None;
-            // Free the full-resolution thumbnail textures (only this window uses
-            // them); they reload from disk on the next open.
-            self.channel_asset_thumbs.remove(&cid);
-            self.channel_emote_counts.remove(&cid);
-            self.channel_asset_status.remove(&cid);
+        // Draft/texture cleanup for a closed window happens in the caller
+        // (channel_properties_windows), which also drops it from the open list.
+        !open
+    }
+
+    /// Render every open emote-viewer window (one per channel+provider) — a
+    /// grid of images with their codes; emotes whose image file is gone (the
+    /// manifest still lists them, but the file was removed upstream) appear
+    /// separately under "Deprecated". Reuses the shared `emote_anim` decode
+    /// cache, so emotes animate against the same clock as chat replay.
+    fn emote_viewer_windows(&mut self, ctx: &egui::Context) {
+        let mut closed: Vec<(String, EmoteProvider)> = Vec::new();
+        for i in 0..self.emote_viewers.len() {
+            let key = (
+                self.emote_viewers[i].channel_name.clone(),
+                self.emote_viewers[i].provider,
+            );
+            if self.emote_viewer_window(ctx, i) {
+                closed.push(key);
+            }
+        }
+        if !closed.is_empty() {
+            self.emote_viewers
+                .retain(|v| !closed.contains(&(v.channel_name.clone(), v.provider)));
+            if self.emote_viewers.is_empty() {
+                // Free decoded emote frames now the last viewer is closed
+                // (mirrors the chat popup). An open chat replay re-decodes its
+                // visible emotes next frame — cheap and bounded.
+                self.clear_emote_cache();
+            }
         }
     }
 
-    /// Emote-viewer window — every emote one provider has for one channel, drawn as a
-    /// grid of images with their codes. Emotes whose image file is gone (the manifest
-    /// still lists them, but the file was removed upstream) appear separately under
-    /// "Deprecated". Reuses the shared `emote_anim` decode cache, so emotes animate
-    /// against the same clock as chat replay.
+    /// One emote-viewer window; returns true when it should close.
     #[allow(deprecated)]
-    fn emote_viewer_window(&mut self, ctx: &egui::Context) {
-        if self.emote_viewer.is_none() {
-            return;
-        }
+    fn emote_viewer_window(&mut self, ctx: &egui::Context, idx: usize) -> bool {
         // Watchdog: name this phase (REPRO 2 — emote viewer grid left open).
         self.heartbeat.set_activity(crate::watchdog::Activity::EmoteViewerGrid);
         // Render toggles + shared cache copied out before borrowing the viewer, so
@@ -18932,13 +19076,13 @@ impl StreamArchiverApp {
         let animate_emotes = self.animate_emotes;
         let now = ctx.input(|i| i.time);
         let mut decode_misses: Vec<std::path::PathBuf> = Vec::new();
-        // Were this channel's assets refetched while the window stayed open? The
-        // lists below were enumerated once on open, so they no longer reflect disk.
-        let stale = self.emote_viewer_stale;
 
         // Extract everything we need from the viewer up front, so the borrow ends
         // before we need to mutably borrow self later (for NLL borrow checker).
-        let viewer = self.emote_viewer.as_ref().expect("checked Some above");
+        let viewer = &self.emote_viewers[idx];
+        // Were this channel's assets refetched while the window stayed open? The
+        // lists below were enumerated once on open, so they no longer reflect disk.
+        let stale = viewer.stale;
         let provider = viewer.provider;
         let channel_name = viewer.channel_name.clone();
         let active = viewer.active.clone();
@@ -18951,7 +19095,7 @@ impl StreamArchiverApp {
         let mut clear_properties = false;
 
         ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("emote_viewer_vp"),
+            egui::ViewportId::from_hash_of(("emote_viewer_vp", &channel_name, provider.label())),
             egui::ViewportBuilder::default()
                 .with_title(format!("{} emotes — {}", provider.label(), channel_name))
                 .with_inner_size([560.0, 600.0]),
@@ -19102,26 +19246,18 @@ impl StreamArchiverApp {
 
         // Apply context-menu / properties-window state changes collected during render.
         if let Some(ep) = pending_properties {
-            if let Some(viewer) = &mut self.emote_viewer {
+            if let Some(viewer) = self.emote_viewers.get_mut(idx) {
                 viewer.emote_properties = Some(ep);
             }
         } else if clear_properties {
-            if let Some(viewer) = &mut self.emote_viewer {
+            if let Some(viewer) = self.emote_viewers.get_mut(idx) {
                 viewer.emote_properties = None;
             }
         }
 
         self.pump_emote_decodes(decode_misses, now, ctx);
 
-        if !open {
-            self.emote_viewer = None;
-            // Reset the stale flag so a later re-open starts fresh (not pre-flagged).
-            self.emote_viewer_stale = false;
-            // Free decoded emote frames now the window is closed (mirrors the chat
-            // popup). If the chat replay is still open it re-decodes its visible
-            // emotes next frame — cheap and bounded.
-            self.clear_emote_cache();
-        }
+        !open
     }
 
     /// Asset change-history popup: the recorded add/remove of emotes plus
@@ -19129,14 +19265,27 @@ impl StreamArchiverApp {
     /// across all its platforms. Lines are built once on open (see
     /// [`AssetHistoryView::new`]); this just renders the snapshot. Mirrors
     /// [`Self::meta_popup_window`].
+    /// Render every open asset-history window (one per channel).
+    fn asset_history_windows(&mut self, ctx: &egui::Context) {
+        let mut closed: Vec<String> = Vec::new();
+        for i in 0..self.asset_histories.len() {
+            let name = self.asset_histories[i].channel_name.clone();
+            if self.asset_history_window(ctx, i) {
+                closed.push(name);
+            }
+        }
+        if !closed.is_empty() {
+            self.asset_histories.retain(|h| !closed.contains(&h.channel_name));
+        }
+    }
+
+    /// One asset-history window; returns true when it should close.
     #[allow(deprecated)]
-    fn asset_history_window(&mut self, ctx: &egui::Context) {
-        let Some(view) = self.asset_history.as_ref() else {
-            return;
-        };
+    fn asset_history_window(&mut self, ctx: &egui::Context, idx: usize) -> bool {
+        let view = &self.asset_histories[idx];
         let mut open = true;
         ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("asset_history_vp"),
+            egui::ViewportId::from_hash_of(("asset_history_vp", &view.channel_name)),
             egui::ViewportBuilder::default()
                 .with_title(format!("Asset history — {}", view.channel_name))
                 .with_inner_size([560.0, 440.0]),
@@ -19171,9 +19320,7 @@ impl StreamArchiverApp {
                 });
             },
         );
-        if !open {
-            self.asset_history = None;
-        }
+        !open
     }
 }
 
