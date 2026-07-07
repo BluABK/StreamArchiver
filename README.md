@@ -786,6 +786,16 @@ feed is browsable in the **Posts** top-level tab or the pop-out **📣 Posts**
 window, with a channel filter and text search; each new post also raises a
 notification.
 
+- **Post kinds.** A channel's community tab mixes the channel's **own posts**,
+  **viewer posts** (fans posting in the channel's Community space), and
+  **reshares** (the channel quoting another post). StreamArchiver tells them
+  apart by the owner-highlight YouTube renders on the channel's own posts and by
+  matching author channel ids against the page owner. Viewer posts are archived
+  but **hidden by default** — a *Show viewer posts (N)* toggle reveals them with
+  a *viewer* badge — and **only the channel's own posts raise notifications**. A
+  reshare renders the resharer's comment above an indented quote card showing
+  the original author, text, and images (all archived, so the quote survives if
+  the original is later deleted).
 - **Ordering.** Posts sort by their (approximate) **publish time**, derived
   from YouTube's relative timestamps ("2 weeks ago") the first time a post is
   seen — not by when the archiver happened to discover them. Hover the
