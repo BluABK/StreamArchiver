@@ -465,7 +465,7 @@ fn uc_from_url(url: &str) -> Option<String> {
 
 /// Find the channel's own `UC…` id in page HTML. Prefers the channel-identifying
 /// markers (`externalId`, canonical `/channel/`) over a generic `channelId`.
-fn find_uc(html: &str) -> Option<String> {
+pub(crate) fn find_uc(html: &str) -> Option<String> {
     for marker in ["\"externalId\":\"", "/channel/", "\"channelId\":\""] {
         let mut from = 0;
         while let Some(rel) = html[from..].find(marker) {

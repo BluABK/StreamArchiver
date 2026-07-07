@@ -1432,16 +1432,30 @@ impl DetectContext {
         parse_community_posts(&data, &mut posts);
         posts.truncate(MAX_POSTS);
 
-        let mut first_page_new = 0usize;
+        // The page owner's `UC…` id (from the canonical `/channel/` link) tells
+        // the channel's own posts apart from viewer posts. Reused for the whole
+        // continuation walk — continuation JSON carries no page HTML.
+        let owner_id = crate::websub::find_uc(&body).unwrap_or_default();
+
+        // Gap-fill heuristics track CHANNEL posts only: viewer posts (fans
+        // commenting) churn constantly and must not trigger a deep walk every
+        // round.
+        let mut channel_on_page = 0usize;
+        let mut channel_new = 0usize;
         for p in &posts {
-            if self.ingest_post(row, p, true, events).await {
-                first_page_new += 1;
+            let kind = classify_author_kind(p, &owner_id);
+            let is_new = self.ingest_post(row, p, kind, true, events).await;
+            if kind == "channel" {
+                channel_on_page += 1;
+                if is_new {
+                    channel_new += 1;
+                }
             }
         }
 
         // ── Older pages (continuation walk) ──
         let backfill_done = self.store.posts_backfill_done(row.monitor.id).unwrap_or(true);
-        let gap_suspected = !posts.is_empty() && first_page_new == posts.len();
+        let gap_suspected = channel_on_page > 0 && channel_new == channel_on_page;
         if backfill_done && !gap_suspected {
             return;
         }
@@ -1472,8 +1486,8 @@ impl DetectContext {
         if backfill_done {
             tracing::info!(
                 channel = %row.channel.name,
-                new_posts = first_page_new,
-                "entire first page of community posts was unseen; gap-filling older pages"
+                new_posts = channel_new,
+                "entire first page of channel posts was unseen; gap-filling older pages"
             );
         } else {
             tracing::info!(
@@ -1501,12 +1515,14 @@ impl DetectContext {
             parse_community_posts(&resp, &mut older);
             pages += 1;
             walked += older.len() as i64;
-            let mut new_here = 0usize;
+            let mut channel_new_here = 0usize;
             for p in &older {
                 // No notifications for walked pages: these are old posts being
                 // archived, not fresh activity.
-                if self.ingest_post(row, p, false, events).await {
-                    new_here += 1;
+                let kind = classify_author_kind(p, &owner_id);
+                let is_new = self.ingest_post(row, p, kind, false, events).await;
+                if kind == "channel" && is_new {
+                    channel_new_here += 1;
                 }
             }
             match find_continuation_token(&resp) {
@@ -1516,8 +1532,8 @@ impl DetectContext {
                     break;
                 }
             }
-            if backfill_done && new_here == 0 {
-                completed = true; // gap-fill reached already-archived posts
+            if backfill_done && channel_new_here == 0 {
+                completed = true; // gap-fill reached already-archived channel posts
                 break;
             }
         }
@@ -1545,28 +1561,37 @@ impl DetectContext {
 
     /// Upsert one parsed community post (row + cached images) and return whether
     /// it was newly seen. `notify == true` additionally emits the `youtube_post`
-    /// notification for a new post — the backfill/gap walks pass `false` so
-    /// archiving old posts never spams the feed.
+    /// notification for a new **channel** post — the backfill/gap walks pass
+    /// `false` so archiving old posts never spams the feed, and viewer posts
+    /// never notify regardless. `author_kind` (`channel`/`viewer`) is persisted
+    /// on the row so the feed can hide viewer posts.
     async fn ingest_post(
         &self,
         row: &MonitorWithChannel,
         p: &ParsedPost,
+        author_kind: &str,
         notify: bool,
         events: &EventTx,
     ) -> bool {
-        let (pk, is_new) = match self.store.community_post_upsert_full(&crate::store::NewCommunityPost {
+        // One builder for both the initial upsert and the post-icon refresh
+        // (they differ only in `author_icon`).
+        let mk = |author_icon: String| crate::store::NewCommunityPost {
             monitor_id: row.monitor.id,
             channel_id: row.channel.id,
             post_id: p.post_id.clone(),
             author: p.author.clone(),
-            author_icon: String::new(), // filled below once the icon is cached
+            author_icon,
             published_text: p.published_text.clone(),
             body_text: p.body_text.clone(),
             links_json: p.links_json.clone(),
             vote_count: p.vote_count.clone(),
+            shared_json: p.shared_json.clone(),
             raw_json: p.raw_json.clone(),
+            author_kind: author_kind.to_string(),
+            author_channel_id: p.author_channel_id.clone(),
             ..Default::default()
-        }) {
+        };
+        let (pk, is_new) = match self.store.community_post_upsert_full(&mk(String::new())) {
             Ok(v) => v,
             Err(_) => return false,
         };
@@ -1584,19 +1609,9 @@ impl DetectContext {
             if !p.author_icon_url.is_empty()
                 && let Some((_, path)) = self.download_post_image(row, &p.author_icon_url).await
             {
-                let _ = self.store.community_post_upsert_full(&crate::store::NewCommunityPost {
-                    monitor_id: row.monitor.id,
-                    channel_id: row.channel.id,
-                    post_id: p.post_id.clone(),
-                    author: p.author.clone(),
-                    author_icon: path.to_string_lossy().into_owned(),
-                    published_text: p.published_text.clone(),
-                    body_text: p.body_text.clone(),
-                    links_json: p.links_json.clone(),
-                    vote_count: p.vote_count.clone(),
-                    raw_json: p.raw_json.clone(),
-                    ..Default::default()
-                });
+                let _ = self
+                    .store
+                    .community_post_upsert_full(&mk(path.to_string_lossy().into_owned()));
             }
 
             // Download + record each attachment image, in order. A small
@@ -1621,11 +1636,31 @@ impl DetectContext {
                         .await;
                 }
             }
+
+            // A reshare's quoted-original images, continuing the ordinal
+            // sequence and tagged `shared_image` so the feed renders them inside
+            // the quote card rather than as the post's own attachments.
+            let base = p.image_urls.len();
+            for (i, url) in p.shared_image_urls.iter().enumerate() {
+                if let Some((hash, path)) = self.download_post_image(row, url).await {
+                    let local = path.to_string_lossy().into_owned();
+                    let _ = self.store.community_post_media_upsert(
+                        pk,
+                        (base + i) as i64,
+                        "shared_image",
+                        url,
+                        &hash,
+                        &local,
+                    );
+                    tokio::time::sleep(Duration::from_millis(150 + spread_rand_u64() % 500))
+                        .await;
+                }
+            }
         }
 
-        // A newly-seen post → one notification (fresh activity only; the
-        // backfill/gap walks archive silently).
-        if is_new && notify {
+        // A newly-seen CHANNEL post → one notification (fresh activity only; the
+        // backfill/gap walks archive silently, and viewer posts never notify).
+        if is_new && notify && author_kind == "channel" {
             let snippet: String = p.body_text.chars().take(140).collect();
             let _ = self.store.insert_notification(&crate::store::NewNotification {
                 kind: NotificationKind::YoutubePost.id().to_string(),
@@ -3389,6 +3424,12 @@ struct ParsedPost {
     post_id: String,
     author: String,
     author_icon_url: String,
+    /// The author's `UC…` channel id, when extractable — compared against the
+    /// page owner id to tell the channel's own posts from viewer posts.
+    author_channel_id: String,
+    /// `showPostAuthorBackgroundHighlight` present ⇔ the channel owner authored
+    /// this post (YouTube renders it with the owner's highlight).
+    is_owner_highlight: bool,
     published_text: String,
     body_text: String,
     /// JSON array of `{text, url}` runs (url `""` = plain) for 1:1 link rendering.
@@ -3396,8 +3437,60 @@ struct ParsedPost {
     vote_count: String,
     /// Attachment image URLs, in document order (single or multi-image posts).
     image_urls: Vec<String>,
+    /// For a reshare: the quoted original as JSON `{author, author_channel_id,
+    /// published_text, body_text, links_json}` — empty for a normal post.
+    shared_json: String,
+    /// For a reshare: the quoted original's attachment image URLs, in order.
+    shared_image_urls: Vec<String>,
     /// The post renderer subtree, serialized for forward-compat re-parsing.
     raw_json: String,
+}
+
+/// Flatten a `{runs:[…]}` content node into concatenated body text + a
+/// `[{text,url}]` links array (the 1:1 shape the feed renders). Shared by the
+/// normal post's `contentText` and a reshare's `content`.
+fn runs_to_body_and_links(node: Option<&Value>) -> (String, String) {
+    let mut body_text = String::new();
+    let mut runs_json: Vec<Value> = Vec::new();
+    if let Some(runs) = node.and_then(|c| c.get("runs")).and_then(|r| r.as_array()) {
+        for run in runs {
+            let text = run.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            let url = run
+                .get("navigationEndpoint")
+                .and_then(|ne| {
+                    ne.get("urlEndpoint")
+                        .and_then(|u| u.get("url"))
+                        .and_then(|u| u.as_str())
+                        .or_else(|| {
+                            ne.get("commandMetadata")
+                                .and_then(|c| c.get("webCommandMetadata"))
+                                .and_then(|w| w.get("url"))
+                                .and_then(|u| u.as_str())
+                        })
+                })
+                .unwrap_or("");
+            body_text.push_str(text);
+            runs_json.push(serde_json::json!({ "text": text, "url": url }));
+        }
+    }
+    let links_json = serde_json::to_string(&runs_json).unwrap_or_else(|_| "[]".to_string());
+    (body_text, links_json)
+}
+
+/// A post author's `UC…` channel id from an endpoint node (`authorEndpoint`, or
+/// a reshare's `endpoint`/`navigationEndpoint`): the current `profileCardCommand`
+/// shape, then the legacy `browseEndpoint`.
+fn author_channel_id_from(ep: Option<&Value>) -> String {
+    ep.and_then(|e| e.get("profileCardCommand"))
+        .and_then(|c| c.get("profileOwnerExternalChannelId"))
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            ep.and_then(|e| e.get("browseEndpoint"))
+                .and_then(|b| b.get("browseId"))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Recursively collect full community posts from `ytInitialData`. Matches both
@@ -3407,14 +3500,17 @@ struct ParsedPost {
 fn parse_community_posts(v: &Value, out: &mut Vec<ParsedPost>) {
     match v {
         Value::Object(map) => {
-            let post = map
-                .get("backstagePostRenderer")
-                .or_else(|| map.get("sharedPostRenderer"));
-            if let Some(post) = post {
-                if let Some(p) = parse_one_post(post) {
+            if let Some(post) = map.get("backstagePostRenderer") {
+                if let Some(p) = parse_one_post(post, false) {
                     out.push(p);
                 }
                 return; // don't recurse into a captured post subtree
+            }
+            if let Some(post) = map.get("sharedPostRenderer") {
+                if let Some(p) = parse_one_post(post, true) {
+                    out.push(p);
+                }
+                return;
             }
             for val in map.values() {
                 parse_community_posts(val, out);
@@ -3467,21 +3563,46 @@ fn find_continuation_token(v: &Value) -> Option<String> {
     }
 }
 
-/// Parse one `backstagePostRenderer` / `sharedPostRenderer` object. Best-effort:
-/// a missing `postId` disqualifies the post; every other field defaults to empty.
-fn parse_one_post(post: &Value) -> Option<ParsedPost> {
+/// Classify a parsed post as the channel's own (`channel`) or a viewer's
+/// (`viewer`). A post is the channel's when YouTube gives it the owner
+/// highlight, or its author id equals the page owner id. It is a viewer's only
+/// when both ids are known and differ — anything ambiguous (owner id or author
+/// id missing) stays `channel` so a genuine post is never hidden.
+fn classify_author_kind(p: &ParsedPost, owner_id: &str) -> &'static str {
+    if p.is_owner_highlight || (!owner_id.is_empty() && p.author_channel_id == owner_id) {
+        "channel"
+    } else if !owner_id.is_empty() && !p.author_channel_id.is_empty() {
+        "viewer"
+    } else {
+        "channel"
+    }
+}
+
+/// First `runs[0].text` of a `{runs:[…]}` node, else empty.
+fn first_run_text(node: Option<&Value>) -> String {
+    node.and_then(|n| n.get("runs"))
+        .and_then(|r| r.as_array())
+        .and_then(|a| a.first())
+        .and_then(|r| r.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Parse one community item. `shared == false` is a normal `backstagePostRenderer`;
+/// `shared == true` is a `sharedPostRenderer` (a reshare / quote-post, whose
+/// fields are named differently and which embeds the quoted original).
+/// Best-effort: a missing `postId` disqualifies the item; every other field
+/// defaults to empty.
+fn parse_one_post(post: &Value, shared: bool) -> Option<ParsedPost> {
     let post_id = post.get("postId").and_then(|v| v.as_str())?.to_string();
-    let first_run_text = |node: Option<&Value>| -> String {
-        node.and_then(|n| n.get("runs"))
-            .and_then(|r| r.as_array())
-            .and_then(|a| a.first())
-            .and_then(|r| r.get("text"))
-            .and_then(|t| t.as_str())
-            .unwrap_or("")
-            .to_string()
-    };
+    if shared {
+        return parse_shared_post(post_id, post);
+    }
     let author = first_run_text(post.get("authorText"));
     let author_icon_url = largest_thumbnail(post.get("authorThumbnail")).unwrap_or_default();
+    let author_channel_id = author_channel_id_from(post.get("authorEndpoint"));
+    let is_owner_highlight = post.get("showPostAuthorBackgroundHighlight").is_some();
     let published_text = first_run_text(post.get("publishedTimeText"));
     let vote_count = post
         .get("voteCount")
@@ -3489,35 +3610,7 @@ fn parse_one_post(post: &Value) -> Option<ParsedPost> {
         .unwrap_or("")
         .to_string();
 
-    // Content runs → concatenated body text + a {text,url} array for link styling.
-    let mut body_text = String::new();
-    let mut runs_json: Vec<Value> = Vec::new();
-    if let Some(runs) = post
-        .get("contentText")
-        .and_then(|c| c.get("runs"))
-        .and_then(|r| r.as_array())
-    {
-        for run in runs {
-            let text = run.get("text").and_then(|t| t.as_str()).unwrap_or("");
-            let url = run
-                .get("navigationEndpoint")
-                .and_then(|ne| {
-                    ne.get("urlEndpoint")
-                        .and_then(|u| u.get("url"))
-                        .and_then(|u| u.as_str())
-                        .or_else(|| {
-                            ne.get("commandMetadata")
-                                .and_then(|c| c.get("webCommandMetadata"))
-                                .and_then(|w| w.get("url"))
-                                .and_then(|u| u.as_str())
-                        })
-                })
-                .unwrap_or("");
-            body_text.push_str(text);
-            runs_json.push(serde_json::json!({ "text": text, "url": url }));
-        }
-    }
-    let links_json = serde_json::to_string(&runs_json).unwrap_or_else(|_| "[]".to_string());
+    let (body_text, links_json) = runs_to_body_and_links(post.get("contentText"));
 
     // Attachment images (single `backstageImageRenderer` or multi-image) in order —
     // reuse the schedule-OCR image walk, scoped to this post's attachment subtree.
@@ -3532,11 +3625,82 @@ fn parse_one_post(post: &Value) -> Option<ParsedPost> {
         post_id,
         author,
         author_icon_url,
+        author_channel_id,
+        is_owner_highlight,
         published_text,
         body_text,
         links_json,
         vote_count,
         image_urls,
+        shared_json: String::new(),
+        shared_image_urls: Vec::new(),
+        raw_json,
+    })
+}
+
+/// Parse a `sharedPostRenderer` — the resharer's identity + comment, plus the
+/// quoted original (parsed with the normal path) captured into `shared_json` /
+/// `shared_image_urls`.
+fn parse_shared_post(post_id: String, post: &Value) -> Option<ParsedPost> {
+    // The resharer's display name concatenates all runs (usually one).
+    let author = post
+        .get("displayName")
+        .and_then(|d| d.get("runs"))
+        .and_then(|r| r.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|run| run.get("text").and_then(|t| t.as_str()))
+                .collect::<String>()
+        })
+        .unwrap_or_default();
+    let author_icon_url = largest_thumbnail(post.get("thumbnail")).unwrap_or_default();
+    let author_channel_id = {
+        let id = author_channel_id_from(post.get("endpoint"));
+        if id.is_empty() {
+            author_channel_id_from(post.get("navigationEndpoint"))
+        } else {
+            id
+        }
+    };
+    let published_text = first_run_text(post.get("publishedTimeText"));
+    let (body_text, links_json) = runs_to_body_and_links(post.get("content"));
+
+    // The quoted original is itself a backstagePostRenderer — parse it and keep
+    // a snapshot (its own images ride `shared_image_urls`).
+    let (shared_json, shared_image_urls) = match post
+        .get("originalPost")
+        .and_then(|o| o.get("backstagePostRenderer"))
+        .and_then(|o| parse_one_post(o, false))
+    {
+        Some(op) => {
+            let sj = serde_json::json!({
+                "author": op.author,
+                "author_channel_id": op.author_channel_id,
+                "published_text": op.published_text,
+                "body_text": op.body_text,
+                "links_json": op.links_json,
+            })
+            .to_string();
+            (sj, op.image_urls)
+        }
+        None => (String::new(), Vec::new()),
+    };
+
+    let raw_json = serde_json::to_string(post).unwrap_or_default();
+
+    Some(ParsedPost {
+        post_id,
+        author,
+        author_icon_url,
+        author_channel_id,
+        is_owner_highlight: false,
+        published_text,
+        body_text,
+        links_json,
+        vote_count: String::new(),
+        image_urls: Vec::new(),
+        shared_json,
+        shared_image_urls,
         raw_json,
     })
 }
@@ -4504,5 +4668,84 @@ mod tests {
             }]
         });
         assert_eq!(find_continuation_token(&last), None);
+    }
+
+    #[test]
+    fn classify_channel_vs_viewer_posts() {
+        let owner = "UCowner00000000000000000";
+        let author_ep = |id: &str| {
+            serde_json::json!({
+                "profileCardCommand": { "profileOwnerExternalChannelId": id }
+            })
+        };
+
+        // Owner highlight ⇒ channel, even without an id match.
+        let own = serde_json::json!({
+            "postId": "own1",
+            "authorText": { "runs": [{ "text": "Streamer" }] },
+            "authorEndpoint": author_ep(owner),
+            "showPostAuthorBackgroundHighlight": { "lightThemeColor": 1 },
+            "contentText": { "runs": [{ "text": "hi" }] }
+        });
+        let p = parse_one_post(&own, false).unwrap();
+        assert!(p.is_owner_highlight);
+        assert_eq!(p.author_channel_id, owner);
+        assert_eq!(classify_author_kind(&p, owner), "channel");
+
+        // No highlight + foreign id ⇒ viewer.
+        let fan = serde_json::json!({
+            "postId": "fan1",
+            "authorText": { "runs": [{ "text": "A Fan" }] },
+            "authorEndpoint": author_ep("UCfan0000000000000000000"),
+            "contentText": { "runs": [{ "text": "hello there" }] }
+        });
+        let p = parse_one_post(&fan, false).unwrap();
+        assert!(!p.is_owner_highlight);
+        assert_eq!(classify_author_kind(&p, owner), "viewer");
+
+        // Unknown owner id (find_uc failed) ⇒ conservative channel.
+        assert_eq!(classify_author_kind(&p, ""), "channel");
+    }
+
+    #[test]
+    fn parse_shared_post_captures_original() {
+        let owner = "UCowner00000000000000000";
+        let reshare = serde_json::json!({
+            "sharedPostRenderer": {
+                "postId": "re1",
+                "displayName": { "runs": [{ "text": "Streamer" }] },
+                "endpoint": {
+                    "profileCardCommand": { "profileOwnerExternalChannelId": owner }
+                },
+                "content": { "runs": [{ "text": "check this out" }] },
+                "originalPost": { "backstagePostRenderer": {
+                    "postId": "orig1",
+                    "authorText": { "runs": [{ "text": "Miniko Mew" }] },
+                    "publishedTimeText": { "runs": [{ "text": "1 month ago" }] },
+                    "contentText": { "runs": [{ "text": "the original" }] },
+                    "backstageAttachment": { "backstageImageRenderer": {
+                        "image": { "thumbnails": [{ "url": "https://img/orig.jpg" }] }
+                    }}
+                }}
+            }
+        });
+        let mut posts = Vec::new();
+        parse_community_posts(&reshare, &mut posts);
+        assert_eq!(posts.len(), 1, "reshare parsed as one post, original not double-counted");
+        let p = &posts[0];
+        assert_eq!(p.post_id, "re1");
+        assert_eq!(p.author, "Streamer");
+        assert_eq!(p.body_text, "check this out");
+        assert_eq!(p.author_channel_id, owner);
+        assert!(p.image_urls.is_empty(), "reshare has no own attachment");
+        assert_eq!(p.shared_image_urls, vec!["https://img/orig.jpg".to_string()]);
+
+        let shared: Value = serde_json::from_str(&p.shared_json).unwrap();
+        assert_eq!(shared["author"], "Miniko Mew");
+        assert_eq!(shared["body_text"], "the original");
+        assert_eq!(shared["published_text"], "1 month ago");
+
+        // A channel resharing its own space still classifies as channel.
+        assert_eq!(classify_author_kind(p, owner), "channel");
     }
 }
