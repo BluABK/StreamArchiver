@@ -70,6 +70,9 @@ pub struct DetectOutcome {
     pub broadcaster_id: Option<String>,
     /// Stream title at detection time, when the platform provides it.
     pub stream_title: Option<String>,
+    /// Game/category at detection time, when the platform provides it
+    /// (Twitch `game_name`, Kick category). Feeds the trigger-word matcher.
+    pub stream_game: Option<String>,
 }
 
 impl DetectOutcome {
@@ -84,6 +87,7 @@ impl DetectOutcome {
             thumbnail_url: None,
             broadcaster_id: None,
             stream_title: None,
+            stream_game: None,
         }
     }
     fn live_at(
@@ -113,6 +117,10 @@ impl DetectOutcome {
         self.stream_title = stream_title;
         self
     }
+    fn with_stream_game(mut self, stream_game: Option<String>) -> DetectOutcome {
+        self.stream_game = stream_game;
+        self
+    }
     fn offline(monitor_id: i64) -> DetectOutcome {
         DetectOutcome {
             monitor_id,
@@ -124,6 +132,7 @@ impl DetectOutcome {
             thumbnail_url: None,
             broadcaster_id: None,
             stream_title: None,
+            stream_game: None,
         }
     }
     fn err(monitor_id: i64, detail: impl Into<String>) -> DetectOutcome {
@@ -137,6 +146,7 @@ impl DetectOutcome {
             thumbnail_url: None,
             broadcaster_id: None,
             stream_title: None,
+            stream_game: None,
         }
     }
 }
@@ -504,6 +514,7 @@ impl DetectContext {
             kind: String,
             started_at: Option<String>,
             title: Option<String>,
+            game_name: Option<String>,
         }
         #[derive(Deserialize)]
         struct StreamsResp {
@@ -528,8 +539,9 @@ impl DetectContext {
 
                 match resp {
                     Ok(r) if r.status().is_success() => {
-                        // login -> (went_live, stream_id, user_id, thumbnail_url, title)
-                        let live: HashMap<String, (Option<i64>, Option<String>, String, String, Option<String>)> =
+                        // login -> (went_live, stream_id, user_id, thumbnail_url, title, game)
+                        #[allow(clippy::type_complexity)]
+                        let live: HashMap<String, (Option<i64>, Option<String>, String, String, Option<String>, Option<String>)> =
                             match r.json::<StreamsResp>().await
                         {
                             Ok(sr) => sr
@@ -540,7 +552,7 @@ impl DetectContext {
                                     let when = s.started_at.as_deref().and_then(parse_rfc3339);
                                     (
                                         s.user_login.to_lowercase(),
-                                        (when, Some(s.id), s.user_id, s.thumbnail_url, s.title),
+                                        (when, Some(s.id), s.user_id, s.thumbnail_url, s.title, s.game_name),
                                     )
                                 })
                                 .collect(),
@@ -560,12 +572,13 @@ impl DetectContext {
                             let key = l.to_lowercase();
                             for mid in &login_to_mons[l] {
                                 outcomes.push(match live.get(&key) {
-                                    Some((went, id, uid, thumb, title)) => {
+                                    Some((went, id, uid, thumb, title, game)) => {
                                         DetectOutcome::live_at(*mid, "live", *went)
                                             .with_stream_id(id.clone())
                                             .with_broadcaster_id(Some(uid.clone()))
                                             .with_thumbnail_url(Some(thumb.clone()))
                                             .with_stream_title(title.clone())
+                                            .with_stream_game(game.clone())
                                     }
                                     None => DetectOutcome::offline(*mid),
                                 });
@@ -1966,11 +1979,18 @@ impl DetectContext {
                         .or_else(|| stream["title"].as_str())
                         .filter(|s| !s.is_empty())
                         .map(str::to_string);
+                    let game = stream["category"]["name"]
+                        .as_str()
+                        .or_else(|| ch["category"]["name"].as_str())
+                        .or_else(|| stream["categories"][0]["name"].as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
                     DetectOutcome::live_at(item.monitor_id, "live", went)
                         .with_stream_id(id)
                         .with_broadcaster_id(kick_slug(&item.url).map(|s| s.to_string()))
                         .with_thumbnail_url(thumb)
                         .with_stream_title(title)
+                        .with_stream_game(game)
                 } else {
                     DetectOutcome::offline(item.monitor_id)
                 }
@@ -2033,7 +2053,7 @@ impl DetectContext {
                         || body.contains("\"isLiveNow\":true")
                 };
                 if live {
-                    let (broadcaster_id, thumbnail_url, video_id) = if let Some(pr) = &pr_opt {
+                    let (broadcaster_id, thumbnail_url, video_id, title) = if let Some(pr) = &pr_opt {
                         let ch_id =
                             pr["videoDetails"]["channelId"].as_str().map(str::to_string);
                         let thumb = pr["videoDetails"]["thumbnail"]["thumbnails"]
@@ -2042,14 +2062,19 @@ impl DetectContext {
                             .and_then(|t| t["url"].as_str())
                             .map(str::to_string);
                         let vid = pr["videoDetails"]["videoId"].as_str().map(str::to_string);
-                        (ch_id, thumb, vid)
+                        let title = pr["videoDetails"]["title"]
+                            .as_str()
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                        (ch_id, thumb, vid, title)
                     } else {
-                        (None, None, None)
+                        (None, None, None, None)
                     };
                     DetectOutcome::live(item.monitor_id, "live")
                         .with_broadcaster_id(broadcaster_id)
                         .with_thumbnail_url(thumbnail_url)
                         .with_stream_id(video_id)
+                        .with_stream_title(title)
                 } else {
                     DetectOutcome::offline(item.monitor_id)
                 }

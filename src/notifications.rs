@@ -170,6 +170,31 @@ fn handle(store: &Store, ev: AppEvent) {
             };
             (content, meta)
         }
+        AppEvent::TriggerMatched { monitor_id, desc, matched, went_live_at, forced_start } => {
+            let Some(row) = store.get_monitor_with_channel(monitor_id).ok().flatten() else {
+                return;
+            };
+            let heading = format!("⚡ {} — trigger matched", row.channel.name);
+            let mut content = content_for(&row, heading, "Watch stream");
+            content.lines = vec![
+                format!("\u{201c}{matched}\u{201d}"),
+                if forced_start {
+                    format!("{desc} — recording started (Auto-record is off)")
+                } else {
+                    format!("{desc} — applied to the automatic recording")
+                },
+            ];
+            let meta = NotifMeta {
+                kind: NotificationKind::TriggerMatched,
+                severity: "info",
+                monitor_id: Some(monitor_id),
+                channel: row.channel.name.clone(),
+                recording_id: None,
+                // One feed row per stream even if the capture restarts.
+                ref_key: format!("trigger:{monitor_id}:{went_live_at}"),
+            };
+            (content, meta)
+        }
         AppEvent::RecordingFinished {
             recording_id,
             channel,

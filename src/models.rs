@@ -776,6 +776,9 @@ pub struct MonitorWithChannel {
     /// Captured stderr tail of the latest recording (the `log_excerpt`), used to
     /// show *why* it failed on hover. Empty when there's no recording yet.
     pub last_recording_log: String,
+    /// The latest recording's trigger-word match description (empty when it
+    /// started normally) — drives the ⚡ badge in the state cell.
+    pub last_recording_trigger: String,
     /// Cached auto Twitch-sub ad-free status: `None` unknown/not checked,
     /// `Some(false)` checked & not subscribed, `Some(true)` subscribed. Combined
     /// with `monitor.ad_free` (the manual flag) for the Ad-free column. (The
@@ -934,12 +937,15 @@ pub enum NotificationKind {
     YoutubePost,
     /// A recording's published Twitch VOD came back DMCA-muted.
     VodMuted,
+    /// A trigger-word rule matched the live title/game and started a recording.
+    TriggerMatched,
 }
 
 impl NotificationKind {
     /// Every kind, in feed-filter display order.
-    pub const ALL: [NotificationKind; 8] = [
+    pub const ALL: [NotificationKind; 9] = [
         NotificationKind::WentLive,
+        NotificationKind::TriggerMatched,
         NotificationKind::RecordingFinished,
         NotificationKind::Error,
         NotificationKind::TaskFailed,
@@ -960,6 +966,7 @@ impl NotificationKind {
             NotificationKind::ScheduleUpdated => "schedule_updated",
             NotificationKind::YoutubePost => "youtube_post",
             NotificationKind::VodMuted => "vod_muted",
+            NotificationKind::TriggerMatched => "trigger_matched",
         }
     }
 
@@ -979,6 +986,7 @@ impl NotificationKind {
             NotificationKind::ScheduleUpdated => "Schedule updated",
             NotificationKind::YoutubePost => "YouTube post",
             NotificationKind::VodMuted => "VOD muted",
+            NotificationKind::TriggerMatched => "Trigger matched",
         }
     }
 
@@ -994,6 +1002,7 @@ impl NotificationKind {
             NotificationKind::ScheduleUpdated => "🗓",
             NotificationKind::YoutubePost => "📣",
             NotificationKind::VodMuted => "✂",
+            NotificationKind::TriggerMatched => "⚡",
         }
     }
 }
@@ -1715,6 +1724,10 @@ pub struct Recording {
     pub backfill_path: Option<String>,
     /// Lossless post-stream concat of head + live capture (`{stem}.full.mkv`).
     pub full_path: Option<String>,
+    /// Human description of the trigger-word match that started this recording
+    /// (e.g. `title ~ "karaoke"`), empty when it started normally. Drives the
+    /// ⚡ badge in the streams table.
+    pub trigger_info: String,
 }
 
 /// A recording whose published VOD came back DMCA-muted — a row of the Issues
@@ -1977,6 +1990,7 @@ mod tests {
             vod_dl_video_id: None,
             backfill_path: None,
             full_path: None,
+            trigger_info: String::new(),
         }
     }
 

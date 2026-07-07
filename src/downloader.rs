@@ -1220,7 +1220,7 @@ impl Supervisor {
                     if self.shutdown.load(Ordering::SeqCst) {
                         continue; // draining: don't start new recordings
                     }
-                    self.try_begin(signal.monitor_id, signal.went_live_at, signal.approximate, signal.stream_id, signal.thumbnail_url, signal.broadcaster_id, signal.stream_title, false, false);
+                    self.try_begin(signal.monitor_id, signal.went_live_at, signal.approximate, signal.stream_id, signal.thumbnail_url, signal.broadcaster_id, signal.stream_title, signal.stream_game, false, false);
                 }
                 Some(cmd) = manual_rx.recv() => match cmd {
                     ManualCommand::Start { id, user_initiated } => {
@@ -2083,6 +2083,7 @@ impl Supervisor {
     /// marks a user-initiated start: it additionally bypasses the Auto gate —
     /// the user can always record an Auto-off instance explicitly.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn try_begin(
         &self,
         monitor_id: i64,
@@ -2092,6 +2093,7 @@ impl Supervisor {
         thumbnail_url: Option<String>,
         broadcaster_id: Option<String>,
         stream_title: Option<String>,
+        stream_game: Option<String>,
         bypass_backoff: bool,
         forced: bool,
     ) -> bool {
@@ -2109,24 +2111,91 @@ impl Supervisor {
             self.backoff.lock().unwrap().remove(&monitor_id);
         }
 
-        let row = match self.store.get_monitor_with_channel(monitor_id) {
+        let mut row = match self.store.get_monitor_with_channel(monitor_id) {
             Ok(Some(r)) => r,
             _ => {
                 self.active.lock().unwrap().remove(&monitor_id);
                 return false;
             }
         };
-        if !forced && (!row.channel.enabled || !row.monitor.enabled) {
+        // Trigger words: a title/game match starts a recording even with Auto
+        // off, and its per-rule overrides apply even with Auto on.
+        let auto_off = !row.channel.enabled || !row.monitor.enabled;
+        let mut trigger_hit: Option<crate::triggers::TriggerHit> = None;
+        {
+            let rules =
+                crate::triggers::effective_rules(&self.store, row.channel.id, monitor_id);
+            if !rules.is_empty() {
+                if stream_title.is_some() || stream_game.is_some() {
+                    trigger_hit = crate::triggers::first_match(
+                        &rules,
+                        stream_title.as_deref(),
+                        stream_game.as_deref(),
+                    );
+                } else if !forced && auto_off {
+                    // The signal carried no title/game (EventSub push) but this
+                    // Auto-off monitor has trigger rules — re-detect to fetch
+                    // them, then re-enter with the metadata filled in (the
+                    // is_some() guard above prevents a second re-check loop).
+                    self.active.lock().unwrap().remove(&monitor_id);
+                    let this = self.clone();
+                    let row_bg = row.clone();
+                    tokio::spawn(async move {
+                        let o = this.check_one(&row_bg).await;
+                        if o.live && (o.stream_title.is_some() || o.stream_game.is_some()) {
+                            this.try_begin(
+                                monitor_id,
+                                o.went_live_at.or(went_live_at),
+                                o.went_live_at.is_none() && approximate,
+                                o.stream_id.or(stream_id),
+                                o.thumbnail_url.or(thumbnail_url),
+                                o.broadcaster_id.or(broadcaster_id),
+                                o.stream_title,
+                                o.stream_game,
+                                bypass_backoff,
+                                forced,
+                            );
+                        }
+                    });
+                    let _ = self.store.set_monitor_check_result(monitor_id, "live", now_unix());
+                    return false;
+                }
+            }
+        }
+        if !forced && auto_off && trigger_hit.is_none() {
             // Auto-record is off for this channel/instance: detection keeps the
-            // state fresh, but only an explicit user Start records. Update
-            // last_state so the UI shows the stream as "live".
+            // state fresh, but only an explicit user Start (or a trigger-word
+            // match) records. Update last_state so the UI shows "live".
             self.active.lock().unwrap().remove(&monitor_id);
             let _ = self.store.set_monitor_check_result(monitor_id, "live", now_unix());
             return false;
         }
+        let trigger_info = trigger_hit.as_ref().map(|h| h.describe()).unwrap_or_default();
+        if let Some(hit) = &trigger_hit {
+            // Per-rule override: the recording this rule starts captures from
+            // the start (or not) regardless of the monitor's own flag. Applied
+            // on the row clone so every downstream read sees it.
+            if let Some(v) = hit.rule.capture_from_start {
+                row.monitor.capture_from_start = v;
+            }
+            info!(
+                monitor_id,
+                channel = row.channel.name.as_str(),
+                hit = trigger_info.as_str(),
+                forced_start = auto_off,
+                "trigger word matched — starting recording"
+            );
+            let _ = self.events.send(AppEvent::TriggerMatched {
+                monitor_id,
+                desc: trigger_info.clone(),
+                matched: hit.matched.clone(),
+                went_live_at: went_live_at.unwrap_or(0),
+                forced_start: auto_off,
+            });
+        }
         let this = self.clone();
         tokio::spawn(async move {
-            this.record(row, went_live_at, approximate, stream_id, thumbnail_url, broadcaster_id, stream_title).await;
+            this.record(row, went_live_at, approximate, stream_id, thumbnail_url, broadcaster_id, stream_title, trigger_info).await;
         });
         true
     }
@@ -2153,7 +2222,7 @@ impl Supervisor {
                     Some(t) => (Some(t), false),
                     None => (Some(now_unix()), true),
                 };
-                self.try_begin(monitor_id, went, approx, outcome.stream_id, outcome.thumbnail_url, outcome.broadcaster_id, outcome.stream_title, true, user_initiated);
+                self.try_begin(monitor_id, went, approx, outcome.stream_id, outcome.thumbnail_url, outcome.broadcaster_id, outcome.stream_title, outcome.stream_game, true, user_initiated);
             } else {
                 // Auto off + automatic trigger: just update the state so the
                 // UI shows "live"; nothing records.
@@ -2660,6 +2729,7 @@ impl Supervisor {
                     thumbnail_url: None,
                     broadcaster_id: None,
                     stream_title: None,
+                    stream_game: None,
                 }),
             DetectionMethod::GenericProbe => self.ctx.detect_generic(&item).await,
             DetectionMethod::YouTubeApi => self.ctx.detect_youtube_api(&item).await,
@@ -2714,6 +2784,7 @@ impl Supervisor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn record(
         &self,
         row: MonitorWithChannel,
@@ -2723,6 +2794,9 @@ impl Supervisor {
         thumbnail_url: Option<String>,
         broadcaster_id: Option<String>,
         stream_title: Option<String>,
+        // Human description of the trigger-word match that started this
+        // recording (empty when it started normally). Stored on the row.
+        trigger_info: String,
     ) {
         let monitor_id = row.monitor.id;
         // Per-stream key for the SABR stall maps. Fully per-stream when a video ID
@@ -2804,6 +2878,7 @@ impl Supervisor {
                 approximate,
                 stream_id.as_deref(),
                 Some(&take_group),
+                &trigger_info,
             )
             .unwrap_or(0);
         let _ = self
@@ -2846,9 +2921,10 @@ impl Supervisor {
             let tg = take_group.clone();
             let sid = stream_id.clone();
             let cname = row.channel.name.clone();
+            let tinfo = trigger_info.clone();
             tokio::spawn(async move {
                 this.run_dash_companion(
-                    monitor_id, dash_plan, tg, sid, went_live_at, approximate, cname,
+                    monitor_id, dash_plan, tg, sid, went_live_at, approximate, cname, tinfo,
                 )
                 .await;
             });
@@ -3301,6 +3377,8 @@ impl Supervisor {
         went_live_at: Option<i64>,
         approximate: bool,
         channel_name: String,
+        // Same trigger marker as the primary — the companion is part of the take.
+        trigger_info: String,
     ) {
         if let Some(parent) = plan.capture_path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
@@ -3320,6 +3398,7 @@ impl Supervisor {
                 approximate,
                 stream_id.as_deref(),
                 Some(&take_group),
+                &trigger_info,
             )
             .unwrap_or(0);
         let _ = self.events.send(AppEvent::RecordingStarted {
@@ -5408,6 +5487,7 @@ fn recording_from_detached(row: &DetachedRow) -> Recording {
         vod_dl_video_id: None,
         backfill_path: None,
         full_path: None,
+        trigger_info: String::new(),
     }
 }
 
@@ -8128,6 +8208,7 @@ mod tests {
             last_recording_title: String::new(),
             last_recording_category: String::new(),
             last_recording_log: String::new(),
+            last_recording_trigger: String::new(),
             ad_free_sub: None,
             recording_count: 0,
             next_stream_at: None,

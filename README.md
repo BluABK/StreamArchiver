@@ -455,6 +455,51 @@ returns the exact host.)
 > and the mid-stream [head backfill](#streams-live-monitoring) for a late-joined
 > capture.
 
+### Trigger words (force-record on title/game match) ⚡
+
+Streams titled **"unarchived"** or **"karaoke"** usually mean there will be **no
+VOD** (or a heavily muted one) — the live capture is the only copy you'll ever
+get. **Trigger rules** make sure those get recorded even on channels you don't
+auto-record: when a monitored channel is live and its **title or game/category**
+matches a rule, recording starts **even with Auto off**. The check runs at
+go-live *and on every poll*, so a streamer flipping the title to "unarchived
+karaoke" 20 minutes in still triggers on the next poll (Auto-off monitors are
+polled regardless).
+
+**Rule anatomy.** Each rule is structured, not just a word:
+
+- **Field** — match against the *Title*, the *Game* (category), or *Any field*.
+- **Match** — *Contains* (case-insensitive substring; phrases like `no vod`
+  match as a whole) or *Regex* (case-insensitive by default — start the pattern
+  with `(?-i)` to opt out; an invalid regex is shown in red and never matches).
+- **From start** — a per-rule override of the instance's *capture from start*
+  flag for the recording the rule starts: *Inherit* keeps the instance setting,
+  *On* forces the DVR head backfill / live-from-start path (usually what you
+  want for unarchived streams), *Off* forces it off.
+- An **enabled** checkbox per rule, so seasonal rules can be kept but parked.
+
+**Three-level control.** Rules resolve through the same inheritance chain as the
+VOD options — **global < per-channel < per-instance** — but as a *list*, each
+level picks a mode: **Inherit** (use the level above unchanged), **Extend**
+(inherited rules *plus* this level's own), **Replace** (only this level's
+rules), or **Off** (no triggers here at all, inherited ones included). Global
+rules live in **Settings → Downloads → Trigger words**; the channel and
+instance overrides in their **Properties** windows ("Trigger words" section).
+
+**What you see when one fires.** A **⚡ Trigger matched** notification + rich
+toast (which rule matched, the matching title/game text, and what it did); the
+recording and its takes carry a **⚡ badge** (hover shows the match, e.g.
+`title ~ "karaoke" · capture-from-start forced on`); and the take's Properties
+window gets a **Trigger** row. With Auto *on*, rules still run — the per-rule
+*From start* override applies to the automatic recording and the match is
+recorded the same way.
+
+> Platform notes: Twitch (Helix) and Kick polls carry title+category natively.
+> Twitch **EventSub** pushes don't include a title, so a matching-capable
+> follow-up check fetches it automatically. YouTube's *scrape* detection carries
+> the title; the quota-based *Data API* method does not — use scrape for
+> channels you want triggers on.
+
 ### Post-stream VOD download (archive the published VOD)
 
 After a stream ends the platform publishes its own **post-processed VOD** — Twitch's

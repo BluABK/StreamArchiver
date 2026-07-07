@@ -33,7 +33,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 43;
+const SCHEMA_VERSION: i64 = 44;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -930,7 +930,17 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 43)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 43);
+        if version < 44 {
+            // Trigger words: the human description of the rule match that
+            // started this recording (e.g. `title ~ "karaoke"`), empty when it
+            // started normally. Named trigger_info because TRIGGER is an SQL
+            // keyword. Drives the ⚡ badge + notification.
+            conn.execute_batch(
+                "ALTER TABLE recording ADD COLUMN trigger_info TEXT NOT NULL DEFAULT '';",
+            )?;
+            conn.pragma_update(None, "user_version", 44)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 44);
         Ok(())
     }
 
@@ -1684,6 +1694,7 @@ impl Store {
     // ----- recordings -----
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_recording(
         &self,
         monitor_id: i64,
@@ -1693,12 +1704,13 @@ impl Store {
         went_live_approx: bool,
         stream_id: Option<&str>,
         take_group: Option<&str>,
+        trigger_info: &str,
     ) -> Result<i64> {
         let conn = self.db();
         conn.execute(
-            "INSERT INTO recording(monitor_id, started_at, output_path, status, went_live_at, went_live_approx, stream_id, take_group)
-             VALUES(?1, ?2, ?3, 'recording', ?4, ?5, ?6, ?7)",
-            params![monitor_id, started_at, output_path, went_live_at, went_live_approx as i64, stream_id, take_group],
+            "INSERT INTO recording(monitor_id, started_at, output_path, status, went_live_at, went_live_approx, stream_id, take_group, trigger_info)
+             VALUES(?1, ?2, ?3, 'recording', ?4, ?5, ?6, ?7, ?8)",
+            params![monitor_id, started_at, output_path, went_live_at, went_live_approx as i64, stream_id, take_group, trigger_info],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -2967,7 +2979,8 @@ impl Store {
                 c.preferred_platform,
                 m.thumbnail_in_toast,
                 c.enabled,
-                m.sabr_codec_pref, m.sabr_codec_custom
+                m.sabr_codec_pref, m.sabr_codec_custom,
+                COALESCE(r.trigger_info, '')
              FROM monitor m
              JOIN channel c ON c.id = m.channel_id
              LEFT JOIN recording r
@@ -3035,6 +3048,7 @@ impl Store {
                     last_recording_category: r.get(42)?,
                     ad_free_sub: r.get::<_, Option<i64>>(33)?.map(|v| v != 0),
                     recording_count: r.get(28)?,
+                    last_recording_trigger: r.get(50)?,
                     // Filled by the UI from next_scheduled_streams(), not this query.
                     next_stream_at: None,
                     next_stream_title: String::new(),
@@ -3065,7 +3079,7 @@ impl Store {
                     vod_id, vod_state, vod_muted_secs,
                     recovery_state, recovered_path,
                     vod_dl_state, vod_dl_path, vod_dl_video_id,
-                    backfill_path, full_path
+                    backfill_path, full_path, COALESCE(trigger_info, '')
              FROM recording WHERE monitor_id = ?1 ORDER BY started_at, id",
         )?;
         let rows = stmt
@@ -3101,6 +3115,7 @@ impl Store {
                     vod_dl_video_id: r.get(27)?,
                     backfill_path: r.get(28)?,
                     full_path: r.get(29)?,
+                    trigger_info: r.get(30)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3154,6 +3169,7 @@ impl Store {
                     vod_dl_video_id: None,
                     backfill_path: None,
                     full_path: None,
+                    trigger_info: String::new(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3212,6 +3228,7 @@ impl Store {
                     vod_dl_video_id: None,
                     backfill_path: None,
                     full_path: None,
+                    trigger_info: String::new(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3292,6 +3309,7 @@ impl Store {
                     vod_dl_video_id: None,
                     backfill_path: None,
                     full_path: None,
+                    trigger_info: String::new(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3363,6 +3381,7 @@ impl Store {
                     vod_dl_video_id: None,
                     backfill_path: None,
                     full_path: None,
+                    trigger_info: String::new(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3550,6 +3569,7 @@ impl Store {
                     vod_dl_video_id: None,
                     backfill_path: None,
                     full_path: None,
+                    trigger_info: String::new(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -4053,7 +4073,7 @@ mod tests {
         let mid = store.insert_monitor(&m).unwrap();
 
         let rid = store
-            .insert_recording(mid, 1_000, "C:/rec/out.mkv", Some(1_000), false, Some("s1"), None)
+            .insert_recording(mid, 1_000, "C:/rec/out.mkv", Some(1_000), false, Some("s1"), None, "")
             .unwrap();
 
         // Insert out of order; the query must return them ordered by offset.
@@ -4094,27 +4114,27 @@ mod tests {
         // A completed SABR/DASH capture whose promote move failed: a non-.ts
         // file still sitting in .cache\.
         let stuck = store
-            .insert_recording(mid, 1_000, "C:/rec/.cache/stuck.mkv", Some(1_000), false, None, None)
+            .insert_recording(mid, 1_000, "C:/rec/.cache/stuck.mkv", Some(1_000), false, None, None, "")
             .unwrap();
         store.finish_recording(stuck, 2_000, 500, Some(0), "completed", "C:/rec/.cache/stuck.mkv", "").unwrap();
 
         // A .ts-in-cache failure is a DIFFERENT, pre-existing category
         // (needs re-remux) and must NOT double-count here.
         let ts_stuck = store
-            .insert_recording(mid, 1_000, "C:/rec/.cache/tsstuck.ts", Some(1_000), false, None, None)
+            .insert_recording(mid, 1_000, "C:/rec/.cache/tsstuck.ts", Some(1_000), false, None, None, "")
             .unwrap();
         store.finish_recording(ts_stuck, 2_000, 500, Some(0), "completed", "C:/rec/.cache/tsstuck.ts", "").unwrap();
 
         // A normal, successfully-promoted recording (not in .cache at all).
         let ok = store
-            .insert_recording(mid, 3_000, "C:/rec/fine.mkv", Some(3_000), false, None, None)
+            .insert_recording(mid, 3_000, "C:/rec/fine.mkv", Some(3_000), false, None, None, "")
             .unwrap();
         store.finish_recording(ok, 4_000, 500, Some(0), "completed", "C:/rec/fine.mkv", "").unwrap();
 
         // A capture that's in .cache because it's still ACTIVELY recording —
         // must not be treated as "stuck" (status isn't 'completed').
         let active = store
-            .insert_recording(mid, 5_000, "C:/rec/.cache/active.mkv", Some(5_000), false, None, None)
+            .insert_recording(mid, 5_000, "C:/rec/.cache/active.mkv", Some(5_000), false, None, None, "")
             .unwrap();
         let _ = active;
 
@@ -4143,7 +4163,7 @@ mod tests {
         m.channel_id = cid;
         let mid = store.insert_monitor(&m).unwrap();
         let rid = store
-            .insert_recording(mid, 1_000, "C:/rec/out.mkv", Some(1_000), false, Some("s1"), None)
+            .insert_recording(mid, 1_000, "C:/rec/out.mkv", Some(1_000), false, Some("s1"), None, "")
             .unwrap();
 
         store.insert_ad_break(rid, 120, 15).unwrap();
@@ -4231,7 +4251,7 @@ mod tests {
         m.channel_id = cid;
         let mid = store.insert_monitor(&m).unwrap();
         let rid = store
-            .insert_recording(mid, 1_000, "C:/rec/out.mkv", Some(1_000), false, Some("s1"), None)
+            .insert_recording(mid, 1_000, "C:/rec/out.mkv", Some(1_000), false, Some("s1"), None, "")
             .unwrap();
 
         // Insert out of order; the query returns them ordered by offset.
@@ -4778,7 +4798,7 @@ mod tests {
         let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
         let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
         let rid = store
-            .insert_recording(mid, 100, "C:/tmp/a.mkv", Some(50), false, Some("s1"), None)
+            .insert_recording(mid, 100, "C:/tmp/a.mkv", Some(50), false, Some("s1"), None, "")
             .unwrap();
 
         store.set_recording_backfill_path(rid, "C:/tmp/a.head.mkv").unwrap();
@@ -4795,12 +4815,29 @@ mod tests {
     }
 
     #[test]
+    fn migration_44_trigger_info_roundtrip() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        let hit = store
+            .insert_recording(mid, 100, "C:/tmp/a.mkv", Some(50), false, Some("s1"), None, "title ~ \"karaoke\"")
+            .unwrap();
+        let normal = store
+            .insert_recording(mid, 200, "C:/tmp/b.mkv", Some(150), false, Some("s2"), None, "")
+            .unwrap();
+        let recs = store.recordings_for_monitor(mid).unwrap();
+        let by_id = |id| recs.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(by_id(hit).trigger_info, "title ~ \"karaoke\"");
+        assert_eq!(by_id(normal).trigger_info, "");
+    }
+
+    #[test]
     fn pending_head_concat_needs_ended_take_without_full() {
         let store = Store::open_in_memory().unwrap();
         let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
         let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
         let rid = store
-            .insert_recording(mid, 100, "C:/tmp/a.mkv", Some(50), false, Some("s1"), None)
+            .insert_recording(mid, 100, "C:/tmp/a.mkv", Some(50), false, Some("s1"), None, "")
             .unwrap();
         // Still recording → not pending even with a head present.
         store.set_recording_backfill_path(rid, "C:/tmp/a.head.mkv").unwrap();
@@ -4819,7 +4856,7 @@ mod tests {
         let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
         let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
         store
-            .insert_recording(mid, 100, "C:/tmp/a.mkv", Some(50), false, Some("s1"), None)
+            .insert_recording(mid, 100, "C:/tmp/a.mkv", Some(50), false, Some("s1"), None, "")
             .unwrap();
         // The first take of s1 owns the head; a retake (later start) does not.
         assert!(store.is_first_take_for_stream(mid, "s1", 100).unwrap());
@@ -4834,7 +4871,7 @@ mod tests {
         let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
         let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
         let rid = store
-            .insert_recording(mid, 100, "C:/tmp/a.mkv", Some(50), false, Some("s1"), None)
+            .insert_recording(mid, 100, "C:/tmp/a.mkv", Some(50), false, Some("s1"), None, "")
             .unwrap();
         store.set_recording_vod_found(rid, "999", 0).unwrap();
         store.set_recording_vod_muted_secs(rid, 360).unwrap();
@@ -4852,7 +4889,7 @@ mod tests {
 
         // rec1: 'downloading' with a completed video → replay candidate.
         let r1 = store
-            .insert_recording(mid, 100, "C:/tmp/a.mkv", Some(50), false, Some("s1"), None)
+            .insert_recording(mid, 100, "C:/tmp/a.mkv", Some(50), false, Some("s1"), None, "")
             .unwrap();
         let v1 = store.insert_video(&sample_video()).unwrap();
         store.finish_video(v1, 200, 10, Some(0), "completed", "C:/tmp/a.vod.mkv", "").unwrap();
@@ -4860,7 +4897,7 @@ mod tests {
 
         // rec2: video completed but the recording already archived → not a candidate.
         let r2 = store
-            .insert_recording(mid, 300, "C:/tmp/b.mkv", Some(250), false, Some("s2"), None)
+            .insert_recording(mid, 300, "C:/tmp/b.mkv", Some(250), false, Some("s2"), None, "")
             .unwrap();
         let v2 = store.insert_video(&sample_video()).unwrap();
         store.finish_video(v2, 400, 10, Some(0), "completed", "C:/tmp/b.vod.mkv", "").unwrap();

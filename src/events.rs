@@ -155,6 +155,20 @@ pub enum AppEvent {
         monitor_id: i64,
         state: String,
     },
+    /// A trigger-word rule matched a live stream's title/game and a recording
+    /// is starting because of it (or, with Auto on, its per-rule overrides
+    /// were applied to the normal start).
+    TriggerMatched {
+        monitor_id: i64,
+        /// Human description of the match, e.g. `title ~ "karaoke"`.
+        desc: String,
+        /// The full field value that matched (the title/game text).
+        matched: String,
+        /// Go-live time — part of the notification dedupe key (one per stream).
+        went_live_at: i64,
+        /// True when Auto-record was off and only the trigger started this.
+        forced_start: bool,
+    },
     RecordingStarted {
         monitor_id: i64,
         recording_id: i64,
@@ -228,6 +242,8 @@ pub struct LiveSignal {
     pub broadcaster_id: Option<String>,
     /// Stream title at go-live time, if the platform provided it at detection.
     pub stream_title: Option<String>,
+    /// Game/category at go-live time, if the platform provided it at detection.
+    pub stream_game: Option<String>,
 }
 
 impl LiveSignal {
@@ -240,6 +256,7 @@ impl LiveSignal {
             thumbnail_url: None,
             broadcaster_id: None,
             stream_title: None,
+            stream_game: None,
         }
     }
 
@@ -261,6 +278,11 @@ impl LiveSignal {
 
     pub fn with_stream_title(mut self, stream_title: Option<String>) -> LiveSignal {
         self.stream_title = stream_title;
+        self
+    }
+
+    pub fn with_stream_game(mut self, stream_game: Option<String>) -> LiveSignal {
+        self.stream_game = stream_game;
         self
     }
 }

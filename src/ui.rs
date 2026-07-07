@@ -644,6 +644,9 @@ struct SettingsForm {
     vod_dl_enabled: bool,
     /// Replace the live recording with the VOD when the download succeeds.
     vod_dl_replace: bool,
+    /// Global trigger-word rules (start recording on title/game match even with
+    /// Auto off). Channel/instance Properties can extend/replace/disable them.
+    trigger_rules: Vec<crate::triggers::TriggerRule>,
 }
 
 /// Background load state of an import fetch (followed/subscriptions).
@@ -889,6 +892,10 @@ pub struct StreamArchiverApp {
     /// Editable per-instance (monitor) schedule-source *scope* overrides shown
     /// in instance Properties — one draft per open window, keyed by monitor id.
     instance_scope_drafts: HashMap<i64, crate::schedule_source::SourceScopeConfig>,
+    /// Per-open channel-Properties trigger-word scope drafts (saved on change).
+    channel_trigger_drafts: HashMap<i64, crate::triggers::TriggerScope>,
+    /// Per-open instance-Properties trigger-word scope drafts (saved on change).
+    instance_trigger_drafts: HashMap<i64, crate::triggers::TriggerScope>,
     /// Draft for the "Edit schedule item" dialog (None = closed). Saving converts
     /// the row to a protected `"manual"` source so refreshes don't overwrite it.
     edit_schedule: Option<EditScheduleDraft>,
@@ -1275,6 +1282,7 @@ impl StreamArchiverApp {
             recovery_max_conc: setting_or_empty(&core, crate::recovery::K_RECOVERY_MAX_CONC),
             vod_dl_enabled: setting_or_empty(&core, crate::vod_archive::K_VOD_DL_ENABLED) == "1",
             vod_dl_replace: setting_or_empty(&core, crate::vod_archive::K_VOD_DL_REPLACE) == "1",
+            trigger_rules: crate::triggers::load_global_rules(&core.store),
         };
         // Apply the loaded date format + short-timestamp pattern before the first render.
         set_active_date_fmt(settings.date_fmt);
@@ -1461,6 +1469,8 @@ impl StreamArchiverApp {
             channel_cfg_drafts: HashMap::new(),
             channel_scope_drafts: HashMap::new(),
             instance_scope_drafts: HashMap::new(),
+            channel_trigger_drafts: HashMap::new(),
+            instance_trigger_drafts: HashMap::new(),
             edit_schedule: None,
             schedule_selected: HashSet::new(),
             merge_preview: None,
@@ -2376,6 +2386,13 @@ impl StreamArchiverApp {
                 return;
             }
         }
+        // Trigger rules serialize to JSON, so they can't ride the &str pairs.
+        if let Err(e) =
+            crate::triggers::save_global_rules(&self.core.store, &self.settings.trigger_rules)
+        {
+            self.status = format!("Error saving trigger rules: {e}");
+            return;
+        }
         // If Discord import is now off (toggled off or token cleared), purge any
         // previously-imported Discord events so they don't linger on the calendar.
         if !discord_on {
@@ -2853,6 +2870,114 @@ fn scope_override_editor(
     });
 
     changed
+}
+
+/// Editor for a list of trigger-word rules — one row per rule: enabled toggle,
+/// field selector (Any/Title/Game), match type (Contains/Regex), the pattern
+/// (validated live when regex), a per-rule "capture from start" override, and
+/// remove. Returns true when anything changed (detected by value comparison so
+/// combo selections and add/remove all count).
+fn trigger_rules_editor(
+    ui: &mut egui::Ui,
+    rules: &mut Vec<crate::triggers::TriggerRule>,
+    salt: &str,
+) -> bool {
+    use crate::triggers::{TriggerField, TriggerRule, pattern_error};
+    let before = rules.clone();
+    let mut remove: Option<usize> = None;
+    for i in 0..rules.len() {
+        let r = &mut rules[i];
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut r.enabled, "").on_hover_text("Rule enabled");
+            egui::ComboBox::from_id_salt((salt, "field", i))
+                .selected_text(r.field.label())
+                .width(86.0)
+                .show_ui(ui, |ui| {
+                    for f in TriggerField::ALL {
+                        ui.selectable_value(&mut r.field, f, f.label());
+                    }
+                });
+            egui::ComboBox::from_id_salt((salt, "match", i))
+                .selected_text(if r.regex { "Regex" } else { "Contains" })
+                .width(86.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut r.regex, false, "Contains")
+                        .on_hover_text("Case-insensitive substring match.");
+                    ui.selectable_value(&mut r.regex, true, "Regex")
+                        .on_hover_text("Case-insensitive regular expression.");
+                });
+            let err = pattern_error(r);
+            let mut edit = egui::TextEdit::singleline(&mut r.pattern)
+                .hint_text(if r.regex { "unarchi(v|ve)d" } else { "karaoke" })
+                .desired_width(150.0);
+            if err.is_some() {
+                edit = edit.text_color(HL_ERROR_TEXT);
+            }
+            let resp = ui.add(edit);
+            match &err {
+                Some(e) => {
+                    resp.on_hover_text(format!("Invalid regex — this rule never matches:\n{e}"));
+                }
+                None => {
+                    resp.on_hover_text(if r.regex {
+                        "Case-insensitive regex (start the pattern with (?-i) for case-sensitive)."
+                    } else {
+                        "Case-insensitive substring — phrases like \"no vod\" match as a whole."
+                    });
+                }
+            }
+            ui.label("From start:").on_hover_text(
+                "Force the 'capture from start' flag for the recording this rule starts \
+                 (unarchived streams usually warrant it). Inherit = the instance's own setting.",
+            );
+            tristate_combo(ui, &format!("{salt}_cfs_{i}"), &mut r.capture_from_start);
+            if ui.small_button("🗑").on_hover_text("Remove this rule").clicked() {
+                remove = Some(i);
+            }
+        });
+    }
+    if let Some(i) = remove {
+        rules.remove(i);
+    }
+    if ui.button("➕ Add trigger").clicked() {
+        rules.push(TriggerRule::default());
+    }
+    *rules != before
+}
+
+/// Inherit/Extend/Replace/Off editor for a channel- or instance-level trigger
+/// scope (same structural idiom as [`scope_override_editor`]). Returns true on
+/// any change so the caller can persist immediately.
+fn trigger_scope_editor(
+    ui: &mut egui::Ui,
+    scope: &mut crate::triggers::TriggerScope,
+    salt: &str,
+) -> bool {
+    use crate::triggers::TriggerMode;
+    let before = scope.clone();
+    ui.horizontal(|ui| {
+        for (mode, label, tip) in [
+            (TriggerMode::Inherit, "Inherit", "Use the inherited trigger rules unchanged."),
+            (TriggerMode::Extend, "Extend", "Inherited rules PLUS the extra rules below."),
+            (
+                TriggerMode::Replace,
+                "Replace",
+                "Ignore inherited rules; only the rules below apply here.",
+            ),
+            (
+                TriggerMode::Off,
+                "Off",
+                "No trigger words here at all — inherited rules included.",
+            ),
+        ] {
+            ui.radio_value(&mut scope.mode, mode, label).on_hover_text(tip);
+        }
+    });
+    if matches!(scope.mode, TriggerMode::Extend | TriggerMode::Replace) {
+        ui.add_space(2.0);
+        trigger_rules_editor(ui, &mut scope.rules, salt);
+    }
+    *scope != before
 }
 
 fn fmt_datetime_short(secs: i64) -> String {
@@ -4323,7 +4448,7 @@ fn fmt_speed(bytes_per_sec: f64) -> String {
 /// hover). Each `id` is a stable persistence key: never reuse or change one
 /// once shipped.
 const STREAM_COLUMNS: [GridCol; 19] = [
-    GridCol { id: "auto",        title: "Auto",       tooltip: "Auto-record: start recording automatically when the stream goes live. Detection, schedules, assets and metadata always stay up to date regardless; manual Start still records. The channel checkbox and each instance checkbox are independent.", min_width: 36.0,  initial: 0.0,   sortable: true,  stretch: false },
+    GridCol { id: "auto",        title: "Auto",       tooltip: "Auto-record: start recording automatically when the stream goes live. Detection, schedules, assets and metadata always stay up to date regardless; manual Start still records, and trigger words (Settings → Downloads) can still start a recording while Auto is off. The channel checkbox and each instance checkbox are independent.", min_width: 36.0,  initial: 0.0,   sortable: true,  stretch: false },
     GridCol { id: "actions",     title: "Actions",    tooltip: "Per-row actions: start/stop recording, edit, add instance, open folder, delete.",            min_width: 126.0, initial: 0.0,   sortable: false, stretch: false },
     GridCol { id: "platform",    title: "Plat",       tooltip: "Source platform (icon): Twitch, YouTube, Kick, or a generic URL. A channel shows every platform among its instances.", min_width: 52.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "name",        title: "Name",       tooltip: "Channel (container) name. Expand it to see its instances and recording history.",            min_width: 130.0, initial: 0.0,   sortable: true,  stretch: false },
@@ -5222,7 +5347,7 @@ fn render_instance_row(
             "auto" => {
                 let mut on = m.enabled;
                 let cb = ui.checkbox(&mut on, "").on_hover_text(
-                    "Auto-record this instance when it goes live. Off = still monitored (state, schedules, metadata stay current) but nothing records unless you press ▶.",
+                    "Auto-record this instance when it goes live. Off = still monitored (state, schedules, metadata stay current) but nothing records unless you press ▶ or a trigger word matches.",
                 );
                 if cb.changed() {
                     a.toggle_enabled = Some((m.id, on));
@@ -5356,6 +5481,16 @@ fn render_instance_row(
                             "Live-chat download is still running.\n\
                              Right-click → Stop chat download to abort it.",
                         );
+                    }
+                    if recording && !row.last_recording_trigger.is_empty() {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xe8, 0xc5, 0x4a),
+                            egui::RichText::new("⚡").small(),
+                        )
+                        .on_hover_text(format!(
+                            "Recording started by a trigger word: {}",
+                            row.last_recording_trigger,
+                        ));
                     }
                     if needs_remux_count > 0 {
                         let lbl = if needs_remux_count == 1 {
@@ -8866,6 +9001,13 @@ impl StreamArchiverApp {
                                     ui.label(code.to_string());
                                     ui.end_row();
                                 }
+                                if !rec.trigger_info.is_empty() {
+                                    ui.label("Trigger").on_hover_text(
+                                        "This recording was started by a trigger-word rule.",
+                                    );
+                                    ui.label(format!("⚡ {}", rec.trigger_info));
+                                    ui.end_row();
+                                }
                             });
 
                         ui.add_space(8.0);
@@ -12336,6 +12478,16 @@ impl StreamArchiverApp {
                                                 } else {
                                                     resp.on_hover_text(&t.status);
                                                 }
+                                                if !t.trigger_info.is_empty() {
+                                                    ui.colored_label(
+                                                        egui::Color32::from_rgb(0xe8, 0xc5, 0x4a),
+                                                        egui::RichText::new("⚡").small(),
+                                                    )
+                                                    .on_hover_text(format!(
+                                                        "Started by a trigger word: {}",
+                                                        t.trigger_info,
+                                                    ));
+                                                }
                                                 // VOD state badge (Twitch only)
                                                 match t.vod_state.as_deref() {
                                                     Some("not_published") => {
@@ -15086,6 +15238,31 @@ impl StreamArchiverApp {
                  recording's chat/thumbnail sidecars are kept.",
             );
 
+            // ── Trigger words ──────────────────────────────────────────────────
+            }
+
+            if self.section_shown(SettingsTab::Downloads, "Trigger words", &["trigger", "word", "karaoke", "unarchived", "force", "auto", "title", "game", "regex"]) {
+            ui.add_space(12.0);
+            ui.heading("Trigger words ⚡");
+            ui.label(
+                "Start recording when a live stream's title or game matches a rule — even when \
+                 Auto-record is OFF. Meant for words like \"unarchived\" or \"karaoke\" that \
+                 signal there will be no VOD (or a muted one). Checked at go-live and on every \
+                 poll, so a mid-stream title change also fires. Each rule can force the \
+                 'capture from start' flag for the recording it starts. These are the GLOBAL \
+                 rules; channel/instance Properties can extend, replace, or disable them.",
+            );
+            ui.add_space(6.0);
+            trigger_rules_editor(ui, &mut self.settings.trigger_rules, "settings_triggers");
+            ui.label(
+                egui::RichText::new(
+                    "Note: EventSub-pushed go-lives fetch the title via a follow-up check; \
+                     YouTube 'Data API' detection has no title — use the scrape method there.",
+                )
+                .small()
+                .weak(),
+            );
+
             // ── Twitch VOD recovery ────────────────────────────────────────────
             }
 
@@ -17672,7 +17849,8 @@ impl StreamArchiverApp {
                                  goes live (same toggle as the Auto column in the Streams grid). \
                                  Off = the channel is still monitored — live state, schedules, \
                                  assets and metadata stay up to date — but recording only starts \
-                                 when you press ▶ yourself.",
+                                 when you press ▶ yourself, or when a trigger word matches the \
+                                 live title/game.",
                             );
                         ui.end_row();
 
@@ -18295,6 +18473,7 @@ impl StreamArchiverApp {
             self.properties_popups.retain(|m| !closed.contains(m));
             for mid in closed {
                 self.instance_scope_drafts.remove(&mid);
+                self.instance_trigger_drafts.remove(&mid);
                 // Free the shared per-channel asset caches when this was the
                 // last Properties window (channel or instance) showing them.
                 let cid = self.rows.iter().find(|r| r.monitor.id == mid).map(|r| r.channel.id);
@@ -18399,8 +18578,12 @@ impl StreamArchiverApp {
         self.instance_scope_drafts
             .entry(m.id)
             .or_insert_with(|| load_monitor_scope(&self.core.store, m.id));
+        self.instance_trigger_drafts
+            .entry(m.id)
+            .or_insert_with(|| crate::triggers::load_monitor_trigger_scope(&self.core.store, m.id));
         let global_order = load_source_order(&self.core.store);
         let mut scope_dirty = false;
+        let mut trigger_dirty = false;
 
         let mut open = true;
         ctx.show_viewport_immediate(
@@ -18699,6 +18882,27 @@ impl StreamArchiverApp {
                     });
                 }
 
+                // ── Trigger words (this instance) ────────────────────────
+                egui::CollapsingHeader::new(egui::RichText::new("Trigger words").strong())
+                    .id_salt("inst_props_sec_triggers")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "Start recording when the live title/game matches — even with Auto \
+                             off. Inherits the channel's rules, which inherit the global ones \
+                             (Settings → Downloads → Trigger words).",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    if let Some(scope) = self.instance_trigger_drafts.get_mut(&m.id)
+                        && trigger_scope_editor(ui, scope, "inst_triggers")
+                    {
+                        trigger_dirty = true;
+                    }
+                    });
+
                 // ── Schedule sources (this instance) ─────────────────────
                 egui::CollapsingHeader::new(
                     egui::RichText::new("Schedule sources (this instance)").strong(),
@@ -18736,6 +18940,12 @@ impl StreamArchiverApp {
                     self.core.request_schedule_refresh();
                 }
             }
+        }
+        if trigger_dirty
+            && let Some(scope) = self.instance_trigger_drafts.get(&mid)
+            && let Err(e) = crate::triggers::save_monitor_trigger_scope(&self.core.store, mid, scope)
+        {
+            self.status = format!("Error saving trigger words: {e}");
         }
 
         // ⟳ Refetch dispatches outside the viewport closure (same cache-drop set
@@ -18975,6 +19185,7 @@ impl StreamArchiverApp {
             self.channel_properties_popups.retain(|c| *c != cid);
             self.channel_cfg_drafts.remove(&cid);
             self.channel_scope_drafts.remove(&cid);
+            self.channel_trigger_drafts.remove(&cid);
             // Free the full-resolution thumbnail textures; they reload from disk
             // on the next open. Kept while an instance-Properties window of this
             // channel is still open — those share the same caches.
@@ -19068,9 +19279,13 @@ impl StreamArchiverApp {
             self.channel_scope_drafts
                 .insert(ch.id, load_channel_scope(&self.core.store, ch.id));
         }
+        self.channel_trigger_drafts
+            .entry(ch.id)
+            .or_insert_with(|| crate::triggers::load_channel_trigger_scope(&self.core.store, ch.id));
         let global_order = self.props_source_order.clone();
         let mut cfg_dirty = false;
         let mut scope_dirty = false;
+        let mut trigger_dirty = false;
 
         // The first-open asset loads are done; everything from here is the sub-window
         // build + paint. Stamp that distinctly so a freeze here is attributed to the
@@ -19414,6 +19629,27 @@ impl StreamArchiverApp {
                     });
                     });
 
+                // ── Trigger words (per-channel) ──────────────────────────
+                egui::CollapsingHeader::new(egui::RichText::new("Trigger words").strong())
+                    .id_salt("ch_props_sec_triggers")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "Start recording when the live title/game matches — even with Auto \
+                             off — for every instance in this channel. Inherits the global rules \
+                             (Settings → Downloads → Trigger words); instances can override again.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    if let Some(scope) = self.channel_trigger_drafts.get_mut(&ch.id)
+                        && trigger_scope_editor(ui, scope, "ch_triggers")
+                    {
+                        trigger_dirty = true;
+                    }
+                    });
+
                 // ── Schedule sources (per-channel) ───────────────────────
                 if let Some(cfg) = self.channel_cfg_drafts.get_mut(&ch.id) {
                     egui::CollapsingHeader::new(
@@ -19626,6 +19862,12 @@ impl StreamArchiverApp {
                     self.core.request_schedule_refresh();
                 }
             }
+        }
+        if trigger_dirty
+            && let Some(scope) = self.channel_trigger_drafts.get(&cid)
+            && let Err(e) = crate::triggers::save_channel_trigger_scope(&self.core.store, cid, scope)
+        {
+            self.status = format!("Error saving trigger words: {e}");
         }
 
         // Draft/texture cleanup for a closed window happens in the caller
@@ -23071,6 +23313,7 @@ mod tests {
             vod_dl_video_id: None,
             backfill_path: None,
             full_path: None,
+            trigger_info: String::new(),
         }
     }
 

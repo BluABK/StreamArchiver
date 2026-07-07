@@ -28,6 +28,7 @@ mod schedule_ocr;
 mod schedule_source;
 mod scheduler;
 mod store;
+mod triggers;
 mod ui;
 mod version;
 mod vod_archive;
@@ -441,6 +442,7 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
         last_recording_title: String::new(),
         last_recording_category: String::new(),
         last_recording_log: String::new(),
+        last_recording_trigger: String::new(),
         ad_free_sub: None,
         recording_count: 0,
         next_stream_at: None,

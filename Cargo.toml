@@ -29,6 +29,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tray-icon = "0.24.1"
 windows = { version = "0.62", features = ["Win32_System_JobObjects", "Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_Storage_FileSystem", "Win32_System_Com", "UI_Notifications", "Data_Xml_Dom", "Win32_UI_Controls", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_System_DataExchange", "Win32_System_Memory"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "ico"] }
+regex-lite = "0.1.9"
 
 [build-dependencies]
 embed-manifest = "1.4"
