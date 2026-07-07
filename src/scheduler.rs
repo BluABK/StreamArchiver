@@ -87,6 +87,13 @@ async fn tick(
     for row in &rows {
         let m = &row.monitor;
         prev_state.insert(m.id, m.last_state.clone());
+        // Master "Enabled" switch off → fully dormant: no detection at all (nor
+        // any recording/fetch elsewhere). The channel keeps its last state until
+        // manually checked. Distinct from Auto (below), which never gates
+        // detection. This is the ONLY switch that stops polling.
+        if !row.automation_on() {
+            continue;
+        }
         // Auto-off monitors are still polled: Auto only gates the automatic
         // recording start (enforced in the supervisor's try_begin), while
         // detection keeps liveness, go-live times, and downstream metadata
@@ -193,6 +200,29 @@ async fn tick(
         {
             warn!(
                 "scheduler: failed to persist state for {}: {e:#}",
+                o.monitor_id
+            );
+        }
+        // Persist the last-detected live info on EVERY poll, regardless of the
+        // Auto-record flag, so the grid can show a live channel's title/game/
+        // viewers without a recording. Cleared (empty + -1) when offline/errored
+        // or when the platform omits a field.
+        let (title, game, thumb, viewers) = if o.live && !o.error {
+            (
+                o.stream_title.as_deref().unwrap_or(""),
+                o.stream_game.as_deref().unwrap_or(""),
+                o.thumbnail_url.as_deref().unwrap_or(""),
+                o.stream_viewers.unwrap_or(-1),
+            )
+        } else {
+            ("", "", "", -1)
+        };
+        if let Err(e) = ctx
+            .store
+            .set_monitor_live_meta(o.monitor_id, title, game, thumb, viewers)
+        {
+            warn!(
+                "scheduler: failed to persist live meta for {}: {e:#}",
                 o.monitor_id
             );
         }

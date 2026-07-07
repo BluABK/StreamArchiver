@@ -328,6 +328,7 @@ fn run_add(args: &[String], pos: usize) -> Result<()> {
         channel_id,
         url: url.clone(),
         enabled: true,
+        automation_enabled: true,
         tool,
         detection_method: method,
         poll_interval_secs: 30,
@@ -400,12 +401,14 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
             color: String::new(),
             preferred_asset: None,
             enabled: true,
+            automation_enabled: true,
         },
         monitor: models::Monitor {
             id: 0,
             channel_id: 0,
             url: url.clone(),
             enabled: true,
+            automation_enabled: true,
             tool,
             detection_method: models::DetectionMethod::GenericProbe,
             poll_interval_secs: 60,
@@ -448,6 +451,10 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
         recording_count: 0,
         next_stream_at: None,
         next_stream_title: String::new(),
+        last_title: String::new(),
+        last_game: String::new(),
+        last_thumbnail_url: String::new(),
+        last_viewers: -1,
     };
     let plan = downloader::build_plan(
         &row,

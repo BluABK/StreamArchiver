@@ -217,6 +217,7 @@ pub fn create_monitor(
         channel_id,
         url: url.to_string(),
         enabled: monitor_enabled,
+        automation_enabled: true,
         tool: defaults.resolve_tool(platform),
         detection_method: defaults.resolve_detection(platform),
         poll_interval_secs: defaults.resolve_poll_interval(platform).max(5),

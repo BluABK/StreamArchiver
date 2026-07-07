@@ -33,7 +33,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 48;
+const SCHEMA_VERSION: i64 = 49;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -1315,7 +1315,26 @@ impl Store {
             reclassify_posts_v48(&conn)?;
             conn.pragma_update(None, "user_version", 48)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 48);
+        if version < 49 {
+            // Two separate switches. `enabled` (both tables) has always been the
+            // Auto-RECORD flag (a disk-space control) — it is left untouched.
+            // `automation_enabled` is a NEW master switch: off = fully dormant
+            // (no detection/recording/asset/about/posts/schedule fetch; only
+            // manual actions work). Plus per-monitor live-state columns so the
+            // last-detected title/game/thumbnail/viewers are stored on every
+            // poll (regardless of Auto) and shown in the grid without a
+            // recording. `last_viewers = -1` means unknown/not-applicable.
+            conn.execute_batch(
+                "ALTER TABLE monitor  ADD COLUMN automation_enabled INTEGER NOT NULL DEFAULT 1;
+                 ALTER TABLE channel  ADD COLUMN automation_enabled INTEGER NOT NULL DEFAULT 1;
+                 ALTER TABLE monitor  ADD COLUMN last_title         TEXT    NOT NULL DEFAULT '';
+                 ALTER TABLE monitor  ADD COLUMN last_game          TEXT    NOT NULL DEFAULT '';
+                 ALTER TABLE monitor  ADD COLUMN last_thumbnail_url TEXT    NOT NULL DEFAULT '';
+                 ALTER TABLE monitor  ADD COLUMN last_viewers       INTEGER NOT NULL DEFAULT -1;",
+            )?;
+            conn.pragma_update(None, "user_version", 49)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 49);
         Ok(())
     }
 
@@ -1952,8 +1971,8 @@ impl Store {
         let conn = self.db();
         let ch = conn
             .query_row(
-                "SELECT id, name, url, platform, created_at, color, preferred_platform, enabled \
-                 FROM channel WHERE url = ?1",
+                "SELECT id, name, url, platform, created_at, color, preferred_platform, enabled, \
+                 automation_enabled FROM channel WHERE url = ?1",
                 params![url],
                 Self::map_channel,
             )
@@ -1989,7 +2008,8 @@ impl Store {
     pub fn list_channels(&self) -> Result<Vec<Channel>> {
         let conn = self.db();
         let mut stmt = conn.prepare(
-            "SELECT id, name, url, platform, created_at, color, preferred_platform, enabled FROM channel
+            "SELECT id, name, url, platform, created_at, color, preferred_platform, enabled, \
+             automation_enabled FROM channel
              ORDER BY name COLLATE NOCASE, id",
         )?;
         let rows = stmt
@@ -2053,6 +2073,17 @@ impl Store {
         Ok(())
     }
 
+    /// Master automation switch for a whole channel (all its instances). Off =
+    /// fully dormant. Independent from `enabled` (the Auto-record flag).
+    pub fn set_channel_automation_enabled(&self, channel_id: i64, on: bool) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE channel SET automation_enabled = ?2 WHERE id = ?1",
+            params![channel_id, on as i64],
+        )?;
+        Ok(())
+    }
+
     // ----- monitors -----
 
     #[allow(clippy::too_many_arguments)]
@@ -2063,8 +2094,8 @@ impl Store {
                 quality, output_dir, filename_template, container, capture_from_start, auth_kind,
                 auth_value, extra_args, max_concurrent, last_state, ad_free, audio_tracks, subtitle_tracks,
                 chat_log, fetch_thumbnail, fetch_chat_assets, dual_capture, thumbnail_in_toast,
-                sabr_codec_pref, sabr_codec_custom)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+                sabr_codec_pref, sabr_codec_custom, automation_enabled)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
             params![
                 m.channel_id,
                 m.url,
@@ -2092,6 +2123,7 @@ impl Store {
                 m.thumbnail_in_toast as i64,
                 m.sabr_codec_pref.id(),
                 m.sabr_codec_custom,
+                m.automation_enabled as i64,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -2105,7 +2137,8 @@ impl Store {
                 auth_kind=?12, auth_value=?13, extra_args=?14, max_concurrent=?15, ad_free=?16,
                 audio_tracks=?17, subtitle_tracks=?18, chat_log=?19,
                 fetch_thumbnail=?20, fetch_chat_assets=?21, dual_capture=?22,
-                thumbnail_in_toast=?23, sabr_codec_pref=?24, sabr_codec_custom=?25 WHERE id=?1",
+                thumbnail_in_toast=?23, sabr_codec_pref=?24, sabr_codec_custom=?25,
+                automation_enabled=?26 WHERE id=?1",
             params![
                 m.id,
                 m.url,
@@ -2132,6 +2165,7 @@ impl Store {
                 m.thumbnail_in_toast as i64,
                 m.sabr_codec_pref.id(),
                 m.sabr_codec_custom,
+                m.automation_enabled as i64,
             ],
         )?;
         Ok(())
@@ -2143,6 +2177,27 @@ impl Store {
         conn.execute(
             "UPDATE monitor SET last_state = ?2, last_checked_at = ?3 WHERE id = ?1",
             params![id, state, checked_at],
+        )?;
+        Ok(())
+    }
+
+    /// Persist the last-detected live info on a monitor (title/game/thumbnail/
+    /// viewers), written on every poll regardless of the Auto-record flag so the
+    /// grid can show a live channel's info without a recording. Empty strings +
+    /// `viewers = -1` clear stale info when a channel goes offline.
+    pub fn set_monitor_live_meta(
+        &self,
+        id: i64,
+        title: &str,
+        game: &str,
+        thumbnail_url: &str,
+        viewers: i64,
+    ) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE monitor SET last_title = ?2, last_game = ?3,
+                 last_thumbnail_url = ?4, last_viewers = ?5 WHERE id = ?1",
+            params![id, title, game, thumbnail_url, viewers],
         )?;
         Ok(())
     }
@@ -2161,6 +2216,17 @@ impl Store {
         conn.execute(
             "UPDATE monitor SET enabled=?2 WHERE id=?1",
             params![id, enabled as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Master automation switch for a single instance. Off = fully dormant.
+    /// Independent from `enabled` (the Auto-record flag).
+    pub fn set_monitor_automation_enabled(&self, id: i64, on: bool) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE monitor SET automation_enabled=?2 WHERE id=?1",
+            params![id, on as i64],
         )?;
         Ok(())
     }
@@ -3544,7 +3610,9 @@ impl Store {
                 m.thumbnail_in_toast,
                 c.enabled,
                 m.sabr_codec_pref, m.sabr_codec_custom,
-                COALESCE(r.trigger_info, '')
+                COALESCE(r.trigger_info, ''),
+                m.automation_enabled, c.automation_enabled,
+                m.last_title, m.last_game, m.last_thumbnail_url, m.last_viewers
              FROM monitor m
              JOIN channel c ON c.id = m.channel_id
              LEFT JOIN recording r
@@ -3564,12 +3632,14 @@ impl Store {
                         &r.get::<_, String>(45)?,
                     ),
                     enabled: r.get::<_, i64>(47)? != 0,
+                    automation_enabled: r.get::<_, i64>(52)? != 0,
                 };
                 let monitor = Monitor {
                     id: r.get(5)?,
                     channel_id: r.get(6)?,
                     url: r.get(29)?,
                     enabled: r.get::<_, i64>(7)? != 0,
+                    automation_enabled: r.get::<_, i64>(51)? != 0,
                     tool: Tool::parse(&r.get::<_, String>(8)?),
                     detection_method: DetectionMethod::parse(&r.get::<_, String>(9)?),
                     poll_interval_secs: r.get(10)?,
@@ -3613,6 +3683,10 @@ impl Store {
                     ad_free_sub: r.get::<_, Option<i64>>(33)?.map(|v| v != 0),
                     recording_count: r.get(28)?,
                     last_recording_trigger: r.get(50)?,
+                    last_title: r.get(53)?,
+                    last_game: r.get(54)?,
+                    last_thumbnail_url: r.get(55)?,
+                    last_viewers: r.get(56)?,
                     // Filled by the UI from next_scheduled_streams(), not this query.
                     next_stream_at: None,
                     next_stream_title: String::new(),
@@ -4377,6 +4451,7 @@ impl Store {
             color: r.get(5)?,
             preferred_asset: crate::models::PreferredAssetSource::parse(&r.get::<_, String>(6)?),
             enabled: r.get::<_, i64>(7)? != 0,
+            automation_enabled: r.get::<_, i64>(8)? != 0,
         })
     }
 }
@@ -4391,6 +4466,7 @@ mod tests {
             channel_id,
             url: "https://twitch.tv/sample".into(),
             enabled: true,
+            automation_enabled: true,
             tool: Tool::Streamlink,
             detection_method: DetectionMethod::TwitchApi,
             poll_interval_secs: 60,
@@ -4471,6 +4547,60 @@ mod tests {
         // deleting the channel cascades to monitors.
         store.delete_channel(c1).unwrap();
         assert_eq!(store.list_monitors_with_channels().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn automation_switch_and_live_meta() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store
+            .upsert_channel("Live One", "https://twitch.tv/live1", Platform::Twitch)
+            .unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        // Both master switches default ON (new columns DEFAULT 1); automation_on
+        // requires both channel + monitor.
+        let row = |s: &Store| {
+            s.list_monitors_with_channels()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.monitor.id == mid)
+                .unwrap()
+        };
+        assert!(row(&store).monitor.automation_enabled);
+        assert!(row(&store).channel.automation_enabled);
+        assert!(row(&store).automation_on());
+
+        // Disabling the instance's master switch turns automation off; the
+        // Auto-record flag (`enabled`) is untouched.
+        store.set_monitor_automation_enabled(mid, false).unwrap();
+        let r = row(&store);
+        assert!(!r.monitor.automation_enabled);
+        assert!(!r.automation_on());
+        assert!(r.monitor.enabled, "Auto-record flag independent of master");
+
+        store.set_monitor_automation_enabled(mid, true).unwrap();
+        store.set_channel_automation_enabled(cid, false).unwrap();
+        assert!(!row(&store).automation_on(), "channel master gates too");
+        store.set_channel_automation_enabled(cid, true).unwrap();
+        assert!(row(&store).automation_on());
+
+        // Live meta persists + round-trips; offline clears it.
+        assert_eq!(row(&store).last_viewers, -1, "unknown by default");
+        store
+            .set_monitor_live_meta(mid, "Ranked grind", "VALORANT", "https://t/x.jpg", 1234)
+            .unwrap();
+        let r = row(&store);
+        assert_eq!(r.last_title, "Ranked grind");
+        assert_eq!(r.last_game, "VALORANT");
+        assert_eq!(r.last_thumbnail_url, "https://t/x.jpg");
+        assert_eq!(r.last_viewers, 1234);
+
+        store.set_monitor_live_meta(mid, "", "", "", -1).unwrap();
+        let r = row(&store);
+        assert_eq!(r.last_title, "");
+        assert_eq!(r.last_viewers, -1);
     }
 
     fn sample_video() -> Video {

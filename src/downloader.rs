@@ -2071,8 +2071,13 @@ impl Supervisor {
         let mut seen: std::collections::HashSet<(String, Platform, String)> =
             std::collections::HashSet::new();
         for row in &rows {
-            // Auto (enabled) is NOT checked here: an Auto-off channel's assets
-            // stay archived — only the per-instance fetch toggle opts out.
+            // Master switch off → fully dormant: skip the automatic asset sweep
+            // (the manual ⟳ Refetch still works). Auto-record (`enabled`) is NOT
+            // checked here — an Auto-off channel's assets stay archived; only the
+            // per-instance fetch toggle opts out.
+            if !row.automation_on() {
+                continue;
+            }
             if !row.monitor.fetch_chat_assets {
                 continue;
             }
@@ -2137,6 +2142,10 @@ impl Supervisor {
         };
         // Trigger words: a title/game match starts a recording even with Auto
         // off, and its per-rule overrides apply even with Auto on.
+        // `enabled` is the Auto-record flag — it gates AUTOMATIC recording to
+        // disk ONLY (a disk-space control), never detection/metadata/fetch. The
+        // master dormancy switch is handled upstream (scheduler skips dormant
+        // monitors, so this path isn't reached for them).
         let auto_off = !row.channel.enabled || !row.monitor.enabled;
         let mut trigger_hit: Option<crate::triggers::TriggerHit> = None;
         {
@@ -2230,6 +2239,12 @@ impl Supervisor {
             Ok(Some(r)) => r,
             _ => return,
         };
+        // A dormant monitor (master switch off) ignores automatic push triggers
+        // (WebSub/EventSub) entirely — it does nothing until manually acted on.
+        // An explicit user Start still works (it's a manual trigger).
+        if !user_initiated && !row.automation_on() {
+            return;
+        }
         let auto = row.channel.enabled && row.monitor.enabled;
         let name = row.channel.name.clone();
         let outcome = self.check_one(&row).await;
@@ -2747,6 +2762,7 @@ impl Supervisor {
                     broadcaster_id: None,
                     stream_title: None,
                     stream_game: None,
+                    stream_viewers: None,
                 }),
             DetectionMethod::GenericProbe => self.ctx.detect_generic(&item).await,
             DetectionMethod::YouTubeApi => self.ctx.detect_youtube_api(&item).await,
@@ -8182,12 +8198,14 @@ mod tests {
                 color: String::new(),
                 preferred_asset: None,
                 enabled: true,
+                automation_enabled: true,
             },
             monitor: Monitor {
                 id: 7,
                 channel_id: 1,
                 url: url.into(),
                 enabled: true,
+                automation_enabled: true,
                 tool,
                 detection_method: DetectionMethod::TwitchApi,
                 poll_interval_secs: 60,
@@ -8230,6 +8248,10 @@ mod tests {
             recording_count: 0,
             next_stream_at: None,
             next_stream_title: String::new(),
+            last_title: String::new(),
+            last_game: String::new(),
+            last_thumbnail_url: String::new(),
+            last_viewers: -1,
         }
     }
 

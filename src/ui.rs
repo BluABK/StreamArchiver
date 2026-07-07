@@ -287,7 +287,10 @@ struct MonitorForm {
     /// Manually mark this instance ad-free (member/sub/Turbo) — drives the Ad-free
     /// column when auto detection isn't available.
     ad_free: bool,
+    /// Auto-record toggle (the "Auto" column) — disk recording only.
     enabled: bool,
+    /// Master automation toggle (the "Enabled" column) — off = fully dormant.
+    automation_enabled: bool,
     auth_kind: AuthKind,
     auth_value: String,
     /// Audio tracks to capture (streamlink `--hls-audio-select`): empty = default,
@@ -343,6 +346,7 @@ impl MonitorForm {
             dual_capture: false,
             ad_free: false,
             enabled: true,
+            automation_enabled: true,
             auth_kind: AuthKind::Inherit,
             auth_value: String::new(),
             // New monitors default to max-archival: every audio + subtitle track,
@@ -380,6 +384,7 @@ impl MonitorForm {
             dual_capture: m.dual_capture,
             ad_free: m.ad_free,
             enabled: m.enabled,
+            automation_enabled: m.automation_enabled,
             auth_kind: m.auth_kind,
             auth_value: m.auth_value.clone(),
             audio_tracks: m.audio_tracks.clone(),
@@ -419,6 +424,7 @@ impl MonitorForm {
             dual_capture: false,
             ad_free: false,
             enabled: true,
+            automation_enabled: true,
             auth_kind: AuthKind::Inherit,
             auth_value: String::new(),
             // New monitors default to max-archival: every audio + subtitle track,
@@ -2046,6 +2052,7 @@ impl StreamArchiverApp {
             channel_id: form.channel_id.unwrap_or(0),
             url: form.url.trim().to_string(),
             enabled: form.enabled,
+            automation_enabled: form.automation_enabled,
             tool: form.tool,
             detection_method: form.detection_method,
             poll_interval_secs: form.poll_interval_secs.max(5),
@@ -2098,12 +2105,15 @@ impl StreamArchiverApp {
                     };
                     let mut m = monitor;
                     m.channel_id = channel_id;
-                    let mid = match monitor_id {
+                    let (mid, new_monitor_id) = match monitor_id {
                         Some(id) => {
                             store.update_monitor(&m).map_err(|e| e.to_string())?;
-                            id
+                            (id, None)
                         }
-                        None => store.insert_monitor(&m).map_err(|e| e.to_string())?,
+                        None => {
+                            let id = store.insert_monitor(&m).map_err(|e| e.to_string())?;
+                            (id, Some(id))
+                        }
                     };
                     let _ = crate::vod_archive::save_monitor_vod_scope(&store, mid, &vod_scope);
                     let rows = store.list_monitors_with_channels().map_err(|e| e.to_string())?;
@@ -2124,7 +2134,7 @@ impl StreamArchiverApp {
                         .flatten()
                         .and_then(|s| s.trim().parse().ok())
                         .unwrap_or(90);
-                    Ok(SaveRows { rows, channels, next_streams, yt_quota_today, yt_quota_cutoff, yt_search_today, yt_search_cutoff })
+                    Ok(SaveRows { rows, channels, next_streams, yt_quota_today, yt_quota_cutoff, yt_search_today, yt_search_cutoff, new_monitor_id })
                 })();
                 debug!(elapsed_ms = t.elapsed().as_millis(), ok = result.is_ok(), "save-monitor done");
                 let _ = tx.send(result);
@@ -2218,7 +2228,7 @@ impl StreamArchiverApp {
                         .flatten()
                         .and_then(|s| s.trim().parse().ok())
                         .unwrap_or(90);
-                    Some(SaveRows { rows, channels, next_streams, yt_quota_today, yt_quota_cutoff, yt_search_today, yt_search_cutoff })
+                    Some(SaveRows { rows, channels, next_streams, yt_quota_today, yt_quota_cutoff, yt_search_today, yt_search_cutoff, new_monitor_id: None })
                 })();
                 debug!(
                     elapsed_ms = t.elapsed().as_millis(),
@@ -2324,6 +2334,14 @@ impl StreamArchiverApp {
         self.expanded_streams
             .retain(|k| stream_key_monitor(k).is_some_and(|mid| live_monitors.contains(&mid)));
         self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
+        // A freshly-added instance: fetch its assets/About right away (icons,
+        // banner, About page) instead of waiting for the hourly sweep. Live
+        // state + title/game/viewers follow from the scheduler's next tick — a
+        // new monitor is due immediately (no last_checked_at). Recording stays
+        // manual, so no auto-Start here.
+        if let Some(mid) = save.new_monitor_id {
+            self.core.manual(crate::events::ManualCommand::RefetchAssets(mid));
+        }
     }
 
     fn save_settings(&mut self) {
@@ -4433,6 +4451,22 @@ fn fmt_went_live(at: Option<i64>, approx: bool) -> String {
     }
 }
 
+/// Compact live viewer count (`1234` → `1.2K`, `1_200_000` → `1.2M`); empty for
+/// a negative (unknown) count.
+fn fmt_viewers(n: i64) -> String {
+    if n < 0 {
+        String::new()
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 10_000 {
+        format!("{}K", n / 1000)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 /// Human-readable byte size (B / KB / MB / GB).
 fn fmt_bytes(bytes: i64) -> String {
     let b = bytes.max(0) as f64;
@@ -4488,8 +4522,9 @@ fn fmt_speed(bytes_per_sec: f64) -> String {
 /// `initial`-width columns, which start narrow and truncate (full value on
 /// hover). Each `id` is a stable persistence key: never reuse or change one
 /// once shipped.
-const STREAM_COLUMNS: [GridCol; 19] = [
-    GridCol { id: "auto",        title: "Auto",       tooltip: "Auto-record: start recording automatically when the stream goes live. Detection, schedules, assets and metadata always stay up to date regardless; manual Start still records, and trigger words (Settings → Downloads) can still start a recording while Auto is off. The channel checkbox and each instance checkbox are independent.", min_width: 36.0,  initial: 0.0,   sortable: true,  stretch: false },
+const STREAM_COLUMNS: [GridCol; 21] = [
+    GridCol { id: "enabled",     title: "On",         tooltip: "Master switch. Off = fully dormant: no detection, recording, or asset/about/posts/schedule fetch until you act manually (▶ Start, ⟳ Refetch). Independent from Auto (which only gates automatic recording). The channel checkbox and each instance checkbox are independent.", min_width: 30.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "auto",        title: "Auto",       tooltip: "Auto-record: automatically record to disk when the stream goes live (a disk-space control). It does NOT gate detection, metadata, posts, schedules or assets — those always run while the channel is On. Manual Start still records, and trigger words (Settings → Downloads) can still start a recording while Auto is off. The channel checkbox and each instance checkbox are independent.", min_width: 36.0,  initial: 0.0,   sortable: true,  stretch: false },
     GridCol { id: "actions",     title: "Actions",    tooltip: "Per-row actions: start/stop recording, edit, add instance, open folder, delete.",            min_width: 126.0, initial: 0.0,   sortable: false, stretch: false },
     GridCol { id: "platform",    title: "Plat",       tooltip: "Source platform (icon): Twitch, YouTube, Kick, or a generic URL. A channel shows every platform among its instances.", min_width: 52.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "name",        title: "Name",       tooltip: "Channel (container) name. Expand it to see its instances and recording history.",            min_width: 130.0, initial: 0.0,   sortable: true,  stretch: false },
@@ -4500,6 +4535,7 @@ const STREAM_COLUMNS: [GridCol; 19] = [
     GridCol { id: "next_stream", title: "Next stream",tooltip: "Next scheduled stream (Twitch schedule / YouTube upcoming). Hover for its title; double-click for the full schedule.", min_width: 96.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "game",        title: "Game",       tooltip: "Current game / category of the most recent recording. Truncated — hover for the full name.", min_width: 60.0,  initial: 96.0,  sortable: true, stretch: false },
     GridCol { id: "title",       title: "Title",      tooltip: "Current stream title of the most recent recording. Truncated — hover for the full title.",   min_width: 80.0,  initial: 170.0, sortable: true, stretch: false },
+    GridCol { id: "viewers",     title: "👁",         tooltip: "Live viewer count (Twitch / Kick; YouTube best-effort). Shown for a live channel even when not recording; blank when offline or unknown.", min_width: 44.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "changes",     title: "✏",          tooltip: "Title / game-category changes logged during the recording. Hover or double-click for the log.", min_width: 24.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "ads",         title: "📢",         tooltip: "Ad breaks detected (Twitch + streamlink); each is a hard cut. Hover for count + total time; double-click for the cut list.", min_width: 24.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "went_live",   title: "Went Live",  tooltip: "When the stream went live on the platform (a trailing \"~\" means it's our approximate time).", min_width: 96.0, initial: 0.0,  sortable: true, stretch: false },
@@ -4510,8 +4546,8 @@ const STREAM_COLUMNS: [GridCol; 19] = [
     GridCol { id: "added",       title: "Added",      tooltip: "When the channel was added.",                                                               min_width: 84.0,  initial: 0.0,   sortable: true, stretch: false },
 ];
 
-/// Total Streams columns (19 total, including the non-sortable Actions slot).
-const STREAM_COLS: usize = STREAM_COLUMNS.len(); // = 19
+/// Total Streams columns (21 total, including the non-sortable Actions slot).
+const STREAM_COLS: usize = STREAM_COLUMNS.len(); // = 21
 
 /// The Videos columns, in DEFAULT display order (mirrors `STREAM_COLUMNS`).
 /// The trailing Actions column (index `VIDEO_COLS`, 9) is non-sortable and
@@ -5153,10 +5189,14 @@ fn channel_cells(
         .filter_map(|m| m.monitor.last_checked_at)
         .max()
         .unwrap_or(0);
-    // In STREAM_COLUMNS order: Auto, Actions(empty), Plat, Name, Tool, Detection,
-    // Polled, State, Next stream, Game, Title, ✏ (Changes), 📢 (Ads), Went Live,
-    // Started On, Lost, Duration, Ad-free, Added.
+    // In STREAM_COLUMNS order: Enabled, Auto, Actions(empty), Plat, Name, Tool,
+    // Detection, Polled, State, Next stream, Game, Title, Viewers, ✏ (Changes),
+    // 📢 (Ads), Went Live, Started On, Lost, Duration, Ad-free, Added.
     vec![
+        Cell::num(
+            if channel.automation_enabled { 1.0 } else { 0.0 },
+            if channel.automation_enabled { "on" } else { "off" },
+        ),
         Cell::num(
             if channel.enabled { 1.0 } else { 0.0 },
             if channel.enabled { "on" } else { "off" },
@@ -5187,8 +5227,13 @@ fn channel_cells(
                 next_at.map(fmt_datetime_short).unwrap_or_default(),
             )
         },
-        Cell::text(if rec.active { primary.last_recording_category.clone() } else { String::new() }),
-        Cell::text(if rec.active { primary.last_recording_title.clone() } else { String::new() }),
+        Cell::text(if rec.active { primary.last_recording_category.clone() } else { primary.last_game.clone() }),
+        Cell::text(if rec.active { primary.last_recording_title.clone() } else { primary.last_title.clone() }),
+        // Viewers — live count (blank when offline/unknown).
+        Cell::num(
+            primary.last_viewers.max(0) as f64,
+            if primary.last_viewers >= 0 { fmt_viewers(primary.last_viewers) } else { String::new() },
+        ),
         // ✏ Changes (index 11)
         Cell::num(
             primary.last_recording_meta_changes as f64,
@@ -5231,6 +5276,7 @@ struct RowActions {
     add_instance: Option<i64>,          // channel id
     delete: Option<(i64, String)>,      // (monitor id, channel name)
     toggle_enabled: Option<(i64, bool)>,
+    toggle_automation: Option<(i64, bool)>,
     select: Option<i64>,                // monitor id
     open_schedule: Option<i64>,         // monitor id (open its Next stream popup)
     properties: Option<i64>,            // monitor id
@@ -5352,6 +5398,14 @@ fn render_instance_row(
             a.add_instance = Some(row.channel.id);
             ui.close();
         }
+        let master_label = if m.automation_enabled { "⏸  Disable (go dormant)" } else { "✔  Enable" };
+        if ui.button(master_label)
+            .on_hover_text("Master switch. Off = fully dormant: no detection/recording/fetch until acted on manually. Independent from Auto.")
+            .clicked()
+        {
+            a.toggle_automation = Some((m.id, !m.automation_enabled));
+            ui.close();
+        }
         let toggle_label = if m.enabled { "⏸  Auto-record off" } else { "✔  Auto-record on" };
         if ui.button(toggle_label)
             .on_hover_text("Whether recording starts automatically on live. Detection and metadata keep running either way; ▶ Start still records manually.")
@@ -5385,10 +5439,20 @@ fn render_instance_row(
     // how the user has hidden/reordered columns.
     for &ci in order {
         tr.col(|ui| { tint_cell(ui, tint); match STREAM_COLUMNS[ci].id {
+            "enabled" => {
+                let mut on = m.automation_enabled;
+                let cb = ui.checkbox(&mut on, "").on_hover_text(
+                    "Master switch. Off = fully dormant: no detection, recording, or asset/about/posts/schedule fetch until you act manually (▶ Start, ⟳ Refetch). Independent from Auto.",
+                );
+                if cb.changed() {
+                    a.toggle_automation = Some((m.id, on));
+                }
+                cb.context_menu(|ui| add_menu(ui, a));
+            }
             "auto" => {
                 let mut on = m.enabled;
                 let cb = ui.checkbox(&mut on, "").on_hover_text(
-                    "Auto-record this instance when it goes live. Off = still monitored (state, schedules, metadata stay current) but nothing records unless you press ▶ or a trigger word matches.",
+                    "Auto-record this instance when it goes live (disk-space control). Off = still monitored (state, schedules, metadata, posts stay current) but nothing records unless you press ▶ or a trigger word matches.",
                 );
                 if cb.changed() {
                     a.toggle_enabled = Some((m.id, on));
@@ -5516,6 +5580,16 @@ fn render_instance_row(
             }
             "state" => {
                 ui.horizontal(|ui| {
+                    // Dormant (master switch off) → a paused glyph; its state is
+                    // frozen (no detection) so the normal live/idle icon would be
+                    // misleading.
+                    if !row.automation_on() {
+                        ui.colored_label(egui::Color32::GRAY, "⏸").on_hover_text(
+                            "Dormant — automation is off (the Enabled switch). No detection, \
+                             recording, or fetch until acted on manually.",
+                        );
+                        return;
+                    }
                     let (icon, color) = state_icon(&m.last_state);
                     let resp = ui.colored_label(color, icon);
                     let is_failed = m.last_state == "failed"
@@ -5567,13 +5641,20 @@ fn render_instance_row(
                 }
             }
             "game" => {
-                if rec.active {
-                    meta_value_cell(ui, &row.last_recording_category);
-                }
+                // While recording, the live meta-log wins; otherwise fall back
+                // to the last-detected game so a live-not-recording channel
+                // still shows it.
+                let v = if rec.active { &row.last_recording_category } else { &row.last_game };
+                meta_value_cell(ui, v);
             }
             "title" => {
-                if rec.active {
-                    meta_value_cell(ui, &row.last_recording_title);
+                let v = if rec.active { &row.last_recording_title } else { &row.last_title };
+                meta_value_cell(ui, v);
+            }
+            "viewers" => {
+                if row.last_viewers >= 0 {
+                    ui.add(egui::Label::new(fmt_viewers(row.last_viewers)).truncate())
+                        .on_hover_text(format!("{} viewers", row.last_viewers));
                 }
             }
             "changes" => {
@@ -6084,6 +6165,10 @@ struct SaveRows {
     yt_quota_cutoff: i64,
     yt_search_today: i64,
     yt_search_cutoff: i64,
+    /// Id of a newly-INSERTED monitor (a fresh add, not an edit) — the UI fires
+    /// an immediate asset/About fetch for it so a new channel isn't blank until
+    /// the hourly sweep. `None` for an edit.
+    new_monitor_id: Option<i64>,
 }
 
 /// In-flight form-save spawned on a background thread. The thread holds the store
@@ -11423,6 +11508,7 @@ impl StreamArchiverApp {
         let mut view_chat_rec: Option<(i64, i64)> = None;
         // Container-level actions.
         let mut toggle_channel_enabled: Option<(i64, bool)> = None; // set all instances
+        let mut toggle_channel_automation: Option<(i64, bool)> = None; // master switch
         let mut rename_channel: Option<i64> = None;
         let mut delete_channel: Option<(i64, String)> = None;
         let mut clear_channel_err: Option<i64> = None;
@@ -11826,14 +11912,24 @@ impl StreamArchiverApp {
                                 });
                                 let meta_changes =
                                     primary.map(|m| m.last_recording_meta_changes);
+                                // While recording, show the live meta-log; else
+                                // fall back to the last-detected info so a
+                                // live-not-recording channel still shows it.
                                 let cur_category = primary
-                                    .filter(|m| m.last_recording_status.as_deref() == Some("recording"))
-                                    .map(|m| m.last_recording_category.clone())
+                                    .map(|m| if m.last_recording_status.as_deref() == Some("recording") {
+                                        m.last_recording_category.clone()
+                                    } else {
+                                        m.last_game.clone()
+                                    })
                                     .unwrap_or_default();
                                 let cur_title = primary
-                                    .filter(|m| m.last_recording_status.as_deref() == Some("recording"))
-                                    .map(|m| m.last_recording_title.clone())
+                                    .map(|m| if m.last_recording_status.as_deref() == Some("recording") {
+                                        m.last_recording_title.clone()
+                                    } else {
+                                        m.last_title.clone()
+                                    })
                                     .unwrap_or_default();
+                                let cur_viewers = primary.map(|m| m.last_viewers).unwrap_or(-1);
                                 // The channel's next stream = the SOONEST upcoming
                                 // across its instances (the past-recording primary
                                 // may be a different platform with no schedule).
@@ -11858,11 +11954,20 @@ impl StreamArchiverApp {
                                     let mut disc = false;
                                     for &ci2 in &col_order {
                                         tr.col(|ui| { tint_cell(ui, tint); match STREAM_COLUMNS[ci2].id {
+                                            "enabled" => {
+                                                let mut on = ch.automation_enabled;
+                                                let cb = ui
+                                                    .add_enabled(ninst > 0, egui::Checkbox::new(&mut on, ""))
+                                                    .on_hover_text("Master switch for this channel. Off = all its instances go fully dormant (no detection/recording/fetch) until acted on manually. Independent from each instance's own switch and from Auto.");
+                                                if cb.changed() {
+                                                    toggle_channel_automation = Some((cid, on));
+                                                }
+                                            }
                                             "auto" => {
                                                 let mut on = ch.enabled;
                                                 let cb = ui
                                                     .add_enabled(ninst > 0, egui::Checkbox::new(&mut on, ""))
-                                                    .on_hover_text("Auto-record this channel. Off = its instances are still monitored (state, schedules, metadata stay current) but nothing records unless started manually. Independent from each instance's own toggle.");
+                                                    .on_hover_text("Auto-record this channel (disk-space control). Off = its instances are still monitored (state, schedules, metadata, posts stay current) but nothing records unless started manually. Independent from each instance's own toggle.");
                                                 if cb.changed() {
                                                     toggle_channel_enabled = Some((cid, on));
                                                 }
@@ -11995,6 +12100,12 @@ impl StreamArchiverApp {
                                             }
                                             "title" => {
                                                 meta_value_cell(ui, &cur_title);
+                                            }
+                                            "viewers" => {
+                                                if cur_viewers >= 0 {
+                                                    ui.add(egui::Label::new(fmt_viewers(cur_viewers)).truncate())
+                                                        .on_hover_text(format!("{} viewers", cur_viewers));
+                                                }
                                             }
                                             "changes" => {
                                                 if let Some(c) = meta_changes {
@@ -13150,11 +13261,23 @@ impl StreamArchiverApp {
             }
             self.reload_rows();
         }
+        if let Some((id, on)) = acts.toggle_automation {
+            if let Err(e) = self.core.store.set_monitor_automation_enabled(id, on) {
+                self.status = format!("Error: {e}");
+            }
+            self.reload_rows();
+        }
         if let Some((id, name)) = acts.delete {
             self.confirm_delete = Some((id, name));
         }
         if let Some((cid, on)) = toggle_channel_enabled {
             if let Err(e) = self.core.store.set_channel_enabled(cid, on) {
+                self.status = format!("Error: {e}");
+            }
+            self.reload_rows();
+        }
+        if let Some((cid, on)) = toggle_channel_automation {
+            if let Err(e) = self.core.store.set_channel_automation_enabled(cid, on) {
                 self.status = format!("Error: {e}");
             }
             self.reload_rows();
@@ -18090,15 +18213,25 @@ impl StreamArchiverApp {
                             );
                         ui.end_row();
 
+                        ui.label("Enabled");
+                        ui.checkbox(&mut form.automation_enabled, "")
+                            .on_hover_text(
+                                "Master switch (same as the Enabled column). Off = fully \
+                                 dormant: no detection, recording, or asset/about/posts/schedule \
+                                 fetch until you act manually (▶ Start, ⟳ Refetch). Independent \
+                                 from Auto below.",
+                            );
+                        ui.end_row();
+
                         ui.label("Auto");
                         ui.checkbox(&mut form.enabled, "")
                             .on_hover_text(
-                                "Auto-record: start recording automatically when this channel \
-                                 goes live (same toggle as the Auto column in the Streams grid). \
-                                 Off = the channel is still monitored — live state, schedules, \
-                                 assets and metadata stay up to date — but recording only starts \
-                                 when you press ▶ yourself, or when a trigger word matches the \
-                                 live title/game.",
+                                "Auto-record: automatically record to disk when this channel \
+                                 goes live (a disk-space control; same as the Auto column). It \
+                                 does NOT gate detection, metadata, posts, schedules or assets — \
+                                 those run while the channel is Enabled. Recording only starts \
+                                 automatically when this is on; otherwise press ▶ yourself, or a \
+                                 trigger word matches the live title/game.",
                             );
                         ui.end_row();
 

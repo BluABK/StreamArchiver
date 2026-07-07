@@ -73,6 +73,9 @@ pub struct DetectOutcome {
     /// Game/category at detection time, when the platform provides it
     /// (Twitch `game_name`, Kick category). Feeds the trigger-word matcher.
     pub stream_game: Option<String>,
+    /// Live viewer count at detection time (Twitch `viewer_count`, Kick
+    /// viewers; YouTube best-effort). `None` when the platform/path omits it.
+    pub stream_viewers: Option<i64>,
 }
 
 impl DetectOutcome {
@@ -88,6 +91,7 @@ impl DetectOutcome {
             broadcaster_id: None,
             stream_title: None,
             stream_game: None,
+            stream_viewers: None,
         }
     }
     fn live_at(
@@ -121,6 +125,10 @@ impl DetectOutcome {
         self.stream_game = stream_game;
         self
     }
+    fn with_stream_viewers(mut self, stream_viewers: Option<i64>) -> DetectOutcome {
+        self.stream_viewers = stream_viewers;
+        self
+    }
     fn offline(monitor_id: i64) -> DetectOutcome {
         DetectOutcome {
             monitor_id,
@@ -133,6 +141,7 @@ impl DetectOutcome {
             broadcaster_id: None,
             stream_title: None,
             stream_game: None,
+            stream_viewers: None,
         }
     }
     fn err(monitor_id: i64, detail: impl Into<String>) -> DetectOutcome {
@@ -147,6 +156,7 @@ impl DetectOutcome {
             broadcaster_id: None,
             stream_title: None,
             stream_game: None,
+            stream_viewers: None,
         }
     }
 }
@@ -515,6 +525,7 @@ impl DetectContext {
             started_at: Option<String>,
             title: Option<String>,
             game_name: Option<String>,
+            viewer_count: Option<i64>,
         }
         #[derive(Deserialize)]
         struct StreamsResp {
@@ -539,9 +550,9 @@ impl DetectContext {
 
                 match resp {
                     Ok(r) if r.status().is_success() => {
-                        // login -> (went_live, stream_id, user_id, thumbnail_url, title, game)
+                        // login -> (went_live, stream_id, user_id, thumbnail_url, title, game, viewers)
                         #[allow(clippy::type_complexity)]
-                        let live: HashMap<String, (Option<i64>, Option<String>, String, String, Option<String>, Option<String>)> =
+                        let live: HashMap<String, (Option<i64>, Option<String>, String, String, Option<String>, Option<String>, Option<i64>)> =
                             match r.json::<StreamsResp>().await
                         {
                             Ok(sr) => sr
@@ -552,7 +563,7 @@ impl DetectContext {
                                     let when = s.started_at.as_deref().and_then(parse_rfc3339);
                                     (
                                         s.user_login.to_lowercase(),
-                                        (when, Some(s.id), s.user_id, s.thumbnail_url, s.title, s.game_name),
+                                        (when, Some(s.id), s.user_id, s.thumbnail_url, s.title, s.game_name, s.viewer_count),
                                     )
                                 })
                                 .collect(),
@@ -572,13 +583,14 @@ impl DetectContext {
                             let key = l.to_lowercase();
                             for mid in &login_to_mons[l] {
                                 outcomes.push(match live.get(&key) {
-                                    Some((went, id, uid, thumb, title, game)) => {
+                                    Some((went, id, uid, thumb, title, game, viewers)) => {
                                         DetectOutcome::live_at(*mid, "live", *went)
                                             .with_stream_id(id.clone())
                                             .with_broadcaster_id(Some(uid.clone()))
                                             .with_thumbnail_url(Some(thumb.clone()))
                                             .with_stream_title(title.clone())
                                             .with_stream_game(game.clone())
+                                            .with_stream_viewers(*viewers)
                                     }
                                     None => DetectOutcome::offline(*mid),
                                 });
@@ -1901,10 +1913,12 @@ impl DetectContext {
             return None;
         }
         let guilds = self.discord_guild_ids(&token).await?;
-        // URL needles per enabled monitor (skip monitors we can't match by URL).
+        // URL needles per active monitor (skip dormant ones + those we can't
+        // match by URL). Auto-record (`enabled`) does NOT gate schedule scraping
+        // — only the master automation switch does.
         let needles: Vec<(i64, Vec<String>)> = rows
             .iter()
-            .filter(|r| r.channel.enabled && r.monitor.enabled)
+            .filter(|r| r.automation_on())
             .map(|r| (r.monitor.id, monitor_needles(&r.monitor.url)))
             .filter(|(_, n)| !n.is_empty())
             .collect();
@@ -2204,12 +2218,16 @@ impl DetectContext {
                         .or_else(|| stream["categories"][0]["name"].as_str())
                         .filter(|s| !s.is_empty())
                         .map(str::to_string);
+                    let viewers = stream["viewer_count"]
+                        .as_i64()
+                        .or_else(|| stream["viewers"].as_i64());
                     DetectOutcome::live_at(item.monitor_id, "live", went)
                         .with_stream_id(id)
                         .with_broadcaster_id(kick_slug(&item.url).map(|s| s.to_string()))
                         .with_thumbnail_url(thumb)
                         .with_stream_title(title)
                         .with_stream_game(game)
+                        .with_stream_viewers(viewers)
                 } else {
                     DetectOutcome::offline(item.monitor_id)
                 }
@@ -2637,6 +2655,7 @@ fn youtube_channels_deduped(ctx: &Arc<DetectContext>) -> Vec<MonitorWithChannel>
         .list_monitors_with_channels()
         .unwrap_or_default()
         .into_iter()
+        .filter(|r| r.automation_on()) // dormant channels fetch no posts
         .filter(|r| r.monitor.platform() == Platform::YouTube)
         .filter(|r| seen.insert(youtube_community_url(&r.monitor.url)))
         .collect()
@@ -2817,6 +2836,9 @@ async fn refresh_schedules_once(
     let live: std::collections::HashSet<i64> = rows.iter().map(|r| r.monitor.id).collect();
     last_fetched.retain(|id, _| live.contains(id));
     last_ocr.retain(|k, _| live.contains(&k.0));
+    // Dormant channels (master switch off) fetch no schedules. Filter AFTER the
+    // retain above so cleanup for deleted monitors still runs on the full list.
+    let rows: Vec<MonitorWithChannel> = rows.into_iter().filter(|r| r.automation_on()).collect();
     // `now_secs` is the authoritative clock for both `last_fetched` (persisted,
     // must survive restarts) and the OCR cadence.  `now` (Instant) is kept only
     // for `discord_last`, which is in-memory-only and doesn't need wall-clock.
@@ -4268,6 +4290,28 @@ mod tests {
         // Non-Google URLs pass through untouched.
         let other = "https://example.com/banner.png";
         assert_eq!(normalize_yt_image_url(other), other);
+    }
+
+    #[test]
+    fn detect_outcome_carries_viewers() {
+        // Builder plumbs viewer count; the base constructors default it to None.
+        let o = DetectOutcome::live(7, "live").with_stream_viewers(Some(1234));
+        assert_eq!(o.stream_viewers, Some(1234));
+        assert_eq!(DetectOutcome::offline(7).stream_viewers, None);
+        assert_eq!(DetectOutcome::err(7, "x").stream_viewers, None);
+    }
+
+    #[test]
+    fn kick_viewer_count_parses_from_value() {
+        // Mirrors the Kick detect path's extraction (viewer_count, then viewers).
+        let s = serde_json::json!({ "viewer_count": 87 });
+        let got = s["viewer_count"].as_i64().or_else(|| s["viewers"].as_i64());
+        assert_eq!(got, Some(87));
+        let s2 = serde_json::json!({ "viewers": 42 });
+        let got2 = s2["viewer_count"].as_i64().or_else(|| s2["viewers"].as_i64());
+        assert_eq!(got2, Some(42));
+        let s3 = serde_json::json!({ "is_live": true });
+        assert_eq!(s3["viewer_count"].as_i64().or_else(|| s3["viewers"].as_i64()), None);
     }
 
     #[test]

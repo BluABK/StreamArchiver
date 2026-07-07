@@ -62,15 +62,27 @@ two tools on one URL.
 2. **➕** on a channel row (or **Add instance to channel** in the menu) adds
    another instance — including one on a **different platform** (paste a YouTube
    URL on a Twitch channel, etc.).
-3. **Auto** toggles work at both levels: the **channel** checkbox gates *all*
-   its instances at once; each **instance** has its own independent checkbox
-   (pause just YouTube for the day, keep Twitch) — recording auto-starts only
-   when **both** are on. The same toggle appears as **Auto** on the add/edit
-   instance form. **Auto controls only the automatic recording start** — an
-   Auto-off channel is still fully monitored: liveness is polled/pushed as
-   usual (the State column shows *live*), schedules, channel assets, community
-   posts, and metadata keep refreshing into the archive, and the ▶ **Start**
-   button always records on demand (bypassing Auto). **✏** renames the
+3. **Two independent switches**, each at both the channel and instance level
+   (the channel checkbox gates *all* its instances at once; each instance has
+   its own — pause just YouTube for the day, keep Twitch). Both also appear on
+   the add/edit instance form:
+   - **Enabled** (the **On** column, left of Auto; default on) is the **master
+     switch**. Off = **fully dormant**: no detection, recording, or asset/About/
+     posts/schedule fetch — the channel does nothing until you act manually
+     (▶ **Start**, ⟳ **Refetch**). Its State cell shows **⏸** and its live info
+     freezes. Use it to shelve a channel without deleting it.
+   - **Auto** (default on) controls **only the automatic recording to disk** — a
+     disk-space control. It does **not** gate detection, metadata, posts,
+     schedules, or assets: an Auto-off (but Enabled) channel is still fully
+     monitored — liveness is polled/pushed as usual (the State column shows
+     *live*, and the **Title/Game/👁 Viewers** columns show its current stream
+     even though nothing is recording), everything keeps refreshing into the
+     archive, and the ▶ **Start** button always records on demand. Recording
+     auto-starts only when **both** Enabled and Auto are on (or a trigger word
+     matches).
+
+   Adding a channel fetches its assets/About immediately, and its live state +
+   title/game/viewers appear within one poll cycle (≤30s). **✏** renames the
    channel; the per-instance **✏** edits that instance (incl. its URL). **🗑**
    deletes a channel (and its instances) or a single instance.
 4. **Settings** → Twitch/YouTube credentials, default output folder, max concurrent
@@ -139,11 +151,13 @@ a ▲/▼ shows the active column); type in the box under a header to filter tha
 column (case-insensitive substring). Filters combine across columns. This works on
 the **Videos** and **Streams** tables alike.
 
-The channel table shows, per channel: Auto (auto-record on/off), Name, Platform (with a
+The channel table shows, per channel: **On** (master switch — dormant when off),
+Auto (auto-record on/off), Name, Platform (with a
 brand badge), Tool, Detection, **Polled** (when it was last checked, with the poll
 interval in parentheses — e.g. `2026-06-21 14:02:33 (60s)`), State, **Next stream**
 (the next scheduled stream — see below), **Game** and
-**Title** (the current category/title of the latest recording), **Went Live** (the
+**Title** (the current category/title — the live stream's when detected, else the
+latest recording's), **👁 Viewers** (live viewer count when live), **Went Live** (the
 platform's go-live time — `~`-prefixed when only our first-detected time is known,
 e.g. for scrape), **Started On** (when we began recording), **Lost time** (how
 much of the stream we missed), **Duration** (live, `HH:MM:SS`), and **Added** (when

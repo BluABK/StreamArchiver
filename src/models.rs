@@ -623,9 +623,16 @@ pub struct Channel {
     /// = auto: the first instance with a fetched icon. Set explicitly via the
     /// channel's Properties → icon source.
     pub preferred_asset: Option<PreferredAssetSource>,
-    /// Channel-level enabled flag. Independent from each instance's `Monitor::enabled`;
-    /// a monitor runs only when both this AND `monitor.enabled` are true.
+    /// Channel-level **Auto-record** flag. Independent from each instance's
+    /// `Monitor::enabled`; a monitor auto-records only when both this AND
+    /// `monitor.enabled` are true. Auto gates disk recording ONLY — not
+    /// detection, metadata, posts, or any other fetch.
     pub enabled: bool,
+    /// Channel-level **master automation** switch. Off = fully dormant (no
+    /// detection/recording/asset/about/posts/schedule fetch for any instance;
+    /// only manual actions work). Automation runs only when both this AND
+    /// `monitor.automation_enabled` are true.
+    pub automation_enabled: bool,
 }
 
 /// The channel's chosen icon/banner source, persisted in the legacy
@@ -673,7 +680,14 @@ pub struct Monitor {
     pub channel_id: i64,
     /// Source URL for this instance (platform is derived from it).
     pub url: String,
+    /// **Auto-record** flag (disk-space control): gates ONLY whether a live
+    /// stream is automatically recorded to disk. Does NOT gate detection,
+    /// metadata, posts, or any other fetch. See [`Channel::enabled`].
     pub enabled: bool,
+    /// **Master automation** switch for this instance. Off = fully dormant
+    /// (no detection/recording/fetch; manual only). See
+    /// [`Channel::automation_enabled`].
+    pub automation_enabled: bool,
     pub tool: Tool,
     pub detection_method: DetectionMethod,
     pub poll_interval_secs: i64,
@@ -794,6 +808,28 @@ pub struct MonitorWithChannel {
     pub next_stream_at: Option<i64>,
     /// Title of that next scheduled stream (for the cell hover); empty when none.
     pub next_stream_title: String,
+    /// Last-detected live stream title, persisted on every poll (regardless of
+    /// Auto). Shown in the Title column when the channel is live but NOT
+    /// recording; empty when offline/unknown.
+    pub last_title: String,
+    /// Last-detected live game/category (Twitch + Kick; YouTube has none).
+    pub last_game: String,
+    /// Last-detected live thumbnail URL — stored on every poll; groundwork for
+    /// a hover preview (no grid column consumes it yet).
+    #[allow(dead_code)]
+    pub last_thumbnail_url: String,
+    /// Last-detected live viewer count; `-1` = unknown/not applicable.
+    pub last_viewers: i64,
+}
+
+impl MonitorWithChannel {
+    /// Whether background automation may run for this instance: the master
+    /// switch on both the channel and the instance. Off = fully dormant
+    /// (detection, recording, and all fetches paused; manual actions still
+    /// work). Distinct from the Auto-record flag (`enabled`).
+    pub fn automation_on(&self) -> bool {
+        self.channel.automation_enabled && self.monitor.automation_enabled
+    }
 }
 
 /// One advertisement break detected during a recording take.
