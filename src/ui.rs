@@ -18407,7 +18407,7 @@ impl StreamArchiverApp {
             egui::ViewportId::from_hash_of(("instance_props_vp", mid)),
             egui::ViewportBuilder::default()
                 .with_title(format!("Instance — {}", ch.name))
-                .with_inner_size([480.0, 380.0]),
+                .with_inner_size([480.0, 560.0]),
             |ctx, _class| {
                 if ctx.input(|i| i.viewport().close_requested()) {
                     open = false;
@@ -18459,8 +18459,13 @@ impl StreamArchiverApp {
 
                 ui.separator();
 
+                egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+
                 // ── Monitor (instance) ───────────────────────────────────
-                ui.strong("Monitor (instance)");
+                egui::CollapsingHeader::new(egui::RichText::new("Monitor (instance)").strong())
+                    .id_salt("inst_props_sec_monitor")
+                    .default_open(true)
+                    .show(ui, |ui| {
                 egui::Grid::new("props_mon")
                     .num_columns(2)
                     .spacing([12.0, 4.0])
@@ -18510,14 +18515,19 @@ impl StreamArchiverApp {
                         ui.label(prop_bool(m.fetch_chat_assets));
                         ui.end_row();
                     });
+                    });
 
                 // ── Assets (this instance's account) ─────────────────────
                 // The same data the channel Properties window shows, filtered
                 // to the account this instance's URL resolves to.
                 if let Some(acc) = &inst_account {
-                    ui.add_space(8.0);
+                    egui::CollapsingHeader::new(
+                        egui::RichText::new("Assets (this account)").strong(),
+                    )
+                    .id_salt("inst_props_sec_assets")
+                    .default_open(true)
+                    .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.strong("Assets (this account)");
                         if ui
                             .button("⟳ Refetch")
                             .on_hover_text(format!(
@@ -18686,11 +18696,16 @@ impl StreamArchiverApp {
                                 }
                             });
                     }
+                    });
                 }
 
                 // ── Schedule sources (this instance) ─────────────────────
-                ui.add_space(8.0);
-                ui.strong("Schedule sources (this instance)");
+                egui::CollapsingHeader::new(
+                    egui::RichText::new("Schedule sources (this instance)").strong(),
+                )
+                .id_salt("inst_props_sec_sched")
+                .default_open(false)
+                .show(ui, |ui| {
                 ui.label(
                     egui::RichText::new(
                         "Overrides the global order/title-fill for this one instance, taking \
@@ -18705,6 +18720,9 @@ impl StreamArchiverApp {
                         scope_dirty = true;
                     }
                 }
+                });
+
+                }); // ScrollArea
                 });
                 draw_alt_image_preview(ctx);
             },
@@ -18869,12 +18887,12 @@ impl StreamArchiverApp {
             Some(mid) => (
                 egui::ViewportId::from_hash_of(("instance_props_vp", mid)),
                 format!("Instance — {}", ch.name),
-                [480.0, 480.0],
+                [480.0, 560.0],
             ),
             None => (
                 egui::ViewportId::from_hash_of(("channel_props_vp", cid)),
                 format!("Properties — {}", ch.name),
-                [480.0, 600.0],
+                [480.0, 640.0],
             ),
         };
         let mut open = true;
@@ -19065,7 +19083,7 @@ impl StreamArchiverApp {
             egui::ViewportId::from_hash_of(("channel_props_vp", cid)),
             egui::ViewportBuilder::default()
                 .with_title(format!("Properties — {}", ch.name))
-                .with_inner_size([480.0, 600.0]),
+                .with_inner_size([480.0, 640.0]),
             |ctx, _class| {
                 if ctx.input(|i| i.viewport().close_requested()) {
                     open = false;
@@ -19120,14 +19138,20 @@ impl StreamArchiverApp {
 
                 ui.separator();
 
-                // ── Mainpage asset thumbnails ────────────────────────────
-                // A visual overview of every original icon/banner this channel
-                // has across its platforms. Hover for size, Alt to preview at
-                // full resolution, click to open the file.
+                egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+
+                // ── Assets ───────────────────────────────────────────────
+                // Thumbnail overview of every original icon/banner across the
+                // channel's accounts (hover for size, Alt to preview full-res,
+                // click to open the file), then the refetch/history controls,
+                // icon-source picker, per-account status grid and emote-viewer
+                // launchers.
+                egui::CollapsingHeader::new(egui::RichText::new("Assets").strong())
+                    .id_salt("ch_props_sec_assets")
+                    .default_open(true)
+                    .show(ui, |ui| {
                 if !thumbs.is_empty() {
                     ui.add_space(2.0);
-                    ui.strong("Assets");
-                    ui.add_space(3.0);
                     const THUMB_H: f32 = 56.0;
                     ui.horizontal_wrapped(|ui| {
                         for t in &thumbs {
@@ -19152,46 +19176,11 @@ impl StreamArchiverApp {
                             }
                         }
                     });
-                    ui.separator();
                 }
 
-                // ── Channel ─────────────────────────────────────────────
-                ui.strong("Channel");
-                egui::Grid::new("props_ch")
-                    .num_columns(2)
-                    .spacing([12.0, 4.0])
-                    .show(ui, |ui| {
-                        ui.label("DB channel ID");
-                        ui.label(ch.id.to_string());
-                        ui.end_row();
-
-                        ui.label("URL");
-                        if ui.link(&ch.url).clicked() {
-                            ui.ctx().open_url(egui::OpenUrl::new_tab(ch.url.clone()));
-                        }
-                        ui.end_row();
-
-                        if ch.platform == Platform::YouTube {
-                            let yt_id = extract_yt_channel_id(&ch.url)
-                                .unwrap_or_else(|| "— (handle URL, ID not in URL)".into());
-                            ui.label("Channel ID");
-                            ui.horizontal(|ui| {
-                                ui.label(&yt_id);
-                                if !yt_id.starts_with('—')
-                                    && ui.small_button("⧉").on_hover_text("Copy").clicked()
-                                {
-                                    ui.ctx().copy_text(yt_id.clone());
-                                }
-                            });
-                            ui.end_row();
-                        }
-                    });
-
-                // ── Assets ───────────────────────────────────────────────
                 {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        ui.strong("Channel assets");
                         if !accounts.is_empty()
                             && ui
                                 .button("⟳ Refetch")
@@ -19387,11 +19376,52 @@ impl StreamArchiverApp {
                         }
                     }
                 }
+                    });
+
+                // ── Channel ─────────────────────────────────────────────
+                egui::CollapsingHeader::new(egui::RichText::new("Channel").strong())
+                    .id_salt("ch_props_sec_channel")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                egui::Grid::new("props_ch")
+                    .num_columns(2)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("DB channel ID");
+                        ui.label(ch.id.to_string());
+                        ui.end_row();
+
+                        ui.label("URL");
+                        if ui.link(&ch.url).clicked() {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(ch.url.clone()));
+                        }
+                        ui.end_row();
+
+                        if ch.platform == Platform::YouTube {
+                            let yt_id = extract_yt_channel_id(&ch.url)
+                                .unwrap_or_else(|| "— (handle URL, ID not in URL)".into());
+                            ui.label("Channel ID");
+                            ui.horizontal(|ui| {
+                                ui.label(&yt_id);
+                                if !yt_id.starts_with('—')
+                                    && ui.small_button("⧉").on_hover_text("Copy").clicked()
+                                {
+                                    ui.ctx().copy_text(yt_id.clone());
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
+                    });
 
                 // ── Schedule sources (per-channel) ───────────────────────
                 if let Some(cfg) = self.channel_cfg_drafts.get_mut(&ch.id) {
-                    ui.add_space(6.0);
-                    ui.strong("Schedule sources (this channel)");
+                    egui::CollapsingHeader::new(
+                        egui::RichText::new("Schedule sources (this channel)").strong(),
+                    )
+                    .id_salt("ch_props_sec_sched")
+                    .default_open(false)
+                    .show(ui, |ui| {
                     ui.label(
                         egui::RichText::new(
                             "Used by the image/scrape sources you enable in Settings → Schedule \
@@ -19509,7 +19539,10 @@ impl StreamArchiverApp {
                             scope_dirty = true;
                         }
                     }
+                    });
                 }
+
+                }); // ScrollArea
 
                 // Apply an icon-source change picked in the combo above.
                 if let Some(newp) = pref_change.take() {

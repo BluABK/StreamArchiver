@@ -774,7 +774,10 @@ Shared third-party emotes (BTTV/FFZ/7TV) and global Twitch badges are
 superseded icons / banners are **archived** rather than overwritten (see *change
 history* below).
 
-**Where it shows up — channel Properties** (right-click a channel → **Properties**):
+**Where it shows up — channel Properties** (right-click a channel → **Properties**).
+The window is organized into collapsible sections (**Assets · Channel · Schedule
+sources** — the last starts collapsed) and scrolls when content outgrows it;
+collapse/expand choices are remembered across restarts:
 
 - The header avatar plus an **Assets** thumbnail strip of every original
   icon/banner across the channel's accounts — hover for pixel size, hold **Alt**
@@ -797,7 +800,9 @@ same asset data scoped to *that instance's own account*: the header uses the
 account's avatar and links its source URL, and an **Assets (this account)**
 section carries the account's icon/banner thumbnails, its status row, **⟳
 Refetch** (this account only), **📂** (this account's folder), **🕑 History**
-(this account's changes only), and its emote-viewer launchers.
+(this account's changes only), and its emote-viewer launchers. It uses the same
+collapsible-section layout (**Monitor · Assets · Schedule sources**, the last
+collapsed by default) with a scrollbar when needed.
 
 **Change history.** Manifests and images are overwritten wholesale on each
 refetch, so a removed emote code or a swapped banner would otherwise vanish with
