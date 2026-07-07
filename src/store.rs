@@ -424,8 +424,6 @@ pub struct CommunityPostRow {
     pub vote_count: String,
     /// Reshared/quoted original as JSON `{author, author_channel_id,
     /// published_text, body_text, links_json}` — empty for a non-reshare.
-    /// (Read by the posts-feed reshare card, added in the UI step.)
-    #[allow(dead_code)]
     pub shared_json: String,
     /// First-seen timestamp — ordering tiebreaker for same-bucket posts.
     #[allow(dead_code)]
@@ -434,8 +432,6 @@ pub struct CommunityPostRow {
     /// "2 weeks ago" text at first sight — drives the feed order; 0 = unknown.
     pub published_at: i64,
     /// `channel` or `viewer` — the feed hides viewer posts unless toggled on.
-    /// (Read by the feed filter + badge, added in the UI step.)
-    #[allow(dead_code)]
     pub author_kind: String,
     pub channel: String,
     pub media: Vec<PostMediaRow>,

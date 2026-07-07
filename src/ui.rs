@@ -787,6 +787,10 @@ pub struct StreamArchiverApp {
     posts_refreshed: Option<std::time::Instant>,
     posts_search: String,
     posts_channel_filter: Option<i64>,
+    /// Whether the posts feed also shows viewer posts (fans posting in the
+    /// channel's Community space). Off by default — session-only, like the
+    /// other feed filters.
+    posts_show_viewer: bool,
     post_img_cache: PostImageCache,
     /// The widget inspector (F12): whether the window is open (session-only,
     /// like the other window flags) and its tab/selection/snapshot state.
@@ -1424,6 +1428,7 @@ impl StreamArchiverApp {
             posts_refreshed: None,
             posts_search: String::new(),
             posts_channel_filter: None,
+            posts_show_viewer: false,
             post_img_cache: HashMap::new(),
             show_inspector: false,
             inspector: crate::inspector::InspectorState::default(),
@@ -16459,6 +16464,17 @@ impl StreamArchiverApp {
             {
                 self.posts_search.clear();
             }
+            let viewer_n = posts.iter().filter(|p| p.author_kind == "viewer").count();
+            if viewer_n > 0 {
+                ui.checkbox(
+                    &mut self.posts_show_viewer,
+                    format!("Show viewer posts ({viewer_n})"),
+                )
+                .on_hover_text(
+                    "Include posts made by viewers in the channel's Community space \
+                     (off by default — only the channel's own posts are shown)",
+                );
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .button("⟳ Refresh")
@@ -16473,11 +16489,13 @@ impl StreamArchiverApp {
 
         let q = self.posts_search.trim().to_lowercase();
         let cf = self.posts_channel_filter;
+        let show_viewer = self.posts_show_viewer;
         let visible: Vec<usize> = posts
             .iter()
             .enumerate()
             .filter(|(_, p)| {
-                cf.map(|c| p.channel_id == c).unwrap_or(true)
+                (show_viewer || p.author_kind != "viewer")
+                    && cf.map(|c| p.channel_id == c).unwrap_or(true)
                     && (q.is_empty()
                         || p.author.to_lowercase().contains(&q)
                         || p.body_text.to_lowercase().contains(&q)
@@ -16535,6 +16553,12 @@ impl StreamArchiverApp {
                                     if !p.channel.is_empty() && p.channel != p.author {
                                         ui.small(format!("· {}", p.channel));
                                     }
+                                    if p.author_kind == "viewer" {
+                                        ui.small(egui::RichText::new("· viewer").weak())
+                                            .on_hover_text(
+                                                "A viewer's post in the channel's Community space",
+                                            );
+                                    }
                                 });
                             });
                         });
@@ -16547,6 +16571,38 @@ impl StreamArchiverApp {
                             .filter(|m| m.kind == "image" && !m.local_path.is_empty())
                         {
                             self.show_post_image(ui, &m.content_hash, &m.local_path);
+                        }
+                        // Reshared/quoted original, as an indented quote card.
+                        if !p.shared_json.is_empty()
+                            && let Ok(sh) =
+                                serde_json::from_str::<serde_json::Value>(&p.shared_json)
+                        {
+                            let s_author =
+                                sh.get("author").and_then(|v| v.as_str()).unwrap_or("");
+                            let s_time = sh
+                                .get("published_text")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let s_body =
+                                sh.get("body_text").and_then(|v| v.as_str()).unwrap_or("");
+                            let s_links = sh
+                                .get("links_json")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("[]");
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                let mut head = format!("↪ {s_author}");
+                                if !s_time.is_empty() {
+                                    head.push_str(&format!(" · {s_time}"));
+                                }
+                                ui.label(egui::RichText::new(head).weak());
+                                render_post_body(ui, s_links, s_body);
+                                for m in p.media.iter().filter(|m| {
+                                    m.kind == "shared_image" && !m.local_path.is_empty()
+                                }) {
+                                    self.show_post_image(ui, &m.content_hash, &m.local_path);
+                                }
+                            });
                         }
                         ui.horizontal(|ui| {
                             if !p.vote_count.is_empty() {
