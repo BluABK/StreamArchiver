@@ -16687,7 +16687,11 @@ impl StreamArchiverApp {
             {
                 self.posts_search.clear();
             }
-            let viewer_n = posts.iter().filter(|p| p.author_kind == "viewer").count();
+            let viewer_n = posts
+                .iter()
+                .filter(|p| p.author_kind == "viewer")
+                .filter(|p| self.posts_channel_filter.is_none_or(|cid| p.channel_id == cid))
+                .count();
             if viewer_n > 0 {
                 ui.checkbox(
                     &mut self.posts_show_viewer,
