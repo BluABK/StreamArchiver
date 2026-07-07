@@ -1384,9 +1384,26 @@ impl DetectContext {
     /// Fetch + parse the channel's community posts, upsert full post rows +
     /// attachments (images downloaded into `posts/`), and emit a `youtube_post`
     /// notification for each newly-seen post. Best-effort: a fetch/parse miss is
-    /// a no-op (never destructive). v1 is first-page only (~newest 10–20 posts).
-    async fn fetch_channel_posts(&self, row: &MonitorWithChannel, events: &EventTx) {
+    /// a no-op (never destructive).
+    ///
+    /// Beyond the first page, older posts are archived via InnerTube browse
+    /// continuations: a one-time full-history backfill per monitor (paced like a
+    /// person scrolling, no notifications, resumable across restarts via
+    /// `community_post_backfill`), and afterwards a bounded gap-fill walk
+    /// whenever an entire first page turns out to be unseen (more than a page of
+    /// posts landed between rounds).
+    async fn fetch_channel_posts(
+        &self,
+        row: &MonitorWithChannel,
+        events: &EventTx,
+        shutdown: &Arc<AtomicBool>,
+    ) {
         const MAX_POSTS: usize = 20;
+        /// Full-history walk cap (~10 posts/page → ~4000 posts) — a runaway
+        /// guard, not an expected limit.
+        const BACKFILL_MAX_PAGES: i64 = 400;
+        /// Gap-fill walk cap once the backfill is complete.
+        const GAPFILL_MAX_PAGES: i64 = 40;
         let community_url = youtube_community_url(&row.monitor.url);
         let jitter_ms = (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1415,99 +1432,238 @@ impl DetectContext {
         parse_community_posts(&data, &mut posts);
         posts.truncate(MAX_POSTS);
 
+        let mut first_page_new = 0usize;
         for p in &posts {
-            let (pk, is_new) = match self.store.community_post_upsert_full(&crate::store::NewCommunityPost {
-                monitor_id: row.monitor.id,
-                channel_id: row.channel.id,
-                post_id: p.post_id.clone(),
-                author: p.author.clone(),
-                author_icon: String::new(), // filled below once the icon is cached
-                published_text: p.published_text.clone(),
-                body_text: p.body_text.clone(),
-                links_json: p.links_json.clone(),
-                vote_count: p.vote_count.clone(),
-                raw_json: p.raw_json.clone(),
-                ..Default::default()
-            }) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            // Download the images/avatar only for a newly-seen post (or one whose
-            // media somehow wasn't cached yet). `download_post_image` always
-            // re-fetches the bytes to hash them, so re-downloading an existing
-            // post's images on every 6 h re-scan would be pure wasted traffic —
-            // gate it so steady-state re-scans make no image requests at all.
-            let need_media =
-                is_new || self.store.community_post_media_count(pk).unwrap_or(0) == 0;
-            let mut first_image: Option<String> = None;
-            if need_media {
-                // Cache the author icon (best-effort) and record it on the row.
-                if !p.author_icon_url.is_empty()
-                    && let Some((_, path)) = self.download_post_image(row, &p.author_icon_url).await
-                {
-                    let _ = self.store.community_post_upsert_full(&crate::store::NewCommunityPost {
-                        monitor_id: row.monitor.id,
-                        channel_id: row.channel.id,
-                        post_id: p.post_id.clone(),
-                        author: p.author.clone(),
-                        author_icon: path.to_string_lossy().into_owned(),
-                        published_text: p.published_text.clone(),
-                        body_text: p.body_text.clone(),
-                        links_json: p.links_json.clone(),
-                        vote_count: p.vote_count.clone(),
-                        raw_json: p.raw_json.clone(),
-                        ..Default::default()
-                    });
-                }
-
-                // Download + record each attachment image, in order. A small
-                // randomized delay between images makes an image-heavy post's
-                // first fetch look like a page loading its images progressively
-                // rather than a scripted download loop.
-                for (ordinal, url) in p.image_urls.iter().enumerate() {
-                    if let Some((hash, path)) = self.download_post_image(row, url).await {
-                        let local = path.to_string_lossy().into_owned();
-                        if first_image.is_none() {
-                            first_image = Some(local.clone());
-                        }
-                        let _ = self.store.community_post_media_upsert(
-                            pk,
-                            ordinal as i64,
-                            "image",
-                            url,
-                            &hash,
-                            &local,
-                        );
-                        tokio::time::sleep(Duration::from_millis(150 + spread_rand_u64() % 500))
-                            .await;
-                    }
-                }
-            }
-
-            // A newly-seen post → one notification.
-            if is_new {
-                let snippet: String = p.body_text.chars().take(140).collect();
-                let _ = self.store.insert_notification(&crate::store::NewNotification {
-                    kind: NotificationKind::YoutubePost.id().to_string(),
-                    severity: "info".to_string(),
-                    title: format!("{} posted", row.channel.name),
-                    body: snippet,
-                    monitor_id: Some(row.monitor.id),
-                    channel: row.channel.name.clone(),
-                    action_label: "Open post".to_string(),
-                    action_url: format!("https://www.youtube.com/post/{}", p.post_id),
-                    image_path: first_image.unwrap_or_default(),
-                    ref_key: format!("post:{}:{}", row.monitor.id, p.post_id),
-                    ..Default::default()
-                });
-                // Nudge the UI to reload the posts feed if it's open.
-                let _ = events.send(AppEvent::MonitorState {
-                    monitor_id: row.monitor.id,
-                    state: row.monitor.last_state.clone(),
-                });
+            if self.ingest_post(row, p, true, events).await {
+                first_page_new += 1;
             }
         }
+
+        // ── Older pages (continuation walk) ──
+        let backfill_done = self.store.posts_backfill_done(row.monitor.id).unwrap_or(true);
+        let gap_suspected = !posts.is_empty() && first_page_new == posts.len();
+        if backfill_done && !gap_suspected {
+            return;
+        }
+        let Some(mut token) = find_continuation_token(&data) else {
+            // No continuation on the first page — the whole feed fits on one
+            // page, so the full history is trivially archived.
+            if !backfill_done {
+                let _ = self.store.posts_backfill_record(row.monitor.id, true, 0, 0);
+            }
+            return;
+        };
+        let (Some(api_key), Some(client_version)) = (
+            ytcfg_str(&body, "INNERTUBE_API_KEY"),
+            ytcfg_str(&body, "INNERTUBE_CONTEXT_CLIENT_VERSION"),
+        ) else {
+            return;
+        };
+
+        let max_pages = if backfill_done { GAPFILL_MAX_PAGES } else { BACKFILL_MAX_PAGES };
+        let mut pages = 0i64;
+        let mut walked = 0i64;
+        let mut completed = false;
+        while pages < max_pages {
+            if shutdown.load(Ordering::SeqCst) {
+                break; // partial session is recorded below; resumes next round
+            }
+            // Human-ish scroll pacing between continuation requests.
+            tokio::time::sleep(Duration::from_millis(2500 + spread_rand_u64() % 4500)).await;
+            let Some(resp) = self
+                .fetch_posts_continuation(&community_url, &api_key, &client_version, &token)
+                .await
+            else {
+                break;
+            };
+            let mut older = Vec::new();
+            parse_community_posts(&resp, &mut older);
+            pages += 1;
+            walked += older.len() as i64;
+            let mut new_here = 0usize;
+            for p in &older {
+                // No notifications for walked pages: these are old posts being
+                // archived, not fresh activity.
+                if self.ingest_post(row, p, false, events).await {
+                    new_here += 1;
+                }
+            }
+            match find_continuation_token(&resp) {
+                Some(next) if next != token && !older.is_empty() => token = next,
+                _ => {
+                    completed = true; // end of the feed
+                    break;
+                }
+            }
+            if backfill_done && new_here == 0 {
+                completed = true; // gap-fill reached already-archived posts
+                break;
+            }
+        }
+        if !backfill_done {
+            let _ = self
+                .store
+                .posts_backfill_record(row.monitor.id, completed, pages, walked);
+            if completed {
+                tracing::info!(
+                    channel = %row.channel.name,
+                    pages,
+                    posts = walked,
+                    "community posts backfill complete"
+                );
+            }
+        }
+    }
+
+    /// Upsert one parsed community post (row + cached images) and return whether
+    /// it was newly seen. `notify == true` additionally emits the `youtube_post`
+    /// notification for a new post — the backfill/gap walks pass `false` so
+    /// archiving old posts never spams the feed.
+    async fn ingest_post(
+        &self,
+        row: &MonitorWithChannel,
+        p: &ParsedPost,
+        notify: bool,
+        events: &EventTx,
+    ) -> bool {
+        let (pk, is_new) = match self.store.community_post_upsert_full(&crate::store::NewCommunityPost {
+            monitor_id: row.monitor.id,
+            channel_id: row.channel.id,
+            post_id: p.post_id.clone(),
+            author: p.author.clone(),
+            author_icon: String::new(), // filled below once the icon is cached
+            published_text: p.published_text.clone(),
+            body_text: p.body_text.clone(),
+            links_json: p.links_json.clone(),
+            vote_count: p.vote_count.clone(),
+            raw_json: p.raw_json.clone(),
+            ..Default::default()
+        }) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+
+        // Download the images/avatar only for a newly-seen post (or one whose
+        // media somehow wasn't cached yet). `download_post_image` always
+        // re-fetches the bytes to hash them, so re-downloading an existing
+        // post's images on every 6 h re-scan would be pure wasted traffic —
+        // gate it so steady-state re-scans make no image requests at all.
+        let need_media =
+            is_new || self.store.community_post_media_count(pk).unwrap_or(0) == 0;
+        let mut first_image: Option<String> = None;
+        if need_media {
+            // Cache the author icon (best-effort) and record it on the row.
+            if !p.author_icon_url.is_empty()
+                && let Some((_, path)) = self.download_post_image(row, &p.author_icon_url).await
+            {
+                let _ = self.store.community_post_upsert_full(&crate::store::NewCommunityPost {
+                    monitor_id: row.monitor.id,
+                    channel_id: row.channel.id,
+                    post_id: p.post_id.clone(),
+                    author: p.author.clone(),
+                    author_icon: path.to_string_lossy().into_owned(),
+                    published_text: p.published_text.clone(),
+                    body_text: p.body_text.clone(),
+                    links_json: p.links_json.clone(),
+                    vote_count: p.vote_count.clone(),
+                    raw_json: p.raw_json.clone(),
+                    ..Default::default()
+                });
+            }
+
+            // Download + record each attachment image, in order. A small
+            // randomized delay between images makes an image-heavy post's
+            // first fetch look like a page loading its images progressively
+            // rather than a scripted download loop.
+            for (ordinal, url) in p.image_urls.iter().enumerate() {
+                if let Some((hash, path)) = self.download_post_image(row, url).await {
+                    let local = path.to_string_lossy().into_owned();
+                    if first_image.is_none() {
+                        first_image = Some(local.clone());
+                    }
+                    let _ = self.store.community_post_media_upsert(
+                        pk,
+                        ordinal as i64,
+                        "image",
+                        url,
+                        &hash,
+                        &local,
+                    );
+                    tokio::time::sleep(Duration::from_millis(150 + spread_rand_u64() % 500))
+                        .await;
+                }
+            }
+        }
+
+        // A newly-seen post → one notification (fresh activity only; the
+        // backfill/gap walks archive silently).
+        if is_new && notify {
+            let snippet: String = p.body_text.chars().take(140).collect();
+            let _ = self.store.insert_notification(&crate::store::NewNotification {
+                kind: NotificationKind::YoutubePost.id().to_string(),
+                severity: "info".to_string(),
+                title: format!("{} posted", row.channel.name),
+                body: snippet,
+                monitor_id: Some(row.monitor.id),
+                channel: row.channel.name.clone(),
+                action_label: "Open post".to_string(),
+                action_url: format!("https://www.youtube.com/post/{}", p.post_id),
+                image_path: first_image.unwrap_or_default(),
+                ref_key: format!("post:{}:{}", row.monitor.id, p.post_id),
+                ..Default::default()
+            });
+        }
+        if is_new {
+            // Nudge the UI to reload the posts feed if it's open.
+            let _ = events.send(AppEvent::MonitorState {
+                monitor_id: row.monitor.id,
+                state: row.monitor.last_state.clone(),
+            });
+        }
+        is_new
+    }
+
+    /// POST one InnerTube `browse` continuation for the community feed and
+    /// return the parsed response (the next page's posts + follow-up token live
+    /// in `onResponseReceivedEndpoints[].appendContinuationItemsAction`). The
+    /// key/version come from the page's own inline `ytcfg`, so the request
+    /// matches what the page's JS would send; the shared client already carries
+    /// the fingerprint user-agent.
+    async fn fetch_posts_continuation(
+        &self,
+        referer: &str,
+        api_key: &str,
+        client_version: &str,
+        token: &str,
+    ) -> Option<Value> {
+        let body = serde_json::json!({
+            "context": { "client": {
+                "clientName": "WEB",
+                "clientVersion": client_version,
+                "hl": "en",
+                "gl": "US",
+            }},
+            "continuation": token,
+        });
+        let url =
+            format!("https://www.youtube.com/youtubei/v1/browse?key={api_key}&prettyPrint=false");
+        let resp = self
+            .http
+            .post(&url)
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Cookie", "CONSENT=YES+1; SOCS=CAI")
+            .header("Origin", "https://www.youtube.com")
+            .header("Referer", referer)
+            .header("X-Youtube-Client-Name", "1")
+            .header("X-Youtube-Client-Version", client_version)
+            .json(&body)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.json::<Value>().await.ok()
     }
 
     /// OCR the image on the channel's pinned tweet. Best-effort: hits the public
@@ -2399,7 +2555,7 @@ pub async fn refresh_community_posts(
             continue;
         };
 
-        ctx.fetch_channel_posts(&row, &events).await;
+        ctx.fetch_channel_posts(&row, &events, &shutdown).await;
 
         // Spread one channel per (CYCLE / N) so a full rotation ≈ CYCLE, with a
         // polite floor, then jitter ±40% so it isn't a fixed-interval metronome.
@@ -3242,6 +3398,44 @@ fn parse_community_posts(v: &Value, out: &mut Vec<ParsedPost>) {
             }
         }
         _ => {}
+    }
+}
+
+/// Extract a string field from a page's inline `ytcfg` blob (`"KEY":"value"`).
+/// Used for `INNERTUBE_API_KEY` / `INNERTUBE_CONTEXT_CLIENT_VERSION`, which the
+/// continuation `browse` POSTs must echo.
+fn ytcfg_str(body: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\":\"");
+    let start = body.find(&pat)? + pat.len();
+    let rest = &body[start..];
+    let end = rest.find('"')?;
+    let v = &rest[..end];
+    if v.is_empty() {
+        None
+    } else {
+        Some(v.replace("\\/", "/"))
+    }
+}
+
+/// DFS for the feed's `continuationItemRenderer` → continuation token. Present
+/// on the initial `ytInitialData` and on every `browse` continuation response
+/// while more pages exist; absent on the last page.
+fn find_continuation_token(v: &Value) -> Option<String> {
+    match v {
+        Value::Object(map) => {
+            if let Some(t) = map
+                .get("continuationItemRenderer")
+                .and_then(|c| c.get("continuationEndpoint"))
+                .and_then(|e| e.get("continuationCommand"))
+                .and_then(|c| c.get("token"))
+                .and_then(|t| t.as_str())
+            {
+                return Some(t.to_string());
+            }
+            map.values().find_map(find_continuation_token)
+        }
+        Value::Array(arr) => arr.iter().find_map(find_continuation_token),
+        _ => None,
     }
 }
 
@@ -4218,5 +4412,69 @@ mod tests {
         ];
         fill_titles(&mut base, &donor, TITLE_FILL_WINDOW_SECS);
         assert_eq!(base[0].title, "Near");
+    }
+
+    #[test]
+    fn ytcfg_str_extracts_innertube_fields() {
+        let body = r#"<script>ytcfg.set({"INNERTUBE_API_KEY":"AIzaSyTest123",
+            "INNERTUBE_CONTEXT_CLIENT_VERSION":"2.20260701.01.00",
+            "PATHY":"a\/b"});</script>"#;
+        assert_eq!(
+            ytcfg_str(body, "INNERTUBE_API_KEY").as_deref(),
+            Some("AIzaSyTest123")
+        );
+        assert_eq!(
+            ytcfg_str(body, "INNERTUBE_CONTEXT_CLIENT_VERSION").as_deref(),
+            Some("2.20260701.01.00")
+        );
+        // Escaped slashes are unescaped (they appear in ytcfg URL values).
+        assert_eq!(ytcfg_str(body, "PATHY").as_deref(), Some("a/b"));
+        assert_eq!(ytcfg_str(body, "MISSING"), None);
+        assert_eq!(ytcfg_str(r#"{"EMPTY":""}"#, "EMPTY"), None);
+    }
+
+    #[test]
+    fn continuation_token_and_posts_parse_from_browse_response() {
+        // The shape of an InnerTube browse continuation response: appended
+        // items carry more posts + the next continuationItemRenderer.
+        let resp = serde_json::json!({
+            "onResponseReceivedEndpoints": [{
+                "appendContinuationItemsAction": {
+                    "continuationItems": [
+                        { "backstagePostThreadRenderer": { "post": {
+                            "backstagePostRenderer": {
+                                "postId": "OLD_POST_1",
+                                "publishedTimeText": { "runs": [{ "text": "2 years ago" }] },
+                                "contentText": { "runs": [{ "text": "old news" }] }
+                            }
+                        }}},
+                        { "continuationItemRenderer": {
+                            "continuationEndpoint": {
+                                "continuationCommand": { "token": "NEXT_TOKEN" }
+                            }
+                        }}
+                    ]
+                }
+            }]
+        });
+        let mut posts = Vec::new();
+        parse_community_posts(&resp, &mut posts);
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].post_id, "OLD_POST_1");
+        assert_eq!(posts[0].published_text, "2 years ago");
+        assert_eq!(posts[0].body_text, "old news");
+        assert_eq!(find_continuation_token(&resp).as_deref(), Some("NEXT_TOKEN"));
+
+        // Last page: no continuationItemRenderer → no token.
+        let last = serde_json::json!({
+            "onResponseReceivedEndpoints": [{
+                "appendContinuationItemsAction": { "continuationItems": [
+                    { "backstagePostThreadRenderer": { "post": {
+                        "backstagePostRenderer": { "postId": "OLDEST" }
+                    }}}
+                ]}
+            }]
+        });
+        assert_eq!(find_continuation_token(&last), None);
     }
 }

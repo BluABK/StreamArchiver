@@ -16524,7 +16524,13 @@ impl StreamArchiverApp {
                                 ui.label(egui::RichText::new(name).strong());
                                 ui.horizontal(|ui| {
                                     if !p.published_text.is_empty() {
-                                        ui.small(&p.published_text);
+                                        let resp = ui.small(&p.published_text);
+                                        if p.published_at > 0 {
+                                            resp.on_hover_text(format!(
+                                                "≈ {}",
+                                                fmt_datetime_short(p.published_at)
+                                            ));
+                                        }
                                     }
                                     if !p.channel.is_empty() && p.channel != p.author {
                                         ui.small(format!("· {}", p.channel));

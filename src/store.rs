@@ -33,7 +33,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 45;
+const SCHEMA_VERSION: i64 = 46;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -120,6 +120,67 @@ pub struct NewCommunityPost {
     pub raw_json: String,
 }
 
+/// Parse a YouTube relative-time string ("2 weeks ago", "Streamed 3 days ago",
+/// "1 month ago (edited)") into an age in seconds. Months/years use 30/365-day
+/// approximations — the source only has bucket precision anyway. `None` when no
+/// `<number> <unit>` pair is found.
+fn parse_relative_age(text: &str) -> Option<i64> {
+    let lower = text.trim().to_lowercase();
+    if lower.starts_with("just now") || lower.starts_with("moments ago") {
+        return Some(0);
+    }
+    let mut toks = lower.split_whitespace().peekable();
+    while let Some(tok) = toks.next() {
+        let Ok(n) = tok.parse::<i64>() else { continue };
+        let Some(unit) = toks.peek() else { break };
+        let mult: i64 = if unit.starts_with("sec") {
+            1
+        } else if unit.starts_with("min") {
+            60
+        } else if unit.starts_with("hour") {
+            3600
+        } else if unit.starts_with("day") {
+            86_400
+        } else if unit.starts_with("week") {
+            604_800
+        } else if unit.starts_with("month") {
+            2_592_000
+        } else if unit.starts_with("year") {
+            31_536_000
+        } else {
+            continue;
+        };
+        return Some(n.saturating_mul(mult));
+    }
+    None
+}
+
+/// v46 migration: estimate `published_at` for legacy post rows from the stored
+/// relative text, anchored at `last_seen` (the scan that last refreshed the
+/// text — it is overwritten on every re-scan, so that is when it was true).
+/// Unparseable text falls back to `first_seen`. Only touches rows still at the
+/// column DEFAULT 0.
+fn fill_published_at(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT id, published_text, first_seen, last_seen
+         FROM community_post WHERE published_at = 0",
+    )?;
+    let rows: Vec<(i64, String, i64, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    for (id, text, first_seen, last_seen) in rows {
+        let at = parse_relative_age(&text)
+            .map(|age| last_seen - age)
+            .unwrap_or(first_seen);
+        conn.execute(
+            "UPDATE community_post SET published_at = ?2 WHERE id = ?1",
+            params![id, at],
+        )?;
+    }
+    Ok(())
+}
+
 /// A new about-page capture to record (schema v45 `about_snapshot`). Keyed on
 /// `(channel_id, platform, account)` — one row per distinct content version;
 /// identical re-captures only bump `last_checked_at`.
@@ -188,9 +249,12 @@ pub struct CommunityPostRow {
     /// Shared-video/post summary (rendered in a later phase).
     #[allow(dead_code)]
     pub shared_json: String,
-    /// First-seen timestamp — ordering only (the UI shows `published_text`).
+    /// First-seen timestamp — ordering tiebreaker for same-bucket posts.
     #[allow(dead_code)]
     pub first_seen: i64,
+    /// Approximate publish time (epoch), derived from YouTube's relative
+    /// "2 weeks ago" text at first sight — drives the feed order; 0 = unknown.
+    pub published_at: i64,
     pub channel: String,
     pub media: Vec<PostMediaRow>,
 }
@@ -1011,7 +1075,33 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 45)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 45);
+        if version < 46 {
+            // Community posts: an (approximate) publish time derived from
+            // YouTube's relative "2 weeks ago" strings. Feed ordering previously
+            // used `first_seen` (discovery time), which scrambles a channel's
+            // backlog — every post found in one scan ties on the same second.
+            // Existing rows are estimated from the stored relative text anchored
+            // at `last_seen` (the scan that last refreshed the text); rows with
+            // unparseable text fall back to `first_seen`. Plus per-monitor
+            // bookkeeping for the full-history posts backfill walk.
+            conn.execute_batch(
+                "ALTER TABLE community_post
+                     ADD COLUMN published_at INTEGER NOT NULL DEFAULT 0;
+                 CREATE INDEX IF NOT EXISTS idx_community_post_pub
+                     ON community_post(monitor_id, published_at DESC);
+                 CREATE TABLE IF NOT EXISTS community_post_backfill (
+                     monitor_id      INTEGER PRIMARY KEY,
+                     completed_at    INTEGER NOT NULL DEFAULT 0,
+                     last_attempt_at INTEGER NOT NULL DEFAULT 0,
+                     pages           INTEGER NOT NULL DEFAULT 0,
+                     posts_seen      INTEGER NOT NULL DEFAULT 0,
+                     FOREIGN KEY(monitor_id) REFERENCES monitor(id) ON DELETE CASCADE
+                 );",
+            )?;
+            fill_published_at(&conn)?;
+            conn.pragma_update(None, "user_version", 46)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 46);
         Ok(())
     }
 
@@ -1267,6 +1357,11 @@ impl Store {
     /// `first_seen` on an existing row (refreshing the other fields + `last_seen`).
     /// Returns `(post_pk, is_new)`; `is_new == true` drives the `youtube_post`
     /// notification.
+    ///
+    /// `published_at` is estimated from the relative `published_text` at INSERT
+    /// and deliberately never updated: the relative buckets only get coarser
+    /// with age ("2 weeks ago" → "1 month ago"), so the first estimate is the
+    /// most precise one this source can give.
     pub fn community_post_upsert_full(&self, p: &NewCommunityPost) -> Result<(i64, bool)> {
         let conn = self.db();
         let now = now_unix();
@@ -1291,20 +1386,62 @@ impl Store {
             )?;
             Ok((pk, false))
         } else {
+            let published_at = parse_relative_age(&p.published_text)
+                .map(|age| now - age)
+                .unwrap_or(now);
             conn.execute(
                 "INSERT INTO community_post
                      (monitor_id, channel_id, post_id, author, author_icon, published_text,
                       body_text, links_json, poll_json, vote_count, shared_json, raw_json,
-                      first_seen, last_seen)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13)",
+                      first_seen, last_seen, published_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13,?14)",
                 params![
                     p.monitor_id, p.channel_id, p.post_id, p.author, p.author_icon,
                     p.published_text, p.body_text, p.links_json, p.poll_json, p.vote_count,
-                    p.shared_json, p.raw_json, now,
+                    p.shared_json, p.raw_json, now, published_at,
                 ],
             )?;
             Ok((conn.last_insert_rowid(), true))
         }
+    }
+
+    /// True when the full-history posts backfill has completed for this monitor.
+    pub fn posts_backfill_done(&self, monitor_id: i64) -> Result<bool> {
+        let conn = self.db();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM community_post_backfill
+             WHERE monitor_id = ?1 AND completed_at > 0",
+            params![monitor_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Record one backfill session: accumulates pages/posts walked and stamps
+    /// `completed_at` once a walk reached the end of the channel's feed. A later
+    /// interrupted session never clears an earlier completion.
+    pub fn posts_backfill_record(
+        &self,
+        monitor_id: i64,
+        completed: bool,
+        pages: i64,
+        posts_seen: i64,
+    ) -> Result<()> {
+        let conn = self.db();
+        let now = now_unix();
+        conn.execute(
+            "INSERT INTO community_post_backfill
+                 (monitor_id, completed_at, last_attempt_at, pages, posts_seen)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(monitor_id) DO UPDATE SET
+                 last_attempt_at = excluded.last_attempt_at,
+                 pages = pages + excluded.pages,
+                 posts_seen = posts_seen + excluded.posts_seen,
+                 completed_at = CASE WHEN excluded.completed_at > 0
+                                     THEN excluded.completed_at ELSE completed_at END",
+            params![monitor_id, if completed { now } else { 0 }, now, pages, posts_seen],
+        )?;
+        Ok(())
     }
 
     /// Upsert one attachment of a post (idempotent on `(post_pk, ordinal)`).
@@ -1473,10 +1610,11 @@ impl Store {
         Ok(rows)
     }
 
-    /// List community posts (newest `first_seen` first) with their ordered media.
-    /// Global across all channels when `monitor_id` is `None`; per-channel when
-    /// `Some`. Each row carries the denormalized channel name for the feed's
-    /// display + channel filter.
+    /// List community posts (newest publish time first — the approximate
+    /// `published_at`, with `first_seen`/insertion order as tiebreakers within
+    /// one relative-time bucket) with their ordered media. Global across all
+    /// channels when `monitor_id` is `None`; per-channel when `Some`. Each row
+    /// carries the denormalized channel name for the feed's display + filter.
     pub fn list_community_posts(
         &self,
         monitor_id: Option<i64>,
@@ -1498,20 +1636,25 @@ impl Store {
                 vote_count: r.get(10)?,
                 shared_json: r.get(11)?,
                 first_seen: r.get(12)?,
-                channel: r.get::<_, Option<String>>(13)?.unwrap_or_default(),
+                published_at: r.get(13)?,
+                channel: r.get::<_, Option<String>>(14)?.unwrap_or_default(),
                 media: Vec::new(),
             })
         };
+        // Order: publish-time buckets, then discovery time, then `id ASC` —
+        // within one scan batch posts are inserted in page order (newest
+        // first), so ascending ids keep that order for same-bucket ties.
         const COLS: &str = "cp.id, cp.monitor_id, cp.channel_id, cp.post_id, cp.author, \
              cp.author_icon, cp.published_text, cp.body_text, cp.links_json, cp.poll_json, \
-             cp.vote_count, cp.shared_json, cp.first_seen, ch.name";
+             cp.vote_count, cp.shared_json, cp.first_seen, cp.published_at, ch.name";
+        const ORDER: &str = "cp.published_at DESC, cp.first_seen DESC, cp.id ASC";
         let mut posts: Vec<CommunityPostRow> = match monitor_id {
             Some(mid) => {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT {COLS} FROM community_post cp
                      LEFT JOIN channel ch ON ch.id = cp.channel_id
                      WHERE cp.monitor_id = ?1
-                     ORDER BY cp.first_seen DESC, cp.id DESC LIMIT ?2"
+                     ORDER BY {ORDER} LIMIT ?2"
                 ))?;
                 stmt.query_map(params![mid, limit], |r| map_row(r))?
                     .collect::<rusqlite::Result<Vec<_>>>()?
@@ -1520,7 +1663,7 @@ impl Store {
                 let mut stmt = conn.prepare(&format!(
                     "SELECT {COLS} FROM community_post cp
                      LEFT JOIN channel ch ON ch.id = cp.channel_id
-                     ORDER BY cp.first_seen DESC, cp.id DESC LIMIT ?1"
+                     ORDER BY {ORDER} LIMIT ?1"
                 ))?;
                 stmt.query_map(params![limit], |r| map_row(r))?
                     .collect::<rusqlite::Result<Vec<_>>>()?
@@ -4945,18 +5088,20 @@ mod tests {
         m.channel_id = cid;
         let mid = store.insert_monitor(&m).unwrap();
 
-        let post = |id: &str, body: &str| NewCommunityPost {
+        let post = |id: &str, body: &str, published: &str| NewCommunityPost {
             monitor_id: mid,
             channel_id: cid,
             post_id: id.into(),
             author: "Streamer".into(),
-            published_text: "2 days ago".into(),
+            published_text: published.into(),
             body_text: body.into(),
             ..Default::default()
         };
 
         // First upsert → new; attach two ordered images.
-        let (pk, is_new) = store.community_post_upsert_full(&post("p1", "hello")).unwrap();
+        let (pk, is_new) = store
+            .community_post_upsert_full(&post("p1", "hello", "2 days ago"))
+            .unwrap();
         assert!(is_new);
         store.community_post_media_upsert(pk, 0, "image", "u0", "h0", "C:/0").unwrap();
         store.community_post_media_upsert(pk, 1, "image", "u1", "h1", "C:/1").unwrap();
@@ -4966,15 +5111,20 @@ mod tests {
         assert_eq!(store.community_post_media_count(pk).unwrap(), 2);
 
         // Re-upsert same post_id → NOT new (updates body, preserves first_seen).
-        let (pk2, is_new2) = store.community_post_upsert_full(&post("p1", "edited")).unwrap();
+        let (pk2, is_new2) = store
+            .community_post_upsert_full(&post("p1", "edited", "2 days ago"))
+            .unwrap();
         assert_eq!(pk2, pk);
         assert!(!is_new2);
 
-        // A different post_id → new.
-        let (_, is_new3) = store.community_post_upsert_full(&post("p2", "second")).unwrap();
+        // A different post_id → new. Fresher relative time → sorts first.
+        let (_, is_new3) = store
+            .community_post_upsert_full(&post("p2", "second", "1 day ago"))
+            .unwrap();
         assert!(is_new3);
 
-        // Global list (newest first): p2 then p1; p1 carries its 2 ordered images.
+        // Global list (newest publish time first): p2 then p1; p1 carries its
+        // 2 ordered images.
         let rows = store.list_community_posts(None, 100).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].post_id, "p2");
@@ -4992,6 +5142,132 @@ mod tests {
         // Deleting the monitor cascades to posts + media.
         store.delete_monitor(mid).unwrap();
         assert!(store.list_community_posts(None, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_relative_age_buckets() {
+        assert_eq!(parse_relative_age("37 seconds ago"), Some(37));
+        assert_eq!(parse_relative_age("5 minutes ago (edited)"), Some(300));
+        assert_eq!(parse_relative_age("10 hours ago"), Some(36_000));
+        assert_eq!(parse_relative_age("2 days ago"), Some(172_800));
+        assert_eq!(parse_relative_age("Streamed 3 weeks ago"), Some(1_814_400));
+        assert_eq!(parse_relative_age("1 month ago"), Some(2_592_000));
+        assert_eq!(parse_relative_age("1 year ago"), Some(31_536_000));
+        assert_eq!(parse_relative_age("just now"), Some(0));
+        // No <number> <unit> pair → unknown.
+        assert_eq!(parse_relative_age(""), None);
+        assert_eq!(parse_relative_age("yesterday"), None);
+        assert_eq!(parse_relative_age("Episode 5"), None);
+    }
+
+    #[test]
+    fn community_post_publish_ordering() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        let post = |id: &str, published: &str| NewCommunityPost {
+            monitor_id: mid,
+            channel_id: cid,
+            post_id: id.into(),
+            published_text: published.into(),
+            ..Default::default()
+        };
+
+        // Inserted in scrambled discovery order (as a backfill walk would) —
+        // the list must still come back in publish order, newest first.
+        store.community_post_upsert_full(&post("mid", "3 weeks ago")).unwrap();
+        store.community_post_upsert_full(&post("old", "1 year ago")).unwrap();
+        store.community_post_upsert_full(&post("new", "2 hours ago")).unwrap();
+        let rows = store.list_community_posts(None, 100).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.post_id.as_str()).collect();
+        assert_eq!(ids, ["new", "mid", "old"]);
+
+        // A re-scan coarsens the relative text ("1 year ago" stays the drifting
+        // display string) but must NOT move the stored publish estimate.
+        let before = rows.iter().find(|r| r.post_id == "old").unwrap().published_at;
+        store.community_post_upsert_full(&post("old", "2 years ago")).unwrap();
+        let rows = store.list_community_posts(None, 100).unwrap();
+        let after = rows.iter().find(|r| r.post_id == "old").unwrap();
+        assert_eq!(after.published_at, before, "estimate pinned at first sight");
+        assert_eq!(after.published_text, "2 years ago", "display text refreshed");
+
+        // Unparseable text falls back to discovery time (never 0).
+        store.community_post_upsert_full(&post("odd", "yesterday")).unwrap();
+        let rows = store.list_community_posts(None, 100).unwrap();
+        let odd = rows.iter().find(|r| r.post_id == "odd").unwrap();
+        assert_eq!(odd.published_at, odd.first_seen);
+    }
+
+    #[test]
+    fn fill_published_at_estimates_legacy_rows() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        // Simulate pre-v46 rows: published_at still at the column DEFAULT 0.
+        // The estimate anchors at last_seen (the scan that wrote the text).
+        let ins = |post_id: &str, text: &str, first: i64, last: i64| {
+            store
+                .db()
+                .execute(
+                    "INSERT INTO community_post
+                         (monitor_id, channel_id, post_id, published_text,
+                          first_seen, last_seen, published_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+                    params![mid, cid, post_id, text, first, last],
+                )
+                .unwrap();
+        };
+        ins("a", "2 days ago", 1_000, 2_000_000);
+        ins("b", "no date here", 1_234, 2_000_000);
+
+        fill_published_at(&store.db()).unwrap();
+
+        let rows = store.list_community_posts(None, 100).unwrap();
+        let get = |id: &str| rows.iter().find(|r| r.post_id == id).unwrap().published_at;
+        assert_eq!(get("a"), 2_000_000 - 172_800);
+        assert_eq!(get("b"), 1_234, "unparseable → first_seen fallback");
+    }
+
+    #[test]
+    fn posts_backfill_state_accumulates() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        assert!(!store.posts_backfill_done(mid).unwrap());
+
+        // An interrupted session records progress but not completion.
+        store.posts_backfill_record(mid, false, 3, 30).unwrap();
+        assert!(!store.posts_backfill_done(mid).unwrap());
+
+        // The finishing session flips completion; counters accumulate.
+        store.posts_backfill_record(mid, true, 2, 20).unwrap();
+        assert!(store.posts_backfill_done(mid).unwrap());
+        let (pages, posts): (i64, i64) = store
+            .db()
+            .query_row(
+                "SELECT pages, posts_seen FROM community_post_backfill WHERE monitor_id = ?1",
+                params![mid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((pages, posts), (5, 50));
+
+        // A later partial session (e.g. a gap-fill bookkeeping call) never
+        // clears an earlier completion.
+        store.posts_backfill_record(mid, false, 1, 10).unwrap();
+        assert!(store.posts_backfill_done(mid).unwrap());
+
+        // Unknown monitor → not done.
+        assert!(!store.posts_backfill_done(mid + 999).unwrap());
     }
 
     #[test]
