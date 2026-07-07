@@ -1166,6 +1166,7 @@ streamarchiver --capture-test <tool> <url> <secs> # record N s, kill tree, remux
 streamarchiver --run-for <secs>                   # headless: run core then stop
 streamarchiver --twitch-login                     # OAuth2 device-code Connect flow
 streamarchiver --hidden                           # start to tray (no window)
+streamarchiver --debug                            # enable the Debug tab (always on in debug builds)
 ```
 
 ## Widget inspector (F12)

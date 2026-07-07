@@ -1099,7 +1099,7 @@ pub struct StreamArchiverApp {
     /// mirrored from settings; edited via the Background "Scheduled" checkboxes.
     job_toggles: std::collections::HashMap<String, bool>,
     /// Debug view state — persisted across frames; fields are always present but
-    /// only rendered when `cfg!(debug_assertions)`.
+    /// only rendered when [`debug_view_enabled`] (debug build or `--debug`).
     debug_monitor_idx: usize,
     debug_test_title: String,
     debug_test_game: String,
@@ -2682,6 +2682,16 @@ static SHORT_TS_ENABLED: std::sync::atomic::AtomicBool =
 /// it can be changed at runtime without a full restart.
 static SHORT_TS_PAT: std::sync::OnceLock<std::sync::Mutex<String>> =
     std::sync::OnceLock::new();
+
+/// Whether the Debug view is available: always in debug builds; in release
+/// builds only when launched with `--debug`. Computed once (the process args
+/// can't change at runtime).
+fn debug_view_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        cfg!(debug_assertions) || std::env::args().any(|a| a == "--debug")
+    })
+}
 
 fn short_ts_on() -> bool {
     SHORT_TS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
@@ -6214,7 +6224,7 @@ impl eframe::App for StreamArchiverApp {
                     if ui.selectable_value(&mut self.view, View::Stats, "Stats").clicked() {
                         self.stats_snapshot = None; // force reload on tab open
                     }
-                    if cfg!(debug_assertions) {
+                    if debug_view_enabled() {
                         ui.selectable_value(&mut self.view, View::Debug, "Debug");
                     }
                     ui.separator();
@@ -15763,11 +15773,15 @@ impl StreamArchiverApp {
         });
     }
 
-    /// Debug view (debug builds only). Shows a toast tester, build identity,
-    /// data counts, filesystem paths, and the live process list.
+    /// Debug view (debug builds, or release builds launched with `--debug`).
+    /// Shows a toast tester, build identity, data counts, filesystem paths,
+    /// and the live process list.
     fn debug_view(&mut self, ui: &mut egui::Ui) {
-        if !cfg!(debug_assertions) {
-            ui.label("Debug view is only available in debug builds.");
+        if !debug_view_enabled() {
+            ui.label(
+                "Debug view is only available in debug builds, or when the app \
+                 is launched with --debug.",
+            );
             return;
         }
 
