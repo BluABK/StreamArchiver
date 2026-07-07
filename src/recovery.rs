@@ -804,6 +804,18 @@ pub async fn harvest_hosts(store: &Store, client: &reqwest::Client, vod_ids: &[S
     (learned, checked)
 }
 
+/// The Background-task label and the recording id (if any) a recovery is
+/// tied to — `RecoverVod(Some(id))` is how the Streams grid's VodJob row
+/// joins its live progress bar back to the take that started it.
+fn recovery_task_label_and_id(sink: &RecoverySink) -> (String, Option<i64>) {
+    match sink {
+        RecoverySink::Recording(id) => (format!("VOD recovery · rec #{id}"), Some(*id)),
+        RecoverySink::Standalone { filename, .. } => {
+            (format!("VOD recovery · {filename}"), None)
+        }
+    }
+}
+
 /// End-to-end recovery: derive → probe → rewrite → mux → file the result.
 /// Shared by the supervisor command, the bulk scan, and the auto-mute hook.
 #[allow(clippy::too_many_arguments)]
@@ -817,13 +829,10 @@ pub async fn run_recovery(
     probe_all: bool,
     task_id: u64,
 ) {
-    let label = match &sink {
-        RecoverySink::Recording(id) => format!("VOD recovery · rec #{id}"),
-        RecoverySink::Standalone { filename, .. } => format!("VOD recovery · {filename}"),
-    };
+    let (label, rec_id) = recovery_task_label_and_id(&sink);
     let _ = events.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
         id: task_id,
-        kind: crate::events::BackgroundTaskKind::RecoverVod,
+        kind: crate::events::BackgroundTaskKind::RecoverVod(rec_id),
         label,
         detail: format!("{}_{}", inputs.login, inputs.broadcast_id),
         started_at: now_unix(),
@@ -1197,6 +1206,24 @@ pub mod scrape {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_task_carries_recording_id_for_recording_sink() {
+        let (label, rec_id) = recovery_task_label_and_id(&RecoverySink::Recording(42));
+        assert_eq!(rec_id, Some(42));
+        assert!(label.contains("42"));
+    }
+
+    #[test]
+    fn recovery_task_has_no_recording_id_for_standalone_sink() {
+        let sink = RecoverySink::Standalone {
+            output_dir: "out".into(),
+            filename: "clip.mkv".into(),
+        };
+        let (label, rec_id) = recovery_task_label_and_id(&sink);
+        assert_eq!(rec_id, None);
+        assert!(label.contains("clip.mkv"));
+    }
 
     #[test]
     fn sha1_known_vector() {

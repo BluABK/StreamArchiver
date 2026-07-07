@@ -11531,6 +11531,10 @@ impl StreamArchiverApp {
         let exp_channels = self.expanded_channels.clone();
         let exp_instances = self.expanded_instances.clone();
         let exp_streams = self.expanded_streams.clone();
+        // Snapshot live VOD-backfill download progress (video_id -> 0.0..=1.0),
+        // same map the Videos tab reads (`core.video_progress`) — joined via
+        // `Recording.vod_dl_video_id` for the VodJob backfill row's progress bar.
+        let vid_progress = self.core.video_progress.lock().unwrap().clone();
         // Snapshot which monitors currently have an ad playing (for the row tint).
         let ad_active = self.core.ad_active.lock().unwrap().clone();
         let ad_running = |mid: i64| ad_active.get(&mid).is_some_and(|&end| now < end);
@@ -11827,11 +11831,28 @@ impl StreamArchiverApp {
                 // (the sort/filter state is last frame's when a header was
                 // clicked this frame — corrected on the immediate repaint).
                 #[derive(Clone, Copy)]
+                enum VodJobKind {
+                    Recovery,
+                    Backfill,
+                }
+                #[derive(Clone, Copy)]
                 enum Vis {
                     Channel(usize),
                     Instance { row: usize, depth: usize },
                     Stream { mid: i64, gi: usize, depth: usize },
                     Take { mid: i64, gi: usize, ti: usize, depth: usize },
+                    VodJob { mid: i64, gi: usize, ti: usize, kind: VodJobKind, depth: usize },
+                }
+                // A stream is only expandable when it has more than one take,
+                // or at least one take carries a VOD-recovery/backfill job —
+                // the job row is the only depth-3 child a single-take stream
+                // can have (its own take info stays folded into the Stream
+                // row, same as today).
+                fn stream_has_children(g: &crate::models::StreamGroup) -> bool {
+                    g.takes.len() > 1
+                        || g.takes
+                            .iter()
+                            .any(|t| t.recovery_state.is_some() || t.vod_dl_state.is_some())
                 }
                 let order = ordered_rows(model, &sort, &filters);
                 let mut vis: Vec<Vis> = Vec::new();
@@ -11852,9 +11873,21 @@ impl StreamArchiverApp {
                         if let Some(grps) = groups.get(&mid) {
                             for (gi, g) in grps.iter().enumerate() {
                                 vis.push(Vis::Stream { mid, gi, depth: 2 });
-                                if g.takes.len() > 1 && exp_streams.contains(&g.key) {
-                                    for ti in 0..g.takes.len() {
-                                        vis.push(Vis::Take { mid, gi, ti, depth: 3 });
+                                if stream_has_children(g) && exp_streams.contains(&g.key) {
+                                    for (ti, t) in g.takes.iter().enumerate() {
+                                        if g.takes.len() > 1 {
+                                            vis.push(Vis::Take { mid, gi, ti, depth: 3 });
+                                        }
+                                        if t.recovery_state.is_some() {
+                                            vis.push(Vis::VodJob {
+                                                mid, gi, ti, kind: VodJobKind::Recovery, depth: 3,
+                                            });
+                                        }
+                                        if t.vod_dl_state.is_some() {
+                                            vis.push(Vis::VodJob {
+                                                mid, gi, ti, kind: VodJobKind::Backfill, depth: 3,
+                                            });
+                                        }
                                     }
                                 }
                             }
@@ -12280,7 +12313,7 @@ impl StreamArchiverApp {
                             }
                             Vis::Stream { mid, gi, depth } => {
                                 let g = &groups[&mid][gi];
-                                let has_takes = g.takes.len() > 1;
+                                let has_takes = stream_has_children(g);
                                 let expanded = exp_streams.contains(&g.key);
                                 let when = fmt_went_live(g.went_live_at, g.went_live_approx);
                                 let ts_fn = |s| if short_ts_on() { fmt_datetime_compact(s) } else { fmt_datetime_short(s) };
@@ -12767,34 +12800,9 @@ impl StreamArchiverApp {
                                                     }
                                                     _ => {}
                                                 }
-                                                // CDN VOD-recovery badge.
-                                                match t.recovery_state.as_deref() {
-                                                    Some("recovering") => {
-                                                        ui.colored_label(
-                                                            egui::Color32::from_rgb(80, 160, 220),
-                                                            "🛟 recovering…",
-                                                        ).on_hover_text("Reconstructing the VOD from CDN segments — see the Background tab.");
-                                                    }
-                                                    Some("recovered") => {
-                                                        ui.colored_label(
-                                                            egui::Color32::from_rgb(70, 180, 90),
-                                                            "🛟 recovered",
-                                                        ).on_hover_text("A full VOD was recovered from the CDN — right-click → Open recovered file.");
-                                                    }
-                                                    Some("partial") => {
-                                                        ui.colored_label(
-                                                            egui::Color32::from_rgb(220, 160, 30),
-                                                            "🛟 partial",
-                                                        ).on_hover_text("A partial VOD was recovered (some segments were gone) — right-click → Open recovered file.");
-                                                    }
-                                                    Some("unavailable") => {
-                                                        ui.colored_label(
-                                                            egui::Color32::from_rgb(150, 150, 150),
-                                                            "🛟 gone",
-                                                        ).on_hover_text("No segments survived on the CDN — past the ~60-day recovery window.");
-                                                    }
-                                                    _ => {}
-                                                }
+                                                // CDN VOD-recovery status now has its own
+                                                // sibling row (Vis::VodJob) below this take —
+                                                // see the "🛟 VOD recovery" row.
                                                 // Live-DVR head backfill badges.
                                                 if t.full_path.is_some() {
                                                     ui.colored_label(
@@ -12807,54 +12815,9 @@ impl StreamArchiverApp {
                                                         "🧩 head",
                                                     ).on_hover_text("Missed start was backfilled from the live VOD ({stem}.head.mkv) — the joined file lands after the recording finishes.");
                                                 }
-                                                // Post-stream published-VOD download badge.
-                                                match t.vod_dl_state.as_deref() {
-                                                    Some("downloading") => {
-                                                        ui.colored_label(
-                                                            egui::Color32::from_rgb(80, 160, 220),
-                                                            "📼 VOD…",
-                                                        ).on_hover_text("Downloading the published VOD — see the Videos tab.");
-                                                    }
-                                                    Some("archived") => {
-                                                        if t.vod_muted_secs.unwrap_or(0) > 0 {
-                                                            ui.colored_label(
-                                                                egui::Color32::from_rgb(70, 180, 90),
-                                                                "📼 VOD (pre-mute)",
-                                                            ).on_hover_text("The published VOD is now DMCA-muted — your downloaded archive predates the mute and has the original audio.");
-                                                        } else {
-                                                            ui.colored_label(
-                                                                egui::Color32::from_rgb(70, 180, 90),
-                                                                "📼 VOD",
-                                                            ).on_hover_text("The published VOD was downloaded alongside — right-click → Open downloaded VOD.");
-                                                        }
-                                                    }
-                                                    Some("replaced") => {
-                                                        if t.vod_muted_secs.unwrap_or(0) > 0 {
-                                                            ui.colored_label(
-                                                                egui::Color32::from_rgb(70, 180, 90),
-                                                                "📼 replaced (pre-mute)",
-                                                            ).on_hover_text("The live capture was replaced by the published VOD before Twitch muted it — this copy has the original audio.");
-                                                        } else {
-                                                            ui.colored_label(
-                                                                egui::Color32::from_rgb(70, 180, 90),
-                                                                "📼 replaced",
-                                                            ).on_hover_text("The live capture was replaced by the published VOD.");
-                                                        }
-                                                    }
-                                                    Some("muted") => {
-                                                        ui.colored_label(
-                                                            egui::Color32::from_rgb(220, 120, 30),
-                                                            "✂ muted VOD",
-                                                        ).on_hover_text("The published VOD is DMCA-muted — un-muting via recovery; see the Issues panel.");
-                                                    }
-                                                    Some("failed") => {
-                                                        ui.colored_label(
-                                                            egui::Color32::from_rgb(200, 90, 90),
-                                                            "📼 VOD failed",
-                                                        ).on_hover_text("The published-VOD download failed — right-click → Download VOD now to retry.");
-                                                    }
-                                                    _ => {}
-                                                }
+                                                // Post-stream published-VOD download status now
+                                                // has its own sibling row (Vis::VodJob) below
+                                                // this take — see the "📼 VOD backfill" row.
                                                 // In-progress / needs-attention badges
                                                 let needs_remux = t.output_path.ends_with(".ts")
                                                     && t.output_path.contains(".cache");
@@ -13054,18 +13017,10 @@ impl StreamArchiverApp {
                                             open_recover_take = Some(t.id);
                                             ui.close();
                                         }
-                                        if let Some(rp) = t.recovered_path.as_ref().filter(|p| !p.is_empty()) {
-                                            let rp_ok =
-                                                self.fs_probes.is_file(std::path::Path::new(rp));
-                                            if ui
-                                                .add_enabled(rp_ok, egui::Button::new("🛟  Open recovered file"))
-                                                .clicked()
-                                            {
-                                                open_path = Some(std::path::PathBuf::from(rp));
-                                                ui.close();
-                                            }
-                                        }
-                                        // Post-stream published-VOD download (manual trigger / open).
+                                        // Post-stream published-VOD download (manual trigger).
+                                        // Result actions ("Open recovered file" / "Open
+                                        // downloaded VOD") live on the job's own sibling row
+                                        // (Vis::VodJob) once a job exists.
                                         if t.stream_id.is_some()
                                             && ui
                                                 .button("📥  Download VOD now")
@@ -13074,17 +13029,6 @@ impl StreamArchiverApp {
                                         {
                                             archive_vod_now = Some(t.id);
                                             ui.close();
-                                        }
-                                        if let Some(vp) = t.vod_dl_path.as_ref().filter(|p| !p.is_empty()) {
-                                            let vp_ok =
-                                                self.fs_probes.is_file(std::path::Path::new(vp));
-                                            if ui
-                                                .add_enabled(vp_ok, egui::Button::new("📼  Open downloaded VOD"))
-                                                .clicked()
-                                            {
-                                                open_path = Some(std::path::PathBuf::from(vp));
-                                                ui.close();
-                                            }
                                         }
                                         if ui
                                             .add_enabled(
@@ -13144,6 +13088,162 @@ impl StreamArchiverApp {
                                         }
                                     });
                                 }
+                            }
+                            Vis::VodJob { mid, gi, ti, kind, depth } => {
+                                let g = &groups[&mid][gi];
+                                let t = &g.takes[ti];
+                                let take_suffix = if g.takes.len() > 1 {
+                                    format!(" · Take {}", ti + 1)
+                                } else {
+                                    String::new()
+                                };
+                                for &ci2 in &col_order {
+                                    tr.col(|ui| match STREAM_COLUMNS[ci2].id {
+                                        "name" => {
+                                            let label = match kind {
+                                                VodJobKind::Recovery => format!("🛟 VOD recovery{take_suffix}"),
+                                                VodJobKind::Backfill => format!("📼 VOD backfill{take_suffix}"),
+                                            };
+                                            tree_name(
+                                                ui, depth, false, false, None,
+                                                egui::RichText::new(label).weak(),
+                                            );
+                                        }
+                                        "state" => match kind {
+                                            VodJobKind::Recovery => {
+                                                let live = self.background_tasks.iter().find(|bt| {
+                                                    matches!(
+                                                        bt.kind,
+                                                        crate::events::BackgroundTaskKind::RecoverVod(Some(rid)) if rid == t.id
+                                                    )
+                                                });
+                                                if let Some(bt) = live {
+                                                    ui.add(
+                                                        egui::ProgressBar::new(bt.progress.unwrap_or(0.0))
+                                                            .show_percentage()
+                                                            .desired_width(90.0),
+                                                    );
+                                                    if let Some(info) = &bt.progress_info {
+                                                        ui.label(info);
+                                                    }
+                                                } else {
+                                                    match t.recovery_state.as_deref() {
+                                                        Some("recovering") => {
+                                                            ui.colored_label(egui::Color32::from_rgb(80, 160, 220), "recovering…")
+                                                                .on_hover_text("Reconstructing the VOD from CDN segments — see the Background tab.");
+                                                        }
+                                                        Some("recovered") => {
+                                                            ui.colored_label(egui::Color32::from_rgb(70, 180, 90), "recovered")
+                                                                .on_hover_text("A full VOD was recovered from the CDN — right-click → Open recovered file.");
+                                                        }
+                                                        Some("partial") => {
+                                                            ui.colored_label(egui::Color32::from_rgb(220, 160, 30), "partial")
+                                                                .on_hover_text("A partial VOD was recovered (some segments were gone) — right-click → Open recovered file.");
+                                                        }
+                                                        Some("unavailable") => {
+                                                            ui.colored_label(egui::Color32::from_rgb(150, 150, 150), "gone")
+                                                                .on_hover_text("No segments survived on the CDN — past the ~60-day recovery window.");
+                                                        }
+                                                        Some("failed") => {
+                                                            ui.colored_label(egui::Color32::from_rgb(200, 90, 90), "failed")
+                                                                .on_hover_text("The recovery attempt failed — right-click → Retry recovery.");
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                }
+                                            }
+                                            VodJobKind::Backfill => {
+                                                let live_progress = t
+                                                    .vod_dl_video_id
+                                                    .and_then(|vid| vid_progress.get(&vid).copied());
+                                                if t.vod_dl_state.as_deref() == Some("downloading") {
+                                                    if let Some(f) = live_progress {
+                                                        ui.add(
+                                                            egui::ProgressBar::new(f)
+                                                                .desired_width(90.0)
+                                                                .text(format!("{:.0}%", f * 100.0)),
+                                                        );
+                                                    } else {
+                                                        ui.colored_label(egui::Color32::from_rgb(80, 160, 220), "downloading…")
+                                                            .on_hover_text("Downloading the published VOD — see the Videos tab.");
+                                                    }
+                                                } else {
+                                                    match t.vod_dl_state.as_deref() {
+                                                        Some("archived") => {
+                                                            let text = if t.vod_muted_secs.unwrap_or(0) > 0 {
+                                                                "archived (pre-mute)"
+                                                            } else {
+                                                                "archived"
+                                                            };
+                                                            ui.colored_label(egui::Color32::from_rgb(70, 180, 90), text)
+                                                                .on_hover_text("The published VOD was downloaded alongside — right-click → Open downloaded VOD.");
+                                                        }
+                                                        Some("replaced") => {
+                                                            let text = if t.vod_muted_secs.unwrap_or(0) > 0 {
+                                                                "replaced (pre-mute)"
+                                                            } else {
+                                                                "replaced"
+                                                            };
+                                                            ui.colored_label(egui::Color32::from_rgb(70, 180, 90), text)
+                                                                .on_hover_text("The live capture was replaced by the published VOD.");
+                                                        }
+                                                        Some("muted") => {
+                                                            ui.colored_label(egui::Color32::from_rgb(220, 120, 30), "muted")
+                                                                .on_hover_text("The published VOD is DMCA-muted — un-muting via recovery; see the Issues panel.");
+                                                        }
+                                                        Some("failed") => {
+                                                            ui.colored_label(egui::Color32::from_rgb(200, 90, 90), "failed")
+                                                                .on_hover_text("The published-VOD download failed — right-click → Retry download.");
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        _ => {}
+                                    });
+                                }
+                                tr.response().context_menu(|ui| {
+                                    ui.set_min_width(180.0);
+                                    match kind {
+                                        VodJobKind::Recovery => {
+                                            if let Some(rp) = t.recovered_path.as_ref().filter(|p| !p.is_empty()) {
+                                                let rp_ok = self.fs_probes.is_file(std::path::Path::new(rp));
+                                                if ui
+                                                    .add_enabled(rp_ok, egui::Button::new("🛟  Open recovered file"))
+                                                    .clicked()
+                                                {
+                                                    open_path = Some(std::path::PathBuf::from(rp));
+                                                    ui.close();
+                                                }
+                                            }
+                                            if matches!(t.recovery_state.as_deref(), Some("failed") | Some("unavailable"))
+                                                && ui.button("🛟  Retry recovery").clicked()
+                                            {
+                                                open_recover_take = Some(t.id);
+                                                ui.close();
+                                            }
+                                        }
+                                        VodJobKind::Backfill => {
+                                            if let Some(vp) = t.vod_dl_path.as_ref().filter(|p| !p.is_empty()) {
+                                                let vp_ok = self.fs_probes.is_file(std::path::Path::new(vp));
+                                                if ui
+                                                    .add_enabled(vp_ok, egui::Button::new("📼  Open downloaded VOD"))
+                                                    .clicked()
+                                                {
+                                                    open_path = Some(std::path::PathBuf::from(vp));
+                                                    ui.close();
+                                                }
+                                            }
+                                            if t.vod_dl_state.as_deref() == Some("failed")
+                                                && ui.button("📥  Retry download").clicked()
+                                            {
+                                                archive_vod_now = Some(t.id);
+                                                ui.close();
+                                            }
+                                        }
+                                    }
+                                });
                             }
                         }
                     });

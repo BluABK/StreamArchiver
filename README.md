@@ -419,16 +419,21 @@ still yields everything that remains.
 
 **Recording badges.** In the recording-history tree, a Twitch take shows its VOD
 state: **⚠ no VOD** (never published), **✂ muted** (the published VOD has DMCA-muted
-content — your local recording is the authoritative copy), and after a recovery
-**🛟 recovered** / **🛟 partial** (some segments were gone) / **🛟 gone** (past the
-~60-day window).
+content — your local recording is the authoritative copy). Once a recovery has run,
+it gets its **own sibling row** — **🛟 VOD recovery** — right under the take (same
+tree depth as a take, expand the stream to see it even for a single take), with a
+live progress bar while running and a final status (**recovered** / **partial**
+(some segments were gone) / **gone** (past the ~60-day window) / **failed**)
+afterwards.
 
 **Recovering one:**
 
 - **From a tracked recording** — right-click a Twitch take (especially one badged
   **⚠ no VOD** or **✂ muted**) → **🛟 Recover VOD…**. The dialog is pre-filled from
   the recording's stored broadcast id + go-live time, and the recovered MKV is
-  attached back onto that recording (open it via **🛟 Open recovered file**).
+  attached back onto that recording (right-click the **🛟 VOD recovery** row →
+  **Open recovered file**, or **Retry recovery** if it failed or the segments are
+  gone).
 - **Manually / any VOD** — the **🛟 Recover Twitch VOD…** button on the **Videos**
   tab opens the same dialog blank. Enter the streamer login + broadcast id + UTC
   start, or **paste a URL**: a `twitch.tv/videos/<id>` link resolves everything via
@@ -553,9 +558,9 @@ archive download typically starts within seconds of publication. After a clean V
 found, a **mute watcher** keeps re-checking it for another ~2 hours:
 
 - Mute lands **after** your download completed → **you won the race**: the archive
-  keeps its state and the take shows **📼 VOD (pre-mute)** (or **📼 replaced
-  (pre-mute)**) — your copy has the original audio even though the online VOD is now
-  silenced.
+  keeps its state and the **📼 VOD backfill** row shows **archived (pre-mute)** (or
+  **replaced (pre-mute)**) — your copy has the original audio even though the online
+  VOD is now silenced.
 - Mute lands **before/during** the download → the normal muted flow below runs (a
   mid-mute download may already contain silenced segments, so it's flagged, never
   trusted as clean).
@@ -571,20 +576,23 @@ recovered VOD**, **Re-run recovery**, or **Keep live / dismiss**.
 tool working/side files (logs, `.part`, `.ytdl`) can never be picked up as the output,
 a nonzero exit code must pass an `ffprobe` check, and before the file is archived (or
 allowed to replace anything) its probed duration must be plausible (≥ 90 % of the live
-capture / broadcast span). Anything failing these checks is marked **📼 VOD failed**
-and retryable — the live recording is never touched. Download filenames are also
-length-capped so the tool's temp paths stay under Windows' 260-character limit
-(yt-dlp/streamlink are Python and can't use long paths, even when the app itself can).
-On every start a **reconcile pass** repairs interrupted state: archive downloads that
-finished while the app was down get filed properly, and any `archived` row whose file
-turns out bogus is demoted to `muted`/`failed` so it surfaces in Issues instead of
-masquerading as done.
+capture / broadcast span). Anything failing these checks lands the **📼 VOD backfill**
+row in a **failed** state, retryable — the live recording is never touched. Download
+filenames are also length-capped so the tool's temp paths stay under Windows'
+260-character limit (yt-dlp/streamlink are Python and can't use long paths, even when
+the app itself can). On every start a **reconcile pass** repairs interrupted state:
+archive downloads that finished while the app was down get filed properly, and any
+`archived` row whose file turns out bogus is demoted to `muted`/`failed` so it
+surfaces in Issues instead of masquerading as done.
 
-**Badges & actions.** A take shows its archive state in the history tree: **📼 VOD**
-(downloaded alongside), **📼 replaced**, **📼 VOD (pre-mute)** / **📼 replaced
-(pre-mute)** (archived before a later mute — your copy has the original audio),
-**✂ muted VOD**, **📼 VOD…** (downloading), or **📼 VOD failed**. Right-click a take
-for **📥 Download VOD now** (on-demand / retry) and **📼 Open downloaded VOD**.
+**Its own row.** A published-VOD download gets a **sibling row** in the recording
+tree — **📼 VOD backfill** — right under the take it belongs to (same tree depth as a
+take; expand the stream to see it even when there's only one take), showing a live
+progress bar while downloading and a final status once done: **archived** (downloaded
+alongside), **replaced**, **archived (pre-mute)** / **replaced (pre-mute)**, **muted**,
+or **failed**. Right-click a take for **📥 Download VOD now** (on-demand / retry); once
+a job exists, right-click the **📼 VOD backfill** row itself for **Open downloaded
+VOD** or **Retry download**.
 
 > **Notes.** This re-downloads the whole stream, so it doubles storage/bandwidth — hence
 > it's opt-in and granular. Twitch is the most reliable path (instant VOD publication +

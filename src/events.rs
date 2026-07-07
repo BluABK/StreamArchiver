@@ -34,7 +34,9 @@ pub enum BackgroundTaskKind {
     ReorganizeMonitor(i64),
     ReorganizeChannel(i64),
     /// A single Twitch VOD recovery (CDN probe + segment salvage + mux).
-    RecoverVod,
+    /// Carries the recording id when recovering into an existing take
+    /// (`None` for a standalone recovery not tied to a recording).
+    RecoverVod(Option<i64>),
     /// A bulk sweep recovering all eligible deleted/muted recordings.
     RecoverVodScan,
     /// Harvesting current CDN hosts from published VODs via GQL.
@@ -58,7 +60,7 @@ impl BackgroundTaskKind {
             BackgroundTaskKind::ReorganizeTake(_) => "Re-organize take",
             BackgroundTaskKind::ReorganizeMonitor(_) => "Re-organize monitor",
             BackgroundTaskKind::ReorganizeChannel(_) => "Re-organize channel",
-            BackgroundTaskKind::RecoverVod => "VOD recovery",
+            BackgroundTaskKind::RecoverVod(_) => "VOD recovery",
             BackgroundTaskKind::RecoverVodScan => "VOD recovery scan",
             BackgroundTaskKind::RefreshCdnHosts => "Refresh CDN hosts",
             BackgroundTaskKind::HeadBackfill => "Head backfill",
