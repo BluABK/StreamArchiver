@@ -942,6 +942,9 @@ pub fn build_video_plan(
     let stem = video_stem(v, started_at, title, channel, video_id, &quality, media, v.tool.label(), Platform::detect(&v.url).as_str());
     let extra = split_args(&v.extra_args);
     let platform = Platform::detect(&v.url);
+    // Keep the child tool's working paths under MAX_PATH (Python has no
+    // long-path support; the per-component cap alone can't see the full path).
+    let stem = stem_capped_for_child_path(&dir, &stem);
     // Don't clobber an existing finished file (all video tools end at .mkv).
     let stem = unique_stem(&dir, &stem, "mkv", None);
     let final_path = dir.join(format!("{stem}.mkv"));
@@ -2358,8 +2361,12 @@ impl Supervisor {
 
     /// Atomically decide a video's final status and drop its `active_videos`
     /// membership: a stop tombstone (set under the same lock by `stop_video`)
-    /// wins over the byte-count classification. Returns the chosen status.
-    fn finalize_video(&self, id: i64, bytes: i64, shutting_down: bool) -> &'static str {
+    /// wins over the byte-count classification. `media_ok` is the caller's
+    /// verdict that the final file is a real media output (plausible extension
+    /// and, when the exit code is nonzero/unknown, an ffprobe-confirmed
+    /// duration) — without it a nonzero-size `.log` promoted by mistake would
+    /// classify "completed". Returns the chosen status.
+    fn finalize_video(&self, id: i64, bytes: i64, media_ok: bool, shutting_down: bool) -> &'static str {
         let mut active = self.active_videos.lock().unwrap();
         let stopped = self.stopping_videos.lock().unwrap().remove(&id);
         let stalled = self
@@ -2381,7 +2388,7 @@ impl Supervisor {
             // We're quitting and killed the tree; treat any in-flight download as
             // incomplete regardless of how many bytes landed.
             "orphaned"
-        } else if bytes > 0 {
+        } else if bytes > 0 && media_ok {
             "completed"
         } else {
             "failed"
@@ -2396,7 +2403,7 @@ impl Supervisor {
         if self.stopping_videos.lock().unwrap().contains(&id)
             || self.shutdown.load(Ordering::SeqCst)
         {
-            let status = self.finalize_video(id, 0, self.shutdown.load(Ordering::SeqCst));
+            let status = self.finalize_video(id, 0, false, self.shutdown.load(Ordering::SeqCst));
             let _ = self
                 .store
                 .finish_video(id, now_unix(), 0, None, status, "", "");
@@ -2571,9 +2578,18 @@ impl Supervisor {
         }
 
         let bytes = file_len(&final_path).await as i64;
+        // A clean exit with a media-named file is trusted; a nonzero/unknown
+        // exit must additionally prove itself to ffprobe (partial-but-playable
+        // files stay "completed"-eligible, promoted logs never are).
+        let exit_ok = matches!(outcome.exit_code, None | Some(0));
+        let name_ok = final_path
+            .file_name()
+            .map(|n| plausible_media_output(&format!(".{}", n.to_string_lossy())))
+            .unwrap_or(false);
+        let media_ok = name_ok && (exit_ok || media_duration_secs(&final_path).await.is_some());
         // Decide status + drop the active_videos entry atomically so a concurrent
         // stop can't be lost (and its tombstone can't outlive this task).
-        let status = self.finalize_video(id, bytes, self.shutdown.load(Ordering::SeqCst));
+        let status = self.finalize_video(id, bytes, media_ok, self.shutdown.load(Ordering::SeqCst));
         let _ = self.store.finish_video(
             id,
             now_unix(),
@@ -2889,6 +2905,30 @@ impl Supervisor {
             ))
         });
 
+        // Twitch capture-from-start: streamlink's --hls-live-restart only rewinds
+        // within its own DVR view and usually misses. The published VOD's
+        // playlist, however, already exists on the CDN and grows while the
+        // stream is live — a backfill job downloads the missed head from it
+        // (pre-mute originals!) and the post-stream concat joins head + live.
+        if rec_id != 0
+            && row.monitor.platform() == Platform::Twitch
+            && row.monitor.capture_from_start
+            && let (Some(sid), Some(wl)) = (stream_id.clone(), went_live_at)
+        {
+            let this = self.clone();
+            let capture = plan.capture_path.clone();
+            let final_p = plan.final_path.clone();
+            let url = row.monitor.url.clone();
+            let channel = row.channel.name.clone();
+            tokio::spawn(async move {
+                this.head_backfill_job(
+                    monitor_id, rec_id, capture, final_p, url, channel, sid, wl, approximate,
+                    started_at,
+                )
+                .await;
+            });
+        }
+
         // Twitch+streamlink filters ads into hard cuts and logs each break; record
         // them so the UI can show ad count/time and the cut timestamps. Skip when
         // the recording row failed to insert (rec_id 0) — an ad break with a 0
@@ -3203,6 +3243,11 @@ impl Supervisor {
         });
         self.schedule_vod_check(rec_id, row.monitor.platform(), status, &row.monitor.url, went_live_at, approximate);
         self.schedule_vod_archive(rec_id, &row, went_live_at, status);
+        // Join a backfilled head with the finished capture (no-op without one).
+        {
+            let this = self.clone();
+            tokio::spawn(async move { this.maybe_concat_backfill(rec_id).await });
+        }
         info!(monitor_id, bytes, status, "recording finished");
         if status == "failed" && !outcome.log.is_empty() {
             warn!(monitor_id, "recording stderr:\n{}", outcome.log);
@@ -4067,6 +4112,12 @@ impl Supervisor {
                     let approx = self.store.recording_went_live_approx(row.ref_id);
                     self.schedule_vod_check(row.ref_id, platform, status, &vod_url, row.went_live_at, approx);
                 }
+                // Join a backfilled head with the adopted capture (no-op without one).
+                {
+                    let this = self.clone();
+                    let rid = row.ref_id;
+                    tokio::spawn(async move { this.maybe_concat_backfill(rid).await });
+                }
                 if let Some(mid) = row.monitor_id {
                     let _ = self.events.send(AppEvent::MonitorState {
                         monitor_id: mid,
@@ -4082,6 +4133,14 @@ impl Supervisor {
                     .lock()
                     .unwrap()
                     .remove(&(DetachedKind::Video, row.ref_id));
+                // Adopted processes have no exit code, so a real media file
+                // must prove itself: plausible media name AND an
+                // ffprobe-readable duration (a promoted `.log` has neither).
+                let media_ok = final_path
+                    .file_name()
+                    .map(|n| plausible_media_output(&format!(".{}", n.to_string_lossy())))
+                    .unwrap_or(false)
+                    && media_duration_secs(&final_path).await.is_some();
                 let status = if stopped {
                     "stopped"
                 } else if stalled {
@@ -4089,7 +4148,7 @@ impl Supervisor {
                     // the file is truncated — never classify it "completed"
                     // (a completed VOD archive may replace the live capture).
                     "failed"
-                } else if bytes > 0 {
+                } else if bytes > 0 && media_ok {
                     "completed"
                 } else {
                     "failed"
@@ -4343,6 +4402,10 @@ impl Supervisor {
             status: status.into(),
         });
         self.schedule_vod_check(rec_id, row.monitor.platform(), status, &row.monitor.url, rec.went_live_at, rec.went_live_approx);
+        {
+            let this = self.clone();
+            tokio::spawn(async move { this.maybe_concat_backfill(rec_id).await });
+        }
         info!(monitor_id, rec_id, bytes, status, "resumed recording finished");
         self.active.lock().unwrap().remove(&monitor_id);
     }
@@ -4491,6 +4554,35 @@ impl Supervisor {
     /// Completion hook for a VOD-archive download: record the file on the recording
     /// and, when replace-on-success resolves ON and the VOD isn't muted, swap it in
     /// for the live capture. A no-op for ordinary (non-archive) video downloads.
+    /// True when a completed VOD-archive download looks like the real video:
+    /// ffprobe can read a duration, and (when an expectation is derivable from
+    /// the live capture or the recording's wall-clock span) that duration is
+    /// at least 90% of it. The VOD can legitimately be LONGER than the live
+    /// capture (late join), never dramatically shorter.
+    async fn vod_archive_sane(&self, rec_id: i64, final_path: &Path) -> bool {
+        let Some(dur) = media_duration_secs(final_path).await else {
+            return false;
+        };
+        let expected = match self.store.recording_duration_hint(rec_id).ok().flatten() {
+            Some((live_path, went_live_at, ended_at)) => {
+                let live = if live_path.is_empty() {
+                    None
+                } else {
+                    media_duration_secs(Path::new(&live_path)).await
+                };
+                live.or(match (went_live_at, ended_at) {
+                    (Some(a), Some(b)) if b > a => Some(b - a),
+                    _ => None,
+                })
+            }
+            None => None,
+        };
+        match expected {
+            Some(exp) if exp > 0 => dur * 10 >= exp * 9,
+            _ => true, // no expectation derivable — a probeable video is enough
+        }
+    }
+
     async fn finalize_vod_archive(&self, video_id: i64, final_path: &Path, status: &str) {
         let Ok(Some(rec_id)) = self.store.recording_for_vod_video(video_id) else {
             return;
@@ -4500,11 +4592,32 @@ impl Supervisor {
             let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
             return;
         }
+        // Belt-and-braces sanity check before this file is trusted as the
+        // archive (and possibly replaces the live capture): it must be a
+        // probeable video of plausible length. "completed" status alone once
+        // let a promoted 10 KB `.vod.log` get archived (2026-07-06 incident).
+        if !self.vod_archive_sane(rec_id, final_path).await {
+            let _ = self.store.set_recording_vod_dl(rec_id, "failed", Some(video_id));
+            let _ = self.store.set_video_status(video_id, "failed");
+            let _ = self.events.send(AppEvent::Error {
+                context: "VOD archive".into(),
+                message: format!(
+                    "downloaded VOD failed the sanity check (not a plausible video): {}",
+                    final_path.display()
+                ),
+            });
+            let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
+            return;
+        }
         let vod_path = final_path.to_string_lossy().into_owned();
         let replace_info = self.store.recording_replace_info(rec_id).ok().flatten();
         // A DMCA-muted VOD stays flagged "muted" even after a manual "Download
         // VOD now": the file is recorded, but the Issues entry must not vanish
         // as if a clean archive landed (the downloaded copy has silenced audio).
+        // Ordering invariant vs. the post-find mute watcher: a mute recorded
+        // BEFORE/DURING the download is seen here and labels the file 'muted';
+        // a mute detected AFTER this hook ran never relabels it — the watcher
+        // skips terminal 'archived'/'replaced' states (pre-mute copy is good).
         let muted = replace_info
             .as_ref()
             .is_some_and(|(_, _, _, m)| m.unwrap_or(0) > 0);
@@ -4551,6 +4664,404 @@ impl Supervisor {
             }
         }
         let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
+    }
+
+    /// Startup repair pass for post-stream VOD archives, run after
+    /// `reconcile_detached`:
+    ///  1. **Replay** — a download that completed (possibly under an older
+    ///     binary whose reattach path lacked the archive hook) but whose
+    ///     recording is still `'downloading'`/`'failed'` gets its
+    ///     [`Self::finalize_vod_archive`] re-run; the sanity gate inside
+    ///     decides archived/replace vs failed.
+    ///  2. **Audit** — `'archived'` rows pointing at a bogus file (empty,
+    ///     wrong extension, missing, tiny, or unprobeable — e.g. the promoted
+    ///     `.vod.log` of the 2026-07-06 incident) are demoted to `'muted'`
+    ///     (when Helix says the VOD is now muted; auto-recovery kicks in) or
+    ///     `'failed'`. The bogus file itself is left on disk.
+    pub async fn reconcile_vod_archives(&self) {
+        for (rec_id, video_id, path) in
+            self.store.vod_archive_replay_candidates().unwrap_or_default()
+        {
+            if path.is_empty() {
+                continue;
+            }
+            info!(rec_id, video_id, "vod archive reconcile: replaying completed download");
+            self.finalize_vod_archive(video_id, Path::new(&path), "completed").await;
+        }
+
+        let mut helix: Option<(String, String)> = None;
+        for (rec_id, video_id, path, stored_muted, vod_id) in
+            self.store.vod_archived_rows().unwrap_or_default()
+        {
+            let p = Path::new(&path);
+            let cheap_suspicious = path.is_empty()
+                || !path.to_ascii_lowercase().ends_with(".mkv")
+                || file_len(p).await < 1024 * 1024;
+            if !cheap_suspicious {
+                continue;
+            }
+            // Wrong-looking but probeable (e.g. a healthy .webm) is left alone.
+            if !path.is_empty() && media_duration_secs(p).await.is_some() {
+                continue;
+            }
+            warn!(
+                rec_id,
+                path, "vod archive reconcile: archived file is not a plausible video (kept on disk)"
+            );
+            // Re-check the mute state now — the VOD may have been muted after
+            // the bogus archive landed (exactly the 2026-07-06 sequence).
+            let mut muted_secs = stored_muted;
+            if let Some(vid) = vod_id.as_deref() {
+                if helix.is_none() {
+                    helix = self.ctx.twitch_helix_auth().await.ok();
+                }
+                if let Some((cid, tok)) = helix.as_ref()
+                    && let Ok(Some(m)) =
+                        poll_twitch_vod_muted(&self.ctx.http_client(), cid, tok, vid).await
+                {
+                    muted_secs = m;
+                    let _ = self.store.set_recording_vod_muted_secs(rec_id, m);
+                }
+            }
+            if let Some(vid) = video_id {
+                let _ = self.store.set_video_status(vid, "failed");
+            }
+            if muted_secs > 0 {
+                let _ = self.store.set_recording_vod_dl(rec_id, "muted", video_id);
+                let channel =
+                    archive_channel_name(&self.store, rec_id).unwrap_or_else(|| "?".into());
+                let _ = self.events.send(AppEvent::VodMuted {
+                    recording_id: rec_id,
+                    channel,
+                    muted_secs,
+                });
+                spawn_auto_recovery(&self.ctx, &self.store, &self.events, rec_id);
+            } else {
+                let _ = self.store.set_recording_vod_dl(rec_id, "failed", video_id);
+            }
+            let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
+        }
+
+        // Head-concat crash healing: joins that were pending when the app died.
+        for rec_id in self.store.recordings_pending_head_concat().unwrap_or_default() {
+            self.maybe_concat_backfill(rec_id).await;
+        }
+    }
+
+    /// Backfill a late-joined Twitch capture's missed beginning from the
+    /// growing published-VOD playlist while the stream is still live. Runs as
+    /// its own task (it may outlive the recording), then hands off to
+    /// [`Self::maybe_concat_backfill`]. Downloading DURING the stream matters:
+    /// DMCA mutes land minutes after stream end and scrub the originals, so
+    /// the head fetched now carries the original audio.
+    #[allow(clippy::too_many_arguments)]
+    async fn head_backfill_job(
+        &self,
+        monitor_id: i64,
+        rec_id: i64,
+        capture_path: PathBuf,
+        final_path: PathBuf,
+        monitor_url: String,
+        channel: String,
+        stream_id: String,
+        went_live_at: i64,
+        went_live_approx: bool,
+        started_at: i64,
+    ) {
+        // Let the CDN folder appear and streamlink's own rewind (if any) settle.
+        for _ in 0..(120 * 4) {
+            if self.shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        // --hls-live-restart actually rewound to the start → nothing was missed.
+        if self.store.recording_lost_secs(rec_id).ok().flatten() == Some(0) {
+            return;
+        }
+        // Only the earliest take of a stream owns the missed HEAD; a later
+        // take's gap is mid-stream (a retake), not this feature's job.
+        if !self
+            .store
+            .is_first_take_for_stream(monitor_id, &stream_id, started_at)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let Some(login) = crate::detectors::twitch_login(&monitor_url) else {
+            return;
+        };
+        let Some(out_dir) = final_path.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        let Some(stem) = final_path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+            return;
+        };
+
+        // Missed head length: prefer measuring the growing capture against the
+        // wall clock (accounts for any partial rewind); fall back to the plain
+        // start-delay. A very young .ts can refuse a duration — retry a bit.
+        let mut captured: Option<i64> = None;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                for _ in 0..(30 * 4) {
+                    if self.shutdown.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+            captured = media_duration_secs(&capture_path).await;
+            if captured.is_some() {
+                break;
+            }
+        }
+        let mut missed = match captured {
+            Some(c) => (now_unix() - went_live_at - c).max(0),
+            None => (started_at - went_live_at).max(0),
+        };
+        if missed < 60 {
+            info!(rec_id, missed, "head backfill: gap too small, skipping");
+            return;
+        }
+
+        let task_id = crate::events::next_task_id();
+        let _ = self.events.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
+            id: task_id,
+            kind: crate::events::BackgroundTaskKind::HeadBackfill,
+            label: channel.clone(),
+            detail: format!("missed ~{missed}s — fetching from the live VOD"),
+            started_at: now_unix(),
+            progress: Some(0.0),
+            progress_info: None,
+        }));
+        let finish = |outcome: crate::events::TaskOutcome| {
+            let _ = self.events.send(AppEvent::BackgroundTaskFinished { id: task_id, outcome });
+        };
+
+        let client = self.ctx.http_client();
+        let hosts = crate::recovery::load_hosts(&self.store);
+        let max_conc = crate::recovery::load_max_conc(&self.store);
+        let inputs = crate::recovery::RecoveryInputs {
+            login,
+            broadcast_id: stream_id,
+            start_epoch: went_live_at,
+            went_live_approx,
+            vod_id: None, // not published yet — hash-probe path only
+        };
+        // The folder can lag the stream start a little; retry a few times.
+        let mut found = None;
+        for attempt in 0..5 {
+            if attempt > 0 {
+                for _ in 0..(60 * 4) {
+                    if self.shutdown.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+            found = crate::recovery::resolve_playlist(&client, &inputs, &hosts, max_conc).await;
+            if found.is_some() {
+                break;
+            }
+        }
+        let Some(found) = found else {
+            // VODs disabled and folder absent — quiet failure, no error toast.
+            info!(rec_id, "head backfill: live playlist not found on the CDN");
+            finish(crate::events::TaskOutcome::Failed("live playlist not found".into()));
+            return;
+        };
+        if captured.is_none() {
+            // The capture wouldn't probe; the matched folder second is the true
+            // go-live moment — refine the fallback estimate with it.
+            missed = (started_at - found.matched_epoch).max(0);
+        }
+
+        // Fetch only the head (+ a few seconds of seam overlap), fresh segments,
+        // no probing needed; `-t` trims the mux to the measured gap.
+        let head_secs = missed as f64;
+        let playlist = match crate::recovery::build_playlist(
+            &client,
+            &found.url,
+            max_conc,
+            false,
+            Some(head_secs + 4.0),
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(rec_id, "head backfill: playlist build failed: {e:#}");
+                finish(crate::events::TaskOutcome::Failed(format!("playlist: {e:#}")));
+                return;
+            }
+        };
+        let cache = cache_dir(&out_dir);
+        let _ = tokio::fs::create_dir_all(&cache).await;
+        crate::platform::set_hidden(&cache);
+        let pl_path = cache.join(format!("{stem}.head.m3u8"));
+        if let Err(e) = tokio::fs::write(&pl_path, &playlist.text).await {
+            warn!(rec_id, "head backfill: cannot write playlist: {e:#}");
+            finish(crate::events::TaskOutcome::Failed(format!("write playlist: {e}")));
+            return;
+        }
+        let tmp_head = cache.join(format!("{stem}.head.mkv"));
+        if let Err(e) = crate::recovery::mux_playlist_to_mkv(
+            &pl_path,
+            &tmp_head,
+            Some((self.events.clone(), task_id)),
+            Some(head_secs),
+        )
+        .await
+        {
+            warn!(rec_id, "head backfill: mux failed: {e:#}");
+            finish(crate::events::TaskOutcome::Failed(format!("mux: {e:#}")));
+            let _ = tokio::fs::remove_file(&tmp_head).await;
+            let _ = tokio::fs::remove_file(&pl_path).await;
+            return;
+        }
+        let _ = tokio::fs::remove_file(&pl_path).await;
+        match rename_or_shorten(&tmp_head, &out_dir, &stem, "head.mkv").await {
+            Ok(dest) => {
+                let _ = self
+                    .store
+                    .set_recording_backfill_path(rec_id, &dest.to_string_lossy());
+                let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
+                info!(rec_id, missed, "head backfill: {} ready", dest.display());
+                finish(crate::events::TaskOutcome::CompletedWithNote(format!(
+                    "{missed}s backfilled"
+                )));
+            }
+            Err(e) => {
+                warn!(rec_id, "head backfill: promote failed: {e:#}");
+                finish(crate::events::TaskOutcome::Failed(format!("promote: {e}")));
+                return;
+            }
+        }
+        // The stream may have ended (and finalized) while we were fetching —
+        // this covers that ordering; the finalize-side call covers the other.
+        self.maybe_concat_backfill(rec_id).await;
+    }
+
+    /// Join a backfilled head with the finished live capture into one seamless
+    /// `{stem}.full.mkv` (lossless concat; both parts are KEPT). Idempotent and
+    /// callable from every completion path — whichever of {backfill done, live
+    /// finalize, startup healing} runs last performs the join.
+    pub async fn maybe_concat_backfill(&self, rec_id: i64) {
+        let Some((status, live_path, backfill, full)) =
+            self.store.backfill_concat_info(rec_id).ok().flatten()
+        else {
+            return;
+        };
+        if full.is_some() || status == "recording" || status != "completed" {
+            return;
+        }
+        let Some(head) = backfill else { return };
+        let head_p = PathBuf::from(&head);
+        let live_p = PathBuf::from(&live_path);
+        if !live_path.to_ascii_lowercase().ends_with(".mkv")
+            || !head_p.is_file()
+            || !live_p.is_file()
+        {
+            return;
+        }
+        let (Some(out_dir), Some(stem)) = (
+            live_p.parent().map(Path::to_path_buf),
+            live_p.file_stem().map(|s| s.to_string_lossy().into_owned()),
+        ) else {
+            return;
+        };
+
+        // Same-encode guard: `-c copy` concat only splices cleanly when both
+        // parts carry identical codec parameters (they do when the capture ran
+        // at source quality — same Twitch encode). Mismatch → keep the parts.
+        let (head_info, live_info) = (probe_media(&head).await, probe_media(&live_path).await);
+        let compatible = match (&head_info, &live_info) {
+            (Some(h), Some(l)) => {
+                h.vcodec == l.vcodec
+                    && h.width == l.width
+                    && h.height == l.height
+                    && h.fps == l.fps
+                    && h.acodec == l.acodec
+            }
+            _ => false,
+        };
+        if !compatible {
+            warn!(
+                rec_id,
+                "head concat: codec parameters differ between head and live capture — keeping parts unjoined"
+            );
+            return;
+        }
+
+        let task_id = crate::events::next_task_id();
+        let channel = archive_channel_name(&self.store, rec_id).unwrap_or_default();
+        let _ = self.events.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
+            id: task_id,
+            kind: crate::events::BackgroundTaskKind::HeadBackfill,
+            label: channel,
+            detail: "joining head + live capture".into(),
+            started_at: now_unix(),
+            progress: None,
+            progress_info: None,
+        }));
+        let finish = |outcome: crate::events::TaskOutcome| {
+            let _ = self.events.send(AppEvent::BackgroundTaskFinished { id: task_id, outcome });
+        };
+
+        let cache = cache_dir(&out_dir);
+        let _ = tokio::fs::create_dir_all(&cache).await;
+        let tmp_full = cache.join(format!("{stem}.full.mkv"));
+        if let Err(e) = concat_mkvs(&cache, &head_p, &live_p, &tmp_full).await {
+            warn!(rec_id, "head concat failed: {e:#}");
+            finish(crate::events::TaskOutcome::Failed(format!("{e:#}")));
+            let _ = tokio::fs::remove_file(&tmp_full).await;
+            return;
+        }
+        // Duration sanity: a silently-broken concat (e.g. only one part copied)
+        // is discarded rather than promoted.
+        let (head_d, live_d, full_d) = (
+            media_duration_secs(&head_p).await.unwrap_or(0),
+            media_duration_secs(&live_p).await.unwrap_or(0),
+            media_duration_secs(&tmp_full).await.unwrap_or(0),
+        );
+        let expected = head_d + live_d;
+        if expected > 0 && ((full_d - expected).abs() > 5 + expected / 50) {
+            warn!(
+                rec_id,
+                full_d, expected, "head concat: joined duration implausible — discarding"
+            );
+            finish(crate::events::TaskOutcome::Failed(format!(
+                "joined duration {full_d}s vs expected {expected}s"
+            )));
+            let _ = tokio::fs::remove_file(&tmp_full).await;
+            return;
+        }
+        // Idempotency: another completion path may have joined while we muxed.
+        if matches!(
+            self.store.backfill_concat_info(rec_id).ok().flatten(),
+            Some((_, _, _, Some(_)))
+        ) {
+            let _ = tokio::fs::remove_file(&tmp_full).await;
+            finish(crate::events::TaskOutcome::Completed);
+            return;
+        }
+        match rename_or_shorten(&tmp_full, &out_dir, &stem, "full.mkv").await {
+            Ok(dest) => {
+                let _ = self
+                    .store
+                    .set_recording_full_path(rec_id, &dest.to_string_lossy());
+                let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
+                info!(rec_id, "head concat: full stream ready at {}", dest.display());
+                finish(crate::events::TaskOutcome::CompletedWithNote(
+                    "head + live joined (parts kept)".into(),
+                ));
+            }
+            Err(e) => {
+                warn!(rec_id, "head concat: promote failed: {e:#}");
+                finish(crate::events::TaskOutcome::Failed(format!("promote: {e}")));
+            }
+        }
     }
 
     async fn run_process(
@@ -4873,6 +5384,8 @@ fn recording_from_detached(row: &DetachedRow) -> Recording {
         vod_dl_state: None,
         vod_dl_path: None,
         vod_dl_video_id: None,
+        backfill_path: None,
+        full_path: None,
     }
 }
 
@@ -5143,6 +5656,80 @@ pub async fn probe_formats(tool: Tool, url: &str, auth: &AuthSource) -> Result<S
         Ok(format!("(no output; exit {:?})", out.status.code()))
     } else {
         Ok(s)
+    }
+}
+
+/// Losslessly concatenate two same-encode MKVs (`head` then `tail`) into `dst`
+/// via ffmpeg's concat demuxer (`-c copy`). `-fflags +genpts` regenerates
+/// timestamps across the seam and `-avoid_negative_ts make_zero` keeps the
+/// joined timeline monotonic. The list file lives in `list_dir` (a `.cache\`
+/// dir) and is removed afterwards. Caller is responsible for verifying codec
+/// compatibility first — mismatched parameters produce a broken file, not an
+/// ffmpeg error.
+async fn concat_mkvs(
+    list_dir: &Path,
+    head: &Path,
+    tail: &Path,
+    dst: &Path,
+) -> anyhow::Result<()> {
+    use std::process::Stdio;
+
+    // ffconcat quoting: single-quote each path, escaping embedded quotes.
+    fn entry(p: &Path) -> String {
+        format!("file '{}'", p.to_string_lossy().replace('\'', r"'\''"))
+    }
+    let stem = dst
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "concat".into());
+    let list_path = list_dir.join(format!("{stem}.concat.txt"));
+    let list = format!("ffconcat version 1.0\n{}\n{}\n", entry(head), entry(tail));
+    tokio::fs::write(&list_path, list).await?;
+
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-y")
+        .arg("-fflags")
+        .arg("+genpts")
+        .arg("-f")
+        .arg("concat")
+        .arg("-safe")
+        .arg("0")
+        .arg("-i")
+        .arg(&list_path)
+        .arg("-map")
+        .arg("0:v?")
+        .arg("-map")
+        .arg("0:a?")
+        .arg("-c")
+        .arg("copy")
+        .arg("-avoid_negative_ts")
+        .arg("make_zero")
+        .arg(dst)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let out = cmd.output().await;
+    let _ = tokio::fs::remove_file(&list_path).await;
+    let out = out?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let tail_lines: Vec<&str> = stderr
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .rev()
+            .take(3)
+            .collect();
+        let tail_msg: String = tail_lines.into_iter().rev().collect::<Vec<_>>().join(" | ");
+        anyhow::bail!(
+            "ffmpeg concat failed (exit {:?}): {tail_msg}",
+            out.status.code()
+        )
     }
 }
 
@@ -5838,6 +6425,29 @@ const COLLISION_SUFFIX_RESERVE: usize = 10;
 /// `title-tba`/`games-tba` name.
 const MAX_STEM_UTF16_LEN: usize =
     NTFS_MAX_COMPONENT_UTF16 - LONGEST_COMPANION_SUFFIX_LEN - COLLISION_SUFFIX_RESERVE; // 229
+
+/// Total-path budget for tool CHILD processes. yt-dlp/streamlink are Python
+/// without a long-path manifest, so the WHOLE path (not just each component)
+/// must stay under Windows' MAX_PATH of 260 WCHARs — our own Rust I/O is
+/// exempt (std uses `\\?\` verbatim paths), which is why the per-component
+/// cap alone was not enough: a 2026-07-06 VOD-archive download died in 3 s
+/// because `.cache\{232-unit stem}.vod.mp4.ytdl` came to 263 units.
+const MAX_CHILD_PATH_UTF16: usize = 240; // 260 minus drive/NUL/safety headroom
+
+/// Longest working-file suffix a child appends under `.cache\`:
+/// yt-dlp `.fNNN.webm.part` (15) beats `.mp4.ytdl` / `.temp.mkv` (9). Round up.
+const LONGEST_CHILD_SUFFIX_UTF16: usize = 16;
+
+/// Cap `stem` so `{dir}\.cache\{stem}{worst child suffix}{collision suffix}`
+/// stays under [`MAX_CHILD_PATH_UTF16`] for the tool child process — a
+/// total-path cap layered on top of `expand_template`'s per-component cap.
+fn stem_capped_for_child_path(dir: &Path, stem: &str) -> String {
+    let cache_units = cache_dir(dir).to_string_lossy().encode_utf16().count();
+    let budget = MAX_CHILD_PATH_UTF16
+        .saturating_sub(cache_units + 1 + LONGEST_CHILD_SUFFIX_UTF16 + COLLISION_SUFFIX_RESERVE)
+        .max(20); // pathological deep dirs still get a usable name
+    stem_fitting_budget(stem, budget.min(MAX_STEM_UTF16_LEN))
+}
 
 /// Build the `{games}` value from the categories played: distinct names in order
 /// of first appearance (case-insensitive dedup), joined with `, ` and capped to
@@ -6583,7 +7193,11 @@ async fn meta_watcher(
 
 /// Find the actual output when the predicted path is missing: the largest file
 /// in `predicted`'s directory whose name shares its stem (e.g. yt-dlp wrote
-/// `<stem>.webm` instead of the predicted `<stem>.mkv`).
+/// `<stem>.webm` instead of the predicted `<stem>.mkv`). Tool working/side
+/// files sharing the stem (`.log`, `.ytdl`, `.part`, chat/subtitle sidecars)
+/// are never candidates — a failed download whose only stem-mate was its own
+/// log file used to get that log promoted as the "video" and classified
+/// completed (2026-07-06 incident).
 async fn newest_with_stem(predicted: &Path) -> Option<PathBuf> {
     let dir = predicted.parent()?;
     let stem = predicted.file_stem()?.to_string_lossy().into_owned();
@@ -6591,7 +7205,7 @@ async fn newest_with_stem(predicted: &Path) -> Option<PathBuf> {
     let mut entries = tokio::fs::read_dir(dir).await.ok()?;
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with(&stem) {
+        if name.starts_with(&stem) && plausible_media_output(&name[stem.len()..]) {
             let len = entry.metadata().await.map(|m| m.len()).unwrap_or(0);
             if len > 0 && best.as_ref().map(|(b, _)| len > *b).unwrap_or(true) {
                 best = Some((len, entry.path()));
@@ -6599,6 +7213,25 @@ async fn newest_with_stem(predicted: &Path) -> Option<PathBuf> {
         }
     }
     best.map(|(_, p)| p)
+}
+
+/// True when `rest` (a filename minus the predicted stem, e.g. `".mkv"` or
+/// `" (2).webm"` or `".vod.log"`) names a plausible final media output rather
+/// than a tool working/side file.
+fn plausible_media_output(rest: &str) -> bool {
+    let lower = rest.to_ascii_lowercase();
+    // Working/side files a tool leaves next to (or instead of) the video.
+    const NEVER: [&str; 8] = [
+        ".log", ".ytdl", ".part", ".json", ".jsonl", ".vtt", ".m3u8", ".txt",
+    ];
+    if NEVER.iter().any(|s| lower.ends_with(s)) || lower.contains(".temp.") {
+        return false;
+    }
+    const MEDIA_EXTS: [&str; 8] = ["mkv", "mp4", "webm", "ts", "mov", "flv", "m4a", "opus"];
+    match lower.rsplit_once('.') {
+        Some((_, ext)) => MEDIA_EXTS.contains(&ext),
+        None => false,
+    }
 }
 
 /// True when a capture produced no footage because the stream wasn't actually
@@ -6993,18 +7626,39 @@ fn civil_from_unix_utc(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
 
 // ---------- Twitch VOD background checker ----------
 
-/// How long to wait between polling attempts.
+/// How long to wait between polling attempts (YouTube/Kick VOD waits; the
+/// Twitch check uses the faster [`vod_poll_delay_secs`] schedule).
 const VOD_POLL_INTERVAL_SECS: u64 = 5 * 60;
 /// Maximum number of polls before giving up (5 min × 12 = 60 min total).
 const VOD_MAX_POLLS: u32 = 12;
-/// Maximum delta between a VOD's `created_at` and the broadcast's `went_live_at`
-/// for them to be considered the same stream (2 hours).
-const VOD_MATCH_WINDOW_SECS: i64 = 2 * 3600;
+
+/// Delay BEFORE 0-based Twitch VOD poll `n`: immediate first check (Twitch
+/// publishes the archive within seconds of stream end), 25 s cadence for the
+/// first ~10 minutes, then 5-minute backoff. The fast phase exists to win the
+/// race against DMCA muting, which is applied minutes AFTER publication and
+/// scrubs the original segments from the CDN — an archive download that
+/// starts inside that window captures the un-muted stream.
+fn vod_poll_delay_secs(poll: u32) -> u64 {
+    match poll {
+        0 => 0,
+        1..=24 => 25,
+        _ => 300,
+    }
+}
+/// Twitch poll count: 25 fast polls (~10 min) + 10 five-minute polls ≈ 60 min.
+const VOD_TOTAL_POLLS: u32 = 35;
+
+/// After a clean (un-muted) VOD is found: how long to keep re-checking its
+/// mute status, and how often. Mutes usually land within minutes; 2 h covers
+/// the slow tail.
+const MUTE_WATCH_POLLS: u32 = 40;
+const MUTE_WATCH_INTERVAL_SECS: u64 = 180;
 
 /// Background task that polls Helix `/videos` for the Twitch VOD produced by a
-/// just-finished recording. Polls every [`VOD_POLL_INTERVAL_SECS`] for up to
-/// [`VOD_MAX_POLLS`] attempts, then marks the recording `not_published` if
-/// no matching VOD appears.
+/// just-finished recording, on the [`vod_poll_delay_secs`] schedule (immediate,
+/// then fast, then backed off — [`VOD_TOTAL_POLLS`] attempts). Marks the
+/// recording `not_published` if no matching VOD appears. When a clean VOD is
+/// found it keeps watching for a late DMCA mute (see [`watch_vod_mute`]).
 async fn check_twitch_vod(
     ctx: Arc<DetectContext>,
     store: Arc<Store>,
@@ -7014,9 +7668,6 @@ async fn check_twitch_vod(
     login: String,
     went_live_at: Option<i64>,
 ) {
-    // Wait before the first check — VODs take several minutes to appear.
-    tokio::time::sleep(Duration::from_secs(VOD_POLL_INTERVAL_SECS)).await;
-
     let (client_id, token) = match ctx.twitch_helix_auth().await {
         Ok(t) => t,
         Err(e) => {
@@ -7032,10 +7683,8 @@ async fn check_twitch_vod(
         }
     };
 
-    for poll in 0..VOD_MAX_POLLS {
-        if poll > 0 {
-            tokio::time::sleep(Duration::from_secs(VOD_POLL_INTERVAL_SECS)).await;
-        }
+    for poll in 0..VOD_TOTAL_POLLS {
+        tokio::time::sleep(Duration::from_secs(vod_poll_delay_secs(poll))).await;
         match poll_twitch_vod(&ctx.http_client(), &client_id, &token, &user_id, went_live_at).await {
             Ok(Some((vod_id, muted_secs))) => {
                 let _ = store.set_recording_vod_found(rec_id, &vod_id, muted_secs);
@@ -7057,9 +7706,14 @@ async fn check_twitch_vod(
                     } else if setting_true(&store, crate::recovery::K_AUTO_RECOVER_MUTED) {
                         spawn_auto_recovery(&ctx, &store, &events, rec_id);
                     }
-                } else if archive_on {
-                    // Clean published VOD — download it (alongside / replace).
-                    enqueue_vod_archive(&store, &manual_tx, rec_id, &crate::vod_archive::twitch_vod_url(&vod_id));
+                } else {
+                    if archive_on {
+                        // Clean published VOD — download it (alongside / replace)
+                        // NOW, before a late mute can scrub the originals.
+                        enqueue_vod_archive(&store, &manual_tx, rec_id, &crate::vod_archive::twitch_vod_url(&vod_id));
+                    }
+                    // Mutes are applied minutes AFTER publication — keep watching.
+                    watch_vod_mute(&ctx, &store, &events, rec_id, &login, &vod_id).await;
                 }
                 return;
             }
@@ -7228,8 +7882,8 @@ fn spawn_auto_recovery(ctx: &Arc<DetectContext>, store: &Arc<Store>, events: &Ev
 }
 
 /// Query Helix `/helix/videos` for the streamer's most recent archive VODs and
-/// find one whose `created_at` is within [`VOD_MATCH_WINDOW_SECS`] of
-/// `went_live_at`. Returns `Some((vod_id, muted_secs))` on match, `None` if
+/// find one whose `created_at` is within [`crate::vod_archive::VOD_MATCH_WINDOW_SECS`]
+/// of `went_live_at`. Returns `Some((vod_id, muted_secs))` on match, `None` if
 /// no matching VOD exists yet, or an error on a transient API failure.
 async fn poll_twitch_vod(
     client: &reqwest::Client,
@@ -7264,7 +7918,7 @@ async fn poll_twitch_vod(
             continue;
         };
         let matches = match went_live_at {
-            Some(wl) => (created_ts - wl).abs() <= VOD_MATCH_WINDOW_SECS,
+            Some(wl) => (created_ts - wl).abs() <= crate::vod_archive::VOD_MATCH_WINDOW_SECS,
             None => true, // no anchor — accept the most recent archive
         };
         if !matches {
@@ -7277,6 +7931,112 @@ async fn poll_twitch_vod(
         return Ok(Some((vod_id.to_string(), muted_secs)));
     }
     Ok(None)
+}
+
+/// Keep re-checking a freshly-published, currently-clean VOD for a late DMCA
+/// mute (every [`MUTE_WATCH_INTERVAL_SECS`] for up to [`MUTE_WATCH_POLLS`]
+/// polls, ~2 h). On the first mute detection:
+///  - always record the muted seconds (narrow setter — never clobbers
+///    `vod_state`/`vod_id`);
+///  - archive already `'archived'`/`'replaced'` → leave the state alone: the
+///    download finished BEFORE the mute, so our copy has the original audio
+///    (the UI shows a "pre-mute" badge from `vod_muted_secs`);
+///  - otherwise (no download, still downloading, or failed) → the standard
+///    muted flow: state `'muted'`, `VodMuted` issue, CDN auto-recovery. A
+///    download still in flight keeps its `'muted'` label when it completes
+///    via `finalize_vod_archive`'s re-check — correct, since a mid-mute
+///    download may already contain silenced segments.
+async fn watch_vod_mute(
+    ctx: &Arc<DetectContext>,
+    store: &Arc<Store>,
+    events: &EventTx,
+    rec_id: i64,
+    login: &str,
+    vod_id: &str,
+) {
+    for _ in 0..MUTE_WATCH_POLLS {
+        tokio::time::sleep(Duration::from_secs(MUTE_WATCH_INTERVAL_SECS)).await;
+        // Re-resolve auth each poll — the watch outlives short-lived tokens.
+        let Ok((client_id, token)) = ctx.twitch_helix_auth().await else {
+            continue;
+        };
+        let muted_secs = match poll_twitch_vod_muted(&ctx.http_client(), &client_id, &token, vod_id).await
+        {
+            Ok(Some(m)) => m,
+            Ok(None) => return, // VOD delisted — nothing left to watch
+            Err(e) => {
+                warn!(rec_id, vod_id, "mute watch poll error: {e:#}");
+                continue;
+            }
+        };
+        if muted_secs <= 0 {
+            continue;
+        }
+        info!(rec_id, vod_id, muted_secs, "published VOD was muted after stream end");
+        let _ = store.set_recording_vod_muted_secs(rec_id, muted_secs);
+        let (state, dl_video_id) = store
+            .recording_vod_dl(rec_id)
+            .ok()
+            .flatten()
+            .unwrap_or((None, None));
+        match state.as_deref().unwrap_or_default() {
+            "archived" | "replaced" => {} // pre-mute archive in hand — the race was won
+            _ if archive_download_enabled(store, rec_id) => {
+                // Keep the video link: an in-flight download's completion hook
+                // looks the recording up BY that link (and re-checks the mute).
+                let _ = store.set_recording_vod_dl(rec_id, "muted", dl_video_id);
+                let channel =
+                    archive_channel_name(store, rec_id).unwrap_or_else(|| login.to_string());
+                let _ = events.send(AppEvent::VodMuted {
+                    recording_id: rec_id,
+                    channel,
+                    muted_secs,
+                });
+                spawn_auto_recovery(ctx, store, events, rec_id);
+            }
+            _ => {
+                if setting_true(store, crate::recovery::K_AUTO_RECOVER_MUTED) {
+                    spawn_auto_recovery(ctx, store, events, rec_id);
+                }
+            }
+        }
+        let _ = events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
+        return; // first detection ends the watch
+    }
+}
+
+/// Current muted-segment seconds for a KNOWN VOD via Helix `/videos?id=`.
+/// `Ok(None)` = the VOD is no longer listed (deleted/expired).
+async fn poll_twitch_vod_muted(
+    client: &reqwest::Client,
+    client_id: &str,
+    token: &str,
+    vod_id: &str,
+) -> anyhow::Result<Option<i64>> {
+    use anyhow::bail;
+    let resp = client
+        .get("https://api.twitch.tv/helix/videos")
+        .header("Client-Id", client_id)
+        .bearer_auth(token)
+        .query(&[("id", vod_id)])
+        .send()
+        .await?;
+    // Helix answers 404 for an unknown/deleted VOD id.
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        bail!("Helix /videos?id: {}", resp.status());
+    }
+    let v: serde_json::Value = resp.json().await?;
+    let Some(item) = v["data"].as_array().and_then(|d| d.first()) else {
+        return Ok(None);
+    };
+    let muted: i64 = item["muted_segments"]
+        .as_array()
+        .map(|segs| segs.iter().filter_map(|s| s["duration"].as_i64()).sum())
+        .unwrap_or(0);
+    Ok(Some(muted))
 }
 
 #[cfg(test)]
@@ -8560,6 +9320,54 @@ mod tests {
             "ERROR: unable to download video data: HTTP Error 403: Forbidden"
         ));
         assert!(!stream_ended_or_unavailable(""));
+    }
+
+    #[test]
+    fn stem_capped_for_child_path_keeps_cache_path_under_budget() {
+        // The 2026-07-06 incident: a 232-unit stem under A:\streams\Zentreya —
+        // `.cache\{stem}.vod.mp4.ytdl` came to 263 WCHARs and killed yt-dlp.
+        let dir = Path::new(r"A:\streams\Zentreya");
+        let long_stem = format!("Zentreya - 2026-07-06 22-08-19 - {}.vod", "x".repeat(200));
+        let capped = stem_capped_for_child_path(dir, &long_stem);
+        let cache_units = cache_dir(dir).to_string_lossy().encode_utf16().count();
+        let total = cache_units
+            + 1
+            + capped.encode_utf16().count()
+            + LONGEST_CHILD_SUFFIX_UTF16
+            + COLLISION_SUFFIX_RESERVE;
+        assert!(total <= MAX_CHILD_PATH_UTF16, "total {total}");
+        // A short stem is untouched.
+        assert_eq!(stem_capped_for_child_path(dir, "short.vod"), "short.vod");
+        // Deterministic.
+        assert_eq!(capped, stem_capped_for_child_path(dir, &long_stem));
+    }
+
+    #[test]
+    fn plausible_media_output_rejects_working_files() {
+        // Tool working/side files must never be promoted as the video.
+        for rest in [
+            ".log", ".vod.log", ".ytdl", ".mp4.ytdl", ".part", ".f303.webm.part",
+            ".chat.jsonl", ".live_chat.json", ".en.vtt", ".m3u8", ".temp.mkv", "",
+        ] {
+            assert!(!plausible_media_output(rest), "{rest:?} accepted");
+        }
+        // Real media outputs (incl. collision variants and differing exts).
+        for rest in [".mkv", ".vod.mkv", ".webm", ".mp4", ".ts", " (2).mkv", ".m4a"] {
+            assert!(plausible_media_output(rest), "{rest:?} rejected");
+        }
+    }
+
+    #[test]
+    fn vod_poll_schedule_is_immediate_then_fast_then_backed_off() {
+        // First check fires immediately at stream end (the mute race).
+        assert_eq!(vod_poll_delay_secs(0), 0);
+        // Fast phase: ~10 minutes of 25 s polls.
+        let fast: u64 = (1..=24).map(vod_poll_delay_secs).sum();
+        assert_eq!(fast, 600);
+        // Backoff phase: 5-minute polls; total window stays around an hour.
+        assert_eq!(vod_poll_delay_secs(25), 300);
+        let total: u64 = (0..VOD_TOTAL_POLLS).map(vod_poll_delay_secs).sum();
+        assert!((3600..=3900).contains(&total), "total {total}");
     }
 
     #[test]

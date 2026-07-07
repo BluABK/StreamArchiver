@@ -322,6 +322,13 @@ impl AppCore {
         self.rt
             .spawn(async move { sweep_sup.sweep_caches(skip_stems).await });
 
+        // Repair pass for post-stream VOD archives: replay completed downloads
+        // whose recording-side finalize never ran, and demote 'archived' rows
+        // that point at a bogus file (see reconcile_vod_archives).
+        let vod_sup = supervisor.clone();
+        self.rt
+            .spawn(async move { vod_sup.reconcile_vod_archives().await });
+
         // Periodic channel-asset refresh (keeps icons/badges/emotes current for
         // channels that rarely record).
         let asset_sup = supervisor.clone();

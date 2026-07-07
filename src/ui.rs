@@ -7797,7 +7797,7 @@ impl StreamArchiverApp {
                         crate::recovery::enumerate_qualities(&client, &found, max_conc).await;
                     let chosen = qualities.first().cloned().unwrap_or_else(|| "chunked".into());
                     let url = found.url.replacen("chunked", &chosen, 1);
-                    match crate::recovery::build_playlist(&client, &url, max_conc, probe_all).await {
+                    match crate::recovery::build_playlist(&client, &url, max_conc, probe_all, None).await {
                         Ok(r) => RecoverProbe::Found {
                             host: found.host,
                             matched_epoch: found.matched_epoch,
@@ -12228,6 +12228,18 @@ impl StreamArchiverApp {
                                                     }
                                                     _ => {}
                                                 }
+                                                // Live-DVR head backfill badges.
+                                                if t.full_path.is_some() {
+                                                    ui.colored_label(
+                                                        egui::Color32::from_rgb(70, 180, 90),
+                                                        "🧩 full",
+                                                    ).on_hover_text("Missed start was backfilled from the live VOD and joined with the capture — see {stem}.full.mkv (head + live parts kept).");
+                                                } else if t.backfill_path.is_some() {
+                                                    ui.colored_label(
+                                                        egui::Color32::from_rgb(80, 160, 220),
+                                                        "🧩 head",
+                                                    ).on_hover_text("Missed start was backfilled from the live VOD ({stem}.head.mkv) — the joined file lands after the recording finishes.");
+                                                }
                                                 // Post-stream published-VOD download badge.
                                                 match t.vod_dl_state.as_deref() {
                                                     Some("downloading") => {
@@ -12237,16 +12249,30 @@ impl StreamArchiverApp {
                                                         ).on_hover_text("Downloading the published VOD — see the Videos tab.");
                                                     }
                                                     Some("archived") => {
-                                                        ui.colored_label(
-                                                            egui::Color32::from_rgb(70, 180, 90),
-                                                            "📼 VOD",
-                                                        ).on_hover_text("The published VOD was downloaded alongside — right-click → Open downloaded VOD.");
+                                                        if t.vod_muted_secs.unwrap_or(0) > 0 {
+                                                            ui.colored_label(
+                                                                egui::Color32::from_rgb(70, 180, 90),
+                                                                "📼 VOD (pre-mute)",
+                                                            ).on_hover_text("The published VOD is now DMCA-muted — your downloaded archive predates the mute and has the original audio.");
+                                                        } else {
+                                                            ui.colored_label(
+                                                                egui::Color32::from_rgb(70, 180, 90),
+                                                                "📼 VOD",
+                                                            ).on_hover_text("The published VOD was downloaded alongside — right-click → Open downloaded VOD.");
+                                                        }
                                                     }
                                                     Some("replaced") => {
-                                                        ui.colored_label(
-                                                            egui::Color32::from_rgb(70, 180, 90),
-                                                            "📼 replaced",
-                                                        ).on_hover_text("The live capture was replaced by the published VOD.");
+                                                        if t.vod_muted_secs.unwrap_or(0) > 0 {
+                                                            ui.colored_label(
+                                                                egui::Color32::from_rgb(70, 180, 90),
+                                                                "📼 replaced (pre-mute)",
+                                                            ).on_hover_text("The live capture was replaced by the published VOD before Twitch muted it — this copy has the original audio.");
+                                                        } else {
+                                                            ui.colored_label(
+                                                                egui::Color32::from_rgb(70, 180, 90),
+                                                                "📼 replaced",
+                                                            ).on_hover_text("The live capture was replaced by the published VOD.");
+                                                        }
                                                     }
                                                     Some("muted") => {
                                                         ui.colored_label(
@@ -22385,6 +22411,8 @@ mod tests {
             vod_dl_state: None,
             vod_dl_path: None,
             vod_dl_video_id: None,
+            backfill_path: None,
+            full_path: None,
         }
     }
 

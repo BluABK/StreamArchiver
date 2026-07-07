@@ -32,7 +32,7 @@ pub const K_CHANNEL_VOD_SCOPE: &str = "channel_vod_scope";
 pub const K_MONITOR_VOD_SCOPE: &str = "monitor_vod_scope";
 
 /// Twitch/YouTube VOD match window: the published VOD's start vs. our go-live time.
-const VOD_MATCH_WINDOW_SECS: i64 = 2 * 3600;
+pub const VOD_MATCH_WINDOW_SECS: i64 = 2 * 3600;
 
 // ---------- three-level scope config (clone of SourceScopeConfig) ----------
 

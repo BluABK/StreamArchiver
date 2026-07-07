@@ -417,13 +417,21 @@ struct MediaSeg {
 /// muted-marked segments are HEAD-probed; plain segments pass through verbatim —
 /// the key win for long VODs. `probe_all = true` (a *deleted* VOD): every segment
 /// is probed and dead ones dropped.
+///
+/// `max_secs` truncates the source playlist to its first N seconds before any
+/// segment work (the head-backfill case: only the missed beginning is wanted,
+/// and the source is a still-growing live playlist).
 pub async fn build_playlist(
     client: &reqwest::Client,
     playlist_url: &str,
     max_conc: usize,
     probe_all: bool,
+    max_secs: Option<f64>,
 ) -> anyhow::Result<RecoveredPlaylist> {
-    let src = client.get(playlist_url).send().await?.error_for_status()?.text().await?;
+    let mut src = client.get(playlist_url).send().await?.error_for_status()?.text().await?;
+    if let Some(cap) = max_secs {
+        src = truncate_playlist(&src, cap);
+    }
     let base = playlist_prefix(playlist_url);
 
     // Enumerate media-segment lines (position-keyed).
@@ -517,6 +525,50 @@ pub async fn build_playlist(
     Ok(RecoveredPlaylist { text: out, total, present, unmuted_recovered, missing })
 }
 
+/// Truncate a playlist to its first `max_secs` seconds of media (by summed
+/// `#EXTINF` durations, so the cut lands on a segment boundary — up to one
+/// segment over), and terminate it with `#EXT-X-ENDLIST` if the source lacks
+/// one. A still-growing live `index-dvr.m3u8` has no ENDLIST, and without it
+/// ffmpeg treats the input as a live stream and waits at the end instead of
+/// finishing.
+fn truncate_playlist(src: &str, max_secs: f64) -> String {
+    let mut out = String::new();
+    let mut acc = 0.0f64;
+    let mut pending_extinf: Option<&str> = None;
+    for line in src.lines() {
+        let t = line.trim();
+        if t == "#EXT-X-ENDLIST" {
+            break; // re-appended below
+        }
+        if t.starts_with("#EXTINF") {
+            pending_extinf = Some(line);
+            continue;
+        }
+        if is_segment_line(t) {
+            if acc >= max_secs {
+                break;
+            }
+            if let Some(ex) = pending_extinf.take() {
+                acc += ex
+                    .trim()
+                    .strip_prefix("#EXTINF:")
+                    .and_then(|rest| rest.split(',').next())
+                    .and_then(|s| s.trim().parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                out.push_str(ex);
+                out.push('\n');
+            }
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str("#EXT-X-ENDLIST\n");
+    out
+}
+
 /// Sum the `#EXTINF:<secs>,` durations in a playlist file (for progress %).
 async fn playlist_duration_secs(path: &Path) -> Option<f64> {
     let text = tokio::fs::read_to_string(path).await.ok()?;
@@ -537,11 +589,14 @@ async fn playlist_duration_secs(path: &Path) -> Option<f64> {
 /// ffmpeg-mux a local rewritten playlist (referencing remote `.ts`) into an MKV.
 /// The `-protocol_whitelist` must precede `-i` (why `remux_ts_to_mkv` can't be
 /// reused). Emits `BackgroundTaskProgress` when a `(tx, task_id)` is given.
-/// `.kill_on_drop(true)` — recovery is ephemeral; quitting reaps it.
+/// `max_secs` adds `-t` (output cap — the head-backfill trim to the exact
+/// missed duration). `.kill_on_drop(true)` — recovery is ephemeral; quitting
+/// reaps it.
 pub async fn mux_playlist_to_mkv(
     playlist_path: &Path,
     dst: &Path,
     progress_tx: Option<(EventTx, u64)>,
+    max_secs: Option<f64>,
 ) -> anyhow::Result<()> {
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -567,8 +622,11 @@ pub async fn mux_playlist_to_mkv(
         .arg("copy")
         .arg("-progress")
         .arg("pipe:1")
-        .arg("-nostats")
-        .arg(dst)
+        .arg("-nostats");
+    if let Some(secs) = max_secs {
+        cmd.arg("-t").arg(format!("{secs:.3}"));
+    }
+    cmd.arg(dst)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -805,7 +863,7 @@ pub async fn run_recovery(
     let chosen = resolve_quality(&quality, &quals);
     let playlist_url = swap_quality(&found.url, &chosen);
 
-    let recovered = match build_playlist(&client, &playlist_url, max_conc, probe_all).await {
+    let recovered = match build_playlist(&client, &playlist_url, max_conc, probe_all, None).await {
         Ok(r) => r,
         Err(e) => {
             finish_fail(format!("playlist build failed: {e}"));
@@ -856,7 +914,7 @@ pub async fn run_recovery(
     let final_stem = crate::downloader::unique_stem(&out_dir, &base_stem, "mkv", None);
     let dst = out_dir.join(format!("{final_stem}.mkv"));
 
-    let mux = mux_playlist_to_mkv(&temp_playlist, &dst, Some((events.clone(), task_id))).await;
+    let mux = mux_playlist_to_mkv(&temp_playlist, &dst, Some((events.clone(), task_id)), None).await;
     let _ = tokio::fs::remove_file(&temp_playlist).await;
 
     match mux {
@@ -1206,6 +1264,30 @@ mod tests {
     }
 
     #[test]
+    fn truncate_playlist_stops_at_max_secs_and_appends_endlist() {
+        // A live playlist: no #EXT-X-ENDLIST, 10 s segments.
+        let src = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n\
+                   #EXTINF:10.000,\n0.ts\n#EXTINF:10.000,\n1.ts\n\
+                   #EXTINF:10.000,\n2.ts\n#EXTINF:10.000,\n3.ts\n";
+        // 25 s cap → segments 0,1,2 (acc hits 30 ≥ 25 before segment 3).
+        let out = truncate_playlist(src, 25.0);
+        assert!(out.contains("2.ts"), "{out}");
+        assert!(!out.contains("3.ts"), "{out}");
+        assert!(out.ends_with("#EXT-X-ENDLIST\n"), "{out}");
+        // Header lines survive.
+        assert!(out.contains("#EXT-X-TARGETDURATION:10"), "{out}");
+    }
+
+    #[test]
+    fn truncate_playlist_is_noop_when_shorter_than_cap() {
+        let src = "#EXTM3U\n#EXTINF:10.000,\n0.ts\n#EXT-X-ENDLIST\n";
+        let out = truncate_playlist(src, 300.0);
+        assert!(out.contains("0.ts"), "{out}");
+        // Exactly one terminator (the source's own is re-appended, not doubled).
+        assert_eq!(out.matches("#EXT-X-ENDLIST").count(), 1, "{out}");
+    }
+
+    #[test]
     fn playlist_prefix_strips_filename() {
         assert_eq!(
             playlist_prefix("https://host/abc_streamer_123/chunked/index-dvr.m3u8"),
@@ -1296,7 +1378,7 @@ mod tests {
                     .unwrap_or_else(|| panic!("{login} (gql={use_gql}): playlist should resolve"));
                 assert_eq!(found.matched_epoch, true_epoch, "{login} (gql={use_gql}): true start");
 
-                let recovered = build_playlist(&client, &found.url, 16, false).await.unwrap();
+                let recovered = build_playlist(&client, &found.url, 16, false, None).await.unwrap();
                 eprintln!(
                     "{login} (gql={use_gql}): {}/{} present, {} un-muted, {} missing",
                     recovered.present, recovered.total, recovered.unmuted_recovered, recovered.missing

@@ -1673,6 +1673,11 @@ pub struct Recording {
     /// `vod_dl_video_id` column via SQL); not read off the struct today.
     #[allow(dead_code)]
     pub vod_dl_video_id: Option<i64>,
+    /// A late-joined capture's missed beginning, downloaded from the growing
+    /// published-VOD playlist while the stream was live (`{stem}.head.mkv`).
+    pub backfill_path: Option<String>,
+    /// Lossless post-stream concat of head + live capture (`{stem}.full.mkv`).
+    pub full_path: Option<String>,
 }
 
 /// A recording whose published VOD came back DMCA-muted — a row of the Issues
@@ -1933,6 +1938,8 @@ mod tests {
             vod_dl_state: None,
             vod_dl_path: None,
             vod_dl_video_id: None,
+            backfill_path: None,
+            full_path: None,
         }
     }
 

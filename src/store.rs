@@ -33,7 +33,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 42;
+const SCHEMA_VERSION: i64 = 43;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -918,7 +918,19 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 42)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 42);
+        if version < 43 {
+            // Live DVR head backfill: a late-joined capture's missed beginning,
+            // downloaded from the growing published-VOD playlist while the
+            // stream is still live (`{stem}.head.mkv`), and the post-stream
+            // lossless concat of head + live capture (`{stem}.full.mkv`).
+            // NULL = no backfill was needed/attempted.
+            conn.execute_batch(
+                "ALTER TABLE recording ADD COLUMN backfill_path TEXT;
+                 ALTER TABLE recording ADD COLUMN full_path     TEXT;",
+            )?;
+            conn.pragma_update(None, "user_version", 43)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 43);
         Ok(())
     }
 
@@ -1802,6 +1814,94 @@ impl Store {
         Ok(())
     }
 
+    // ----- live DVR head backfill (capture-from-start for Twitch) -----
+
+    /// A recording's current lost-time value (`None` = not yet resolved).
+    pub fn recording_lost_secs(&self, id: i64) -> Result<Option<i64>> {
+        let conn = self.db();
+        let v = conn
+            .query_row(
+                "SELECT lost_secs FROM recording WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?;
+        Ok(v.flatten())
+    }
+
+    /// Attach the backfilled head file (`{stem}.head.mkv`) to a recording.
+    pub fn set_recording_backfill_path(&self, id: i64, path: &str) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE recording SET backfill_path=?2 WHERE id=?1",
+            params![id, path],
+        )?;
+        Ok(())
+    }
+
+    /// Attach the concatenated full file (`{stem}.full.mkv`) to a recording.
+    pub fn set_recording_full_path(&self, id: i64, path: &str) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE recording SET full_path=?2 WHERE id=?1",
+            params![id, path],
+        )?;
+        Ok(())
+    }
+
+    /// `(status, output_path, backfill_path, full_path)` — what the head-concat
+    /// step needs to decide whether both parts are ready to join.
+    #[allow(clippy::type_complexity)]
+    pub fn backfill_concat_info(
+        &self,
+        id: i64,
+    ) -> Result<Option<(String, String, Option<String>, Option<String>)>> {
+        let conn = self.db();
+        let row = conn
+            .query_row(
+                "SELECT status, COALESCE(output_path, ''), backfill_path, full_path
+                 FROM recording WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// True when no earlier take exists for the same monitor + platform stream —
+    /// only the earliest take of a stream owns the missed HEAD; later takes'
+    /// gaps are mid-stream and not this feature's job.
+    pub fn is_first_take_for_stream(
+        &self,
+        monitor_id: i64,
+        stream_id: &str,
+        started_at: i64,
+    ) -> Result<bool> {
+        let conn = self.db();
+        let earlier: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM recording
+             WHERE monitor_id = ?1 AND stream_id = ?2 AND started_at < ?3",
+            params![monitor_id, stream_id, started_at],
+            |r| r.get(0),
+        )?;
+        Ok(earlier == 0)
+    }
+
+    /// Recordings with a backfilled head that still lacks the final concat
+    /// (crash healing — the join is idempotent and re-runnable).
+    pub fn recordings_pending_head_concat(&self) -> Result<Vec<i64>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM recording
+             WHERE backfill_path IS NOT NULL AND full_path IS NULL
+               AND status != 'recording'",
+        )?;
+        let rows = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        Ok(rows)
+    }
+
     // ----- post-stream published-VOD download ("archive the VOD after end") -----
 
     /// Set the archive-download state + link the download job (`video.id`).
@@ -1875,6 +1975,92 @@ impl Store {
                  WHERE r.id = ?1",
                 params![rec_id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Completed archive downloads whose recording-side finalize never ran —
+    /// `vod_dl_state` still `'downloading'` (or reset to `'failed'` by the
+    /// startup sweep) while the linked video row says `'completed'`. Rows whose
+    /// video is still in the detached registry are excluded: those are being
+    /// adopted by `reconcile_detached` and will finalize through that path.
+    /// Returns `(rec_id, video_id, video output_path)`.
+    pub fn vod_archive_replay_candidates(&self) -> Result<Vec<(i64, i64, String)>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT r.id, v.id, COALESCE(v.output_path, '')
+             FROM recording r JOIN video v ON v.id = r.vod_dl_video_id
+             WHERE r.vod_dl_state IN ('downloading', 'failed') AND v.status = 'completed'
+               AND v.id NOT IN (SELECT ref_id FROM detached_process WHERE kind = 'video')",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Every recording currently claiming a terminal `'archived'` state —
+    /// audited at startup for bogus archives (e.g. a promoted log file).
+    /// Returns `(rec_id, vod_dl_video_id, vod_dl_path, vod_muted_secs, vod_id)`.
+    #[allow(clippy::type_complexity)]
+    pub fn vod_archived_rows(
+        &self,
+    ) -> Result<Vec<(i64, Option<i64>, String, i64, Option<String>)>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id, vod_dl_video_id, COALESCE(vod_dl_path, ''),
+                    COALESCE(vod_muted_secs, 0), vod_id
+             FROM recording WHERE vod_dl_state = 'archived'",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// `(vod_dl_state, vod_dl_video_id)` for one recording — what the post-find
+    /// mute watcher needs to decide whether the archive predates the mute.
+    pub fn recording_vod_dl(&self, id: i64) -> Result<Option<(Option<String>, Option<i64>)>> {
+        let conn = self.db();
+        let row = conn
+            .query_row(
+                "SELECT vod_dl_state, vod_dl_video_id FROM recording WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Update only the muted-seconds count (post-find mute watcher) — must not
+    /// clobber `vod_state`/`vod_id` the way `set_recording_vod_found` would.
+    pub fn set_recording_vod_muted_secs(&self, id: i64, muted_secs: i64) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE recording SET vod_muted_secs=?2 WHERE id=?1",
+            params![id, muted_secs],
+        )?;
+        Ok(())
+    }
+
+    /// `(live output_path, went_live_at, ended_at)` — what the archive sanity
+    /// check needs to derive the expected VOD duration (probe the live file,
+    /// else the recorded wall-clock span).
+    #[allow(clippy::type_complexity)]
+    pub fn recording_duration_hint(
+        &self,
+        rec_id: i64,
+    ) -> Result<Option<(String, Option<i64>, Option<i64>)>> {
+        let conn = self.db();
+        let row = conn
+            .query_row(
+                "SELECT COALESCE(output_path, ''), went_live_at, ended_at
+                 FROM recording WHERE id = ?1",
+                params![rec_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
         Ok(row)
@@ -2875,7 +3061,8 @@ impl Store {
                     take_group, COALESCE(notes, ''),
                     vod_id, vod_state, vod_muted_secs,
                     recovery_state, recovered_path,
-                    vod_dl_state, vod_dl_path, vod_dl_video_id
+                    vod_dl_state, vod_dl_path, vod_dl_video_id,
+                    backfill_path, full_path
              FROM recording WHERE monitor_id = ?1 ORDER BY started_at, id",
         )?;
         let rows = stmt
@@ -2909,6 +3096,8 @@ impl Store {
                     vod_dl_state: r.get(25)?,
                     vod_dl_path: r.get(26)?,
                     vod_dl_video_id: r.get(27)?,
+                    backfill_path: r.get(28)?,
+                    full_path: r.get(29)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2960,6 +3149,8 @@ impl Store {
                     vod_dl_state: None,
                     vod_dl_path: None,
                     vod_dl_video_id: None,
+                    backfill_path: None,
+                    full_path: None,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3016,6 +3207,8 @@ impl Store {
                     vod_dl_state: None,
                     vod_dl_path: None,
                     vod_dl_video_id: None,
+                    backfill_path: None,
+                    full_path: None,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3094,6 +3287,8 @@ impl Store {
                     vod_dl_state: None,
                     vod_dl_path: None,
                     vod_dl_video_id: None,
+                    backfill_path: None,
+                    full_path: None,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3163,6 +3358,8 @@ impl Store {
                     vod_dl_state: None,
                     vod_dl_path: None,
                     vod_dl_video_id: None,
+                    backfill_path: None,
+                    full_path: None,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3348,6 +3545,8 @@ impl Store {
                     vod_dl_state: None,
                     vod_dl_path: None,
                     vod_dl_video_id: None,
+                    backfill_path: None,
+                    full_path: None,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -4568,5 +4767,131 @@ mod tests {
         // Deleting the monitor cascades to posts + media.
         store.delete_monitor(mid).unwrap();
         assert!(store.list_community_posts(None, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn migration_43_backfill_columns_roundtrip() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        let rid = store
+            .insert_recording(mid, 100, "C:/tmp/a.mkv", Some(50), false, Some("s1"), None)
+            .unwrap();
+
+        store.set_recording_backfill_path(rid, "C:/tmp/a.head.mkv").unwrap();
+        store.set_recording_full_path(rid, "C:/tmp/a.full.mkv").unwrap();
+        let recs = store.recordings_for_monitor(mid).unwrap();
+        assert_eq!(recs[0].backfill_path.as_deref(), Some("C:/tmp/a.head.mkv"));
+        assert_eq!(recs[0].full_path.as_deref(), Some("C:/tmp/a.full.mkv"));
+
+        let (status, out, head, full) = store.backfill_concat_info(rid).unwrap().unwrap();
+        assert_eq!(status, "recording");
+        assert_eq!(out, "C:/tmp/a.mkv");
+        assert_eq!(head.as_deref(), Some("C:/tmp/a.head.mkv"));
+        assert_eq!(full.as_deref(), Some("C:/tmp/a.full.mkv"));
+    }
+
+    #[test]
+    fn pending_head_concat_needs_ended_take_without_full() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        let rid = store
+            .insert_recording(mid, 100, "C:/tmp/a.mkv", Some(50), false, Some("s1"), None)
+            .unwrap();
+        // Still recording → not pending even with a head present.
+        store.set_recording_backfill_path(rid, "C:/tmp/a.head.mkv").unwrap();
+        assert!(store.recordings_pending_head_concat().unwrap().is_empty());
+        // Finished → pending.
+        store.finish_recording(rid, 200, 1, Some(0), "completed", "C:/tmp/a.mkv", "").unwrap();
+        assert_eq!(store.recordings_pending_head_concat().unwrap(), vec![rid]);
+        // Joined → no longer pending.
+        store.set_recording_full_path(rid, "C:/tmp/a.full.mkv").unwrap();
+        assert!(store.recordings_pending_head_concat().unwrap().is_empty());
+    }
+
+    #[test]
+    fn first_take_for_stream_ignores_other_streams_and_later_takes() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        store
+            .insert_recording(mid, 100, "C:/tmp/a.mkv", Some(50), false, Some("s1"), None)
+            .unwrap();
+        // The first take of s1 owns the head; a retake (later start) does not.
+        assert!(store.is_first_take_for_stream(mid, "s1", 100).unwrap());
+        assert!(!store.is_first_take_for_stream(mid, "s1", 200).unwrap());
+        // A different stream id is unaffected by s1's takes.
+        assert!(store.is_first_take_for_stream(mid, "s2", 200).unwrap());
+    }
+
+    #[test]
+    fn vod_muted_secs_setter_preserves_vod_state_and_id() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        let rid = store
+            .insert_recording(mid, 100, "C:/tmp/a.mkv", Some(50), false, Some("s1"), None)
+            .unwrap();
+        store.set_recording_vod_found(rid, "999", 0).unwrap();
+        store.set_recording_vod_muted_secs(rid, 360).unwrap();
+        let rec = &store.recordings_for_monitor(mid).unwrap()[0];
+        assert_eq!(rec.vod_id.as_deref(), Some("999"), "vod_id untouched");
+        assert_eq!(rec.vod_state.as_deref(), Some("found"), "vod_state untouched");
+        assert_eq!(rec.vod_muted_secs, Some(360));
+    }
+
+    #[test]
+    fn vod_archive_replay_candidates_excludes_detached_and_terminal() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+
+        // rec1: 'downloading' with a completed video → replay candidate.
+        let r1 = store
+            .insert_recording(mid, 100, "C:/tmp/a.mkv", Some(50), false, Some("s1"), None)
+            .unwrap();
+        let v1 = store.insert_video(&sample_video()).unwrap();
+        store.finish_video(v1, 200, 10, Some(0), "completed", "C:/tmp/a.vod.mkv", "").unwrap();
+        store.set_recording_vod_dl(r1, "downloading", Some(v1)).unwrap();
+
+        // rec2: video completed but the recording already archived → not a candidate.
+        let r2 = store
+            .insert_recording(mid, 300, "C:/tmp/b.mkv", Some(250), false, Some("s2"), None)
+            .unwrap();
+        let v2 = store.insert_video(&sample_video()).unwrap();
+        store.finish_video(v2, 400, 10, Some(0), "completed", "C:/tmp/b.vod.mkv", "").unwrap();
+        store.set_recording_vod_dl(r2, "downloading", Some(v2)).unwrap();
+        store.set_recording_vod_archived(r2, "C:/tmp/b.vod.mkv", "archived").unwrap();
+
+        let cands = store.vod_archive_replay_candidates().unwrap();
+        assert_eq!(
+            cands,
+            vec![(r1, v1, "C:/tmp/a.vod.mkv".to_string())],
+            "only the stuck-downloading row replays"
+        );
+
+        // A video still in the detached registry is being adopted — excluded.
+        store
+            .register_detached(&crate::models::DetachedRow {
+                kind: DetachedKind::Video,
+                ref_id: v1,
+                monitor_id: None,
+                pid: 1,
+                proc_start: 0,
+                job_name: String::new(),
+                log_path: String::new(),
+                capture_path: String::new(),
+                final_path: String::new(),
+                remux_to_mkv: false,
+                take_group: None,
+                spawn_build: String::new(),
+                started_at: 0,
+                secondary: false,
+                stream_id: None,
+                went_live_at: None,
+            })
+            .unwrap();
+        assert!(store.vod_archive_replay_candidates().unwrap().is_empty());
     }
 }
