@@ -5691,6 +5691,12 @@ fn load_asset_history_lines(name: &str, accounts: &[AssetAccount]) -> Vec<String
 struct AssetThumb {
     /// Human label, e.g. "Twitch icon" / "YouTube banner".
     label: String,
+    /// Which account this asset belongs to (lets the instance Properties
+    /// window filter the channel-wide strip down to its own account).
+    platform: Platform,
+    account: String,
+    /// `"icon"` or `"banner"`.
+    kind: &'static str,
     /// Absolute path on disk (opened on click).
     path: std::path::PathBuf,
     tex: egui::TextureHandle,
@@ -18264,10 +18270,23 @@ impl StreamArchiverApp {
     /// Instance (monitor) properties window — header + monitor-specific info.
     #[allow(deprecated)]
     /// Render every open instance-properties window (one per monitor).
+    /// True if any open instance-Properties popup belongs to the given channel
+    /// (those windows share the channel's per-open asset caches).
+    fn instance_props_open_for_channel(&self, cid: i64) -> bool {
+        self.properties_popups
+            .iter()
+            .any(|&pm| self.rows.iter().any(|r| r.monitor.id == pm && r.channel.id == cid))
+    }
+
     fn instance_properties_windows(&mut self, ctx: &egui::Context) {
         let mut closed: Vec<i64> = Vec::new();
-        for i in 0..self.properties_popups.len() {
-            let mid = self.properties_popups[i];
+        // Snapshot: a window closed mid-load removes itself from the list
+        // inside drive_props_load, so indexed iteration could skip/overrun.
+        let ids: Vec<i64> = self.properties_popups.clone();
+        for mid in ids {
+            if !self.properties_popups.contains(&mid) {
+                continue; // removed mid-loop (closed while loading)
+            }
             if self.instance_properties_window(ctx, mid) {
                 closed.push(mid);
             }
@@ -18276,6 +18295,17 @@ impl StreamArchiverApp {
             self.properties_popups.retain(|m| !closed.contains(m));
             for mid in closed {
                 self.instance_scope_drafts.remove(&mid);
+                // Free the shared per-channel asset caches when this was the
+                // last Properties window (channel or instance) showing them.
+                let cid = self.rows.iter().find(|r| r.monitor.id == mid).map(|r| r.channel.id);
+                if let Some(cid) = cid
+                    && !self.channel_properties_popups.contains(&cid)
+                    && !self.instance_props_open_for_channel(cid)
+                {
+                    self.channel_asset_thumbs.remove(&cid);
+                    self.channel_emote_counts.remove(&cid);
+                    self.channel_asset_status.remove(&cid);
+                }
             }
         }
     }
@@ -18288,18 +18318,83 @@ impl StreamArchiverApp {
         };
         let ch = &row.channel;
         let m = &row.monitor;
+        let cid = ch.id;
 
-        let (platforms, accounts) = {
+        let accounts = {
             let mons: Vec<&MonitorWithChannel> =
-                self.rows.iter().filter(|r| r.channel.id == ch.id).collect();
-            (channel_platforms(&mons), channel_asset_accounts(&mons))
+                self.rows.iter().filter(|r| r.channel.id == cid).collect();
+            channel_asset_accounts(&mons)
+        };
+        // This instance's own asset account (None for Generic URLs — no asset
+        // fetcher, so no assets section). Matched by (platform, slug) rather
+        // than monitor id: two tools on one URL share the sibling's entry.
+        let inst_account: Option<AssetAccount> = if m.platform() == Platform::Generic {
+            None
+        } else {
+            let slug = asset_account(&m.url, m.platform());
+            accounts
+                .iter()
+                .find(|a| a.platform == m.platform() && a.account == slug)
+                .cloned()
         };
 
-        let icon_tex = self
-            .channel_icons
-            .entry(ch.id)
-            .or_insert_with(|| resolve_channel_icon(ch, &accounts, ctx))
-            .clone();
+        // The assets shown below come from the same per-channel caches the
+        // channel Properties window uses, filtered to this account — loaded
+        // OFF the UI thread on first open (see drive_props_load).
+        if inst_account.is_some()
+            && !self.channel_asset_status.contains_key(&cid)
+            && !self.drive_props_load(cid, ch, &accounts, Some(mid), ctx)
+        {
+            return false; // still loading — placeholder is on screen
+        }
+
+        let thumbs = if inst_account.is_some() {
+            self.channel_asset_thumbs
+                .entry(cid)
+                .or_insert_with(|| load_channel_asset_thumbs(ch, &accounts, ctx))
+                .clone()
+        } else {
+            Vec::new()
+        };
+        let emote_counts = if inst_account.is_some() {
+            self.channel_emote_counts
+                .entry(cid)
+                .or_insert_with(|| emote_provider_counts(&ch.name, &accounts))
+                .clone()
+        } else {
+            Vec::new()
+        };
+        let asset_status = if inst_account.is_some() {
+            self.channel_asset_status
+                .entry(cid)
+                .or_insert_with(|| build_platform_asset_status(&ch.name, &accounts))
+                .clone()
+        } else {
+            Vec::new()
+        };
+
+        // Header icon: this instance's own account avatar when fetched; the
+        // channel-level icon as the fallback (nothing fetched yet / Generic).
+        let icon_tex = inst_account
+            .as_ref()
+            .and_then(|acc| {
+                thumbs
+                    .iter()
+                    .find(|t| {
+                        t.kind == "icon" && t.platform == acc.platform && t.account == acc.account
+                    })
+                    .map(|t| t.tex.clone())
+            })
+            .or_else(|| {
+                self.channel_icons
+                    .entry(cid)
+                    .or_insert_with(|| resolve_channel_icon(ch, &accounts, ctx))
+                    .clone()
+            });
+
+        let mut refetch = false;
+        let mut open_emote_viewer: Option<(EmoteProvider, AssetAccount)> = None;
+        let mut open_asset_history = false;
 
         self.instance_scope_drafts
             .entry(m.id)
@@ -18342,25 +18437,22 @@ impl StreamArchiverApp {
                     ui.vertical(|ui| {
                         ui.add_space(4.0);
                         ui.heading(&ch.name);
+                        // This instance's platform + source URL (not the
+                        // channel-wide platform list — that's channel Properties).
                         ui.horizontal(|ui| {
                             let ptex = self
                                 .platform_tex
                                 .get_or_insert_with(|| PlatformTextures::load(ui.ctx()));
-                            for &p in &platforms {
-                                if let Some(t) = ptex.get(p) {
-                                    ui.add(
-                                        egui::Image::from_texture(t)
-                                            .max_size(egui::vec2(14.0, 14.0)),
-                                    );
-                                }
+                            if let Some(t) = ptex.get(m.platform()) {
+                                ui.add(
+                                    egui::Image::from_texture(t)
+                                        .max_size(egui::vec2(14.0, 14.0)),
+                                );
                             }
-                            let names: Vec<&str> =
-                                platforms.iter().map(|p| p.label()).collect();
-                            ui.label(if names.is_empty() {
-                                "—".to_string()
-                            } else {
-                                names.join(" · ")
-                            });
+                            if ui.link(instance_label(&m.url)).on_hover_text(&m.url).clicked()
+                            {
+                                ui.ctx().open_url(egui::OpenUrl::new_tab(m.url.clone()));
+                            }
                         });
                     });
                 });
@@ -18419,6 +18511,183 @@ impl StreamArchiverApp {
                         ui.end_row();
                     });
 
+                // ── Assets (this instance's account) ─────────────────────
+                // The same data the channel Properties window shows, filtered
+                // to the account this instance's URL resolves to.
+                if let Some(acc) = &inst_account {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.strong("Assets (this account)");
+                        if ui
+                            .button("⟳ Refetch")
+                            .on_hover_text(format!(
+                                "Fetch icon / banner / badges / emotes for {} now — \
+                                 ignores the 24h cache.",
+                                acc.label,
+                            ))
+                            .clicked()
+                        {
+                            refetch = true;
+                        }
+                        if ui
+                            .button("📂")
+                            .on_hover_text(
+                                "Open this account's asset folder (icons, banners, and the \
+                                 history/ archive of older versions).",
+                            )
+                            .clicked()
+                        {
+                            let dir = channel_asset_dir(&ch.name, acc.platform, &acc.account);
+                            let target = if dir.is_dir() {
+                                dir
+                            } else {
+                                // Nothing fetched yet — fall back to the channel root.
+                                crate::app_paths::asset_cache_dir()
+                                    .join("channel_assets")
+                                    .join(crate::downloader::sanitize_filename(&ch.name))
+                            };
+                            crate::platform::open_path(&target);
+                        }
+                        if ui
+                            .button("🕑 History")
+                            .on_hover_text(
+                                "Show recorded asset changes over time (added / removed \
+                                 emotes, icon / banner / name-colour replacements) for \
+                                 this account only.",
+                            )
+                            .clicked()
+                        {
+                            open_asset_history = true;
+                        }
+                    });
+
+                    // Thumbnails: this account's original icon/banner. Hover for
+                    // size, Alt to preview full-res, click to open the file.
+                    let own_thumbs: Vec<&AssetThumb> = thumbs
+                        .iter()
+                        .filter(|t| t.platform == acc.platform && t.account == acc.account)
+                        .collect();
+                    if !own_thumbs.is_empty() {
+                        ui.add_space(3.0);
+                        const THUMB_H: f32 = 56.0;
+                        ui.horizontal_wrapped(|ui| {
+                            for t in own_thumbs {
+                                let (w, h) = t.dims;
+                                let aspect = if h > 0 { w as f32 / h as f32 } else { 1.0 };
+                                let width = (THUMB_H * aspect).min(THUMB_H * 4.0);
+                                let resp = ui
+                                    .add(
+                                        egui::Image::from_texture(&t.tex)
+                                            .fit_to_exact_size(egui::vec2(width, THUMB_H))
+                                            .corner_radius(egui::CornerRadius::same(4))
+                                            .sense(egui::Sense::click()),
+                                    )
+                                    .on_hover_text(format!(
+                                        "{} — {w}×{h} px\nAlt: preview full size · click: open file",
+                                        t.label,
+                                    ));
+                                queue_alt_image_preview(ui.ctx(), &resp, &t.tex);
+                                if resp.clicked() {
+                                    crate::platform::open_path(&t.path);
+                                }
+                            }
+                        });
+                    }
+
+                    // Status row (same columns as the channel window, minus the
+                    // per-row ⟳ — the header Refetch covers this one account).
+                    ui.add_space(4.0);
+                    egui::Grid::new("inst_props_assets")
+                        .num_columns(6)
+                        .spacing([12.0, 4.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.strong("Source");
+                            ui.strong("Icon");
+                            ui.strong("Banner");
+                            ui.strong("Badges");
+                            ui.strong("Emotes");
+                            ui.strong("Updated");
+                            ui.end_row();
+                            for st in asset_status.iter().filter(|st| {
+                                st.account.platform == acc.platform
+                                    && st.account.account == acc.account
+                            }) {
+                                ui.horizontal(|ui| {
+                                    let ptex = self.platform_tex.get_or_insert_with(|| {
+                                        PlatformTextures::load(ui.ctx())
+                                    });
+                                    if let Some(t) = ptex.get(st.account.platform) {
+                                        ui.add(
+                                            egui::Image::from_texture(t)
+                                                .max_size(egui::vec2(13.0, 13.0)),
+                                        );
+                                    }
+                                    ui.label(&st.account.label);
+                                });
+                                asset_status_cell(ui, st.icon_present, st.icon_variants);
+                                asset_status_cell(ui, st.banner_present, st.banner_variants);
+                                ui.label(if st.badges > 0 {
+                                    st.badges.to_string()
+                                } else {
+                                    "—".into()
+                                });
+                                ui.label(if st.emotes > 0 {
+                                    st.emotes.to_string()
+                                } else {
+                                    "—".into()
+                                });
+                                ui.label(&st.stamp);
+                                ui.end_row();
+                            }
+                        });
+
+                    // Emote viewer launchers for this account only.
+                    if let Some((eacc, counts)) = emote_counts
+                        .iter()
+                        .find(|(a, _)| a.platform == acc.platform && a.account == acc.account)
+                        && counts.iter().any(|(_, n)| *n > 0)
+                    {
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                                ui.strong("View emotes:");
+                                let ptex = self
+                                    .provider_tex
+                                    .get_or_insert_with(|| ProviderTextures::load(ui.ctx()))
+                                    .clone();
+                                for &(provider, count) in counts {
+                                    if count == 0 {
+                                        continue;
+                                    }
+                                    let resp = match provider {
+                                        EmoteProvider::SevenTv => ui.add(egui::ImageButton::new(
+                                            egui::Image::from_texture(&ptex.seventv)
+                                                .fit_to_exact_size(egui::vec2(18.0, 18.0)),
+                                        )),
+                                        EmoteProvider::Bttv => ui.add(egui::ImageButton::new(
+                                            egui::Image::from_texture(&ptex.bttv)
+                                                .fit_to_exact_size(egui::vec2(18.0, 18.0)),
+                                        )),
+                                        EmoteProvider::Twitch => ui.button("😀"),
+                                        EmoteProvider::Ffz => ui.button("FFZ"),
+                                    };
+                                    if resp
+                                        .on_hover_text(format!(
+                                            "View {} {} emote{} for {}",
+                                            count,
+                                            provider.label(),
+                                            if count == 1 { "" } else { "s" },
+                                            eacc.label,
+                                        ))
+                                        .clicked()
+                                    {
+                                        open_emote_viewer = Some((provider, eacc.clone()));
+                                    }
+                                }
+                            });
+                    }
+                }
+
                 // ── Schedule sources (this instance) ─────────────────────
                 ui.add_space(8.0);
                 ui.strong("Schedule sources (this instance)");
@@ -18451,6 +18720,47 @@ impl StreamArchiverApp {
             }
         }
 
+        // ⟳ Refetch dispatches outside the viewport closure (same cache-drop set
+        // as the channel window; channel_icons_small stays for the same
+        // viewport-race reason — it refreshes on AssetFetch completion).
+        if refetch && let Some(acc) = &inst_account {
+            self.core.manual(ManualCommand::RefetchAssets(mid));
+            self.channel_icons.remove(&cid);
+            self.channel_twitch_colors.remove(&cid);
+            self.channel_asset_thumbs.remove(&cid);
+            self.channel_emote_counts.remove(&cid);
+            self.channel_asset_status.remove(&cid);
+            self.status = format!("Refetching assets for {}…", acc.label);
+        }
+        // A launcher button was clicked — open (or refresh) the emote viewer
+        // for this channel+account+provider; other viewers stay open.
+        if let Some((provider, acc)) = open_emote_viewer {
+            let fresh = EmoteViewer::new(
+                ch.name.clone(),
+                acc.account.clone(),
+                acc.has_siblings,
+                provider,
+            );
+            match self.emote_viewers.iter_mut().find(|v| {
+                v.channel_name == ch.name && v.account == acc.account && v.provider == provider
+            }) {
+                Some(slot) => *slot = fresh,
+                None => self.emote_viewers.push(fresh),
+            }
+        }
+        // 🕑 History — the asset-history popup scoped to this account only.
+        if open_asset_history && let Some(acc) = &inst_account {
+            let fresh = AssetHistoryView::new(ch.name.clone(), std::slice::from_ref(acc));
+            match self
+                .asset_histories
+                .iter_mut()
+                .find(|h| h.channel_name == ch.name)
+            {
+                Some(slot) => *slot = fresh,
+                None => self.asset_histories.push(fresh),
+            }
+        }
+
         !open
     }
 
@@ -18463,11 +18773,16 @@ impl StreamArchiverApp {
     /// thread, so the UI thread can't freeze on a slow disk / AV scan / contended store.
     #[must_use]
     #[allow(deprecated)] // CentralPanel::show in an immediate viewport (matches the real window)
+    /// `instance_mid` is `Some(monitor id)` when the caller is an *instance*
+    /// Properties window (it shares the same per-channel caches): the loading
+    /// placeholder then uses that window's viewport id/title, and closing it
+    /// mid-load forgets the instance popup instead of the channel popup.
     fn drive_props_load(
         &mut self,
         cid: i64,
         ch: &Channel,
         accounts: &[AssetAccount],
+        instance_mid: Option<i64>,
         ctx: &egui::Context,
     ) -> bool {
         // Ensure a load for THIS channel is in flight (other windows' loads run
@@ -18550,12 +18865,24 @@ impl StreamArchiverApp {
         // morphs in place when the bundle lands.
         self.heartbeat.set_context(format!("Properties: {}", ch.name));
         self.heartbeat.set_activity(crate::watchdog::Activity::Properties);
+        let (vp_id, title, size) = match instance_mid {
+            Some(mid) => (
+                egui::ViewportId::from_hash_of(("instance_props_vp", mid)),
+                format!("Instance — {}", ch.name),
+                [480.0, 480.0],
+            ),
+            None => (
+                egui::ViewportId::from_hash_of(("channel_props_vp", cid)),
+                format!("Properties — {}", ch.name),
+                [480.0, 600.0],
+            ),
+        };
         let mut open = true;
         ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of(("channel_props_vp", cid)),
+            vp_id,
             egui::ViewportBuilder::default()
-                .with_title(format!("Properties — {}", ch.name))
-                .with_inner_size([480.0, 600.0]),
+                .with_title(title)
+                .with_inner_size(size),
             |ctx, _class| {
                 if ctx.input(|i| i.viewport().close_requested()) {
                     open = false;
@@ -18571,10 +18898,17 @@ impl StreamArchiverApp {
             },
         );
         if !open {
-            // Closed mid-load: forget the popup and its in-flight load (a bundle
-            // that still arrives is dropped because the receiver is gone).
-            self.channel_properties_popups.retain(|c| *c != cid);
-            self.props_loads.retain(|pl| pl.channel_id != cid);
+            // Closed mid-load: forget the popup; drop the in-flight load only
+            // when no other window (channel or sibling instance) still wants it.
+            match instance_mid {
+                Some(mid) => self.properties_popups.retain(|m| *m != mid),
+                None => self.channel_properties_popups.retain(|c| *c != cid),
+            }
+            if !self.channel_properties_popups.contains(&cid)
+                && !self.instance_props_open_for_channel(cid)
+            {
+                self.props_loads.retain(|pl| pl.channel_id != cid);
+            }
         }
         // Keep frames coming while a load is in flight so we poll the loader
         // (the spinner animates too) — but NOT unconditionally: that busy-looped
@@ -18590,7 +18924,9 @@ impl StreamArchiverApp {
     /// switched away while the background load ran). In-progress config/scope edits are
     /// preserved: the drafts are only seeded when they don't already belong to this channel.
     fn install_props_loaded(&mut self, loaded: PropsLoaded) {
-        if !self.channel_properties_popups.contains(&loaded.channel_id) {
+        if !self.channel_properties_popups.contains(&loaded.channel_id)
+            && !self.instance_props_open_for_channel(loaded.channel_id)
+        {
             return;
         }
         let id = loaded.channel_id;
@@ -18621,11 +18957,14 @@ impl StreamArchiverApp {
             self.channel_properties_popups.retain(|c| *c != cid);
             self.channel_cfg_drafts.remove(&cid);
             self.channel_scope_drafts.remove(&cid);
-            // Free the full-resolution thumbnail textures (only this window
-            // uses them); they reload from disk on the next open.
-            self.channel_asset_thumbs.remove(&cid);
-            self.channel_emote_counts.remove(&cid);
-            self.channel_asset_status.remove(&cid);
+            // Free the full-resolution thumbnail textures; they reload from disk
+            // on the next open. Kept while an instance-Properties window of this
+            // channel is still open — those share the same caches.
+            if !self.instance_props_open_for_channel(cid) {
+                self.channel_asset_thumbs.remove(&cid);
+                self.channel_emote_counts.remove(&cid);
+                self.channel_asset_status.remove(&cid);
+            }
         }
     }
 
@@ -18659,7 +18998,7 @@ impl StreamArchiverApp {
         // because it is the cache dropped on every close (and on rename/refetch), so each
         // open re-loads through this off-thread path rather than blocking the UI thread.
         if !self.channel_asset_status.contains_key(&ch.id)
-            && !self.drive_props_load(cid, &ch, &accounts, ctx)
+            && !self.drive_props_load(cid, &ch, &accounts, None, ctx)
         {
             return false; // still loading — placeholder is on screen
         }
@@ -19773,6 +20112,9 @@ fn load_channel_asset_thumbs(
             if let Some((tex, dims)) = load_image_texture(&path, ctx, &key) {
                 out.push(AssetThumb {
                     label: format!("{} {kind}", acc.label),
+                    platform: acc.platform,
+                    account: acc.account.clone(),
+                    kind,
                     path,
                     tex,
                     dims,

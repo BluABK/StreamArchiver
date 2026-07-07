@@ -792,6 +792,13 @@ history* below).
   image has gone from the cache are shown separately under **Deprecated (no longer
   available)**. Sibling accounts open separate viewer windows.
 
+**Instance Properties** (right-click an instance row → **Properties**) shows the
+same asset data scoped to *that instance's own account*: the header uses the
+account's avatar and links its source URL, and an **Assets (this account)**
+section carries the account's icon/banner thumbnails, its status row, **⟳
+Refetch** (this account only), **📂** (this account's folder), **🕑 History**
+(this account's changes only), and its emote-viewer launchers.
+
 **Change history.** Manifests and images are overwritten wholesale on each
 refetch, so a removed emote code or a swapped banner would otherwise vanish with
 no trace. Instead, every refetch is diffed against the previous state: the changes
