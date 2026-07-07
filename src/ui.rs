@@ -927,6 +927,11 @@ pub struct StreamArchiverApp {
     /// Separate from `channel_icons` so the small slot can use a properly
     /// Lanczos-downscaled thumbnail while Properties loads the full source.
     channel_icons_small: HashMap<i64, Option<egui::TextureHandle>>,
+    /// Pre-scaled (64 px) per-INSTANCE icon textures for the instance rows of the
+    /// streams table, keyed by monitor id — each instance shows the avatar fetched
+    /// for its own account dir (GEEGA main vs alt). Same lifecycle as
+    /// `channel_icons_small` (cleared on AssetFetch completion / channel rename).
+    instance_icons_small: HashMap<i64, Option<egui::TextureHandle>>,
     /// Decoded + downscaled chat-emote frames, keyed by absolute image path. Shared
     /// with background decode tasks (`Arc<Mutex<…>>`). Animated GIF/WebP cycle; the
     /// frames are downscaled to render size to bound RAM, and the map is LRU-evicted
@@ -1471,6 +1476,7 @@ impl StreamArchiverApp {
             rec_props_popups: Vec::new(),
             channel_icons: HashMap::new(),
             channel_icons_small: HashMap::new(),
+            instance_icons_small: HashMap::new(),
             emote_anim: Arc::new(Mutex::new(HashMap::new())),
             emote_epoch: Arc::new(AtomicU64::new(0)),
             channel_asset_thumbs: HashMap::new(),
@@ -1883,6 +1889,7 @@ impl StreamArchiverApp {
                             );
                             self.channel_icons.clear();
                             self.channel_icons_small.clear();
+                            self.instance_icons_small.clear();
                             self.channel_twitch_colors.clear();
                             // Banners/icons may have changed — drop the cached
                             // Properties thumbnails so they reload from disk.
@@ -4491,6 +4498,8 @@ struct StreamsViewCache {
     stamp: (i64, u64),
     chan_entries: Vec<ChanEntry>,
     channel_avatars: HashMap<i64, egui::TextureHandle>,
+    /// Per-instance (monitor-id-keyed) avatar: the icon of that instance's own account.
+    instance_avatars: HashMap<i64, egui::TextureHandle>,
     channel_name_colors: HashMap<i64, (egui::Color32, bool)>,
     groups: HashMap<i64, Vec<StreamGroup>>,
     model: Vec<Vec<Cell>>,
@@ -4868,12 +4877,14 @@ fn state_icon(state: &str) -> (&'static str, egui::Color32) {
 }
 
 /// Render the Streams-tree Name cell: indent by `depth`, a clickable ▶/▼ when
-/// `has_children`, then `label`. Returns true if the disclosure was clicked.
+/// `has_children`, an optional 18 px avatar, then `label`. Returns true if the
+/// disclosure was clicked.
 fn tree_name(
     ui: &mut egui::Ui,
     depth: usize,
     has_children: bool,
     expanded: bool,
+    avatar: Option<&egui::TextureHandle>,
     label: impl Into<egui::WidgetText>,
 ) -> bool {
     let mut clicked = false;
@@ -4889,6 +4900,15 @@ fn tree_name(
         }
     } else {
         ui.add_space(16.0); // align with rows that have a triangle
+    }
+    if let Some(tex) = avatar {
+        let resp = ui.add(
+            egui::Image::from_texture(tex)
+                .fit_to_exact_size(egui::vec2(18.0, 18.0))
+                .corner_radius(egui::CornerRadius::same(3)),
+        );
+        queue_alt_image_preview(ui.ctx(), &resp, tex);
+        ui.add_space(3.0);
     }
     ui.label(label);
     clicked
@@ -5076,6 +5096,8 @@ fn render_instance_row(
     needs_remux_count: usize,
     stream_target: Option<&StreamTarget>,
     media_player: &str,
+    // This instance's own account avatar for the Name cell (None until fetched).
+    avatar: Option<&egui::TextureHandle>,
     order: &[usize],
     a: &mut RowActions,
 ) -> bool {
@@ -5287,6 +5309,7 @@ fn render_instance_row(
                     depth,
                     has_history,
                     expanded,
+                    avatar,
                     egui::RichText::new(instance_label(&row.monitor.url)).color(name_color),
                 );
                 ui.response().on_hover_text(&row.monitor.url);
@@ -6739,6 +6762,15 @@ impl StreamArchiverApp {
                         if let Some(id) = id_opt {
                             self.channel_icons.remove(&id);
                             self.channel_icons_small.remove(&id);
+                            let mids: Vec<i64> = self
+                                .rows
+                                .iter()
+                                .filter(|r| r.channel.id == id)
+                                .map(|r| r.monitor.id)
+                                .collect();
+                            for mid in mids {
+                                self.instance_icons_small.remove(&mid);
+                            }
                             self.channel_twitch_colors.remove(&id);
                             self.channel_asset_thumbs.remove(&id);
                             self.channel_emote_counts.remove(&id);
@@ -11155,6 +11187,8 @@ impl StreamArchiverApp {
             // and its name colour up front — both need `&mut self` (caches), so
             // the read-only table closure below can just look them up by id.
             let mut channel_avatars: HashMap<i64, egui::TextureHandle> = HashMap::new();
+            // Same, per instance row (each shows its own account's avatar).
+            let mut instance_avatars: HashMap<i64, egui::TextureHandle> = HashMap::new();
             // Per-container name colour as (base, adjust): `adjust` marks a fetched
             // Twitch broadcaster colour that should be made readable against the row's
             // *effective* background at render time (rows tint when recording/ad/error).
@@ -11174,6 +11208,16 @@ impl StreamArchiverApp {
                     .clone();
                 if let Some(t) = tex {
                     channel_avatars.insert(cid, t);
+                }
+                for &ri in &e.rows {
+                    let mid = self.rows[ri].monitor.id;
+                    if !self.instance_icons_small.contains_key(&mid) {
+                        let tex = resolve_instance_icon_small(&self.rows[ri], ui.ctx());
+                        self.instance_icons_small.insert(mid, tex);
+                    }
+                    if let Some(t) = self.instance_icons_small.get(&mid).and_then(|o| o.clone()) {
+                        instance_avatars.insert(mid, t);
+                    }
                 }
                 // Name colour: a manual custom colour wins; otherwise tint Twitch
                 // channels with the streamer's own (cached) name colour — from the
@@ -11198,6 +11242,12 @@ impl StreamArchiverApp {
                     (channel_event_color(cid, ""), false)
                 };
                 channel_name_colors.insert(cid, name_color);
+            }
+            // Drop small-icon entries for monitors that no longer exist so deleted
+            // instances don't pin their textures forever.
+            {
+                let live: HashSet<i64> = self.rows.iter().map(|r| r.monitor.id).collect();
+                self.instance_icons_small.retain(|mid, _| live.contains(mid));
             }
 
             // Lazily load + cache recordings for currently-expanded monitors, then
@@ -11292,6 +11342,7 @@ impl StreamArchiverApp {
                 stamp,
                 chan_entries,
                 channel_avatars,
+                instance_avatars,
                 channel_name_colors,
                 groups,
                 model,
@@ -11300,6 +11351,7 @@ impl StreamArchiverApp {
         let cache = self.streams_cache.as_ref().unwrap();
         let chan_entries = &cache.chan_entries;
         let channel_avatars = &cache.channel_avatars;
+        let instance_avatars = &cache.instance_avatars;
         let channel_name_colors = &cache.channel_name_colors;
         let groups = &cache.groups;
         let model = &cache.model;
@@ -11812,6 +11864,7 @@ impl StreamArchiverApp {
                                     tint, output_dir_ok, depth, has_hist, expanded,
                                     inst_needs_remux,
                                     inst_stream_target.as_ref(), &media_player,
+                                    instance_avatars.get(&mid),
                                     &col_order, &mut acts,
                                 ) {
                                     toggle_instance = Some(mid);
@@ -11943,7 +11996,7 @@ impl StreamArchiverApp {
                                             }
                                             "name" => {
                                                 disc = tree_name(
-                                                    ui, depth, has_takes, expanded,
+                                                    ui, depth, has_takes, expanded, None,
                                                     egui::RichText::new(label.clone()),
                                                 );
                                                 if has_takes {
@@ -12254,7 +12307,7 @@ impl StreamArchiverApp {
                                                     None => format!("Take {}", ti + 1),
                                                 };
                                                 tree_name(
-                                                    ui, depth, false, false,
+                                                    ui, depth, false, false, None,
                                                     egui::RichText::new(label).weak(),
                                                 );
                                             }
@@ -20219,6 +20272,24 @@ fn resolve_channel_icon_small(
             .join(crate::downloader::sanitize_filename(&channel.name));
         load_channel_icon_small(&flat, ctx, &key)
     })
+}
+
+/// Small avatar for a streams-table instance row: the icon fetched into that
+/// instance's own account dir (so GEEGA main and alt each show their own face).
+/// Falls back to the legacy per-platform dir for pre-migration trees.
+fn resolve_instance_icon_small(
+    row: &MonitorWithChannel,
+    ctx: &egui::Context,
+) -> Option<egui::TextureHandle> {
+    let platform = row.monitor.platform();
+    if platform == Platform::Generic {
+        return None; // no asset fetcher for generic URLs — nothing on disk
+    }
+    let account = asset_account(&row.monitor.url, platform);
+    let key = format!("m{}", row.monitor.id);
+    crate::assets::asset_read_dirs(&row.channel.name, platform, &account)
+        .iter()
+        .find_map(|d| load_channel_icon_small(d, ctx, &key))
 }
 
 // ---------- Alt-hover full-resolution image preview ----------

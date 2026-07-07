@@ -746,7 +746,9 @@ platform** (a streamer's main + alt Twitch account) therefore keeps two fully
 separate asset trees — icons, emotes, name colours, and change histories never
 overwrite each other — while two tools pointed at the *same* URL share one tree.
 Chat replay, notifications, and the streams-list tint all read the account
-belonging to the specific instance involved. On first launch after upgrading,
+belonging to the specific instance involved, and each **instance row** in the
+Streams table shows its own account's avatar next to its URL (the container row
+keeps showing the channel-level icon chosen by the *Icon source* picker). On first launch after upgrading,
 existing per-platform asset folders are migrated automatically into the first
 matching instance's account subfolder (a `.accounts_migrated` stamp marks it
 done; already-downloaded community-post and schedule images stay where their
