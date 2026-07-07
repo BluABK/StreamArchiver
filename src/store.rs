@@ -33,7 +33,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 47;
+const SCHEMA_VERSION: i64 = 48;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -118,6 +118,13 @@ pub struct NewCommunityPost {
     pub vote_count: String,
     pub shared_json: String,
     pub raw_json: String,
+    /// `channel` (the monitored channel's own post), `viewer` (a fan posting in
+    /// the channel's Community space), or `channel` for a reshare. Drives the
+    /// UI's viewer-post hiding + the "only channel posts notify" rule.
+    pub author_kind: String,
+    /// The post author's `UC…` channel id, when extractable — lets a later
+    /// round correct a conservative first classification.
+    pub author_channel_id: String,
 }
 
 /// Parse a YouTube relative-time string ("2 weeks ago", "Streamed 3 days ago",
@@ -179,6 +186,175 @@ fn fill_published_at(conn: &Connection) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// The author's `UC…` channel id from a post renderer's `authorEndpoint`
+/// (current `profileCardCommand` shape, then the legacy `browseEndpoint`).
+fn post_author_channel_id(post: &serde_json::Value) -> String {
+    let ep = post.get("authorEndpoint");
+    ep.and_then(|e| e.get("profileCardCommand"))
+        .and_then(|c| c.get("profileOwnerExternalChannelId"))
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            ep.and_then(|e| e.get("browseEndpoint"))
+                .and_then(|b| b.get("browseId"))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Flatten a `{runs:[{text,navigationEndpoint…}]}` node into concatenated body
+/// text plus a `[{text,url}]` links array (the same 1:1 shape the live parser
+/// produces). Used by the v48 reshare repair.
+fn runs_node_to_body_links(node: Option<&serde_json::Value>) -> (String, String) {
+    let mut body = String::new();
+    let mut runs_json: Vec<serde_json::Value> = Vec::new();
+    if let Some(runs) = node.and_then(|c| c.get("runs")).and_then(|r| r.as_array()) {
+        for run in runs {
+            let text = run.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            let url = run
+                .get("navigationEndpoint")
+                .and_then(|ne| {
+                    ne.get("urlEndpoint")
+                        .and_then(|u| u.get("url"))
+                        .and_then(|u| u.as_str())
+                        .or_else(|| {
+                            ne.get("commandMetadata")
+                                .and_then(|c| c.get("webCommandMetadata"))
+                                .and_then(|w| w.get("url"))
+                                .and_then(|u| u.as_str())
+                        })
+                })
+                .unwrap_or("");
+            body.push_str(text);
+            runs_json.push(serde_json::json!({ "text": text, "url": url }));
+        }
+    }
+    let links = serde_json::to_string(&runs_json).unwrap_or_else(|_| "[]".to_string());
+    (body, links)
+}
+
+/// v48 repair: tag every existing community_post row as `channel` or `viewer`,
+/// and rebuild reshare rows the old `sharedPostRenderer` path stored empty.
+///
+/// Owner id per monitor is inferred offline from the rows that carry
+/// `showPostAuthorBackgroundHighlight` (the channel's own posts) — no network.
+fn reclassify_posts_v48(conn: &Connection) -> Result<()> {
+    use std::collections::HashMap;
+    struct Row {
+        id: i64,
+        monitor_id: i64,
+        raw: serde_json::Value,
+        author_id: String,
+        highlighted: bool,
+    }
+    let mut stmt =
+        conn.prepare("SELECT id, monitor_id, raw_json FROM community_post")?;
+    let rows: Vec<Row> = stmt
+        .query_map([], |r| {
+            let id: i64 = r.get(0)?;
+            let monitor_id: i64 = r.get(1)?;
+            let raw_str: String = r.get(2)?;
+            Ok((id, monitor_id, raw_str))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .map(|(id, monitor_id, raw_str)| {
+            let raw: serde_json::Value =
+                serde_json::from_str(&raw_str).unwrap_or(serde_json::Value::Null);
+            let author_id = post_author_channel_id(&raw);
+            let highlighted = raw.get("showPostAuthorBackgroundHighlight").is_some();
+            Row { id, monitor_id, raw, author_id, highlighted }
+        })
+        .collect();
+    drop(stmt);
+
+    // Owner id per monitor = the author id of a highlighted (own) post.
+    let mut owner: HashMap<i64, String> = HashMap::new();
+    for row in &rows {
+        if row.highlighted && !row.author_id.is_empty() {
+            owner.entry(row.monitor_id).or_insert_with(|| row.author_id.clone());
+        }
+    }
+
+    for row in &rows {
+        // Reshare repair: the sharedPostRenderer subtree the old path mangled.
+        let is_reshare = row.raw.get("originalPost").is_some()
+            || row.raw.get("displayName").is_some();
+        if is_reshare {
+            let author = row
+                .raw
+                .get("displayName")
+                .and_then(|d| d.get("runs"))
+                .and_then(|r| r.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|run| run.get("text").and_then(|t| t.as_str()))
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
+            let (body, links) = runs_node_to_body_links(row.raw.get("content"));
+            let orig = row
+                .raw
+                .get("originalPost")
+                .and_then(|o| o.get("backstagePostRenderer"));
+            let shared_json = orig
+                .map(|o| {
+                    let author_o =
+                        first_run_text(o.get("authorText"));
+                    let (obody, olinks) =
+                        runs_node_to_body_links(o.get("contentText"));
+                    serde_json::json!({
+                        "author": author_o,
+                        "author_channel_id": post_author_channel_id(o),
+                        "published_text": first_run_text(o.get("publishedTimeText")),
+                        "body_text": obody,
+                        "links_json": olinks,
+                    })
+                    .to_string()
+                })
+                .unwrap_or_default();
+            conn.execute(
+                "UPDATE community_post
+                    SET author = ?2, body_text = ?3, links_json = ?4,
+                        shared_json = ?5, author_kind = 'channel',
+                        author_channel_id = ?6
+                  WHERE id = ?1",
+                params![row.id, author, body, links, shared_json, row.author_id],
+            )?;
+            continue;
+        }
+
+        let owner_id = owner.get(&row.monitor_id).map(String::as_str).unwrap_or("");
+        let kind = if !row.highlighted
+            && !row.author_id.is_empty()
+            && !owner_id.is_empty()
+            && row.author_id != owner_id
+        {
+            "viewer"
+        } else {
+            "channel"
+        };
+        conn.execute(
+            "UPDATE community_post SET author_kind = ?2, author_channel_id = ?3
+              WHERE id = ?1",
+            params![row.id, kind, row.author_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// First `runs[0].text` of a `{runs:[…]}` node, else empty — the migration twin
+/// of the live parser's inline helper.
+fn first_run_text(node: Option<&serde_json::Value>) -> String {
+    node.and_then(|n| n.get("runs"))
+        .and_then(|r| r.as_array())
+        .and_then(|a| a.first())
+        .and_then(|r| r.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// A new about-page capture to record (schema v45 `about_snapshot`). Keyed on
@@ -246,7 +422,9 @@ pub struct CommunityPostRow {
     #[allow(dead_code)]
     pub poll_json: String,
     pub vote_count: String,
-    /// Shared-video/post summary (rendered in a later phase).
+    /// Reshared/quoted original as JSON `{author, author_channel_id,
+    /// published_text, body_text, links_json}` — empty for a non-reshare.
+    /// (Read by the posts-feed reshare card, added in the UI step.)
     #[allow(dead_code)]
     pub shared_json: String,
     /// First-seen timestamp — ordering tiebreaker for same-bucket posts.
@@ -255,6 +433,10 @@ pub struct CommunityPostRow {
     /// Approximate publish time (epoch), derived from YouTube's relative
     /// "2 weeks ago" text at first sight — drives the feed order; 0 = unknown.
     pub published_at: i64,
+    /// `channel` or `viewer` — the feed hides viewer posts unless toggled on.
+    /// (Read by the feed filter + badge, added in the UI step.)
+    #[allow(dead_code)]
+    pub author_kind: String,
     pub channel: String,
     pub media: Vec<PostMediaRow>,
 }
@@ -1120,7 +1302,24 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 47)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 47);
+        if version < 48 {
+            // Community posts carry three item kinds at the same structural
+            // position: the channel's own posts, VIEWER posts (fans posting in
+            // the channel's space), and reshares. They were all archived as the
+            // channel's own — viewer posts even fired misattributed "«channel»
+            // posted" notifications. Tag each row so the UI can hide viewer
+            // posts and the fetcher can skip notifying them; repair reshare
+            // rows the old sharedPostRenderer path stored empty.
+            conn.execute_batch(
+                "ALTER TABLE community_post
+                     ADD COLUMN author_kind       TEXT NOT NULL DEFAULT 'channel';
+                 ALTER TABLE community_post
+                     ADD COLUMN author_channel_id TEXT NOT NULL DEFAULT '';",
+            )?;
+            reclassify_posts_v48(&conn)?;
+            conn.pragma_update(None, "user_version", 48)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 48);
         Ok(())
     }
 
@@ -1396,11 +1595,13 @@ impl Store {
                 "UPDATE community_post SET
                      author = ?2, author_icon = ?3, published_text = ?4, body_text = ?5,
                      links_json = ?6, poll_json = ?7, vote_count = ?8, shared_json = ?9,
-                     raw_json = ?10, last_seen = ?11
+                     raw_json = ?10, last_seen = ?11, author_kind = ?12,
+                     author_channel_id = ?13
                  WHERE id = ?1",
                 params![
                     pk, p.author, p.author_icon, p.published_text, p.body_text, p.links_json,
-                    p.poll_json, p.vote_count, p.shared_json, p.raw_json, now,
+                    p.poll_json, p.vote_count, p.shared_json, p.raw_json, now, p.author_kind,
+                    p.author_channel_id,
                 ],
             )?;
             Ok((pk, false))
@@ -1412,12 +1613,13 @@ impl Store {
                 "INSERT INTO community_post
                      (monitor_id, channel_id, post_id, author, author_icon, published_text,
                       body_text, links_json, poll_json, vote_count, shared_json, raw_json,
-                      first_seen, last_seen, published_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13,?14)",
+                      first_seen, last_seen, published_at, author_kind, author_channel_id)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13,?14,?15,?16)",
                 params![
                     p.monitor_id, p.channel_id, p.post_id, p.author, p.author_icon,
                     p.published_text, p.body_text, p.links_json, p.poll_json, p.vote_count,
-                    p.shared_json, p.raw_json, now, published_at,
+                    p.shared_json, p.raw_json, now, published_at, p.author_kind,
+                    p.author_channel_id,
                 ],
             )?;
             Ok((conn.last_insert_rowid(), true))
@@ -1656,7 +1858,8 @@ impl Store {
                 shared_json: r.get(11)?,
                 first_seen: r.get(12)?,
                 published_at: r.get(13)?,
-                channel: r.get::<_, Option<String>>(14)?.unwrap_or_default(),
+                author_kind: r.get(14)?,
+                channel: r.get::<_, Option<String>>(15)?.unwrap_or_default(),
                 media: Vec::new(),
             })
         };
@@ -1665,7 +1868,8 @@ impl Store {
         // first), so ascending ids keep that order for same-bucket ties.
         const COLS: &str = "cp.id, cp.monitor_id, cp.channel_id, cp.post_id, cp.author, \
              cp.author_icon, cp.published_text, cp.body_text, cp.links_json, cp.poll_json, \
-             cp.vote_count, cp.shared_json, cp.first_seen, cp.published_at, ch.name";
+             cp.vote_count, cp.shared_json, cp.first_seen, cp.published_at, \
+             cp.author_kind, ch.name";
         const ORDER: &str = "cp.published_at DESC, cp.first_seen DESC, cp.id ASC";
         let mut posts: Vec<CommunityPostRow> = match monitor_id {
             Some(mid) => {
@@ -5287,6 +5491,120 @@ mod tests {
 
         // Unknown monitor → not done.
         assert!(!store.posts_backfill_done(mid + 999).unwrap());
+    }
+
+    #[test]
+    fn community_post_author_kind_roundtrips() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        store
+            .community_post_upsert_full(&NewCommunityPost {
+                monitor_id: mid,
+                channel_id: cid,
+                post_id: "v1".into(),
+                author: "Fan".into(),
+                author_kind: "viewer".into(),
+                author_channel_id: "UCfan0000000000000000000".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let rows = store.list_community_posts(None, 100).unwrap();
+        assert_eq!(rows[0].author_kind, "viewer");
+
+        // A later round can correct a conservative first guess (UPDATE path).
+        store
+            .community_post_upsert_full(&NewCommunityPost {
+                monitor_id: mid,
+                channel_id: cid,
+                post_id: "v1".into(),
+                author: "Fan".into(),
+                author_kind: "channel".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let rows = store.list_community_posts(None, 100).unwrap();
+        assert_eq!(rows[0].author_kind, "channel");
+    }
+
+    #[test]
+    fn reclassify_v48_tags_and_repairs() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        // Insert three legacy rows via raw SQL at the pre-v48 shape (the new
+        // columns exist but sit at their DEFAULT 'channel'/'' — reclassify must
+        // move them). raw_json mirrors the real renderer subtrees.
+        let owner = "UCowner00000000000000000";
+        let author_ep = |id: &str| {
+            serde_json::json!({
+                "profileCardCommand": { "profileOwnerExternalChannelId": id }
+            })
+        };
+        let own_post = serde_json::json!({
+            "postId": "own1",
+            "authorText": { "runs": [{ "text": "Streamer" }] },
+            "authorEndpoint": author_ep(owner),
+            "showPostAuthorBackgroundHighlight": { "lightThemeColor": 1 },
+            "contentText": { "runs": [{ "text": "my post" }] }
+        });
+        let viewer_post = serde_json::json!({
+            "postId": "fan1",
+            "authorText": { "runs": [{ "text": "A Fan" }] },
+            "authorEndpoint": author_ep("UCfan0000000000000000000"),
+            "contentText": { "runs": [{ "text": "hello there" }] }
+        });
+        // A reshare the old path stored with empty author/body.
+        let reshare = serde_json::json!({
+            "postId": "re1",
+            "displayName": { "runs": [{ "text": "Streamer" }] },
+            "endpoint": author_ep(owner),
+            "content": { "runs": [{ "text": "check this out" }] },
+            "originalPost": { "backstagePostRenderer": {
+                "postId": "orig1",
+                "authorText": { "runs": [{ "text": "Miniko Mew" }] },
+                "authorEndpoint": author_ep("UCorig0000000000000000000"),
+                "publishedTimeText": { "runs": [{ "text": "1 month ago" }] },
+                "contentText": { "runs": [{ "text": "the original" }] }
+            }}
+        });
+        let ins = |post_id: &str, author: &str, body: &str, raw: &serde_json::Value| {
+            store
+                .db()
+                .execute(
+                    "INSERT INTO community_post
+                         (monitor_id, channel_id, post_id, author, body_text,
+                          raw_json, first_seen, last_seen)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 100, 100)",
+                    params![mid, cid, post_id, author, body, raw.to_string()],
+                )
+                .unwrap();
+        };
+        ins("own1", "Streamer", "my post", &own_post);
+        ins("fan1", "A Fan", "hello there", &viewer_post);
+        ins("re1", "", "", &reshare); // legacy mangled reshare
+
+        reclassify_posts_v48(&store.db()).unwrap();
+
+        let rows = store.list_community_posts(None, 100).unwrap();
+        let get = |id: &str| rows.iter().find(|r| r.post_id == id).unwrap();
+        assert_eq!(get("own1").author_kind, "channel");
+        assert_eq!(get("fan1").author_kind, "viewer");
+
+        let re = get("re1");
+        assert_eq!(re.author_kind, "channel");
+        assert_eq!(re.author, "Streamer", "reshare author rebuilt from displayName");
+        assert_eq!(re.body_text, "check this out", "reshare body rebuilt from content");
+        let shared: serde_json::Value = serde_json::from_str(&re.shared_json).unwrap();
+        assert_eq!(shared["author"], "Miniko Mew");
+        assert_eq!(shared["body_text"], "the original");
+        assert_eq!(shared["published_text"], "1 month ago");
     }
 
     #[test]
