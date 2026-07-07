@@ -1045,6 +1045,12 @@ pub struct StreamArchiverApp {
     /// Open asset change-history popup (None = closed). Holds the channel's
     /// `asset_changes.jsonl` parsed + formatted once on open (newest first).
     asset_histories: Vec<AssetHistoryView>,
+    /// Open About-page viewers (one per channel + platform + account): the
+    /// account's archived about versions with a picker + rendered content.
+    about_views: Vec<AboutView>,
+    /// Channel Properties "About pages" rows: latest snapshot + version count
+    /// per (platform, account), loaded off-thread with the props bundle.
+    channel_about_latest: HashMap<i64, Vec<(crate::store::AboutSnapshotRow, i64)>>,
     /// GPU textures for the third-party emote-provider logos (7TV/BTTV), uploaded
     /// once on first use of the emote launcher buttons.
     provider_tex: Option<ProviderTextures>,
@@ -1522,6 +1528,8 @@ impl StreamArchiverApp {
             pending_schedule: None,
             emote_viewers: Vec::new(),
             asset_histories: Vec::new(),
+            about_views: Vec::new(),
+            channel_about_latest: HashMap::new(),
             provider_tex: None,
             channel_twitch_colors: HashMap::new(),
             videos_sort: SortState {
@@ -1936,6 +1944,17 @@ impl StreamArchiverApp {
                                     h.reload();
                                 }
                             }
+                            // Same for open About viewers: re-query the snapshots
+                            // (a new version may have landed) and drop their panel
+                            // textures so changed images re-decode from disk.
+                            for v in &mut self.about_views {
+                                if v.channel_name == task.label {
+                                    v.reload(&self.core.store);
+                                    v.img_cache.clear();
+                                }
+                            }
+                            // Channel-Properties About rows are stale too.
+                            self.channel_about_latest.clear();
                         }
                         // Record a task_failed notification (the failing task
                         // carries its kind + label + error here; the event alone
@@ -5786,6 +5805,83 @@ impl AssetHistoryView {
     }
 }
 
+/// One open About-page viewer: an account's archived about versions (newest
+/// first), a version picker, and the selected version's parsed content.
+/// Snapshots are queried once on open; [`AboutView::reload`] re-queries when a
+/// background asset fetch for the channel lands.
+struct AboutView {
+    channel_id: i64,
+    channel_name: String,
+    platform: Platform,
+    account: String,
+    /// Display label from [`AssetAccount::label`], e.g. `"Twitch (geega_alt)"`.
+    label: String,
+    snapshots: Vec<crate::store::AboutSnapshotRow>,
+    /// Index into `snapshots` (0 = newest).
+    selected: usize,
+    /// `panels_json`/`links_json` of the selected version, parsed once per
+    /// selection change (not per frame).
+    panels: Vec<crate::assets::AboutPanel>,
+    links: Vec<crate::assets::AboutLink>,
+    md_cache: egui_commonmark::CommonMarkCache,
+    /// Panel-image textures keyed by content hash. Deliberately NOT the shared
+    /// `post_img_cache` — the posts feed's 200-entry cap would evict panel
+    /// textures mid-frame.
+    img_cache: PostImageCache,
+}
+
+impl AboutView {
+    fn new(
+        store: &crate::store::Store,
+        channel_id: i64,
+        channel_name: String,
+        platform: Platform,
+        account: String,
+        label: String,
+    ) -> AboutView {
+        let mut view = AboutView {
+            channel_id,
+            channel_name,
+            platform,
+            account,
+            label,
+            snapshots: Vec::new(),
+            selected: 0,
+            panels: Vec::new(),
+            links: Vec::new(),
+            md_cache: egui_commonmark::CommonMarkCache::default(),
+            img_cache: HashMap::new(),
+        };
+        view.reload(store);
+        view
+    }
+
+    /// Re-query the snapshot list (newest first), keeping the selected version
+    /// by snapshot id when it still exists (a new version shifts indices).
+    fn reload(&mut self, store: &crate::store::Store) {
+        let keep_id = self.snapshots.get(self.selected).map(|s| s.id);
+        self.snapshots = store
+            .about_snapshots_for_account(self.channel_id, self.platform.as_str(), &self.account)
+            .unwrap_or_default();
+        let idx = keep_id
+            .and_then(|id| self.snapshots.iter().position(|s| s.id == id))
+            .unwrap_or(0);
+        self.select(idx);
+    }
+
+    /// Change the displayed version and re-parse its panels/links JSON.
+    fn select(&mut self, idx: usize) {
+        self.selected = idx;
+        let Some(snap) = self.snapshots.get(idx) else {
+            self.panels.clear();
+            self.links.clear();
+            return;
+        };
+        self.panels = serde_json::from_str(&snap.panels_json).unwrap_or_default();
+        self.links = serde_json::from_str(&snap.links_json).unwrap_or_default();
+    }
+}
+
 /// Short display label for an emote-provider manifest stem as stored in
 /// [`crate::assets::AssetChange::provider`]. Falls back to the raw stem.
 fn provider_label_from_id(id: &str) -> &str {
@@ -5960,6 +6056,8 @@ struct PropsLoaded {
     cfg: crate::schedule_source::ChannelSourceConfig,
     source_order: Vec<SourceEntry>,
     scope: crate::schedule_source::SourceScopeConfig,
+    /// Latest About snapshot + version count per (platform, account).
+    about_latest: Vec<(crate::store::AboutSnapshotRow, i64)>,
 }
 
 /// In-flight native file/folder picker spawned on a background thread so the UI
@@ -6494,6 +6592,7 @@ impl eframe::App for StreamArchiverApp {
         self.format_designer_window(ui.ctx());
         self.confirm_quit_stop_window(ui.ctx());
         self.import_window(ui.ctx());
+        self.about_windows(ui.ctx());
         self.inspector_window(ui.ctx());
 
         draw_alt_image_preview(ui.ctx());
@@ -18661,6 +18760,7 @@ impl StreamArchiverApp {
         let mut refetch = false;
         let mut open_emote_viewer: Option<(EmoteProvider, AssetAccount)> = None;
         let mut open_asset_history = false;
+        let mut open_about = false;
 
         self.instance_scope_drafts
             .entry(m.id)
@@ -18838,6 +18938,18 @@ impl StreamArchiverApp {
                             .clicked()
                         {
                             open_asset_history = true;
+                        }
+                        if ui
+                            .button("ℹ About")
+                            .on_hover_text(
+                                "Show this account's archived About page — description, \
+                                 panels, links — with a version picker. Captured with \
+                                 each asset fetch; a new version is stored only when the \
+                                 content actually changed.",
+                            )
+                            .clicked()
+                        {
+                            open_about = true;
                         }
                     });
 
@@ -19045,6 +19157,7 @@ impl StreamArchiverApp {
             self.channel_asset_thumbs.remove(&cid);
             self.channel_emote_counts.remove(&cid);
             self.channel_asset_status.remove(&cid);
+            self.channel_about_latest.remove(&cid);
             self.status = format!("Refetching assets for {}…", acc.label);
         }
         // A launcher button was clicked — open (or refresh) the emote viewer
@@ -19074,6 +19187,10 @@ impl StreamArchiverApp {
                 Some(slot) => *slot = fresh,
                 None => self.asset_histories.push(fresh),
             }
+        }
+        // ℹ About — the archived About-page viewer for this account.
+        if open_about && let Some(acc) = &inst_account {
+            self.open_about_view(cid, &ch.name, acc);
         }
 
         !open
@@ -19127,6 +19244,7 @@ impl StreamArchiverApp {
                         cfg: load_channel_cfg(&store, id),
                         source_order: load_source_order(&store),
                         scope: load_channel_scope(&store, id),
+                        about_latest: store.about_latest_per_account(id).unwrap_or_default(),
                     };
                     debug!(elapsed_ms = t.elapsed().as_millis(), channel_id = id, "props-load done");
                     // Receiver gone (window closed) → the send is simply dropped.
@@ -19150,6 +19268,7 @@ impl StreamArchiverApp {
                         cfg: load_channel_cfg(&self.core.store, id),
                         source_order: load_source_order(&self.core.store),
                         scope: load_channel_scope(&self.core.store, id),
+                        about_latest: self.core.store.about_latest_per_account(id).unwrap_or_default(),
                     };
                     self.install_props_loaded(loaded);
                     return true;
@@ -19249,6 +19368,7 @@ impl StreamArchiverApp {
         self.channel_asset_thumbs.insert(id, loaded.thumbs);
         self.channel_emote_counts.insert(id, loaded.emote_counts);
         self.channel_asset_status.insert(id, loaded.asset_status);
+        self.channel_about_latest.insert(id, loaded.about_latest);
         self.props_source_order = loaded.source_order;
         self.channel_cfg_drafts.entry(id).or_insert(loaded.cfg);
         self.channel_scope_drafts.entry(id).or_insert(loaded.scope);
@@ -19349,10 +19469,20 @@ impl StreamArchiverApp {
             .entry(ch.id)
             .or_insert_with(|| build_platform_asset_status(&ch.name, &accounts))
             .clone();
+        // Latest About snapshot + version count per account — small indexed
+        // rows, loaded once per open (or with the props bundle) and cached.
+        let about_latest = self
+            .channel_about_latest
+            .entry(ch.id)
+            .or_insert_with(|| {
+                self.core.store.about_latest_per_account(ch.id).unwrap_or_default()
+            })
+            .clone();
 
         let mut pref_change: Option<Option<crate::models::PreferredAssetSource>> = None;
         let mut open_emote_viewer: Option<(EmoteProvider, AssetAccount)> = None;
         let mut open_asset_history = false;
+        let mut open_about_account: Option<AssetAccount> = None;
         let mut refetch_monitor_ids: Vec<i64> = Vec::new();
 
         if !self.channel_cfg_drafts.contains_key(&ch.id) {
@@ -19519,6 +19649,39 @@ impl StreamArchiverApp {
                             open_asset_history = true;
                         }
                     });
+
+                    // About pages — one row per asset account, each opening the
+                    // archived About-page viewer (version picker + rendered
+                    // description/panels/links). Captured with every asset fetch.
+                    if !accounts.is_empty() {
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new("About pages").strong());
+                        for acc in &accounts {
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .button(format!("ℹ {}", acc.label))
+                                    .on_hover_text(
+                                        "Show this account's archived About page with a \
+                                         version picker. A new version is stored only \
+                                         when the content actually changed.",
+                                    )
+                                    .clicked()
+                                {
+                                    open_about_account = Some(acc.clone());
+                                }
+                                match about_latest.iter().find(|(s, _)| {
+                                    s.platform == acc.platform.as_str() && s.account == acc.account
+                                }) {
+                                    Some((s, n)) => ui.weak(format!(
+                                        "{n} version(s) · captured {} · checked {}",
+                                        fmt_datetime_short(s.fetched_at),
+                                        fmt_datetime_short(s.last_checked_at),
+                                    )),
+                                    None => ui.weak("never captured"),
+                                };
+                            });
+                        }
+                    }
 
                     // Icon source picker — one entry per asset ACCOUNT (a channel
                     // can hold a main + alt on one platform).
@@ -19903,6 +20066,7 @@ impl StreamArchiverApp {
             self.channel_asset_thumbs.remove(&ch.id);
             self.channel_emote_counts.remove(&ch.id);
             self.channel_asset_status.remove(&ch.id);
+            self.channel_about_latest.remove(&ch.id);
             self.status = format!("Refetching assets for {}…", ch.name);
         }
         // A launcher button was clicked above — open (or refresh) the emote
@@ -19932,6 +20096,10 @@ impl StreamArchiverApp {
                 Some(slot) => *slot = fresh,
                 None => self.asset_histories.push(fresh),
             }
+        }
+        // ℹ — open the archived About-page viewer for one of the accounts.
+        if let Some(acc) = open_about_account {
+            self.open_about_view(ch.id, &ch.name, &acc);
         }
 
         if cfg_dirty {
@@ -20259,6 +20427,207 @@ impl StreamArchiverApp {
             },
         );
         !open
+    }
+
+    /// Open (or refresh in place) the About-page viewer for one account.
+    fn open_about_view(&mut self, channel_id: i64, channel_name: &str, acc: &AssetAccount) {
+        let fresh = AboutView::new(
+            &self.core.store,
+            channel_id,
+            channel_name.to_string(),
+            acc.platform,
+            acc.account.clone(),
+            acc.label.clone(),
+        );
+        match self.about_views.iter_mut().find(|v| {
+            v.channel_id == channel_id && v.platform == acc.platform && v.account == acc.account
+        }) {
+            Some(slot) => *slot = fresh,
+            None => self.about_views.push(fresh),
+        }
+    }
+
+    /// Render every open About-page viewer (one per channel+platform+account).
+    fn about_windows(&mut self, ctx: &egui::Context) {
+        let mut closed: Vec<usize> = Vec::new();
+        for i in 0..self.about_views.len() {
+            if self.about_window(ctx, i) {
+                closed.push(i);
+            }
+        }
+        for i in closed.into_iter().rev() {
+            self.about_views.remove(i);
+        }
+    }
+
+    /// One About-page viewer window; returns true when it should close.
+    /// Version picker (newest first) + the selected version's description
+    /// (markdown), panel cards (image / title / markdown body / link), and
+    /// external links. Mirrors [`Self::asset_history_window`]'s lifecycle.
+    #[allow(deprecated)]
+    fn about_window(&mut self, ctx: &egui::Context, idx: usize) -> bool {
+        let view = &mut self.about_views[idx];
+        let mut open = true;
+        let mut open_url: Option<String> = None;
+        let mut select: Option<usize> = None;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of((
+                "about_vp",
+                view.channel_id,
+                view.platform.as_str(),
+                &view.account,
+            )),
+            egui::ViewportBuilder::default()
+                .with_title(format!("About — {} · {}", view.channel_name, view.label))
+                .with_inner_size([560.0, 640.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if view.snapshots.is_empty() {
+                        ui.label(
+                            "No About page captured yet. It is archived with each channel \
+                             asset fetch — use ⟳ Refetch in Properties to force one now.",
+                        );
+                        return;
+                    }
+                    let snap = view.snapshots[view.selected].clone();
+                    ui.horizontal(|ui| {
+                        ui.label("Version:");
+                        egui::ComboBox::from_id_salt("about_ver")
+                            .selected_text(about_version_label(&view.snapshots, view.selected))
+                            .show_ui(ui, |ui| {
+                                for i in 0..view.snapshots.len() {
+                                    if ui
+                                        .selectable_label(
+                                            i == view.selected,
+                                            about_version_label(&view.snapshots, i),
+                                        )
+                                        .clicked()
+                                    {
+                                        select = Some(i);
+                                    }
+                                }
+                            });
+                        ui.weak(format!(
+                            "last checked {}",
+                            fmt_datetime_short(snap.last_checked_at)
+                        ));
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        if !snap.description.trim().is_empty() {
+                            ui.push_id(("about_desc", snap.id), |ui| {
+                                egui_commonmark::CommonMarkViewer::new().show(
+                                    ui,
+                                    &mut view.md_cache,
+                                    &snap.description,
+                                );
+                            });
+                            ui.add_space(6.0);
+                        }
+                        for (i, p) in view.panels.iter().enumerate() {
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                if !p.image_path.is_empty() {
+                                    show_about_image(ui, &mut view.img_cache, &p.image_hash, &p.image_path);
+                                }
+                                if !p.title.trim().is_empty() {
+                                    ui.strong(&p.title);
+                                }
+                                if !p.description_md.trim().is_empty() {
+                                    ui.push_id(("about_panel", snap.id, i), |ui| {
+                                        egui_commonmark::CommonMarkViewer::new().show(
+                                            ui,
+                                            &mut view.md_cache,
+                                            &p.description_md,
+                                        );
+                                    });
+                                }
+                                if !p.link.trim().is_empty()
+                                    && ui.link(&p.link).on_hover_text("Open in browser").clicked()
+                                {
+                                    open_url = Some(p.link.clone());
+                                }
+                            });
+                            ui.add_space(4.0);
+                        }
+                        if !view.links.is_empty() {
+                            ui.add_space(4.0);
+                            ui.strong("Links");
+                            for l in &view.links {
+                                let text = if l.title.trim().is_empty() {
+                                    l.url.clone()
+                                } else {
+                                    format!("{} — {}", l.title, l.url)
+                                };
+                                if ui.link(text).on_hover_text(&l.url).clicked() {
+                                    open_url = Some(l.url.clone());
+                                }
+                            }
+                        }
+                    });
+                });
+                draw_alt_image_preview(ctx);
+            },
+        );
+        if let Some(i) = select {
+            self.about_views[idx].select(i);
+        }
+        if let Some(url) = open_url {
+            ctx.open_url(egui::OpenUrl::new_tab(url));
+        }
+        !open
+    }
+}
+
+/// Version-picker entry: capture timestamp, `(current)` on the newest.
+fn about_version_label(snaps: &[crate::store::AboutSnapshotRow], i: usize) -> String {
+    let s = &snaps[i];
+    format!(
+        "{}{}",
+        fmt_datetime_short(s.fetched_at),
+        if i == 0 { "  (current)" } else { "" }
+    )
+}
+
+/// Render one About panel image from disk, lazily decoded only when visible
+/// (mirrors `show_post_image`, but against the viewer's own cache).
+fn show_about_image(ui: &mut egui::Ui, cache: &mut PostImageCache, hash: &str, path: &str) {
+    const MAX_W: f32 = 500.0;
+    const MAX_H: f32 = 400.0;
+    const PLACEHOLDER_H: f32 = 120.0;
+    let cached = cache.get(hash).cloned();
+    match cached {
+        Some(Some((tex, _))) => {
+            let w = ui.available_width().min(MAX_W);
+            let resp = ui.add(
+                egui::Image::from_texture(&tex)
+                    .max_width(w)
+                    .max_height(MAX_H)
+                    .sense(egui::Sense::click()),
+            );
+            queue_alt_image_preview(ui.ctx(), &resp, &tex);
+            if resp.on_hover_text("Alt: preview full size · click: open file").clicked() {
+                crate::platform::open_path(std::path::Path::new(path));
+            }
+        }
+        Some(None) => {
+            // Decode failed / file gone (e.g. channel renamed) — quiet marker.
+            ui.weak("(image unavailable)");
+        }
+        None => {
+            let w = ui.available_width().min(MAX_W);
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(w, PLACEHOLDER_H), egui::Sense::hover());
+            if ui.is_rect_visible(rect) {
+                let key = format!("about_{hash}");
+                let loaded = load_image_texture(std::path::Path::new(path), ui.ctx(), &key);
+                cache.insert(hash.to_string(), loaded);
+                ui.ctx().request_repaint();
+            }
+        }
     }
 }
 

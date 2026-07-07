@@ -2116,14 +2116,13 @@ async fn fetch_youtube_about(
             Ok(resp) if resp.status().is_success() => {
                 if let Ok(body) = resp.text().await
                     && let Some(data) = crate::detectors::extract_json_after(&body, "ytInitialData")
+                    && let Some(hit) = youtube_about_from_page_data(&data)
                 {
-                    if let Some(hit) = youtube_about_from_page_data(&data) {
-                        raw = find_key_object(&data, "aboutChannelViewModel")
-                            .or_else(|| find_key_object(&data, "channelAboutFullMetadataRenderer"))
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null);
-                        scraped = Some(hit);
-                    }
+                    raw = find_key_object(&data, "aboutChannelViewModel")
+                        .or_else(|| find_key_object(&data, "channelAboutFullMetadataRenderer"))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    scraped = Some(hit);
                 }
             }
             Ok(resp) => warn!("YouTube about page ({base}): {}", resp.status()),

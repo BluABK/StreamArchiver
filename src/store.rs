@@ -146,6 +146,9 @@ pub struct AboutSnapshotRow {
     pub account: String,
     pub fetched_at: i64,
     pub last_checked_at: i64,
+    /// Version identity — read by the dedup path, kept on the row for
+    /// completeness (the viewer identifies versions by `id`/`fetched_at`).
+    #[allow(dead_code)]
     pub content_hash: String,
     pub description: String,
     pub panels_json: String,
