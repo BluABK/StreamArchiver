@@ -1168,6 +1168,40 @@ streamarchiver --twitch-login                     # OAuth2 device-code Connect f
 streamarchiver --hidden                           # start to tray (no window)
 ```
 
+## Widget inspector (F12)
+
+A DevTools-style inspector for the UI itself, available in all builds. Press **F12**
+(while the main window is focused) to toggle the 🔍 Inspector window.
+
+- **Elements** lists every widget instrumented with `.inspect()` during the last frame.
+  Click a row to select it (click again to deselect); hovering a row highlights the
+  widget on screen with a blue outline — this works in the main window **and** inside
+  child windows (Processes, Properties, …). The properties panel shows the widget's
+  name, id, rect/size, enabled/hovered/clicked state, viewport, custom props, and the
+  exact source location (`file:line:column`) of the `.inspect()` call, with a 📋
+  copy button. A selected widget that isn't on screen shows "(not on screen this
+  frame)" and the selection is kept.
+- **Layout / Memory / Style** delegate to egui's built-in `inspection_ui`, `memory_ui`,
+  and `settings_ui` debug panels (per-frame stats, id/state memory, live style editing).
+
+Widgets opt in from code by chaining on the `egui::Response`
+(`use crate::inspector::Inspectable`):
+
+```rust
+ui.button("💾 Save settings").inspect("Settings: Save button", &[]);
+// Hot paths (per-row cells): props are only built while the inspector is open.
+resp.inspect_with("Streams grid: instance Name cell",
+    || vec![("channel", row.channel.name.clone())]);
+```
+
+Registration is a single atomic load + branch when the inspector is closed, so
+instrumentation is effectively free in normal use. Caveats: egui auto-ids derive from
+layout order, so a selection inside a dynamic list can shift to a different row when
+the list changes (wrap loop widgets in `push_id` with a stable key for stable
+selection); the source location always identifies the call site regardless. F12 is
+read from the main window's input, so it doesn't toggle while a child window has
+focus.
+
 ## Architecture
 
 Single binary; the tokio core (scheduler + download supervisor) runs regardless of the

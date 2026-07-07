@@ -19,6 +19,7 @@ mod google_oauth;
 mod grid_columns;
 mod hls_preview;
 mod imports;
+mod inspector;
 mod models;
 mod notifications;
 mod oauth;

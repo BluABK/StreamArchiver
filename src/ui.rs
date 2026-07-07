@@ -34,6 +34,7 @@ use crate::models::{
 use crate::google_oauth;
 use crate::grid_columns::{self, ColumnEntry, GridCol, GridState, GridTableId};
 use crate::imports::{self, ImportCandidate};
+use crate::inspector::Inspectable;
 use crate::oauth::{self, AuthFlow};
 use crate::platform::AutoStart;
 use crate::schedule_source::{
@@ -787,6 +788,10 @@ pub struct StreamArchiverApp {
     posts_search: String,
     posts_channel_filter: Option<i64>,
     post_img_cache: PostImageCache,
+    /// The widget inspector (F12): whether the window is open (session-only,
+    /// like the other window flags) and its tab/selection/snapshot state.
+    show_inspector: bool,
+    inspector: crate::inspector::InspectorState,
     quitting: bool,
     /// UI-freeze watchdog heartbeat: stamped each frame so a background thread can
     /// detect (and surface as a native dialog) a hung UI thread. See [`crate::watchdog`].
@@ -1414,6 +1419,8 @@ impl StreamArchiverApp {
             posts_search: String::new(),
             posts_channel_filter: None,
             post_img_cache: HashMap::new(),
+            show_inspector: false,
+            inspector: crate::inspector::InspectorState::default(),
             quitting: false,
             heartbeat,
             view: View::Streams,
@@ -5437,7 +5444,19 @@ fn render_instance_row(
                     avatar,
                     egui::RichText::new(instance_label(&row.monitor.url)).color(name_color),
                 );
-                ui.response().on_hover_text(&row.monitor.url);
+                // inspect_with: props are only built while the inspector is
+                // open (this runs per row per frame). Auto-id caveat applies —
+                // the cell id derives from layout order within the table.
+                ui.response().on_hover_text(&row.monitor.url).inspect_with(
+                    "Streams grid: instance Name cell",
+                    || {
+                        vec![
+                            ("channel", row.channel.name.clone()),
+                            ("url", row.monitor.url.clone()),
+                            ("state", m.last_state.clone()),
+                        ]
+                    },
+                );
             }
             "tool" => {
                 ui.label(short_tool_label(m.tool)).on_hover_text(m.tool.tooltip());
@@ -6147,6 +6166,9 @@ impl eframe::App for StreamArchiverApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.handle_shortcuts(ui.ctx());
+        // Arm/disarm widget registration before anything draws, so pushes go
+        // live the same frame F12 turns the inspector on.
+        crate::inspector::set_enabled(self.show_inspector);
 
         egui::Panel::top("top")
             .resizable(false)
@@ -6180,7 +6202,8 @@ impl eframe::App for StreamArchiverApp {
                         env!("GIT_HASH"),
                     ));
                     ui.separator();
-                    ui.selectable_value(&mut self.view, View::Streams, "Streams");
+                    ui.selectable_value(&mut self.view, View::Streams, "Streams")
+                        .inspect("View tab: Streams", &[]);
                     ui.selectable_value(&mut self.view, View::Videos, "Videos");
                     ui.selectable_value(&mut self.view, View::Schedule, "Schedule");
                     if ui.selectable_value(&mut self.view, View::Posts, "Posts").clicked() {
@@ -6461,8 +6484,14 @@ impl eframe::App for StreamArchiverApp {
         self.format_designer_window(ui.ctx());
         self.confirm_quit_stop_window(ui.ctx());
         self.import_window(ui.ctx());
+        self.inspector_window(ui.ctx());
 
         draw_alt_image_preview(ui.ctx());
+
+        // Must remain the FINAL statement of ui(): the child-viewport windows
+        // above register their widgets after the root CentralPanel, so an
+        // earlier drain would split one frame's widgets across two snapshots.
+        self.inspector.end_frame(self.show_inspector);
     }
 }
 
@@ -6476,6 +6505,12 @@ impl StreamArchiverApp {
         const ADD: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::N);
         const SETTINGS: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Comma);
         const REFRESH: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F5);
+
+        // Widget inspector toggle — handled before the modal early-return so
+        // it works even while a dialog is open.
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F12)) {
+            self.show_inspector = !self.show_inspector;
+        }
 
         // A modal is open: Esc closes it, everything else is swallowed.
         if self.form.is_some()
@@ -13886,7 +13921,11 @@ impl StreamArchiverApp {
                 self.settings_search_lc.clear();
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("💾 Save settings").clicked() {
+                if ui
+                    .button("💾 Save settings")
+                    .inspect("Settings: Save button", &[])
+                    .clicked()
+                {
                     self.save_settings();
                 }
             });
@@ -15917,6 +15956,34 @@ impl StreamArchiverApp {
     }
 
     /// Task-manager-style dialog listing every spawned download tool process with
+    /// The widget inspector (F12): lists widgets instrumented with
+    /// [`crate::inspector::Inspectable::inspect`], with per-widget properties,
+    /// source location, a highlight overlay, and tabs delegating to egui's
+    /// built-in layout/memory/style debug UIs. Displays the previous frame's
+    /// snapshot (drained by `end_frame` at the very end of `ui()`).
+    #[allow(deprecated)]
+    fn inspector_window(&mut self, ctx: &egui::Context) {
+        if !self.show_inspector {
+            return;
+        }
+        let mut open = true;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("inspector_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("🔍 Inspector")
+                .with_inner_size([520.0, 600.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    crate::inspector::ui_contents(ui, &mut self.inspector);
+                });
+            },
+        );
+        self.show_inspector = open;
+    }
+
     /// its PID, status, and uptime, plus per-process Stop (graceful) / Kill (force)
     /// and reveal-log/folder actions. Doubles as a live list of spawned processes.
     #[allow(deprecated)]
@@ -15998,7 +16065,13 @@ impl StreamArchiverApp {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(format!("{} spawned process(es)", self.processes.len()));
-                        if ui.button("⟳ Refresh").clicked() {
+                        // Child-viewport instrumentation: proves registration +
+                        // highlight painting inside an immediate viewport.
+                        if ui
+                            .button("⟳ Refresh")
+                            .inspect("Processes: Refresh button", &[])
+                            .clicked()
+                        {
                             act = Some(Act::Refresh);
                         }
                         ui.weak("Stop = graceful (file finalized) · Kill = force-terminate the tree");
