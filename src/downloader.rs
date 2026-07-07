@@ -1900,6 +1900,7 @@ impl Supervisor {
         let url = row.monitor.url.clone();
         let known_bid = broadcaster_id.unwrap_or_default();
         let monitor_id = row.monitor.id;
+        let channel_id = row.channel.id;
         let running_asset_fetches = self.running_asset_fetches.clone();
 
         let task_id = crate::events::next_task_id();
@@ -1907,7 +1908,7 @@ impl Supervisor {
             id: task_id,
             kind: crate::events::BackgroundTaskKind::AssetFetch,
             label: row.channel.name.clone(),
-            detail: format!("{} ({account}) · icon, banner, badges, emotes", platform.label()),
+            detail: format!("{} ({account}) · icon, banner, badges, emotes, about", platform.label()),
             started_at: now_unix(),
             progress: None,
             progress_info: None,
@@ -1915,6 +1916,15 @@ impl Supervisor {
 
         tokio::spawn(async move {
             use crate::events::TaskOutcome;
+            // The About-page archive rides every asset fetch: same cadence,
+            // dedup, and job gating; snapshots go to the store keyed like the
+            // asset dirs (channel + platform + account).
+            let sink = crate::assets::AboutSink {
+                store: store.clone(),
+                channel_id,
+                platform: platform.as_str().to_string(),
+                account: account.clone(),
+            };
             let outcome = match platform {
                 Platform::Twitch => match ctx.twitch_helix_auth().await {
                     Ok((client_id, token)) => {
@@ -1930,6 +1940,7 @@ impl Supervisor {
                                 let platform_dir = crate::app_paths::platform_assets_dir();
                                 if crate::assets::run_twitch_assets(
                                     &http, &client_id, &token, &bid, &asset_dir, &platform_dir,
+                                    Some(&sink),
                                 )
                                 .await
                                 {
@@ -1958,7 +1969,7 @@ impl Supervisor {
                     } else {
                         None
                     };
-                    let channel_id = uc.as_deref().unwrap_or("");
+                    let yt_channel_id = uc.as_deref().unwrap_or("");
                     let browser = store
                         .get_setting("cookies_browser")
                         .ok()
@@ -1969,7 +1980,7 @@ impl Supervisor {
                         if browser_name.is_empty() { "chrome" } else { browser_name }
                     );
                     if crate::assets::run_youtube_assets(
-                        &http, &api_key, channel_id, &url, &asset_dir, Some(&fp),
+                        &http, &api_key, yt_channel_id, &url, &asset_dir, Some(&fp), Some(&sink),
                     )
                     .await
                     {
@@ -1986,7 +1997,13 @@ impl Supervisor {
                     };
                     match slug {
                         Some(slug)
-                            if crate::assets::run_kick_assets(&http, &slug, &asset_dir).await =>
+                            if crate::assets::run_kick_assets(
+                                &http,
+                                &slug,
+                                &asset_dir,
+                                Some(&sink),
+                            )
+                            .await =>
                         {
                             TaskOutcome::Completed
                         }

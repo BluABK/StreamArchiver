@@ -33,7 +33,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 44;
+const SCHEMA_VERSION: i64 = 45;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -118,6 +118,48 @@ pub struct NewCommunityPost {
     pub vote_count: String,
     pub shared_json: String,
     pub raw_json: String,
+}
+
+/// A new about-page capture to record (schema v45 `about_snapshot`). Keyed on
+/// `(channel_id, platform, account)` — one row per distinct content version;
+/// identical re-captures only bump `last_checked_at`.
+#[derive(Clone, Debug, Default)]
+pub struct NewAboutSnapshot {
+    pub channel_id: i64,
+    pub platform: String, // Platform::as_str()
+    pub account: String,  // assets::account_slug of the instance URL
+    pub content_hash: String,
+    pub description: String,
+    pub panels_json: String, // JSON [assets::AboutPanel]
+    pub links_json: String,  // JSON [assets::AboutLink]
+    pub raw_json: String,    // platform response subtree (forward-compat)
+}
+
+/// One persisted about-page version, as returned by
+/// [`Store::about_snapshots_for_account`] / [`Store::about_latest_per_account`].
+#[derive(Clone, Debug)]
+pub struct AboutSnapshotRow {
+    pub id: i64,
+    #[allow(dead_code)]
+    pub channel_id: i64,
+    pub platform: String,
+    pub account: String,
+    pub fetched_at: i64,
+    pub last_checked_at: i64,
+    pub content_hash: String,
+    pub description: String,
+    pub panels_json: String,
+    pub links_json: String,
+}
+
+/// Outcome of [`Store::about_snapshot_record`]: `inserted` = a new version row
+/// was created; `prev_hash` = the latest hash BEFORE this call (`None` = first
+/// capture ever for the key — the caller keeps the change log silent).
+pub struct AboutRecordOutcome {
+    #[allow(dead_code)]
+    pub id: i64,
+    pub inserted: bool,
+    pub prev_hash: Option<String>,
 }
 
 /// A persisted community post feed row with its ordered attachments, as returned
@@ -940,7 +982,33 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 44)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 44);
+        if version < 45 {
+            // About-page archive: one row per distinct content VERSION of an
+            // account's about page (description, panels, links). Keyed by
+            // (channel_id, platform, account) — the same identity as the asset
+            // dirs, but by channel *id* so renames don't orphan history.
+            // `last_checked_at` bumps when a fetch found identical content.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS about_snapshot (
+                    id              INTEGER PRIMARY KEY,
+                    channel_id      INTEGER NOT NULL,
+                    platform        TEXT NOT NULL,
+                    account         TEXT NOT NULL,
+                    fetched_at      INTEGER NOT NULL,
+                    last_checked_at INTEGER NOT NULL,
+                    content_hash    TEXT NOT NULL,
+                    description     TEXT NOT NULL DEFAULT '',
+                    panels_json     TEXT NOT NULL DEFAULT '[]',
+                    links_json      TEXT NOT NULL DEFAULT '[]',
+                    raw_json        TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY(channel_id) REFERENCES channel(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_about_snapshot_key
+                    ON about_snapshot(channel_id, platform, account, fetched_at DESC);",
+            )?;
+            conn.pragma_update(None, "user_version", 45)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 45);
         Ok(())
     }
 
@@ -1269,6 +1337,137 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(n)
+    }
+
+    // ----- about-page archive (schema v45) -----
+
+    /// Record an about-page capture: insert a new version when `content_hash`
+    /// differs from the latest row for `(channel_id, platform, account)`,
+    /// otherwise just bump that row's `last_checked_at`.
+    pub fn about_snapshot_record(&self, s: &NewAboutSnapshot) -> Result<AboutRecordOutcome> {
+        let conn = self.db();
+        let now = now_unix();
+        let latest: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT id, content_hash FROM about_snapshot
+                 WHERE channel_id = ?1 AND platform = ?2 AND account = ?3
+                 ORDER BY fetched_at DESC, id DESC LIMIT 1",
+                params![s.channel_id, s.platform, s.account],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((id, hash)) = &latest
+            && *hash == s.content_hash
+        {
+            conn.execute(
+                "UPDATE about_snapshot SET last_checked_at = ?2 WHERE id = ?1",
+                params![id, now],
+            )?;
+            return Ok(AboutRecordOutcome {
+                id: *id,
+                inserted: false,
+                prev_hash: Some(hash.clone()),
+            });
+        }
+        conn.execute(
+            "INSERT INTO about_snapshot
+                 (channel_id, platform, account, fetched_at, last_checked_at,
+                  content_hash, description, panels_json, links_json, raw_json)
+             VALUES (?1,?2,?3,?4,?4,?5,?6,?7,?8,?9)",
+            params![
+                s.channel_id, s.platform, s.account, now, s.content_hash, s.description,
+                s.panels_json, s.links_json, s.raw_json,
+            ],
+        )?;
+        Ok(AboutRecordOutcome {
+            id: conn.last_insert_rowid(),
+            inserted: true,
+            prev_hash: latest.map(|(_, h)| h),
+        })
+    }
+
+    /// True when at least one about snapshot exists for the key. Drives the
+    /// degraded-fetch gate (a partial capture may only ever be the baseline).
+    pub fn about_snapshot_exists(
+        &self,
+        channel_id: i64,
+        platform: &str,
+        account: &str,
+    ) -> Result<bool> {
+        let conn = self.db();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM about_snapshot
+             WHERE channel_id = ?1 AND platform = ?2 AND account = ?3",
+            params![channel_id, platform, account],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    fn about_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AboutSnapshotRow> {
+        Ok(AboutSnapshotRow {
+            id: r.get(0)?,
+            channel_id: r.get(1)?,
+            platform: r.get(2)?,
+            account: r.get(3)?,
+            fetched_at: r.get(4)?,
+            last_checked_at: r.get(5)?,
+            content_hash: r.get(6)?,
+            description: r.get(7)?,
+            panels_json: r.get(8)?,
+            links_json: r.get(9)?,
+        })
+    }
+
+    /// All archived versions of one account's about page, newest first (the
+    /// viewer's version picker).
+    pub fn about_snapshots_for_account(
+        &self,
+        channel_id: i64,
+        platform: &str,
+        account: &str,
+    ) -> Result<Vec<AboutSnapshotRow>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id, channel_id, platform, account, fetched_at, last_checked_at,
+                    content_hash, description, panels_json, links_json
+             FROM about_snapshot
+             WHERE channel_id = ?1 AND platform = ?2 AND account = ?3
+             ORDER BY fetched_at DESC, id DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![channel_id, platform, account], Self::about_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Latest snapshot per (platform, account) of a channel, with each
+    /// account's total version count — the channel-Properties "About pages"
+    /// list.
+    pub fn about_latest_per_account(
+        &self,
+        channel_id: i64,
+    ) -> Result<Vec<(AboutSnapshotRow, i64)>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id, channel_id, platform, account, fetched_at, last_checked_at,
+                    content_hash, description, panels_json, links_json,
+                    (SELECT COUNT(*) FROM about_snapshot i
+                      WHERE i.channel_id = o.channel_id AND i.platform = o.platform
+                        AND i.account = o.account) AS versions
+             FROM about_snapshot o
+             WHERE channel_id = ?1
+               AND fetched_at = (SELECT MAX(fetched_at) FROM about_snapshot i
+                                  WHERE i.channel_id = o.channel_id
+                                    AND i.platform = o.platform AND i.account = o.account)
+             ORDER BY platform, account",
+        )?;
+        let rows = stmt
+            .query_map(params![channel_id], |r| {
+                Ok((Self::about_row(r)?, r.get::<_, i64>(10)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// List community posts (newest `first_seen` first) with their ordered media.
@@ -4829,6 +5028,113 @@ mod tests {
         let by_id = |id| recs.iter().find(|r| r.id == id).unwrap();
         assert_eq!(by_id(hit).trigger_info, "title ~ \"karaoke\"");
         assert_eq!(by_id(normal).trigger_info, "");
+    }
+
+    fn about(cid: i64, platform: &str, account: &str, hash: &str, desc: &str) -> NewAboutSnapshot {
+        NewAboutSnapshot {
+            channel_id: cid,
+            platform: platform.into(),
+            account: account.into(),
+            content_hash: hash.into(),
+            description: desc.into(),
+            panels_json: "[]".into(),
+            links_json: "[]".into(),
+            raw_json: String::new(),
+        }
+    }
+
+    #[test]
+    fn about_record_inserts_baseline() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        assert!(!store.about_snapshot_exists(cid, "twitch", "a").unwrap());
+        let o = store.about_record_test(&about(cid, "twitch", "a", "h1", "bio v1"));
+        assert!(o.inserted);
+        assert!(o.prev_hash.is_none(), "first capture ever has no prev hash");
+        assert!(store.about_snapshot_exists(cid, "twitch", "a").unwrap());
+        let rows = store.about_snapshots_for_account(cid, "twitch", "a").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].description, "bio v1");
+        assert_eq!(rows[0].fetched_at, rows[0].last_checked_at);
+    }
+
+    #[test]
+    fn about_record_dedups_same_hash() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        store.about_record_test(&about(cid, "twitch", "a", "h1", "bio"));
+        // Force a visibly newer last_checked_at.
+        {
+            let conn = store.db();
+            conn.execute("UPDATE about_snapshot SET fetched_at = 100, last_checked_at = 100", [])
+                .unwrap();
+        }
+        let o = store.about_record_test(&about(cid, "twitch", "a", "h1", "bio"));
+        assert!(!o.inserted, "same hash must not create a version");
+        assert_eq!(o.prev_hash.as_deref(), Some("h1"));
+        let rows = store.about_snapshots_for_account(cid, "twitch", "a").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].last_checked_at > 100, "check timestamp bumped");
+        assert_eq!(rows[0].fetched_at, 100, "capture timestamp untouched");
+    }
+
+    #[test]
+    fn about_record_new_version_on_change() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        store.about_record_test(&about(cid, "twitch", "a", "h1", "old"));
+        // Backdate the first row so newest-first ordering is observable.
+        {
+            let conn = store.db();
+            conn.execute("UPDATE about_snapshot SET fetched_at = 100", []).unwrap();
+        }
+        let o = store.about_record_test(&about(cid, "twitch", "a", "h2", "new"));
+        assert!(o.inserted);
+        assert_eq!(o.prev_hash.as_deref(), Some("h1"), "prev hash drives the change log");
+        let rows = store.about_snapshots_for_account(cid, "twitch", "a").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].description, "new", "newest first");
+        assert_eq!(rows[1].description, "old");
+    }
+
+    #[test]
+    fn about_latest_per_account_two_accounts() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        store.about_record_test(&about(cid, "twitch", "main", "h1", "main v1"));
+        {
+            let conn = store.db();
+            conn.execute("UPDATE about_snapshot SET fetched_at = 100", []).unwrap();
+        }
+        store.about_record_test(&about(cid, "twitch", "main", "h2", "main v2"));
+        store.about_record_test(&about(cid, "twitch", "alt", "h3", "alt v1"));
+        let latest = store.about_latest_per_account(cid).unwrap();
+        assert_eq!(latest.len(), 2);
+        let main = latest.iter().find(|(s, _)| s.account == "main").unwrap();
+        assert_eq!(main.0.description, "main v2");
+        assert_eq!(main.1, 2, "version count");
+        let alt = latest.iter().find(|(s, _)| s.account == "alt").unwrap();
+        assert_eq!(alt.0.description, "alt v1");
+        assert_eq!(alt.1, 1);
+    }
+
+    #[test]
+    fn about_keys_isolated_per_platform() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        store.about_record_test(&about(cid, "twitch", "same", "h1", "twitch bio"));
+        let o = store.about_record_test(&about(cid, "kick", "same", "h1", "kick bio"));
+        assert!(o.inserted, "same account slug on another platform is a distinct key");
+        assert!(o.prev_hash.is_none());
+        assert_eq!(store.about_snapshots_for_account(cid, "twitch", "same").unwrap().len(), 1);
+        assert_eq!(store.about_snapshots_for_account(cid, "kick", "same").unwrap().len(), 1);
+    }
+
+    impl Store {
+        /// Test shim: unwraps the Result to keep the assertions terse.
+        fn about_record_test(&self, s: &NewAboutSnapshot) -> AboutRecordOutcome {
+            self.about_snapshot_record(s).unwrap()
+        }
     }
 
     #[test]

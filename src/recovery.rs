@@ -227,9 +227,10 @@ pub async fn find_live_playlist(
     None
 }
 
-/// Twitch's public web client-id (read-only GQL). Used only to look up a published
-/// VOD's exact CDN folder via `seekPreviewsURL` — no auth or user data involved.
-const GQL_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
+/// Twitch's public web client-id (read-only GQL). Used to look up a published
+/// VOD's exact CDN folder via `seekPreviewsURL` and to read public channel
+/// panels for the About-page archive — no auth or user data involved.
+pub(crate) const GQL_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
 
 /// A published VOD's exact CDN location, resolved from Twitch GQL — no host-list
 /// guessing. Also yields the login/broadcast/start the derivation would need.

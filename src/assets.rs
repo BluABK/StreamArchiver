@@ -472,19 +472,23 @@ pub async fn fetch_stream_thumbnail(client: &Client, url: &str, dest: &Path) -> 
 
 // ---------- Twitch channel assets ----------
 
-/// Download Twitch channel icon and offline banner into `asset_dir/`.
+/// Download Twitch channel icon and offline banner into `asset_dir/`. Returns
+/// the broadcaster's channel description (bio) from the same Helix response —
+/// input to the About-page snapshot, no extra request.
 async fn fetch_twitch_channel_assets(
     client: &Client,
     client_id: &str,
     token: &str,
     broadcaster_id: &str,
     asset_dir: &Path,
-) -> Result<()> {
+) -> Result<String> {
     #[derive(Deserialize)]
     struct TwitchUser {
         profile_image_url: String,
         #[serde(default)]
         offline_image_url: String,
+        #[serde(default)]
+        description: String,
     }
     #[derive(Deserialize)]
     struct UsersResp {
@@ -524,7 +528,7 @@ async fn fetch_twitch_channel_assets(
             warn!("twitch banner: {e}");
         }
     }
-    Ok(())
+    Ok(user.description)
 }
 
 // ---------- Twitch badges ----------
@@ -1287,15 +1291,16 @@ async fn fetch_7tv_emotes(
 // ---------- YouTube ----------
 
 /// Download YouTube channel icon and banner into `asset_dir/`.
-/// Returns `Ok(true)` when a banner image was successfully written, so the caller
-/// can skip the page-scrape banner fallback and avoid two YouTube banner sources
-/// overwriting each other on every fetch (phantom "banner replaced" history).
+/// Returns `(banner_set, description)`: `banner_set` lets the caller skip the
+/// page-scrape banner fallback (two banner sources overwrite each other and
+/// spam phantom history); `description` is `snippet.description` from the same
+/// response — About-page input, zero extra quota.
 async fn fetch_youtube_channel_assets(
     client: &Client,
     api_key: &str,
     channel_id: &str,
     asset_dir: &Path,
-) -> Result<bool> {
+) -> Result<(bool, String)> {
     if api_key.is_empty() || channel_id.is_empty() {
         bail!("missing YouTube API key or channel ID");
     }
@@ -1336,17 +1341,21 @@ async fn fetch_youtube_channel_assets(
             Err(e) => warn!("YouTube banner: {e}"),
         }
     }
-    Ok(banner_set)
+    let description = item["snippet"]["description"].as_str().unwrap_or("").to_string();
+    Ok((banner_set, description))
 }
 
 // ---------- Kick ----------
 
 /// Download Kick channel icon and banner into `asset_dir/` via the v2 API.
+/// Returns the parsed v2 channel JSON so the caller can also archive the
+/// about page (bio + socials) from the SAME response — zero extra requests,
+/// zero extra Cloudflare exposure.
 async fn fetch_kick_channel_assets(
     client: &Client,
     slug: &str,
     asset_dir: &Path,
-) -> Result<()> {
+) -> Result<serde_json::Value> {
     if slug.is_empty() {
         bail!("empty Kick slug");
     }
@@ -1379,7 +1388,7 @@ async fn fetch_kick_channel_assets(
             warn!("Kick banner: {e}");
         }
     }
-    Ok(())
+    Ok(v)
 }
 
 // ---------- Platform orchestrators ----------
@@ -1405,11 +1414,16 @@ pub async fn run_twitch_assets(
     broadcaster_id: &str,
     asset_dir: &Path,
     platform_dir: &Path,
+    about: Option<&AboutSink>,
 ) -> bool {
+    let mut description: Option<String> = None;
     let ok = match fetch_twitch_channel_assets(client, client_id, token, broadcaster_id, asset_dir)
         .await
     {
-        Ok(()) => true,
+        Ok(desc) => {
+            description = Some(desc);
+            true
+        }
         Err(e) => {
             warn!("Twitch channel assets ({broadcaster_id}): {e}");
             false
@@ -1442,6 +1456,14 @@ pub async fn run_twitch_assets(
         fetch_twitch_name_color(client, client_id, token, broadcaster_id, asset_dir).await
     {
         warn!("Twitch name color ({broadcaster_id}): {e}");
+    }
+    // About-page archive (best-effort like badges/emotes): the Helix bio came
+    // with the icon fetch; panels need one anonymous GQL round-trip.
+    if let (Some(sink), Some(desc)) = (about, description) {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        if let Err(e) = fetch_twitch_about(client, broadcaster_id, desc, asset_dir, sink).await {
+            warn!("Twitch about ({broadcaster_id}): {e}");
+        }
     }
     if ok {
         write_fetched_stamp(asset_dir);
@@ -1616,15 +1638,18 @@ pub async fn run_youtube_assets(
     channel_url: &str,
     asset_dir: &Path,
     fingerprint: Option<&BrowserFingerprint>,
+    about: Option<&AboutSink>,
 ) -> bool {
     let mut any_ok = false;
     let mut api_set_banner = false;
+    let mut api_description: Option<String> = None;
 
     if !api_key.is_empty() && !channel_id.is_empty() {
         match fetch_youtube_channel_assets(client, api_key, channel_id, asset_dir).await {
-            Ok(banner_set) => {
+            Ok((banner_set, description)) => {
                 any_ok = true;
                 api_set_banner = banner_set;
+                api_description = Some(description);
             }
             Err(e) => warn!("YouTube channel assets ({channel_id}): {e}"),
         }
@@ -1640,16 +1665,47 @@ pub async fn run_youtube_assets(
         }
     }
 
+    // About-page archive (best-effort): API description + /about page links.
+    if let Some(sink) = about
+        && let Err(e) = fetch_youtube_about(
+            client,
+            channel_url,
+            api_description,
+            fingerprint,
+            asset_dir,
+            sink,
+        )
+        .await
+    {
+        warn!("YouTube about ({channel_url}): {e}");
+    }
+
     if any_ok {
         write_fetched_stamp(asset_dir);
     }
     any_ok
 }
 
-/// Run Kick channel asset fetches (icon, banner). Stamps only on success.
-pub async fn run_kick_assets(client: &Client, slug: &str, asset_dir: &Path) -> bool {
+/// Run Kick channel asset fetches (icon, banner) and, when `about` is given,
+/// archive the bio + social links from the SAME v2 response (zero extra
+/// requests). Stamps only on success.
+pub async fn run_kick_assets(
+    client: &Client,
+    slug: &str,
+    asset_dir: &Path,
+    about: Option<&AboutSink>,
+) -> bool {
     match fetch_kick_channel_assets(client, slug, asset_dir).await {
-        Ok(()) => {
+        Ok(v) => {
+            if let Some(sink) = about {
+                let (bio, links) = kick_about_from_channel_json(&v);
+                if let Err(e) =
+                    persist_about_snapshot(client, asset_dir, sink, bio, Vec::new(), links, v, false)
+                        .await
+                {
+                    warn!("Kick about ({slug}): {e}");
+                }
+            }
             write_fetched_stamp(asset_dir);
             true
         }
@@ -1658,6 +1714,431 @@ pub async fn run_kick_assets(client: &Client, slug: &str, asset_dir: &Path) -> b
             false
         }
     }
+}
+
+// ---------- About page archive ----------
+
+/// One Twitch panel / generic about-page block, persisted as JSON in
+/// `about_snapshot.panels_json`. All fields default so older snapshots keep
+/// deserializing when new per-panel fields are added later.
+#[derive(serde::Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct AboutPanel {
+    #[serde(default)]
+    pub title: String,
+    /// Twitch panel bodies are markdown; other platforms use plain text here.
+    #[serde(default)]
+    pub description_md: String,
+    #[serde(default)]
+    pub image_url: String,
+    /// fnv64 of the downloaded image bytes; empty = not downloaded (hashing
+    /// then falls back to `image_url`).
+    #[serde(default)]
+    pub image_hash: String,
+    /// Absolute path under the account's `about/` dir; empty = no image.
+    #[serde(default)]
+    pub image_path: String,
+    #[serde(default)]
+    pub link: String,
+}
+
+/// One external link from an about page (persisted in `links_json`).
+#[derive(serde::Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct AboutLink {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub url: String,
+}
+
+/// Everything a platform about-step needs to persist a snapshot from inside
+/// the spawned asset task.
+pub struct AboutSink {
+    pub store: std::sync::Arc<crate::store::Store>,
+    pub channel_id: i64,
+    pub platform: String, // Platform::as_str()
+    pub account: String,  // account_slug of the instance URL
+}
+
+/// Deterministic version hash over the about-page CONTENT: description +
+/// per-panel (title, body, link, image identity) + links. Field values are
+/// trimmed and joined with `\x1f`, records with `\x1e`, hashed with fnv64.
+/// A panel's image identity is its byte hash when downloaded, else its URL —
+/// so CDN URL churn serving identical bytes does NOT create a new version.
+pub fn about_content_hash(description: &str, panels: &[AboutPanel], links: &[AboutLink]) -> String {
+    let mut s = String::new();
+    s.push_str(description.trim());
+    for p in panels {
+        s.push('\x1e');
+        let img = if p.image_hash.is_empty() { p.image_url.trim() } else { &p.image_hash };
+        for part in [p.title.trim(), p.description_md.trim(), p.link.trim(), img] {
+            s.push_str(part);
+            s.push('\x1f');
+        }
+    }
+    for l in links {
+        s.push('\x1e');
+        s.push_str(l.title.trim());
+        s.push('\x1f');
+        s.push_str(l.url.trim());
+    }
+    crate::detectors::fnv64(s.as_bytes()).to_string()
+}
+
+/// Parse Twitch GQL `user.panels` into panels, tolerating schema drift: only
+/// entries that expose at least one DefaultPanel field are kept, null/missing
+/// fields stay empty, non-panel garbage is skipped. Never panics.
+pub(crate) fn twitch_panels_from_gql(v: &serde_json::Value) -> Vec<AboutPanel> {
+    let Some(arr) = v["data"]["user"]["panels"].as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|p| {
+            if !p.is_object() {
+                return None;
+            }
+            let panel = AboutPanel {
+                title: p["title"].as_str().unwrap_or("").to_string(),
+                description_md: p["description"].as_str().unwrap_or("").to_string(),
+                image_url: p["imageURL"].as_str().unwrap_or("").to_string(),
+                link: p["linkURL"].as_str().unwrap_or("").to_string(),
+                ..Default::default()
+            };
+            // ExtensionPanel etc. come back with all DefaultPanel fields null.
+            if panel.title.is_empty()
+                && panel.description_md.is_empty()
+                && panel.image_url.is_empty()
+                && panel.link.is_empty()
+            {
+                None
+            } else {
+                Some(panel)
+            }
+        })
+        .collect()
+}
+
+/// Extract (bio, social links) from a Kick v2 channel JSON blob. Bare handles
+/// in the flat social fields are mapped to full profile URLs; empty fields are
+/// skipped; a missing `user` object yields `("", [])`.
+pub(crate) fn kick_about_from_channel_json(v: &serde_json::Value) -> (String, Vec<AboutLink>) {
+    let user = &v["user"];
+    let bio = user["bio"].as_str().unwrap_or("").trim().to_string();
+    let mut links = Vec::new();
+    for (field, base) in [
+        ("instagram", "https://instagram.com/"),
+        ("twitter", "https://twitter.com/"),
+        ("youtube", "https://youtube.com/"),
+        ("discord", "https://discord.gg/"),
+        ("tiktok", "https://tiktok.com/@"),
+        ("facebook", "https://facebook.com/"),
+    ] {
+        let raw = user[field].as_str().unwrap_or("").trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let url = if raw.starts_with("http://") || raw.starts_with("https://") {
+            raw.to_string()
+        } else {
+            format!("{base}{}", raw.trim_start_matches('@'))
+        };
+        links.push(AboutLink { title: field.to_string(), url });
+    }
+    (bio, links)
+}
+
+/// Depth-first search for the first object stored under `key` anywhere in the
+/// tree. The YouTube about node moves around inside `ytInitialData` between
+/// layout generations, so fixed index paths are too brittle.
+pub(crate) fn find_key_object<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+    match v {
+        serde_json::Value::Object(map) => {
+            if let Some(hit) = map.get(key) {
+                return Some(hit);
+            }
+            map.values().find_map(|c| find_key_object(c, key))
+        }
+        serde_json::Value::Array(arr) => arr.iter().find_map(|c| find_key_object(c, key)),
+        _ => None,
+    }
+}
+
+/// Unwrap a YouTube `/redirect?...&q=<encoded>` wrapper to the real target URL
+/// (percent-decoded). Non-redirect URLs pass through unchanged.
+pub(crate) fn unwrap_yt_redirect(url: &str) -> String {
+    let is_redirect = url.starts_with("https://www.youtube.com/redirect")
+        || url.starts_with("/redirect");
+    if !is_redirect {
+        return url.to_string();
+    }
+    let Some(q) = url.split_once('?').and_then(|(_, qs)| {
+        qs.split('&').find_map(|kv| kv.strip_prefix("q="))
+    }) else {
+        return url.to_string();
+    };
+    // Minimal percent-decode (%XX → byte); '+' is literal in this parameter.
+    let bytes = q.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let (Some(h), Some(l)) = (
+                (bytes.get(i + 1).copied()).and_then(|c| (c as char).to_digit(16)),
+                (bytes.get(i + 2).copied()).and_then(|c| (c as char).to_digit(16)),
+            )
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| q.to_string())
+}
+
+/// Extract (description, links) from a channel About page's `ytInitialData`,
+/// trying the current `aboutChannelViewModel` first, then the legacy
+/// `channelAboutFullMetadataRenderer`. `None` = no about node found at all.
+pub(crate) fn youtube_about_from_page_data(
+    data: &serde_json::Value,
+) -> Option<(String, Vec<AboutLink>)> {
+    if let Some(vm) = find_key_object(data, "aboutChannelViewModel") {
+        let description = vm["description"].as_str().unwrap_or("").to_string();
+        let mut links = Vec::new();
+        if let Some(arr) = vm["links"].as_array() {
+            for l in arr {
+                let l = &l["channelExternalLinkViewModel"];
+                let title = l["title"]["content"].as_str().unwrap_or("").to_string();
+                let url = l["link"]["content"].as_str().unwrap_or("").trim().to_string();
+                if !url.is_empty() {
+                    let url = if url.starts_with("http") { url } else { format!("https://{url}") };
+                    links.push(AboutLink { title, url: unwrap_yt_redirect(&url) });
+                }
+            }
+        }
+        return Some((description, links));
+    }
+    if let Some(r) = find_key_object(data, "channelAboutFullMetadataRenderer") {
+        let description = r["description"]["simpleText"].as_str().unwrap_or("").to_string();
+        let mut links = Vec::new();
+        if let Some(arr) = r["primaryLinks"].as_array() {
+            for l in arr {
+                let title = l["title"]["simpleText"].as_str().unwrap_or("").to_string();
+                let url = l["navigationEndpoint"]["urlEndpoint"]["url"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                if !url.is_empty() {
+                    links.push(AboutLink { title, url: unwrap_yt_redirect(&url) });
+                }
+            }
+        }
+        return Some((description, links));
+    }
+    None
+}
+
+/// [`crate::detectors`]' post-image downloader's twin for the `about/` subdir:
+/// download, hash the bytes with fnv64, store content-addressed as
+/// `{hash}.{ext}` (identical bytes reuse the existing file). `None` = failure.
+async fn download_about_image(
+    client: &Client,
+    url: &str,
+    about_dir: &Path,
+) -> Option<(String, PathBuf)> {
+    let ext = ext_from_url(url).unwrap_or("png");
+    let tmp = about_dir.join(format!("tmp.{ext}"));
+    download_image(client, url, &tmp).await.ok()?;
+    let bytes = tokio::fs::read(&tmp).await.ok()?;
+    let hash = crate::detectors::fnv64(&bytes).to_string();
+    let dest = about_dir.join(format!("{hash}.{ext}"));
+    if tokio::fs::try_exists(&dest).await.unwrap_or(false) {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    } else if tokio::fs::rename(&tmp, &dest).await.is_err() {
+        let _ = tokio::fs::write(&dest, &bytes).await;
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    Some((hash, dest))
+}
+
+/// Download panel images into `asset_dir/about/`, hash the content, and record
+/// the snapshot (new DB version only when the content actually changed).
+///
+/// `degraded` marks a round where an OPTIONAL enrichment source failed (Twitch
+/// GQL panels, YouTube about-scrape links): such a capture may only ever be
+/// the FIRST baseline — over an existing snapshot it is skipped entirely
+/// (not even a `last_checked_at` bump, since the content is unverified). This
+/// prevents version flip-flop when the enrichment source is temporarily down.
+///
+/// A genuine new version over an existing baseline also appends an
+/// `asset_changes.jsonl` line (`kind: "about"`), so the Asset history window
+/// lists the change; the first-ever capture stays silent like all baselines.
+#[allow(clippy::too_many_arguments)]
+async fn persist_about_snapshot(
+    client: &Client,
+    asset_dir: &Path,
+    sink: &AboutSink,
+    description: String,
+    mut panels: Vec<AboutPanel>,
+    links: Vec<AboutLink>,
+    raw: serde_json::Value,
+    degraded: bool,
+) -> Result<()> {
+    if degraded
+        && sink
+            .store
+            .about_snapshot_exists(sink.channel_id, &sink.platform, &sink.account)?
+    {
+        return Ok(());
+    }
+    let about_dir = asset_dir.join("about");
+    if panels.iter().any(|p| !p.image_url.is_empty()) {
+        tokio::fs::create_dir_all(&about_dir).await?;
+    }
+    for p in &mut panels {
+        if p.image_url.is_empty() {
+            continue;
+        }
+        if let Some((hash, path)) = download_about_image(client, &p.image_url, &about_dir).await {
+            p.image_hash = hash;
+            p.image_path = path.to_string_lossy().into_owned();
+        } else {
+            warn!("about panel image failed: {}", p.image_url);
+        }
+    }
+    let content_hash = about_content_hash(&description, &panels, &links);
+    let outcome = sink.store.about_snapshot_record(&crate::store::NewAboutSnapshot {
+        channel_id: sink.channel_id,
+        platform: sink.platform.clone(),
+        account: sink.account.clone(),
+        content_hash: content_hash.clone(),
+        description,
+        panels_json: serde_json::to_string(&panels).unwrap_or_else(|_| "[]".into()),
+        links_json: serde_json::to_string(&links).unwrap_or_else(|_| "[]".into()),
+        raw_json: raw.to_string(),
+    })?;
+    if outcome.inserted && let Some(prev) = outcome.prev_hash {
+        append_asset_changes(
+            asset_dir,
+            &[AssetChange {
+                at: now_unix(),
+                kind: "about".to_string(),
+                provider: String::new(),
+                action: "changed".to_string(),
+                name: String::new(),
+                id: String::new(),
+                old: prev,
+                new: content_hash,
+            }],
+        )
+        .await;
+    }
+    Ok(())
+}
+
+/// Fetch a broadcaster's public About panels via anonymous Twitch GQL (the
+/// same read-only transport recovery uses for `seekPreviewsURL`). Returns the
+/// parsed panels plus the raw GQL response for `raw_json`.
+async fn fetch_twitch_panels_gql(
+    client: &Client,
+    broadcaster_id: &str,
+) -> Result<(Vec<AboutPanel>, serde_json::Value)> {
+    let query = format!(
+        "query{{user(id:\"{broadcaster_id}\"){{panels{{__typename id \
+         ... on DefaultPanel{{title imageURL linkURL description}}}}}}}}"
+    );
+    let resp = client
+        .post("https://gql.twitch.tv/gql")
+        .header("Client-Id", crate::recovery::GQL_CLIENT_ID)
+        .json(&serde_json::json!({ "query": query }))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        bail!("Twitch GQL panels: {}", resp.status());
+    }
+    let v: serde_json::Value = resp.json().await?;
+    if v["data"]["user"].is_null() {
+        bail!("Twitch GQL panels: no user for id {broadcaster_id}");
+    }
+    Ok((twitch_panels_from_gql(&v), v))
+}
+
+/// Archive the Twitch about page: the Helix `description` (already fetched
+/// with the icon/banner) plus panels via anonymous GQL. A GQL failure degrades
+/// the round (baseline-only persist).
+async fn fetch_twitch_about(
+    client: &Client,
+    broadcaster_id: &str,
+    description: String,
+    asset_dir: &Path,
+    sink: &AboutSink,
+) -> Result<()> {
+    let (panels, raw, degraded) = match fetch_twitch_panels_gql(client, broadcaster_id).await {
+        Ok((panels, raw)) => (panels, raw, false),
+        Err(e) => {
+            warn!("Twitch panels ({broadcaster_id}): {e}");
+            (Vec::new(), serde_json::Value::Null, true)
+        }
+    };
+    persist_about_snapshot(client, asset_dir, sink, description, panels, Vec::new(), raw, degraded)
+        .await
+}
+
+/// Archive the YouTube about page: description from the Data API response
+/// (when the API path ran) with the `/about` page scrape supplying links (and
+/// the description fallback). A scrape miss degrades the round.
+async fn fetch_youtube_about(
+    client: &Client,
+    channel_url: &str,
+    api_description: Option<String>,
+    fingerprint: Option<&BrowserFingerprint>,
+    asset_dir: &Path,
+    sink: &AboutSink,
+) -> Result<()> {
+    let base = {
+        let t = channel_url.trim().trim_end_matches('/');
+        t.strip_suffix("/live")
+            .or_else(|| t.strip_suffix("/streams"))
+            .or_else(|| t.strip_suffix("/community"))
+            .unwrap_or(t)
+            .to_string()
+    };
+    let mut scraped: Option<(String, Vec<AboutLink>)> = None;
+    let mut raw = serde_json::Value::Null;
+    if !base.is_empty() {
+        let rb = client
+            .get(format!("{base}/about"))
+            .query(&[("hl", "en"), ("gl", "US")])
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Cookie", "CONSENT=YES+1; SOCS=CAI");
+        let rb = if let Some(fp) = fingerprint { fp.apply_yt_nav_headers(rb) } else { rb };
+        match rb.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(body) = resp.text().await
+                    && let Some(data) = crate::detectors::extract_json_after(&body, "ytInitialData")
+                {
+                    if let Some(hit) = youtube_about_from_page_data(&data) {
+                        raw = find_key_object(&data, "aboutChannelViewModel")
+                            .or_else(|| find_key_object(&data, "channelAboutFullMetadataRenderer"))
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        scraped = Some(hit);
+                    }
+                }
+            }
+            Ok(resp) => warn!("YouTube about page ({base}): {}", resp.status()),
+            Err(e) => warn!("YouTube about page ({base}): {e}"),
+        }
+    }
+    let degraded = scraped.is_none();
+    let (scrape_desc, links) = scraped.unwrap_or_default();
+    let description = api_description.filter(|d| !d.trim().is_empty()).unwrap_or(scrape_desc);
+    if description.trim().is_empty() && links.is_empty() {
+        // Nothing from either source — not even worth a degraded baseline.
+        bail!("no about content from API or scrape");
+    }
+    persist_about_snapshot(client, asset_dir, sink, description, Vec::new(), links, raw, degraded)
+        .await
 }
 
 #[cfg(test)]
@@ -1681,6 +2162,145 @@ mod tests {
             .join(format!("{prefix}-{}-{n}-{nanos}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn about_hash_stable_and_sensitive() {
+        let panels = vec![AboutPanel {
+            title: "Schedule".into(),
+            description_md: "Mon-Fri".into(),
+            image_url: "https://cdn/img.png".into(),
+            link: "https://example.com".into(),
+            ..Default::default()
+        }];
+        let links = vec![AboutLink { title: "twitter".into(), url: "https://x.com/a".into() }];
+        let base = about_content_hash("bio", &panels, &links);
+        assert_eq!(base, about_content_hash("bio", &panels, &links), "deterministic");
+        assert_eq!(base, about_content_hash("  bio  ", &panels, &links), "trims fields");
+        assert_ne!(base, about_content_hash("other bio", &panels, &links));
+        let mut p2 = panels.clone();
+        p2[0].title = "New title".into();
+        assert_ne!(base, about_content_hash("bio", &p2, &links));
+        let mut l2 = links.clone();
+        l2[0].url = "https://x.com/b".into();
+        assert_ne!(base, about_content_hash("bio", &panels, &l2));
+        // With a byte hash present, the (churning) CDN URL no longer matters…
+        let mut p3 = panels.clone();
+        p3[0].image_hash = "1234".into();
+        let hashed = about_content_hash("bio", &p3, &links);
+        let mut p4 = p3.clone();
+        p4[0].image_url = "https://cdn/rotated-url.png".into();
+        assert_eq!(hashed, about_content_hash("bio", &p4, &links), "image_hash beats image_url");
+        // …but without one, a URL change does.
+        let mut p5 = panels.clone();
+        p5[0].image_url = "https://cdn/rotated-url.png".into();
+        assert_ne!(base, about_content_hash("bio", &p5, &links));
+    }
+
+    #[test]
+    fn twitch_panels_parse_and_drift() {
+        let v = serde_json::json!({"data": {"user": {"panels": [
+            {"__typename": "DefaultPanel", "id": "1", "title": "Schedule",
+             "imageURL": "https://cdn/p1.png", "linkURL": "https://example.com",
+             "description": "**Mon-Fri** 18:00"},
+            {"__typename": "ExtensionPanel", "id": "2", "title": null,
+             "imageURL": null, "linkURL": null, "description": null},
+            {"__typename": "DefaultPanel", "id": "3", "title": null,
+             "imageURL": "https://cdn/p3.png", "linkURL": null, "description": null},
+            "garbage-entry",
+        ]}}});
+        let panels = twitch_panels_from_gql(&v);
+        assert_eq!(panels.len(), 2, "extension panel + garbage skipped");
+        assert_eq!(panels[0].title, "Schedule");
+        assert_eq!(panels[0].description_md, "**Mon-Fri** 18:00");
+        assert_eq!(panels[1].image_url, "https://cdn/p3.png");
+        assert_eq!(panels[1].title, "", "null fields stay empty, panel kept");
+        // No user / no panels → empty, never a panic.
+        assert!(twitch_panels_from_gql(&serde_json::json!({})).is_empty());
+        assert!(twitch_panels_from_gql(&serde_json::json!({"data": {"user": null}})).is_empty());
+    }
+
+    #[test]
+    fn kick_about_extracts_bio_and_socials() {
+        let v = serde_json::json!({"user": {
+            "bio": "  VTuber streaming rhythm games  ",
+            "instagram": "@somebody",
+            "twitter": "somebody",
+            "discord": "https://discord.gg/abc123",
+            "youtube": "",
+            "tiktok": null,
+        }});
+        let (bio, links) = kick_about_from_channel_json(&v);
+        assert_eq!(bio, "VTuber streaming rhythm games");
+        assert_eq!(links.len(), 3, "empty/null socials skipped");
+        let by = |t: &str| links.iter().find(|l| l.title == t).unwrap().url.clone();
+        assert_eq!(by("instagram"), "https://instagram.com/somebody", "@handle mapped to URL");
+        assert_eq!(by("twitter"), "https://twitter.com/somebody");
+        assert_eq!(by("discord"), "https://discord.gg/abc123", "full URLs pass through");
+        // Missing user object.
+        let (bio, links) = kick_about_from_channel_json(&serde_json::json!({}));
+        assert!(bio.is_empty() && links.is_empty());
+    }
+
+    #[test]
+    fn youtube_about_new_and_legacy_shapes() {
+        // Current layout: aboutChannelViewModel nested somewhere in the tree.
+        let new = serde_json::json!({"onResponseReceivedEndpoints": [{"whatever": {
+            "aboutChannelViewModel": {
+                "description": "I stream things.",
+                "links": [
+                    {"channelExternalLinkViewModel": {
+                        "title": {"content": "Twitter"},
+                        "link": {"content": "twitter.com/someone"}}},
+                    {"channelExternalLinkViewModel": {
+                        "title": {"content": "Shop"},
+                        "link": {"content": "https://www.youtube.com/redirect?event=channel_description&q=https%3A%2F%2Fshop.example.com%2Fmerch"}}},
+                ],
+            }}}]});
+        let (desc, links) = youtube_about_from_page_data(&new).unwrap();
+        assert_eq!(desc, "I stream things.");
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].url, "https://twitter.com/someone", "scheme added");
+        assert_eq!(links[1].url, "https://shop.example.com/merch", "redirect unwrapped");
+
+        // Legacy layout.
+        let legacy = serde_json::json!({"contents": {"x": {
+            "channelAboutFullMetadataRenderer": {
+                "description": {"simpleText": "Old style about."},
+                "primaryLinks": [{
+                    "title": {"simpleText": "Website"},
+                    "navigationEndpoint": {"urlEndpoint": {"url": "https://example.com"}}}],
+            }}}});
+        let (desc, links) = youtube_about_from_page_data(&legacy).unwrap();
+        assert_eq!(desc, "Old style about.");
+        assert_eq!(links[0].title, "Website");
+
+        assert!(youtube_about_from_page_data(&serde_json::json!({"no": "about"})).is_none());
+        // unwrap_yt_redirect passthrough.
+        assert_eq!(unwrap_yt_redirect("https://example.com/a?q=x"), "https://example.com/a?q=x");
+    }
+
+    #[test]
+    fn about_panel_serde_round_trip() {
+        let panels = vec![
+            AboutPanel {
+                title: "A".into(),
+                description_md: "body".into(),
+                image_url: "u".into(),
+                image_hash: "h".into(),
+                image_path: "p".into(),
+                link: "l".into(),
+            },
+            AboutPanel::default(),
+        ];
+        let json = serde_json::to_string(&panels).unwrap();
+        let back: Vec<AboutPanel> = serde_json::from_str(&json).unwrap();
+        assert_eq!(panels, back);
+        // Forward-compat: unknown fields tolerated, missing fields default.
+        let sparse: Vec<AboutPanel> =
+            serde_json::from_str(r#"[{"title":"T","future_field":123}]"#).unwrap();
+        assert_eq!(sparse[0].title, "T");
+        assert_eq!(sparse[0].image_hash, "");
     }
 
     #[test]
