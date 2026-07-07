@@ -183,6 +183,30 @@ recent *tail*, not the beginning, so we don't claim a "lost" figure: the column
 just shows the provisional `Started − Went Live` estimate until catch-up is
 confirmed.
 
+**Twitch head backfill (missed-start recovery, while live).** On Twitch,
+streamlink's `--hls-live-restart` only rewinds within its own DVR view and
+usually can't reach the true start of a long-running stream. But the published
+VOD's playlist already exists on Twitch's CDN and **grows while the stream is
+live** — so when a *Capture from start* recording joined ≥ 1 minute late, a
+background job (visible in the **Background** panel as *Head backfill*) locates
+that live playlist (same derivation as [VOD
+recovery](#twitch-vod-recovery-deleted--muted-vods); no published VOD needed),
+downloads **just the missed beginning**, and saves it as `{stem}.head.mkv` next
+to the recording. Doing this *during* the stream matters: DMCA mutes are applied
+minutes **after** the stream ends and scrub the original segments — a head
+fetched mid-stream carries the **original, un-muted audio**.
+
+Once the live recording finishes, the head and the capture are **losslessly
+concatenated** (stream copy, no re-encode) into `{stem}.full.mkv` — a true
+full-stream file — and **both parts are kept**. The take shows a **🧩 head**
+badge while only the head exists and **🧩 full** once the join lands. The join
+is skipped (parts kept, warning logged) if the capture ran at a transcoded
+quality whose codec parameters differ from the source-quality head, and a
+duration sanity check discards a broken join rather than promoting it. An
+interrupted join is retried on the next app start. Only the **first take** of a
+stream backfills (a retake's gap is mid-stream, not the head), and nothing runs
+when catch-up already zeroed Lost time.
+
 ### Row actions & shortcuts
 
 Left-click a row to select it; **right-click** any row — channel, instance,
@@ -419,6 +443,11 @@ returns the exact host.)
 > the silenced copy — a complete, playable file with silence over the muted stretch —
 > rather than restored audio; the `un-muted` count in the probe tells you which you
 > got. The public-API lookups use Twitch's read-only web client id (no account).
+> To get original audio *despite* a mute, the best defenses are the ones that run
+> **before** the mute lands: the immediate post-stream [VOD
+> download](#post-stream-vod-download-archive-the-published-vod) (races the mute pass)
+> and the mid-stream [head backfill](#streams-live-monitoring) for a late-joined
+> capture.
 
 ### Post-stream VOD download (archive the published VOD)
 
@@ -450,6 +479,22 @@ VOD isn't DMCA-muted), the live capture is swapped out: the VOD is renamed to th
 file's name — so the recording's chat/thumbnail sidecars stay matched — and the old file
 is deleted only *after* the VOD is confirmed good.
 
+**Racing the DMCA mute (Twitch).** Twitch publishes the VOD within **seconds** of
+stream end, but applies DMCA mutes **minutes later** — and the mute pass also scrubs
+the original segments from the CDN, so speed decides whether you get original audio.
+The VOD check therefore polls **immediately** at stream end, then every 25 s for the
+first ~10 minutes, then backs off to 5-minute polls (~1 h window) — a clean VOD's
+archive download typically starts within seconds of publication. After a clean VOD is
+found, a **mute watcher** keeps re-checking it for another ~2 hours:
+
+- Mute lands **after** your download completed → **you won the race**: the archive
+  keeps its state and the take shows **📼 VOD (pre-mute)** (or **📼 replaced
+  (pre-mute)**) — your copy has the original audio even though the online VOD is now
+  silenced.
+- Mute lands **before/during** the download → the normal muted flow below runs (a
+  mid-mute download may already contain silenced segments, so it's flagged, never
+  trusted as clean).
+
 **Muted VODs are handled specially.** A DMCA-muted Twitch VOD is silenced, so it's
 **never** downloaded as-is and **never** replaces the live recording (which has the full
 audio). Instead the [CDN recovery](#twitch-vod-recovery-deleted--muted-vods) runs to
@@ -457,17 +502,31 @@ un-mute what it can, a desktop notification fires, and the take is listed in the
 Issues** panel under *DMCA-muted VODs* with buttons to **Open live recording**, **Open
 recovered VOD**, **Re-run recovery**, or **Keep live / dismiss**.
 
+**Download integrity.** A "completed" archive is only trusted after it proves itself:
+tool working/side files (logs, `.part`, `.ytdl`) can never be picked up as the output,
+a nonzero exit code must pass an `ffprobe` check, and before the file is archived (or
+allowed to replace anything) its probed duration must be plausible (≥ 90 % of the live
+capture / broadcast span). Anything failing these checks is marked **📼 VOD failed**
+and retryable — the live recording is never touched. Download filenames are also
+length-capped so the tool's temp paths stay under Windows' 260-character limit
+(yt-dlp/streamlink are Python and can't use long paths, even when the app itself can).
+On every start a **reconcile pass** repairs interrupted state: archive downloads that
+finished while the app was down get filed properly, and any `archived` row whose file
+turns out bogus is demoted to `muted`/`failed` so it surfaces in Issues instead of
+masquerading as done.
+
 **Badges & actions.** A take shows its archive state in the history tree: **📼 VOD**
-(downloaded alongside), **📼 replaced**, **✂ muted VOD**, **📼 VOD…** (downloading), or
-**📼 VOD failed**. Right-click a take for **📥 Download VOD now** (on-demand / retry) and
-**📼 Open downloaded VOD**.
+(downloaded alongside), **📼 replaced**, **📼 VOD (pre-mute)** / **📼 replaced
+(pre-mute)** (archived before a later mute — your copy has the original audio),
+**✂ muted VOD**, **📼 VOD…** (downloading), or **📼 VOD failed**. Right-click a take
+for **📥 Download VOD now** (on-demand / retry) and **📼 Open downloaded VOD**.
 
 > **Notes.** This re-downloads the whole stream, so it doubles storage/bandwidth — hence
-> it's opt-in and granular. Twitch is the most reliable path (it reuses the existing
-> VOD-availability poller). YouTube/Kick VOD readiness after a stream is less
-> deterministic — the download retries for up to ~1 hour and, if the VOD still isn't
-> available, marks the archive `failed` without ever touching the live recording (use
-> **📥 Download VOD now** to retry later).
+> it's opt-in and granular. Twitch is the most reliable path (instant VOD publication +
+> the fast poller). YouTube/Kick VOD readiness after a stream is less deterministic —
+> the download retries for up to ~1 hour and, if the VOD still isn't available, marks
+> the archive `failed` without ever touching the live recording (use **📥 Download VOD
+> now** to retry later).
 
 ### Audio & subtitle tracks
 
@@ -995,7 +1054,10 @@ Both SABR paths are **mpv-only**; other players get the DASH companion's `.ts`
 - Override the DB path with `STREAMARCHIVER_DB`, default output dir with
   `STREAMARCHIVER_OUT` (handy for testing).
 - Recordings + sidecars (`.chat.jsonl`, `.live_chat.json`, subtitle `.vtt`): your
-  configured output folder (default: `Videos\StreamArchiver\`).
+  configured output folder (default: `Videos\StreamArchiver\`). Companion video
+  files share the recording's stem: `{stem}.vod.mkv` (downloaded published VOD),
+  `{stem}.head.mkv` (backfilled missed start), `{stem}.full.mkv` (head + live
+  joined), and a recovered VOD from CDN recovery.
 - Asset cache: `%APPDATA%\StreamArchiver\data\asset-cache\` (see *Channel assets &
   change history*):
   - `channel_assets\{name}\{platform}\` — per channel + platform:
