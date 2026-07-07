@@ -4316,7 +4316,7 @@ fn fmt_speed(bytes_per_sec: f64) -> String {
 /// hover). Each `id` is a stable persistence key: never reuse or change one
 /// once shipped.
 const STREAM_COLUMNS: [GridCol; 19] = [
-    GridCol { id: "auto",        title: "Auto",       tooltip: "Enable/disable monitoring. The channel checkbox and each instance checkbox are independent.", min_width: 36.0,  initial: 0.0,   sortable: true,  stretch: false },
+    GridCol { id: "auto",        title: "Auto",       tooltip: "Auto-record: start recording automatically when the stream goes live. Detection, schedules, assets and metadata always stay up to date regardless; manual Start still records. The channel checkbox and each instance checkbox are independent.", min_width: 36.0,  initial: 0.0,   sortable: true,  stretch: false },
     GridCol { id: "actions",     title: "Actions",    tooltip: "Per-row actions: start/stop recording, edit, add instance, open folder, delete.",            min_width: 126.0, initial: 0.0,   sortable: false, stretch: false },
     GridCol { id: "platform",    title: "Plat",       tooltip: "Source platform (icon): Twitch, YouTube, Kick, or a generic URL. A channel shows every platform among its instances.", min_width: 52.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "name",        title: "Name",       tooltip: "Channel (container) name. Expand it to see its instances and recording history.",            min_width: 130.0, initial: 0.0,   sortable: true,  stretch: false },
@@ -5164,8 +5164,11 @@ fn render_instance_row(
             a.add_instance = Some(row.channel.id);
             ui.close();
         }
-        let toggle_label = if m.enabled { "⏸  Disable" } else { "✔  Enable" };
-        if ui.button(toggle_label).clicked() {
+        let toggle_label = if m.enabled { "⏸  Auto-record off" } else { "✔  Auto-record on" };
+        if ui.button(toggle_label)
+            .on_hover_text("Whether recording starts automatically on live. Detection and metadata keep running either way; ▶ Start still records manually.")
+            .clicked()
+        {
             a.toggle_enabled = Some((m.id, !m.enabled));
             ui.close();
         }
@@ -5196,7 +5199,9 @@ fn render_instance_row(
         tr.col(|ui| { tint_cell(ui, tint); match STREAM_COLUMNS[ci].id {
             "auto" => {
                 let mut on = m.enabled;
-                let cb = ui.checkbox(&mut on, "");
+                let cb = ui.checkbox(&mut on, "").on_hover_text(
+                    "Auto-record this instance when it goes live. Off = still monitored (state, schedules, metadata stay current) but nothing records unless you press ▶.",
+                );
                 if cb.changed() {
                     a.toggle_enabled = Some((m.id, on));
                 }
@@ -9672,7 +9677,7 @@ impl StreamArchiverApp {
             .ctx()
             .data_mut(|d| d.remove_temp::<i64>(egui::Id::new("sched_start")))
         {
-            self.core.manual(ManualCommand::Start { id: mid, notify_offline: true });
+            self.core.manual(ManualCommand::Start { id: mid, user_initiated: true });
             self.status = "Checking channel… will record if live.".into();
         }
         if let Some(sid) = ui
@@ -11417,7 +11422,7 @@ impl StreamArchiverApp {
                                                 let mut on = ch.enabled;
                                                 let cb = ui
                                                     .add_enabled(ninst > 0, egui::Checkbox::new(&mut on, ""))
-                                                    .on_hover_text("Enable/disable this channel. Independent from each instance's own toggle.");
+                                                    .on_hover_text("Auto-record this channel. Off = its instances are still monitored (state, schedules, metadata stay current) but nothing records unless started manually. Independent from each instance's own toggle.");
                                                 if cb.changed() {
                                                     toggle_channel_enabled = Some((cid, on));
                                                 }
@@ -12739,7 +12744,7 @@ impl StreamArchiverApp {
             self.channel_asset_status.remove(&cid);
         }
         if let Some(id) = acts.start {
-            self.core.manual(ManualCommand::Start { id, notify_offline: true });
+            self.core.manual(ManualCommand::Start { id, user_initiated: true });
             self.status = "Checking channel… will record if live.".into();
         }
         if let Some(id) = acts.stop {
@@ -17510,9 +17515,15 @@ impl StreamArchiverApp {
                             );
                         ui.end_row();
 
-                        ui.label("Enabled");
+                        ui.label("Auto");
                         ui.checkbox(&mut form.enabled, "")
-                            .on_hover_text("Monitor this channel for live streams");
+                            .on_hover_text(
+                                "Auto-record: start recording automatically when this channel \
+                                 goes live (same toggle as the Auto column in the Streams grid). \
+                                 Off = the channel is still monitored — live state, schedules, \
+                                 assets and metadata stay up to date — but recording only starts \
+                                 when you press ▶ yourself.",
+                            );
                         ui.end_row();
 
                         ui.label("Auth");

@@ -87,9 +87,10 @@ async fn tick(
     for row in &rows {
         let m = &row.monitor;
         prev_state.insert(m.id, m.last_state.clone());
-        if !row.channel.enabled || !m.enabled {
-            continue;
-        }
+        // Auto-off monitors are still polled: Auto only gates the automatic
+        // recording start (enforced in the supervisor's try_begin), while
+        // detection keeps liveness, go-live times, and downstream metadata
+        // current for every monitored channel.
         // Don't poll a monitor that's currently being recorded — the supervisor
         // owns its state until the tool exits.
         if recording.contains(&m.id) {

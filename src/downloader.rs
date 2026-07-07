@@ -1218,12 +1218,12 @@ impl Supervisor {
                     if self.shutdown.load(Ordering::SeqCst) {
                         continue; // draining: don't start new recordings
                     }
-                    self.try_begin(signal.monitor_id, signal.went_live_at, signal.approximate, signal.stream_id, signal.thumbnail_url, signal.broadcaster_id, signal.stream_title, false);
+                    self.try_begin(signal.monitor_id, signal.went_live_at, signal.approximate, signal.stream_id, signal.thumbnail_url, signal.broadcaster_id, signal.stream_title, false, false);
                 }
                 Some(cmd) = manual_rx.recv() => match cmd {
-                    ManualCommand::Start { id, notify_offline } => {
+                    ManualCommand::Start { id, user_initiated } => {
                         let this = self.clone();
-                        tokio::spawn(async move { this.manual_start(id, notify_offline).await });
+                        tokio::spawn(async move { this.manual_start(id, user_initiated).await });
                     }
                     ManualCommand::Stop(id) => self.manual_stop(id),
                     ManualCommand::StartVideo(id) => {
@@ -2044,7 +2044,9 @@ impl Supervisor {
         let mut seen: std::collections::HashSet<(String, Platform)> =
             std::collections::HashSet::new();
         for row in &rows {
-            if !row.monitor.enabled || !row.monitor.fetch_chat_assets {
+            // Auto (enabled) is NOT checked here: an Auto-off channel's assets
+            // stay archived — only the per-instance fetch toggle opts out.
+            if !row.monitor.fetch_chat_assets {
                 continue;
             }
             // A recording channel's record() path already handles its assets.
@@ -2066,7 +2068,10 @@ impl Supervisor {
     }
 
     /// Reserve the monitor and spawn its recording task. Returns false if it was
-    /// skipped (already active, or in backoff when not bypassing).
+    /// skipped (already active, or in backoff when not bypassing). `forced`
+    /// marks a user-initiated start: it additionally bypasses the Auto gate —
+    /// the user can always record an Auto-off instance explicitly.
+    #[allow(clippy::too_many_arguments)]
     fn try_begin(
         &self,
         monitor_id: i64,
@@ -2077,6 +2082,7 @@ impl Supervisor {
         broadcaster_id: Option<String>,
         stream_title: Option<String>,
         bypass_backoff: bool,
+        forced: bool,
     ) -> bool {
         {
             let mut active = self.active.lock().unwrap();
@@ -2099,9 +2105,10 @@ impl Supervisor {
                 return false;
             }
         };
-        if !row.channel.enabled || !row.monitor.enabled {
-            // A push notification arrived for a disabled channel/monitor. Don't
-            // record, but update last_state so the UI can show it as "live".
+        if !forced && (!row.channel.enabled || !row.monitor.enabled) {
+            // Auto-record is off for this channel/instance: detection keeps the
+            // state fresh, but only an explicit user Start records. Update
+            // last_state so the UI shows the stream as "live".
             self.active.lock().unwrap().remove(&monitor_id);
             let _ = self.store.set_monitor_check_result(monitor_id, "live", now_unix());
             return false;
@@ -2113,8 +2120,12 @@ impl Supervisor {
         true
     }
 
-    /// Manual "Start": check the channel now and record if live.
-    async fn manual_start(&self, monitor_id: i64, notify_offline: bool) {
+    /// "Start" command: check the channel now and record if live. A
+    /// user-initiated start records even when Auto is off (Auto only gates
+    /// *automatic* starts) and toasts when the channel isn't live; an
+    /// automatic trigger (WebSub push) honors the Auto gate and just keeps
+    /// the stream state fresh.
+    async fn manual_start(&self, monitor_id: i64, user_initiated: bool) {
         if self.active.lock().unwrap().contains_key(&monitor_id) {
             return; // already recording
         }
@@ -2122,22 +2133,22 @@ impl Supervisor {
             Ok(Some(r)) => r,
             _ => return,
         };
-        let enabled = row.channel.enabled && row.monitor.enabled;
+        let auto = row.channel.enabled && row.monitor.enabled;
         let name = row.channel.name.clone();
         let outcome = self.check_one(&row).await;
         if outcome.live {
-            if enabled {
+            if auto || user_initiated {
                 let (went, approx) = match outcome.went_live_at {
                     Some(t) => (Some(t), false),
                     None => (Some(now_unix()), true),
                 };
-                self.try_begin(monitor_id, went, approx, outcome.stream_id, outcome.thumbnail_url, outcome.broadcaster_id, outcome.stream_title, true);
+                self.try_begin(monitor_id, went, approx, outcome.stream_id, outcome.thumbnail_url, outcome.broadcaster_id, outcome.stream_title, true, user_initiated);
             } else {
-                // Disabled: just update the state so the UI can show "live" for
-                // channels we're monitoring passively via push notifications.
+                // Auto off + automatic trigger: just update the state so the
+                // UI shows "live"; nothing records.
                 let _ = self.store.set_monitor_check_result(monitor_id, "live", now_unix());
             }
-        } else if enabled && notify_offline {
+        } else if user_initiated {
             let message = if outcome.error && !outcome.detail.is_empty() {
                 format!("{name}: {}", outcome.detail)
             } else {
@@ -2148,7 +2159,7 @@ impl Supervisor {
                 message,
             });
         } else {
-            // Disabled and offline: update state silently.
+            // Automatic trigger and offline: update state silently.
             let _ = self.store.set_monitor_check_result(monitor_id, "offline", now_unix());
         }
     }

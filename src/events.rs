@@ -279,11 +279,13 @@ pub enum UiCommand {
 /// On-demand recording commands from the UI to the download supervisor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ManualCommand {
-    /// Check the channel now and, if live, start recording (bypassing backoff).
-    /// `notify_offline`: toast an error when the channel turns out not to be
-    /// live. Set to true for explicit UI button clicks; false for automatic
-    /// triggers (WebSub events) so a "not live" outcome is silently discarded.
-    Start { id: i64, notify_offline: bool },
+    /// Check the channel now and, if live, start recording.
+    /// `user_initiated`: true for explicit UI button clicks — the start
+    /// bypasses backoff AND the Auto gate (a user can always record an
+    /// Auto-off instance), and a "not live" outcome toasts an error. False
+    /// for automatic triggers (WebSub events) — those honor the Auto gate
+    /// and discard a "not live" outcome silently.
+    Start { id: i64, user_initiated: bool },
     /// Abort the channel's active recording.
     Stop(i64),
     /// Begin downloading a queued on-demand video (by `video` id).

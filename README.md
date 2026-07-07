@@ -62,11 +62,17 @@ two tools on one URL.
 2. **➕** on a channel row (or **Add instance to channel** in the menu) adds
    another instance — including one on a **different platform** (paste a YouTube
    URL on a Twitch channel, etc.).
-3. **On** toggles work at both levels: the **channel** checkbox enables/disables
-   *all* its instances at once; each **instance** has its own checkbox (disable
-   just YouTube for the day, keep Twitch). **✏** renames the channel; the
-   per-instance **✏** edits that instance (incl. its URL). **🗑** deletes a
-   channel (and its instances) or a single instance.
+3. **Auto** toggles work at both levels: the **channel** checkbox gates *all*
+   its instances at once; each **instance** has its own independent checkbox
+   (pause just YouTube for the day, keep Twitch) — recording auto-starts only
+   when **both** are on. The same toggle appears as **Auto** on the add/edit
+   instance form. **Auto controls only the automatic recording start** — an
+   Auto-off channel is still fully monitored: liveness is polled/pushed as
+   usual (the State column shows *live*), schedules, channel assets, community
+   posts, and metadata keep refreshing into the archive, and the ▶ **Start**
+   button always records on demand (bypassing Auto). **✏** renames the
+   channel; the per-instance **✏** edits that instance (incl. its URL). **🗑**
+   deletes a channel (and its instances) or a single instance.
 4. **Settings** → Twitch/YouTube credentials, default output folder, max concurrent
    downloads, and **start at login** (autostart). Folder fields have a **Browse…**
    button.
@@ -133,7 +139,7 @@ a ▲/▼ shows the active column); type in the box under a header to filter tha
 column (case-insensitive substring). Filters combine across columns. This works on
 the **Videos** and **Streams** tables alike.
 
-The channel table shows, per channel: On (enable/disable), Name, Platform (with a
+The channel table shows, per channel: Auto (auto-record on/off), Name, Platform (with a
 brand badge), Tool, Detection, **Polled** (when it was last checked, with the poll
 interval in parentheses — e.g. `2026-06-21 14:02:33 (60s)`), State, **Next stream**
 (the next scheduled stream — see below), **Game** and

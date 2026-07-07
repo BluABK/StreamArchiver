@@ -230,7 +230,7 @@ pub async fn run(
             video_last_checked
                 .retain(|_, &mut t| now.duration_since(t) < Duration::from_secs(3600));
             for mid in &to_check {
-                let _ = manual_tx.send(ManualCommand::Start { id: *mid, notify_offline: false });
+                let _ = manual_tx.send(ManualCommand::Start { id: *mid, user_initiated: false });
             }
             if newcur != after {
                 cursor = Some(newcur);

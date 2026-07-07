@@ -533,7 +533,7 @@ fn run_manual_test(id: i64, secs: u64) -> Result<()> {
     let core = AppCore::new(Arc::new(store)).context("starting core")?;
     core.start();
     info!("manual-test: Start({id})");
-    core.manual(ManualCommand::Start { id, notify_offline: true });
+    core.manual(ManualCommand::Start { id, user_initiated: true });
     std::thread::sleep(std::time::Duration::from_secs(secs));
     info!("manual-test: Stop({id})");
     core.manual(ManualCommand::Stop(id));

@@ -2627,9 +2627,8 @@ async fn refresh_schedules_once(
                 continue;
             }
         }
-        if !row.channel.enabled || !row.monitor.enabled {
-            continue;
-        }
+        // Auto-off monitors still get schedule refreshes: Auto only gates the
+        // automatic recording start, never metadata collection.
         // Re-fetch each monitor at most every `refresh_secs` (wall-clock, survives restarts).
         if let Some(t) = last_fetched.get(&row.monitor.id) {
             if now_secs.saturating_sub(*t) < refresh_secs as i64 {
