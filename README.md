@@ -777,6 +777,34 @@ download captures `live_chat` (e.g. a YouTube VOD's chat replay) the same way.
 Chat sidecars sit next to the video and **follow it** if the file is renamed
 (see *Filename media info*), so they stay matched to their recording.
 
+### YouTube community posts (📣 Posts)
+
+StreamArchiver archives the **community posts** of every monitored YouTube
+channel — text (with clickable links), attached images, author avatar, and like
+count — into the database and the channel's asset cache (`posts\` folder). The
+feed is browsable in the **Posts** top-level tab or the pop-out **📣 Posts**
+window, with a channel filter and text search; each new post also raises a
+notification.
+
+- **Ordering.** Posts sort by their (approximate) **publish time**, derived
+  from YouTube's relative timestamps ("2 weeks ago") the first time a post is
+  seen — not by when the archiver happened to discover them. Hover the
+  timestamp for the estimated absolute date. The estimate is pinned at first
+  sight (the relative buckets only get coarser with age), so re-scans never
+  shuffle the feed.
+- **Full-history backfill.** The first time a channel's posts are fetched,
+  StreamArchiver walks the community tab's *older posts* pages until the very
+  first post, so the whole backlog lands in the archive — paced like a person
+  scrolling (a few seconds between pages), without notifications, and resumable
+  if the app shuts down mid-walk. Afterwards each periodic round only reads the
+  first page; if an *entire* first page turns out to be new (more than a page
+  of posts landed between rounds), a bounded gap-fill walk fetches deeper until
+  it reaches already-archived posts, so nothing is ever skipped.
+- **Cadence.** Fetching is trickled to look like a human occasionally opening a
+  community tab: one channel at a time, randomized order and jitter, each
+  channel revisited roughly every 6 hours (Background → **YouTube posts
+  refresh** toggles the whole job).
+
 ### Channel assets & change history
 
 To make chat replay look right offline — and to archive a channel's *visual
