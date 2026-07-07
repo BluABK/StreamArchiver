@@ -33,7 +33,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 46;
+const SCHEMA_VERSION: i64 = 47;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -413,6 +413,9 @@ impl Store {
     fn migrate(&self) -> Result<()> {
         let conn = self.db();
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version < SCHEMA_VERSION {
+            tracing::info!(from = version, to = SCHEMA_VERSION, "migrating database schema");
+        }
         if version < 1 {
             conn.execute_batch(
                 r#"
@@ -1101,7 +1104,23 @@ impl Store {
             fill_published_at(&conn)?;
             conn.pragma_update(None, "user_version", 46)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 46);
+        if version < 47 {
+            // Hygiene for the short-lived v46 build: a ZERO-post first page
+            // used to record a "trivially complete" posts backfill, conflating
+            // channels without a community tab (or an interstitial that parsed
+            // empty) with feeds that genuinely fit on one page. A completion
+            // recorded without a single archived post is bogus — drop it so
+            // the monitor gets a real walk. One-page feeds keep theirs (they
+            // have posts).
+            conn.execute_batch(
+                "DELETE FROM community_post_backfill
+                  WHERE pages = 0 AND posts_seen = 0
+                    AND monitor_id NOT IN
+                        (SELECT DISTINCT monitor_id FROM community_post);",
+            )?;
+            conn.pragma_update(None, "user_version", 47)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 47);
         Ok(())
     }
 

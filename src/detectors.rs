@@ -1446,10 +1446,19 @@ impl DetectContext {
             return;
         }
         let Some(mut token) = find_continuation_token(&data) else {
-            // No continuation on the first page — the whole feed fits on one
-            // page, so the full history is trivially archived.
-            if !backfill_done {
+            // No continuation on the first page. If the page did show posts,
+            // the whole feed fits on one page and the history is trivially
+            // archived. A ZERO-post page is left unrecorded: it could equally
+            // be a channel without a community tab or an interstitial that
+            // parsed empty, so re-check next round rather than lock in a
+            // completion that would block a real walk later.
+            if !backfill_done && !posts.is_empty() {
                 let _ = self.store.posts_backfill_record(row.monitor.id, true, 0, 0);
+                tracing::info!(
+                    channel = %row.channel.name,
+                    posts = posts.len(),
+                    "community posts fit on one page; backfill complete"
+                );
             }
             return;
         };
@@ -1460,6 +1469,18 @@ impl DetectContext {
             return;
         };
 
+        if backfill_done {
+            tracing::info!(
+                channel = %row.channel.name,
+                new_posts = first_page_new,
+                "entire first page of community posts was unseen; gap-filling older pages"
+            );
+        } else {
+            tracing::info!(
+                channel = %row.channel.name,
+                "starting full-history community posts backfill"
+            );
+        }
         let max_pages = if backfill_done { GAPFILL_MAX_PAGES } else { BACKFILL_MAX_PAGES };
         let mut pages = 0i64;
         let mut walked = 0i64;
@@ -1510,6 +1531,13 @@ impl DetectContext {
                     pages,
                     posts = walked,
                     "community posts backfill complete"
+                );
+            } else {
+                tracing::info!(
+                    channel = %row.channel.name,
+                    pages,
+                    posts = walked,
+                    "community posts backfill paused; resuming next round"
                 );
             }
         }
