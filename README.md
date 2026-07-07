@@ -781,8 +781,9 @@ Chat sidecars sit next to the video and **follow it** if the file is renamed
 
 To make chat replay look right offline — and to archive a channel's *visual
 identity* over time — StreamArchiver downloads each channel's icon, banner,
-badges, emotes, and the broadcaster's chat name colour into a per-channel asset
-cache, and records every change it sees on later refetches.
+badges, emotes, the broadcaster's chat name colour, and the channel's **About
+page** (see *About page archive* below) into a per-channel asset cache, and
+records every change it sees on later refetches.
 
 The cache is keyed **per account**: `channel_assets/{channel}/{platform}/{account}/`,
 where `{account}` is derived from the instance's URL (Twitch login, Kick slug,
@@ -834,6 +835,9 @@ collapse/expand choices are remembered across restarts:
 - **⟳ Refetch** fetches **every** account now (ignores the 24 h cache); **📂**
   opens the channel's asset folder; **🕑 History** opens the change log (below;
   entries name the account when a platform has more than one).
+- **About pages** — one row per account (version count + captured/checked
+  timestamps), each **ℹ** button opening that account's archived About page
+  viewer (see *About page archive* below).
 - **View emotes** — one launcher per account+provider that has emotes, opening an
   **emote viewer**: a grid of every emote with its chat code (animated emotes play
   when *Animate emotes* is on in Settings). Codes still listed in the manifest whose
@@ -845,7 +849,8 @@ same asset data scoped to *that instance's own account*: the header uses the
 account's avatar and links its source URL, and an **Assets (this account)**
 section carries the account's icon/banner thumbnails, its status row, **⟳
 Refetch** (this account only), **📂** (this account's folder), **🕑 History**
-(this account's changes only), and its emote-viewer launchers. It uses the same
+(this account's changes only), **ℹ About** (this account's archived About
+page), and its emote-viewer launchers. It uses the same
 collapsible-section layout (**Monitor · Assets · Schedule sources**, the last
 collapsed by default) with a scrollbar when needed.
 
@@ -867,6 +872,37 @@ manifest — so the log is a durable record of what the channel *used* to have. 
 the emote viewer or History window is open when a background refetch for that
 channel lands, an amber **"assets were refetched — reopen"** banner appears (the
 History window also reloads itself in place).
+
+**About page archive.** Alongside the visual assets, every asset fetch also
+captures the channel's *About page* — the free-text self-description streamers
+change (and delete) over time — **versioned**: a new snapshot row is stored only
+when the content actually changed; an identical re-capture just bumps the
+"checked" timestamp. What's captured, per platform:
+
+- **Twitch** — the channel bio (from the same Helix call as the icon) plus the
+  full **About panels** (title, markdown body, image, link) via an anonymous
+  read-only GQL query (no credentials beyond the ones detection already uses).
+  Panel images are stored content-addressed under the account's `about/` folder,
+  and the version hash uses the image *bytes* — a CDN re-serving the same image
+  from a new URL is not a new version.
+- **YouTube** — the channel description from the Data API response already
+  requested for the icon/banner (zero extra quota), plus the external links from
+  a best-effort `/about` page scrape (redirect-wrapped URLs are unwrapped).
+- **Kick** — the bio + social links (Twitter/Instagram/Discord/…) from the same
+  v2 response the icon/banner fetch already uses (zero extra requests).
+
+If an *optional* source fails (Twitch GQL, the YouTube scrape), the round is
+**degraded**: it may establish the very first baseline, but it never overwrites
+existing history with a stripped-down version — so a temporary API outage can't
+fake an "everything was removed" edit. A genuine change is also logged to the
+**🕑 History** window (`about changed`).
+
+The **About viewer** (the **ℹ** buttons above) shows any archived version via a
+**version picker** (newest = *current*): the description and Twitch panel bodies
+render as real markdown, panel images decode lazily (Alt-preview / click-to-open
+like the thumbnails), and panel/external links open in the browser. The window
+reloads in place when a background refetch lands. Versions live in the database
+(`about_snapshot`), keyed per (channel, platform, account) like the asset dirs.
 
 **Refresh cadence.** Per instance, **Fetch chat assets** (on by default) controls
 whether that channel participates. A background job (**Channel asset refresh**,
