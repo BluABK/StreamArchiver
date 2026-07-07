@@ -106,6 +106,11 @@ fn main() -> Result<()> {
 
     let store = Store::open(&app_paths::db_path()).context("opening data store")?;
 
+    // One-time asset-cache migration to the per-account layout
+    // (channel_assets/{name}/{platform}/{account}/) — synchronous, before the
+    // core starts so no fetch can race the file moves.
+    assets::migrate_assets_to_account_dirs(&store);
+
     // Load the optional custom crash/freeze dialog icon (set in Settings → Diagnostics).
     let dialog_icon_path = store
         .get_setting(models::K_DIALOG_ICON)
@@ -391,7 +396,7 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
             platform: Platform::detect(&url),
             created_at: 0,
             color: String::new(),
-            preferred_platform: None,
+            preferred_asset: None,
             enabled: true,
         },
         monitor: models::Monitor {

@@ -1153,10 +1153,12 @@ pub struct Supervisor {
     /// any non-stall outcome (success, ended, manual) so it tracks back-to-back
     /// stalls only; in-memory only. Keyed by `(monitor_id, stream_id)`.
     sabr_stall_count: Arc<Mutex<HashMap<SabrKey, u32>>>,
-    /// (channel_name, platform_str) pairs for which an asset-fetch task is currently
-    /// in flight. Prevents stacking duplicate fetches when the user clicks
-    /// "Re-fetch" repeatedly or a periodic fetch fires while one is already running.
-    running_asset_fetches: Arc<Mutex<HashSet<(String, String)>>>,
+    /// (channel_name, platform_str, account_slug) triples for which an asset-fetch
+    /// task is currently in flight. Prevents stacking duplicate fetches when the
+    /// user clicks "Re-fetch" repeatedly or a periodic fetch fires while one is
+    /// already running — while letting a same-platform sibling account fetch
+    /// concurrently.
+    running_asset_fetches: Arc<Mutex<HashSet<(String, String, String)>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1866,16 +1868,24 @@ impl Supervisor {
         force: bool,
     ) {
         let platform = row.monitor.platform();
-        // Per-platform asset dir: one container can hold the same creator on
-        // Twitch + YouTube + Kick, each with its own icon/banner/badges/emotes —
-        // namespacing by platform keeps them from overwriting each other (and the
-        // 24h freshness stamp becomes per-(channel, platform) for free).
-        let asset_dir = crate::assets::channel_asset_dir(&row.channel.name, platform);
+        // Per-platform, per-ACCOUNT asset dir: one container can hold the same
+        // creator on Twitch + YouTube + Kick — and multiple accounts on ONE
+        // platform (main + alt Twitch). Namespacing by platform + account slug
+        // keeps them from overwriting each other (and the 24h freshness stamp
+        // becomes per-(channel, platform, account) for free).
+        let account = crate::assets::account_slug(&row.monitor.url, platform);
+        let asset_dir = crate::assets::channel_asset_dir(&row.channel.name, platform, &account);
         if !force && !crate::assets::should_refetch_assets(&asset_dir) {
             return;
         }
-        // Guard: skip if a fetch for this (channel, platform) is already in flight.
-        let fetch_key = (row.channel.name.clone(), platform.as_str().to_string());
+        // Guard: skip if a fetch for this (channel, platform, account) is already
+        // in flight. Two tools on the SAME URL share the key (one fetch); a
+        // sibling account fetches independently.
+        let fetch_key = (
+            row.channel.name.clone(),
+            platform.as_str().to_string(),
+            account.clone(),
+        );
         {
             let mut running = self.running_asset_fetches.lock().unwrap();
             if running.contains(&fetch_key) {
@@ -1897,7 +1907,7 @@ impl Supervisor {
             id: task_id,
             kind: crate::events::BackgroundTaskKind::AssetFetch,
             label: row.channel.name.clone(),
-            detail: format!("{} · icon, banner, badges, emotes", platform.label()),
+            detail: format!("{} ({account}) · icon, banner, badges, emotes", platform.label()),
             started_at: now_unix(),
             progress: None,
             progress_info: None,
@@ -2041,7 +2051,7 @@ impl Supervisor {
             .is_empty();
         let recording: std::collections::HashSet<i64> =
             self.active.lock().unwrap().keys().copied().collect();
-        let mut seen: std::collections::HashSet<(String, Platform)> =
+        let mut seen: std::collections::HashSet<(String, Platform, String)> =
             std::collections::HashSet::new();
         for row in &rows {
             // Auto (enabled) is NOT checked here: an Auto-off channel's assets
@@ -2056,10 +2066,11 @@ impl Supervisor {
             if row.monitor.platform() == Platform::YouTube && !yt_key_set {
                 continue;
             }
-            // Instances of one (channel, platform) share an asset dir — fetch it
-            // once per pass. Keyed by platform too so a container that spans
-            // Twitch + YouTube refreshes BOTH (not just the first one seen).
-            if !seen.insert((sanitize_filename(&row.channel.name), row.monitor.platform())) {
+            // Instances of one (channel, platform, ACCOUNT) share an asset dir —
+            // fetch it once per pass. Two tools on one URL dedup here; a sibling
+            // account on the same platform (main + alt) gets its own fetch.
+            let account = crate::assets::account_slug(&row.monitor.url, row.monitor.platform());
+            if !seen.insert((sanitize_filename(&row.channel.name), row.monitor.platform(), account)) {
                 continue;
             }
             // force=false: a no-op when the channel's assets are still fresh.
@@ -8072,7 +8083,7 @@ mod tests {
                 platform,
                 created_at: 0,
                 color: String::new(),
-                preferred_platform: None,
+                preferred_asset: None,
                 enabled: true,
             },
             monitor: Monitor {

@@ -617,14 +617,51 @@ pub struct Channel {
     /// Optional custom hex color for this channel (e.g. `"#ff9800"`).
     /// Empty string means "use the automatic palette color".
     pub color: String,
-    /// Which platform's profile pic / banner represents this container (a
-    /// container can hold the same creator on Twitch + YouTube + Kick, each with
-    /// its own assets). `None` = auto: the first instance-platform that has a
-    /// fetched icon. Set explicitly via the channel's Properties → icon source.
-    pub preferred_platform: Option<Platform>,
+    /// Which platform's (and optionally which account's) profile pic / banner
+    /// represents this container (a container can hold the same creator on
+    /// Twitch + YouTube + Kick — and multiple ACCOUNTS on one platform). `None`
+    /// = auto: the first instance with a fetched icon. Set explicitly via the
+    /// channel's Properties → icon source.
+    pub preferred_asset: Option<PreferredAssetSource>,
     /// Channel-level enabled flag. Independent from each instance's `Monitor::enabled`;
     /// a monitor runs only when both this AND `monitor.enabled` are true.
     pub enabled: bool,
+}
+
+/// The channel's chosen icon/banner source, persisted in the legacy
+/// `channel.preferred_platform` TEXT column as `platform[:account]` —
+/// backward-compatible: a bare `"twitch"` (pre-account rows) parses with
+/// `account: None`, meaning "the first Twitch account of the container".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreferredAssetSource {
+    pub platform: Platform,
+    /// [`crate::assets::account_slug`] of the chosen instance's URL; `None` =
+    /// whichever account of `platform` comes first.
+    pub account: Option<String>,
+}
+
+impl PreferredAssetSource {
+    /// Parse the DB text form (`""` → None handled by the caller via
+    /// `parse_opt`-style emptiness checks; here `"twitch"` / `"twitch:geega"`).
+    pub fn parse(s: &str) -> Option<PreferredAssetSource> {
+        let s = s.trim();
+        if s.is_empty() {
+            return None;
+        }
+        let (plat, account) = match s.split_once(':') {
+            Some((p, a)) => (p, (!a.trim().is_empty()).then(|| a.trim().to_string())),
+            None => (s, None),
+        };
+        Platform::parse_opt(plat).map(|platform| PreferredAssetSource { platform, account })
+    }
+
+    /// The DB text form (`platform` or `platform:account`).
+    pub fn to_db(&self) -> String {
+        match &self.account {
+            Some(a) => format!("{}:{a}", self.platform.as_str()),
+            None => self.platform.as_str().to_string(),
+        }
+    }
 }
 
 /// One capture instance for a channel (source URL + tool + quality + detection +
@@ -2064,5 +2101,24 @@ mod tests {
         let groups = group_recordings(&recs);
         assert!(groups[0].is_active());
         assert_eq!(groups[0].ended_at(), None);
+    }
+
+    #[test]
+    fn preferred_asset_source_roundtrip() {
+        // Legacy bare-platform value (pre-account rows): account = None.
+        let bare = PreferredAssetSource::parse("twitch").unwrap();
+        assert_eq!(bare.platform, Platform::Twitch);
+        assert_eq!(bare.account, None);
+        assert_eq!(bare.to_db(), "twitch");
+        // Per-account form.
+        let acc = PreferredAssetSource::parse("twitch:geega_alt").unwrap();
+        assert_eq!(acc.platform, Platform::Twitch);
+        assert_eq!(acc.account.as_deref(), Some("geega_alt"));
+        assert_eq!(acc.to_db(), "twitch:geega_alt");
+        // Empty / unknown → None (auto).
+        assert_eq!(PreferredAssetSource::parse(""), None);
+        assert_eq!(PreferredAssetSource::parse("generic"), None);
+        // A dangling colon parses as a bare platform.
+        assert_eq!(PreferredAssetSource::parse("kick:").unwrap().account, None);
     }
 }

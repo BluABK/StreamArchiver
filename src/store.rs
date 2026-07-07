@@ -1451,18 +1451,19 @@ impl Store {
         Ok(())
     }
 
-    /// Set (or clear) the preferred asset platform for a channel container — the
-    /// platform whose profile pic / banner represents it. `None` reverts to auto
-    /// (the first instance-platform that has a fetched icon).
-    pub fn set_channel_preferred_platform(
+    /// Set (or clear) the preferred asset source for a channel container — the
+    /// platform (and optionally account) whose profile pic / banner represents
+    /// it, stored as `platform[:account]` text. `None` reverts to auto (the
+    /// first instance that has a fetched icon).
+    pub fn set_channel_preferred_asset(
         &self,
         id: i64,
-        platform: Option<Platform>,
+        source: Option<&crate::models::PreferredAssetSource>,
     ) -> Result<()> {
         let conn = self.db();
         conn.execute(
             "UPDATE channel SET preferred_platform = ?2 WHERE id = ?1",
-            params![id, platform.map(|p| p.as_str()).unwrap_or("")],
+            params![id, source.map(|s| s.to_db()).unwrap_or_default()],
         )?;
         Ok(())
     }
@@ -2982,7 +2983,9 @@ impl Store {
                     platform: Platform::parse(&r.get::<_, String>(3)?),
                     created_at: r.get(4)?,
                     color: r.get(43)?,
-                    preferred_platform: Platform::parse_opt(&r.get::<_, String>(45)?),
+                    preferred_asset: crate::models::PreferredAssetSource::parse(
+                        &r.get::<_, String>(45)?,
+                    ),
                     enabled: r.get::<_, i64>(47)? != 0,
                 };
                 let monitor = Monitor {
@@ -3788,7 +3791,7 @@ impl Store {
             platform: Platform::parse(&r.get::<_, String>(3)?),
             created_at: r.get(4)?,
             color: r.get(5)?,
-            preferred_platform: Platform::parse_opt(&r.get::<_, String>(6)?),
+            preferred_asset: crate::models::PreferredAssetSource::parse(&r.get::<_, String>(6)?),
             enabled: r.get::<_, i64>(7)? != 0,
         })
     }

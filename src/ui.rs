@@ -945,7 +945,7 @@ pub struct StreamArchiverApp {
     /// viewer uses (one `fs::metadata` per emote) — recomputing it every frame would
     /// be hundreds of stat calls per repaint. Invalidated wherever `channel_asset_thumbs`
     /// is (open/rename/refetch/close).
-    channel_emote_counts: HashMap<i64, [(EmoteProvider, usize); 4]>,
+    channel_emote_counts: HashMap<i64, Vec<(AssetAccount, [(EmoteProvider, usize); 4])>>,
     /// Per-platform asset-status rows for the open Properties window, keyed by channel
     /// id. Cached for the same reason as `channel_emote_counts`: each row is built from
     /// blocking filesystem I/O (`read_dir` + per-file `metadata` + full JSON manifest
@@ -5533,6 +5533,12 @@ impl EmoteProvider {
 /// repaint — e.g. for animation — without re-touching the disk each frame.
 struct EmoteViewer {
     channel_name: String,
+    /// Account slug of the instance whose emote cache is shown — a channel can
+    /// hold several same-platform accounts (main + alt), each with its own set.
+    account: String,
+    /// True when the channel has sibling accounts on the platform, so the
+    /// window title should name the account.
+    has_siblings: bool,
     provider: EmoteProvider,
     active: Vec<ViewerEmote>,
     deprecated: Vec<ViewerEmote>,
@@ -5543,13 +5549,20 @@ struct EmoteViewer {
 }
 
 impl EmoteViewer {
-    fn new(channel_name: String, provider: EmoteProvider) -> EmoteViewer {
+    fn new(
+        channel_name: String,
+        account: String,
+        has_siblings: bool,
+        provider: EmoteProvider,
+    ) -> EmoteViewer {
         let (active, deprecated): (Vec<ViewerEmote>, Vec<ViewerEmote>) =
-            enumerate_provider_emotes(&channel_name, provider)
+            enumerate_provider_emotes(&channel_name, &account, provider)
                 .into_iter()
                 .partition(|e| e.exists);
         EmoteViewer {
             channel_name,
+            account,
+            has_siblings,
             provider,
             active,
             deprecated,
@@ -5566,23 +5579,23 @@ impl EmoteViewer {
 /// load-once-on-open pattern so the popup never touches the disk per frame.
 struct AssetHistoryView {
     channel_name: String,
-    /// Platforms this channel runs on (non-`Generic`), retained so the view can be
+    /// The channel's asset accounts (non-`Generic`), retained so the view can be
     /// reloaded in place when a background asset refetch lands while it's open.
-    platforms: Vec<Platform>,
+    accounts: Vec<AssetAccount>,
     lines: Vec<String>,
 }
 
 impl AssetHistoryView {
-    fn new(channel_name: String, platforms: &[Platform]) -> AssetHistoryView {
-        let lines = load_asset_history_lines(&channel_name, platforms);
-        AssetHistoryView { channel_name, platforms: platforms.to_vec(), lines }
+    fn new(channel_name: String, accounts: &[AssetAccount]) -> AssetHistoryView {
+        let lines = load_asset_history_lines(&channel_name, accounts);
+        AssetHistoryView { channel_name, accounts: accounts.to_vec(), lines }
     }
 
     /// Re-read the change logs from disk (newest first), keeping the window open.
     /// Called when an asset refetch for this channel completes so a live history
     /// view reflects the just-recorded changes without a manual reopen.
     fn reload(&mut self) {
-        self.lines = load_asset_history_lines(&self.channel_name, &self.platforms);
+        self.lines = load_asset_history_lines(&self.channel_name, &self.accounts);
     }
 }
 
@@ -5600,7 +5613,7 @@ fn provider_label_from_id(id: &str) -> &str {
 /// One display line for a recorded asset change, e.g.
 /// `2026-06-29 14:30  Twitch · 7TV emote +PogU`, `… · Twitch icon replaced`, or
 /// `… · Twitch name colour #9146FF → #00FF00`.
-fn fmt_asset_change_line(platform: Platform, c: &crate::assets::AssetChange) -> String {
+fn fmt_asset_change_line(source_label: &str, c: &crate::assets::AssetChange) -> String {
     let when = fmt_datetime_short(c.at);
     let what = match c.kind.as_str() {
         "emote" => {
@@ -5618,23 +5631,34 @@ fn fmt_asset_change_line(platform: Platform, c: &crate::assets::AssetChange) -> 
         },
         other => format!("{other} {}", c.action),
     };
-    format!("{when}  {} · {what}", platform.label())
+    format!("{when}  {source_label} · {what}")
 }
 
-/// Load and format a channel's recorded asset changes across all its (non-generic)
-/// platforms, newest first. Empty when nothing has been recorded yet.
-fn load_asset_history_lines(name: &str, platforms: &[Platform]) -> Vec<String> {
-    let mut all: Vec<(Platform, crate::assets::AssetChange)> = Vec::new();
-    for &p in platforms.iter().filter(|p| **p != Platform::Generic) {
-        let dir = channel_asset_dir(name, p);
+/// Load and format a channel's recorded asset changes across all its asset
+/// accounts (plus each platform's legacy pre-account dir), newest first. Empty
+/// when nothing has been recorded yet.
+fn load_asset_history_lines(name: &str, accounts: &[AssetAccount]) -> Vec<String> {
+    let mut all: Vec<(String, crate::assets::AssetChange)> = Vec::new();
+    let mut legacy_seen: Vec<Platform> = Vec::new();
+    for acc in accounts {
+        let dir = channel_asset_dir(name, acc.platform, &acc.account);
         for c in crate::assets::read_asset_changes(&dir) {
-            all.push((p, c));
+            all.push((acc.label.clone(), c));
+        }
+        // Pre-migration entries live in the legacy platform dir — read it once
+        // per platform, labelled without an account.
+        if !legacy_seen.contains(&acc.platform) {
+            legacy_seen.push(acc.platform);
+            let legacy = crate::assets::legacy_platform_dir(name, acc.platform);
+            for c in crate::assets::read_asset_changes(&legacy) {
+                all.push((acc.platform.label().to_string(), c));
+            }
         }
     }
     // Newest first. `sort_by_key` is stable, so changes sharing a timestamp keep
-    // their per-platform append order.
+    // their per-source append order.
     all.sort_by_key(|c| std::cmp::Reverse(c.1.at));
-    all.iter().map(|(p, c)| fmt_asset_change_line(*p, c)).collect()
+    all.iter().map(|(l, c)| fmt_asset_change_line(l, c)).collect()
 }
 
 /// A loaded mainpage image asset (icon/banner) shown as a thumbnail in the channel
@@ -5659,7 +5683,7 @@ struct AssetThumb {
 /// per repaint and can stall the UI thread for >10s on slow or AV-scanned storage.
 #[derive(Clone)]
 struct PlatformAssetStatus {
-    platform: Platform,
+    account: AssetAccount,
     icon_present: bool,
     icon_variants: usize,
     banner_present: bool,
@@ -5667,6 +5691,56 @@ struct PlatformAssetStatus {
     badges: usize,
     emotes: usize,
     stamp: String,
+}
+
+/// One asset ACCOUNT of a channel container: a distinct (platform, account-slug)
+/// among its instances. Two tools on one URL collapse to one entry; a main + alt
+/// account on the same platform yield two.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AssetAccount {
+    platform: Platform,
+    /// [`crate::assets::account_slug`] of the owning instance's URL.
+    account: String,
+    /// First monitor carrying this account — the Refetch dispatch target.
+    monitor_id: i64,
+    /// Display label: `"Twitch"`, or `"Twitch (geega_alt)"` when the channel
+    /// has sibling accounts on the platform.
+    label: String,
+    /// True when another account of the same platform exists in the channel.
+    has_siblings: bool,
+}
+
+/// A channel's asset accounts: distinct (platform, account) pairs among its
+/// instances, first-seen order, `Generic` skipped (no asset source).
+fn channel_asset_accounts(monitors: &[&MonitorWithChannel]) -> Vec<AssetAccount> {
+    let mut out: Vec<AssetAccount> = Vec::new();
+    for m in monitors {
+        let platform = m.monitor.platform();
+        if platform == Platform::Generic {
+            continue;
+        }
+        let account = asset_account(&m.monitor.url, platform);
+        if !out.iter().any(|a| a.platform == platform && a.account == account) {
+            out.push(AssetAccount {
+                platform,
+                account,
+                monitor_id: m.monitor.id,
+                label: String::new(),
+                has_siblings: false,
+            });
+        }
+    }
+    // Label pass: name the account only when the platform has siblings.
+    for i in 0..out.len() {
+        let siblings = out.iter().filter(|a| a.platform == out[i].platform).count() > 1;
+        out[i].has_siblings = siblings;
+        out[i].label = if siblings {
+            format!("{} ({})", out[i].platform.label(), out[i].account)
+        } else {
+            out[i].platform.label().to_string()
+        };
+    }
+    out
 }
 
 /// Handle to the background thread loading a channel Properties window's per-open data.
@@ -5688,7 +5762,7 @@ struct PropsLoaded {
     /// `None` = no icon file found (a successful "no icon" result, not a failure).
     icon: Option<egui::TextureHandle>,
     thumbs: Vec<AssetThumb>,
-    emote_counts: [(EmoteProvider, usize); 4],
+    emote_counts: Vec<(AssetAccount, [(EmoteProvider, usize); 4])>,
     asset_status: Vec<PlatformAssetStatus>,
     cfg: crate::schedule_source::ChannelSourceConfig,
     source_order: Vec<SourceEntry>,
@@ -5728,17 +5802,20 @@ struct PendingSave {
 /// status grid used to compute inline: icon/banner presence + archived-variant counts,
 /// a depth-2 badge-dir count, the Twitch emote-dir file count plus each third-party
 /// manifest length, and the last-fetched stamp.
-fn build_platform_asset_status(name: &str, platforms: &[Platform]) -> Vec<PlatformAssetStatus> {
-    platforms
+fn build_platform_asset_status(name: &str, accounts: &[AssetAccount]) -> Vec<PlatformAssetStatus> {
+    accounts
         .iter()
-        .map(|&p| {
-            let pdir = channel_asset_dir(name, p);
+        .map(|acc| {
+            // Read from the account dir; fall back to the legacy pre-account
+            // dir so a not-yet-refetched channel still shows its assets.
+            let dirs = crate::assets::asset_read_dirs(name, acc.platform, &acc.account);
+            let pdir = if dirs[0].exists() { dirs[0].clone() } else { dirs[1].clone() };
             let mut emotes = prop_count_dir_files(&pdir.join("emotes").join("twitch"));
             for src in &["bttv", "ffz", "7tv"] {
                 emotes += prop_read_manifest_count(&pdir.join("emotes").join(format!("{src}.json")));
             }
             PlatformAssetStatus {
-                platform: p,
+                account: acc.clone(),
                 icon_present: prop_find_first(&pdir, "icon.").is_some(),
                 icon_variants: prop_variant_count(&pdir, "icon"),
                 banner_present: prop_find_first(&pdir, "banner.").is_some(),
@@ -10401,10 +10478,19 @@ impl StreamArchiverApp {
                 Some(Target::Url(crate::detectors::youtube_community_url(&s.url)))
             }
             ScheduleSourceKind::TwitchBannerOcr => {
-                // Prefer the OCR'd offline-banner image on disk; fall back to the
-                // channel page (which shows the banner when offline).
-                let dir = crate::assets::channel_asset_dir(&s.channel_name, Platform::Twitch);
+                // Prefer the OCR'd offline-banner image on disk (this source's
+                // own account dir, then any account/legacy dir); fall back to
+                // the channel page (which shows the banner when offline).
+                let account = asset_account(&s.url, Platform::Twitch);
+                let dir = crate::assets::channel_asset_dir(&s.channel_name, Platform::Twitch, &account);
                 crate::assets::find_asset(&dir, "banner.")
+                    .or_else(|| {
+                        crate::assets::find_asset_any_account(
+                            &s.channel_name,
+                            Platform::Twitch,
+                            "banner.",
+                        )
+                    })
                     .map(Target::Path)
                     .or_else(|| {
                         crate::detectors::twitch_login(&s.url)
@@ -11076,29 +11162,34 @@ impl StreamArchiverApp {
             let mut channel_name_colors: HashMap<i64, (egui::Color32, bool)> = HashMap::new();
             for e in &chan_entries {
                 let cid = e.channel.id;
-                let platforms = {
+                let accounts = {
                     let mons: Vec<&MonitorWithChannel> =
                         e.rows.iter().map(|&i| &self.rows[i]).collect();
-                    channel_platforms(&mons)
+                    channel_asset_accounts(&mons)
                 };
                 let tex = self
                     .channel_icons_small
                     .entry(cid)
-                    .or_insert_with(|| resolve_channel_icon_small(&e.channel, &platforms, ui.ctx()))
+                    .or_insert_with(|| resolve_channel_icon_small(&e.channel, &accounts, ui.ctx()))
                     .clone();
                 if let Some(t) = tex {
                     channel_avatars.insert(cid, t);
                 }
                 // Name colour: a manual custom colour wins; otherwise tint Twitch
-                // channels with the streamer's own (cached) name colour; otherwise the
-                // automatic palette.
+                // channels with the streamer's own (cached) name colour — from the
+                // preferred icon-source account when set, else the first Twitch
+                // account; otherwise the automatic palette.
                 let name_color = if !e.channel.color.is_empty() {
                     (channel_event_color(cid, &e.channel.color), false)
-                } else if platforms.contains(&Platform::Twitch) {
+                } else if let Some(tw) = preferred_account_index(&e.channel.preferred_asset, &accounts)
+                    .filter(|&i| accounts[i].platform == Platform::Twitch)
+                    .map(|i| &accounts[i])
+                    .or_else(|| accounts.iter().find(|a| a.platform == Platform::Twitch))
+                {
                     match *self
                         .channel_twitch_colors
                         .entry(cid)
-                        .or_insert_with(|| load_twitch_name_color(&e.channel.name))
+                        .or_insert_with(|| load_twitch_name_color(&e.channel.name, &tw.account))
                     {
                         Some(c) => (c, true), // raw broadcaster colour → readability at render
                         None => (channel_event_color(cid, ""), false),
@@ -17656,14 +17747,17 @@ impl StreamArchiverApp {
         let row = self.rows.iter().find(|r| r.monitor.id == monitor_id);
         let monitor_name = row.map(|r| r.channel.name.clone()).unwrap_or_default();
         let platform = row.map(|r| r.monitor.platform());
+        // The emote/badge cache is per-ACCOUNT: this monitor's URL names which
+        // account's assets to use (a channel can hold a main + alt Twitch).
+        let account = row
+            .map(|r| asset_account(&r.monitor.url, r.monitor.platform()))
+            .unwrap_or_default();
         // Twitch: build the third-party emote map (BTTV/FFZ/7TV) once and point at
         // the first-party emote dir. YouTube/others: empty map, no dir (emotes come
         // inline in the runs / aren't word-matched).
         let (emote_map, twitch_emote_dir) = if platform == Some(Platform::Twitch) {
-            let dir = channel_asset_dir(&monitor_name, Platform::Twitch)
-                .join("emotes")
-                .join("twitch");
-            (Arc::new(build_emote_map(&monitor_name)), Some(dir))
+            let dir = twitch_emotes_dir(&monitor_name, &account).join("twitch");
+            (Arc::new(build_emote_map(&monitor_name, &account)), Some(dir))
         } else {
             (Arc::new(HashMap::new()), None)
         };
@@ -18142,16 +18236,16 @@ impl StreamArchiverApp {
         let ch = &row.channel;
         let m = &row.monitor;
 
-        let platforms: Vec<Platform> = {
+        let (platforms, accounts) = {
             let mons: Vec<&MonitorWithChannel> =
                 self.rows.iter().filter(|r| r.channel.id == ch.id).collect();
-            channel_platforms(&mons)
+            (channel_platforms(&mons), channel_asset_accounts(&mons))
         };
 
         let icon_tex = self
             .channel_icons
             .entry(ch.id)
-            .or_insert_with(|| resolve_channel_icon(ch, &platforms, ctx))
+            .or_insert_with(|| resolve_channel_icon(ch, &accounts, ctx))
             .clone();
 
         self.instance_scope_drafts
@@ -18320,8 +18414,7 @@ impl StreamArchiverApp {
         &mut self,
         cid: i64,
         ch: &Channel,
-        platforms: &[Platform],
-        asset_platforms: &[Platform],
+        accounts: &[AssetAccount],
         ctx: &egui::Context,
     ) -> bool {
         // Ensure a load for THIS channel is in flight (other windows' loads run
@@ -18330,8 +18423,7 @@ impl StreamArchiverApp {
         if need_spawn {
             let (tx, rx) = std::sync::mpsc::channel();
             let ch_bg = ch.clone();
-            let platforms_bg = platforms.to_vec();
-            let asset_platforms_bg = asset_platforms.to_vec();
+            let accounts_bg = accounts.to_vec();
             let ctx_bg = ctx.clone();
             let store = self.core.store.clone();
             debug!(channel_id = cid, "spawning props-load thread");
@@ -18345,10 +18437,10 @@ impl StreamArchiverApp {
                     let id = ch_bg.id;
                     let loaded = PropsLoaded {
                         channel_id: id,
-                        icon: resolve_channel_icon(&ch_bg, &platforms_bg, &ctx_bg),
-                        thumbs: load_channel_asset_thumbs(&ch_bg, &platforms_bg, &ctx_bg),
-                        emote_counts: emote_provider_counts(&ch_bg.name),
-                        asset_status: build_platform_asset_status(&ch_bg.name, &asset_platforms_bg),
+                        icon: resolve_channel_icon(&ch_bg, &accounts_bg, &ctx_bg),
+                        thumbs: load_channel_asset_thumbs(&ch_bg, &accounts_bg, &ctx_bg),
+                        emote_counts: emote_provider_counts(&ch_bg.name, &accounts_bg),
+                        asset_status: build_platform_asset_status(&ch_bg.name, &accounts_bg),
                         cfg: load_channel_cfg(&store, id),
                         source_order: load_source_order(&store),
                         scope: load_channel_scope(&store, id),
@@ -18368,10 +18460,10 @@ impl StreamArchiverApp {
                     let id = ch.id;
                     let loaded = PropsLoaded {
                         channel_id: id,
-                        icon: resolve_channel_icon(ch, platforms, ctx),
-                        thumbs: load_channel_asset_thumbs(ch, platforms, ctx),
-                        emote_counts: emote_provider_counts(&ch.name),
-                        asset_status: build_platform_asset_status(&ch.name, asset_platforms),
+                        icon: resolve_channel_icon(ch, accounts, ctx),
+                        thumbs: load_channel_asset_thumbs(ch, accounts, ctx),
+                        emote_counts: emote_provider_counts(&ch.name, accounts),
+                        asset_status: build_platform_asset_status(&ch.name, accounts),
                         cfg: load_channel_cfg(&self.core.store, id),
                         source_order: load_source_order(&self.core.store),
                         scope: load_channel_scope(&self.core.store, id),
@@ -18498,16 +18590,11 @@ impl StreamArchiverApp {
         // `Properties` right before the sub-window is created (below).
         self.heartbeat.set_context(format!("Properties: {}", ch.name));
         self.heartbeat.set_activity(crate::watchdog::Activity::PropertiesLoad);
-        // First monitor of this channel — used for asset refetch.
-        let first_mon = self.rows.iter().find(|r| r.channel.id == cid).map(|r| r.monitor.clone());
-
-        let platforms: Vec<Platform> = {
+        let (platforms, accounts) = {
             let mons: Vec<&MonitorWithChannel> =
                 self.rows.iter().filter(|r| r.channel.id == cid).collect();
-            channel_platforms(&mons)
+            (channel_platforms(&mons), channel_asset_accounts(&mons))
         };
-        let asset_platforms: Vec<Platform> =
-            platforms.iter().copied().filter(|p| *p != Platform::Generic).collect();
 
         // First-open — and every reopen, since these per-open caches are dropped on
         // close — asset load runs OFF the UI thread: icon/thumbnail image decode + GPU
@@ -18519,7 +18606,7 @@ impl StreamArchiverApp {
         // because it is the cache dropped on every close (and on rename/refetch), so each
         // open re-loads through this off-thread path rather than blocking the UI thread.
         if !self.channel_asset_status.contains_key(&ch.id)
-            && !self.drive_props_load(cid, &ch, &platforms, &asset_platforms, ctx)
+            && !self.drive_props_load(cid, &ch, &accounts, ctx)
         {
             return false; // still loading — placeholder is on screen
         }
@@ -18527,22 +18614,23 @@ impl StreamArchiverApp {
         let icon_tex = self
             .channel_icons
             .entry(ch.id)
-            .or_insert_with(|| resolve_channel_icon(&ch, &platforms, ctx))
+            .or_insert_with(|| resolve_channel_icon(&ch, &accounts, ctx))
             .clone();
 
-        // Mainpage asset thumbnails (icon + banner per platform). Loaded full-res
+        // Mainpage asset thumbnails (icon + banner per account). Loaded full-res
         // once per open; the clone is cheap (Arc-backed texture handles).
         let thumbs = self
             .channel_asset_thumbs
             .entry(ch.id)
-            .or_insert_with(|| load_channel_asset_thumbs(&ch, &platforms, ctx))
+            .or_insert_with(|| load_channel_asset_thumbs(&ch, &accounts, ctx))
             .clone();
-        // Viewable emote counts per provider — enumerated once per open (one stat per
-        // emote) and cached, since this runs every frame the window is up.
-        let emote_counts = *self
+        // Viewable emote counts per account+provider — enumerated once per open
+        // (one stat per emote) and cached, since this runs every frame.
+        let emote_counts = self
             .channel_emote_counts
             .entry(ch.id)
-            .or_insert_with(|| emote_provider_counts(&ch.name));
+            .or_insert_with(|| emote_provider_counts(&ch.name, &accounts))
+            .clone();
         // Per-platform asset-status rows — built once per open from blocking filesystem
         // I/O (read_dir + per-file metadata + full JSON manifest parse) and cached, so the
         // status grid (rebuilt every frame the window is open) reads from memory instead of
@@ -18551,12 +18639,13 @@ impl StreamArchiverApp {
         let asset_status = self
             .channel_asset_status
             .entry(ch.id)
-            .or_insert_with(|| build_platform_asset_status(&ch.name, &asset_platforms))
+            .or_insert_with(|| build_platform_asset_status(&ch.name, &accounts))
             .clone();
 
-        let mut pref_change: Option<Option<Platform>> = None;
-        let mut open_emote_viewer: Option<EmoteProvider> = None;
+        let mut pref_change: Option<Option<crate::models::PreferredAssetSource>> = None;
+        let mut open_emote_viewer: Option<(EmoteProvider, AssetAccount)> = None;
         let mut open_asset_history = false;
+        let mut refetch_monitor_ids: Vec<i64> = Vec::new();
 
         if !self.channel_cfg_drafts.contains_key(&ch.id) {
             self.channel_cfg_drafts
@@ -18711,30 +18800,16 @@ impl StreamArchiverApp {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         ui.strong("Channel assets");
-                        if let Some(m) = &first_mon {
-                            if ui
+                        if !accounts.is_empty()
+                            && ui
                                 .button("⟳ Refetch")
-                                .on_hover_text(format!(
-                                    "Fetch icon / banner / badges / emotes for this channel's \
-                                     platform ({}) now — ignores the 24h cache.",
-                                    m.platform().label(),
-                                ))
+                                .on_hover_text(
+                                    "Fetch icon / banner / badges / emotes for EVERY account of \
+                                     this channel now — ignores the 24h cache.",
+                                )
                                 .clicked()
-                            {
-                                self.core.manual(ManualCommand::RefetchAssets(m.id));
-                                self.channel_icons.remove(&ch.id);
-                                // channel_icons_small is NOT cleared here: this callback
-                                // runs inside a child viewport whose paint_and_update_textures
-                                // would free the texture from the shared painter before the
-                                // main viewport paints the streams table, causing "Failed to
-                                // find texture" warnings. The small icon reloads on the next
-                                // AssetFetch completion (logic() clears it before any rendering).
-                                self.channel_twitch_colors.remove(&ch.id);
-                                self.channel_asset_thumbs.remove(&ch.id);
-                                self.channel_emote_counts.remove(&ch.id);
-                                self.channel_asset_status.remove(&ch.id);
-                                self.status = format!("Refetching assets for {}…", ch.name);
-                            }
+                        {
+                            refetch_monitor_ids.extend(accounts.iter().map(|a| a.monitor_id));
                         }
                         if ui
                             .button("📂")
@@ -18762,15 +18837,24 @@ impl StreamArchiverApp {
                         }
                     });
 
-                    // Icon source picker.
+                    // Icon source picker — one entry per asset ACCOUNT (a channel
+                    // can hold a main + alt on one platform).
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.label("Icon source:");
-                        let cur = ch.preferred_platform;
+                        let cur = ch.preferred_asset.clone();
+                        // A legacy bare-platform preference matches that platform's
+                        // FIRST account row.
+                        let selected_idx = cur.as_ref().and_then(|p| {
+                            accounts.iter().position(|a| {
+                                a.platform == p.platform
+                                    && p.account.as_deref().is_none_or(|acc| acc == a.account)
+                            })
+                        });
                         egui::ComboBox::from_id_salt("pref_plat_cb")
-                            .selected_text(match cur {
-                                Some(p) => p.label(),
-                                None => "Auto (first available)",
+                            .selected_text(match selected_idx {
+                                Some(i) => accounts[i].label.clone(),
+                                None => "Auto (first available)".to_string(),
                             })
                             .show_ui(ui, |ui| {
                                 if ui
@@ -18779,35 +18863,41 @@ impl StreamArchiverApp {
                                 {
                                     pref_change = Some(None);
                                 }
-                                for &p in &asset_platforms {
+                                for (i, a) in accounts.iter().enumerate() {
                                     if ui
-                                        .selectable_label(cur == Some(p), p.label())
+                                        .selectable_label(selected_idx == Some(i), &a.label)
                                         .clicked()
                                     {
-                                        pref_change = Some(Some(p));
+                                        pref_change =
+                                            Some(Some(crate::models::PreferredAssetSource {
+                                                platform: a.platform,
+                                                account: Some(a.account.clone()),
+                                            }));
                                     }
                                 }
                             })
                             .response
                             .on_hover_text(
-                                "Which platform's profile pic represents this channel. \
-                                 Auto uses the first platform that has a fetched icon.",
+                                "Which account's profile pic represents this channel. \
+                                 Auto uses the first account that has a fetched icon.",
                             );
                     });
 
-                    // Per-platform asset status.
+                    // Per-account asset status (one row per platform ACCOUNT —
+                    // a main + alt on one platform get separate rows).
                     ui.add_space(4.0);
                     egui::Grid::new("props_assets")
-                        .num_columns(6)
+                        .num_columns(7)
                         .spacing([12.0, 4.0])
                         .striped(true)
                         .show(ui, |ui| {
-                            ui.strong("Platform");
+                            ui.strong("Source");
                             ui.strong("Icon");
                             ui.strong("Banner");
                             ui.strong("Badges");
                             ui.strong("Emotes");
                             ui.strong("Updated");
+                            ui.strong("");
                             ui.end_row();
                             // Reads from the per-open `asset_status` cache — NO filesystem
                             // I/O here (it would otherwise be dozens of syscalls per frame;
@@ -18817,13 +18907,13 @@ impl StreamArchiverApp {
                                     let ptex = self.platform_tex.get_or_insert_with(|| {
                                         PlatformTextures::load(ui.ctx())
                                     });
-                                    if let Some(t) = ptex.get(st.platform) {
+                                    if let Some(t) = ptex.get(st.account.platform) {
                                         ui.add(
                                             egui::Image::from_texture(t)
                                                 .max_size(egui::vec2(13.0, 13.0)),
                                         );
                                     }
-                                    ui.label(st.platform.label());
+                                    ui.label(&st.account.label);
                                 });
                                 asset_status_cell(ui, st.icon_present, st.icon_variants);
                                 asset_status_cell(ui, st.banner_present, st.banner_variants);
@@ -18838,50 +18928,71 @@ impl StreamArchiverApp {
                                     "—".into()
                                 });
                                 ui.label(&st.stamp);
+                                if ui
+                                    .small_button("⟳")
+                                    .on_hover_text(format!(
+                                        "Refetch assets for {} only (ignores the 24h cache).",
+                                        st.account.label,
+                                    ))
+                                    .clicked()
+                                {
+                                    refetch_monitor_ids.push(st.account.monitor_id);
+                                }
                                 ui.end_row();
                             }
                         });
 
-                    // Emote viewers: one launcher per provider that has emotes.
-                    // Twitch (first-party) uses a generic emote glyph; the third
-                    // parties use their brand logo (7TV/BTTV) or a text badge (FFZ).
-                    if emote_counts.iter().any(|(_, n)| *n > 0) {
+                    // Emote viewers: one launcher per (account, provider) that has
+                    // emotes. Twitch (first-party) uses a generic emote glyph; the
+                    // third parties use their brand logo (7TV/BTTV) or a text badge
+                    // (FFZ). Sibling accounts each get their own labelled row.
+                    if emote_counts.iter().any(|(_, counts)| counts.iter().any(|(_, n)| *n > 0)) {
                         ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            ui.strong("View emotes:");
-                            let ptex = self
-                                .provider_tex
-                                .get_or_insert_with(|| ProviderTextures::load(ui.ctx()))
-                                .clone();
-                            for (provider, count) in emote_counts {
-                                if count == 0 {
-                                    continue;
-                                }
-                                let resp = match provider {
-                                    EmoteProvider::SevenTv => ui.add(egui::ImageButton::new(
-                                        egui::Image::from_texture(&ptex.seventv)
-                                            .fit_to_exact_size(egui::vec2(18.0, 18.0)),
-                                    )),
-                                    EmoteProvider::Bttv => ui.add(egui::ImageButton::new(
-                                        egui::Image::from_texture(&ptex.bttv)
-                                            .fit_to_exact_size(egui::vec2(18.0, 18.0)),
-                                    )),
-                                    EmoteProvider::Twitch => ui.button("😀"),
-                                    EmoteProvider::Ffz => ui.button("FFZ"),
-                                };
-                                if resp
-                                    .on_hover_text(format!(
-                                        "View {} {} emote{} for this channel",
-                                        count,
-                                        provider.label(),
-                                        if count == 1 { "" } else { "s" },
-                                    ))
-                                    .clicked()
-                                {
-                                    open_emote_viewer = Some(provider);
-                                }
+                        for (acc, counts) in &emote_counts {
+                            if !counts.iter().any(|(_, n)| *n > 0) {
+                                continue;
                             }
-                        });
+                            ui.horizontal(|ui| {
+                                if acc.has_siblings {
+                                    ui.strong(format!("View emotes ({}):", acc.account));
+                                } else {
+                                    ui.strong("View emotes:");
+                                }
+                                let ptex = self
+                                    .provider_tex
+                                    .get_or_insert_with(|| ProviderTextures::load(ui.ctx()))
+                                    .clone();
+                                for &(provider, count) in counts {
+                                    if count == 0 {
+                                        continue;
+                                    }
+                                    let resp = match provider {
+                                        EmoteProvider::SevenTv => ui.add(egui::ImageButton::new(
+                                            egui::Image::from_texture(&ptex.seventv)
+                                                .fit_to_exact_size(egui::vec2(18.0, 18.0)),
+                                        )),
+                                        EmoteProvider::Bttv => ui.add(egui::ImageButton::new(
+                                            egui::Image::from_texture(&ptex.bttv)
+                                                .fit_to_exact_size(egui::vec2(18.0, 18.0)),
+                                        )),
+                                        EmoteProvider::Twitch => ui.button("😀"),
+                                        EmoteProvider::Ffz => ui.button("FFZ"),
+                                    };
+                                    if resp
+                                        .on_hover_text(format!(
+                                            "View {} {} emote{} for {}",
+                                            count,
+                                            provider.label(),
+                                            if count == 1 { "" } else { "s" },
+                                            acc.label,
+                                        ))
+                                        .clicked()
+                                    {
+                                        open_emote_viewer = Some((provider, acc.clone()));
+                                    }
+                                }
+                            });
+                        }
                     }
                 }
 
@@ -19009,9 +19120,9 @@ impl StreamArchiverApp {
                 }
 
                 // Apply an icon-source change picked in the combo above.
-                if let Some(newp) = pref_change {
+                if let Some(newp) = pref_change.take() {
                     if let Err(e) =
-                        self.core.store.set_channel_preferred_platform(ch.id, newp)
+                        self.core.store.set_channel_preferred_asset(ch.id, newp.as_ref())
                     {
                         self.status = format!("Error: {e}");
                     } else {
@@ -19026,22 +19137,45 @@ impl StreamArchiverApp {
             },
         );
 
+        // The Refetch buttons (header = every account, per-row = one account)
+        // dispatch outside the viewport closure.
+        if !refetch_monitor_ids.is_empty() {
+            refetch_monitor_ids.sort_unstable();
+            refetch_monitor_ids.dedup();
+            for mid in &refetch_monitor_ids {
+                self.core.manual(ManualCommand::RefetchAssets(*mid));
+            }
+            self.channel_icons.remove(&ch.id);
+            // channel_icons_small is NOT cleared here: this runs while a child
+            // viewport is being painted; freeing the texture from the shared
+            // painter before the main viewport paints the streams table causes
+            // "Failed to find texture" warnings. The small icon reloads on the
+            // next AssetFetch completion (logic() clears it before rendering).
+            self.channel_twitch_colors.remove(&ch.id);
+            self.channel_asset_thumbs.remove(&ch.id);
+            self.channel_emote_counts.remove(&ch.id);
+            self.channel_asset_status.remove(&ch.id);
+            self.status = format!("Refetching assets for {}…", ch.name);
+        }
         // A launcher button was clicked above — open (or refresh) the emote
-        // viewer for this channel+provider; other channels' viewers stay open.
-        if let Some(provider) = open_emote_viewer {
-            let fresh = EmoteViewer::new(ch.name.clone(), provider);
-            match self
-                .emote_viewers
-                .iter_mut()
-                .find(|v| v.channel_name == ch.name && v.provider == provider)
-            {
+        // viewer for this channel+account+provider; other viewers stay open.
+        if let Some((provider, acc)) = open_emote_viewer {
+            let fresh = EmoteViewer::new(
+                ch.name.clone(),
+                acc.account.clone(),
+                acc.has_siblings,
+                provider,
+            );
+            match self.emote_viewers.iter_mut().find(|v| {
+                v.channel_name == ch.name && v.account == acc.account && v.provider == provider
+            }) {
                 Some(slot) => *slot = fresh, // re-enumerated → stale flag reset
                 None => self.emote_viewers.push(fresh),
             }
         }
         // The "🕑 History" button was clicked — load and open the asset-history popup.
         if open_asset_history {
-            let fresh = AssetHistoryView::new(ch.name.clone(), &asset_platforms);
+            let fresh = AssetHistoryView::new(ch.name.clone(), &accounts);
             match self
                 .asset_histories
                 .iter_mut()
@@ -19080,10 +19214,11 @@ impl StreamArchiverApp {
     /// separately under "Deprecated". Reuses the shared `emote_anim` decode
     /// cache, so emotes animate against the same clock as chat replay.
     fn emote_viewer_windows(&mut self, ctx: &egui::Context) {
-        let mut closed: Vec<(String, EmoteProvider)> = Vec::new();
+        let mut closed: Vec<(String, String, EmoteProvider)> = Vec::new();
         for i in 0..self.emote_viewers.len() {
             let key = (
                 self.emote_viewers[i].channel_name.clone(),
+                self.emote_viewers[i].account.clone(),
                 self.emote_viewers[i].provider,
             );
             if self.emote_viewer_window(ctx, i) {
@@ -19091,8 +19226,9 @@ impl StreamArchiverApp {
             }
         }
         if !closed.is_empty() {
-            self.emote_viewers
-                .retain(|v| !closed.contains(&(v.channel_name.clone(), v.provider)));
+            self.emote_viewers.retain(|v| {
+                !closed.contains(&(v.channel_name.clone(), v.account.clone(), v.provider))
+            });
             if self.emote_viewers.is_empty() {
                 // Free decoded emote frames now the last viewer is closed
                 // (mirrors the chat popup). An open chat replay re-decodes its
@@ -19122,6 +19258,12 @@ impl StreamArchiverApp {
         let stale = viewer.stale;
         let provider = viewer.provider;
         let channel_name = viewer.channel_name.clone();
+        let account = viewer.account.clone();
+        let title_channel = if viewer.has_siblings {
+            format!("{channel_name} ({account})")
+        } else {
+            channel_name.clone()
+        };
         let active = viewer.active.clone();
         let deprecated = viewer.deprecated.clone();
         let current_properties = viewer.emote_properties.clone();
@@ -19132,9 +19274,14 @@ impl StreamArchiverApp {
         let mut clear_properties = false;
 
         ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of(("emote_viewer_vp", &channel_name, provider.label())),
+            egui::ViewportId::from_hash_of((
+                "emote_viewer_vp",
+                &channel_name,
+                &account,
+                provider.label(),
+            )),
             egui::ViewportBuilder::default()
-                .with_title(format!("{} emotes — {}", provider.label(), channel_name))
+                .with_title(format!("{} emotes — {title_channel}", provider.label()))
                 .with_inner_size([560.0, 600.0]),
             |ctx, _class| {
                 if ctx.input(|i| i.viewport().close_requested()) {
@@ -19363,10 +19510,16 @@ impl StreamArchiverApp {
 
 // ── Properties window helpers ────────────────────────────────────────────────
 
-/// Per-platform channel asset directory: `…/channel_assets/{name}/{platform}/`.
-/// Thin alias for the shared definition in [`crate::assets::channel_asset_dir`].
-fn channel_asset_dir(name: &str, platform: Platform) -> std::path::PathBuf {
-    crate::assets::channel_asset_dir(name, platform)
+/// Per-account channel asset directory:
+/// `…/channel_assets/{name}/{platform}/{account}/`. Thin alias for the shared
+/// definition in [`crate::assets::channel_asset_dir`].
+fn channel_asset_dir(name: &str, platform: Platform, account: &str) -> std::path::PathBuf {
+    crate::assets::channel_asset_dir(name, platform, account)
+}
+
+/// The account slug of a monitor URL — the last asset-path segment.
+fn asset_account(url: &str, platform: Platform) -> String {
+    crate::assets::account_slug(url, platform)
 }
 
 /// Stable per-platform identity of a monitor's source URL, used to detect whether
@@ -19397,13 +19550,17 @@ fn import_row_matches(row: &ImportRow, q: &str) -> bool {
         || row.cand.id.to_lowercase().contains(q)
 }
 
-/// The Twitch broadcaster's chosen chat name colour for `name`, if the asset fetch
-/// cached one (`…/{name}/twitch/name_color.txt`, e.g. `#9146FF`). `None` when the
-/// streamer set no colour or assets haven't been fetched.
-fn load_twitch_name_color(name: &str) -> Option<egui::Color32> {
-    let path = channel_asset_dir(name, Platform::Twitch).join("name_color.txt");
-    let s = std::fs::read_to_string(path).ok()?;
-    parse_chat_hex_color(s.trim())
+/// The Twitch broadcaster's chosen chat name colour for `name`'s `account`, if
+/// the asset fetch cached one (`…/{name}/twitch/{account}/name_color.txt`, e.g.
+/// `#9146FF`; legacy pre-account dir as fallback). `None` when the streamer set
+/// no colour or assets haven't been fetched.
+fn load_twitch_name_color(name: &str, account: &str) -> Option<egui::Color32> {
+    for dir in crate::assets::asset_read_dirs(name, Platform::Twitch, account) {
+        if let Ok(s) = std::fs::read_to_string(dir.join("name_color.txt")) {
+            return parse_chat_hex_color(s.trim());
+        }
+    }
+    None
 }
 
 /// Build a Twitch channel's third-party emote lookup: case-sensitive emote code →
@@ -19414,9 +19571,21 @@ fn load_twitch_name_color(name: &str) -> Option<egui::Color32> {
 /// Precedence on a code defined by multiple providers: **7TV > BTTV > FFZ** — we
 /// insert in that order with `or_insert`, so the first (highest-priority) provider
 /// to define a code wins and later duplicates don't clobber it.
-fn build_emote_map(name: &str) -> HashMap<String, std::path::PathBuf> {
+/// The Twitch `emotes/` dir for (channel, account): the account dir when it has
+/// content, else the legacy pre-account per-platform dir (read fallback).
+fn twitch_emotes_dir(name: &str, account: &str) -> std::path::PathBuf {
+    let [primary, legacy] = crate::assets::asset_read_dirs(name, Platform::Twitch, account);
+    let primary = primary.join("emotes");
+    if primary.exists() {
+        return primary;
+    }
+    let legacy = legacy.join("emotes");
+    if legacy.exists() { legacy } else { primary }
+}
+
+fn build_emote_map(name: &str, account: &str) -> HashMap<String, std::path::PathBuf> {
     use crate::assets::EmoteManifestEntry;
-    let emotes_dir = channel_asset_dir(name, Platform::Twitch).join("emotes");
+    let emotes_dir = twitch_emotes_dir(name, account);
     let plat = crate::app_paths::platform_assets_dir();
     let mut map: HashMap<String, std::path::PathBuf> = HashMap::new();
 
@@ -19527,22 +19696,30 @@ fn load_image_texture(
 }
 
 /// Load a channel's mainpage image assets (the `icon.*` and `banner.*` of each
-/// platform — never emotes or badges) into textures for the Properties thumbnail
-/// strip, in a stable platform/asset order. Skips assets that are absent.
+/// asset account — never emotes or badges) into textures for the Properties
+/// thumbnail strip, in a stable account/asset order. Skips absent assets;
+/// legacy pre-account dirs are consulted as a fallback per account.
 fn load_channel_asset_thumbs(
     channel: &Channel,
-    platforms: &[Platform],
+    accounts: &[AssetAccount],
     ctx: &egui::Context,
 ) -> Vec<AssetThumb> {
     let mut out: Vec<AssetThumb> = Vec::new();
-    for &p in platforms.iter().filter(|p| **p != Platform::Generic) {
-        let dir = channel_asset_dir(&channel.name, p);
+    for acc in accounts {
+        let dirs = crate::assets::asset_read_dirs(&channel.name, acc.platform, &acc.account);
         for (prefix, kind) in [("icon.", "icon"), ("banner.", "banner")] {
-            let Some(path) = prop_find_first(&dir, prefix) else { continue };
-            let key = format!("thumb_{}_{}_{kind}", channel.id, p.as_str());
+            let Some(path) = dirs.iter().find_map(|d| prop_find_first(d, prefix)) else {
+                continue;
+            };
+            let key = format!(
+                "thumb_{}_{}_{}_{kind}",
+                channel.id,
+                acc.platform.as_str(),
+                acc.account
+            );
             if let Some((tex, dims)) = load_image_texture(&path, ctx, &key) {
                 out.push(AssetThumb {
-                    label: format!("{} {kind}", p.label()),
+                    label: format!("{} {kind}", acc.label),
                     path,
                     tex,
                     dims,
@@ -19564,14 +19741,24 @@ fn load_channel_asset_thumbs(
 /// upstream. Order: Twitch, 7TV, BTTV, FFZ — the order the launcher buttons are drawn
 /// in. This stats one file per emote, so callers cache the result rather than recompute
 /// it per frame.
-fn emote_provider_counts(name: &str) -> [(EmoteProvider, usize); 4] {
-    [
-        EmoteProvider::Twitch,
-        EmoteProvider::SevenTv,
-        EmoteProvider::Bttv,
-        EmoteProvider::Ffz,
-    ]
-    .map(|p| (p, enumerate_provider_emotes(name, p).len()))
+fn emote_provider_counts(
+    name: &str,
+    accounts: &[AssetAccount],
+) -> Vec<(AssetAccount, [(EmoteProvider, usize); 4])> {
+    accounts
+        .iter()
+        .filter(|a| a.platform == Platform::Twitch) // emotes are a Twitch-side concept
+        .map(|a| {
+            let counts = [
+                EmoteProvider::Twitch,
+                EmoteProvider::SevenTv,
+                EmoteProvider::Bttv,
+                EmoteProvider::Ffz,
+            ]
+            .map(|p| (p, enumerate_provider_emotes(name, &a.account, p).len()));
+            (a.clone(), counts)
+        })
+        .collect()
 }
 
 /// Enumerate a provider's emotes for a channel, resolved to on-disk image paths.
@@ -19579,9 +19766,9 @@ fn emote_provider_counts(name: &str) -> [(EmoteProvider, usize); 4] {
 /// exactly like [`build_emote_map`]; an entry whose image is gone is kept but marked
 /// `exists = false` (the viewer lists those under "Deprecated"). Twitch is
 /// directory-listed by opaque id (no codes, so never deprecated). Sorted by code.
-fn enumerate_provider_emotes(name: &str, provider: EmoteProvider) -> Vec<ViewerEmote> {
+fn enumerate_provider_emotes(name: &str, account: &str, provider: EmoteProvider) -> Vec<ViewerEmote> {
     use crate::assets::{EmoteManifestEntry, sanitize_emote_name};
-    let emotes_dir = channel_asset_dir(name, Platform::Twitch).join("emotes");
+    let emotes_dir = twitch_emotes_dir(name, account);
     let plat = crate::app_paths::platform_assets_dir();
 
     // Resolve an emote's on-disk path: try the new `{id}_{name}.{ext}` pattern
@@ -19879,29 +20066,43 @@ fn word_match_segments(
     out
 }
 
-/// Resolve a container's avatar — the chosen-platform profile pic. An explicit
-/// `preferred_platform` wins when it's one of the container's instance platforms
-/// (showing a placeholder until that platform's icon is fetched); otherwise auto:
-/// the first instance-platform (first-seen order) whose icon loads. `None` when
-/// no platform has a fetched icon yet.
+/// Which asset account an explicit icon-source preference selects: matching
+/// platform, and — for a legacy bare-platform preference — that platform's
+/// first account.
+fn preferred_account_index(
+    pref: &Option<crate::models::PreferredAssetSource>,
+    accounts: &[AssetAccount],
+) -> Option<usize> {
+    let p = pref.as_ref()?;
+    accounts.iter().position(|a| {
+        a.platform == p.platform && p.account.as_deref().is_none_or(|acc| acc == a.account)
+    })
+}
+
+/// Resolve a container's avatar — the chosen account's profile pic. An explicit
+/// `preferred_asset` wins when it matches one of the container's asset accounts
+/// (showing a placeholder until that account's icon is fetched); otherwise auto:
+/// the first account (first-seen order) whose icon loads, then the legacy
+/// per-platform and flat dirs. `None` when nothing has a fetched icon yet.
 fn resolve_channel_icon(
     channel: &Channel,
-    platforms: &[Platform],
+    accounts: &[AssetAccount],
     ctx: &egui::Context,
 ) -> Option<egui::TextureHandle> {
     let key = channel.id.to_string();
-    let load =
-        |p: Platform| load_channel_icon(&channel_asset_dir(&channel.name, p), ctx, &key);
-    if let Some(p) = channel.preferred_platform {
-        if platforms.contains(&p) {
-            return load(p);
-        }
+    let load = |a: &AssetAccount| {
+        crate::assets::asset_read_dirs(&channel.name, a.platform, &a.account)
+            .iter()
+            .find_map(|d| load_channel_icon(d, ctx, &key))
+    };
+    if let Some(i) = preferred_account_index(&channel.preferred_asset, accounts) {
+        return load(&accounts[i]);
     }
-    platforms.iter().copied().find_map(load).or_else(|| {
+    accounts.iter().find_map(load).or_else(|| {
         // Legacy fallback (auto mode only): assets fetched before per-platform
         // namespacing lived in the flat channel_assets/{name}/ dir. Show that
-        // icon until a per-platform refetch repopulates the namespaced dir, so an
-        // existing container's avatar doesn't go blank on upgrade.
+        // icon until a refetch repopulates the namespaced dirs, so an existing
+        // container's avatar doesn't go blank on upgrade.
         let flat = crate::app_paths::asset_cache_dir()
             .join("channel_assets")
             .join(crate::downloader::sanitize_filename(&channel.name));
@@ -20000,19 +20201,19 @@ fn load_channel_icon_small(
 /// the streams-table avatar slot.
 fn resolve_channel_icon_small(
     channel: &Channel,
-    platforms: &[Platform],
+    accounts: &[AssetAccount],
     ctx: &egui::Context,
 ) -> Option<egui::TextureHandle> {
     let key = channel.id.to_string();
-    let load = |p: Platform| {
-        load_channel_icon_small(&channel_asset_dir(&channel.name, p), ctx, &key)
+    let load = |a: &AssetAccount| {
+        crate::assets::asset_read_dirs(&channel.name, a.platform, &a.account)
+            .iter()
+            .find_map(|d| load_channel_icon_small(d, ctx, &key))
     };
-    if let Some(p) = channel.preferred_platform {
-        if platforms.contains(&p) {
-            return load(p);
-        }
+    if let Some(i) = preferred_account_index(&channel.preferred_asset, accounts) {
+        return load(&accounts[i]);
     }
-    platforms.iter().copied().find_map(load).or_else(|| {
+    accounts.iter().find_map(load).or_else(|| {
         let flat = crate::app_paths::asset_cache_dir()
             .join("channel_assets")
             .join(crate::downloader::sanitize_filename(&channel.name));

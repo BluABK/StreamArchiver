@@ -53,14 +53,225 @@ fn write_global_badges_stamp(platform_dir: &Path) {
 
 // ---------- Core utility ----------
 
-/// Per-platform channel asset directory: `…/channel_assets/{name}/{platform}/`.
-/// The single source of truth for the layout — shared by the asset fetcher, the
-/// UI (avatars / status grid), and desktop notifications, so they never drift.
-pub fn channel_asset_dir(name: &str, platform: crate::models::Platform) -> PathBuf {
+/// A monitor URL's stable per-ACCOUNT identity slug, used as the last segment of
+/// the asset cache path so two same-platform instances of one channel (a main +
+/// alt Twitch account) never share a directory. Purely syntactic (no network):
+/// Twitch login / Kick slug / YouTube handle-or-UC-id parsed from the URL; any
+/// unparseable URL falls back to a sanitized excerpt + a stable FNV hash so
+/// distinct URLs can't collide. Always lowercase, filename-safe, non-empty.
+pub fn account_slug(url: &str, platform: crate::models::Platform) -> String {
+    use crate::models::Platform;
+    let raw = match platform {
+        Platform::Twitch => crate::detectors::twitch_login(url),
+        Platform::Kick => crate::detectors::kick_slug(url).map(|s| s.to_lowercase()),
+        Platform::YouTube => youtube_account_token(url),
+        Platform::Generic => None,
+    };
+    let slug = match raw {
+        Some(s) => crate::downloader::sanitize_filename(&s).to_lowercase(),
+        None => url_fallback_slug(url),
+    };
+    if slug.is_empty() { url_fallback_slug(url) } else { slug }
+}
+
+/// YouTube account token from a channel URL: `@handle` (sans `@`), `/channel/UC…`
+/// id, or a `/c/{name}` / `/user/{name}` path segment — all lowercased.
+fn youtube_account_token(url: &str) -> Option<String> {
+    let lower = url.trim().to_lowercase();
+    if let Some(pos) = lower.find("/@") {
+        let handle = lower[pos + 2..].split(['/', '?', '#']).next()?.trim();
+        if !handle.is_empty() {
+            return Some(handle.to_string());
+        }
+    }
+    for marker in ["/channel/", "/c/", "/user/"] {
+        if let Some(pos) = lower.find(marker) {
+            let seg = lower[pos + marker.len()..].split(['/', '?', '#']).next()?.trim();
+            if !seg.is_empty() {
+                return Some(seg.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Fallback account slug for URLs no platform parser understands: a short
+/// sanitized excerpt for readability + a stable FNV-1a hash for uniqueness.
+fn url_fallback_slug(url: &str) -> String {
+    let trimmed = url.trim().trim_start_matches("https://").trim_start_matches("http://");
+    let mut excerpt = crate::downloader::sanitize_filename(trimmed).to_lowercase();
+    excerpt.truncate(40);
+    let excerpt = excerpt.trim_matches(['.', ' ', '_']).to_string();
+    let hash = crate::detectors::fnv64(url.trim().as_bytes());
+    if excerpt.is_empty() {
+        format!("url_{:08x}", hash as u32)
+    } else {
+        format!("{excerpt}_{:08x}", hash as u32)
+    }
+}
+
+/// Per-account channel asset directory:
+/// `…/channel_assets/{name}/{platform}/{account}/`. The single source of truth
+/// for the layout — shared by the asset fetcher, the UI (avatars / status grid),
+/// and desktop notifications, so they never drift. `account` is
+/// [`account_slug`] of the owning monitor's URL; two instances on the SAME
+/// platform (main + alt account) therefore get separate trees, while two tools
+/// on the SAME URL share one.
+pub fn channel_asset_dir(name: &str, platform: crate::models::Platform, account: &str) -> PathBuf {
+    legacy_platform_dir(name, platform).join(account)
+}
+
+/// The pre-account layout (`…/channel_assets/{name}/{platform}/`) — kept as a
+/// read-fallback and as the startup migration's source. New writes never land
+/// here.
+pub fn legacy_platform_dir(name: &str, platform: crate::models::Platform) -> PathBuf {
     crate::app_paths::asset_cache_dir()
         .join("channel_assets")
         .join(crate::downloader::sanitize_filename(name))
         .join(platform.as_str())
+}
+
+/// The directories to consult when READING an asset: the account dir first,
+/// then the legacy per-platform dir (pre-migration layouts / renamed channels).
+pub fn asset_read_dirs(
+    name: &str,
+    platform: crate::models::Platform,
+    account: &str,
+) -> [PathBuf; 2] {
+    [
+        channel_asset_dir(name, platform, account),
+        legacy_platform_dir(name, platform),
+    ]
+}
+
+/// Entries the startup migration moves from a legacy `{name}/{platform}/` dir
+/// into its `{account}/` subdir. STRICTLY allow-listed: `posts/` and
+/// `schedule_src/` hold files whose ABSOLUTE paths are persisted in the DB
+/// (`community_post_media.local_path`, `schedule_source_image.local_path`), so
+/// they must stay put (both self-heal into account dirs on the next fetch);
+/// unknown entries (including already-migrated account subdirs) are never
+/// touched.
+fn legacy_payload_entry(name: &str) -> bool {
+    matches!(name, "name_color.txt" | "asset_changes.jsonl" | ".assets_fetched_at"
+        | "emotes" | "badges" | "history")
+        || name.starts_with("icon.")
+        || name.starts_with("icon_")
+        || name.starts_with("banner.")
+}
+
+/// One-time startup migration: move each channel's legacy per-platform asset
+/// payload into the per-ACCOUNT subdir of the FIRST monitor for that
+/// (channel, platform) — matching the pre-account layout's de-facto winner.
+/// Channels with no matching monitor (renamed/removed) are left untouched; the
+/// read-fallback covers them. Stamped with `.accounts_migrated` so it runs once.
+pub fn migrate_assets_to_account_dirs(store: &crate::store::Store) {
+    let root = crate::app_paths::asset_cache_dir().join("channel_assets");
+    let mut first_urls: std::collections::HashMap<(String, crate::models::Platform), String> =
+        std::collections::HashMap::new();
+    if let Ok(rows) = store.list_monitors_with_channels() {
+        for row in &rows {
+            let key = (
+                crate::downloader::sanitize_filename(&row.channel.name),
+                row.monitor.platform(),
+            );
+            first_urls.entry(key).or_insert_with(|| row.monitor.url.clone());
+        }
+    }
+    migrate_assets_root(&root, &first_urls);
+}
+
+/// Testable core of [`migrate_assets_to_account_dirs`] (takes the tree root and
+/// the (sanitized-channel, platform) → first-monitor-URL map directly).
+pub(crate) fn migrate_assets_root(
+    root: &Path,
+    first_urls: &std::collections::HashMap<(String, crate::models::Platform), String>,
+) {
+    use crate::models::Platform;
+    if !root.is_dir() {
+        return; // nothing fetched yet — first run populates account dirs directly
+    }
+    let stamp = root.join(".accounts_migrated");
+    if stamp.exists() {
+        return;
+    }
+    let Ok(channels) = std::fs::read_dir(root) else { return };
+    for chan in channels.flatten() {
+        let chan_dir = chan.path();
+        if !chan_dir.is_dir() {
+            continue;
+        }
+        let chan_key = chan.file_name().to_string_lossy().into_owned();
+        for plat_name in ["twitch", "youtube", "kick", "generic"] {
+            let plat_dir = chan_dir.join(plat_name);
+            if !plat_dir.is_dir() {
+                continue;
+            }
+            let platform = Platform::parse(plat_name);
+            // Legacy payload present directly in the platform dir?
+            let legacy: Vec<PathBuf> = std::fs::read_dir(&plat_dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(legacy_payload_entry)
+                })
+                .collect();
+            if legacy.is_empty() {
+                continue;
+            }
+            let Some(url) = first_urls.get(&(chan_key.clone(), platform)) else {
+                warn!(
+                    "asset migration: no monitor matches {chan_key}/{plat_name} — leaving legacy layout in place"
+                );
+                continue;
+            };
+            let account_dir = plat_dir.join(account_slug(url, platform));
+            let _ = std::fs::create_dir_all(&account_dir);
+            for src in legacy {
+                let Some(fname) = src.file_name() else { continue };
+                let dest = account_dir.join(fname);
+                if dest.exists() {
+                    continue; // a newer account-side copy exists — keep both, prefer it
+                }
+                if let Err(e) = std::fs::rename(&src, &dest) {
+                    warn!("asset migration: could not move {} -> {}: {e}", src.display(), dest.display());
+                }
+            }
+            tracing::info!(
+                "asset migration: {chan_key}/{plat_name} -> per-account dir {}",
+                account_dir.display()
+            );
+        }
+    }
+    let _ = std::fs::write(&stamp, now_unix().to_string());
+}
+
+/// Find `{prefix}*` under ANY account subdir of `{name}/{platform}/` (then the
+/// legacy platform dir itself) — for readers that know the channel but not
+/// which account produced the asset (e.g. the banner-OCR schedule source).
+pub fn find_asset_any_account(
+    name: &str,
+    platform: crate::models::Platform,
+    prefix: &str,
+) -> Option<PathBuf> {
+    let root = legacy_platform_dir(name, platform);
+    if let Ok(entries) = std::fs::read_dir(&root) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir()
+                && !p.file_name().is_some_and(|n| {
+                    matches!(n.to_str(), Some("history" | "emotes" | "badges" | "posts" | "schedule_src"))
+                })
+                && let Some(hit) = find_asset(&p, prefix)
+            {
+                return Some(hit);
+            }
+        }
+    }
+    find_asset(&root, prefix)
 }
 
 /// First file in `dir` whose name starts with `prefix` (e.g. `"banner."`). Used to
@@ -1633,5 +1844,81 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn account_slug_per_platform() {
+        use crate::models::Platform;
+        // Twitch: login, lowercased, path/query stripped.
+        assert_eq!(account_slug("https://twitch.tv/GEEGA", Platform::Twitch), "geega");
+        assert_eq!(account_slug("https://www.twitch.tv/geega_alt/videos?x=1", Platform::Twitch), "geega_alt");
+        // Kick: slug, lowercased.
+        assert_eq!(account_slug("https://kick.com/CoolGuy", Platform::Kick), "coolguy");
+        // YouTube: @handle, /channel/UC id, /c/name, /user/name.
+        assert_eq!(account_slug("https://www.youtube.com/@LofiGirl/live", Platform::YouTube), "lofigirl");
+        assert_eq!(
+            account_slug("https://youtube.com/channel/UCabc123XYZ", Platform::YouTube),
+            "ucabc123xyz"
+        );
+        assert_eq!(account_slug("https://youtube.com/c/SomeName", Platform::YouTube), "somename");
+        assert_eq!(account_slug("https://youtube.com/user/OldName/videos", Platform::YouTube), "oldname");
+        // Same account, two tools → identical slug (shared dir).
+        assert_eq!(
+            account_slug("https://twitch.tv/geega", Platform::Twitch),
+            account_slug("https://TWITCH.tv/GEEGA/", Platform::Twitch)
+        );
+        // Generic / unparseable: sanitized excerpt + stable hash; distinct URLs differ.
+        let a = account_slug("https://example.com/streams/a", Platform::Generic);
+        let b = account_slug("https://example.com/streams/b", Platform::Generic);
+        assert_ne!(a, b);
+        assert_eq!(a, account_slug("https://example.com/streams/a", Platform::Generic));
+        assert!(!a.is_empty() && !a.contains('/') && !a.contains(':'), "{a:?}");
+    }
+
+    #[test]
+    fn migration_moves_legacy_payload_into_first_account_dir() {
+        use crate::models::Platform;
+        let root = unique_test_dir("sa-acct-migrate");
+        let plat = root.join("GEEGA").join("twitch");
+        std::fs::create_dir_all(plat.join("emotes")).unwrap();
+        std::fs::create_dir_all(plat.join("posts")).unwrap();
+        std::fs::create_dir_all(plat.join("schedule_src")).unwrap();
+        std::fs::write(plat.join("icon.png"), b"i").unwrap();
+        std::fs::write(plat.join("name_color.txt"), b"#123456").unwrap();
+        std::fs::write(plat.join("posts").join("p.jpg"), b"p").unwrap();
+        std::fs::write(plat.join("schedule_src").join("s.png"), b"s").unwrap();
+        // An unmatched channel dir must be left untouched.
+        let orphan = root.join("Renamed").join("twitch");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join("icon.png"), b"o").unwrap();
+
+        let mut urls = std::collections::HashMap::new();
+        urls.insert(
+            ("GEEGA".to_string(), Platform::Twitch),
+            "https://twitch.tv/geega".to_string(),
+        );
+        migrate_assets_root(&root, &urls);
+
+        let acct = plat.join("geega");
+        assert!(acct.join("icon.png").is_file(), "icon moved into the account dir");
+        assert!(acct.join("name_color.txt").is_file());
+        assert!(acct.join("emotes").is_dir());
+        assert!(!plat.join("icon.png").exists(), "legacy copy gone");
+        // DB-referenced dirs must NOT move.
+        assert!(plat.join("posts").join("p.jpg").is_file());
+        assert!(plat.join("schedule_src").join("s.png").is_file());
+        // Unmatched channel untouched.
+        assert!(orphan.join("icon.png").is_file());
+        // Idempotent: stamp written; a second run with different urls is a no-op.
+        assert!(root.join(".accounts_migrated").is_file());
+        let mut urls2 = std::collections::HashMap::new();
+        urls2.insert(
+            ("Renamed".to_string(), Platform::Twitch),
+            "https://twitch.tv/other".to_string(),
+        );
+        migrate_assets_root(&root, &urls2);
+        assert!(orphan.join("icon.png").is_file(), "stamped run must not touch anything");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

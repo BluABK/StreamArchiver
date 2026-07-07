@@ -91,7 +91,7 @@ pub fn send_test_toast(
     title: &str,
     game: &str,
 ) {
-    let dir = crate::assets::channel_asset_dir(channel_name, platform);
+    let account = crate::assets::account_slug(channel_url, platform);
     let mut lines = Vec::new();
     if !title.is_empty() {
         lines.push(title.to_string());
@@ -106,8 +106,8 @@ pub fn send_test_toast(
     show_toast(ToastContent {
         heading: format!("{channel_name} is live"),
         lines,
-        logo: crate::assets::find_asset(&dir, "icon."),
-        hero: crate::assets::find_asset(&dir, "banner."),
+        logo: find_toast_asset(channel_name, platform, &account, "icon."),
+        hero: find_toast_asset(channel_name, platform, &account, "banner."),
         action,
     });
 }
@@ -304,7 +304,8 @@ fn content_for_url(
     action_label: &str,
     override_url: Option<String>,
 ) -> ToastContent {
-    let dir = crate::assets::channel_asset_dir(&row.channel.name, row.monitor.platform());
+    let platform = row.monitor.platform();
+    let account = crate::assets::account_slug(&row.monitor.url, platform);
     let mut lines = Vec::new();
     if !row.last_recording_title.is_empty() {
         lines.push(row.last_recording_title.clone());
@@ -320,10 +321,23 @@ fn content_for_url(
     ToastContent {
         heading,
         lines,
-        logo: crate::assets::find_asset(&dir, "icon."),
-        hero: crate::assets::find_asset(&dir, "banner."),
+        logo: find_toast_asset(&row.channel.name, platform, &account, "icon."),
+        hero: find_toast_asset(&row.channel.name, platform, &account, "banner."),
         action,
     }
+}
+
+/// Locate a toast image: the monitor's own account dir first, then the legacy
+/// per-platform dir (pre-migration layouts).
+fn find_toast_asset(
+    name: &str,
+    platform: crate::models::Platform,
+    account: &str,
+    prefix: &str,
+) -> Option<std::path::PathBuf> {
+    crate::assets::asset_read_dirs(name, platform, account)
+        .iter()
+        .find_map(|d| crate::assets::find_asset(d, prefix))
 }
 
 fn content_for(row: &MonitorWithChannel, heading: String, action_label: &str) -> ToastContent {

@@ -739,6 +739,19 @@ identity* over time — StreamArchiver downloads each channel's icon, banner,
 badges, emotes, and the broadcaster's chat name colour into a per-channel asset
 cache, and records every change it sees on later refetches.
 
+The cache is keyed **per account**: `channel_assets/{channel}/{platform}/{account}/`,
+where `{account}` is derived from the instance's URL (Twitch login, Kick slug,
+YouTube handle or UC-id). A channel container holding **two instances on the same
+platform** (a streamer's main + alt Twitch account) therefore keeps two fully
+separate asset trees — icons, emotes, name colours, and change histories never
+overwrite each other — while two tools pointed at the *same* URL share one tree.
+Chat replay, notifications, and the streams-list tint all read the account
+belonging to the specific instance involved. On first launch after upgrading,
+existing per-platform asset folders are migrated automatically into the first
+matching instance's account subfolder (a `.accounts_migrated` stamp marks it
+done; already-downloaded community-post and schedule images stay where their
+database records point and re-home on their next fetch).
+
 **What's fetched, per platform:**
 
 - **Twitch** (needs Twitch credentials — the same app/user token as detection):
@@ -762,17 +775,20 @@ history* below).
 **Where it shows up — channel Properties** (right-click a channel → **Properties**):
 
 - The header avatar plus an **Assets** thumbnail strip of every original
-  icon/banner across the channel's platforms — hover for pixel size, hold **Alt**
+  icon/banner across the channel's accounts — hover for pixel size, hold **Alt**
   to preview full-size, click to open the file.
-- A per-platform status grid (**Icon · Banner · Badges · Emotes · Updated**) and
-  an **Icon source** picker (which platform's profile pic represents the channel).
-- **⟳ Refetch** forces a fetch now (ignores the 24 h cache); **📂** opens the
-  channel's asset folder; **🕑 History** opens the change log (below).
-- **View emotes** — one launcher per provider that has emotes, opening an **emote
-  viewer**: a grid of every emote with its chat code (animated emotes play when
-  *Animate emotes* is on in Settings). Codes still listed in the manifest whose
+- A per-**account** status grid (**Icon · Banner · Badges · Emotes · Updated**),
+  one row per account — labelled like `Twitch (geega_alt)` when a platform has
+  siblings — each with its own **⟳** to refetch just that account, and an **Icon
+  source** picker choosing which *account's* profile pic represents the channel.
+- **⟳ Refetch** fetches **every** account now (ignores the 24 h cache); **📂**
+  opens the channel's asset folder; **🕑 History** opens the change log (below;
+  entries name the account when a platform has more than one).
+- **View emotes** — one launcher per account+provider that has emotes, opening an
+  **emote viewer**: a grid of every emote with its chat code (animated emotes play
+  when *Animate emotes* is on in Settings). Codes still listed in the manifest whose
   image has gone from the cache are shown separately under **Deprecated (no longer
-  available)**.
+  available)**. Sibling accounts open separate viewer windows.
 
 **Change history.** Manifests and images are overwritten wholesale on each
 refetch, so a removed emote code or a swapped banner would otherwise vanish with
@@ -1066,13 +1082,17 @@ Both SABR paths are **mpv-only**; other players get the DASH companion's `.ts`
   joined), and a recovered VOD from CDN recovery.
 - Asset cache: `%APPDATA%\StreamArchiver\data\asset-cache\` (see *Channel assets &
   change history*):
-  - `channel_assets\{name}\{platform}\` — per channel + platform:
+  - `channel_assets\{name}\{platform}\{account}\` — per channel + platform +
+    account (the account is the URL-derived login/slug/handle, so a main + alt
+    on one platform never collide):
     - `icon.<ext>`, `banner.<ext>` (current), `name_color.txt`, `.assets_fetched_at`
       (24 h freshness stamp).
     - `badges\`, `emotes\twitch\` (first-party files), `emotes\{bttv,ffz,7tv}.json`
       (third-party emote manifests).
     - `history\` — superseded icons/banners; `emotes\history\` — superseded emote
       manifests; `asset_changes.jsonl` — the append-only change log.
+    - (`posts\` and `schedule_src\` may still sit at the platform level for
+      pre-migration downloads — their paths are recorded in the DB.)
   - `platform_assets\` — deduplicated shared emote images + global Twitch badges
     (referenced by every channel, stored once).
 

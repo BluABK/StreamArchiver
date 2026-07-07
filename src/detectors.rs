@@ -200,7 +200,7 @@ pub struct DetectContext {
 /// FNV-1a 64-bit hash — simple, stable, and fast; used instead of `DefaultHasher`
 /// (which is not guaranteed stable across Rust versions) for the persisted OCR
 /// image cache.
-fn fnv64(data: &[u8]) -> u64 {
+pub(crate) fn fnv64(data: &[u8]) -> u64 {
     const PRIME: u64 = 1_099_511_628_211;
     const BASIS: u64 = 14_695_981_039_346_656_037;
     let mut h = BASIS;
@@ -1083,7 +1083,9 @@ impl DetectContext {
     /// Destination for a downloaded schedule-source image, kept in a `schedule_src/`
     /// subdir of the channel asset dir so it never collides with archival assets.
     fn schedule_src_path(&self, row: &MonitorWithChannel, stem: &str, ext: &str) -> PathBuf {
-        crate::assets::channel_asset_dir(&row.channel.name, row.monitor.platform())
+        let platform = row.monitor.platform();
+        let account = crate::assets::account_slug(&row.monitor.url, platform);
+        crate::assets::channel_asset_dir(&row.channel.name, platform, &account)
             .join("schedule_src")
             .join(format!("{stem}.{ext}"))
     }
@@ -1095,8 +1097,18 @@ impl DetectContext {
         row: &MonitorWithChannel,
         cfg: &ChannelSourceConfig,
     ) -> Option<Vec<ScheduleSegment>> {
-        let dir = crate::assets::channel_asset_dir(&row.channel.name, Platform::Twitch);
-        let banner = crate::assets::find_asset(&dir, "banner.")?;
+        // The row may be a non-Twitch instance of the container; and even a
+        // Twitch row's banner may live under a sibling account — search the
+        // row's own account first, then any account, then the legacy dir.
+        let banner = if row.monitor.platform() == Platform::Twitch {
+            let account = crate::assets::account_slug(&row.monitor.url, Platform::Twitch);
+            let dir = crate::assets::channel_asset_dir(&row.channel.name, Platform::Twitch, &account);
+            crate::assets::find_asset(&dir, "banner.").or_else(|| {
+                crate::assets::find_asset_any_account(&row.channel.name, Platform::Twitch, "banner.")
+            })
+        } else {
+            crate::assets::find_asset_any_account(&row.channel.name, Platform::Twitch, "banner.")
+        }?;
         self.ocr_image_cached(
             row.monitor.id,
             ScheduleSourceKind::TwitchBannerOcr.id(),
@@ -1338,8 +1350,10 @@ impl DetectContext {
         img_url: &str,
     ) -> Option<(String, PathBuf)> {
         let ext = url_image_ext(img_url);
+        let platform = row.monitor.platform();
+        let account = crate::assets::account_slug(&row.monitor.url, platform);
         let posts_dir =
-            crate::assets::channel_asset_dir(&row.channel.name, row.monitor.platform()).join("posts");
+            crate::assets::channel_asset_dir(&row.channel.name, platform, &account).join("posts");
         let tmp = posts_dir.join(format!("tmp.{ext}"));
         crate::assets::download_image(&self.http, img_url, &tmp).await.ok()?;
         let bytes = tokio::fs::read(&tmp).await.ok()?;
