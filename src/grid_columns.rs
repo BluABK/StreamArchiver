@@ -1,9 +1,14 @@
 //! Persisted, user-customizable grid columns: visibility, order, and sort for
 //! every data table (Streams, Videos, Background Active/Recent, Processes,
-//! Issues). Column widths are deliberately NOT covered here — egui_extras's
-//! width cache has no `serde` feature enabled in this build, so it's already
-//! volatile (session-only) for every table today; there is nothing to persist
-//! or reset for it beyond the existing per-table "⇔ Fit columns" mechanism.
+//! Issues). Column widths are NOT covered here — they're persisted separately,
+//! for free, by `egui_extras`'s own `TableState` (Cargo.toml enables its
+//! `serde` feature) via egui's normal memory persistence (`eframe`'s
+//! `persistence_path`, keyed by each table's `id_salt` — see `GridTableId::key`,
+//! reused as the `id_salt` in every `TableBuilder`). The one thing THIS module
+//! has to get right for that to actually stick: `GridState::note_order` must
+//! not report "changed" on a table's first frame of a session — see its doc
+//! comment — or the caller's resulting `tb.reset()` wipes the widths egui just
+//! loaded from disk before they're ever painted.
 //!
 //! Mirrors [`crate::schedule_source`]'s `SourceEntry` / `load_source_order` /
 //! `save_source_order` / `merge_order` pattern almost exactly, generalized
@@ -131,25 +136,31 @@ impl GridTableId {
 /// column now sits in that slot.
 pub struct GridState {
     pub entries: Vec<ColumnEntry>,
-    last_order: Vec<usize>,
+    /// `None` until the first `note_order` call. Column widths are persisted
+    /// across restarts (`egui_extras`'s `serde` feature — see the module docs
+    /// above), so the first call of a fresh session must NOT report "changed":
+    /// there is no prior in-session order to have drifted from, and doing so
+    /// would force a `tb.reset()` on the very first frame, wiping out the
+    /// widths egui just loaded from disk before they're ever shown.
+    last_order: Option<Vec<usize>>,
 }
 
 impl GridState {
     pub fn load(store: &Store, table: GridTableId, columns: &[GridCol]) -> Self {
         GridState {
             entries: load_columns(store, table, columns),
-            last_order: Vec::new(),
+            last_order: None,
         }
     }
 
     /// Call once per frame with this frame's freshly-computed `effective_order()`
-    /// result. Returns true when the order differs from last frame's (including
-    /// the very first call) — the caller should force a `tb.reset()` when true.
+    /// result. Returns true when the order differs from a previously-noted
+    /// in-session order — the caller should force a `tb.reset()` when true.
+    /// The very first call of a session never reports changed (nothing to
+    /// have changed FROM yet); only an actual in-session reorder does.
     pub fn note_order(&mut self, order: &[usize]) -> bool {
-        let changed = self.last_order != order;
-        if changed {
-            self.last_order = order.to_vec();
-        }
+        let changed = self.last_order.as_deref().is_some_and(|prev| prev != order);
+        self.last_order = Some(order.to_vec());
         changed
     }
 }
@@ -416,6 +427,20 @@ mod tests {
         GridCol { id: "b", title: "B", tooltip: "", min_width: 10.0, initial: 0.0, sortable: true, stretch: false },
         GridCol { id: "c", title: "C", tooltip: "", min_width: 10.0, initial: 0.0, sortable: false, stretch: false },
     ];
+
+    #[test]
+    fn note_order_first_call_never_reports_changed() {
+        // Regression guard: a fresh session's first frame must not force a
+        // `tb.reset()` (via a reported "changed") — that would wipe out
+        // column widths egui just loaded from persisted memory before they
+        // ever got painted. Only a REAL in-session reorder should report true.
+        let store = Store::open_in_memory().unwrap();
+        let mut state = GridState::load(&store, GridTableId::Streams, &COLS);
+        assert!(!state.note_order(&[0, 1, 2]), "first call must not report changed");
+        assert!(!state.note_order(&[0, 1, 2]), "unchanged order stays unchanged");
+        assert!(state.note_order(&[1, 0, 2]), "an actual reorder must report changed");
+        assert!(!state.note_order(&[1, 0, 2]), "settles back to unchanged after the reorder");
+    }
 
     #[test]
     fn load_defaults_to_declaration_order_all_visible() {
