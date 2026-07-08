@@ -4956,6 +4956,30 @@ const STREAM_COLUMNS: [GridCol; 22] = [
 /// Total Streams columns, including the non-sortable Actions slot.
 const STREAM_COLS: usize = STREAM_COLUMNS.len();
 
+/// Effective `min_width` for a Streams-grid column. Went Live / Started On /
+/// Next stream / Polled render via [`short_ts_on`]-aware formatters
+/// (`ts_label`/`ts_went_live_label`/`next_stream_cell`/`fmt_polled`) whose
+/// short-mode text ("12/07 02:00", or "02:00" for Polled) is much narrower
+/// than their `GridCol::min_width` — calibrated for the longer full-format
+/// text. Since `Column::auto()`'s min_width is only ever a FLOOR (full mode
+/// still auto-grows past it as needed), shrinking it while short mode is on
+/// is safe both ways; without this the column was stuck with permanent
+/// trailing space in short mode (reported 2026-07-08). A column whose width
+/// was already fit/persisted at the old, wider floor needs one manual
+/// resize or "⇔ Fit columns" to actually shrink to the new floor — egui_extras
+/// keeps a resizable column's stored width once set, it doesn't re-measure
+/// every frame.
+fn streams_col_min_width(c: &GridCol) -> f32 {
+    if !short_ts_on() {
+        return c.min_width;
+    }
+    match c.id {
+        "went_live" | "started_on" | "next_stream" => c.min_width.min(64.0),
+        "polled" => c.min_width.min(40.0),
+        _ => c.min_width,
+    }
+}
+
 /// The Videos columns, in DEFAULT display order (mirrors `STREAM_COLUMNS`).
 /// The trailing Actions column (index `VIDEO_COLS`, 9) is non-sortable and
 /// gated by the existing Show Actions setting, same as Streams'.
@@ -13276,21 +13300,22 @@ impl StreamArchiverApp {
                 // `col_order`, so the counts can't drift.
                 for &i in &col_order {
                     let c = &STREAM_COLUMNS[i];
+                    let min_width = streams_col_min_width(c);
                     let col = if reset_cols {
                         // Drive a clean sizing pass: auto_with_initial_suggestion
                         // seeds the column at min_width (not 0) so cells render
                         // normally during the pass — no zero-width wrapping, no
                         // vertical row bounce. After the pass, content widths are
                         // stored and the next frame snaps to them.
-                        Column::auto_with_initial_suggestion(c.min_width)
-                            .at_least(c.min_width)
+                        Column::auto_with_initial_suggestion(min_width)
+                            .at_least(min_width)
                             .clip(c.initial > 0.0)
                     } else if c.initial > 0.0 {
                         // Content-capped column (Title / Game): start narrow and
                         // clip — the cell truncates and shows the full text on hover.
-                        Column::initial(c.initial).at_least(c.min_width).clip(true)
+                        Column::initial(c.initial).at_least(min_width).clip(true)
                     } else {
-                        Column::auto().at_least(c.min_width)
+                        Column::auto().at_least(min_width)
                     };
                     tb = tb.column(col);
                 }
@@ -25493,6 +25518,7 @@ mod tests {
         active_date_fmt, aggregate_stream_changes, build_twitch_segments, channel_cells,
         channel_live_count,
         channel_primary, chat_file_for_recording, compose_browser_profile, contrast_ratio,
+        set_short_ts, streams_col_min_width,
         fmt_polled, hsl_to_rgb, meta_change_lines, monitor_import_identity, ordered_rows,
         parse_first_party_spans, playable_with, player_is_mpv, readable_color, recording_cells,
         rgb_to_hsl, set_active_date_fmt, split_browser_profile, stream_target_for_active,
@@ -26096,6 +26122,28 @@ mod tests {
         let s = fmt_polled(Some(1_700_000_000), 45);
         assert!(s.ends_with(" (45s)"), "got {s:?}");
         assert!(s.len() > " (45s)".len());
+    }
+
+    #[test]
+    fn streams_col_min_width_shrinks_only_for_short_ts_datetime_cols() {
+        // Regression guard: short-timestamp mode's rendered text is much
+        // narrower than these columns' full-mode `min_width`, which used to
+        // leave permanent trailing space (reported 2026-07-08). Full mode is
+        // untouched either way — `Column::auto()`'s min_width is just a floor.
+        let went_live = STREAM_COLUMNS.iter().find(|c| c.id == "went_live").unwrap();
+        let polled = STREAM_COLUMNS.iter().find(|c| c.id == "polled").unwrap();
+        let name = STREAM_COLUMNS.iter().find(|c| c.id == "name").unwrap();
+
+        set_short_ts(false);
+        assert_eq!(streams_col_min_width(went_live), went_live.min_width, "full mode: unchanged");
+        assert_eq!(streams_col_min_width(polled), polled.min_width, "full mode: unchanged");
+
+        set_short_ts(true);
+        assert!(streams_col_min_width(went_live) < went_live.min_width, "short mode shrinks went_live's floor");
+        assert!(streams_col_min_width(polled) < polled.min_width, "short mode shrinks polled's floor");
+        assert_eq!(streams_col_min_width(name), name.min_width, "non-datetime column untouched");
+
+        set_short_ts(false); // restore default for other tests
     }
 
     #[test]
