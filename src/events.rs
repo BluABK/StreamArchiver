@@ -118,6 +118,7 @@ pub const TOGGLEABLE_JOBS: &[(&str, &str)] = &[
     ("YouTube WebSub poll", "job_websub_poll"),
     ("Channel asset refresh", "job_asset_refresh"),
     ("YouTube posts refresh", "job_community_posts"),
+    ("Scheduled recordings", "job_scheduled_recordings"),
 ];
 
 pub fn job_registry() -> JobRegistry {

@@ -344,6 +344,105 @@ impl DetectionMethod {
     }
 }
 
+/// Whether a [`ScheduledRecording`] fires once or on a weekly repeat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecurrenceKind {
+    /// Fires once at `start_at`.
+    Once,
+    /// Fires every week on the matching `days_of_week` bits at `time_of_day_secs`.
+    Weekly,
+}
+
+impl RecurrenceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RecurrenceKind::Once => "once",
+            RecurrenceKind::Weekly => "weekly",
+        }
+    }
+
+    pub fn parse(s: &str) -> RecurrenceKind {
+        match s {
+            "weekly" => RecurrenceKind::Weekly,
+            _ => RecurrenceKind::Once,
+        }
+    }
+}
+
+/// Bits for `ScheduledRecording::days_of_week` (Mon=bit0..Sun=bit6).
+pub const DOW_MON: i64 = 1 << 0;
+pub const DOW_TUE: i64 = 1 << 1;
+pub const DOW_WED: i64 = 1 << 2;
+pub const DOW_THU: i64 = 1 << 3;
+pub const DOW_FRI: i64 = 1 << 4;
+pub const DOW_SAT: i64 = 1 << 5;
+pub const DOW_SUN: i64 = 1 << 6;
+/// `days_of_week` bit for a `chrono::Weekday` (Mon..Sun, matching `DOW_*` order).
+pub fn dow_bit(w: chrono::Weekday) -> i64 {
+    use chrono::Weekday::*;
+    match w {
+        Mon => DOW_MON,
+        Tue => DOW_TUE,
+        Wed => DOW_WED,
+        Thu => DOW_THU,
+        Fri => DOW_FRI,
+        Sat => DOW_SAT,
+        Sun => DOW_SUN,
+    }
+}
+
+/// A force-start recording rule for one monitor: fires at a specific time
+/// (`Once`) or weekly (`Weekly`), bypassing the Auto-record flag the same way
+/// a trigger-word match does (see `Supervisor::try_begin`'s `forced` param).
+/// Lets a channel stay Auto-off — or even Detection: [`DetectionMethod::Disabled`]
+/// — while still guaranteeing a recording at a known time. See
+/// `scheduled_recordings.rs` for the recurrence math and the background job
+/// that fires these.
+#[derive(Clone, Debug)]
+pub struct ScheduledRecording {
+    pub id: i64,
+    pub monitor_id: i64,
+    pub label: String,
+    pub kind: RecurrenceKind,
+    /// Unix ts; used when `kind == Once`.
+    pub start_at: Option<i64>,
+    /// Weekday bitmask (see `DOW_*`); used when `kind == Weekly`.
+    pub days_of_week: Option<i64>,
+    /// Seconds since local midnight; used when `kind == Weekly`.
+    pub time_of_day_secs: Option<i64>,
+    /// Optional unix ts: stop recurring after this time (`Weekly` only).
+    pub until: Option<i64>,
+    /// Optional auto-stop duration; `None` = record until the stream ends naturally.
+    pub duration_secs: Option<i64>,
+    pub enabled: bool,
+    /// Cached next occurrence; `None` once a `Once` rule has fired (or a
+    /// `Weekly` rule has passed its `until`).
+    pub next_run_at: Option<i64>,
+    /// Occurrence start ts last actually fired — dedupes a tick from re-firing
+    /// the same occurrence. Round-tripped from the DB but not read by the UI
+    /// yet (no "last fired" column); the dedupe logic itself works off the
+    /// raw column in `due_scheduled_stops`/`mark_scheduled_recording_fired`,
+    /// not this struct field.
+    #[allow(dead_code)]
+    pub last_fired_at: Option<i64>,
+    /// Set while a duration-bound occurrence is actively recording; cleared
+    /// once the auto-stop has run. Same story as `last_fired_at` — the
+    /// background job queries the column directly (`due_scheduled_stops`).
+    #[allow(dead_code)]
+    pub pending_stop_at: Option<i64>,
+    #[allow(dead_code)]
+    pub created_at: i64,
+}
+
+/// A [`ScheduledRecording`] joined with its channel/monitor names, for the
+/// management window and the Streams grid column.
+#[derive(Clone, Debug)]
+pub struct ScheduledRecordingWithNames {
+    pub rec: ScheduledRecording,
+    pub channel_name: String,
+    pub monitor_url: String,
+}
+
 /// Per-monitor authentication source for the downloader tools. `Inherit` uses
 /// the global Settings default; anything else overrides it for this channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

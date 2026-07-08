@@ -564,6 +564,32 @@ recorded the same way.
 > the title; the quota-based *Data API* method does not — use scrape for
 > channels you want triggers on.
 
+### Scheduled recordings (force-record at a time or on a weekly repeat) 📅
+
+Trigger words fire on *content* (title/game); **scheduled recordings** fire on
+*time* — a specific date+time (**Once**) or a **Weekly** repeat on chosen
+days, at a chosen time. Like a trigger match, a due schedule **force-starts
+the recording even with Auto off** (and works on a **Disabled**-detection
+instance, which has no automatic liveness check at all) — for channels you
+know the schedule of but don't want kept on Auto.
+
+- **Manual scheduling**: the **📅 Scheduled rec (n)** toolbar button opens a
+  management window listing every rule (channel, instance, recurrence, next
+  run, duration) with **Edit / Delete / + Add new** actions.
+- **Right-click scheduling**: in the Schedule view, right-click any calendar
+  entry → **📅 Schedule recording…** to prefill a one-off rule from that
+  entry's channel, start time, and (when known) duration.
+- **Duration**: optional — leave it off to record until the stream ends
+  naturally, or set a fixed number of minutes to auto-stop.
+- **Weekly rules** support an optional **until** date to stop the recurrence,
+  and every day/time is evaluated in your local timezone.
+- The Schedule view's month grid shows a small **⏺ rec** badge under the day
+  number on any day with a scheduled recording (hover for details); the
+  Streams grid has a matching **Scheduled rec** column (hidden by default —
+  enable it from the column header).
+- A background job checks for due rules every ~20s; it can be paused from the
+  Background view like any other periodic job ("Scheduled recordings").
+
 ### Post-stream VOD download (archive the published VOD)
 
 After a stream ends the platform publishes its own **post-processed VOD** — Twitch's

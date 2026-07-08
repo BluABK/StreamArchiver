@@ -2202,6 +2202,92 @@ impl Supervisor {
         }
     }
 
+    /// Periodically fire due [`crate::models::ScheduledRecording`] rules
+    /// (schema v51) — force a recording to start at a specific time or on a
+    /// weekly repeat, the same way a trigger-word match does, and auto-stop
+    /// duration-bound occurrences. Independent of `run()`'s live-signal/
+    /// manual-command loop: a scheduled rule calls `try_begin`/`manual_stop`
+    /// directly rather than routing through a [`ManualCommand`], since
+    /// `manual_start` calls `check_one` first for non-`Disabled` detection
+    /// methods and would surface a "not live" toast — wrong for a headless
+    /// timer that must fire unconditionally.
+    pub async fn scheduled_recordings_loop(
+        &self,
+        shutdown: Arc<AtomicBool>,
+        jobs: crate::events::JobRegistry,
+    ) {
+        const TICK_SECS: u64 = 20;
+        loop {
+            if shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            if self.store.job_enabled("job_scheduled_recordings") {
+                self.scheduled_recordings_tick();
+                crate::events::mark_job(&jobs, "Scheduled recordings", TICK_SECS as i64);
+            }
+            crate::app_core::sleep_cancellable(Duration::from_secs(TICK_SECS), &shutdown).await;
+        }
+    }
+
+    fn scheduled_recordings_tick(&self) {
+        let now = now_unix();
+        match self.store.due_scheduled_recordings(now) {
+            Ok(due) => {
+                for rule in due {
+                    let row = match self.store.get_monitor_with_channel(rule.monitor_id) {
+                        Ok(Some(r)) => r,
+                        Ok(None) => continue, // monitor gone; FK cascade already dropped the rule
+                        Err(e) => {
+                            warn!(
+                                "scheduled recordings: failed to load monitor {}: {e:#}",
+                                rule.monitor_id
+                            );
+                            continue;
+                        }
+                    };
+                    // The master On/Off switch still fully gates this (dormant means
+                    // dormant); leave the rule untouched so it fires the moment
+                    // automation resumes instead of silently consuming the occurrence.
+                    if !row.automation_on() {
+                        continue;
+                    }
+                    let occurrence_start = rule.next_run_at.unwrap_or(now);
+                    if self.try_begin(
+                        rule.monitor_id, Some(now), true, None, None, None, None, None, true, true,
+                    ) {
+                        info!(
+                            monitor_id = rule.monitor_id,
+                            rule_id = rule.id,
+                            "scheduled recording: force-started"
+                        );
+                    }
+                    let next = crate::scheduled_recordings::compute_next_run(&rule, occurrence_start);
+                    let pending_stop = rule.duration_secs.map(|d| now + d);
+                    if let Err(e) = self.store.mark_scheduled_recording_fired(
+                        rule.id,
+                        occurrence_start,
+                        next,
+                        pending_stop,
+                    ) {
+                        warn!("scheduled recordings: failed to mark rule {} fired: {e:#}", rule.id);
+                    }
+                }
+            }
+            Err(e) => warn!("scheduled recordings: failed to load due rules: {e:#}"),
+        }
+        match self.store.due_scheduled_stops(now) {
+            Ok(stops) => {
+                for (id, monitor_id) in stops {
+                    self.manual_stop(monitor_id);
+                    if let Err(e) = self.store.clear_scheduled_recording_stop(id) {
+                        warn!("scheduled recordings: failed to clear stop for rule {id}: {e:#}");
+                    }
+                }
+            }
+            Err(e) => warn!("scheduled recordings: failed to load due stops: {e:#}"),
+        }
+    }
+
     /// Reserve the monitor and spawn its recording task. Returns false if it was
     /// skipped (already active, or in backoff when not bypassing). `forced`
     /// marks a user-initiated start: it additionally bypasses the Auto gate —

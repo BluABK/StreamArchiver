@@ -27,9 +27,9 @@ use crate::models::{
     K_REMUX_EMBED_THUMBNAIL, K_REMUX_EMBED_TITLE, K_REMUX_TITLE_TEMPLATE, K_REMUX_EMBED_SUBS,
     K_FILE_SPLIT_ENABLED, K_FILE_SPLIT_VIDEOS, K_FILE_SPLIT_SUBS, K_FILE_SPLIT_CHAT,
     K_FILE_SPLIT_THUMBS, K_FILE_SPLIT_LOGS,
-    MediaInfoMode, Monitor, MonitorDefaults, MonitorWithChannel, OcrStats, Platform, Recording,
-    SabrCodecPref, ScheduleSegment, StreamGroup, StreamMetaChange, Tool, UpcomingStream, Video,
-    group_recordings, now_unix,
+    MediaInfoMode, Monitor, MonitorDefaults, MonitorWithChannel, OcrStats, Platform, RecurrenceKind,
+    Recording, SabrCodecPref, ScheduleSegment, ScheduledRecording, ScheduledRecordingWithNames,
+    StreamGroup, StreamMetaChange, Tool, UpcomingStream, Video, group_recordings, now_unix,
 };
 use crate::google_oauth;
 use crate::grid_columns::{self, ColumnEntry, GridCol, GridState, GridTableId};
@@ -870,6 +870,13 @@ pub struct StreamArchiverApp {
     confirm_delete_segment: Option<i64>,
     /// Backing state for the create/rename-channel dialog.
     channel_form: Option<ChannelForm>,
+    /// Scheduled recordings (schema v51): the management window's open flag +
+    /// last-loaded rows (refreshed in `reload_rows`, cheap — one small table),
+    /// the add/edit dialog (`None` = closed), and a pending delete confirmation.
+    show_scheduled_recordings: bool,
+    scheduled_recordings: Vec<crate::models::ScheduledRecordingWithNames>,
+    scheduled_recording_form: Option<ScheduledRecordingForm>,
+    confirm_delete_scheduled_recording: Option<(i64, String)>,
     /// Sort + per-column filters for the Streams table.
     streams_sort: SortState,
     streams_filters: Vec<String>,
@@ -1431,7 +1438,21 @@ impl StreamArchiverApp {
         let initial_custom_presets = core.store.get_filename_presets().unwrap_or_default();
         // Load every grid table's persisted column order/visibility + sort
         // before `core` is moved; see `crate::grid_columns`.
-        let streams_grid = GridState::load(&core.store, GridTableId::Streams, &STREAM_COLUMNS);
+        let mut streams_grid = GridState::load(&core.store, GridTableId::Streams, &STREAM_COLUMNS);
+        // "Scheduled rec" (schema v51) should start hidden — every other column
+        // defaults to visible (grid_columns.rs's deliberate "new column id =
+        // visible" rule), but this one is niche enough that showing it
+        // unconditionally would clutter the grid for anyone who never uses
+        // scheduled recordings. One-time seed: the first time this column
+        // shows up in a fresh/older persisted list, hide it and persist
+        // immediately; a settings marker stops this from re-hiding it once the
+        // user has had a chance to turn it back on themselves.
+        const K_SCHED_REC_COL_SEEDED: &str = "streams_scheduled_rec_col_seeded";
+        if core.store.get_setting(K_SCHED_REC_COL_SEEDED).ok().flatten().is_none() {
+            grid_columns::set_visible(&mut streams_grid.entries, "scheduled_rec", false);
+            grid_columns::save_columns(&core.store, GridTableId::Streams, &streams_grid.entries);
+            let _ = core.store.set_setting(K_SCHED_REC_COL_SEEDED, "1");
+        }
         let streams_sort_persisted = grid_columns::load_sort(&core.store, GridTableId::Streams);
         let videos_grid = GridState::load(&core.store, GridTableId::Videos, &VIDEO_COLUMNS);
         let videos_sort_persisted = grid_columns::load_sort(&core.store, GridTableId::Videos);
@@ -1502,6 +1523,10 @@ impl StreamArchiverApp {
             confirm_delete_channel: None,
             confirm_delete_segment: None,
             channel_form: None,
+            show_scheduled_recordings: false,
+            scheduled_recordings: Vec::new(),
+            scheduled_recording_form: None,
+            confirm_delete_scheduled_recording: None,
             streams_sort: SortState {
                 keys: grid_columns::resolve_sort(&STREAM_COLUMNS, &streams_sort_persisted)
                     .into_iter()
@@ -1669,6 +1694,12 @@ impl StreamArchiverApp {
         match self.core.store.list_channels() {
             Ok(chs) => self.channels = chs,
             Err(e) => warn!("failed to load channels: {e:#}"),
+        }
+        // Scheduled recordings (schema v51) — small table, cheap to reload
+        // in full; drives the toolbar count and the grid column.
+        match self.core.store.list_scheduled_recordings() {
+            Ok(v) => self.scheduled_recordings = v,
+            Err(e) => warn!("failed to load scheduled recordings: {e:#}"),
         }
         // Drop expansion state for channels/monitors that no longer exist (avoids
         // an unbounded leak and "sticky" expansion if a row id is later reused).
@@ -3272,6 +3303,63 @@ fn parse_local_datetime(date: &str, time: &str) -> Option<i64> {
         .map(|dt| dt.timestamp())
 }
 
+/// Unix timestamp of local midnight for `d` (falls back to `0` on the
+/// essentially-impossible case of no valid local instant that day).
+fn local_midnight(d: chrono::NaiveDate) -> i64 {
+    use chrono::TimeZone;
+    chrono::Local
+        .from_local_datetime(&d.and_hms_opt(0, 0, 0).unwrap())
+        .single()
+        .map(|dt| dt.timestamp())
+        .unwrap_or(0)
+}
+
+/// Format seconds-since-local-midnight (a [`ScheduledRecording::time_of_day_secs`])
+/// as `HH:MM`.
+fn split_time_of_day(secs: i64) -> String {
+    let secs = secs.clamp(0, 86_399);
+    format!("{:02}:{:02}", secs / 3600, (secs % 3600) / 60)
+}
+
+/// Parse `HH:MM` (or `HH:MM:SS`) into seconds-since-local-midnight. `None` on
+/// malformed input.
+fn parse_time_of_day(time: &str) -> Option<i64> {
+    use chrono::{NaiveTime, Timelike};
+    let t = NaiveTime::parse_from_str(time.trim(), "%H:%M")
+        .or_else(|_| NaiveTime::parse_from_str(time.trim(), "%H:%M:%S"))
+        .ok()?;
+    Some(t.num_seconds_from_midnight() as i64)
+}
+
+/// Human-readable recurrence summary for the scheduled-recordings management
+/// window, e.g. "Once — 2026-07-10 18:00" or "Every Mon/Wed/Fri 20:00 until
+/// 2026-08-01".
+fn describe_recurrence(r: &ScheduledRecording) -> String {
+    match r.kind {
+        RecurrenceKind::Once => match r.start_at {
+            Some(t) => format!("Once — {}", fmt_datetime_short(t)),
+            None => "Once".to_string(),
+        },
+        RecurrenceKind::Weekly => {
+            let bits = r.days_of_week.unwrap_or(0);
+            let names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+            let days: Vec<&str> = names
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| bits & (1 << i) != 0)
+                .map(|(_, n)| *n)
+                .collect();
+            let days_s = if days.is_empty() { "no days".to_string() } else { days.join("/") };
+            let time_s = split_time_of_day(r.time_of_day_secs.unwrap_or(0));
+            let mut s = format!("Every {days_s} {time_s}");
+            if let Some(u) = r.until {
+                s.push_str(&format!(" until {}", fmt_datetime_short(u)));
+            }
+            s
+        }
+    }
+}
+
 /// Build a filename preview for the Format Designer using real monitor/recording
 /// data. Media info is synthetic (1920×1080/60fps/h264/aac) since probing requires
 /// async work the UI thread doesn't do. Extension is NOT included.
@@ -3659,6 +3747,17 @@ fn schedule_copy_menu(ui: &mut egui::Ui, s: &UpcomingStream, hidden: bool, merge
     if ui.button("▶  Start recording").clicked() {
         ui.ctx()
             .data_mut(|d| d.insert_temp(egui::Id::new("sched_start"), s.monitor_id));
+        ui.close();
+    }
+    if ui
+        .button("📅  Schedule recording…")
+        .on_hover_text(
+            "Force-record this (or a repeat of it) at the scheduled time without turning Auto on.",
+        )
+        .clicked()
+    {
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(egui::Id::new("sched_schedule_rec"), s.segment_id));
         ui.close();
     }
     ui.separator();
@@ -4304,6 +4403,115 @@ struct EditScheduleDraft {
     error: String,
 }
 
+/// Backing state for the scheduled-recording Add/Edit dialog (schema v51).
+/// Force-starts a recording at a specific time or on a weekly repeat,
+/// bypassing Auto — see `Supervisor::scheduled_recordings_tick`.
+struct ScheduledRecordingForm {
+    /// `None` = creating a new rule.
+    id: Option<i64>,
+    monitor_id: i64,
+    /// For the dialog heading only — not persisted.
+    channel_name: String,
+    monitor_url: String,
+    label: String,
+    kind: RecurrenceKind,
+    /// Local `YYYY-MM-DD` / `HH:MM` — used when `kind == Once`.
+    date: String,
+    time: String,
+    /// Mon..Sun (index 0..6, matching `DOW_MON..DOW_SUN`) — used when `kind == Weekly`.
+    days: [bool; 7],
+    /// Local `HH:MM` time-of-day — used when `kind == Weekly`.
+    weekly_time: String,
+    /// Optional local end date for the recurrence (inclusive); empty = no end.
+    until_date: String,
+    /// Auto-stop after a fixed duration instead of recording until the stream
+    /// ends naturally.
+    use_duration: bool,
+    duration_minutes: String,
+    enabled: bool,
+    /// Validation message shown in red (empty = none).
+    error: String,
+}
+
+impl ScheduledRecordingForm {
+    fn new_for_monitor(monitor_id: i64, channel_name: &str, monitor_url: &str) -> Self {
+        ScheduledRecordingForm {
+            id: None,
+            monitor_id,
+            channel_name: channel_name.to_string(),
+            monitor_url: monitor_url.to_string(),
+            label: String::new(),
+            kind: RecurrenceKind::Once,
+            date: String::new(),
+            time: String::new(),
+            days: [false; 7],
+            weekly_time: "20:00".to_string(),
+            until_date: String::new(),
+            use_duration: false,
+            duration_minutes: "60".to_string(),
+            enabled: true,
+            error: String::new(),
+        }
+    }
+
+    fn from_existing(row: &ScheduledRecordingWithNames) -> Self {
+        let r = &row.rec;
+        let (date, time) = r.start_at.map(split_local_datetime).unwrap_or_default();
+        let mut days = [false; 7];
+        let bits = r.days_of_week.unwrap_or(0);
+        for (i, d) in days.iter_mut().enumerate() {
+            *d = bits & (1 << i) != 0;
+        }
+        let weekly_time = split_time_of_day(r.time_of_day_secs.unwrap_or(0));
+        let until_date = r.until.map(|u| split_local_datetime(u).0).unwrap_or_default();
+        ScheduledRecordingForm {
+            id: Some(r.id),
+            monitor_id: r.monitor_id,
+            channel_name: row.channel_name.clone(),
+            monitor_url: row.monitor_url.clone(),
+            label: r.label.clone(),
+            kind: r.kind,
+            date,
+            time,
+            days,
+            weekly_time,
+            until_date,
+            use_duration: r.duration_secs.is_some(),
+            duration_minutes: (r.duration_secs.unwrap_or(3600) / 60).max(1).to_string(),
+            enabled: r.enabled,
+            error: String::new(),
+        }
+    }
+
+    /// Prefilled from a calendar entry (the "📅 Schedule recording…" right-click
+    /// action) — a one-off rule at that entry's start time, defaulting the
+    /// duration to the entry's own known length when available.
+    fn from_schedule_entry(s: &UpcomingStream) -> Self {
+        let (date, time) = split_local_datetime(s.start_time);
+        let (use_duration, duration_minutes) = match s.end_time {
+            Some(end) if end > s.start_time => (true, ((end - s.start_time) / 60).max(1).to_string()),
+            _ => (false, "60".to_string()),
+        };
+        ScheduledRecordingForm {
+            id: None,
+            monitor_id: s.monitor_id,
+            channel_name: s.channel_name.clone(),
+            monitor_url: s.url.clone(),
+            label: s.title.clone(),
+            kind: RecurrenceKind::Once,
+            date,
+            time,
+            days: [false; 7],
+            weekly_time: "20:00".to_string(),
+            until_date: String::new(),
+            use_duration,
+            duration_minutes,
+            enabled: true,
+            error: String::new(),
+        }
+    }
+}
+
 /// Draft state for the "Merge schedule events" preview dialog.
 struct MergePreviewDraft {
     /// Snapshots of the events to merge (2+), sorted highest-priority first.
@@ -4662,7 +4870,7 @@ fn fmt_speed(bytes_per_sec: f64) -> String {
 /// `initial`-width columns, which start narrow and truncate (full value on
 /// hover). Each `id` is a stable persistence key: never reuse or change one
 /// once shipped.
-const STREAM_COLUMNS: [GridCol; 21] = [
+const STREAM_COLUMNS: [GridCol; 22] = [
     GridCol { id: "enabled",     title: "On",         tooltip: "Master switch. Off = fully dormant: no detection, recording, or asset/about/posts/schedule fetch until you act manually (▶ Start, ⟳ Refetch). Independent from Auto (which only gates automatic recording). The channel checkbox and each instance checkbox are independent.", min_width: 30.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "auto",        title: "Auto",       tooltip: "Auto-record: automatically record to disk when the stream goes live (a disk-space control). It does NOT gate detection, metadata, posts, schedules or assets — those always run while the channel is On. Manual Start still records, and trigger words (Settings → Downloads) can still start a recording while Auto is off. The channel checkbox and each instance checkbox are independent.", min_width: 36.0,  initial: 0.0,   sortable: true,  stretch: false },
     GridCol { id: "actions",     title: "Actions",    tooltip: "Per-row actions: start/stop recording, edit, add instance, open folder, delete.",            min_width: 126.0, initial: 0.0,   sortable: false, stretch: false },
@@ -4670,6 +4878,7 @@ const STREAM_COLUMNS: [GridCol; 21] = [
     GridCol { id: "name",        title: "Name",       tooltip: "Channel (container) name. Expand it to see its instances and recording history.",            min_width: 130.0, initial: 0.0,   sortable: true,  stretch: false },
     GridCol { id: "tool",        title: "Tool",  tooltip: "Capture tool: SL = streamlink, yt-dlp, ff = ffmpeg. Hover a row for the full name.", min_width: 36.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "detection",   title: "⇄",    tooltip: "Detection method — how liveness is detected: ↺ = API poll, ⚡ = push event, ⌁ = scrape, ◉ = probe, C = CLI, ⛔ = disabled (manual only). Hover a row for the full method.", min_width: 24.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "scheduled_rec", title: "📅", tooltip: "Scheduled recordings: force-start at a specific time or on a weekly repeat, bypassing Auto. Hover for the next few occurrences. Hidden by default — enable it from the column header.", min_width: 32.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "polled",      title: "Polled", tooltip: "When this instance was last checked. Compact mode shows HH:MM only; hover for the full timestamp.", min_width: 64.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "state",       title: "●",    tooltip: "Current monitor state. ⏺ = recording, ● = live (not recording), ○ = idle, ⚠ = failed, ⚡ = aborted.", min_width: 26.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "next_stream", title: "Next stream",tooltip: "Next scheduled stream (Twitch schedule / YouTube upcoming). Hover for its title; double-click for the full schedule.", min_width: 96.0, initial: 0.0, sortable: true, stretch: false },
@@ -5456,6 +5665,10 @@ fn render_instance_row(
     // The most recently started recording for this monitor, if any — the
     // target of the "Backfill head" manual action.
     latest_rec_id: Option<i64>,
+    // Every scheduled recording (schema v51) across all monitors — filtered
+    // to this row's monitor_id in the "scheduled_rec" cell. The table is
+    // small, so a per-row filter is cheaper than threading a prebuilt map.
+    sched_recs: &[ScheduledRecordingWithNames],
     order: &[usize],
     a: &mut RowActions,
 ) -> bool {
@@ -5741,6 +5954,15 @@ fn render_instance_row(
                     m.detection_method.label(),
                     m.detection_method.tooltip()
                 ));
+            }
+            "scheduled_rec" => {
+                let mine: Vec<&ScheduledRecordingWithNames> =
+                    sched_recs.iter().filter(|r| r.rec.monitor_id == m.id && r.rec.enabled).collect();
+                if !mine.is_empty() {
+                    let lines: Vec<String> = mine.iter().map(|r| describe_recurrence(&r.rec)).collect();
+                    ui.label(format!("📅 {}", mine.len()))
+                        .on_hover_text(format!("Scheduled recording(s):\n{}", lines.join("\n")));
+                }
             }
             "polled" => {
                 ui.label(fmt_polled(m.last_checked_at, m.poll_interval_secs))
@@ -6693,6 +6915,25 @@ impl eframe::App for StreamArchiverApp {
                                 self.notif_unread = 0;
                             }
                         }
+                        {
+                            let n = self.scheduled_recordings.iter().filter(|r| r.rec.enabled).count();
+                            let label = if n > 0 {
+                                format!("📅 Scheduled rec ({n})")
+                            } else {
+                                "📅 Scheduled rec".to_string()
+                            };
+                            if ui
+                                .button(label)
+                                .on_hover_text(
+                                    "Recordings scheduled to force-start at a specific time or on \
+                                     a weekly repeat, bypassing Auto — for channels you don't want \
+                                     kept on Auto.",
+                                )
+                                .clicked()
+                            {
+                                self.show_scheduled_recordings = true;
+                            }
+                        }
                         if ui
                             .button("📣 Posts")
                             .on_hover_text("Pop out the YouTube posts feed in its own window")
@@ -6856,6 +7097,9 @@ impl eframe::App for StreamArchiverApp {
         self.asset_history_windows(ui.ctx());
         self.recording_properties_windows(ui.ctx());
         self.processes_window(ui.ctx());
+        self.scheduled_recordings_window(ui.ctx());
+        self.scheduled_recording_form_window(ui.ctx());
+        self.confirm_delete_scheduled_recording_window(ui.ctx());
         self.issues_window(ui.ctx());
         self.notifications_window(ui.ctx());
         self.posts_window(ui.ctx());
@@ -10431,6 +10675,13 @@ impl StreamArchiverApp {
             self.core.manual(ManualCommand::Start { id: mid, user_initiated: true });
             self.status = "Checking channel… will record if live.".into();
         }
+        if let Some(s) = ui
+            .ctx()
+            .data_mut(|d| d.remove_temp::<i64>(egui::Id::new("sched_schedule_rec")))
+            .and_then(|sid| self.schedule_all.iter().find(|s| s.segment_id == sid))
+        {
+            self.scheduled_recording_form = Some(ScheduledRecordingForm::from_schedule_entry(s));
+        }
         if let Some(sid) = ui
             .ctx()
             .data_mut(|d| d.remove_temp::<i64>(egui::Id::new("sched_edit")))
@@ -10626,6 +10877,27 @@ impl StreamArchiverApp {
         let first = chrono::NaiveDate::from_ymd_opt(anchor.year(), month, 1).unwrap_or(anchor);
         let grid_start = week_start(first);
 
+        // Scheduled-recording day badges (schema v51): every enabled rule's
+        // occurrences across the visible 6-week range, grouped by local date
+        // for `schedule_cell`'s badge row + hover detail.
+        let range_start = local_midnight(grid_start) - 1;
+        let range_end = local_midnight(add_days(grid_start, 42));
+        let mut sched_rec_by_day: HashMap<chrono::NaiveDate, Vec<String>> = HashMap::new();
+        for row in &self.scheduled_recordings {
+            if !row.rec.enabled {
+                continue;
+            }
+            for ts in crate::scheduled_recordings::occurrences_in_range(&row.rec, range_start, range_end) {
+                if let Some(dt) = chrono::DateTime::from_timestamp(ts, 0) {
+                    let local = dt.with_timezone(&chrono::Local);
+                    sched_rec_by_day
+                        .entry(local.date_naive())
+                        .or_default()
+                        .push(format!("{} — {}", row.channel_name, local.format("%H:%M")));
+                }
+            }
+        }
+
         let spacing = 4.0;
         let cell_h = 108.0;
         const WD: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
@@ -10673,6 +10945,7 @@ impl StreamArchiverApp {
                                         collide,
                                         ptex,
                                         open_day,
+                                        sched_rec_by_day.get(&day),
                                     );
                                 },
                             );
@@ -10803,6 +11076,7 @@ impl StreamArchiverApp {
         collide: &HashSet<usize>,
         ptex: &PlatformTextures,
         open_day: &mut Option<chrono::NaiveDate>,
+        sched_recs: Option<&Vec<String>>,
     ) {
         use chrono::Datelike;
         let in_month = day.month() == month;
@@ -10830,6 +11104,16 @@ impl StreamArchiverApp {
                     .clicked()
                 {
                     *open_day = Some(day);
+                }
+
+                // Scheduled-recording badge row (schema v51) — shown iff this day
+                // has ≥1 enabled rule due to fire, regardless of whether the
+                // calendar already has a matching stream entry.
+                if let Some(recs) = sched_recs.filter(|r| !r.is_empty()) {
+                    ui.add(egui::Label::new(
+                        egui::RichText::new("⏺ rec").small().color(egui::Color32::from_rgb(0xe0, 0x50, 0x50)),
+                    ))
+                    .on_hover_text(format!("Scheduled recording(s):\n{}", recs.join("\n")));
                 }
 
                 let entries = entries.map(Vec::as_slice).unwrap_or(&[]);
@@ -11739,6 +12023,480 @@ impl StreamArchiverApp {
         }
     }
 
+    /// Add/Edit dialog for a [`ScheduledRecording`] (schema v51).
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
+    fn scheduled_recording_form_window(&mut self, ctx: &egui::Context) {
+        if self.scheduled_recording_form.is_none() {
+            return;
+        }
+        let mut open = true;
+        let mut do_save = false;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("sched_rec_form_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("Schedule recording")
+                .with_inner_size([460.0, 420.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                let Some(f) = self.scheduled_recording_form.as_mut() else {
+                    return;
+                };
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong(&f.channel_name);
+                        ui.weak(format!("· {}", f.monitor_url));
+                    });
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Force-starts a recording at the scheduled time, bypassing Auto — \
+                             works even with Auto off or Detection set to Disabled.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.add_space(8.0);
+                    egui::Grid::new("sched_rec_form_grid")
+                        .num_columns(2)
+                        .spacing([12.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Label");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut f.label)
+                                    .hint_text("optional")
+                                    .desired_width(300.0),
+                            );
+                            ui.end_row();
+
+                            ui.label("Repeats");
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(&mut f.kind, RecurrenceKind::Once, "Once");
+                                ui.selectable_value(&mut f.kind, RecurrenceKind::Weekly, "Weekly");
+                            });
+                            ui.end_row();
+
+                            match f.kind {
+                                RecurrenceKind::Once => {
+                                    ui.label("Start");
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut f.date)
+                                                .hint_text("YYYY-MM-DD")
+                                                .desired_width(110.0),
+                                        );
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut f.time)
+                                                .hint_text("HH:MM")
+                                                .desired_width(70.0),
+                                        );
+                                    });
+                                    ui.end_row();
+                                }
+                                RecurrenceKind::Weekly => {
+                                    ui.label("Days");
+                                    ui.horizontal(|ui| {
+                                        for (i, name) in
+                                            ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+                                                .iter()
+                                                .enumerate()
+                                        {
+                                            ui.checkbox(&mut f.days[i], *name);
+                                        }
+                                    });
+                                    ui.end_row();
+
+                                    ui.label("Time of day");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut f.weekly_time)
+                                            .hint_text("HH:MM")
+                                            .desired_width(70.0),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("Until");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut f.until_date)
+                                            .hint_text("YYYY-MM-DD, optional")
+                                            .desired_width(140.0),
+                                    );
+                                    ui.end_row();
+                                }
+                            }
+
+                            ui.label("Duration");
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut f.use_duration, "Auto-stop after");
+                                ui.add_enabled(
+                                    f.use_duration,
+                                    egui::TextEdit::singleline(&mut f.duration_minutes)
+                                        .desired_width(50.0),
+                                );
+                                ui.label("minutes");
+                            });
+                            ui.end_row();
+                            if !f.use_duration {
+                                ui.label("");
+                                ui.weak("Records until the stream ends naturally.");
+                                ui.end_row();
+                            }
+
+                            ui.label("Enabled");
+                            ui.checkbox(&mut f.enabled, "");
+                            ui.end_row();
+                        });
+
+                    if !f.error.is_empty() {
+                        ui.add_space(4.0);
+                        ui.colored_label(HL_ERROR_TEXT, &f.error);
+                    }
+
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("💾  Save").clicked() {
+                            do_save = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            open = false;
+                        }
+                    });
+                });
+            },
+        );
+
+        if do_save {
+            self.save_scheduled_recording_form();
+            return;
+        }
+        if !open {
+            self.scheduled_recording_form = None;
+        }
+    }
+
+    /// Validates a [`ScheduledRecordingForm`] and derives the DB fields, probing
+    /// the very first occurrence with the same recurrence math the background
+    /// job uses (`compute_next_run`) so a dead-on-arrival rule — e.g. a `Weekly`
+    /// rule whose `until` has already passed — is caught here instead of
+    /// silently never firing.
+    #[allow(clippy::type_complexity)]
+    fn build_scheduled_recording_fields(
+        f: &ScheduledRecordingForm,
+        now: i64,
+    ) -> Result<(RecurrenceKind, String, Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<i64>, i64), &'static str> {
+        let label = f.label.trim().to_string();
+        let (start_at, days_of_week, time_of_day_secs, until) = match f.kind {
+            RecurrenceKind::Once => {
+                let start = parse_local_datetime(&f.date, &f.time)
+                    .ok_or("Start date/time is invalid (use YYYY-MM-DD and HH:MM).")?;
+                if start <= now {
+                    return Err("Start must be in the future.");
+                }
+                (Some(start), None, None, None)
+            }
+            RecurrenceKind::Weekly => {
+                let bits: i64 = f
+                    .days
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, d)| **d)
+                    .map(|(i, _)| 1i64 << i)
+                    .sum();
+                if bits == 0 {
+                    return Err("Pick at least one day.");
+                }
+                let tod = parse_time_of_day(&f.weekly_time)
+                    .ok_or("Time of day is invalid (use HH:MM).")?;
+                let until = if f.until_date.trim().is_empty() {
+                    None
+                } else {
+                    Some(
+                        parse_local_datetime(&f.until_date, "23:59:59")
+                            .ok_or("Until date is invalid (use YYYY-MM-DD).")?,
+                    )
+                };
+                (None, Some(bits), Some(tod), until)
+            }
+        };
+        let duration_secs = if f.use_duration {
+            let m: i64 = f
+                .duration_minutes
+                .trim()
+                .parse()
+                .ok()
+                .filter(|m| *m > 0)
+                .ok_or("Duration must be a whole number of minutes greater than 0.")?;
+            Some(m * 60)
+        } else {
+            None
+        };
+        let probe = ScheduledRecording {
+            id: 0,
+            monitor_id: f.monitor_id,
+            label: label.clone(),
+            kind: f.kind,
+            start_at,
+            days_of_week,
+            time_of_day_secs,
+            until,
+            duration_secs,
+            enabled: true,
+            next_run_at: None,
+            last_fired_at: None,
+            pending_stop_at: None,
+            created_at: 0,
+        };
+        let next_run_at = crate::scheduled_recordings::compute_next_run(&probe, now)
+            .ok_or("This rule would never fire (check the days/until date).")?;
+        Ok((f.kind, label, start_at, days_of_week, time_of_day_secs, until, duration_secs, next_run_at))
+    }
+
+    fn save_scheduled_recording_form(&mut self) {
+        let Some(f) = self.scheduled_recording_form.as_ref() else {
+            return;
+        };
+        let now = now_unix();
+        let built = Self::build_scheduled_recording_fields(f, now);
+        let monitor_id = f.monitor_id;
+        let id = f.id;
+        let enabled = f.enabled;
+        match built {
+            Err(msg) => {
+                if let Some(f) = self.scheduled_recording_form.as_mut() {
+                    f.error = msg.to_string();
+                }
+            }
+            Ok((kind, label, start_at, days_of_week, time_of_day_secs, until, duration_secs, next_run_at)) => {
+                let result = match id {
+                    None => self
+                        .core
+                        .store
+                        .insert_scheduled_recording(
+                            monitor_id, &label, kind, start_at, days_of_week, time_of_day_secs,
+                            until, duration_secs, Some(next_run_at),
+                        )
+                        .and_then(|new_id| {
+                            if enabled {
+                                Ok(())
+                            } else {
+                                self.core.store.set_scheduled_recording_enabled(new_id, false, None)
+                            }
+                        }),
+                    Some(id) => self.core.store.update_scheduled_recording(
+                        id, &label, kind, start_at, days_of_week, time_of_day_secs, until,
+                        duration_secs, enabled, Some(next_run_at),
+                    ),
+                };
+                match result {
+                    Ok(()) => {
+                        self.scheduled_recording_form = None;
+                        self.reload_rows();
+                        self.status = "Scheduled recording saved.".into();
+                    }
+                    Err(e) => {
+                        if let Some(f) = self.scheduled_recording_form.as_mut() {
+                            f.error = format!("Error saving: {e}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The scheduled-recordings management window: list (Channel/Instance/
+    /// Recurrence/Next run/Duration/Enabled) with Edit/Delete row actions and
+    /// an "+ Add new" picker over every known instance.
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
+    fn scheduled_recordings_window(&mut self, ctx: &egui::Context) {
+        if !self.show_scheduled_recordings {
+            return;
+        }
+        let mut open = true;
+        enum Act {
+            Edit(i64),
+            Delete(i64, String),
+            ToggleEnabled(i64, bool),
+            AddNew(i64),
+        }
+        let mut act: Option<Act> = None;
+        // "+ Add new" instance picker, session-only (not persisted).
+        let mut add_new_monitor = self.rows.first().map(|r| r.monitor.id).unwrap_or(0);
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("sched_recs_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("📅 Scheduled recordings")
+                .with_inner_size([720.0, 420.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{} scheduled recording(s)", self.scheduled_recordings.len()));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            egui::ComboBox::from_id_salt("sched_rec_add_monitor")
+                                .selected_text(
+                                    self.rows
+                                        .iter()
+                                        .find(|r| r.monitor.id == add_new_monitor)
+                                        .map(|r| format!("{} — {}", r.channel.name, r.monitor.url))
+                                        .unwrap_or_else(|| "(no instances yet)".to_string()),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for r in &self.rows {
+                                        ui.selectable_value(
+                                            &mut add_new_monitor,
+                                            r.monitor.id,
+                                            format!("{} — {}", r.channel.name, r.monitor.url),
+                                        );
+                                    }
+                                });
+                            if ui
+                                .add_enabled(!self.rows.is_empty(), egui::Button::new("➕ Add new"))
+                                .clicked()
+                            {
+                                act = Some(Act::AddNew(add_new_monitor));
+                            }
+                        });
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        egui::Grid::new("sched_recs_grid")
+                            .num_columns(6)
+                            .striped(true)
+                            .spacing([10.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.strong("Channel");
+                                ui.strong("Instance");
+                                ui.strong("Recurrence");
+                                ui.strong("Next run");
+                                ui.strong("Duration");
+                                ui.strong("");
+                                ui.end_row();
+                                for row in &self.scheduled_recordings {
+                                    let r = &row.rec;
+                                    ui.label(&row.channel_name);
+                                    ui.label(&row.monitor_url);
+                                    ui.label(describe_recurrence(r));
+                                    ui.label(match r.next_run_at {
+                                        Some(t) if r.enabled => fmt_datetime_short(t),
+                                        _ => "—".to_string(),
+                                    });
+                                    ui.label(match r.duration_secs {
+                                        Some(d) => format!("{} min", d / 60),
+                                        None => "until stream ends".to_string(),
+                                    });
+                                    ui.horizontal(|ui| {
+                                        let mut enabled = r.enabled;
+                                        if ui.checkbox(&mut enabled, "").changed() {
+                                            act = Some(Act::ToggleEnabled(r.id, enabled));
+                                        }
+                                        if ui.button("✏").on_hover_text("Edit").clicked() {
+                                            act = Some(Act::Edit(r.id));
+                                        }
+                                        if ui.button("🗑").on_hover_text("Delete").clicked() {
+                                            act = Some(Act::Delete(
+                                                r.id,
+                                                format!("{} — {}", row.channel_name, row.monitor_url),
+                                            ));
+                                        }
+                                    });
+                                    ui.end_row();
+                                }
+                            });
+                    });
+                });
+            },
+        );
+
+        match act {
+            Some(Act::AddNew(monitor_id)) => {
+                if let Some(row) = self.rows.iter().find(|r| r.monitor.id == monitor_id) {
+                    self.scheduled_recording_form = Some(ScheduledRecordingForm::new_for_monitor(
+                        monitor_id,
+                        &row.channel.name,
+                        &row.monitor.url,
+                    ));
+                }
+            }
+            Some(Act::Edit(id)) => {
+                if let Some(row) = self.scheduled_recordings.iter().find(|r| r.rec.id == id) {
+                    self.scheduled_recording_form = Some(ScheduledRecordingForm::from_existing(row));
+                }
+            }
+            Some(Act::Delete(id, name)) => {
+                self.confirm_delete_scheduled_recording = Some((id, name));
+            }
+            Some(Act::ToggleEnabled(id, enabled)) => {
+                let next_run_at = if enabled {
+                    self.scheduled_recordings
+                        .iter()
+                        .find(|r| r.rec.id == id)
+                        .and_then(|r| crate::scheduled_recordings::compute_next_run(&r.rec, now_unix()))
+                } else {
+                    None
+                };
+                match self.core.store.set_scheduled_recording_enabled(id, enabled, next_run_at) {
+                    Ok(()) => self.reload_rows(),
+                    Err(e) => self.status = format!("Error: {e}"),
+                }
+            }
+            None => {}
+        }
+
+        if !open {
+            self.show_scheduled_recordings = false;
+        }
+    }
+
+    /// Modal confirmation for deleting a scheduled recording.
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
+    fn confirm_delete_scheduled_recording_window(&mut self, ctx: &egui::Context) {
+        let Some((id, name)) = self.confirm_delete_scheduled_recording.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut do_delete = false;
+        let mut do_cancel = false;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("del_sched_rec_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("Delete scheduled recording")
+                .with_inner_size([380.0, 120.0])
+                .with_resizable(false),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label(format!("Delete the scheduled recording for “{name}”?"));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Delete").clicked() {
+                            do_delete = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
+                });
+            },
+        );
+        if do_delete {
+            match self.core.store.delete_scheduled_recording(id) {
+                Ok(()) => {
+                    self.confirm_delete_scheduled_recording = None;
+                    self.reload_rows();
+                    self.status = "Scheduled recording deleted.".into();
+                }
+                Err(e) => self.status = format!("Error: {e}"),
+            }
+        } else if do_cancel || !open {
+            self.confirm_delete_scheduled_recording = None;
+        }
+    }
+
     fn channels_view(&mut self, ui: &mut egui::Ui) {
         if self.channels.is_empty() {
             self.streams_cache = None;
@@ -12346,6 +13104,7 @@ impl StreamArchiverApp {
                                                 ui.weak(ninst.to_string());
                                             }
                                             "detection" => {}
+                                            "scheduled_rec" => {}
                                             "polled" => {
                                                 ts_label(ui, last_poll);
                                             }
@@ -12576,6 +13335,7 @@ impl StreamArchiverApp {
                                     inst_stream_target.as_ref(), &media_player,
                                     instance_avatars.get(&mid),
                                     inst_latest_rec_id,
+                                    &self.scheduled_recordings,
                                     &col_order, &mut acts,
                                 ) {
                                     toggle_instance = Some(mid);

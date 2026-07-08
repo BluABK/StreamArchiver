@@ -28,6 +28,7 @@ mod platform;
 mod recovery;
 mod schedule_ocr;
 mod schedule_source;
+mod scheduled_recordings;
 mod scheduler;
 mod store;
 mod triggers;

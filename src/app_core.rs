@@ -338,6 +338,17 @@ impl AppCore {
             asset_sup.asset_refresh_loop(asset_shutdown, asset_jobs).await;
         });
 
+        // Scheduled recordings (schema v51): force-start/stop at a specific
+        // time or on a weekly repeat, independent of Auto/live-detection.
+        let sched_rec_sup = supervisor.clone();
+        let sched_rec_shutdown = self.shutdown.clone();
+        let sched_rec_jobs = self.jobs.clone();
+        self.rt.spawn(async move {
+            sched_rec_sup
+                .scheduled_recordings_loop(sched_rec_shutdown, sched_rec_jobs)
+                .await;
+        });
+
         self.rt.spawn(async move {
             supervisor.run(live_rx, manual_rx).await;
         });

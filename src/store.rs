@@ -28,12 +28,13 @@ fn quota_date_today() -> String {
 
 use crate::models::{
     AdBreak, AuthKind, Channel, Container, DetachedKind, DetachedRow, DetectionMethod, GlobalStats,
-    Monitor, MonitorWithChannel, Platform, SabrCodecPref, ScheduleSegment, StreamMetaChange, Tool,
-    UpcomingStream, Video, now_unix,
+    Monitor, MonitorWithChannel, Platform, RecurrenceKind, SabrCodecPref, ScheduleSegment,
+    ScheduledRecording, ScheduledRecordingWithNames, StreamMetaChange, Tool, UpcomingStream, Video,
+    now_unix,
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 50;
+const SCHEMA_VERSION: i64 = 51;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -1343,7 +1344,38 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 50)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 50);
+        if version < 51 {
+            // Scheduled recordings: force-start a recording at a specific time
+            // (once) or on a weekly repeat, bypassing Auto the same way a
+            // trigger-word match does. `next_run_at`/`last_fired_at` drive the
+            // due-scan; `pending_stop_at` tracks an in-flight duration-bound
+            // occurrence awaiting its auto-stop. See `scheduled_recordings.rs`.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS scheduled_recording (
+                    id               INTEGER PRIMARY KEY,
+                    monitor_id       INTEGER NOT NULL,
+                    label            TEXT NOT NULL DEFAULT '',
+                    kind             TEXT NOT NULL,
+                    start_at         INTEGER,
+                    days_of_week     INTEGER,
+                    time_of_day_secs INTEGER,
+                    until            INTEGER,
+                    duration_secs    INTEGER,
+                    enabled          INTEGER NOT NULL DEFAULT 1,
+                    next_run_at      INTEGER,
+                    last_fired_at    INTEGER,
+                    pending_stop_at  INTEGER,
+                    created_at       INTEGER NOT NULL,
+                    FOREIGN KEY(monitor_id) REFERENCES monitor(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_scheduled_recording_due
+                    ON scheduled_recording(enabled, next_run_at);
+                CREATE INDEX IF NOT EXISTS idx_scheduled_recording_monitor
+                    ON scheduled_recording(monitor_id);",
+            )?;
+            conn.pragma_update(None, "user_version", 51)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 51);
         Ok(())
     }
 
@@ -2618,6 +2650,211 @@ impl Store {
         conn.execute(
             "UPDATE recording SET backfill_path=NULL WHERE id=?1",
             params![id],
+        )?;
+        Ok(())
+    }
+
+    // ----- scheduled recordings (force-start at a time, schema v51) -----
+
+    fn map_scheduled_recording(r: &rusqlite::Row) -> rusqlite::Result<ScheduledRecording> {
+        Ok(ScheduledRecording {
+            id: r.get(0)?,
+            monitor_id: r.get(1)?,
+            label: r.get(2)?,
+            kind: RecurrenceKind::parse(&r.get::<_, String>(3)?),
+            start_at: r.get(4)?,
+            days_of_week: r.get(5)?,
+            time_of_day_secs: r.get(6)?,
+            until: r.get(7)?,
+            duration_secs: r.get(8)?,
+            enabled: r.get::<_, i64>(9)? != 0,
+            next_run_at: r.get(10)?,
+            last_fired_at: r.get(11)?,
+            pending_stop_at: r.get(12)?,
+            created_at: r.get(13)?,
+        })
+    }
+
+    const SCHEDULED_RECORDING_SELECT: &str =
+        "SELECT id, monitor_id, label, kind, start_at, days_of_week, time_of_day_secs, until, \
+         duration_secs, enabled, next_run_at, last_fired_at, pending_stop_at, created_at \
+         FROM scheduled_recording";
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_scheduled_recording(
+        &self,
+        monitor_id: i64,
+        label: &str,
+        kind: RecurrenceKind,
+        start_at: Option<i64>,
+        days_of_week: Option<i64>,
+        time_of_day_secs: Option<i64>,
+        until: Option<i64>,
+        duration_secs: Option<i64>,
+        next_run_at: Option<i64>,
+    ) -> Result<i64> {
+        let conn = self.db();
+        conn.execute(
+            "INSERT INTO scheduled_recording(
+                monitor_id, label, kind, start_at, days_of_week, time_of_day_secs, until,
+                duration_secs, enabled, next_run_at, created_at
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10)",
+            params![
+                monitor_id,
+                label,
+                kind.as_str(),
+                start_at,
+                days_of_week,
+                time_of_day_secs,
+                until,
+                duration_secs,
+                next_run_at,
+                now_unix(),
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Updates the user-editable fields only — `last_fired_at`/`pending_stop_at`
+    /// are job bookkeeping and untouched by an edit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_scheduled_recording(
+        &self,
+        id: i64,
+        label: &str,
+        kind: RecurrenceKind,
+        start_at: Option<i64>,
+        days_of_week: Option<i64>,
+        time_of_day_secs: Option<i64>,
+        until: Option<i64>,
+        duration_secs: Option<i64>,
+        enabled: bool,
+        next_run_at: Option<i64>,
+    ) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE scheduled_recording SET
+                label=?2, kind=?3, start_at=?4, days_of_week=?5, time_of_day_secs=?6, until=?7,
+                duration_secs=?8, enabled=?9, next_run_at=?10
+             WHERE id=?1",
+            params![
+                id,
+                label,
+                kind.as_str(),
+                start_at,
+                days_of_week,
+                time_of_day_secs,
+                until,
+                duration_secs,
+                enabled as i64,
+                next_run_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_scheduled_recording(&self, id: i64) -> Result<()> {
+        let conn = self.db();
+        conn.execute("DELETE FROM scheduled_recording WHERE id=?1", params![id])?;
+        Ok(())
+    }
+
+    /// Every scheduled recording, joined with its channel/monitor for the
+    /// management window — soonest-due enabled rules first, fired/disabled
+    /// ones last.
+    pub fn list_scheduled_recordings(&self) -> Result<Vec<ScheduledRecordingWithNames>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT sr.id, sr.monitor_id, sr.label, sr.kind, sr.start_at, sr.days_of_week, \
+             sr.time_of_day_secs, sr.until, sr.duration_secs, sr.enabled, sr.next_run_at, \
+             sr.last_fired_at, sr.pending_stop_at, sr.created_at, c.name, m.url
+             FROM scheduled_recording sr
+             JOIN monitor m ON m.id = sr.monitor_id
+             JOIN channel c ON c.id = m.channel_id
+             ORDER BY sr.enabled DESC, sr.next_run_at IS NULL, sr.next_run_at ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(ScheduledRecordingWithNames {
+                    rec: Self::map_scheduled_recording(r)?,
+                    channel_name: r.get(14)?,
+                    monitor_url: r.get(15)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Rules due to force-start right now (the background job's tick query).
+    pub fn due_scheduled_recordings(&self, now: i64) -> Result<Vec<ScheduledRecording>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(&format!(
+            "{} WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?1",
+            Self::SCHEDULED_RECORDING_SELECT
+        ))?;
+        let rows = stmt
+            .query_map(params![now], Self::map_scheduled_recording)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// `(id, monitor_id)` of duration-bound occurrences whose auto-stop is due.
+    pub fn due_scheduled_stops(&self, now: i64) -> Result<Vec<(i64, i64)>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id, monitor_id FROM scheduled_recording
+             WHERE pending_stop_at IS NOT NULL AND pending_stop_at <= ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![now], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<(i64, i64)>>>()?;
+        Ok(rows)
+    }
+
+    /// Records that a rule just fired: stamps the occurrence, advances (or
+    /// clears) `next_run_at`, and arms `pending_stop_at` when the rule has a
+    /// duration. A `None` `next_run_at` (a `Once` rule, or a `Weekly` rule past
+    /// its `until`) soft-disables the rule so it stops showing as upcoming but
+    /// stays listed for the user to review/delete.
+    pub fn mark_scheduled_recording_fired(
+        &self,
+        id: i64,
+        occurrence_start: i64,
+        next_run_at: Option<i64>,
+        pending_stop_at: Option<i64>,
+    ) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE scheduled_recording SET
+                last_fired_at=?2, next_run_at=?3, pending_stop_at=?4,
+                enabled = CASE WHEN ?3 IS NULL THEN 0 ELSE enabled END
+             WHERE id=?1",
+            params![id, occurrence_start, next_run_at, pending_stop_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_scheduled_recording_stop(&self, id: i64) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE scheduled_recording SET pending_stop_at=NULL WHERE id=?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Flips `enabled` (management-window checkbox / row action) and installs
+    /// the caller's freshly recomputed `next_run_at` (`None` when disabling).
+    pub fn set_scheduled_recording_enabled(
+        &self,
+        id: i64,
+        enabled: bool,
+        next_run_at: Option<i64>,
+    ) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE scheduled_recording SET enabled=?2, next_run_at=?3 WHERE id=?1",
+            params![id, enabled as i64, next_run_at],
         )?;
         Ok(())
     }
@@ -6247,5 +6484,100 @@ mod tests {
             })
             .unwrap();
         assert!(store.vod_archive_replay_candidates().unwrap().is_empty());
+    }
+
+    #[test]
+    fn scheduled_recording_crud_and_due_queries() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store
+            .upsert_channel("Sched", "https://twitch.tv/sched", Platform::Twitch)
+            .unwrap();
+        let m = sample_monitor(cid);
+        let mid = store.insert_monitor(&m).unwrap();
+
+        let id = store
+            .insert_scheduled_recording(
+                mid,
+                "test rule",
+                RecurrenceKind::Weekly,
+                None,
+                Some(crate::models::DOW_MON),
+                Some(3600),
+                None,
+                Some(1800),
+                Some(1_000_000),
+            )
+            .unwrap();
+
+        let find = |s: &Store, id: i64| {
+            s.list_scheduled_recordings()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.rec.id == id)
+                .unwrap()
+        };
+        let got = find(&store, id).rec;
+        assert_eq!(got.label, "test rule");
+        assert_eq!(got.kind, RecurrenceKind::Weekly);
+        assert_eq!(got.days_of_week, Some(crate::models::DOW_MON));
+        assert_eq!(got.next_run_at, Some(1_000_000));
+        assert!(got.enabled);
+
+        // due_scheduled_recordings only surfaces enabled rows whose next_run_at
+        // has arrived.
+        assert!(store.due_scheduled_recordings(999_999).unwrap().is_empty());
+        let due = store.due_scheduled_recordings(1_000_000).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, id);
+
+        // Listing joins channel/monitor names.
+        let listed = store.list_scheduled_recordings().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].channel_name, "Sched");
+
+        // Firing advances next_run_at and arms the auto-stop.
+        store
+            .mark_scheduled_recording_fired(id, 1_000_000, Some(1_600_000), Some(1_000_000 + 1800))
+            .unwrap();
+        let after_fire = find(&store, id).rec;
+        assert_eq!(after_fire.last_fired_at, Some(1_000_000));
+        assert_eq!(after_fire.next_run_at, Some(1_600_000));
+        assert_eq!(after_fire.pending_stop_at, Some(1_001_800));
+        assert!(after_fire.enabled, "weekly rule stays enabled after firing");
+
+        let stops = store.due_scheduled_stops(1_001_800).unwrap();
+        assert_eq!(stops, vec![(id, mid)]);
+        store.clear_scheduled_recording_stop(id).unwrap();
+        assert!(store.due_scheduled_stops(1_001_800).unwrap().is_empty());
+
+        // A fired Once rule (next_run_at = None) soft-disables instead of
+        // deleting — it stays visible/auditable until the user removes it.
+        let once_id = store
+            .insert_scheduled_recording(
+                mid,
+                "once",
+                RecurrenceKind::Once,
+                Some(500),
+                None,
+                None,
+                None,
+                None,
+                Some(500),
+            )
+            .unwrap();
+        store
+            .mark_scheduled_recording_fired(once_id, 500, None, None)
+            .unwrap();
+        let once_after = find(&store, once_id).rec;
+        assert!(!once_after.enabled);
+        assert_eq!(once_after.next_run_at, None);
+        assert_eq!(store.list_scheduled_recordings().unwrap().len(), 2);
+
+        store.delete_scheduled_recording(once_id).unwrap();
+        assert_eq!(store.list_scheduled_recordings().unwrap().len(), 1);
+
+        // Cascade delete when the owning monitor is removed.
+        store.delete_monitor(mid).unwrap();
+        assert!(store.list_scheduled_recordings().unwrap().is_empty());
     }
 }
