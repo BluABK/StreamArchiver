@@ -1485,6 +1485,12 @@ impl DetectContext {
                     posts = posts.len(),
                     "community posts fit on one page; backfill complete"
                 );
+            } else if posts.is_empty() {
+                tracing::debug!(
+                    channel = %row.channel.name,
+                    url = %community_url,
+                    "community posts page parsed empty (no posts, no continuation) — will retry next round"
+                );
             }
             return;
         };
@@ -3387,15 +3393,20 @@ fn replace_schedule_and_notify(
     true
 }
 
-/// Build the YouTube `/community` (posts tab) URL for a channel URL.
+/// Build the YouTube posts-tab URL for a channel URL. YouTube renamed this
+/// tab from "Community" to "Posts" and retired the `/community` path — it
+/// now serves a "This Community isn't available" placeholder with zero posts
+/// instead of a 404, so a fetch against it "succeeds" (HTTP 200) while
+/// silently returning nothing. `/posts` is the current canonical path.
 pub(crate) fn youtube_community_url(url: &str) -> String {
     let t = url.trim().trim_end_matches('/');
     let t = t
         .strip_suffix("/live")
         .or_else(|| t.strip_suffix("/streams"))
         .or_else(|| t.strip_suffix("/community"))
+        .or_else(|| t.strip_suffix("/posts"))
         .unwrap_or(t);
-    format!("{t}/community")
+    format!("{t}/posts")
 }
 
 /// Whether `s` looks like an http(s) URL (vs. a local filesystem path).
@@ -4271,6 +4282,39 @@ mod tests {
     fn parse_kick_slug() {
         assert_eq!(kick_slug("https://kick.com/Bar/").as_deref(), Some("Bar"));
         assert_eq!(kick_slug("https://kick.com/").as_deref(), None);
+    }
+
+    #[test]
+    fn community_url_uses_posts_path() {
+        // YouTube retired the `/community` tab for `/posts`; `/community` now
+        // returns a "This Community isn't available" placeholder (HTTP 200,
+        // zero posts) instead of an error, so this must not silently regress.
+        assert_eq!(
+            youtube_community_url("https://www.youtube.com/@Foo"),
+            "https://www.youtube.com/@Foo/posts"
+        );
+        assert_eq!(
+            youtube_community_url("https://www.youtube.com/@Foo/"),
+            "https://www.youtube.com/@Foo/posts"
+        );
+        assert_eq!(
+            youtube_community_url("https://www.youtube.com/@Foo/live"),
+            "https://www.youtube.com/@Foo/posts"
+        );
+        assert_eq!(
+            youtube_community_url("https://www.youtube.com/@Foo/streams"),
+            "https://www.youtube.com/@Foo/posts"
+        );
+        // Idempotent / self-healing against a URL already carrying either the
+        // old or new suffix.
+        assert_eq!(
+            youtube_community_url("https://www.youtube.com/@Foo/community"),
+            "https://www.youtube.com/@Foo/posts"
+        );
+        assert_eq!(
+            youtube_community_url("https://www.youtube.com/@Foo/posts"),
+            "https://www.youtube.com/@Foo/posts"
+        );
     }
 
     #[test]

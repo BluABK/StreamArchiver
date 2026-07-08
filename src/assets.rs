@@ -1592,6 +1592,7 @@ async fn fetch_youtube_page_banner(
         t.strip_suffix("/live")
             .or_else(|| t.strip_suffix("/streams"))
             .or_else(|| t.strip_suffix("/community"))
+            .or_else(|| t.strip_suffix("/posts"))
             .unwrap_or(t)
             .to_string()
     };
@@ -2100,6 +2101,7 @@ async fn fetch_youtube_about(
         t.strip_suffix("/live")
             .or_else(|| t.strip_suffix("/streams"))
             .or_else(|| t.strip_suffix("/community"))
+            .or_else(|| t.strip_suffix("/posts"))
             .unwrap_or(t)
             .to_string()
     };
