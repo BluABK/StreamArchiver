@@ -194,7 +194,15 @@ async fn tick(
 
     let checked_at = now_unix();
     for o in &outcomes {
-        let new_state = if o.error {
+        // This tick's `recording` snapshot was taken before the (possibly slow,
+        // batched) detection calls above ran — a recording can start for this
+        // monitor in the meantime (e.g. an EventSub push winning the race
+        // against a still-in-flight Helix poll). Re-check membership fresh
+        // here so this write never clobbers the supervisor's own "recording"
+        // state back to "live"/"offline".
+        let new_state = if active.lock().unwrap().contains_key(&o.monitor_id) {
+            "recording"
+        } else if o.error {
             "error"
         } else if o.live {
             "live"

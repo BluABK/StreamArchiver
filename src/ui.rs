@@ -5721,16 +5721,24 @@ fn channel_cells(
         Cell::text(tool),
         Cell::text(String::new()), // detection
         Cell::num(last as f64, fmt_datetime_short(last)), // polled (datetime only)
-        // Mirrors the rendered state cell: recording > live > failed > blank.
-        Cell::text(if any_recording {
-            "recording".to_string()
-        } else if live_count > 0 {
-            "live".to_string()
-        } else if primary.last_recording_status.as_deref() == Some("failed") {
-            "failed".to_string()
-        } else {
-            String::new()
-        }),
+        // Mirrors the rendered state cell: recording > live > failed > blank
+        // (offline/idle). A numeric priority (not `Cell::text`, whose sort key
+        // is plain alphabetical — "failed" < "live" < "recording" only happens
+        // to match by coincidence, and "" doesn't sort last in every locale)
+        // so ascending/descending both order sensibly and stay correct if
+        // another state label is ever added here.
+        {
+            let (priority, label) = if any_recording {
+                (3.0, "recording")
+            } else if live_count > 0 {
+                (2.0, "live")
+            } else if primary.last_recording_status.as_deref() == Some("failed") {
+                (1.0, "failed")
+            } else {
+                (0.0, "")
+            };
+            Cell::num(priority, label)
+        },
         {
             // Sort/show the channel's SOONEST upcoming stream across its instances.
             let next_at = monitors.iter().filter_map(|m| m.next_stream_at).min();
@@ -25472,8 +25480,9 @@ fn parse_twitch_chat_line(
 #[cfg(test)]
 mod tests {
     use super::{
-        Cell, ChatSegment, DateFmt, SortLevel, SortState, StreamMetaChange, StreamTarget,
-        active_date_fmt, aggregate_stream_changes, build_twitch_segments, channel_live_count,
+        Cell, ChatSegment, DateFmt, SortKey, SortLevel, SortState, StreamMetaChange, StreamTarget,
+        active_date_fmt, aggregate_stream_changes, build_twitch_segments, channel_cells,
+        channel_live_count,
         channel_primary, chat_file_for_recording, compose_browser_profile, contrast_ratio,
         fmt_polled, hsl_to_rgb, meta_change_lines, monitor_import_identity, ordered_rows,
         parse_first_party_spans, playable_with, player_is_mpv, readable_color, recording_cells,
@@ -25644,6 +25653,50 @@ mod tests {
         assert_eq!(channel_live_count(&monitors, &active), 0);
         let primary = channel_primary(&monitors, &active, 700_000).expect("non-empty");
         assert_eq!(primary.monitor.id, 2, "most recent past recording wins");
+    }
+
+    #[test]
+    fn channel_cells_state_sort_key_orders_recording_live_failed_offline() {
+        // The state column must sort by significance (recording > live > failed
+        // > offline/idle), not by `Cell::text`'s plain alphabetical key — which
+        // only coincidentally matched before this fix and would break the
+        // instant a differently-spelled state (e.g. "idle") were ever added.
+        let channel = Channel {
+            id: 1,
+            name: "Test".into(),
+            url: "https://twitch.tv/test".into(),
+            platform: Platform::Twitch,
+            created_at: 0,
+            color: String::new(),
+            preferred_asset: None,
+            enabled: true,
+            automation_enabled: true,
+        };
+        let recording_row = test_row(1, "recording", Some("recording"), Some(1_000_000), None, false);
+        let live_row = test_row(2, "live", None, None, Some(1_000_000), false);
+        let failed_row = test_row(3, "failed", Some("failed"), Some(900_000), None, false);
+        let offline_row = test_row(4, "offline", None, None, None, false);
+        let now = 1_000_100;
+
+        let state_priority = |m: &MonitorWithChannel, active: &HashSet<i64>| {
+            let cells = channel_cells(&channel, &[m], active, now);
+            match cells[8].key {
+                SortKey::Num(n) => n,
+                SortKey::Text(_) => panic!("state cell must be numeric"),
+            }
+        };
+        let mut recording_active = HashSet::new();
+        recording_active.insert(1);
+        let empty = HashSet::new();
+
+        let recording_p = state_priority(&recording_row, &recording_active);
+        let live_p = state_priority(&live_row, &empty);
+        let failed_p = state_priority(&failed_row, &empty);
+        let offline_p = state_priority(&offline_row, &empty);
+
+        assert!(recording_p > live_p, "recording must outrank live");
+        assert!(live_p > failed_p, "live must outrank failed");
+        assert!(failed_p > offline_p, "failed must outrank offline");
     }
 
     // ----- multi-level table sort (ordered_rows) -----
