@@ -33,7 +33,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 49;
+const SCHEMA_VERSION: i64 = 50;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -1334,7 +1334,16 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 49)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 49);
+        if version < 50 {
+            // Which yt-dlp-family binary a Video download uses: empty = system
+            // yt-dlp, "sabr" = the built-in SABR dev build, else a custom
+            // tool's alias (see downloader::CustomTool).
+            conn.execute_batch(
+                "ALTER TABLE video ADD COLUMN tool_binary TEXT NOT NULL DEFAULT '';",
+            )?;
+            conn.pragma_update(None, "user_version", 50)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 50);
         Ok(())
     }
 
@@ -4259,8 +4268,8 @@ impl Store {
         conn.execute(
             "INSERT INTO video(url, title, channel, platform, tool, quality, output_dir,
                 filename_template, auth_kind, auth_value, extra_args, auto_title, status, created_at,
-                audio_tracks, subtitle_tracks, chat_log)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'queued', ?13, ?14, ?15, ?16)",
+                audio_tracks, subtitle_tracks, chat_log, tool_binary)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'queued', ?13, ?14, ?15, ?16, ?17)",
             params![
                 v.url,
                 v.title,
@@ -4278,6 +4287,7 @@ impl Store {
                 v.audio_tracks,
                 v.subtitle_tracks,
                 v.chat_log as i64,
+                v.tool_binary,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -4387,7 +4397,7 @@ impl Store {
                 "SELECT id, url, title, platform, tool, quality, output_dir, filename_template,
                     auth_kind, auth_value, extra_args, status, output_path, bytes, exit_code,
                     created_at, started_at, ended_at, auto_title, channel,
-                    audio_tracks, subtitle_tracks, chat_log, log_excerpt
+                    audio_tracks, subtitle_tracks, chat_log, log_excerpt, tool_binary
                  FROM video WHERE id=?1",
                 params![id],
                 Self::map_video,
@@ -4403,7 +4413,7 @@ impl Store {
             "SELECT id, url, title, platform, tool, quality, output_dir, filename_template,
                 auth_kind, auth_value, extra_args, status, output_path, bytes, exit_code,
                 created_at, started_at, ended_at, auto_title, channel,
-                audio_tracks, subtitle_tracks, chat_log, log_excerpt
+                audio_tracks, subtitle_tracks, chat_log, log_excerpt, tool_binary
              FROM video ORDER BY id DESC",
         )?;
         let rows = stmt
@@ -4420,6 +4430,7 @@ impl Store {
             channel: r.get(19)?,
             platform: Platform::parse(&r.get::<_, String>(3)?),
             tool: Tool::parse(&r.get::<_, String>(4)?),
+            tool_binary: r.get(24)?,
             quality: r.get(5)?,
             output_dir: r.get(6)?,
             filename_template: r.get(7)?,
@@ -4611,6 +4622,7 @@ mod tests {
             channel: String::new(),
             platform: Platform::YouTube,
             tool: Tool::YtDlp,
+            tool_binary: String::new(),
             quality: "best".into(),
             output_dir: "C:/vids".into(),
             filename_template: "{name}_{date}".into(),

@@ -1197,6 +1197,13 @@ pub struct Video {
     pub channel: String,
     pub platform: Platform,
     pub tool: Tool,
+    /// Which binary to invoke when `tool == Tool::YtDlp`: empty = the system
+    /// yt-dlp, `"sabr"` = the built-in SABR dev build, anything else = the
+    /// alias of a user-defined [`crate::downloader::CustomTool`]. Ignored for
+    /// Streamlink/Ffmpeg. Resolved to a program path at download time via
+    /// [`crate::downloader::resolve_ytdlp_program`] (falls back to the system
+    /// binary if the alias no longer exists).
+    pub tool_binary: String,
     pub quality: String,
     pub output_dir: String,
     pub filename_template: String,

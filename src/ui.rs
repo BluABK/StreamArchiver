@@ -471,6 +471,8 @@ struct VideoForm {
     url: String,
     title: String,
     tool: Tool,
+    /// See [`Video::tool_binary`]. Reset alongside `tool` on a platform change.
+    tool_binary: String,
     quality: String,
     output_dir: String,
     filename_template: String,
@@ -500,6 +502,7 @@ impl VideoForm {
             url: String::new(),
             title: String::new(),
             tool: Tool::YtDlp,
+            tool_binary: String::new(),
             quality: "best".into(),
             output_dir: String::new(),
             filename_template: "{name}_{date}_{time}".into(),
@@ -654,6 +657,10 @@ struct SettingsForm {
     /// Global trigger-word rules (start recording on title/game match even with
     /// Auto off). Channel/instance Properties can extend/replace/disable them.
     trigger_rules: Vec<crate::triggers::TriggerRule>,
+    /// User-defined alternate yt-dlp-compatible binaries (alias + path),
+    /// selectable alongside the system yt-dlp / SABR build in the Videos-tab
+    /// download form.
+    custom_tools: Vec<crate::downloader::CustomTool>,
 }
 
 /// Background load state of an import fetch (followed/subscriptions).
@@ -1304,6 +1311,7 @@ impl StreamArchiverApp {
             vod_dl_enabled: setting_or_empty(&core, crate::vod_archive::K_VOD_DL_ENABLED) == "1",
             vod_dl_replace: setting_or_empty(&core, crate::vod_archive::K_VOD_DL_REPLACE) == "1",
             trigger_rules: crate::triggers::load_global_rules(&core.store),
+            custom_tools: crate::downloader::load_custom_tools(&core.store),
         };
         // Apply the loaded date format + short-timestamp pattern before the first render.
         set_active_date_fmt(settings.date_fmt);
@@ -2442,6 +2450,13 @@ impl StreamArchiverApp {
             self.status = format!("Error saving trigger rules: {e}");
             return;
         }
+        // Custom tools serialize to JSON too.
+        if let Err(e) =
+            crate::downloader::save_custom_tools(&self.core.store, &self.settings.custom_tools)
+        {
+            self.status = format!("Error saving custom tools: {e}");
+            return;
+        }
         // If Discord import is now off (toggled off or token cleared), purge any
         // previously-imported Discord events so they don't linger on the calendar.
         if !discord_on {
@@ -3002,6 +3017,77 @@ fn trigger_rules_editor(
         rules.push(TriggerRule::default());
     }
     *rules != before
+}
+
+/// An alias problem for the custom-tool row at `i` — empty, the reserved
+/// `"sabr"` word, or a duplicate of another row's alias — shown inline so the
+/// Videos-tab dropdown never has to disambiguate two identically-named tools.
+fn custom_tool_alias_error(tools: &[crate::downloader::CustomTool], i: usize) -> Option<&'static str> {
+    let alias = tools[i].alias.trim();
+    if alias.is_empty() {
+        return Some("Alias can't be empty");
+    }
+    if alias.eq_ignore_ascii_case(crate::downloader::TOOL_BINARY_SABR) {
+        return Some("\"sabr\" is reserved for the built-in SABR build");
+    }
+    if tools
+        .iter()
+        .enumerate()
+        .any(|(j, t)| j != i && t.alias.trim().eq_ignore_ascii_case(alias))
+    {
+        return Some("Another custom tool already uses this alias");
+    }
+    None
+}
+
+/// Editor for the user-defined custom yt-dlp-compatible binaries (Settings →
+/// Downloads). Each row is offered in the Videos-tab download form's Tool
+/// dropdown alongside the system yt-dlp and the built-in SABR build. Returns
+/// true on any change so the caller can persist immediately.
+fn custom_tools_editor(
+    ui: &mut egui::Ui,
+    tools: &mut Vec<crate::downloader::CustomTool>,
+    pending_browse: &mut Option<PendingBrowse>,
+) -> bool {
+    let before = tools.clone();
+    let mut remove: Option<usize> = None;
+    for i in 0..tools.len() {
+        let err = custom_tool_alias_error(tools, i);
+        let t = &mut tools[i];
+        ui.horizontal(|ui| {
+            let mut alias_edit =
+                egui::TextEdit::singleline(&mut t.alias).hint_text("alias").desired_width(120.0);
+            if err.is_some() {
+                alias_edit = alias_edit.text_color(HL_ERROR_TEXT);
+            }
+            let resp = ui.add(alias_edit);
+            if let Some(e) = &err {
+                resp.on_hover_text(*e);
+            }
+            ui.add(
+                egui::TextEdit::singleline(&mut t.path)
+                    .hint_text(r"e.g. C:\tools\my-yt-dlp\yt-dlp.exe")
+                    .desired_width(340.0),
+            );
+            if ui.button("Browse…").clicked() {
+                *pending_browse = Some(spawn_browse_file(&t.path, move |app, p| {
+                    if let Some(row) = app.settings.custom_tools.get_mut(i) {
+                        row.path = p;
+                    }
+                }));
+            }
+            if ui.small_button("🗑").on_hover_text("Remove this tool").clicked() {
+                remove = Some(i);
+            }
+        });
+    }
+    if let Some(i) = remove {
+        tools.remove(i);
+    }
+    if ui.button("➕ Add custom tool").clicked() {
+        tools.push(crate::downloader::CustomTool::default());
+    }
+    *tools != before
 }
 
 /// Inherit/Extend/Replace/Off editor for a channel- or instance-level trigger
@@ -7774,6 +7860,7 @@ impl StreamArchiverApp {
             let d = self.download_defaults.get(platform).clone();
             let vf = &mut self.video_form;
             vf.tool = d.tool;
+            vf.tool_binary = String::new();
             vf.quality = d.quality;
             vf.output_dir = d.output_dir;
             vf.filename_template = d.filename_template;
@@ -7797,6 +7884,8 @@ impl StreamArchiverApp {
 
         {
             let custom_presets = self.custom_presets.as_slice();
+            let custom_tool_aliases: Vec<String> =
+                self.settings.custom_tools.iter().map(|t| t.alias.clone()).collect();
             let vf = &mut self.video_form;
 
             ui.add_space(6.0);
@@ -7844,12 +7933,57 @@ impl StreamArchiverApp {
                              {name} when Name is left blank).",
                         );
                     ui.label("Tool").on_hover_text(vf.tool.tooltip());
+                    let tool_label = if vf.tool == Tool::YtDlp && !vf.tool_binary.is_empty() {
+                        if vf.tool_binary == crate::downloader::TOOL_BINARY_SABR {
+                            "yt-dlp-dev (SABR)".to_string()
+                        } else {
+                            vf.tool_binary.clone()
+                        }
+                    } else {
+                        vf.tool.label().to_string()
+                    };
                     egui::ComboBox::from_id_salt("video_tool_cb")
-                        .selected_text(vf.tool.label())
+                        .selected_text(tool_label)
                         .show_ui(ui, |ui| {
                             for t in Tool::ALL {
-                                ui.selectable_value(&mut vf.tool, t, t.label())
-                                    .on_hover_text(t.tooltip());
+                                let selected = vf.tool == t && vf.tool_binary.is_empty();
+                                if ui
+                                    .selectable_label(selected, t.label())
+                                    .on_hover_text(t.tooltip())
+                                    .clicked()
+                                {
+                                    vf.tool = t;
+                                    vf.tool_binary.clear();
+                                }
+                            }
+                            let sabr_selected = vf.tool == Tool::YtDlp
+                                && vf.tool_binary == crate::downloader::TOOL_BINARY_SABR;
+                            if ui
+                                .selectable_label(sabr_selected, "yt-dlp-dev (SABR)")
+                                .on_hover_text(
+                                    "The yt-dlp dev build with SABR support, configured in \
+                                     Settings → Downloads → YouTube SABR. Falls back to the \
+                                     system yt-dlp if no SABR build path is set there.",
+                                )
+                                .clicked()
+                            {
+                                vf.tool = Tool::YtDlp;
+                                vf.tool_binary = crate::downloader::TOOL_BINARY_SABR.to_string();
+                            }
+                            for alias in &custom_tool_aliases {
+                                let sel =
+                                    vf.tool == Tool::YtDlp && &vf.tool_binary == alias;
+                                if ui
+                                    .selectable_label(sel, alias)
+                                    .on_hover_text(
+                                        "Custom tool, configured in Settings → Downloads → \
+                                         Custom download tools.",
+                                    )
+                                    .clicked()
+                                {
+                                    vf.tool = Tool::YtDlp;
+                                    vf.tool_binary = alias.clone();
+                                }
                             }
                         });
                     ui.end_row();
@@ -8052,6 +8186,7 @@ impl StreamArchiverApp {
             title: self.video_form.title.trim().to_string(),
             channel: String::new(),
             tool: self.video_form.tool,
+            tool_binary: self.video_form.tool_binary.clone(),
             quality: self.video_form.quality.clone(),
             output_dir: self.video_form.output_dir.clone(),
             filename_template: self.video_form.filename_template.clone(),
@@ -15205,6 +15340,20 @@ impl StreamArchiverApp {
                     );
                     ui.end_row();
                 });
+
+            }
+
+            if self.section_shown(SettingsTab::Downloads, "Custom download tools", &["custom", "tool", "binary", "alias", "yt-dlp", "fork"]) {
+            ui.add_space(12.0);
+            ui.heading("Custom download tools 🔧");
+            ui.label(
+                "Alternate yt-dlp-compatible binaries (e.g. a personal fork or another dev \
+                 build) — each becomes selectable as its own \"Tool\" in the Videos tab's \
+                 download form, alongside yt-dlp and yt-dlp-dev (SABR). Uses the same yt-dlp \
+                 arguments; only the invoked binary differs.",
+            );
+            ui.add_space(6.0);
+            custom_tools_editor(ui, &mut self.settings.custom_tools, &mut self.pending_browse);
 
             }
 

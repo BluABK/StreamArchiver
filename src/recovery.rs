@@ -982,6 +982,7 @@ fn standalone_video(
         channel: inputs.login.clone(),
         platform: crate::models::Platform::Twitch,
         tool: crate::models::Tool::Ffmpeg,
+        tool_binary: String::new(),
         quality: quality.to_string(),
         output_dir: output_dir.to_string(),
         filename_template: String::new(),

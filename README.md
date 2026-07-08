@@ -99,6 +99,17 @@ extra args), and click **Download**. Output is always **MKV** (yt-dlp remuxes to
 MKV; streamlink/ffmpeg capture to `.ts` then remux). Downloads share the same
 global concurrency limit as live recordings.
 
+**Tool.** Alongside `streamlink`, `yt-dlp`, and `ffmpeg`, the dropdown also
+offers **yt-dlp-dev (SABR)** — the same [SABR dev
+build](#youtube-live-capture-from-start-sabr) configured in Settings →
+Downloads, usable here for any on-demand download, not just live
+capture-from-start — plus any **custom tools** defined in Settings →
+Downloads → *Custom download tools*. A custom tool is any other
+yt-dlp-compatible binary (e.g. a personal fork) registered there with an
+alias + path; it uses the same yt-dlp argument template as `yt-dlp`, only the
+invoked binary differs. Picking SABR or a custom tool whose binary path is
+unset/no-longer-valid falls back to the system yt-dlp at download time.
+
 > **YouTube note:** YouTube now refuses VOD media to clients without a **PO
 > token** (downloads would fail with `HTTP Error 403` right after a successful
 > extraction). Video downloads therefore automatically use the bgutil PO-token
@@ -1139,12 +1150,16 @@ together:
 | **SABR manual args** | When set, **replaces** the SABR format + extractor-args preset entirely (put your own `-f` / `--extractor-args` here). The PO-token args still apply. |
 | **DASH companion format** | Format selector for the DASH companion of *dual capture* (below). |
 
-The SABR binary is used **only** when a monitor is **YouTube**, its tool is
-**yt-dlp**, and **Capture from start** is ticked. Everything else — live-chat
-sidecars, channel/chat assets, thumbnails, and on-demand **Videos**/VOD downloads —
-deliberately stays on the **system** yt-dlp, so the stale fork can't break them.
-SABR captures write the final **MKV directly** (SABR merges separate audio+video,
-which the `.ts` intermediate can't hold).
+For **live monitors**, the SABR binary is used **only** when a monitor is
+**YouTube**, its tool is **yt-dlp**, and **Capture from start** is ticked.
+Everything else — live-chat sidecars, channel/chat assets, thumbnails, and
+on-demand **Videos**/VOD downloads — stays on the **system** yt-dlp by
+default, so the stale fork can't break them. The Videos tab's **Tool**
+dropdown can still opt an individual on-demand download into the SABR build
+explicitly (see [Videos (on-demand downloads)](#videos-on-demand-downloads)),
+but nothing switches to it automatically. SABR captures write the final
+**MKV directly** (SABR merges separate audio+video, which the `.ts`
+intermediate can't hold).
 
 #### Installing the bgutil PO-token provider
 

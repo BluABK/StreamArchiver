@@ -186,13 +186,49 @@ impl SabrConfig {
     }
 }
 
-/// The two yt-dlp binaries available to the supervisor: the system build (PATH or
-/// an explicit path) and the optional SABR dev build.
+/// A user-defined alternate yt-dlp-compatible binary (e.g. a personal fork or
+/// a different dev build), selectable per-video download alongside the system
+/// yt-dlp and the built-in SABR dev build. Uses the same yt-dlp argument
+/// template as `Tool::YtDlp` — only the invoked program differs.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CustomTool {
+    pub alias: String,
+    pub path: String,
+}
+
+/// Settings key for the persisted custom-tools list (JSON-encoded
+/// `Vec<CustomTool>`).
+const K_CUSTOM_TOOLS: &str = "custom_tools";
+
+/// Reserved [`Video::tool_binary`] value selecting the built-in SABR dev build.
+pub const TOOL_BINARY_SABR: &str = "sabr";
+
+/// Load the user-defined custom tools list from settings.
+pub fn load_custom_tools(store: &Store) -> Vec<CustomTool> {
+    store
+        .get_setting(K_CUSTOM_TOOLS)
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Persist the user-defined custom tools list to settings.
+pub fn save_custom_tools(store: &Store, tools: &[CustomTool]) -> anyhow::Result<()> {
+    store.set_setting(K_CUSTOM_TOOLS, &serde_json::to_string(tools)?)?;
+    Ok(())
+}
+
+/// The yt-dlp-family binaries available to the supervisor: the system build
+/// (PATH or an explicit path), the optional SABR dev build, and any
+/// user-defined custom tools.
 #[derive(Clone, Debug, Default)]
 pub struct YtDlpBins {
     /// Explicit system yt-dlp path; empty ⇒ `yt-dlp` on PATH.
     pub system: String,
     pub sabr: SabrConfig,
+    pub custom: Vec<CustomTool>,
 }
 
 impl YtDlpBins {
@@ -202,6 +238,29 @@ impl YtDlpBins {
             "yt-dlp".to_string()
         } else {
             self.system.clone()
+        }
+    }
+
+    /// Resolve a [`Video::tool_binary`] value to the program to invoke: empty
+    /// ⇒ the system yt-dlp, [`TOOL_BINARY_SABR`] ⇒ the SABR dev build, else a
+    /// custom tool's path by alias. Falls back to the system yt-dlp if the
+    /// SABR build isn't configured or the alias no longer exists.
+    pub fn resolve_program(&self, tool_binary: &str) -> String {
+        match tool_binary {
+            "" => self.system_program(),
+            TOOL_BINARY_SABR => {
+                if self.sabr.binary.is_empty() {
+                    self.system_program()
+                } else {
+                    self.sabr.binary.clone()
+                }
+            }
+            alias => self
+                .custom
+                .iter()
+                .find(|t| t.alias == alias)
+                .map(|t| t.path.clone())
+                .unwrap_or_else(|| self.system_program()),
         }
     }
 }
@@ -272,6 +331,7 @@ pub(crate) fn load_ytdlp_bins(store: &Store) -> YtDlpBins {
             codec_pref,
             codec_custom: setting_str(store, "ytdlp_sabr_codec_custom"),
         },
+        custom: load_custom_tools(store),
     }
 }
 
@@ -1023,7 +1083,7 @@ pub fn build_video_plan(
             args.extend(extra);
             args.push(v.url.clone());
             DownloadPlan {
-                program: ytdlp.system_program(),
+                program: ytdlp.resolve_program(&v.tool_binary),
                 args,
                 // yt-dlp writes the final MKV into .cache; promoted up via a move.
                 capture_path: cache.join(format!("{stem}.mkv")),
@@ -7931,6 +7991,7 @@ fn enqueue_vod_archive(
         channel: mw.channel.name.clone(),
         platform: m.platform(),
         tool: crate::models::Tool::YtDlp,
+        tool_binary: String::new(),
         quality: if m.quality.trim().is_empty() { "best".into() } else { m.quality.clone() },
         output_dir: dir,
         // Literal stem (no tokens) → the file is `{live_stem}.vod.mkv`, distinct
@@ -8993,6 +9054,7 @@ mod tests {
                 codec_pref: SabrCodecPref::Auto,
                 codec_custom: String::new(),
             },
+            custom: Vec::new(),
         }
     }
 
@@ -9330,6 +9392,7 @@ mod tests {
             channel: String::new(),
             platform: Platform::detect(url),
             tool,
+            tool_binary: String::new(),
             quality: "best".into(),
             output_dir: "C:/vids".into(),
             filename_template: "{name}_{date}".into(),
@@ -9370,6 +9433,43 @@ mod tests {
         // Not a live capture: no live-stream flags.
         assert!(!plan.args.iter().any(|a| a == "--live-from-start"));
         assert!(plan.args.iter().any(|a| a == "--remux-video"));
+    }
+
+    #[test]
+    fn ytdlp_video_uses_sabr_binary_when_selected() {
+        let mut v = video(Tool::YtDlp, "https://youtube.com/watch?v=abc");
+        v.tool_binary = TOOL_BINARY_SABR.into();
+        let plan = build_video_plan(
+            &v,
+            1_700_000_000,
+            "",
+            "",
+            "",
+            &AuthSource::None,
+            &[],
+            None,
+            &sabr_bins(),
+        );
+        assert_eq!(plan.program, "C:/git/yt-dlp-dev/dist/yt-dlp.exe");
+    }
+
+    #[test]
+    fn ytdlp_video_uses_custom_tool_binary_when_selected() {
+        let mut v = video(Tool::YtDlp, "https://youtube.com/watch?v=abc");
+        v.tool_binary = "myfork".into();
+        let mut bins = YtDlpBins::default();
+        bins.custom.push(CustomTool { alias: "myfork".into(), path: "C:/tools/myfork.exe".into() });
+        let plan = build_video_plan(&v, 1_700_000_000, "", "", "", &AuthSource::None, &[], None, &bins);
+        assert_eq!(plan.program, "C:/tools/myfork.exe");
+    }
+
+    #[test]
+    fn resolve_program_falls_back_to_system_for_unknown_binary() {
+        let bins = YtDlpBins::default();
+        // No SABR build configured and no matching custom tool -> system yt-dlp.
+        assert_eq!(bins.resolve_program(TOOL_BINARY_SABR), "yt-dlp");
+        assert_eq!(bins.resolve_program("no-such-alias"), "yt-dlp");
+        assert_eq!(bins.resolve_program(""), "yt-dlp");
     }
 
     #[test]
