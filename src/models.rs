@@ -107,6 +107,7 @@ impl Platform {
                 DetectionMethod::EventSubHelix,
                 DetectionMethod::Scrape,
                 DetectionMethod::GenericProbe,
+                DetectionMethod::Disabled,
             ],
             Platform::YouTube => &[
                 DetectionMethod::Scrape,
@@ -114,13 +115,15 @@ impl Platform {
                 DetectionMethod::WebSubOnly,
                 DetectionMethod::YouTubeApi,
                 DetectionMethod::GenericProbe,
+                DetectionMethod::Disabled,
             ],
             Platform::Kick => &[
                 DetectionMethod::Scrape,
                 DetectionMethod::KickApi,
                 DetectionMethod::GenericProbe,
+                DetectionMethod::Disabled,
             ],
-            Platform::Generic => &[DetectionMethod::GenericProbe],
+            Platform::Generic => &[DetectionMethod::GenericProbe, DetectionMethod::Disabled],
         }
     }
 }
@@ -205,6 +208,13 @@ pub enum DetectionMethod {
     /// with auto=off, or for any YouTube channel where push reliability is
     /// trusted and reducing HTTP traffic is a priority.
     WebSubOnly,
+    /// No automatic liveness checking at all: the scheduler skips this
+    /// instance entirely (no API polls, scrapes, or probes), and no
+    /// push mechanism (WebSub/EventSub) is subscribed either. State only
+    /// changes via a manual "▶ Start" (which records immediately, trusting
+    /// the user, since there's no configured way to check first) or another
+    /// manual action. For channels you only ever want to record by hand.
+    Disabled,
 }
 
 impl DetectionMethod {
@@ -220,6 +230,7 @@ impl DetectionMethod {
             DetectionMethod::KickApi => "kick_api",
             DetectionMethod::WebSub => "websub",
             DetectionMethod::WebSubOnly => "websub_only",
+            DetectionMethod::Disabled => "disabled",
         }
     }
 
@@ -235,6 +246,7 @@ impl DetectionMethod {
             DetectionMethod::KickApi => "Kick official API",
             DetectionMethod::WebSub => "YouTube WebSub (VPS push)",
             DetectionMethod::WebSubOnly => "YouTube WebSub (push only)",
+            DetectionMethod::Disabled => "Disabled (manual only)",
         }
     }
 
@@ -251,6 +263,7 @@ impl DetectionMethod {
             DetectionMethod::KickApi => "Kick API",
             DetectionMethod::WebSub => "WebSub",
             DetectionMethod::WebSubOnly => "WebSub!",
+            DetectionMethod::Disabled => "Disabled",
         }
     }
 
@@ -265,6 +278,7 @@ impl DetectionMethod {
             "kick_api" => DetectionMethod::KickApi,
             "websub" => DetectionMethod::WebSub,
             "websub_only" => DetectionMethod::WebSubOnly,
+            "disabled" => DetectionMethod::Disabled,
             _ => DetectionMethod::GenericProbe,
         }
     }
@@ -319,6 +333,12 @@ impl DetectionMethod {
             DetectionMethod::CliSelfPoll => {
                 "A resident streamlink/yt-dlp retry loop per channel. Higher footprint; intended \
                  only for a few channels."
+            }
+            DetectionMethod::Disabled => {
+                "No automatic liveness checking at all — not polled by the scheduler, and no \
+                 push subscription either. State only changes from a manual action: \"▶ Start\" \
+                 records immediately (there's no configured way to check first, so it trusts \
+                 you). Use for channels you only ever want to record by hand."
             }
         }
     }

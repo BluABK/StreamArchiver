@@ -110,6 +110,8 @@ async fn tick(
         // same idea for YouTube: scrape-polled here as a fallback, and pushed by
         // the websub task (which triggers an on-demand liveness check).
         // WebSubOnly is push-only — no poll fallback, so it is not in this list.
+        // Disabled is intentionally never in this list either: it means "never
+        // auto-check this instance at all" (see `DetectionMethod::Disabled`).
         let handled = matches!(
             m.detection_method,
             DetectionMethod::TwitchApi

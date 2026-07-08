@@ -377,6 +377,7 @@ in-app for a one-line description of each.
 | **Kick official API** | Kick | Client ID + Secret | one poll interval | client-credentials app token; more reliable than scraping (no Cloudflare). |
 | **Scrape poll** | YouTube `/live`, Kick, generic | No | one poll interval | **Default for YouTube/Kick**; no credentials, but fragile to site changes. Go-live time is approximate (`~`). |
 | **Generic probe** | any streamlink/yt-dlp URL | No | one poll interval | `streamlink --stream-url` liveness test; works anywhere those tools do. |
+| **Disabled** | any | No | manual only | No automatic checking at all — not polled by the scheduler, no push subscribed. **▶ Start** records immediately (there's no configured way to check first, so it trusts you) instead of erroring "not live". For channels you only ever want to record by hand. |
 
 **Polling vs. push (Helix vs. EventSub).** Helix *asks* "is it live?" every poll
 interval, so you notice within that interval (and the **Lost time** column ≈ the

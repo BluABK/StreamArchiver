@@ -2332,7 +2332,8 @@ impl Supervisor {
     /// user-initiated start records even when Auto is off (Auto only gates
     /// *automatic* starts) and toasts when the channel isn't live; an
     /// automatic trigger (WebSub push) honors the Auto gate and just keeps
-    /// the stream state fresh.
+    /// the stream state fresh. `Disabled` detection skips the check entirely
+    /// (see below).
     async fn manual_start(&self, monitor_id: i64, user_initiated: bool) {
         if self.active.lock().unwrap().contains_key(&monitor_id) {
             return; // already recording
@@ -2345,6 +2346,17 @@ impl Supervisor {
         // (WebSub/EventSub) entirely — it does nothing until manually acted on.
         // An explicit user Start still works (it's a manual trigger).
         if !user_initiated && !row.automation_on() {
+            return;
+        }
+        // Disabled detection has no configured way to check liveness at all
+        // (the scheduler never polls it and no push is subscribed either) — a
+        // manual Start is the only way such an instance ever records, so it
+        // trusts the user and skips straight to recording instead of calling
+        // check_one (which would just report "not live" and never proceed).
+        if row.monitor.detection_method == DetectionMethod::Disabled {
+            if user_initiated {
+                self.try_begin(monitor_id, Some(now_unix()), true, None, None, None, None, None, true, true);
+            }
             return;
         }
         let auto = row.channel.enabled && row.monitor.enabled;
@@ -2869,6 +2881,21 @@ impl Supervisor {
             DetectionMethod::GenericProbe => self.ctx.detect_generic(&item).await,
             DetectionMethod::YouTubeApi => self.ctx.detect_youtube_api(&item).await,
             DetectionMethod::KickApi => self.ctx.detect_kick_api(&item).await,
+            // No configured way to check — callers should avoid reaching this
+            // (manual_start special-cases it), but never make a network call.
+            DetectionMethod::Disabled => DetectOutcome {
+                monitor_id: item.monitor_id,
+                live: false,
+                detail: "detection disabled for this instance".into(),
+                error: false,
+                went_live_at: None,
+                stream_id: None,
+                thumbnail_url: None,
+                broadcaster_id: None,
+                stream_title: None,
+                stream_game: None,
+                stream_viewers: None,
+            },
             _ => self.ctx.detect_scrape(&item).await,
         }
     }

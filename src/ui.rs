@@ -4669,7 +4669,7 @@ const STREAM_COLUMNS: [GridCol; 21] = [
     GridCol { id: "platform",    title: "Plat",       tooltip: "Source platform (icon): Twitch, YouTube, Kick, or a generic URL. A channel shows every platform among its instances.", min_width: 52.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "name",        title: "Name",       tooltip: "Channel (container) name. Expand it to see its instances and recording history.",            min_width: 130.0, initial: 0.0,   sortable: true,  stretch: false },
     GridCol { id: "tool",        title: "Tool",  tooltip: "Capture tool: SL = streamlink, yt-dlp, ff = ffmpeg. Hover a row for the full name.", min_width: 36.0, initial: 0.0, sortable: true, stretch: false },
-    GridCol { id: "detection",   title: "⇄",    tooltip: "Detection method — how liveness is detected: ↺ = API poll, ⚡ = push event, ⌁ = scrape, ◉ = probe, C = CLI. Hover a row for the full method.", min_width: 24.0, initial: 0.0, sortable: true, stretch: false },
+    GridCol { id: "detection",   title: "⇄",    tooltip: "Detection method — how liveness is detected: ↺ = API poll, ⚡ = push event, ⌁ = scrape, ◉ = probe, C = CLI, ⛔ = disabled (manual only). Hover a row for the full method.", min_width: 24.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "polled",      title: "Polled", tooltip: "When this instance was last checked. Compact mode shows HH:MM only; hover for the full timestamp.", min_width: 64.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "state",       title: "●",    tooltip: "Current monitor state. ⏺ = recording, ● = live (not recording), ○ = idle, ⚠ = failed, ⚡ = aborted.", min_width: 26.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "next_stream", title: "Next stream",tooltip: "Next scheduled stream (Twitch schedule / YouTube upcoming). Hover for its title; double-click for the full schedule.", min_width: 96.0, initial: 0.0, sortable: true, stretch: false },
@@ -5200,6 +5200,7 @@ fn detection_icon(m: crate::models::DetectionMethod) -> &'static str {
         EventSub => "⚡",                          // pure push event
         EventSubHelix => "⚡↺",                   // push + poll fallback
         WebSub | WebSubOnly => "⚡",             // WebSub push
+        Disabled => "⛔",                          // no auto-detection at all
     }
 }
 
@@ -15634,6 +15635,7 @@ impl StreamArchiverApp {
                                 DetectionMethod::Scrape,
                                 DetectionMethod::KickApi,
                                 DetectionMethod::GenericProbe,
+                                DetectionMethod::Disabled,
                             ],
                             Some(p) => p.detection_methods(),
                         };
