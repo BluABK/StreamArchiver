@@ -960,7 +960,10 @@ channel — text (with clickable links), attached images, author avatar, and lik
 count — into the database and the channel's asset cache (`posts\` folder). The
 feed is browsable in the **Posts** top-level tab or the pop-out **📣 Posts**
 window, with a channel filter and text search; each new post also raises a
-notification.
+notification. To keep the feed responsive with a large backlog, only 30 posts
+are laid out at a time — a **Show 30 more** button at the bottom reveals
+further ones (filtering/search apply to the whole backlog either way, not just
+what's currently shown).
 
 - **Post kinds.** A channel's community tab mixes the channel's **own posts**,
   **viewer posts** (fans posting in the channel's Community space), and

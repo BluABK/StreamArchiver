@@ -824,6 +824,13 @@ pub struct StreamArchiverApp {
     /// channel's Community space). Off by default — session-only, like the
     /// other feed filters.
     posts_show_viewer: bool,
+    /// How many of the filtered posts to actually lay out this frame. The feed
+    /// can hold up to 500 rows, each a rich multi-widget card (links, N
+    /// images) — laying all of them out every frame regardless of scroll
+    /// position is the main cost of the tab, so only this many render up
+    /// front; a "Show more" button at the bottom raises it. Session-only,
+    /// reset to the default whenever the filter/search narrows the visible set.
+    posts_render_limit: usize,
     post_img_cache: PostImageCache,
     /// The widget inspector (F12): whether the window is open (session-only,
     /// like the other window flags) and its tab/selection/snapshot state.
@@ -1500,6 +1507,7 @@ impl StreamArchiverApp {
             posts_search: String::new(),
             posts_channel_filter: None,
             posts_show_viewer: false,
+            posts_render_limit: POSTS_PAGE_SIZE,
             post_img_cache: HashMap::new(),
             show_inspector: false,
             inspector: crate::inspector::InspectorState::default(),
@@ -3853,6 +3861,10 @@ const SCHED_TIME_COL_W: f32 = 44.0;
 const SCHED_COL_GAP: f32 = 4.0;
 /// Minimum event block height so zero/short-duration events remain clickable.
 const SCHED_MIN_BLOCK_H: f32 = 22.0;
+
+/// How many filtered posts the Posts feed lays out per "page" (see
+/// `AppState::posts_render_limit`).
+const POSTS_PAGE_SIZE: usize = 30;
 
 /// Schedule-view zoom bounds/step (Ctrl+Plus/Minus; Ctrl+0 resets to 1.0).
 /// Scales the calendar body's font + element sizes; the toolbar/sidebar chrome
@@ -18240,6 +18252,12 @@ impl StreamArchiverApp {
     /// all images 1:1), with a channel filter + text search. Post rows are moved
     /// out of `self` during render so the lazy image-texture cache (`self`) and
     /// the row data (local) don't alias.
+    ///
+    /// Only `posts_render_limit` of the filtered rows are actually laid out
+    /// (see that field's doc comment) — a plain `ScrollArea` doesn't skip
+    /// layout for off-screen content the way a virtualized table does, so
+    /// laying out the full up-to-500-row feed every frame regardless of scroll
+    /// position was the tab's main cost.
     fn render_posts_feed(&mut self, ui: &mut egui::Ui) {
         use std::time::{Duration, Instant};
         let stale = self
@@ -18348,12 +18366,22 @@ impl StreamArchiverApp {
             return;
         }
 
+        let render_limit = self.posts_render_limit.max(POSTS_PAGE_SIZE);
         let mut open_url: Option<String> = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for &i in &visible {
+                for &i in visible.iter().take(render_limit) {
                     let p = &posts[i];
+                    // Salt every widget this card creates by the post's own
+                    // (stable) id instead of its position in the list — with a
+                    // plain position-based id, an image finishing its async
+                    // decode (changing that card's height) shifts every widget
+                    // below it to a new screen rect on the very next frame,
+                    // which egui's debug id-clash check (red outline + a
+                    // "Widget rect ... changed id between passes" warning,
+                    // debug builds only) flags as if it were a bug.
+                    ui.push_id(p.id, |ui| {
                     egui::Frame::group(ui.style()).show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         // Header: avatar + author + timestamp + channel.
@@ -18448,6 +18476,22 @@ impl StreamArchiverApp {
                                 },
                             );
                         });
+                    });
+                    });
+                    ui.add_space(6.0);
+                }
+                if visible.len() > render_limit {
+                    ui.vertical_centered(|ui| {
+                        if ui
+                            .button(format!(
+                                "Show {} more",
+                                POSTS_PAGE_SIZE.min(visible.len() - render_limit)
+                            ))
+                            .clicked()
+                        {
+                            self.posts_render_limit += POSTS_PAGE_SIZE;
+                        }
+                        ui.weak(format!("{} of {} shown", render_limit, visible.len()));
                     });
                     ui.add_space(6.0);
                 }
