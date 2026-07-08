@@ -2541,9 +2541,20 @@ impl Store {
         Ok(row)
     }
 
-    /// True when no earlier take exists for the same monitor + platform stream —
-    /// only the earliest take of a stream owns the missed HEAD; later takes'
-    /// gaps are mid-stream and not this feature's job.
+    /// True when no earlier *viable* take exists for the same monitor +
+    /// platform stream — only the earliest take of a stream owns the missed
+    /// HEAD; later takes' gaps are mid-stream and not this feature's job.
+    ///
+    /// An earlier take that captured nothing at all (`status='failed'` with
+    /// `bytes=0` — it never even started writing) doesn't count as "earlier":
+    /// its own head-backfill job computed a bogus near-zero "missed" gap from
+    /// its own stale `started_at` (which is ~equal to `went_live_at` for an
+    /// instant failure) and quietly skipped with "gap too small". Without
+    /// this exclusion, a stream whose first recording attempt dies instantly
+    /// (e.g. a transient tool crash, or a too-long filename before the
+    /// MAX_PATH fix) permanently loses head-backfill for the whole stream —
+    /// the take that actually captures it is never considered "first" and
+    /// never gets its own job.
     pub fn is_first_take_for_stream(
         &self,
         monitor_id: i64,
@@ -2553,7 +2564,8 @@ impl Store {
         let conn = self.db();
         let earlier: i64 = conn.query_row(
             "SELECT COUNT(*) FROM recording
-             WHERE monitor_id = ?1 AND stream_id = ?2 AND started_at < ?3",
+             WHERE monitor_id = ?1 AND stream_id = ?2 AND started_at < ?3
+               AND NOT (status = 'failed' AND bytes = 0)",
             params![monitor_id, stream_id, started_at],
             |r| r.get(0),
         )?;
@@ -5968,6 +5980,38 @@ mod tests {
         assert!(!store.is_first_take_for_stream(mid, "s1", 200).unwrap());
         // A different stream id is unaffected by s1's takes.
         assert!(store.is_first_take_for_stream(mid, "s2", 200).unwrap());
+    }
+
+    #[test]
+    fn first_take_for_stream_skips_prior_instant_failures() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        let dead = store
+            .insert_recording(mid, 100, "C:/tmp/a.ts", Some(50), false, Some("s1"), None, "")
+            .unwrap();
+        // Died instantly with nothing captured (e.g. the MAX_PATH bug) — a
+        // later retake should still be able to own the missed HEAD.
+        store.finish_recording(dead, 105, 0, Some(1), "failed", "C:/tmp/a.ts", "boom").unwrap();
+        assert!(
+            store.is_first_take_for_stream(mid, "s1", 400).unwrap(),
+            "a retake after an instant 0-byte failure should own the head backfill"
+        );
+
+        // But a prior take that actually captured something (even if it later
+        // failed) still owns it — there's real head footage to not duplicate.
+        let partial = store
+            .insert_recording(mid, 500, "C:/tmp/b.ts", Some(50), false, Some("s2"), None, "")
+            .unwrap();
+        store.finish_recording(partial, 600, 12345, Some(1), "failed", "C:/tmp/b.ts", "boom").unwrap();
+        assert!(!store.is_first_take_for_stream(mid, "s2", 900).unwrap());
+
+        // And a prior take still actively recording (no bytes yet, but not
+        // finished) still blocks — it may yet succeed.
+        store
+            .insert_recording(mid, 1000, "C:/tmp/c.ts", Some(50), false, Some("s3"), None, "")
+            .unwrap();
+        assert!(!store.is_first_take_for_stream(mid, "s3", 1100).unwrap());
     }
 
     #[test]
