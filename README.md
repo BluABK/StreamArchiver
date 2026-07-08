@@ -1049,6 +1049,12 @@ Notes:
   even a template with no unique part (e.g. just `{name}`) never clobbers an
   earlier recording. Use `{take}` (or `{date}`/`{time}`/`{video_id}`) if you'd
   rather the difference be part of the name itself.
+- **Very long titles are shortened automatically** (marked with `...`) so the
+  resulting filename stays under NTFS's per-component limit and — separately —
+  so the working path streamlink/yt-dlp actually write to (under the hidden
+  `.cache\` folder) stays under Windows' 260-character path limit for those
+  Python tools. Both caps apply to live recordings and on-demand downloads
+  alike; you shouldn't ever see a recording fail to start over a long title.
 
 #### Filename media info ({resolution}/{fps}/…)
 

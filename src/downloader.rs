@@ -820,6 +820,12 @@ pub fn build_plan(
         m, &ch.name, started_at, stream_id, stream_title, row.recording_count, &quality, media, "",
         tool_label, &mode, &platform, went_live_at,
     );
+    // Keep the child tool's working path under MAX_PATH (streamlink/yt-dlp are
+    // Python, no long-path manifest) — the per-component cap already applied
+    // inside `expand_template` alone isn't enough (see `MAX_CHILD_PATH_UTF16`);
+    // `build_video_plan` already does this for on-demand downloads, live
+    // captures need the same guard.
+    let stem = stem_capped_for_child_path(&dir, &stem);
     let extra = split_args(&m.extra_args);
     // SABR (YouTube capture-from-start via the dev build) writes the final MKV
     // directly — it merges separate SABR audio+video through ffmpeg, which the
@@ -9562,6 +9568,40 @@ mod tests {
             "ERROR: unable to download video data: HTTP Error 403: Forbidden"
         ));
         assert!(!stream_ended_or_unavailable(""));
+    }
+
+    #[test]
+    fn live_capture_stem_capped_for_child_path() {
+        // Regression (2026-07-08): build_plan (live monitor capture) never
+        // applied stem_capped_for_child_path, unlike build_video_plan — a long
+        // title + a deep output dir could produce a `.cache\{stem}.ts` path
+        // over Windows' MAX_PATH for the streamlink/yt-dlp child process,
+        // which fails to open the output file (looks like ENOENT, not a
+        // length-specific error).
+        let mut r = row(Tool::Streamlink, Container::Mkv, Platform::Twitch);
+        r.monitor.output_dir = r"A:\streams\ProjektMelody".into();
+        r.monitor.filename_template =
+            "{name} - {date} {time} - {title} [{games}] ({quality} {mode} {vcodec} {acodec}) - \
+             [{platform} {video_id}]"
+                .into();
+        let long_title = "x".repeat(200);
+        let plan = build_plan(
+            &r,
+            1_700_000_000,
+            &AuthSource::None,
+            &[],
+            Some("31577148080"),
+            &long_title,
+            None,
+            0,
+            &YtDlpBins::default(),
+        );
+        let total = plan.capture_path.to_string_lossy().encode_utf16().count();
+        assert!(
+            total < 260,
+            "capture path {total} WCHARs (over Windows MAX_PATH): {}",
+            plan.capture_path.display()
+        );
     }
 
     #[test]
