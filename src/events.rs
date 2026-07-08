@@ -376,4 +376,11 @@ pub enum ManualCommand {
     /// Download the published VOD for a recording now (manual trigger / retry of the
     /// post-stream archive feature), by recording id.
     ArchiveVodNow(i64),
+    /// Manually (re)trigger a head backfill for a recording now, by recording id
+    /// (Twitch capture-from-start only). User-initiated: forced regardless of the
+    /// "fetch new head backfill on new take" setting — unlike the automatic path,
+    /// this always attempts the fetch for a non-first take too. Disabled in the UI
+    /// unless the owning channel is currently live (the CDN's growing live
+    /// playlist this depends on stops being pre-mute-safe once the stream ends).
+    BackfillHeadNow(i64),
 }

@@ -261,6 +261,16 @@ every older take's head file for the same stream (a strict subset of the fresh
 one), which is deleted. A fresh head that fails its checks is still kept, just
 never used to replace anything, so nothing is ever lost to a bad check.
 
+**Manual "🧩 Backfill head."** Right-click an **instance** (targets its latest
+recording) or a specific **take** for a manual, on-demand head backfill —
+Twitch only, and only enabled while the channel is **currently live** (the CDN
+playlist this needs stops being reliably pre-mute-safe once the stream ends;
+the button is grayed out otherwise, with a tooltip pointing at **📥 Download
+post-stream VOD** instead). Unlike the automatic path, this always forces the
+fetch regardless of the *fetch new head backfill on new take* setting — it's
+user-initiated, so there's no reason to gate it. The *replace old head*
+setting still applies as configured.
+
 ### Row actions & shortcuts
 
 Left-click a row to select it; **right-click** any row — channel, instance,
@@ -624,9 +634,9 @@ tree — **📼 VOD backfill** — right under the take it belongs to (same tree
 take; expand the stream to see it even when there's only one take), showing a live
 progress bar while downloading and a final status once done: **archived** (downloaded
 alongside), **replaced**, **archived (pre-mute)** / **replaced (pre-mute)**, **muted**,
-or **failed**. Right-click a take for **📥 Download VOD now** (on-demand / retry); once
-a job exists, right-click the **📼 VOD backfill** row itself for **Open downloaded
-VOD** or **Retry download**.
+or **failed**. Right-click a take for **📥 Download post-stream VOD** (on-demand /
+retry); once a job exists, right-click the **📼 VOD backfill** row itself for **Open
+downloaded VOD** or **Retry download**.
 
 > **Notes.** This re-downloads the whole stream, so it doubles storage/bandwidth — hence
 > it's opt-in and granular. Twitch is the most reliable path (instant VOD publication +

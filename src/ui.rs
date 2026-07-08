@@ -5426,6 +5426,8 @@ struct RowActions {
     stream_in_player: Option<StreamTarget>,
     /// Monitor id to open a live stream in the player without recording (set by "Play new instance").
     play_new_instance: Option<i64>,
+    /// Recording id to manually (re)trigger head backfill for (set by "Backfill head").
+    backfill_head: Option<i64>,
 }
 
 /// Render one capture-instance (monitor) row across all columns, with the Name
@@ -5450,6 +5452,9 @@ fn render_instance_row(
     media_player: &str,
     // This instance's own account avatar for the Name cell (None until fetched).
     avatar: Option<&egui::TextureHandle>,
+    // The most recently started recording for this monitor, if any — the
+    // target of the "Backfill head" manual action.
+    latest_rec_id: Option<i64>,
     order: &[usize],
     a: &mut RowActions,
 ) -> bool {
@@ -5528,6 +5533,36 @@ fn render_instance_row(
         if ui.button("📋  Copy URL").clicked() {
             ui.ctx().copy_text(row.monitor.url.clone());
             ui.close();
+        }
+        // Manually (re)trigger a CDN head backfill for this instance's latest
+        // recording — Twitch capture-from-start only, and only while live
+        // (the growing CDN playlist this depends on stops being reliably
+        // pre-mute-safe once the stream ends). Forced regardless of the
+        // "fetch new head backfill on new take" setting (user-initiated).
+        if m.platform() == Platform::Twitch {
+            let is_live = matches!(m.last_state.as_str(), "live" | "recording");
+            if ui
+                .add_enabled(
+                    is_live && latest_rec_id.is_some(),
+                    egui::Button::new("🧩  Backfill head"),
+                )
+                .on_hover_text(
+                    "Fetch the latest recording's missed intro from Twitch's still-growing live \
+                     CDN playlist (pre-mute audio). Always forced — ignores the \"fetch new head \
+                     backfill on new take\" setting.",
+                )
+                .on_disabled_hover_text(if latest_rec_id.is_none() {
+                    "No recording yet for this instance."
+                } else {
+                    "This channel isn't currently live — head backfill needs the still-growing \
+                     live CDN playlist, which stops being reliably pre-mute-safe once the stream \
+                     ends. Use \"Download post-stream VOD\" on the take instead."
+                })
+                .clicked()
+            {
+                a.backfill_head = latest_rec_id;
+                ui.close();
+            }
         }
         ui.separator();
         if ui.button("✏  Edit instance…").clicked() {
@@ -11728,6 +11763,7 @@ impl StreamArchiverApp {
         let mut open_recording_props: Option<i64> = None;
         let mut open_recover_take: Option<i64> = None;
         let mut archive_vod_now: Option<i64> = None;
+        let mut backfill_head_now: Option<i64> = None;
         // (monitor id, recording id) — "View chat" on a stream/take row.
         let mut view_chat_rec: Option<(i64, i64)> = None;
         // Container-level actions.
@@ -12524,12 +12560,21 @@ impl StreamArchiverApp {
                                 let output_dir_ok = self
                                     .fs_probes
                                     .is_dir(std::path::Path::new(&row.monitor.output_dir));
+                                // The most recently started take for this instance (any
+                                // stream) — the "Backfill head" manual action's target.
+                                let inst_latest_rec_id = groups.get(&mid).and_then(|gs| {
+                                    gs.iter()
+                                        .flat_map(|g| g.takes.iter())
+                                        .max_by_key(|t| t.started_at)
+                                        .map(|t| t.id)
+                                });
                                 if render_instance_row(
                                     &mut tr, row, &ptex, now, recording, chat_active,
                                     tint, output_dir_ok, depth, has_hist, expanded,
                                     inst_needs_remux,
                                     inst_stream_target.as_ref(), &media_player,
                                     instance_avatars.get(&mid),
+                                    inst_latest_rec_id,
                                     &col_order, &mut acts,
                                 ) {
                                     toggle_instance = Some(mid);
@@ -13244,14 +13289,51 @@ impl StreamArchiverApp {
                                         // Post-stream published-VOD download (manual trigger).
                                         // Result actions ("Open recovered file" / "Open
                                         // downloaded VOD") live on the job's own sibling row
-                                        // (Vis::VodJob) once a job exists.
+                                        // (Vis::VodJob) once a job exists. Not to be confused
+                                        // with "Backfill head" below — that's the CDN intro
+                                        // segments fetched during the live broadcast, this is
+                                        // the full, already-published VOD downloaded after.
                                         if t.stream_id.is_some()
                                             && ui
-                                                .button("📥  Download VOD now")
-                                                .on_hover_text("Download the platform's published VOD for this recording now (also retries a failed archive).")
+                                                .button("📥  Download post-stream VOD")
+                                                .on_hover_text("Download the platform's full published VOD for this recording now (also retries a failed archive). For the missed intro of a from-start capture, use \"Backfill head\" instead.")
                                                 .clicked()
                                         {
                                             archive_vod_now = Some(t.id);
+                                            ui.close();
+                                        }
+                                        // Manually (re)trigger the CDN head-backfill for this
+                                        // take — Twitch capture-from-start only, and only while
+                                        // the channel is live (the growing CDN playlist this
+                                        // depends on stops being pre-mute-safe once the stream
+                                        // ends). Forced regardless of the "fetch new head
+                                        // backfill on new take" setting (user-initiated).
+                                        let owning_monitor =
+                                            self.rows.iter().find(|r| r.monitor.id == mid).map(|r| &r.monitor);
+                                        let is_twitch = owning_monitor
+                                            .map(|m| m.platform() == Platform::Twitch)
+                                            .unwrap_or(false);
+                                        let is_live = owning_monitor
+                                            .map(|m| matches!(m.last_state.as_str(), "live" | "recording"))
+                                            .unwrap_or(false);
+                                        if t.stream_id.is_some()
+                                            && is_twitch
+                                            && ui
+                                                .add_enabled(is_live, egui::Button::new("🧩  Backfill head"))
+                                                .on_hover_text(
+                                                    "Fetch this take's missed intro from Twitch's still-growing \
+                                                     live CDN playlist (pre-mute audio). Always forced — ignores \
+                                                     the \"fetch new head backfill on new take\" setting.",
+                                                )
+                                                .on_disabled_hover_text(
+                                                    "The channel isn't currently live — head backfill needs the \
+                                                     still-growing live CDN playlist, which stops being reliably \
+                                                     pre-mute-safe once the stream ends. Use \"Download \
+                                                     post-stream VOD\" instead.",
+                                                )
+                                                .clicked()
+                                        {
+                                            backfill_head_now = Some(t.id);
                                             ui.close();
                                         }
                                         if ui
@@ -13506,6 +13588,10 @@ impl StreamArchiverApp {
         if let Some(rec_id) = archive_vod_now {
             self.core.manual(ManualCommand::ArchiveVodNow(rec_id));
             self.status = "Downloading published VOD…".into();
+        }
+        if let Some(rec_id) = backfill_head_now.or_else(|| acts.backfill_head.take()) {
+            self.core.manual(ManualCommand::BackfillHeadNow(rec_id));
+            self.status = "Backfilling head…".into();
         }
         // Next stream double-click: a channel/stream/take row sets the local; an
         // instance row routes through RowActions.
@@ -15890,6 +15976,17 @@ impl StreamArchiverApp {
                  plausible duration), delete older takes' now-redundant head files for the same \
                  stream. Only takes effect when fetching a new head is also on; a fresh head \
                  that fails its checks is still kept, just never used to replace anything.",
+            );
+            ui.label(
+                egui::RichText::new(
+                    "The Streams grid also has a manual \"🧩 Backfill head\" action (on an \
+                     instance — targets its latest recording — or on a specific take), enabled \
+                     only while the channel is live. It always forces the fetch regardless of \
+                     the \"fetch new head backfill on new take\" setting above (replace-old still \
+                     follows the setting).",
+                )
+                .small()
+                .weak(),
             );
 
             // ── Trigger words ──────────────────────────────────────────────────

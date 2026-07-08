@@ -3837,6 +3837,77 @@ impl Store {
         Ok(rows)
     }
 
+    /// Same column list + row shape as `recordings_for_monitor`, factored out
+    /// for the single-row lookups below.
+    const RECORDING_FULL_COLUMNS: &str = "id, monitor_id, started_at, ended_at, status, bytes, exit_code,
+            COALESCE(output_path, ''), went_live_at, went_live_approx, lost_secs, stream_id,
+            (SELECT COUNT(*) FROM ad_break ab WHERE ab.recording_id = recording.id),
+            COALESCE((SELECT SUM(ab.duration_secs) FROM ad_break ab WHERE ab.recording_id = recording.id), 0),
+            (SELECT COUNT(*) FROM stream_meta_change smc
+             WHERE smc.recording_id = recording.id AND smc.old_value != ''),
+            COALESCE(log_excerpt, ''),
+            COALESCE((SELECT new_value FROM stream_meta_change smc
+                      WHERE smc.recording_id = recording.id AND smc.kind = 'title'
+                      ORDER BY smc.at_secs DESC, smc.id DESC LIMIT 1), ''),
+            COALESCE((SELECT new_value FROM stream_meta_change smc
+                      WHERE smc.recording_id = recording.id AND smc.kind = 'category'
+                      ORDER BY smc.at_secs DESC, smc.id DESC LIMIT 1), ''),
+            take_group, COALESCE(notes, ''),
+            vod_id, vod_state, vod_muted_secs,
+            recovery_state, recovered_path,
+            vod_dl_state, vod_dl_path, vod_dl_video_id,
+            backfill_path, full_path, COALESCE(trigger_info, '')";
+
+    fn map_recording_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::models::Recording> {
+        Ok(crate::models::Recording {
+            id: r.get(0)?,
+            monitor_id: r.get(1)?,
+            started_at: r.get(2)?,
+            ended_at: r.get(3)?,
+            status: r.get(4)?,
+            bytes: r.get(5)?,
+            exit_code: r.get(6)?,
+            output_path: r.get(7)?,
+            went_live_at: r.get(8)?,
+            went_live_approx: r.get::<_, Option<i64>>(9)?.unwrap_or(0) != 0,
+            lost_secs: r.get(10)?,
+            stream_id: r.get(11)?,
+            take_group: r.get(18)?,
+            ad_count: r.get(12)?,
+            ad_secs: r.get(13)?,
+            meta_change_count: r.get(14)?,
+            title: r.get(16)?,
+            category: r.get(17)?,
+            log_excerpt: r.get(15)?,
+            notes: r.get(19)?,
+            vod_id: r.get(20)?,
+            vod_state: r.get(21)?,
+            vod_muted_secs: r.get(22)?,
+            recovery_state: r.get(23)?,
+            recovered_path: r.get(24)?,
+            vod_dl_state: r.get(25)?,
+            vod_dl_path: r.get(26)?,
+            vod_dl_video_id: r.get(27)?,
+            backfill_path: r.get(28)?,
+            full_path: r.get(29)?,
+            trigger_info: r.get(30)?,
+        })
+    }
+
+    /// A single recording by id (full row) — used by manual per-take actions
+    /// (e.g. the "Backfill head" context-menu action).
+    pub fn get_recording(&self, id: i64) -> Result<Option<crate::models::Recording>> {
+        let conn = self.db();
+        let row = conn
+            .query_row(
+                &format!("SELECT {} FROM recording WHERE id = ?1", Self::RECORDING_FULL_COLUMNS),
+                params![id],
+                Self::map_recording_row,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     /// Recordings whose output path is still a `.ts` file inside a `.cache`
     /// directory — these finished capturing but were never successfully remuxed
     /// to the final MKV container. Listed newest-first.
@@ -6088,6 +6159,24 @@ mod tests {
         store.clear_recording_backfill_path(take1).unwrap();
         assert!(store.recordings_with_backfill_for_stream(mid, "s1", take3).unwrap().is_empty());
         assert!(!store.recordings_pending_head_concat().unwrap().contains(&take1));
+    }
+
+    #[test]
+    fn get_recording_roundtrip() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+
+        assert!(store.get_recording(999).unwrap().is_none());
+
+        let take1 = store
+            .insert_recording(mid, 100, "C:/tmp/take1.mkv", Some(50), false, Some("s1"), None, "")
+            .unwrap();
+
+        let r1 = store.get_recording(take1).unwrap().unwrap();
+        assert_eq!(r1.id, take1);
+        assert_eq!(r1.output_path, "C:/tmp/take1.mkv");
+        assert_eq!(r1.stream_id.as_deref(), Some("s1"));
     }
 
     #[test]

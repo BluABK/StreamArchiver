@@ -637,6 +637,36 @@ fn cache_dir(output_dir: &Path) -> PathBuf {
     output_dir.join(".cache")
 }
 
+/// Best-effort growing `.cache` file candidates for a still-recording take,
+/// keyed off its predicted final path's stem (mirrors how `build_plan`
+/// derives `capture_path`, without needing to re-derive SABR/container state
+/// — the caller just probes each candidate and uses whichever exists). Used
+/// by `Supervisor::manual_head_backfill` for a take that's still active.
+fn live_capture_candidates(final_path: &Path) -> Vec<PathBuf> {
+    let (Some(dir), Some(stem)) =
+        (final_path.parent(), final_path.file_stem().map(|s| s.to_string_lossy().into_owned()))
+    else {
+        return Vec::new();
+    };
+    let cache = cache_dir(dir);
+    vec![cache.join(format!("{stem}.ts")), cache.join(format!("{stem}.mkv"))]
+}
+
+/// Head-backfill's "missed" length: prefer measuring the capture's own
+/// duration (`captured`) against `reference` — accounts for any partial
+/// rewind — falling back to the plain start delay when the duration can't be
+/// measured. `reference` must be a fixed point in time for an already-
+/// finished capture (its `ended_at`), not a live `now_unix()` — the capture's
+/// duration is static once it's done, so pairing it with an ever-advancing
+/// "now" would make `missed` grow unboundedly with how long ago the take
+/// ended (see `head_backfill_job`'s `missed_reference` parameter).
+fn compute_missed_secs(went_live_at: i64, started_at: i64, captured: Option<i64>, reference: i64) -> i64 {
+    match captured {
+        Some(c) => (reference - went_live_at - c).max(0),
+        None => (started_at - went_live_at).max(0),
+    }
+}
+
 /// Stale `.cache\` working files are swept after this age on startup.
 const CACHE_MAX_AGE_SECS: u64 = 24 * 3600;
 
@@ -1555,6 +1585,12 @@ impl Supervisor {
                                     let _ = store.set_recording_vod_dl(rec_id, "failed", None);
                                 }
                             }
+                        });
+                    }
+                    ManualCommand::BackfillHeadNow(rec_id) => {
+                        let this = self.clone();
+                        tokio::spawn(async move {
+                            this.manual_head_backfill(rec_id).await;
                         });
                     }
                     ManualCommand::RefreshCdnHosts => {
@@ -3121,7 +3157,7 @@ impl Supervisor {
             tokio::spawn(async move {
                 this.head_backfill_job(
                     monitor_id, channel_id, rec_id, capture, final_p, url, channel, sid, wl,
-                    approximate, started_at,
+                    approximate, started_at, None, false,
                 )
                 .await;
             });
@@ -4969,6 +5005,20 @@ impl Supervisor {
         went_live_at: i64,
         went_live_approx: bool,
         started_at: i64,
+        // `None` = `capture_path` is still actively growing — measure "missed"
+        // against a fresh `now_unix()` (today's behavior). `Some(t)` = a fixed
+        // historical reference (a take that's already finished, e.g. a manual
+        // re-trigger long after the fact): using a live `now_unix()` there
+        // would make "missed" grow unboundedly with how long ago the take
+        // ended, since `capture_path`'s duration is a static number once the
+        // take is done.
+        missed_reference: Option<i64>,
+        // User-initiated (the "Backfill head" manual action) ⇒ bypass the
+        // "fetch new head backfill on new take" setting for a non-first take.
+        // Does NOT bypass the `recording_lost_secs == 0` / `missed < 60`
+        // sanity short-circuits below (those are factual, not settings), nor
+        // the separate "replace old heads" setting later in this function.
+        force: bool,
     ) {
         // Let the CDN folder appear and streamlink's own rewind (if any) settle.
         for _ in 0..(120 * 4) {
@@ -4985,12 +5035,14 @@ impl Supervisor {
         // take (a reconnect/retake) only gets its own FRESH, FULL head fetch
         // (go-live through THIS take's start — the missed/head_secs math
         // below already computes that naturally, unmodified, since it's keyed
-        // off the constant `went_live_at`) when the setting is on.
+        // off the constant `went_live_at`) when the setting is on, or always
+        // when `force` (a manual trigger).
         let is_first_take = self
             .store
             .is_first_take_for_stream(monitor_id, &stream_id, started_at)
             .unwrap_or(false);
         if !is_first_take
+            && !force
             && !crate::head_backfill::effective_fetch_new_take(&self.store, channel_id, monitor_id)
         {
             return;
@@ -5023,10 +5075,8 @@ impl Supervisor {
                 break;
             }
         }
-        let mut missed = match captured {
-            Some(c) => (now_unix() - went_live_at - c).max(0),
-            None => (started_at - went_live_at).max(0),
-        };
+        let mut missed =
+            compute_missed_secs(went_live_at, started_at, captured, missed_reference.unwrap_or_else(now_unix));
         if missed < 60 {
             info!(rec_id, missed, "head backfill: gap too small, skipping");
             return;
@@ -5207,6 +5257,65 @@ impl Supervisor {
                 info!(old_id, keep_rec_id, "head backfill: superseded by a newer take's fresh head");
             }
         }
+    }
+
+    /// Manually (re)trigger a head backfill for an existing recording — the
+    /// "🧩 Backfill head" context-menu action, forced regardless of the "fetch
+    /// new head backfill on new take" setting (the UI only enables the button
+    /// while the channel is live, so this is meant to run). Works for a still
+    /// -recording take (finds its growing `.cache` file) or an already
+    /// -finished one (uses the promoted final file — its own duration never
+    /// changes again, so `missed` is computed against its fixed `ended_at`
+    /// rather than a live `now_unix()`, see `head_backfill_job`).
+    pub async fn manual_head_backfill(&self, rec_id: i64) {
+        let Ok(Some(rec)) = self.store.get_recording(rec_id) else {
+            warn!(rec_id, "backfill head: recording not found");
+            return;
+        };
+        let Ok(Some(mw)) = self.store.get_monitor_with_channel(rec.monitor_id) else {
+            warn!(rec_id, "backfill head: owning monitor not found");
+            return;
+        };
+        if mw.monitor.platform() != Platform::Twitch {
+            warn!(rec_id, "backfill head: only supported for Twitch");
+            return;
+        }
+        let (Some(stream_id), Some(went_live_at)) = (rec.stream_id.clone(), rec.went_live_at) else {
+            warn!(rec_id, "backfill head: recording has no known stream id / go-live time");
+            return;
+        };
+        let final_path = PathBuf::from(&rec.output_path);
+        let still_recording = rec.status == "recording";
+        let capture_path = if still_recording {
+            let mut found = None;
+            for c in live_capture_candidates(&final_path) {
+                if tokio::fs::metadata(&c).await.is_ok() {
+                    found = Some(c);
+                    break;
+                }
+            }
+            found.unwrap_or_else(|| final_path.clone())
+        } else {
+            final_path.clone()
+        };
+        let missed_reference =
+            if still_recording { None } else { Some(rec.ended_at.unwrap_or(rec.started_at)) };
+        self.head_backfill_job(
+            rec.monitor_id,
+            mw.channel.id,
+            rec_id,
+            capture_path,
+            final_path,
+            mw.monitor.url.clone(),
+            mw.channel.name.clone(),
+            stream_id,
+            went_live_at,
+            rec.went_live_approx,
+            rec.started_at,
+            missed_reference,
+            true, // force — user-initiated
+        )
+        .await;
     }
 
     /// Join a backfilled head with the finished live capture into one seamless
@@ -9634,6 +9743,40 @@ mod tests {
             "ERROR: unable to download video data: HTTP Error 403: Forbidden"
         ));
         assert!(!stream_ended_or_unavailable(""));
+    }
+
+    #[test]
+    fn compute_missed_secs_matches_reference_not_wall_clock() {
+        // Went live at t=0, this take started (and, if finished, ended) at
+        // t=1000 having captured 100s of footage (e.g. a partial rewind).
+        let went_live_at = 0;
+        let started_at = 1000;
+        let ended_at = 1200;
+        let captured = Some(100);
+
+        // Still-live case: reference IS "now" (whatever it currently is) --
+        // matches today's pre-existing behavior of pairing a growing capture
+        // with a live now_unix().
+        assert_eq!(compute_missed_secs(went_live_at, started_at, captured, 1300), 1200);
+
+        // Finished-take case: using the take's fixed ended_at as the
+        // reference gives a stable, correct answer: 1100.
+        assert_eq!(compute_missed_secs(went_live_at, started_at, captured, ended_at), 1100);
+        // The bug this fixes: pairing a static `captured` duration with a
+        // live wall-clock reference instead of the fixed ended_at inflates
+        // "missed" the longer after the fact you (re-)trigger it -- a manual
+        // backfill an entire day later would wrongly see ~87,500 missed
+        // seconds instead of the true, unchanging 1100.
+        let one_day_later = ended_at + 86_400;
+        assert_eq!(compute_missed_secs(went_live_at, started_at, captured, one_day_later), 87_500);
+        assert_ne!(
+            compute_missed_secs(went_live_at, started_at, captured, one_day_later),
+            compute_missed_secs(went_live_at, started_at, captured, ended_at),
+        );
+
+        // No measurable duration -> plain start-delay fallback, independent
+        // of any reference.
+        assert_eq!(compute_missed_secs(went_live_at, started_at, None, 999_999), started_at);
     }
 
     #[test]
