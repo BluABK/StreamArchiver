@@ -358,19 +358,25 @@ pub fn set_visible(entries: &mut [ColumnEntry], id: &str, visible: bool) {
     }
 }
 
-/// Column-chooser body: one row per persisted entry (checkbox for visibility +
-/// ▲/▼ to reorder), adapted from `source_list_inline_editor` (the ui.rs
-/// schedule-source priority editor) for grid columns. `locked` marks ids whose
-/// visibility is controlled elsewhere (the Streams/Videos "actions" id, gated
-/// by the existing Show Actions setting) — these get a disabled, always-on
-/// checkbox instead of an independent hide toggle, so there's one source of
-/// truth for their visibility. Returns true if `entries` changed (caller is
-/// responsible for persisting).
+/// Column-chooser body: one row per persisted entry (checkbox for visibility,
+/// optionally ▲/▼ to reorder), adapted from `source_list_inline_editor` (the
+/// ui.rs schedule-source priority editor) for grid columns. `locked` marks
+/// ids whose visibility is controlled elsewhere (the Streams/Videos "actions"
+/// id, gated by the existing Show Actions setting) — these get a disabled,
+/// always-on checkbox instead of an independent hide toggle, so there's one
+/// source of truth for their visibility. `show_reorder` hides the ▲/▼
+/// buttons entirely when false — used for the inline, live-applied header
+/// popup (a hide/show toggle there is a single bounded change; letting the
+/// SAME popup also reorder would mean every intermediate step of dragging a
+/// column across many positions forces its own live table reset — see the
+/// dedicated "⇕ Reorder columns…" window instead, which applies once).
+/// Returns true if `entries` changed (caller is responsible for persisting).
 pub fn column_chooser_editor(
     ui: &mut egui::Ui,
     entries: &mut [ColumnEntry],
     columns: &[GridCol],
     locked: impl Fn(&str) -> bool,
+    show_reorder: bool,
 ) -> bool {
     let mut changed = false;
     let mut move_up: Option<usize> = None;
@@ -396,19 +402,21 @@ pub fn column_chooser_editor(
                 } else if ui.checkbox(&mut entry.visible, "").changed() {
                     changed = true;
                 }
-                if ui
-                    .add_enabled(i > 0, egui::Button::new("▲").small())
-                    .on_hover_text("Move up")
-                    .clicked()
-                {
-                    move_up = Some(i);
-                }
-                if ui
-                    .add_enabled(i + 1 < n, egui::Button::new("▼").small())
-                    .on_hover_text("Move down")
-                    .clicked()
-                {
-                    move_down = Some(i);
+                if show_reorder {
+                    if ui
+                        .add_enabled(i > 0, egui::Button::new("▲").small())
+                        .on_hover_text("Move up")
+                        .clicked()
+                    {
+                        move_up = Some(i);
+                    }
+                    if ui
+                        .add_enabled(i + 1 < n, egui::Button::new("▼").small())
+                        .on_hover_text("Move down")
+                        .clicked()
+                    {
+                        move_down = Some(i);
+                    }
                 }
                 let mut label = egui::RichText::new(col.title);
                 if !entry.visible {

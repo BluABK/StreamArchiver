@@ -1150,6 +1150,11 @@ pub struct StreamArchiverApp {
     bg_recent_grid: GridState,
     processes_grid: GridState,
     issues_grid: GridState,
+    /// Backing state for the "⇕ Reorder columns…" window (`None` = closed) —
+    /// a working copy of one table's entries, only written back + persisted
+    /// (and only forcing one table reset, not one per intermediate move) when
+    /// the user hits Apply. See [`ReorderColumnsState`].
+    reorder_columns: Option<ReorderColumnsState>,
     /// Currently running background tasks (asset fetches, thumbnail downloads).
     background_tasks: Vec<crate::events::BackgroundTask>,
     /// Completed/failed background tasks (task, outcome, finished-at unix), newest
@@ -1643,6 +1648,7 @@ impl StreamArchiverApp {
             bg_recent_grid,
             processes_grid,
             issues_grid,
+            reorder_columns: None,
             background_tasks: Vec::new(),
             finished_tasks: Vec::new(),
             job_toggles,
@@ -5040,6 +5046,46 @@ const ISSUES_COLUMNS: [GridCol; 8] = [
     GridCol { id: "actions",  title: "Actions", tooltip: "", min_width: 0.0,   initial: 0.0, sortable: false, stretch: false },
 ];
 
+/// The static `GridCol` descriptor array for a given grid table — used by the
+/// "⇕ Reorder columns…" window, which (unlike each table's own render code)
+/// doesn't already have its column array in scope at the point it needs one.
+fn columns_for(table: GridTableId) -> &'static [GridCol] {
+    match table {
+        GridTableId::Streams => &STREAM_COLUMNS,
+        GridTableId::Videos => &VIDEO_COLUMNS,
+        GridTableId::BgActive => &BG_ACTIVE_COLUMNS,
+        GridTableId::BgRecent => &BG_RECENT_COLUMNS,
+        GridTableId::Processes => &PROCESSES_COLUMNS,
+        GridTableId::Issues => &ISSUES_COLUMNS,
+    }
+}
+
+/// A human-readable name for a grid table's "⇕ Reorder columns…" window title
+/// — `GridTableId::key()` is a settings-map key (`"streams_table"`), not
+/// meant for display.
+fn table_display_name(table: GridTableId) -> &'static str {
+    match table {
+        GridTableId::Streams => "Streams",
+        GridTableId::Videos => "Videos",
+        GridTableId::BgActive => "Background (Active)",
+        GridTableId::BgRecent => "Background (Recent)",
+        GridTableId::Processes => "Processes",
+        GridTableId::Issues => "Issues",
+    }
+}
+
+/// Backing state for the "⇕ Reorder columns…" window: a working copy of one
+/// table's persisted entries, edited freely (checkbox + ▲/▼) and only
+/// written back — triggering exactly one save + one table reset — when the
+/// user hits Apply. This exists specifically so dragging a column across
+/// many positions doesn't force the live grid to reset on every intermediate
+/// move, the way the inline header popup's immediate-apply ▲/▼ used to (see
+/// [[grid-column-width-persistence]]).
+struct ReorderColumnsState {
+    table: GridTableId,
+    draft: Vec<ColumnEntry>,
+}
+
 /// One sort level: a column index (into the table's static `*_COLUMNS` array) +
 /// direction. `SortState.keys` is the priority list, primary first.
 #[derive(Clone, Copy, PartialEq)]
@@ -5282,7 +5328,7 @@ fn grid_header_cell(
     entries: &mut [ColumnEntry],
     columns: &[GridCol],
     locked: impl Fn(&str) -> bool,
-) {
+) -> bool {
     // Register the whole-cell right-click interaction BEFORE rendering the sort
     // button / filter box, so those (added afterwards) sit ON TOP and win their
     // own clicks. egui's hit-test breaks overlap ties in favor of the
@@ -5300,6 +5346,7 @@ fn grid_header_cell(
     } else if !col.title.is_empty() {
         ui.strong(col.title).on_hover_text(col.tooltip);
     }
+    let mut open_reorder = false;
     ctx_resp.context_menu(|ui| {
         ui.set_min_width(200.0);
         if col.sortable {
@@ -5321,29 +5368,35 @@ fn grid_header_cell(
             }
             ui.separator();
         }
-        if !locked(col.id) && !col.title.is_empty() {
-            if ui.button(format!("🚫  Hide '{}'", col.title)).clicked() {
-                grid_columns::set_visible(entries, col.id, false);
-                ui.close();
-            }
-            ui.separator();
+        if !locked(col.id) && !col.title.is_empty() && ui.button(format!("🚫  Hide '{}'", col.title)).clicked() {
+            grid_columns::set_visible(entries, col.id, false);
+            ui.close();
         }
+        if ui.button("⇕  Reorder columns…").clicked() {
+            open_reorder = true;
+            ui.close();
+        }
+        ui.separator();
         egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-            grid_columns::column_chooser_editor(ui, entries, columns, &locked);
+            grid_columns::column_chooser_editor(ui, entries, columns, &locked, false);
         });
     });
+    open_reorder
 }
 
 /// Simpler variant of [`grid_header_cell`] for tables with no sort/filter (the
 /// 4 "simple" tables: Background Active/Recent, Processes, Issues) — just the
-/// plain label plus the shared column-chooser context menu.
+/// plain label plus the shared column-chooser context menu. Returns true when
+/// "⇕ Reorder columns…" was clicked this frame (caller opens the dedicated
+/// apply-once window — see [`grid_header_cell`]'s doc on why reordering isn't
+/// inline here).
 fn grid_header_cell_plain(
     ui: &mut egui::Ui,
     table: GridTableId,
     col: &GridCol,
     entries: &mut [ColumnEntry],
     columns: &[GridCol],
-) {
+) -> bool {
     if !col.title.is_empty() {
         ui.strong(col.title).on_hover_text(col.tooltip);
     }
@@ -5352,19 +5405,23 @@ fn grid_header_cell_plain(
         egui::Id::new(("grid_col_ctx", table.key(), col.id)),
         egui::Sense::click(),
     );
+    let mut open_reorder = false;
     ctx_resp.context_menu(|ui| {
         ui.set_min_width(200.0);
-        if !col.title.is_empty() {
-            if ui.button(format!("🚫  Hide '{}'", col.title)).clicked() {
-                grid_columns::set_visible(entries, col.id, false);
-                ui.close();
-            }
-            ui.separator();
+        if !col.title.is_empty() && ui.button(format!("🚫  Hide '{}'", col.title)).clicked() {
+            grid_columns::set_visible(entries, col.id, false);
+            ui.close();
         }
+        if ui.button("⇕  Reorder columns…").clicked() {
+            open_reorder = true;
+            ui.close();
+        }
+        ui.separator();
         egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-            grid_columns::column_chooser_editor(ui, entries, columns, |_| false);
+            grid_columns::column_chooser_editor(ui, entries, columns, |_| false, false);
         });
     });
+    open_reorder
 }
 
 /// Sort/filter cells for one video row, in Videos-table column order:
@@ -7299,6 +7356,7 @@ impl eframe::App for StreamArchiverApp {
         self.asset_history_windows(ui.ctx());
         self.recording_properties_windows(ui.ctx());
         self.processes_window(ui.ctx());
+        self.reorder_columns_window(ui.ctx());
         self.scheduled_recordings_window(ui.ctx());
         self.scheduled_recording_form_window(ui.ctx());
         self.confirm_delete_scheduled_recording_window(ui.ctx());
@@ -8174,19 +8232,28 @@ impl StreamArchiverApp {
                     };
                     tb = tb.column(col);
                 }
+                let mut want_reorder = false;
                 let table = tb
                     .header(46.0, |mut header| {
                         for &i in &col_order {
                             let c = &VIDEO_COLUMNS[i];
                             let (rect, _) = header.col(|ui| {
-                                grid_header_cell(
+                                if grid_header_cell(
                                     ui, GridTableId::Videos, i, c, true, &mut sort, &mut filters[i],
                                     &mut entries, &VIDEO_COLUMNS, |id| id == "actions",
-                                );
+                                ) {
+                                    want_reorder = true;
+                                }
                             });
                             self.videos_grid.widths.note(c.id, rect.width());
                         }
                     });
+                if want_reorder {
+                    self.reorder_columns = Some(ReorderColumnsState {
+                        table: GridTableId::Videos,
+                        draft: entries.clone(),
+                    });
+                }
                 table.body(|body| {
                         let order = ordered_rows(model, &sort, &filters);
                         // Virtualized: only the rows in view are laid out.
@@ -12784,6 +12851,75 @@ impl StreamArchiverApp {
         }
     }
 
+    /// The "⇕ Reorder columns…" window: edits a working COPY of one table's
+    /// entries (checkbox + ▲/▼, reorder enabled unlike the inline header
+    /// popup) and only commits — one save, one table reset — on Apply.
+    /// Closing the window (✖/native close) discards the draft, same as
+    /// Cancel.
+    #[allow(deprecated)] // CentralPanel::show(ctx) is correct inside a viewport closure
+    fn reorder_columns_window(&mut self, ctx: &egui::Context) {
+        let Some(state) = &mut self.reorder_columns else {
+            return;
+        };
+        let table = state.table;
+        let mut apply = false;
+        let mut cancel = false;
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of(("reorder_columns_vp", table.key())),
+            egui::ViewportBuilder::default()
+                .with_title(format!("Reorder columns — {}", table_display_name(table)))
+                .with_inner_size([320.0, 480.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    cancel = true;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label("Move columns into the order you want, then Apply.");
+                    ui.separator();
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        grid_columns::column_chooser_editor(
+                            ui, &mut state.draft, columns_for(table), |id| id == "actions", true,
+                        );
+                    });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("✔  Apply").clicked() {
+                            apply = true;
+                        }
+                        if ui.button("✖  Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            },
+        );
+
+        if apply {
+            let entries = state.draft.clone();
+            self.apply_reordered_columns(table, entries);
+        }
+        if apply || cancel {
+            self.reorder_columns = None;
+        }
+    }
+
+    /// Write a "⇕ Reorder columns…" draft back into the live grid state for
+    /// `table` and persist it — the ONE reset this whole flow causes, no
+    /// matter how many intermediate moves the user made in the draft window.
+    fn apply_reordered_columns(&mut self, table: GridTableId, entries: Vec<ColumnEntry>) {
+        let target = match table {
+            GridTableId::Streams => &mut self.streams_grid.entries,
+            GridTableId::Videos => &mut self.videos_grid.entries,
+            GridTableId::BgActive => &mut self.bg_active_grid.entries,
+            GridTableId::BgRecent => &mut self.bg_recent_grid.entries,
+            GridTableId::Processes => &mut self.processes_grid.entries,
+            GridTableId::Issues => &mut self.issues_grid.entries,
+        };
+        *target = entries;
+        grid_columns::save_columns(&self.core.store, table, target);
+    }
+
     /// The scheduled-recordings management window: list (Channel/Instance/
     /// Recurrence/Next run/Duration/Enabled) with Edit/Delete row actions and
     /// an "+ Add new" picker over every known instance.
@@ -13420,20 +13556,29 @@ impl StreamArchiverApp {
                 {
                     tb = tb.scroll_to_row(i, Some(egui::Align::Center));
                 }
+                let mut want_reorder = false;
                 let table = tb.header(46.0, |mut header| {
                     for &i in &col_order {
                         let c = &STREAM_COLUMNS[i];
                         let (rect, _) = header.col(|ui| {
-                            grid_header_cell(
+                            if grid_header_cell(
                                 ui, GridTableId::Streams, i, c, true, &mut sort, &mut filters[i],
                                 &mut entries, &STREAM_COLUMNS, |id| id == "actions",
-                            );
+                            ) {
+                                want_reorder = true;
+                            }
                         });
                         // Every frame, not just on a reset — this is what a later
                         // hide/show/reorder's fresh sizing pass seeds from.
                         self.streams_grid.widths.note(c.id, rect.width());
                     }
                 });
+                if want_reorder {
+                    self.reorder_columns = Some(ReorderColumnsState {
+                        table: GridTableId::Streams,
+                        draft: entries.clone(),
+                    });
+                }
                 table.body(|body| {
                     // Virtualized: only the rows in view are laid out — the old
                     // per-row loop rebuilt every widget of every row each frame.
@@ -15727,7 +15872,12 @@ impl StreamArchiverApp {
                         for &i in &bg_active_order {
                             let c = &BG_ACTIVE_COLUMNS[i];
                             h.col(|ui| {
-                                grid_header_cell_plain(ui, GridTableId::BgActive, c, &mut bg_active_entries, &BG_ACTIVE_COLUMNS);
+                                if grid_header_cell_plain(ui, GridTableId::BgActive, c, &mut bg_active_entries, &BG_ACTIVE_COLUMNS) {
+                                    self.reorder_columns = Some(ReorderColumnsState {
+                                        table: GridTableId::BgActive,
+                                        draft: bg_active_entries.clone(),
+                                    });
+                                }
                             });
                         }
                     })
@@ -15789,7 +15939,12 @@ impl StreamArchiverApp {
                         for &i in &bg_recent_order {
                             let c = &BG_RECENT_COLUMNS[i];
                             h.col(|ui| {
-                                grid_header_cell_plain(ui, GridTableId::BgRecent, c, &mut bg_recent_entries, &BG_RECENT_COLUMNS);
+                                if grid_header_cell_plain(ui, GridTableId::BgRecent, c, &mut bg_recent_entries, &BG_RECENT_COLUMNS) {
+                                    self.reorder_columns = Some(ReorderColumnsState {
+                                        table: GridTableId::BgRecent,
+                                        draft: bg_recent_entries.clone(),
+                                    });
+                                }
                             });
                         }
                     })
@@ -18154,7 +18309,12 @@ impl StreamArchiverApp {
                         for &i in &processes_order {
                             let c = &PROCESSES_COLUMNS[i];
                             h.col(|ui| {
-                                grid_header_cell_plain(ui, GridTableId::Processes, c, &mut processes_entries, &PROCESSES_COLUMNS);
+                                if grid_header_cell_plain(ui, GridTableId::Processes, c, &mut processes_entries, &PROCESSES_COLUMNS) {
+                                    self.reorder_columns = Some(ReorderColumnsState {
+                                        table: GridTableId::Processes,
+                                        draft: processes_entries.clone(),
+                                    });
+                                }
                             });
                         }
                     })
@@ -19165,7 +19325,12 @@ impl StreamArchiverApp {
                         for &i in &issues_order {
                             let c = &ISSUES_COLUMNS[i];
                             h.col(|ui| {
-                                grid_header_cell_plain(ui, GridTableId::Issues, c, &mut issues_entries, &ISSUES_COLUMNS);
+                                if grid_header_cell_plain(ui, GridTableId::Issues, c, &mut issues_entries, &ISSUES_COLUMNS) {
+                                    self.reorder_columns = Some(ReorderColumnsState {
+                                        table: GridTableId::Issues,
+                                        draft: issues_entries.clone(),
+                                    });
+                                }
                             });
                         }
                     })

@@ -49,6 +49,17 @@ The window has three tabs: **Streams** (monitor channels for live broadcasts),
 
 ## Using it
 
+### Table columns (Streams, Videos, Background, Processes, Issues)
+
+Every data table's columns can be **hidden/shown** and **resized** by
+dragging a header edge — both persist across restarts. Right-click any
+header for: sort, a filter box, **Hide** this column, and **⇕ Reorder
+columns…**, which opens a small window to freely move columns up/down (and
+toggle visibility) without touching the live table — nothing changes until
+you hit **Apply**, so moving a column across many positions doesn't cause a
+resize/flicker on every intermediate step. **⇔** (Streams toolbar) re-fits
+all columns to their content.
+
 ### Streams (live monitoring)
 
 A **channel** is a *container* (just a name) holding one or more **instances**.
