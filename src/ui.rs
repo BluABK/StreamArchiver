@@ -12889,6 +12889,63 @@ impl StreamArchiverApp {
                                                 ui.close();
                                             }
                                         }
+                                        // VOD-related actions target this stream's LATEST
+                                        // take — a multi-take stream has no single "the"
+                                        // file, but "the VOD" and "the missed head" both
+                                        // conceptually belong to the broadcast as a whole,
+                                        // so pick the take most likely still relevant.
+                                        // Mirrors the same buttons on the Take row.
+                                        if let Some(t) = g.takes.iter().max_by_key(|t| t.started_at)
+                                            && t.stream_id.is_some()
+                                        {
+                                            if ui
+                                                .button("🛟  Recover VOD…")
+                                                .on_hover_text("Reconstruct this stream's (latest take's) VOD from segments still on the Twitch CDN (deleted or DMCA-muted).")
+                                                .clicked()
+                                            {
+                                                open_recover_take = Some(t.id);
+                                                ui.close();
+                                            }
+                                            if ui
+                                                .button("📥  Download post-stream VOD")
+                                                .on_hover_text("Download the platform's full published VOD for this stream's latest take now (also retries a failed archive). For the missed intro of a from-start capture, use \"Backfill head\" instead.")
+                                                .clicked()
+                                            {
+                                                archive_vod_now = Some(t.id);
+                                                ui.close();
+                                            }
+                                            let owning_monitor = self
+                                                .rows
+                                                .iter()
+                                                .find(|r| r.monitor.id == mid)
+                                                .map(|r| &r.monitor);
+                                            let is_twitch = owning_monitor
+                                                .map(|m| m.platform() == Platform::Twitch)
+                                                .unwrap_or(false);
+                                            let is_live = owning_monitor
+                                                .map(|m| matches!(m.last_state.as_str(), "live" | "recording"))
+                                                .unwrap_or(false);
+                                            if is_twitch
+                                                && ui
+                                                    .add_enabled(is_live, egui::Button::new("🧩  Backfill head"))
+                                                    .on_hover_text(
+                                                        "Fetch this stream's latest take's missed intro from \
+                                                         Twitch's still-growing live CDN playlist (pre-mute \
+                                                         audio). Always forced — ignores the \"fetch new head \
+                                                         backfill on new take\" setting.",
+                                                    )
+                                                    .on_disabled_hover_text(
+                                                        "This channel isn't currently live — head backfill needs \
+                                                         the still-growing live CDN playlist, which stops being \
+                                                         reliably pre-mute-safe once the stream ends. Use \
+                                                         \"Download post-stream VOD\" instead.",
+                                                    )
+                                                    .clicked()
+                                            {
+                                                backfill_head_now = Some(t.id);
+                                                ui.close();
+                                            }
+                                        }
                                         if ui
                                             .add_enabled(
                                                 dir.is_some(),
