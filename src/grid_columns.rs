@@ -1,7 +1,7 @@
 //! Persisted, user-customizable grid columns: visibility, order, and sort for
 //! every data table (Streams, Videos, Background Active/Recent, Processes,
-//! Issues). Column widths are NOT covered here — they're persisted separately,
-//! for free, by `egui_extras`'s own `TableState` (Cargo.toml enables its
+//! Issues). Column *restart* persistence is NOT covered here — it's handled
+//! for free by `egui_extras`'s own `TableState` (Cargo.toml enables its
 //! `serde` feature) via egui's normal memory persistence (`eframe`'s
 //! `persistence_path`, keyed by each table's `id_salt` — see `GridTableId::key`,
 //! reused as the `id_salt` in every `TableBuilder`). The one thing THIS module
@@ -9,6 +9,15 @@
 //! not report "changed" on a table's first frame of a session — see its doc
 //! comment — or the caller's resulting `tb.reset()` wipes the widths egui just
 //! loaded from disk before they're ever painted.
+//!
+//! Column widths *surviving a hide/show/reorder within a session* IS covered
+//! here, via [`WidthMemory`] — `egui_extras`'s cache is positionally indexed
+//! and discards itself wholesale (not per-column) the instant the visible-
+//! column list's length or order changes, so without this every OTHER
+//! column's carefully-resized width would visibly snap back too. The caller
+//! notes each column's actual rendered width every frame and, only on a
+//! reset-forced frame, seeds the fresh sizing pass from what it remembered
+//! instead of the column's static declared default.
 //!
 //! Mirrors [`crate::schedule_source`]'s `SourceEntry` / `load_source_order` /
 //! `save_source_order` / `merge_order` pattern almost exactly, generalized
@@ -128,6 +137,42 @@ impl GridTableId {
     }
 }
 
+/// Per-column-id widths, remembered in-session so a hide/show/reorder-forced
+/// `TableBuilder::reset()` doesn't visually reset every column's size —
+/// `egui_extras`'s own width cache is positionally indexed and unconditionally
+/// discarded in full whenever the visible-column list's length OR order
+/// changes (confirmed in `egui_extras-0.34.3/src/table.rs::TableState::load`;
+/// no public API exists to read it back, so we keep our own copy). Deliberately
+/// session-only, not persisted to the store: app-restart persistence is
+/// already handled separately by `egui_extras`'s own serde-backed `TableState`
+/// (see the module docs above) — this only needs to survive the moment
+/// between "user hid/showed/reordered a column" and "the next sizing pass",
+/// which is always within the same running session.
+#[derive(Default)]
+pub struct WidthMemory(HashMap<String, f32>);
+
+impl WidthMemory {
+    /// Record a column's current rendered width (call every frame from the
+    /// header cell's actual laid-out rect — cheap, and always up to date).
+    pub fn note(&mut self, id: &str, width: f32) {
+        self.0.insert(id.to_string(), width);
+    }
+
+    /// The last-known width for a column id, if any (`None` for a column that
+    /// was never rendered this session, e.g. right after being shown for the
+    /// first time ever).
+    pub fn get(&self, id: &str) -> Option<f32> {
+        self.0.get(id).copied()
+    }
+
+    /// Forget every remembered width — used by the explicit "Fit columns"
+    /// action, which should size fresh from content rather than restore
+    /// whatever was previously remembered.
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
 /// Per-table runtime state: the persisted column entries plus the previous
 /// frame's effective order. `note_order` detects a pure reorder (column count
 /// unchanged) so the caller can force a `TableBuilder` width-cache reset —
@@ -143,6 +188,9 @@ pub struct GridState {
     /// would force a `tb.reset()` on the very first frame, wiping out the
     /// widths egui just loaded from disk before they're ever shown.
     last_order: Option<Vec<usize>>,
+    /// See [`WidthMemory`]. Public so the caller can `.note()`/`.get()`/
+    /// `.clear()` it around its own `TableBuilder` construction.
+    pub widths: WidthMemory,
 }
 
 impl GridState {
@@ -150,6 +198,7 @@ impl GridState {
         GridState {
             entries: load_columns(store, table, columns),
             last_order: None,
+            widths: WidthMemory::default(),
         }
     }
 
@@ -448,6 +497,21 @@ mod tests {
         assert!(!state.note_order(&[0, 1, 2]), "unchanged order stays unchanged");
         assert!(state.note_order(&[1, 0, 2]), "an actual reorder must report changed");
         assert!(!state.note_order(&[1, 0, 2]), "settles back to unchanged after the reorder");
+    }
+
+    #[test]
+    fn width_memory_recalls_last_noted_width_until_cleared() {
+        let mut w = WidthMemory::default();
+        assert_eq!(w.get("a"), None, "nothing remembered yet");
+        w.note("a", 123.0);
+        w.note("b", 45.0);
+        assert_eq!(w.get("a"), Some(123.0));
+        w.note("a", 200.0); // a later note overwrites, doesn't accumulate
+        assert_eq!(w.get("a"), Some(200.0));
+        assert_eq!(w.get("b"), Some(45.0), "unrelated id untouched");
+        w.clear();
+        assert_eq!(w.get("a"), None, "cleared (e.g. by a manual 'Fit columns')");
+        assert_eq!(w.get("b"), None);
     }
 
     #[test]

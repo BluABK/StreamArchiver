@@ -8161,8 +8161,14 @@ impl StreamArchiverApp {
                 }
                 for &i in &col_order {
                     let c = &VIDEO_COLUMNS[i];
+                    // A hide/show/reorder-forced reset restores each column to
+                    // its last remembered width instead of snapping back to the
+                    // declared default — see `WidthMemory` (`grid_columns.rs`).
+                    let seed = self.videos_grid.widths.get(c.id);
                     let col = if c.stretch {
                         Column::remainder().at_least(c.min_width)
+                    } else if order_changed && let Some(w) = seed {
+                        Column::auto_with_initial_suggestion(w).at_least(c.min_width)
                     } else {
                         Column::auto().at_least(c.min_width)
                     };
@@ -8172,12 +8178,13 @@ impl StreamArchiverApp {
                     .header(46.0, |mut header| {
                         for &i in &col_order {
                             let c = &VIDEO_COLUMNS[i];
-                            header.col(|ui| {
+                            let (rect, _) = header.col(|ui| {
                                 grid_header_cell(
                                     ui, GridTableId::Videos, i, c, true, &mut sort, &mut filters[i],
                                     &mut entries, &VIDEO_COLUMNS, |id| id == "actions",
                                 );
                             });
+                            self.videos_grid.widths.note(c.id, rect.width());
                         }
                     });
                 table.body(|body| {
@@ -13279,8 +13286,15 @@ impl StreamArchiverApp {
                     .platform_tex
                     .get_or_insert_with(|| PlatformTextures::load(ui.ctx()))
                     .clone();
-                let reset_cols =
-                    std::mem::replace(&mut self.reset_streams_columns, false) || order_changed;
+                // "Manual fit" (the "⇔" toolbar button) and an in-session reorder
+                // both force a fresh sizing pass, but they seed it differently:
+                // a manual fit should size fresh from content (forget anything
+                // remembered), while a hide/show/reorder should restore each
+                // column to whatever the user last resized it to — see
+                // `WidthMemory` (`grid_columns.rs`) for why egui_extras's own
+                // cache can't survive either event on its own.
+                let manual_fit = std::mem::replace(&mut self.reset_streams_columns, false);
+                let reset_cols = manual_fit || order_changed;
                 let mut tb = TableBuilder::new(ui)
                     .id_salt("streams_table")
                     .striped(true)
@@ -13293,6 +13307,9 @@ impl StreamArchiverApp {
                     // Clear persisted column widths so the next load() triggers a
                     // fresh sizing pass at the columns' initial widths.
                     tb.reset();
+                    if manual_fit {
+                        self.streams_grid.widths.clear();
+                    }
                 }
                 // One column per entry in `col_order` (this frame's persisted,
                 // visibility-filtered display order — see `effective_order`);
@@ -13306,8 +13323,13 @@ impl StreamArchiverApp {
                         // seeds the column at min_width (not 0) so cells render
                         // normally during the pass — no zero-width wrapping, no
                         // vertical row bounce. After the pass, content widths are
-                        // stored and the next frame snaps to them.
-                        Column::auto_with_initial_suggestion(min_width)
+                        // stored and the next frame snaps to them. A remembered
+                        // width (unless this is a manual fit, which wants a fresh
+                        // content-based size) overrides that seed so a hide/show/
+                        // reorder restores the user's own size instead of
+                        // snapping back to the declared default.
+                        let seed = self.streams_grid.widths.get(c.id).unwrap_or(min_width);
+                        Column::auto_with_initial_suggestion(seed)
                             .at_least(min_width)
                             .clip(c.initial > 0.0)
                     } else if c.initial > 0.0 {
@@ -13401,12 +13423,15 @@ impl StreamArchiverApp {
                 let table = tb.header(46.0, |mut header| {
                     for &i in &col_order {
                         let c = &STREAM_COLUMNS[i];
-                        header.col(|ui| {
+                        let (rect, _) = header.col(|ui| {
                             grid_header_cell(
                                 ui, GridTableId::Streams, i, c, true, &mut sort, &mut filters[i],
                                 &mut entries, &STREAM_COLUMNS, |id| id == "actions",
                             );
                         });
+                        // Every frame, not just on a reset — this is what a later
+                        // hide/show/reorder's fresh sizing pass seeds from.
+                        self.streams_grid.widths.note(c.id, rect.width());
                     }
                 });
                 table.body(|body| {
