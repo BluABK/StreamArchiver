@@ -332,36 +332,44 @@ pub fn column_chooser_editor(
             continue;
         };
         let is_locked = locked(&entry.id);
-        ui.horizontal(|ui| {
-            if is_locked {
-                let mut always_on = true;
-                ui.add_enabled(false, egui::Checkbox::new(&mut always_on, ""))
-                    .on_hover_text("Visibility controlled by Settings → Display");
-            } else if ui.checkbox(&mut entry.visible, "").changed() {
-                changed = true;
-            }
-            if ui
-                .add_enabled(i > 0, egui::Button::new("▲").small())
-                .on_hover_text("Move up")
-                .clicked()
-            {
-                move_up = Some(i);
-            }
-            if ui
-                .add_enabled(i + 1 < n, egui::Button::new("▼").small())
-                .on_hover_text("Move down")
-                .clicked()
-            {
-                move_down = Some(i);
-            }
-            let mut label = egui::RichText::new(col.title);
-            if !entry.visible {
-                label = label.weak();
-            }
-            let resp = ui.label(label);
-            if !col.tooltip.is_empty() {
-                resp.on_hover_text(col.tooltip);
-            }
+        // Content-keyed by the column's own stable id, not row position: a
+        // ▲/▼ move swaps which entry sits at index `i`, and without this a
+        // reorder would leave each widget's identity behind at its OLD
+        // position instead of following its entry — the same position-vs-
+        // content id-churn class of bug already fixed in the Posts tab this
+        // session (see [[egui-widget-id-warnings]]).
+        ui.push_id(entry.id.clone(), |ui| {
+            ui.horizontal(|ui| {
+                if is_locked {
+                    let mut always_on = true;
+                    ui.add_enabled(false, egui::Checkbox::new(&mut always_on, ""))
+                        .on_hover_text("Visibility controlled by Settings → Display");
+                } else if ui.checkbox(&mut entry.visible, "").changed() {
+                    changed = true;
+                }
+                if ui
+                    .add_enabled(i > 0, egui::Button::new("▲").small())
+                    .on_hover_text("Move up")
+                    .clicked()
+                {
+                    move_up = Some(i);
+                }
+                if ui
+                    .add_enabled(i + 1 < n, egui::Button::new("▼").small())
+                    .on_hover_text("Move down")
+                    .clicked()
+                {
+                    move_down = Some(i);
+                }
+                let mut label = egui::RichText::new(col.title);
+                if !entry.visible {
+                    label = label.weak();
+                }
+                let resp = ui.label(label);
+                if !col.tooltip.is_empty() {
+                    resp.on_hover_text(col.tooltip);
+                }
+            });
         });
     }
     if let Some(i) = move_up {
