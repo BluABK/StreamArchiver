@@ -265,6 +265,9 @@ struct ChannelForm {
     /// Post-stream VOD-download overrides for this channel (`None` = inherit global).
     vod_download: Option<bool>,
     vod_replace: Option<bool>,
+    /// Head-backfill-on-new-take overrides for this channel (`None` = inherit global).
+    head_backfill_fetch: Option<bool>,
+    head_backfill_replace: Option<bool>,
 }
 
 /// Backing state for the add/edit dialog. `name` is the channel (container) name;
@@ -322,6 +325,10 @@ struct MonitorForm {
     /// channel/global default). Loaded from / saved to the monitor scope map.
     vod_download: Option<bool>,
     vod_replace: Option<bool>,
+    /// Head-backfill-on-new-take overrides for this instance (`None` = inherit
+    /// the channel/global default). Loaded from / saved to the monitor scope map.
+    head_backfill_fetch: Option<bool>,
+    head_backfill_replace: Option<bool>,
 }
 
 impl MonitorForm {
@@ -363,6 +370,8 @@ impl MonitorForm {
             last_platform: None,
             vod_download: None,
             vod_replace: None,
+            head_backfill_fetch: None,
+            head_backfill_replace: None,
         }
     }
 
@@ -401,6 +410,8 @@ impl MonitorForm {
             // Overridden by the caller from the monitor scope map (needs the store).
             vod_download: None,
             vod_replace: None,
+            head_backfill_fetch: None,
+            head_backfill_replace: None,
         }
     }
 
@@ -441,6 +452,8 @@ impl MonitorForm {
             last_platform: None,
             vod_download: None,
             vod_replace: None,
+            head_backfill_fetch: None,
+            head_backfill_replace: None,
         }
     }
 }
@@ -654,6 +667,13 @@ struct SettingsForm {
     vod_dl_enabled: bool,
     /// Replace the live recording with the VOD when the download succeeds.
     vod_dl_replace: bool,
+    // --- Head backfill on new takes (global defaults for the 3-level chain) ---
+    /// Fetch a fresh, full head backfill for a later take (a reconnect
+    /// mid-broadcast), not just the stream's first take. Default on.
+    head_backfill_fetch_new_take: bool,
+    /// Once a fresh head passes its integrity checks, delete older takes'
+    /// now-redundant head files for the same stream. Default on.
+    head_backfill_replace_old: bool,
     /// Global trigger-word rules (start recording on title/game match even with
     /// Auto off). Channel/instance Properties can extend/replace/disable them.
     trigger_rules: Vec<crate::triggers::TriggerRule>,
@@ -1310,6 +1330,19 @@ impl StreamArchiverApp {
             recovery_max_conc: setting_or_empty(&core, crate::recovery::K_RECOVERY_MAX_CONC),
             vod_dl_enabled: setting_or_empty(&core, crate::vod_archive::K_VOD_DL_ENABLED) == "1",
             vod_dl_replace: setting_or_empty(&core, crate::vod_archive::K_VOD_DL_REPLACE) == "1",
+            // Default ON: missing key or anything but "0" ⇒ true.
+            head_backfill_fetch_new_take: core
+                .store
+                .get_setting(crate::head_backfill::K_HEAD_BACKFILL_FETCH)
+                .ok()
+                .flatten()
+                .is_none_or(|v| v != "0"),
+            head_backfill_replace_old: core
+                .store
+                .get_setting(crate::head_backfill::K_HEAD_BACKFILL_REPLACE)
+                .ok()
+                .flatten()
+                .is_none_or(|v| v != "0"),
             trigger_rules: crate::triggers::load_global_rules(&core.store),
             custom_tools: crate::downloader::load_custom_tools(&core.store),
         };
@@ -2091,6 +2124,10 @@ impl StreamArchiverApp {
             download: form.vod_download,
             replace: form.vod_replace,
         };
+        let head_backfill_scope = crate::head_backfill::HeadBackfillScope {
+            fetch: form.head_backfill_fetch,
+            replace: form.head_backfill_replace,
+        };
 
         // Close the form immediately so the UI stays responsive while the DB
         // work runs. On a background-thread error the status bar shows the error;
@@ -2134,6 +2171,11 @@ impl StreamArchiverApp {
                         }
                     };
                     let _ = crate::vod_archive::save_monitor_vod_scope(&store, mid, &vod_scope);
+                    let _ = crate::head_backfill::save_monitor_head_backfill_scope(
+                        &store,
+                        mid,
+                        &head_backfill_scope,
+                    );
                     let rows = store.list_monitors_with_channels().map_err(|e| e.to_string())?;
                     let next_streams =
                         store.next_scheduled_streams(now_unix()).map_err(|e| e.to_string())?;
@@ -2446,6 +2488,8 @@ impl StreamArchiverApp {
             (crate::recovery::K_RECOVERY_MAX_CONC, s.recovery_max_conc.trim()),
             (crate::vod_archive::K_VOD_DL_ENABLED, if s.vod_dl_enabled { "1" } else { "0" }),
             (crate::vod_archive::K_VOD_DL_REPLACE, if s.vod_dl_replace { "1" } else { "0" }),
+            (crate::head_backfill::K_HEAD_BACKFILL_FETCH, if s.head_backfill_fetch_new_take { "1" } else { "0" }),
+            (crate::head_backfill::K_HEAD_BACKFILL_REPLACE, if s.head_backfill_replace_old { "1" } else { "0" }),
         ];
         for (k, v) in pairs {
             if let Err(e) = self.core.store.set_setting(k, v) {
@@ -6643,6 +6687,8 @@ impl eframe::App for StreamArchiverApp {
                                     color: String::new(),
                                     vod_download: None,
                                     vod_replace: None,
+                                    head_backfill_fetch: None,
+                                    head_backfill_replace: None,
                                 });
                             }
                             if ui
@@ -6733,6 +6779,8 @@ impl eframe::App for StreamArchiverApp {
                 color: String::new(),
                 vod_download: None,
                 vod_replace: None,
+                head_backfill_fetch: None,
+                head_backfill_replace: None,
             });
         }
         if ctx_refresh_schedule {
@@ -6869,6 +6917,9 @@ impl StreamArchiverApp {
                         let sc = crate::vod_archive::load_monitor_vod_scope(&self.core.store, self.rows[idx].monitor.id);
                         mf.vod_download = sc.download;
                         mf.vod_replace = sc.replace;
+                        let hbsc = crate::head_backfill::load_monitor_head_backfill_scope(&self.core.store, self.rows[idx].monitor.id);
+                        mf.head_backfill_fetch = hbsc.fetch;
+                        mf.head_backfill_replace = hbsc.replace;
                         self.form = Some(mf);
                     }
                 }
@@ -7175,6 +7226,25 @@ impl StreamArchiverApp {
                                      a muted Twitch VOD). Inherit follows the global default.",
                                 );
                             ui.end_row();
+
+                            ui.label("Fetch new head backfill on new take");
+                            tristate_combo(ui, "chform_head_backfill_fetch", &mut f.head_backfill_fetch)
+                                .on_hover_text(
+                                    "Capture-from-start only: fetch a fresh head backfill for a \
+                                     retake (reconnect mid-broadcast), not just the stream's first \
+                                     take. Inherit follows the global default (Settings).",
+                                );
+                            ui.end_row();
+
+                            ui.label("Replace old head (if new is undamaged)");
+                            tristate_combo(ui, "chform_head_backfill_replace", &mut f.head_backfill_replace)
+                                .on_hover_text(
+                                    "Once a fresh head backfill passes its integrity checks, delete \
+                                     older takes' now-redundant head files for the same stream. Only \
+                                     takes effect when fetching a new head is also on. Inherit \
+                                     follows the global default.",
+                                );
+                            ui.end_row();
                         });
                     if !renaming {
                         ui.label(
@@ -7210,6 +7280,10 @@ impl StreamArchiverApp {
                     download: f.vod_download,
                     replace: f.vod_replace,
                 };
+                let head_backfill_scope = crate::head_backfill::HeadBackfillScope {
+                    fetch: f.head_backfill_fetch,
+                    replace: f.head_backfill_replace,
+                };
                 let res = match id_opt {
                     Some(id) => self
                         .core
@@ -7225,6 +7299,11 @@ impl StreamArchiverApp {
                             &self.core.store,
                             cid,
                             &vod_scope,
+                        );
+                        let _ = crate::head_backfill::save_channel_head_backfill_scope(
+                            &self.core.store,
+                            cid,
+                            &head_backfill_scope,
                         );
                         self.status = "Saved.".into();
                         self.channel_form = None;
@@ -13467,6 +13546,9 @@ impl StreamArchiverApp {
                 let sc = crate::vod_archive::load_monitor_vod_scope(&self.core.store, r.monitor.id);
                 mf.vod_download = sc.download;
                 mf.vod_replace = sc.replace;
+                let hbsc = crate::head_backfill::load_monitor_head_backfill_scope(&self.core.store, r.monitor.id);
+                mf.head_backfill_fetch = hbsc.fetch;
+                mf.head_backfill_replace = hbsc.replace;
                 self.form = Some(mf);
             }
         }
@@ -13530,12 +13612,15 @@ impl StreamArchiverApp {
         if let Some(cid) = rename_channel {
             if let Some(c) = self.channels.iter().find(|c| c.id == cid) {
                 let sc = crate::vod_archive::load_channel_vod_scope(&self.core.store, cid);
+                let hbsc = crate::head_backfill::load_channel_head_backfill_scope(&self.core.store, cid);
                 self.channel_form = Some(ChannelForm {
                     id: Some(cid),
                     name: c.name.clone(),
                     color: c.color.clone(),
                     vod_download: sc.download,
                     vod_replace: sc.replace,
+                    head_backfill_fetch: hbsc.fetch,
+                    head_backfill_replace: hbsc.replace,
                 });
             }
         }
@@ -15771,6 +15856,40 @@ impl StreamArchiverApp {
             .on_hover_text(
                 "Only when the download succeeds and (Twitch) the VOD isn't DMCA-muted. The live \
                  recording's chat/thumbnail sidecars are kept.",
+            );
+
+            // ── Post-stream VOD download ────────────────────────────────────────
+            }
+
+            if self.section_shown(SettingsTab::Downloads, "Head backfill on new takes", &["head", "backfill", "take", "retake", "reconnect", "capture from start"]) {
+            ui.add_space(12.0);
+            ui.heading("Head backfill on new takes 🧩");
+            ui.label(
+                "Capture-from-start only: when a stream reconnects mid-broadcast (a new \
+                 recording \"take\"), the gap since the previous take ended is lost the same way \
+                 a missed intro is — and is just as recoverable from the still-growing live CDN \
+                 playlist while the stream stays live. These are the GLOBAL defaults; override \
+                 per-channel (channel Properties) or per-instance (edit instance).",
+            );
+            ui.add_space(6.0);
+            ui.checkbox(
+                &mut self.settings.head_backfill_fetch_new_take,
+                "Fetch new head backfill on new take",
+            )
+            .on_hover_text(
+                "Fetch a fresh, full head backfill (go-live through this take's start) for every \
+                 take, not just the stream's first. Off restores the original behavior: only the \
+                 first take ever gets a head backfill.",
+            );
+            ui.checkbox(
+                &mut self.settings.head_backfill_replace_old,
+                "Replace old head (if new is undamaged)",
+            )
+            .on_hover_text(
+                "Once a fresh head backfill passes its integrity checks (no muted segments, \
+                 plausible duration), delete older takes' now-redundant head files for the same \
+                 stream. Only takes effect when fetching a new head is also on; a fresh head \
+                 that fails its checks is still kept, just never used to replace anything.",
             );
 
             // ── Trigger words ──────────────────────────────────────────────────
@@ -18473,6 +18592,25 @@ impl StreamArchiverApp {
                                 "Replace the live recording with the downloaded VOD when it \
                                  succeeds (never for a muted Twitch VOD). Inherit follows the \
                                  channel, then the global default.",
+                            );
+                        ui.end_row();
+
+                        ui.label("Fetch new head backfill on new take");
+                        tristate_combo(ui, "form_head_backfill_fetch", &mut form.head_backfill_fetch)
+                            .on_hover_text(
+                                "Capture-from-start only: fetch a fresh head backfill for a retake \
+                                 (reconnect mid-broadcast), not just the stream's first take. \
+                                 Inherit follows the channel, then the global default.",
+                            );
+                        ui.end_row();
+
+                        ui.label("Replace old head (if new is undamaged)");
+                        tristate_combo(ui, "form_head_backfill_replace", &mut form.head_backfill_replace)
+                            .on_hover_text(
+                                "Once a fresh head backfill passes its integrity checks, delete \
+                                 older takes' now-redundant head files for the same stream. Only \
+                                 takes effect when fetching a new head is also on. Inherit follows \
+                                 the channel, then the global default.",
                             );
                         ui.end_row();
 

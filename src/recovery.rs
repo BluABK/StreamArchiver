@@ -154,6 +154,12 @@ pub struct RecoveredPlaylist {
     pub present: usize,
     /// Muted segments whose pre-mute original `{n}.ts` survived (true un-mute).
     pub unmuted_recovered: usize,
+    /// Segments that had to fall back to the constructed `-muted` copy — the
+    /// pre-mute original didn't survive, so these ARE silent in the output.
+    /// Unlike `unmuted_recovered`, a nonzero count here means real, audible
+    /// mute damage in `text` (used by head-backfill's integrity gate before
+    /// superseding an older take's head file).
+    pub muted_used: usize,
     /// Segments dropped (neither original nor muted copy on the CDN).
     pub missing: usize,
 }
@@ -447,15 +453,16 @@ pub async fn build_playlist(
     }
 
     // Pass 1 — resolve each segment to an absolute URL (or None) concurrently.
+    // Tuple: (pos, url, was_unmute, was_muted_fallback).
     let sem = Arc::new(Semaphore::new(max_conc.max(1)));
-    let mut set: JoinSet<(usize, Option<String>, bool)> = JoinSet::new();
+    let mut set: JoinSet<(usize, Option<String>, bool, bool)> = JoinSet::new();
     for seg in &segs {
         let needs_probe = seg.marked || probe_all;
         let orig = format!("{base}{}", seg.canonical);
         if !needs_probe {
             // Plain segment of an existing VOD — trust it, no HEAD.
             let pos = seg.pos;
-            set.spawn(async move { (pos, Some(orig), false) });
+            set.spawn(async move { (pos, Some(orig), false, false) });
             continue;
         }
         // Prefer the pre-mute original (`{n}.ts`/`{n}.mp4`) — true un-mute; fall
@@ -466,20 +473,24 @@ pub async fn build_playlist(
         set.spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore");
             if head_ok(&client, &orig).await {
-                (pos, Some(orig), marked) // original survived → un-muted audio
+                (pos, Some(orig), marked, false) // original survived → un-muted audio
             } else if head_ok(&client, &muted).await {
-                (pos, Some(muted), false) // silenced copy — continuity over a hole
+                (pos, Some(muted), false, true) // silenced copy — continuity over a hole
             } else {
-                (pos, None, false)
+                (pos, None, false, false)
             }
         });
     }
     let mut resolved: HashMap<usize, String> = HashMap::new();
     let mut unmuted_recovered = 0usize;
+    let mut muted_used = 0usize;
     while let Some(res) = set.join_next().await {
-        if let Ok((pos, Some(u), was_unmute)) = res {
+        if let Ok((pos, Some(u), was_unmute, was_muted_fallback)) = res {
             if was_unmute {
                 unmuted_recovered += 1;
+            }
+            if was_muted_fallback {
+                muted_used += 1;
             }
             resolved.insert(pos, u);
         }
@@ -523,7 +534,7 @@ pub async fn build_playlist(
         }
     }
 
-    Ok(RecoveredPlaylist { text: out, total, present, unmuted_recovered, missing })
+    Ok(RecoveredPlaylist { text: out, total, present, unmuted_recovered, muted_used, missing })
 }
 
 /// Truncate a playlist to its first `max_secs` seconds of media (by summed
@@ -1409,13 +1420,18 @@ mod tests {
 
                 let recovered = build_playlist(&client, &found.url, 16, false, None).await.unwrap();
                 eprintln!(
-                    "{login} (gql={use_gql}): {}/{} present, {} un-muted, {} missing",
-                    recovered.present, recovered.total, recovered.unmuted_recovered, recovered.missing
+                    "{login} (gql={use_gql}): {}/{} present, {} un-muted, {} muted-fallback, {} missing",
+                    recovered.present,
+                    recovered.total,
+                    recovered.unmuted_recovered,
+                    recovered.muted_used,
+                    recovered.missing
                 );
                 assert!(recovered.total > 0, "{login}: has media segments");
                 assert_eq!(recovered.missing, 0, "{login}: every muted segment resolved");
                 assert!(!recovered.text.contains("-unmuted"), "{login}: no dead -unmuted pointers");
                 assert!(recovered.text.contains(muted_ext), "{login}: muted copies substituted");
+                assert!(recovered.muted_used > 0, "{login}: at least one segment stayed silenced");
             }
         }
     }

@@ -3117,10 +3117,11 @@ impl Supervisor {
             let final_p = plan.final_path.clone();
             let url = row.monitor.url.clone();
             let channel = row.channel.name.clone();
+            let channel_id = row.channel.id;
             tokio::spawn(async move {
                 this.head_backfill_job(
-                    monitor_id, rec_id, capture, final_p, url, channel, sid, wl, approximate,
-                    started_at,
+                    monitor_id, channel_id, rec_id, capture, final_p, url, channel, sid, wl,
+                    approximate, started_at,
                 )
                 .await;
             });
@@ -4958,6 +4959,7 @@ impl Supervisor {
     async fn head_backfill_job(
         &self,
         monitor_id: i64,
+        channel_id: i64,
         rec_id: i64,
         capture_path: PathBuf,
         final_path: PathBuf,
@@ -4979,12 +4981,17 @@ impl Supervisor {
         if self.store.recording_lost_secs(rec_id).ok().flatten() == Some(0) {
             return;
         }
-        // Only the earliest take of a stream owns the missed HEAD; a later
-        // take's gap is mid-stream (a retake), not this feature's job.
-        if !self
+        // The earliest take of a stream always owns the missed HEAD; a later
+        // take (a reconnect/retake) only gets its own FRESH, FULL head fetch
+        // (go-live through THIS take's start — the missed/head_secs math
+        // below already computes that naturally, unmodified, since it's keyed
+        // off the constant `went_live_at`) when the setting is on.
+        let is_first_take = self
             .store
             .is_first_take_for_stream(monitor_id, &stream_id, started_at)
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if !is_first_take
+            && !crate::head_backfill::effective_fetch_new_take(&self.store, channel_id, monitor_id)
         {
             return;
         }
@@ -5121,16 +5128,42 @@ impl Supervisor {
             return;
         }
         let _ = tokio::fs::remove_file(&pl_path).await;
+        let muted_used = playlist.muted_used;
         match rename_or_shorten(&tmp_head, &out_dir, &stem, "head.mkv").await {
             Ok(dest) => {
                 let _ = self
                     .store
                     .set_recording_backfill_path(rec_id, &dest.to_string_lossy());
                 let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
-                info!(rec_id, missed, "head backfill: {} ready", dest.display());
-                finish(crate::events::TaskOutcome::CompletedWithNote(format!(
-                    "{missed}s backfilled"
-                )));
+                info!(rec_id, missed, muted_used, "head backfill: {} ready", dest.display());
+                let note = if muted_used > 0 {
+                    format!("{missed}s backfilled ({muted_used} segments muted)")
+                } else {
+                    format!("{missed}s backfilled")
+                };
+                finish(crate::events::TaskOutcome::CompletedWithNote(note));
+
+                // Integrity gate before ever touching older takes' files: the
+                // fresh head must be fully clean (no segment had to fall back
+                // to a silenced copy — see `RecoveredPlaylist::muted_used`)
+                // and its duration must be plausible against the requested
+                // `head_secs` (a truncated/corrupt mux would otherwise look
+                // "successful" to `rename_or_shorten` alone). Only the
+                // destructive "replace old heads" step is gated on this —
+                // the fresh head itself is always kept regardless.
+                let dur_ok = media_duration_secs(&dest).await.is_some_and(|d| {
+                    (d as f64 - head_secs).abs() <= (5.0f64).max(head_secs * 0.02)
+                });
+                if muted_used == 0 && dur_ok {
+                    if crate::head_backfill::effective_replace_old(&self.store, channel_id, monitor_id) {
+                        self.supersede_old_heads(monitor_id, rec_id, &inputs.broadcast_id).await;
+                    }
+                } else {
+                    info!(
+                        rec_id, muted_used, dur_ok,
+                        "head backfill: skipping supersede of older takes (integrity check failed)"
+                    );
+                }
             }
             Err(e) => {
                 warn!(rec_id, "head backfill: promote failed: {e:#}");
@@ -5141,6 +5174,39 @@ impl Supervisor {
         // The stream may have ended (and finalized) while we were fetching —
         // this covers that ordering; the finalize-side call covers the other.
         self.maybe_concat_backfill(rec_id).await;
+    }
+
+    /// After a fresh, verified-good head backfill for `keep_rec_id`, delete
+    /// older takes' now-redundant standalone head files for the same
+    /// broadcast (they're a strict subset of the fresh one). Gives each old
+    /// take one last, idempotent, safe-anytime chance to join its own
+    /// head+live via `maybe_concat_backfill` before removing the file that
+    /// join would have needed.
+    async fn supersede_old_heads(&self, monitor_id: i64, keep_rec_id: i64, stream_id: &str) {
+        let Ok(others) =
+            self.store.recordings_with_backfill_for_stream(monitor_id, stream_id, keep_rec_id)
+        else {
+            return;
+        };
+        for (old_id, old_path) in others {
+            // Last chance to bake the old head into that take's own full.mkv
+            // before the head file disappears out from under it.
+            self.maybe_concat_backfill(old_id).await;
+            let path = PathBuf::from(&old_path);
+            let removed = match tokio::fs::remove_file(&path).await {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                Err(e) => {
+                    warn!(old_id, keep_rec_id, "head backfill: could not remove superseded head: {e:#}");
+                    false
+                }
+            };
+            if removed {
+                let _ = self.store.clear_recording_backfill_path(old_id);
+                let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: old_id });
+                info!(old_id, keep_rec_id, "head backfill: superseded by a newer take's fresh head");
+            }
+        }
     }
 
     /// Join a backfilled head with the finished live capture into one seamless

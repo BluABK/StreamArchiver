@@ -241,9 +241,25 @@ badge while only the head exists and **🧩 full** once the join lands. The join
 is skipped (parts kept, warning logged) if the capture ran at a transcoded
 quality whose codec parameters differ from the source-quality head, and a
 duration sanity check discards a broken join rather than promoting it. An
-interrupted join is retried on the next app start. Only the **first take** of a
-stream backfills (a retake's gap is mid-stream, not the head), and nothing runs
-when catch-up already zeroed Lost time.
+interrupted join is retried on the next app start. Nothing runs when catch-up
+already zeroed Lost time.
+
+**Fetch new head backfill on new take.** A stream reconnect mid-broadcast (a
+new recording "take") loses footage the same way a missed intro does — and
+it's just as recoverable from the same still-growing CDN playlist while the
+stream stays live. With this setting on (**default**), every take gets its own
+fresh, **full** head backfill (go-live through *that* take's start, not just
+the incremental gap since the previous take), not only the stream's first.
+Global default in Settings → Downloads → *Head backfill on new takes*;
+override per-channel or per-instance like the other 3-level toggles. Turning
+it off restores the original behavior (first take only).
+
+**Replace old head (if new is undamaged).** A sub-setting (**default on**):
+once a fresh head backfill passes its integrity checks — no CDN segment had to
+fall back to a silenced copy, and its duration is plausible — it supersedes
+every older take's head file for the same stream (a strict subset of the fresh
+one), which is deleted. A fresh head that fails its checks is still kept, just
+never used to replace anything, so nothing is ever lost to a bad check.
 
 ### Row actions & shortcuts
 

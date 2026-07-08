@@ -2587,6 +2587,41 @@ impl Store {
         Ok(rows)
     }
 
+    /// Other recordings of the same broadcast that still carry a standalone
+    /// head file — candidates a fresh, verified-good head backfill can
+    /// supersede (see `Supervisor::supersede_old_heads`).
+    pub fn recordings_with_backfill_for_stream(
+        &self,
+        monitor_id: i64,
+        stream_id: &str,
+        exclude_id: i64,
+    ) -> Result<Vec<(i64, String)>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id, backfill_path FROM recording
+             WHERE monitor_id = ?1 AND stream_id = ?2 AND id != ?3
+               AND backfill_path IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map(params![monitor_id, stream_id, exclude_id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<(i64, String)>>>()?;
+        Ok(rows)
+    }
+
+    /// Clear a recording's head-backfill reference — the file itself is
+    /// deleted by the caller first. Used when a later take's fresh head
+    /// supersedes an older take's now-redundant head file.
+    pub fn clear_recording_backfill_path(&self, id: i64) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE recording SET backfill_path=NULL WHERE id=?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
     // ----- post-stream published-VOD download ("archive the VOD after end") -----
 
     /// Set the archive-download state + link the download job (`video.id`).
@@ -6012,6 +6047,47 @@ mod tests {
             .insert_recording(mid, 1000, "C:/tmp/c.ts", Some(50), false, Some("s3"), None, "")
             .unwrap();
         assert!(!store.is_first_take_for_stream(mid, "s3", 1100).unwrap());
+    }
+
+    #[test]
+    fn recordings_with_backfill_for_stream_finds_and_clears_old_heads() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+
+        let take1 = store
+            .insert_recording(mid, 100, "C:/tmp/take1.mkv", Some(50), false, Some("s1"), None, "")
+            .unwrap();
+        store.set_recording_backfill_path(take1, "C:/tmp/take1.head.mkv").unwrap();
+        store.finish_recording(take1, 200, 500, Some(0), "completed", "C:/tmp/take1.mkv", "").unwrap();
+
+        // A take with no backfill_path at all shouldn't show up.
+        let take2 = store
+            .insert_recording(mid, 300, "C:/tmp/take2.mkv", Some(50), false, Some("s1"), None, "")
+            .unwrap();
+
+        // A take of a DIFFERENT stream shouldn't show up either.
+        let other_stream = store
+            .insert_recording(mid, 50, "C:/tmp/other.mkv", Some(10), false, Some("s2"), None, "")
+            .unwrap();
+        store.set_recording_backfill_path(other_stream, "C:/tmp/other.head.mkv").unwrap();
+
+        let take3 = store
+            .insert_recording(mid, 600, "C:/tmp/take3.mkv", Some(50), false, Some("s1"), None, "")
+            .unwrap();
+        store.set_recording_backfill_path(take3, "C:/tmp/take3.head.mkv").unwrap();
+
+        // From take3's perspective, only take1's head is an "other" backfill
+        // for the same stream (take2 has none, other_stream is a different
+        // stream, take3 excludes itself).
+        let others = store.recordings_with_backfill_for_stream(mid, "s1", take3).unwrap();
+        assert_eq!(others, vec![(take1, "C:/tmp/take1.head.mkv".to_string())]);
+        assert!(!others.iter().any(|(id, _)| *id == take2));
+
+        // Clearing take1's backfill_path drops it out of both queries.
+        store.clear_recording_backfill_path(take1).unwrap();
+        assert!(store.recordings_with_backfill_for_stream(mid, "s1", take3).unwrap().is_empty());
+        assert!(!store.recordings_pending_head_concat().unwrap().contains(&take1));
     }
 
     #[test]
