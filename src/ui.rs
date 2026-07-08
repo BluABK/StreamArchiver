@@ -923,6 +923,9 @@ pub struct StreamArchiverApp {
     schedule_show_hidden: bool,
     /// Whether to flag overlapping streams (time collisions) in the calendar.
     schedule_collisions: bool,
+    /// Font/element zoom for the calendar body only (toolbar + sidebar stay
+    /// normal size). 1.0 = 100%; Ctrl+0 resets. Session-only, like `schedule_mode`.
+    schedule_zoom: f32,
     /// The day whose full stream list is shown in a popup (local date; None = closed).
     schedule_day_popup: Option<chrono::NaiveDate>,
     /// Whether the "Schedule sources" dialog is open.
@@ -1552,6 +1555,7 @@ impl StreamArchiverApp {
             schedule_hidden_segments: HashSet::new(),
             schedule_show_hidden: false,
             schedule_collisions: true,
+            schedule_zoom: 1.0,
             schedule_day_popup: None,
             show_schedule_sources: false,
             schedule_sources_draft: Vec::new(),
@@ -3451,6 +3455,17 @@ fn effective_end(s: &UpcomingStream) -> i64 {
         .unwrap_or(s.start_time + COLLISION_DEFAULT_SECS)
 }
 
+/// A stream long enough to be treated as an "all-day" event (Google-Calendar
+/// style) rather than a timed block — e.g. a multi-day subathon. There's no
+/// explicit all-day flag anywhere in the schedule data, so this is a duration
+/// heuristic: 20h+ covers both a genuine full-day placeholder and a real
+/// multi-day range, while staying well clear of a long-but-ordinary overnight
+/// stream (which should still render as a normal time-grid block).
+const ALL_DAY_THRESHOLD_SECS: i64 = 20 * 3600;
+fn is_all_day(s: &UpcomingStream) -> bool {
+    effective_end(s) - s.start_time >= ALL_DAY_THRESHOLD_SECS
+}
+
 /// Format a time range for display: "HH:MM – HH:MM" when end is valid, else "HH:MM".
 fn fmt_time_range(start: i64, end: Option<i64>) -> String {
     let s = fmt_time_short(start);
@@ -3837,6 +3852,22 @@ const SCHED_COL_GAP: f32 = 4.0;
 /// Minimum event block height so zero/short-duration events remain clickable.
 const SCHED_MIN_BLOCK_H: f32 = 22.0;
 
+/// Schedule-view zoom bounds/step (Ctrl+Plus/Minus; Ctrl+0 resets to 1.0).
+/// Scales the calendar body's font + element sizes; the toolbar/sidebar chrome
+/// stays normal size.
+const SCHEDULE_ZOOM_MIN: f32 = 0.6;
+const SCHEDULE_ZOOM_MAX: f32 = 2.0;
+const SCHEDULE_ZOOM_STEP: f32 = 0.1;
+
+// ── Week-view header extras: scheduled-recording avatars + all-day bars ─────
+/// Height reserved for the row of channel avatars under the week-view day
+/// number (only reserved when at least one is due to show that week).
+const SCHED_AVATAR_ROW_H: f32 = 20.0;
+const SCHED_AVATAR_PX: f32 = 14.0;
+/// Height/gap of each Google-Calendar-style all-day event bar in the week view.
+const SCHED_ALL_DAY_BAR_H: f32 = 18.0;
+const SCHED_ALL_DAY_BAR_GAP: f32 = 2.0;
+
 /// Seconds past local midnight for a unix timestamp (for positioning on the time grid).
 fn secs_since_midnight(unix: i64) -> f32 {
     use chrono::Timelike;
@@ -3889,15 +3920,23 @@ fn schedule_time_grid(
     id: &str,
     days: &[chrono::NaiveDate],
     col_w: f32,
+    zoom: f32,
     all: &[UpcomingStream],
     by_day: &HashMap<chrono::NaiveDate, Vec<usize>>,
     collide: &HashSet<usize>,
+    exclude: &HashSet<usize>,
     open_day: &mut Option<chrono::NaiveDate>,
     hidden_segs: &HashSet<i64>,
     selected: &HashSet<i64>,
     merge_labels: &HashMap<i64, String>,
 ) {
     use chrono::Timelike;
+    let hour_px = SCHED_HOUR_PX * zoom;
+    let total_h = SCHED_TOTAL_H * zoom;
+    let time_col_w = SCHED_TIME_COL_W * zoom;
+    let col_gap = SCHED_COL_GAP * zoom;
+    let min_block_h = SCHED_MIN_BLOCK_H * zoom;
+
     // Scroll to show the current local hour, but only the first time the view
     // appears so subsequent frames don't fight the user's manual scroll position.
     let init_id = egui::Id::new(id).with("scroll_init");
@@ -3907,18 +3946,18 @@ fn schedule_time_grid(
         .auto_shrink([false, false]);
     if !already_init {
         let now_hour = chrono::Local::now().hour() as f32;
-        let initial_offset = (now_hour * SCHED_HOUR_PX - 120.0).max(0.0);
+        let initial_offset = (now_hour * hour_px - 120.0 * zoom).max(0.0);
         scroll = scroll.vertical_scroll_offset(initial_offset);
         ui.ctx().data_mut(|d| d.insert_temp(init_id, true));
     }
 
-    let grid_w = SCHED_TIME_COL_W + days.len() as f32 * (col_w + SCHED_COL_GAP);
+    let grid_w = time_col_w + days.len() as f32 * (col_w + col_gap);
 
     let mut clicked_day: Option<chrono::NaiveDate> = None;
 
     scroll.show(ui, |ui| {
             let (response, painter) = ui.allocate_painter(
-                egui::vec2(grid_w, SCHED_TOTAL_H),
+                egui::vec2(grid_w, total_h),
                 egui::Sense::hover(),
             );
             let origin = response.rect.min;
@@ -3927,10 +3966,10 @@ fn schedule_time_grid(
             let grid_line_color = egui::Color32::from_white_alpha(18);
             let half_line_color = egui::Color32::from_white_alpha(8);
             let label_color = ui.visuals().weak_text_color();
-            let font = egui::FontId::proportional(10.0);
+            let font = egui::FontId::proportional(10.0 * zoom);
 
             for hour in 0u32..24 {
-                let y = origin.y + hour as f32 * SCHED_HOUR_PX;
+                let y = origin.y + hour as f32 * hour_px;
                 // Hour label
                 painter.text(
                     egui::pos2(origin.x + 2.0, y + 2.0),
@@ -3942,16 +3981,16 @@ fn schedule_time_grid(
                 // Full-hour line across all columns
                 painter.line_segment(
                     [
-                        egui::pos2(origin.x + SCHED_TIME_COL_W, y),
+                        egui::pos2(origin.x + time_col_w, y),
                         egui::pos2(origin.x + grid_w, y),
                     ],
                     egui::Stroke::new(1.0, grid_line_color),
                 );
                 // Half-hour line (lighter)
-                let yh = y + SCHED_HOUR_PX / 2.0;
+                let yh = y + hour_px / 2.0;
                 painter.line_segment(
                     [
-                        egui::pos2(origin.x + SCHED_TIME_COL_W, yh),
+                        egui::pos2(origin.x + time_col_w, yh),
                         egui::pos2(origin.x + grid_w, yh),
                     ],
                     egui::Stroke::new(1.0, half_line_color),
@@ -3961,9 +4000,9 @@ fn schedule_time_grid(
             // ── Vertical column dividers ──────────────────────────────────
             let divider_color = egui::Color32::from_white_alpha(22);
             for col in 0..=days.len() {
-                let x = origin.x + SCHED_TIME_COL_W + col as f32 * (col_w + SCHED_COL_GAP);
+                let x = origin.x + time_col_w + col as f32 * (col_w + col_gap);
                 painter.line_segment(
-                    [egui::pos2(x, origin.y), egui::pos2(x, origin.y + SCHED_TOTAL_H)],
+                    [egui::pos2(x, origin.y), egui::pos2(x, origin.y + total_h)],
                     egui::Stroke::new(1.0, divider_color),
                 );
             }
@@ -3974,9 +4013,9 @@ fn schedule_time_grid(
                 let today = now.date_naive();
                 let now_secs = (now.hour() * 3600 + now.minute() * 60 + now.second()) as f32;
                 if let Some(col_idx) = days.iter().position(|&d| d == today) {
-                    let x_start = origin.x + SCHED_TIME_COL_W + col_idx as f32 * (col_w + SCHED_COL_GAP);
+                    let x_start = origin.x + time_col_w + col_idx as f32 * (col_w + col_gap);
                     let x_end = x_start + col_w;
-                    let y = origin.y + now_secs / 3600.0 * SCHED_HOUR_PX;
+                    let y = origin.y + now_secs / 3600.0 * hour_px;
                     painter.line_segment(
                         [egui::pos2(x_start, y), egui::pos2(x_end, y)],
                         egui::Stroke::new(2.0, egui::Color32::from_rgb(0xff, 0x44, 0x44)),
@@ -3992,9 +4031,14 @@ fn schedule_time_grid(
 
             // ── Event blocks ──────────────────────────────────────────────
             for (col_idx, &day) in days.iter().enumerate() {
-                let col_x = origin.x + SCHED_TIME_COL_W + col_idx as f32 * (col_w + SCHED_COL_GAP);
-                let indices = by_day.get(&day).map(Vec::as_slice).unwrap_or(&[]);
-                let layout = layout_event_lanes(indices, all);
+                let col_x = origin.x + time_col_w + col_idx as f32 * (col_w + col_gap);
+                let day_indices = by_day.get(&day).map(Vec::as_slice).unwrap_or(&[]);
+                // All-day events (see `is_all_day`) render in the week view's
+                // separate bar strip instead — skip them here to avoid a
+                // duplicate (and grossly clipped) block in the time grid.
+                let indices: Vec<usize> =
+                    day_indices.iter().copied().filter(|i| !exclude.contains(i)).collect();
+                let layout = layout_event_lanes(&indices, all);
 
                 for (stream_idx, lane, total_lanes) in layout {
                     let s = &all[stream_idx];
@@ -4010,8 +4054,8 @@ fn schedule_time_grid(
                     };
                     let duration_secs = (end_secs - start_secs).max(0.0);
 
-                    let top = origin.y + start_secs / 3600.0 * SCHED_HOUR_PX;
-                    let block_h = (duration_secs / 3600.0 * SCHED_HOUR_PX).max(SCHED_MIN_BLOCK_H);
+                    let top = origin.y + start_secs / 3600.0 * hour_px;
+                    let block_h = (duration_secs / 3600.0 * hour_px).max(min_block_h);
                     let lane_w = (col_w - 2.0 * (total_lanes as f32 - 1.0)) / total_lanes as f32;
                     let left = col_x + 1.0 + lane as f32 * (lane_w + 2.0);
 
@@ -4075,11 +4119,11 @@ fn schedule_time_grid(
 
                     // Text inside the block — clip to block_rect so text never
                     // bleeds into adjacent columns.
-                    let text_rect = block_rect.shrink2(egui::vec2(5.0, 3.0));
-                    if text_rect.height() >= 12.0 {
+                    let text_rect = block_rect.shrink2(egui::vec2(5.0, 3.0) * zoom);
+                    if text_rect.height() >= 12.0 * zoom {
                         let text_painter = painter.with_clip_rect(block_rect);
-                        let name_font = egui::FontId::proportional(11.0);
-                        let time_font = egui::FontId::proportional(10.0);
+                        let name_font = egui::FontId::proportional(11.0 * zoom);
+                        let time_font = egui::FontId::proportional(10.0 * zoom);
                         let (name_color, time_color, title_color) = if is_hidden {
                             (
                                 egui::Color32::from_white_alpha(110),
@@ -4109,18 +4153,18 @@ fn schedule_time_grid(
                             name_font,
                             name_color,
                         );
-                        if block_h >= 36.0 {
+                        if block_h >= 36.0 * zoom {
                             text_painter.text(
-                                egui::pos2(text_rect.left(), text_y + 13.0),
+                                egui::pos2(text_rect.left(), text_y + 13.0 * zoom),
                                 egui::Align2::LEFT_TOP,
                                 fmt_time_range(s.start_time, s.end_time),
                                 time_font.clone(),
                                 time_color,
                             );
                         }
-                        if block_h >= 56.0 && !s.title.is_empty() {
+                        if block_h >= 56.0 * zoom && !s.title.is_empty() {
                             text_painter.text(
-                                egui::pos2(text_rect.left(), text_y + 26.0),
+                                egui::pos2(text_rect.left(), text_y + 26.0 * zoom),
                                 egui::Align2::LEFT_TOP,
                                 &s.title,
                                 time_font,
@@ -7128,6 +7172,13 @@ impl StreamArchiverApp {
         const ADD: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::N);
         const SETTINGS: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Comma);
         const REFRESH: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F5);
+        // Schedule-view zoom. Two bindings for zoom-in: `=` is the unshifted key
+        // most keyboards use for zoom (matches browser/editor convention), `+`
+        // covers keyboards/layouts that report the shifted key directly.
+        const SCHED_ZOOM_IN_EQ: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Equals);
+        const SCHED_ZOOM_IN_PLUS: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Plus);
+        const SCHED_ZOOM_OUT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Minus);
+        const SCHED_ZOOM_RESET: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Num0);
 
         // Widget inspector toggle — handled before the modal early-return so
         // it works even while a dialog is open.
@@ -7179,6 +7230,22 @@ impl StreamArchiverApp {
                 self.spawn_reload_schedule();
             }
             self.status = "Refreshing…".into();
+        }
+
+        // Schedule-view zoom (calendar body font/element size).
+        if self.view == View::Schedule {
+            let zoom_in = ctx.input_mut(|i| {
+                i.consume_shortcut(&SCHED_ZOOM_IN_EQ) || i.consume_shortcut(&SCHED_ZOOM_IN_PLUS)
+            });
+            if zoom_in {
+                self.schedule_zoom = (self.schedule_zoom + SCHEDULE_ZOOM_STEP).min(SCHEDULE_ZOOM_MAX);
+            }
+            if ctx.input_mut(|i| i.consume_shortcut(&SCHED_ZOOM_OUT)) {
+                self.schedule_zoom = (self.schedule_zoom - SCHEDULE_ZOOM_STEP).max(SCHEDULE_ZOOM_MIN);
+            }
+            if ctx.input_mut(|i| i.consume_shortcut(&SCHED_ZOOM_RESET)) {
+                self.schedule_zoom = 1.0;
+            }
         }
 
         // Row-targeted keys only fire on the channel list when not typing.
@@ -10277,6 +10344,40 @@ impl StreamArchiverApp {
             .get_or_insert_with(|| PlatformTextures::load(ui.ctx()))
             .clone();
 
+        // Channel avatars for the week-view header's "recording scheduled" row
+        // (schema v51) — same small-icon cache/pattern as the Streams grid,
+        // built here (mutable) so `schedule_week_grid` (immutable) can just
+        // look them up by channel id.
+        let mut sched_rec_avatars: HashMap<i64, egui::TextureHandle> = HashMap::new();
+        {
+            let mut channel_ids: Vec<i64> = self
+                .scheduled_recordings
+                .iter()
+                .filter(|r| r.rec.enabled)
+                .filter_map(|r| self.rows.iter().find(|row| row.monitor.id == r.rec.monitor_id))
+                .map(|row| row.channel.id)
+                .collect();
+            channel_ids.sort_unstable();
+            channel_ids.dedup();
+            for cid in channel_ids {
+                let Some(channel) = self.rows.iter().find(|r| r.channel.id == cid).map(|r| r.channel.clone())
+                else {
+                    continue;
+                };
+                let mons: Vec<&MonitorWithChannel> =
+                    self.rows.iter().filter(|r| r.channel.id == cid).collect();
+                let accounts = channel_asset_accounts(&mons);
+                let tex = self
+                    .channel_icons_small
+                    .entry(cid)
+                    .or_insert_with(|| resolve_channel_icon_small(&channel, &accounts, ui.ctx()))
+                    .clone();
+                if let Some(t) = tex {
+                    sched_rec_avatars.insert(cid, t);
+                }
+            }
+        }
+
         // Precompute (immutable reads of `self`) what the closures need: collisions
         // and the per-day buckets of visible streams (indices into `schedule_all`).
         let collide: HashSet<usize> = if self.schedule_collisions {
@@ -10285,6 +10386,10 @@ impl StreamArchiverApp {
             HashSet::new()
         };
         let mut by_day: HashMap<chrono::NaiveDate, Vec<usize>> = HashMap::new();
+        // Streams long enough to be treated as "all-day" (see `is_all_day`) —
+        // the week view's Google-Calendar-style bar strip renders these
+        // instead of (or in addition to) their normal `by_day` chip/block.
+        let mut all_day_events: Vec<usize> = Vec::new();
         for (i, s) in self.schedule_all.iter().enumerate() {
             if self.schedule_hidden.contains(&s.channel_id) {
                 continue;
@@ -10299,6 +10404,9 @@ impl StreamArchiverApp {
             // their primary renders the merged event block.
             if s.merged_into.is_some() { continue; }
             if self.schedule_auto_secondary.contains(&s.segment_id) { continue; }
+            if is_all_day(s) {
+                all_day_events.push(i);
+            }
             if let Some(d) = local_date(s.start_time) {
                 by_day.entry(d).or_default().push(i);
             }
@@ -10509,6 +10617,31 @@ impl StreamArchiverApp {
                 ui.heading(title);
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Calendar-body zoom (font + element size) — buttons mirror
+                    // the Ctrl+Plus/Minus/0 shortcuts. Toolbar/sidebar are
+                    // unaffected; only the grid rendered below this header scales.
+                    if ui
+                        .add(egui::Button::new("🔍+").small())
+                        .on_hover_text("Zoom in (Ctrl+Plus)")
+                        .clicked()
+                    {
+                        self.schedule_zoom = (self.schedule_zoom + SCHEDULE_ZOOM_STEP).min(SCHEDULE_ZOOM_MAX);
+                    }
+                    if ui
+                        .add(egui::Button::new(format!("{:.0}%", self.schedule_zoom * 100.0)).small())
+                        .on_hover_text("Reset zoom (Ctrl+0)")
+                        .clicked()
+                    {
+                        self.schedule_zoom = 1.0;
+                    }
+                    if ui
+                        .add(egui::Button::new("🔍−").small())
+                        .on_hover_text("Zoom out (Ctrl+Minus)")
+                        .clicked()
+                    {
+                        self.schedule_zoom = (self.schedule_zoom - SCHEDULE_ZOOM_STEP).max(SCHEDULE_ZOOM_MIN);
+                    }
+                    ui.separator();
                     if ui
                         .button("⟳")
                         .on_hover_text("Fetch the latest schedules now (F5)")
@@ -10604,12 +10737,28 @@ impl StreamArchiverApp {
                 ui.separator();
             }
 
+            // Zoom the calendar body only: scale every relative text size
+            // (`.strong()`/`.weak()`/`.small()`/monospace/etc. all resolve
+            // through `TextStyle`, so this one override covers virtually all
+            // text drawn below without touching each call site). Applied to
+            // this `ui` only, after the header/selection-bar above already
+            // rendered at normal size, so the toolbar/sidebar are unaffected.
+            if (self.schedule_zoom - 1.0).abs() > f32::EPSILON {
+                let zoom = self.schedule_zoom;
+                for font_id in ui.style_mut().text_styles.values_mut() {
+                    font_id.size *= zoom;
+                }
+            }
+
             match mode {
                 ScheduleMode::Month => {
                     self.schedule_month_grid(ui, anchor, today, &by_day, &collide, &ptex, &mut open_day)
                 }
                 ScheduleMode::Week => {
-                    self.schedule_week_grid(ui, anchor, today, &by_day, &collide, &ptex, &mut open_day)
+                    self.schedule_week_grid(
+                        ui, anchor, today, &by_day, &collide, &ptex, &mut open_day,
+                        &sched_rec_avatars, &all_day_events,
+                    )
                 }
                 ScheduleMode::Day => {
                     self.schedule_day_grid(ui, anchor, today, &by_day, &collide, &mut open_day)
@@ -10898,8 +11047,9 @@ impl StreamArchiverApp {
             }
         }
 
-        let spacing = 4.0;
-        let cell_h = 108.0;
+        let zoom = self.schedule_zoom;
+        let spacing = 4.0 * zoom;
+        let cell_h = 108.0 * zoom;
         const WD: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
         const MAX_CHIPS: usize = 3;
         // Reserve room for a vertical scrollbar so the columns don't shift when it
@@ -10917,7 +11067,7 @@ impl StreamArchiverApp {
                 ui.horizontal(|ui| {
                     for &wd in &WD {
                         ui.allocate_ui_with_layout(
-                            egui::vec2(col_w, 16.0),
+                            egui::vec2(col_w, 16.0 * zoom),
                             egui::Layout::top_down(egui::Align::Center),
                             |ui| {
                                 ui.label(egui::RichText::new(wd).strong());
@@ -10955,7 +11105,11 @@ impl StreamArchiverApp {
             });
     }
 
-    /// Week view: 7-column time-grid with a 24-hour vertical axis.
+    /// Week view: 7-column time-grid with a 24-hour vertical axis, plus a
+    /// day-header row that shows the avatars of channels with a scheduled
+    /// recording due that day, and a Google-Calendar-style all-day event bar
+    /// strip below the header for streams long enough to count as "all-day"
+    /// (see [`is_all_day`] — e.g. a multi-day subathon).
     #[allow(clippy::too_many_arguments)]
     fn schedule_week_grid(
         &self,
@@ -10966,15 +11120,54 @@ impl StreamArchiverApp {
         collide: &HashSet<usize>,
         _ptex: &PlatformTextures,
         open_day: &mut Option<chrono::NaiveDate>,
+        sched_rec_avatars: &HashMap<i64, egui::TextureHandle>,
+        all_day_events: &[usize],
     ) {
         use chrono::Datelike;
         let ws = week_start(anchor);
+        let we = add_days(ws, 6);
         let days: Vec<chrono::NaiveDate> = (0..7).map(|d| add_days(ws, d)).collect();
+        let zoom = self.schedule_zoom;
 
         // Day-header row (outside the scroll area so it stays fixed).
-        let time_col_w = SCHED_TIME_COL_W;
+        let time_col_w = SCHED_TIME_COL_W * zoom;
+        let col_gap = SCHED_COL_GAP * zoom;
         let avail_w = ui.available_width();
-        let col_w = ((avail_w - time_col_w - 6.0 * SCHED_COL_GAP) / 7.0).max(60.0);
+        let col_w = ((avail_w - time_col_w - 6.0 * col_gap) / 7.0).max(60.0);
+
+        // Channels with an enabled scheduled recording due each visible day
+        // (only those we actually have an avatar for — no point bucketing
+        // channels that'll render nothing).
+        let mut sched_rec_channels_by_day: HashMap<chrono::NaiveDate, Vec<i64>> = HashMap::new();
+        if !sched_rec_avatars.is_empty() {
+            let range_start = local_midnight(ws) - 1;
+            let range_end = local_midnight(add_days(ws, 7));
+            for row in &self.scheduled_recordings {
+                if !row.rec.enabled {
+                    continue;
+                }
+                let Some(mon_row) = self.rows.iter().find(|r| r.monitor.id == row.rec.monitor_id)
+                else {
+                    continue;
+                };
+                let cid = mon_row.channel.id;
+                if !sched_rec_avatars.contains_key(&cid) {
+                    continue;
+                }
+                for ts in crate::scheduled_recordings::occurrences_in_range(&row.rec, range_start, range_end) {
+                    if let Some(dt) = chrono::DateTime::from_timestamp(ts, 0) {
+                        let day = dt.with_timezone(&chrono::Local).date_naive();
+                        let list = sched_rec_channels_by_day.entry(day).or_default();
+                        if !list.contains(&cid) {
+                            list.push(cid);
+                        }
+                    }
+                }
+            }
+        }
+        let show_avatar_row = !sched_rec_channels_by_day.is_empty();
+        let header_h = 36.0 * zoom + if show_avatar_row { SCHED_AVATAR_ROW_H * zoom } else { 0.0 };
+
         ui.horizontal(|ui| {
             ui.add_space(time_col_w);
             for &day in &days {
@@ -10985,16 +11178,49 @@ impl StreamArchiverApp {
                 } else {
                     egui::RichText::new(hdr).strong()
                 };
+                let day_channels = sched_rec_channels_by_day.get(&day);
                 let resp = ui.allocate_ui_with_layout(
-                    egui::vec2(col_w + SCHED_COL_GAP, 36.0),
+                    egui::vec2(col_w + col_gap, header_h),
                     egui::Layout::top_down(egui::Align::Center),
                     |ui| {
                         if is_today {
                             let r = ui.max_rect();
                             ui.painter().rect_filled(r, egui::CornerRadius::ZERO, TODAY_BG);
                         }
-                        ui.add(egui::Label::new(text).sense(egui::Sense::click()))
-                            .on_hover_text("Open day detail")
+                        let lbl_resp = ui
+                            .add(egui::Label::new(text).sense(egui::Sense::click()))
+                            .on_hover_text("Open day detail");
+                        if show_avatar_row {
+                            let _ = ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 2.0 * zoom;
+                                const MAX_AVATARS: usize = 5;
+                                if let Some(chans) = day_channels {
+                                    for &cid in chans.iter().take(MAX_AVATARS) {
+                                        if let Some(tex) = sched_rec_avatars.get(&cid) {
+                                            let name = self
+                                                .rows
+                                                .iter()
+                                                .find(|r| r.channel.id == cid)
+                                                .map(|r| r.channel.name.as_str())
+                                                .unwrap_or("");
+                                            ui.add(
+                                                egui::Image::from_texture(tex)
+                                                    .fit_to_exact_size(egui::vec2(
+                                                        SCHED_AVATAR_PX * zoom,
+                                                        SCHED_AVATAR_PX * zoom,
+                                                    ))
+                                                    .corner_radius(egui::CornerRadius::same(2)),
+                                            )
+                                            .on_hover_text(format!("{name} — recording scheduled"));
+                                        }
+                                    }
+                                    if chans.len() > MAX_AVATARS {
+                                        ui.weak(format!("+{}", chans.len() - MAX_AVATARS));
+                                    }
+                                }
+                            });
+                        }
+                        lbl_resp
                     },
                 );
                 if resp.inner.clicked() {
@@ -11002,16 +11228,102 @@ impl StreamArchiverApp {
                 }
             }
         });
+
+        // All-day event bar strip (Google-Calendar style): each qualifying
+        // stream (`is_all_day`) draws as one continuous rounded bar spanning
+        // its start-to-end day columns, clipped to the visible week. Bars
+        // that overlap in date range stack into additional lanes.
+        let mut bars: Vec<(usize, usize, usize)> = Vec::new(); // (stream_idx, start_col, end_col)
+        for &i in all_day_events {
+            let s = &self.schedule_all[i];
+            let s_date = local_date(s.start_time).unwrap_or(ws);
+            let e_date = local_date(effective_end(s)).unwrap_or(s_date);
+            if e_date < ws || s_date > we {
+                continue; // doesn't overlap the visible week
+            }
+            let start_col = if s_date <= ws { 0usize } else { (s_date - ws).num_days().max(0) as usize };
+            let end_col = if e_date >= we { 6usize } else { (e_date - ws).num_days().max(0) as usize };
+            bars.push((i, start_col.min(6), end_col.min(6).max(start_col.min(6))));
+        }
+        if !bars.is_empty() {
+            bars.sort_by_key(|&(_, start, end)| (start, end));
+            let mut lane_end: Vec<i32> = Vec::new();
+            let mut placed: Vec<(usize, usize, usize, usize)> = Vec::new(); // (idx, start, end, lane)
+            for (idx, start, end) in bars {
+                let lane = lane_end
+                    .iter()
+                    .position(|&le| le < start as i32)
+                    .unwrap_or_else(|| {
+                        lane_end.push(-1);
+                        lane_end.len() - 1
+                    });
+                lane_end[lane] = end as i32;
+                placed.push((idx, start, end, lane));
+            }
+
+            let bar_h = SCHED_ALL_DAY_BAR_H * zoom;
+            let bar_gap = SCHED_ALL_DAY_BAR_GAP * zoom;
+            let strip_w = time_col_w + days.len() as f32 * (col_w + col_gap);
+            let strip_h = lane_end.len() as f32 * (bar_h + bar_gap);
+            let (resp, painter) =
+                ui.allocate_painter(egui::vec2(strip_w, strip_h), egui::Sense::hover());
+            let origin = resp.rect.min;
+            let mut clicked_day: Option<chrono::NaiveDate> = None;
+            for (idx, start, end, lane) in &placed {
+                let s = &self.schedule_all[*idx];
+                let x0 = origin.x + time_col_w + *start as f32 * (col_w + col_gap);
+                let x1 = origin.x + time_col_w + (*end as f32 + 1.0) * (col_w + col_gap) - col_gap;
+                let y = origin.y + *lane as f32 * (bar_h + bar_gap);
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(x0, y),
+                    egui::vec2((x1 - x0).max(4.0), bar_h),
+                );
+                let evt_id = egui::Id::new("sched_allday").with(ws).with(*idx);
+                let evt_resp = ui.interact(rect, evt_id, egui::Sense::click());
+                let color = channel_event_color(s.channel_id, &s.channel_color);
+                let fill = if evt_resp.hovered() {
+                    color
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 210)
+                };
+                painter.rect_filled(rect, egui::CornerRadius::same(4), fill);
+                let label = if s.title.is_empty() {
+                    s.channel_name.clone()
+                } else {
+                    format!("{} — {}", s.channel_name, s.title)
+                };
+                painter.with_clip_rect(rect).text(
+                    egui::pos2(rect.left() + 5.0 * zoom, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    egui::FontId::proportional(11.0 * zoom),
+                    egui::Color32::WHITE,
+                );
+                if evt_resp.clicked() {
+                    clicked_day = Some(days[*start]);
+                }
+                evt_resp.on_hover_text(schedule_detail_line(s)).context_menu(|ui| {
+                    schedule_copy_menu(ui, s, false, None)
+                });
+            }
+            if let Some(d) = clicked_day {
+                *open_day = Some(d);
+            }
+        }
+
         ui.separator();
 
+        let exclude_all_day: HashSet<usize> = all_day_events.iter().copied().collect();
         schedule_time_grid(
             ui,
             "sched_week",
             &days,
             col_w,
+            zoom,
             &self.schedule_all,
             by_day,
             collide,
+            &exclude_all_day,
             open_day,
             &self.schedule_hidden_segments,
             &self.schedule_selected,
@@ -11042,16 +11354,19 @@ impl StreamArchiverApp {
         ui.label(text);
         ui.separator();
 
+        let zoom = self.schedule_zoom;
         let avail_w = ui.available_width();
-        let col_w = (avail_w - SCHED_TIME_COL_W - 2.0).max(80.0);
+        let col_w = (avail_w - SCHED_TIME_COL_W * zoom - 2.0).max(80.0);
         schedule_time_grid(
             ui,
             "sched_day",
             &[anchor],
             col_w,
+            zoom,
             &self.schedule_all,
             by_day,
             collide,
+            &HashSet::new(),
             open_day,
             &self.schedule_hidden_segments,
             &self.schedule_selected,
@@ -11153,6 +11468,7 @@ impl StreamArchiverApp {
         ptex: &PlatformTextures,
         open_day: &mut Option<chrono::NaiveDate>,
     ) {
+        let zoom = self.schedule_zoom;
         // Collect and sort the days from `anchor` forward that have visible entries.
         let mut days: Vec<chrono::NaiveDate> = by_day
             .keys()
@@ -11220,7 +11536,7 @@ impl StreamArchiverApp {
                             ui.add(egui::Label::new(
                                 egui::RichText::new(fmt_time_range(s.start_time, s.end_time))
                                     .monospace()
-                                    .size(12.0),
+                                    .size(12.0 * zoom),
                             ));
 
                             // Platform icon + source badge
@@ -11240,7 +11556,7 @@ impl StreamArchiverApp {
                                     egui::Label::new(
                                         egui::RichText::new(format!("— {}", s.title))
                                             .weak()
-                                            .size(12.0),
+                                            .size(12.0 * zoom),
                                     )
                                     .truncate(),
                                 );
@@ -11252,7 +11568,7 @@ impl StreamArchiverApp {
                                     egui::Label::new(
                                         egui::RichText::new(format!("({})", s.category))
                                             .weak()
-                                            .size(11.0),
+                                            .size(11.0 * zoom),
                                     )
                                     .truncate(),
                                 );

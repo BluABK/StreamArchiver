@@ -777,6 +777,12 @@ and **Day** views (picked from the buttons in the header):
   (platform icon + start time + channel). **Click** a day number, or the
   **+N more…** when a day is busy, to open that day's full list.
 - **Week** — seven day columns (Mon–Sun), each listing *all* of that day's streams.
+  The day header also shows the **avatars of channels with a scheduled recording
+  due that day** (see *Scheduled recordings* above), and any stream long enough
+  to count as an **all-day event** (20h+ — covers both a full-day placeholder and
+  a genuine multi-day range like a subathon) draws as a continuous horizontal bar
+  under the day numbers, Google-Calendar style, instead of a clipped time-grid
+  block.
 - **Day** — a detailed, time-sorted list of one day's streams (time · platform ·
   channel — title (category)).
 - **Navigation** — `◀` / `▶` step by the current view (month/week/day), **Today**
@@ -797,6 +803,12 @@ Times respect the **date format** setting (12- vs 24-hour). `⟳` (or **F5** on 
 tab) **fetches the latest schedules from Twitch/YouTube right away** — it doesn't
 just re-read the stored copy — and the calendar updates when the fetch returns
 (schedules also refresh in the background every few hours).
+
+**Zoom** (calendar body only — the toolbar/sidebar stay normal size): the
+**🔍−** / **percentage** / **🔍+** buttons in the header, or **Ctrl+Plus** /
+**Ctrl+Minus**, scale the calendar's font and element sizes from 60% to 200%;
+**Ctrl+0** (or clicking the percentage button) resets to 100%. Session-only —
+resets to 100% on restart.
 
 > **Note:** the schedule comes from a channel's *published upcoming schedule*.
 > On Twitch that's the streamer's **Schedule** feature — if a channel hasn't set
