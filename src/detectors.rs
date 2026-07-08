@@ -197,6 +197,10 @@ struct TwitchToken {
 pub struct StreamMeta {
     pub title: String,
     pub game: String,
+    /// Live viewer count at fetch time (Twitch/Kick; YouTube's `/live` scrape
+    /// has no reliable viewer field, so always `None` there — mirrors
+    /// `DetectOutcome::stream_viewers`'s own platform coverage).
+    pub viewers: Option<i64>,
 }
 
 pub struct DetectContext {
@@ -685,6 +689,8 @@ impl DetectContext {
             title: String,
             #[serde(default)]
             game_name: String,
+            #[serde(default)]
+            viewer_count: i64,
         }
         #[derive(Deserialize)]
         struct Resp {
@@ -708,6 +714,7 @@ impl DetectContext {
                     return Some(StreamMeta {
                         title: s.title,
                         game: s.game_name,
+                        viewers: Some(s.viewer_count),
                     });
                 }
                 reqwest::StatusCode::UNAUTHORIZED if using_user_token => {
@@ -4234,7 +4241,7 @@ fn parse_youtube_meta(body: &str) -> Option<StreamMeta> {
         .as_str()
         .unwrap_or_default()
         .to_string();
-    Some(StreamMeta { title, game })
+    Some(StreamMeta { title, game, viewers: None })
 }
 
 /// Extract a live Kick stream's title + category from the v2 channel JSON. `None`
@@ -4257,6 +4264,7 @@ fn parse_kick_meta(v: &Value) -> Option<StreamMeta> {
             .as_str()
             .unwrap_or_default()
             .to_string(),
+        viewers: ls["viewer_count"].as_i64().or_else(|| ls["viewers"].as_i64()),
     })
 }
 
@@ -4481,12 +4489,29 @@ mod tests {
     #[test]
     fn kick_meta_parses_title_and_category() {
         let v: Value = serde_json::from_str(
-            r#"{"livestream":{"is_live":true,"session_title":"first stream","categories":[{"name":"Just Chatting"}]}}"#,
+            r#"{"livestream":{"is_live":true,"session_title":"first stream","categories":[{"name":"Just Chatting"}],"viewer_count":42}}"#,
         )
         .unwrap();
         let m = parse_kick_meta(&v).unwrap();
         assert_eq!(m.title, "first stream");
         assert_eq!(m.game, "Just Chatting");
+        assert_eq!(m.viewers, Some(42));
+    }
+
+    #[test]
+    fn kick_meta_viewers_falls_back_to_viewers_field() {
+        // Regression guard: while this session's meta-watcher fix mirrors the
+        // detect-path's viewer_count/viewers fallback (see
+        // `kick_viewer_count_parses_from_value`), keep both call sites in sync.
+        let v: Value = serde_json::from_str(
+            r#"{"livestream":{"is_live":true,"session_title":"x","viewers":7}}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_kick_meta(&v).unwrap().viewers, Some(7));
+
+        let neither: Value =
+            serde_json::from_str(r#"{"livestream":{"is_live":true,"session_title":"x"}}"#).unwrap();
+        assert_eq!(parse_kick_meta(&neither).unwrap().viewers, None);
     }
 
     #[test]

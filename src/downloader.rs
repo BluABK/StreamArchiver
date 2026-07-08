@@ -7651,6 +7651,16 @@ const META_POLL_INTERVAL_SECS: i64 = 60;
 /// `old -> new` (including a change to empty, e.g. a cleared category). Stops
 /// when `done` (recording ended) or `shutdown` is set. No-ops gracefully when
 /// the source is unavailable (creds unset / offline / blocked -> `None`).
+///
+/// Also refreshes `monitor.last_viewers` every cycle (Twitch/Kick only —
+/// YouTube's scrape has no viewer field). This is the ONLY place that field
+/// gets updated while a recording is active: `scheduler::tick` skips an
+/// actively-recording monitor entirely (the supervisor owns its state until
+/// the tool exits), so without this the Viewers column would freeze at
+/// whatever it last read before the recording started (or stay unknown,
+/// since a push-triggered start never had a poll outcome to read one from).
+/// Unlike title/game, the count isn't logged as a "change" — it fluctuates
+/// continuously, so every fetch just overwrites it directly.
 #[allow(clippy::too_many_arguments)]
 async fn meta_watcher(
     ctx: Arc<DetectContext>,
@@ -7702,6 +7712,11 @@ async fn meta_watcher(
                         Err(e) => warn!("insert category change failed: {e:#}"),
                     }
                 }
+            }
+            if let Some(v) = meta.viewers
+                && let Err(e) = store.set_monitor_viewers(monitor_id, v)
+            {
+                warn!("update viewers failed: {e:#}");
             }
             if changed {
                 // Wake the UI so the Changes column / popup refreshes live.

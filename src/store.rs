@@ -2283,6 +2283,21 @@ impl Store {
         Ok(())
     }
 
+    /// Update just the live viewer count, independent of `set_monitor_live_meta`
+    /// — used by the in-recording `meta_watcher` (`downloader.rs`), which polls
+    /// title/game/viewers directly while the scheduler skips an actively-
+    /// recording monitor entirely. A narrow single-column setter so a viewer
+    /// refresh can't clobber the thumbnail/go-live fields that only the
+    /// scheduler's full poll outcome should own.
+    pub fn set_monitor_viewers(&self, id: i64, viewers: i64) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE monitor SET last_viewers = ?2 WHERE id = ?1",
+            params![id, viewers],
+        )?;
+        Ok(())
+    }
+
     pub fn clear_channel_errors(&self, channel_id: i64) -> Result<()> {
         let conn = self.db();
         conn.execute(
