@@ -865,6 +865,15 @@ pub struct Monitor {
     pub max_concurrent: i64,
     pub last_checked_at: Option<i64>,
     pub last_state: String,
+    /// Go-live time of the CURRENTLY live broadcast, tracked purely from
+    /// detection polling — independent of whether a recording exists — so
+    /// Went Live/Started On/Duration have data for a live-but-not-recording
+    /// (Auto off) instance. `None` when offline (cleared on the same poll that
+    /// detects it, then re-stamped fresh the next time it's seen live).
+    pub last_live_since: Option<i64>,
+    /// True when `last_live_since` is our poll-time approximation rather than
+    /// a platform-reported go-live time (mirrors `Recording::went_live_approx`).
+    pub last_live_since_approx: bool,
 }
 
 impl Monitor {

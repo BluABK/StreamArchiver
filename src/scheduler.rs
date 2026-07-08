@@ -80,6 +80,10 @@ async fn tick(
     let mut prev_state: HashMap<i64, String> = HashMap::new();
     // monitor id -> (channel name, detection short label) for readable logs.
     let mut meta: HashMap<i64, (String, &'static str)> = HashMap::new();
+    // monitor id -> the currently-persisted (go-live time, is-approx) so a
+    // continuing live session with no platform-reported go-live time keeps its
+    // originally-stamped approximation instead of drifting forward every poll.
+    let mut prev_live_since: HashMap<i64, (Option<i64>, bool)> = HashMap::new();
 
     let recording: std::collections::HashSet<i64> =
         active.lock().unwrap().keys().copied().collect();
@@ -87,6 +91,7 @@ async fn tick(
     for row in &rows {
         let m = &row.monitor;
         prev_state.insert(m.id, m.last_state.clone());
+        prev_live_since.insert(m.id, (m.last_live_since, m.last_live_since_approx));
         // Master "Enabled" switch off → fully dormant: no detection at all (nor
         // any recording/fetch elsewhere). The channel keeps its last state until
         // manually checked. Distinct from Auto (below), which never gates
@@ -219,16 +224,39 @@ async fn tick(
         } else {
             ("", "", "", -1)
         };
-        if let Err(e) = ctx
-            .store
-            .set_monitor_live_meta(o.monitor_id, title, game, thumb, viewers)
-        {
+        let old_state = prev_state.get(&o.monitor_id).map(String::as_str);
+        // Go-live time for the CURRENTLY live broadcast, independent of any
+        // recording (so Went Live/Started On/Duration have data with Auto off).
+        // A platform-reported time (Twitch) is authoritative and always wins;
+        // when the source gives none, keep the previously-stamped approximation
+        // for as long as the same broadcast continues (still "live" last poll)
+        // rather than re-approximating (and thus drifting) every tick.
+        let (live_since, live_since_approx) = if o.live && !o.error {
+            match o.went_live_at {
+                Some(t) => (Some(t), false),
+                None if old_state == Some("live") => prev_live_since
+                    .get(&o.monitor_id)
+                    .copied()
+                    .unwrap_or((Some(checked_at), true)),
+                None => (Some(checked_at), true),
+            }
+        } else {
+            (None, false)
+        };
+        if let Err(e) = ctx.store.set_monitor_live_meta(
+            o.monitor_id,
+            title,
+            game,
+            thumb,
+            viewers,
+            live_since,
+            live_since_approx,
+        ) {
             warn!(
                 "scheduler: failed to persist live meta for {}: {e:#}",
                 o.monitor_id
             );
         }
-        let old_state = prev_state.get(&o.monitor_id).map(String::as_str);
         let changed = old_state != Some(new_state);
 
         // Readable per-poll logging: name [method] result (+ go-live / error

@@ -240,6 +240,8 @@ pub fn create_monitor(
         max_concurrent: 1,
         last_checked_at: None,
         last_state: "idle".into(),
+        last_live_since: None,
+        last_live_since_approx: false,
         sabr_codec_pref: crate::models::SabrCodecPref::Inherit,
         sabr_codec_custom: String::new(),
     };

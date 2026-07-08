@@ -2372,6 +2372,17 @@ impl Supervisor {
                         }
                     });
                     let _ = self.store.set_monitor_check_result(monitor_id, "live", now_unix());
+                    // Title/game aren't known yet here (that's why the re-check
+                    // above was spawned) but the go-live time is, so at least
+                    // Went Live/Started On/Duration have data instead of sitting
+                    // blank until the re-check (or the next poll) fills the rest in.
+                    let (live_since, live_since_approx) = match went_live_at {
+                        Some(t) => (Some(t), approximate),
+                        None => (Some(now_unix()), true),
+                    };
+                    let _ = self.store.set_monitor_live_meta(
+                        monitor_id, "", "", "", -1, live_since, live_since_approx,
+                    );
                     return false;
                 }
             }
@@ -2379,9 +2390,25 @@ impl Supervisor {
         if !forced && auto_off && trigger_hit.is_none() {
             // Auto-record is off for this channel/instance: detection keeps the
             // state fresh, but only an explicit user Start (or a trigger-word
-            // match) records. Update last_state so the UI shows "live".
+            // match) records. Update last_state so the UI shows "live", and the
+            // live meta (title/game/thumbnail/go-live time) the same way the
+            // poll scheduler does, so Went Live/Started On/Duration aren't blank
+            // just because this channel was seen live via a push signal instead.
             self.active.lock().unwrap().remove(&monitor_id);
             let _ = self.store.set_monitor_check_result(monitor_id, "live", now_unix());
+            let (live_since, live_since_approx) = match went_live_at {
+                Some(t) => (Some(t), approximate),
+                None => (Some(now_unix()), true),
+            };
+            let _ = self.store.set_monitor_live_meta(
+                monitor_id,
+                stream_title.as_deref().unwrap_or(""),
+                stream_game.as_deref().unwrap_or(""),
+                thumbnail_url.as_deref().unwrap_or(""),
+                -1,
+                live_since,
+                live_since_approx,
+            );
             return false;
         }
         let trigger_info = trigger_hit.as_ref().map(|h| h.describe()).unwrap_or_default();
@@ -2456,9 +2483,24 @@ impl Supervisor {
                 };
                 self.try_begin(monitor_id, went, approx, outcome.stream_id, outcome.thumbnail_url, outcome.broadcaster_id, outcome.stream_title, outcome.stream_game, true, user_initiated);
             } else {
-                // Auto off + automatic trigger: just update the state so the
-                // UI shows "live"; nothing records.
+                // Auto off + automatic trigger: just update the state + live
+                // meta (title/game/thumbnail/viewers/go-live time) so the UI
+                // shows "live" with Went Live/Started On/Duration populated;
+                // nothing records.
                 let _ = self.store.set_monitor_check_result(monitor_id, "live", now_unix());
+                let (live_since, live_since_approx) = match outcome.went_live_at {
+                    Some(t) => (Some(t), false),
+                    None => (Some(now_unix()), true),
+                };
+                let _ = self.store.set_monitor_live_meta(
+                    monitor_id,
+                    outcome.stream_title.as_deref().unwrap_or(""),
+                    outcome.stream_game.as_deref().unwrap_or(""),
+                    outcome.thumbnail_url.as_deref().unwrap_or(""),
+                    outcome.stream_viewers.unwrap_or(-1),
+                    live_since,
+                    live_since_approx,
+                );
             }
         } else if user_initiated {
             let message = if outcome.error && !outcome.detail.is_empty() {
@@ -8583,6 +8625,8 @@ mod tests {
                 max_concurrent: 1,
                 last_checked_at: None,
                 last_state: "idle".into(),
+                last_live_since: None,
+                last_live_since_approx: false,
                 sabr_codec_pref: SabrCodecPref::Inherit,
                 sabr_codec_custom: String::new(),
             },

@@ -77,11 +77,21 @@ two tools on one URL.
      disk-space control. It does **not** gate detection, metadata, posts,
      schedules, or assets: an Auto-off (but Enabled) channel is still fully
      monitored — liveness is polled/pushed as usual (the State column shows
-     *live*, and the **Title/Game/👁 Viewers** columns show its current stream
-     even though nothing is recording), everything keeps refreshing into the
-     archive, and the ▶ **Start** button always records on demand. Recording
-     auto-starts only when **both** Enabled and Auto are on (or a trigger word
-     matches).
+     *live*, and the **Title/Game/👁 Viewers/Went Live/Started On/Duration**
+     columns show its current stream even though nothing is recording),
+     everything keeps refreshing into the archive, and the ▶ **Start** button
+     always records on demand. Recording auto-starts only when **both**
+     Enabled and Auto are on (or a trigger word matches). Went Live/Started
+     On/Duration come from detection's own go-live tracking in this case (the
+     same "known even without a recording" data as Title/Game) — Started On
+     mirrors Went Live and Lost time is blank, since nothing is being captured.
+
+   A **channel** (container) row rolls up its instances: the State column shows
+   a live/recording indicator when **any** instance is live (with a count after
+   the icon, e.g. `⏺ 2`, when more than one is), and its Went Live/Started
+   On/Duration/Title/Game/Viewers show whichever live instance went live
+   **earliest** — falling back to the most recent past recording once nothing
+   is currently live.
 
    When **Add stream** creates a brand-new channel, the channel's Enabled/Auto
    start out matching the first instance's — so a new instance added with Auto

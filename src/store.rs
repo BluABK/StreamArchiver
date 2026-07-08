@@ -34,7 +34,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 51;
+const SCHEMA_VERSION: i64 = 52;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -1375,7 +1375,19 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 51)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 51);
+        if version < 52 {
+            // Poll-detected "currently live" go-live time, tracked independent of
+            // any recording (like last_title/last_game — written on every poll
+            // regardless of Auto) so the Went Live/Started On/Duration columns
+            // have something to show for a live-but-not-recording (Auto off)
+            // instance instead of sitting blank. Cleared to NULL on offline.
+            conn.execute_batch(
+                "ALTER TABLE monitor ADD COLUMN last_live_since        INTEGER;
+                 ALTER TABLE monitor ADD COLUMN last_live_since_approx INTEGER NOT NULL DEFAULT 0;",
+            )?;
+            conn.pragma_update(None, "user_version", 52)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 52);
         Ok(())
     }
 
@@ -2244,9 +2256,13 @@ impl Store {
     }
 
     /// Persist the last-detected live info on a monitor (title/game/thumbnail/
-    /// viewers), written on every poll regardless of the Auto-record flag so the
-    /// grid can show a live channel's info without a recording. Empty strings +
-    /// `viewers = -1` clear stale info when a channel goes offline.
+    /// viewers/go-live time), written on every poll regardless of the
+    /// Auto-record flag so the grid can show a live channel's info — including
+    /// Went Live/Started On/Duration — without a recording. Empty strings +
+    /// `viewers = -1` clear stale info when a channel goes offline; `live_since
+    /// = None` likewise clears the go-live time (a fresh value is stamped again
+    /// the next time it's seen live).
+    #[allow(clippy::too_many_arguments)]
     pub fn set_monitor_live_meta(
         &self,
         id: i64,
@@ -2254,12 +2270,15 @@ impl Store {
         game: &str,
         thumbnail_url: &str,
         viewers: i64,
+        live_since: Option<i64>,
+        live_since_approx: bool,
     ) -> Result<()> {
         let conn = self.db();
         conn.execute(
             "UPDATE monitor SET last_title = ?2, last_game = ?3,
-                 last_thumbnail_url = ?4, last_viewers = ?5 WHERE id = ?1",
-            params![id, title, game, thumbnail_url, viewers],
+                 last_thumbnail_url = ?4, last_viewers = ?5,
+                 last_live_since = ?6, last_live_since_approx = ?7 WHERE id = ?1",
+            params![id, title, game, thumbnail_url, viewers, live_since, live_since_approx as i64],
         )?;
         Ok(())
     }
@@ -3926,7 +3945,8 @@ impl Store {
                 m.sabr_codec_pref, m.sabr_codec_custom,
                 COALESCE(r.trigger_info, ''),
                 m.automation_enabled, c.automation_enabled,
-                m.last_title, m.last_game, m.last_thumbnail_url, m.last_viewers
+                m.last_title, m.last_game, m.last_thumbnail_url, m.last_viewers,
+                m.last_live_since, m.last_live_since_approx
              FROM monitor m
              JOIN channel c ON c.id = m.channel_id
              LEFT JOIN recording r
@@ -3978,6 +3998,8 @@ impl Store {
                     max_concurrent: r.get(19)?,
                     last_checked_at: r.get(20)?,
                     last_state: r.get(21)?,
+                    last_live_since: r.get(57)?,
+                    last_live_since_approx: r.get::<_, Option<i64>>(58)?.unwrap_or(0) != 0,
                 };
                 Ok(MonitorWithChannel {
                     channel,
@@ -4876,6 +4898,8 @@ mod tests {
             max_concurrent: 1,
             last_checked_at: None,
             last_state: "idle".into(),
+            last_live_since: None,
+            last_live_since_approx: false,
             sabr_codec_pref: SabrCodecPref::Inherit,
             sabr_codec_custom: String::new(),
         }
@@ -4975,19 +4999,27 @@ mod tests {
 
         // Live meta persists + round-trips; offline clears it.
         assert_eq!(row(&store).last_viewers, -1, "unknown by default");
+        assert_eq!(row(&store).monitor.last_live_since, None, "unset by default");
         store
-            .set_monitor_live_meta(mid, "Ranked grind", "VALORANT", "https://t/x.jpg", 1234)
+            .set_monitor_live_meta(
+                mid, "Ranked grind", "VALORANT", "https://t/x.jpg", 1234, Some(1_000_000), true,
+            )
             .unwrap();
         let r = row(&store);
         assert_eq!(r.last_title, "Ranked grind");
         assert_eq!(r.last_game, "VALORANT");
         assert_eq!(r.last_thumbnail_url, "https://t/x.jpg");
         assert_eq!(r.last_viewers, 1234);
+        assert_eq!(r.monitor.last_live_since, Some(1_000_000));
+        assert!(r.monitor.last_live_since_approx);
 
-        store.set_monitor_live_meta(mid, "", "", "", -1).unwrap();
+        store
+            .set_monitor_live_meta(mid, "", "", "", -1, None, false)
+            .unwrap();
         let r = row(&store);
         assert_eq!(r.last_title, "");
         assert_eq!(r.last_viewers, -1);
+        assert_eq!(r.monitor.last_live_since, None, "cleared on offline");
     }
 
     #[test]

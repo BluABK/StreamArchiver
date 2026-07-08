@@ -2151,6 +2151,8 @@ impl StreamArchiverApp {
             max_concurrent: 1,
             last_checked_at: None,
             last_state: "idle".into(),
+            last_live_since: None,
+            last_live_since_approx: false,
             sabr_codec_pref: form.sabr_codec_pref,
             sabr_codec_custom: form.sabr_codec_custom.trim().to_string(),
         };
@@ -5388,6 +5390,32 @@ struct RecordingCells {
 
 fn recording_cells(row: &MonitorWithChannel, now: i64) -> RecordingCells {
     let active = row.last_recording_status.as_deref() == Some("recording");
+    // Not recording (e.g. Auto off) but currently live: fall back to the
+    // poll-detected go-live time instead of whatever (possibly old/unrelated)
+    // recording happens to be "latest" for this instance, so Went Live/Started
+    // On/Duration still show something for the CURRENT live session. There's no
+    // separate "recording start" here, so Started On mirrors Went Live, and
+    // Lost time doesn't apply (nothing is being captured).
+    if !active && row.monitor.last_state == "live" && let Some(w) = row.monitor.last_live_since {
+        let approx = row.monitor.last_live_since_approx;
+        let went_live = {
+            let s = fmt_datetime_short(w);
+            if approx { format!("{s}~") } else { s }
+        };
+        let dur = (now - w).max(0);
+        return RecordingCells {
+            active: false,
+            started_on: went_live.clone(),
+            started_secs: w,
+            duration: fmt_duration(dur),
+            duration_secs: dur,
+            went_live,
+            went_live_secs: w,
+            went_live_approx: approx,
+            lost: String::new(),
+            lost_secs: 0,
+        };
+    }
     let started = row.last_recording_started;
     let started_secs = started.unwrap_or(0);
     let dur = match (started, row.last_recording_ended, active) {
@@ -5531,14 +5559,48 @@ fn channel_platform(monitors: &[&MonitorWithChannel]) -> Option<Platform> {
     if it.all(|p| p == first) { Some(first) } else { None }
 }
 
-/// The channel's most-recent-activity instance, which drives the container row's
-/// time + ad columns. `None` only for an empty container. Shared by the
-/// sort/filter model and the row render so they can't drift.
-fn channel_primary<'a>(monitors: &[&'a MonitorWithChannel]) -> Option<&'a MonitorWithChannel> {
+/// The instance that represents the channel container row: the
+/// earliest-started instance that is CURRENTLY live or recording (so the row
+/// reflects what's happening right now, not a stale past session — and picks
+/// the earliest when several instances are live at once); or, when nothing is
+/// currently live/recording, the most-recent-past-recording instance (the
+/// original history-browsing behavior). `None` only for an empty container.
+/// Shared by the sort/filter model and the row render so they can't drift.
+fn channel_primary<'a>(
+    monitors: &[&'a MonitorWithChannel],
+    active: &HashSet<i64>,
+    now: i64,
+) -> Option<&'a MonitorWithChannel> {
+    let mut best: Option<(&'a MonitorWithChannel, i64)> = None;
+    for &m in monitors {
+        let recording = active.contains(&m.monitor.id);
+        let live = recording || m.monitor.last_state == "live";
+        if !live {
+            continue;
+        }
+        let went_live = recording_cells(m, now).went_live_secs;
+        if went_live <= 0 {
+            continue;
+        }
+        let better = match best {
+            None => true,
+            Some((_, b)) => went_live < b,
+        };
+        if better {
+            best = Some((m, went_live));
+        }
+    }
+    best.map(|(m, _)| m)
+        .or_else(|| monitors.iter().copied().max_by_key(|m| m.last_recording_started.unwrap_or(0)))
+}
+
+/// How many of the channel's instances are currently live (recording or not) —
+/// drives the container row's bubbled-up live-count badge.
+fn channel_live_count(monitors: &[&MonitorWithChannel], active: &HashSet<i64>) -> usize {
     monitors
         .iter()
-        .copied()
-        .max_by_key(|m| m.last_recording_started.unwrap_or(0))
+        .filter(|m| active.contains(&m.monitor.id) || m.monitor.last_state == "live")
+        .count()
 }
 
 /// How many of the channel's instances are ad-free (manual flag or detected sub).
@@ -5573,8 +5635,10 @@ fn channel_cells(
     }
     // Live process state, not the DB snapshot — matches the rendered state dot.
     let any_recording = monitors.iter().any(|m| active.contains(&m.monitor.id));
-    // The most recent recording across instances drives the time columns.
-    let primary = channel_primary(monitors).unwrap_or(monitors[0]);
+    let live_count = channel_live_count(monitors, active);
+    // The earliest-live (or, if none live, most recent past recording) instance
+    // drives the time columns.
+    let primary = channel_primary(monitors, active, now).unwrap_or(monitors[0]);
     let rec = recording_cells(primary, now);
     let ninst = monitors.len();
     let tool = ninst.to_string();
@@ -5605,9 +5669,11 @@ fn channel_cells(
         Cell::text(tool),
         Cell::text(String::new()), // detection
         Cell::num(last as f64, fmt_datetime_short(last)), // polled (datetime only)
-        // Mirrors the rendered state cell: recording (live) > failed > blank.
+        // Mirrors the rendered state cell: recording > live > failed > blank.
         Cell::text(if any_recording {
             "recording".to_string()
+        } else if live_count > 0 {
+            "live".to_string()
         } else if primary.last_recording_status.as_deref() == Some("failed") {
             "failed".to_string()
         } else {
@@ -5640,12 +5706,12 @@ fn channel_cells(
         ),
         // Went Live (index 13)
         Cell::num(
-            primary.last_recording_went_live.unwrap_or(0) as f64,
+            rec.went_live_secs as f64,
             rec.went_live.clone(),
         ),
         // Started On (index 14)
         Cell::num(
-            primary.last_recording_started.unwrap_or(0) as f64,
+            rec.started_secs as f64,
             rec.started_on.clone(),
         ),
         Cell::num(rec.lost_secs as f64, rec.lost.clone()),
@@ -13265,6 +13331,7 @@ impl StreamArchiverApp {
                                 let any_rec = mons
                                     .iter()
                                     .any(|m| active_ids.contains(&m.monitor.id));
+                                let live_count = channel_live_count(&mons, &active_ids);
                                 let expanded = exp_channels.contains(&cid);
                                 let platforms = channel_platforms(&mons);
                                 let last_poll = mons
@@ -13272,8 +13339,9 @@ impl StreamArchiverApp {
                                     .filter_map(|m| m.monitor.last_checked_at)
                                     .max()
                                     .unwrap_or(0);
-                                // Latest activity across instances drives the time columns.
-                                let primary = channel_primary(&mons);
+                                // The earliest-live (or, if none live, most recent
+                                // past recording) instance drives the time columns.
+                                let primary = channel_primary(&mons, &active_ids, now);
                                 let rec = primary.map(|m| recording_cells(m, now));
                                 let ads = primary.map(|m| {
                                     (m.last_recording_ad_count, m.last_recording_ad_secs)
@@ -13427,7 +13495,30 @@ impl StreamArchiverApp {
                                             "state" => {
                                                 if any_rec {
                                                     let (icon, color) = state_icon("recording");
-                                                    ui.colored_label(color, icon).on_hover_text("recording");
+                                                    let label = if live_count > 1 {
+                                                        format!("{icon} {live_count}")
+                                                    } else {
+                                                        icon.to_string()
+                                                    };
+                                                    let hover = if live_count > 1 {
+                                                        format!("recording ({live_count} instances live)")
+                                                    } else {
+                                                        "recording".to_string()
+                                                    };
+                                                    ui.colored_label(color, label).on_hover_text(hover);
+                                                } else if live_count > 0 {
+                                                    let (icon, color) = state_icon("live");
+                                                    let label = if live_count > 1 {
+                                                        format!("{icon} {live_count}")
+                                                    } else {
+                                                        icon.to_string()
+                                                    };
+                                                    let hover = if live_count > 1 {
+                                                        format!("{live_count} instances live")
+                                                    } else {
+                                                        "live".to_string()
+                                                    };
+                                                    ui.colored_label(color, label).on_hover_text(hover);
                                                 } else if let Some(p) = primary {
                                                     if p.last_recording_status.as_deref() == Some("failed") {
                                                         let (icon, color) = state_icon("failed");
@@ -25301,16 +25392,178 @@ fn parse_twitch_chat_line(
 mod tests {
     use super::{
         Cell, ChatSegment, DateFmt, SortLevel, SortState, StreamMetaChange, StreamTarget,
-        active_date_fmt, aggregate_stream_changes, build_twitch_segments, chat_file_for_recording,
-        compose_browser_profile, contrast_ratio, fmt_polled, hsl_to_rgb, meta_change_lines,
-        monitor_import_identity, ordered_rows, parse_first_party_spans, playable_with,
-        player_is_mpv, readable_color, rgb_to_hsl, set_active_date_fmt, split_browser_profile,
-        stream_target_for_active, strip_ctcp_action, twitch_username_color, word_match_segments,
-        yt_channel_id,
+        active_date_fmt, aggregate_stream_changes, build_twitch_segments, channel_live_count,
+        channel_primary, chat_file_for_recording, compose_browser_profile, contrast_ratio,
+        fmt_polled, hsl_to_rgb, meta_change_lines, monitor_import_identity, ordered_rows,
+        parse_first_party_spans, playable_with, player_is_mpv, readable_color, recording_cells,
+        rgb_to_hsl, set_active_date_fmt, split_browser_profile, stream_target_for_active,
+        strip_ctcp_action, twitch_username_color, word_match_segments, yt_channel_id,
+    };
+    use crate::models::{
+        AuthKind, Channel, Container, DetectionMethod, Monitor, MonitorWithChannel, Platform,
+        SabrCodecPref, Tool,
     };
     use eframe::egui;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
+
+    /// Minimal `MonitorWithChannel` fixture for the live-state bubbling tests
+    /// below — only the fields those tests actually vary are parameters, the
+    /// rest are innocuous defaults.
+    fn test_row(
+        monitor_id: i64,
+        last_state: &str,
+        last_recording_status: Option<&str>,
+        last_recording_started: Option<i64>,
+        last_live_since: Option<i64>,
+        last_live_since_approx: bool,
+    ) -> MonitorWithChannel {
+        MonitorWithChannel {
+            channel: Channel {
+                id: 1,
+                name: "Test Channel".into(),
+                url: "https://twitch.tv/test".into(),
+                platform: Platform::Twitch,
+                created_at: 0,
+                color: String::new(),
+                preferred_asset: None,
+                enabled: true,
+                automation_enabled: true,
+            },
+            monitor: Monitor {
+                id: monitor_id,
+                channel_id: 1,
+                url: "https://twitch.tv/test".into(),
+                enabled: true,
+                automation_enabled: true,
+                tool: Tool::Streamlink,
+                detection_method: DetectionMethod::TwitchApi,
+                poll_interval_secs: 60,
+                quality: "best".into(),
+                output_dir: "C:/rec".into(),
+                filename_template: "{name}_{date}_{time}".into(),
+                container: Container::Mkv,
+                capture_from_start: true,
+                dual_capture: false,
+                sabr_codec_pref: SabrCodecPref::Inherit,
+                sabr_codec_custom: String::new(),
+                ad_free: false,
+                auth_kind: AuthKind::Inherit,
+                auth_value: String::new(),
+                audio_tracks: String::new(),
+                subtitle_tracks: String::new(),
+                chat_log: false,
+                fetch_thumbnail: false,
+                thumbnail_in_toast: false,
+                fetch_chat_assets: false,
+                extra_args: String::new(),
+                max_concurrent: 1,
+                last_checked_at: None,
+                last_state: last_state.to_string(),
+                last_live_since,
+                last_live_since_approx,
+            },
+            last_recording_started,
+            last_recording_ended: None,
+            last_recording_status: last_recording_status.map(str::to_string),
+            last_recording_went_live: last_recording_started,
+            last_recording_went_live_approx: false,
+            last_recording_lost_secs: None,
+            last_recording_ad_count: 0,
+            last_recording_ad_secs: 0,
+            last_recording_meta_changes: 0,
+            last_recording_title: String::new(),
+            last_recording_category: String::new(),
+            last_recording_log: String::new(),
+            last_recording_trigger: String::new(),
+            ad_free_sub: None,
+            recording_count: 0,
+            next_stream_at: None,
+            next_stream_title: String::new(),
+            last_title: String::new(),
+            last_game: String::new(),
+            last_thumbnail_url: String::new(),
+            last_viewers: -1,
+        }
+    }
+
+    // ----- live-state bubbling (Went Live/Started On/Duration w/ Auto off, and
+    // channel-row live indicator/count) -----
+
+    #[test]
+    fn recording_cells_falls_back_to_poll_live_meta_when_not_recording() {
+        // Auto off (or otherwise not currently recording): no recording data at
+        // all, but the poll-detected go-live time is known — Went Live/Started
+        // On/Duration should reflect it instead of sitting blank.
+        let now = 1_000_100;
+        let row = test_row(1, "live", None, None, Some(1_000_000), true);
+        let cells = recording_cells(&row, now);
+        assert!(!cells.active);
+        assert_eq!(cells.went_live_secs, 1_000_000);
+        assert!(cells.went_live_approx);
+        assert!(cells.went_live.ends_with('~'), "approx marker: {}", cells.went_live);
+        assert_eq!(cells.started_secs, 1_000_000, "Started On mirrors Went Live");
+        assert_eq!(cells.duration_secs, 100);
+        assert_eq!(cells.lost_secs, 0, "nothing being captured, so nothing lost");
+    }
+
+    #[test]
+    fn recording_cells_prefers_active_recording_over_poll_live_meta() {
+        // Currently recording: the recording's own timing wins even though a
+        // (stale/unrelated) poll-detected go-live time is also present.
+        let now = 1_000_100;
+        let row = test_row(1, "live", Some("recording"), Some(999_000), Some(1_000_050), false);
+        let cells = recording_cells(&row, now);
+        assert!(cells.active);
+        assert_eq!(cells.started_secs, 999_000);
+        assert_eq!(cells.went_live_secs, 999_000); // last_recording_went_live seeded to started above
+    }
+
+    #[test]
+    fn recording_cells_offline_ignores_stale_live_since() {
+        // Offline with no current recording: a leftover last_live_since from a
+        // prior session must NOT resurface (last_state gates the fallback).
+        let now = 1_000_100;
+        let row = test_row(1, "offline", None, None, Some(1_000_000), true);
+        let cells = recording_cells(&row, now);
+        assert!(!cells.active);
+        assert_eq!(cells.went_live_secs, 0);
+        assert_eq!(cells.started_secs, 0);
+    }
+
+    #[test]
+    fn channel_primary_picks_earliest_live_instance_and_counts_them() {
+        // Two instances live-not-recording at once: the channel row should
+        // represent the EARLIER one (and its duration), not just whichever
+        // happens to sort first / most-recently-checked.
+        let earlier = test_row(1, "live", None, None, Some(1_000_000), false);
+        let later = test_row(2, "live", None, None, Some(1_000_500), false);
+        let monitors = vec![&later, &earlier]; // deliberately out of time order
+        let active = HashSet::new(); // neither is actually recording
+        let now = 1_000_600;
+
+        assert_eq!(channel_live_count(&monitors, &active), 2);
+        let primary = channel_primary(&monitors, &active, now).expect("one is live");
+        assert_eq!(primary.monitor.id, 1, "earliest go-live wins");
+
+        let cells = recording_cells(primary, now);
+        assert_eq!(cells.went_live_secs, 1_000_000);
+        assert_eq!(cells.duration_secs, 600);
+    }
+
+    #[test]
+    fn channel_primary_falls_back_to_last_recording_when_none_live() {
+        // Nothing currently live/recording: falls back to the most-recent-past
+        // recording, matching the original (pre-bubbling) behavior.
+        let old = test_row(1, "offline", None, Some(500_000), None, false);
+        let newer = test_row(2, "offline", None, Some(600_000), None, false);
+        let monitors = vec![&old, &newer];
+        let active = HashSet::new();
+
+        assert_eq!(channel_live_count(&monitors, &active), 0);
+        let primary = channel_primary(&monitors, &active, 700_000).expect("non-empty");
+        assert_eq!(primary.monitor.id, 2, "most recent past recording wins");
+    }
 
     // ----- multi-level table sort (ordered_rows) -----
 
