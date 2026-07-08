@@ -8,6 +8,8 @@ Written in **Rust** with a **native egui UI** (no web/Chromium). Runs in the sys
 tray with the window opened on demand; idle CPU is ~0% and the resident footprint is
 small.
 
+![Streams grid — the main monitoring view](doc/screenshots/streams-grid.png)
+
 ## Status
 
 | Phase | State |
@@ -97,6 +99,8 @@ two tools on one URL.
    button.
 
 ### Videos (on-demand downloads)
+
+![Videos tab — download form and history](doc/screenshots/videos-tab.png)
 
 The **Videos** tab downloads a *specific* video or VOD now — a YouTube video, a
 Twitch VOD, or any `streamlink`/`yt-dlp` URL — rather than watching a channel for
@@ -273,6 +277,8 @@ setting still applies as configured.
 
 ### Row actions & shortcuts
 
+![Right-click context menu on an instance row](doc/screenshots/row-context-menu.png)
+
 Left-click a row to select it; **right-click** any row — channel, instance,
 stream, or take — for a context menu with that row's actions. For an instance:
 Start/Stop recording, **Stream in player** / **Play new instance** (see
@@ -426,6 +432,8 @@ interrupted writes).
 
 ### Issues panel & re-remux
 
+![Issues panel listing a recording that needs a re-remux](doc/screenshots/issues-panel.png)
+
 The **⚠ Issues** button in the toolbar (turns amber with a count when issues exist) opens a panel listing recordings that need attention:
 
 - **Needs re-remux** — a recording whose capture finished as `.ts` but was never successfully remuxed to MKV (e.g. after a crash, a detached process, or an automatic remux failure at finalization). The **🔄 Re-remux** button triggers a background ffmpeg remux; the status cell shows a live progress bar with fps / speed / position once ffmpeg is running. The source `.ts` is deleted only on success.
@@ -438,7 +446,37 @@ The Issues panel refreshes every 5 s while open and every 30 s while closed, so 
 
 > The active re-remux job is a background tokio task and does not survive an app restart. The source `.ts` is always preserved, so after a restart the file reappears in the Issues panel and can be re-triggered.
 
+### Notifications, background jobs & process manager
+
+- **🔔 Notifications** — the bell button in the toolbar (badges with the unread
+  count) opens a window logging live/offline transitions, VOD/recovery
+  completions, trigger matches, new community posts, and more, with a kind
+  filter and text search; **Mark all read** clears the badge. The same events
+  also raise a **desktop toast** (with a "Watch stream"/"Watch VOD" action
+  where relevant).
+
+  ![Notifications window with a mixed feed of events](doc/screenshots/notifications-window.png)
+  ![Desktop toast for a channel going live](doc/screenshots/live-toast-notification.png)
+- **Background** tab — lists every recurring background job (Live poll,
+  Schedule refresh, Ad-free/sub refresh, YouTube WebSub poll, Channel asset
+  refresh, YouTube posts refresh, Scheduled recordings) with its interval and
+  a live countdown to the next run; each has its own on/off toggle (turning
+  off **Live poll** pauses all detection/recording). Below that, **Active**
+  and **Recent** tables show in-flight and just-finished tasks (head
+  backfills, re-remuxes, asset fetches) with live progress and outcome.
+
+  ![Background tab: job schedule plus active/recent task tables](doc/screenshots/background-jobs.png)
+- **🖥 Process manager** — lists every spawned external process (streamlink /
+  yt-dlp / ffmpeg) with its PID, tool, status, and uptime, plus per-process
+  **Stop** (graceful), **Kill** (force-terminate the tree), **Log**, and
+  **Folder** actions — useful for diagnosing a stuck capture without leaving
+  the app.
+
+  ![Process manager listing a running streamlink capture](doc/screenshots/process-manager.png)
+
 ### Twitch VOD recovery (deleted & muted VODs)
+
+![Recording context menu with Recover VOD / Download post-stream VOD / Backfill head](doc/screenshots/vod-recovery-menu.png)
 
 Twitch DMCA-**mutes** VODs (silencing flagged segments) and, on deletion,
 **unpublishes** them — but the underlying `.ts`/`.mp4` segments linger on Twitch's
@@ -591,6 +629,8 @@ know the schedule of but don't want kept on Auto.
   Background view like any other periodic job ("Scheduled recordings").
 
 ### Post-stream VOD download (archive the published VOD)
+
+![Instance context menu with Download post-stream VOD, mid-recording](doc/screenshots/post-stream-vod-menu.png)
 
 After a stream ends the platform publishes its own **post-processed VOD** — Twitch's
 clean transcode, YouTube's finished recording, Kick's VOD — often higher quality /
@@ -771,11 +811,13 @@ scrapes (the API needs the live video id and returns no better category).
 
 The **Schedule** tab shows every upcoming scheduled stream (from the same Twitch +
 YouTube sources as the Next stream column) in a calendar, with **Month**, **Week**,
-and **Day** views (picked from the buttons in the header):
+**Day**, and **Agenda** views (picked from the buttons in the header):
 
 - **Month** — a 6×7 grid; each day cell shows up to three streams as chips
   (platform icon + start time + channel). **Click** a day number, or the
   **+N more…** when a day is busy, to open that day's full list.
+
+  ![Month view with per-day stream chips and scheduled-recording badges](doc/screenshots/schedule-month-view.png)
 - **Week** — seven day columns (Mon–Sun), each listing *all* of that day's streams.
   The day header also shows the **avatars of channels with a scheduled recording
   due that day** (see *Scheduled recordings* above), and any stream long enough
@@ -783,8 +825,16 @@ and **Day** views (picked from the buttons in the header):
   a genuine multi-day range like a subathon) draws as a continuous horizontal bar
   under the day numbers, Google-Calendar style, instead of a clipped time-grid
   block.
+
+  ![Week view with channel avatars and an all-day event bar spanning several days](doc/screenshots/schedule-week-view.png)
 - **Day** — a detailed, time-sorted list of one day's streams (time · platform ·
   channel — title (category)).
+
+  ![Day view — a time grid with overlapping streams laid out in lanes](doc/screenshots/schedule-day-view.png)
+- **Agenda** — a flat, date-grouped list of every upcoming stream across all
+  visible channels, most useful for scanning far ahead at a glance.
+
+  ![Agenda view — flat date-grouped stream list](doc/screenshots/schedule-agenda-view.png)
 - **Navigation** — `◀` / `▶` step by the current view (month/week/day), **Today**
   returns to now. Today is tinted/highlighted.
 - **Right-click** any stream (chip, day list, or popup) to **copy** its URL,
@@ -860,6 +910,13 @@ OCR and scraping sources run on the **slow (6 h) cadence** only, never the 60 s 
 
 **OCR settings** (Settings → Schedule → OCR): the CLI command (default `claude`), primary model (default `haiku`), fallback model (default `sonnet`), default timezone name and UTC offset. Per-channel overrides for timezone, offset, Twitter/X handle, and the "other image" path live in **right-click → Properties → Schedule sources**.
 
+The **Stats** tab tracks cumulative **Claude OCR** usage (invocations, cache
+hits, parse failures, tokens and cost per model) alongside **YouTube Data API**
+quota usage (units and search calls against the daily cutoff), so you can see
+what these features are actually costing you.
+
+![Stats tab — Claude OCR usage/cost and YouTube Data API quota](doc/screenshots/stats-ocr.png)
+
 ### Chat logs
 
 Tick **Log chat** on an instance to archive chat alongside the recording (new
@@ -882,7 +939,11 @@ download captures `live_chat` (e.g. a YouTube VOD's chat replay) the same way.
 Chat sidecars sit next to the video and **follow it** if the file is renamed
 (see *Filename media info*), so they stay matched to their recording.
 
+![Chat log viewer replaying an archived Twitch chat](doc/screenshots/chat-log-viewer.png)
+
 ### YouTube community posts (📣 Posts)
+
+![Posts tab showing a channel's archived community posts](doc/screenshots/community-posts.png)
 
 StreamArchiver archives the **community posts** of every monitored YouTube
 channel — text (with clickable links), attached images, author avatar, and like
@@ -964,6 +1025,9 @@ superseded icons / banners are **archived** rather than overwritten (see *change
 history* below).
 
 **Where it shows up — channel Properties** (right-click a channel → **Properties**).
+
+![Channel Properties — assets, per-account status, and About pages](doc/screenshots/channel-properties.png)
+
 The window is organized into collapsible sections (**Assets · Channel · Schedule
 sources** — the last starts collapsed) and scrolls when content outgrows it;
 collapse/expand choices are remembered across restarts:
@@ -986,6 +1050,8 @@ collapse/expand choices are remembered across restarts:
   when *Animate emotes* is on in Settings). Codes still listed in the manifest whose
   image has gone from the cache are shown separately under **Deprecated (no longer
   available)**. Sibling accounts open separate viewer windows.
+
+  ![Emote viewer windows for a channel's Twitch and 7TV emote sets](doc/screenshots/emote-viewer.png)
 
 **Instance Properties** (right-click an instance row → **Properties**) shows the
 same asset data scoped to *that instance's own account*: the header uses the
@@ -1216,6 +1282,8 @@ together:
    plugin *for the SABR binary*.
 
 #### Settings → "YouTube SABR (live-from-start)"
+
+![Settings → Downloads: SABR, trigger words, and VOD recovery configuration](doc/screenshots/sabr-settings.png)
 
 | Field | Purpose |
 |---|---|
