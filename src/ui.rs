@@ -4953,8 +4953,8 @@ const STREAM_COLUMNS: [GridCol; 22] = [
     GridCol { id: "added",       title: "Added",      tooltip: "When the channel was added.",                                                               min_width: 84.0,  initial: 0.0,   sortable: true, stretch: false },
 ];
 
-/// Total Streams columns (21 total, including the non-sortable Actions slot).
-const STREAM_COLS: usize = STREAM_COLUMNS.len(); // = 21
+/// Total Streams columns, including the non-sortable Actions slot.
+const STREAM_COLS: usize = STREAM_COLUMNS.len();
 
 /// The Videos columns, in DEFAULT display order (mirrors `STREAM_COLUMNS`).
 /// The trailing Actions column (index `VIDEO_COLS`, 9) is non-sortable and
@@ -5700,8 +5700,15 @@ fn channel_cells(
         .max()
         .unwrap_or(0);
     // In STREAM_COLUMNS order: Enabled, Auto, Actions(empty), Plat, Name, Tool,
-    // Detection, Polled, State, Next stream, Game, Title, Viewers, ✏ (Changes),
-    // 📢 (Ads), Went Live, Started On, Lost, Duration, Ad-free, Added.
+    // Detection, Scheduled rec, Polled, State, Next stream, Game, Title,
+    // Viewers, ✏ (Changes), 📢 (Ads), Went Live, Started On, Lost, Duration,
+    // Ad-free, Added. MUST stay positionally 1:1 with STREAM_COLUMNS (every
+    // column needs an entry here even if it's just a blank placeholder like
+    // "actions"/"detection"/"scheduled_rec" below) — `ordered_rows` indexes
+    // this vec by the column's STREAM_COLUMNS position, so a missing entry
+    // silently shifts every later column's sort/filter onto the wrong data
+    // instead of erroring (this exact bug: sorting by "state" was actually
+    // sorting by "next_stream" because "scheduled_rec" had no cell here).
     vec![
         Cell::num(
             if channel.automation_enabled { 1.0 } else { 0.0 },
@@ -5720,6 +5727,7 @@ fn channel_cells(
         Cell::text(channel.name.clone()),
         Cell::text(tool),
         Cell::text(String::new()), // detection
+        Cell::text(String::new()), // scheduled_rec (not aggregated at channel level)
         Cell::num(last as f64, fmt_datetime_short(last)), // polled (datetime only)
         // Mirrors the rendered state cell: recording > live > failed > blank
         // (offline/idle). A numeric priority (not `Cell::text`, whose sort key
@@ -25480,7 +25488,8 @@ fn parse_twitch_chat_line(
 #[cfg(test)]
 mod tests {
     use super::{
-        Cell, ChatSegment, DateFmt, SortKey, SortLevel, SortState, StreamMetaChange, StreamTarget,
+        Cell, ChatSegment, DateFmt, SortKey, SortLevel, SortState, STREAM_COLS, STREAM_COLUMNS,
+        StreamMetaChange, StreamTarget,
         active_date_fmt, aggregate_stream_changes, build_twitch_segments, channel_cells,
         channel_live_count,
         channel_primary, chat_file_for_recording, compose_browser_profile, contrast_ratio,
@@ -25678,9 +25687,16 @@ mod tests {
         let offline_row = test_row(4, "offline", None, None, None, false);
         let now = 1_000_100;
 
+        // Looked up by id, not a hardcoded index — `channel_cells` must stay
+        // positionally 1:1 with `STREAM_COLUMNS` (a missing entry silently
+        // shifts every later column's sort key onto the wrong data instead of
+        // erroring, which is exactly what happened here before this fix: the
+        // "state" click was actually sorting by "next_stream").
+        let state_idx = STREAM_COLUMNS.iter().position(|c| c.id == "state").unwrap();
         let state_priority = |m: &MonitorWithChannel, active: &HashSet<i64>| {
             let cells = channel_cells(&channel, &[m], active, now);
-            match cells[8].key {
+            assert_eq!(cells.len(), STREAM_COLS, "channel_cells must have one entry per STREAM_COLUMNS");
+            match cells[state_idx].key {
                 SortKey::Num(n) => n,
                 SortKey::Text(_) => panic!("state cell must be numeric"),
             }
