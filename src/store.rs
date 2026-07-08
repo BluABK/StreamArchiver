@@ -2028,9 +2028,30 @@ impl Store {
     }
 
     /// Create a new empty channel container (no URL/platform of its own; its
-    /// instances carry the source URLs). Always inserts a new row.
+    /// instances carry the source URLs). Always inserts a new row. `enabled`/
+    /// `automation_enabled` default to the schema default (both `true`).
     pub fn create_container(&self, name: &str) -> Result<i64> {
         self.insert_channel(name, "", Platform::Generic)
+    }
+
+    /// Create a new channel container, seeding its Auto (`enabled`) and
+    /// Enabled (`automation_enabled`) switches instead of leaving them at the
+    /// schema default. Meant for "add stream" flows that create a channel
+    /// alongside its first instance: without this, a brand-new channel always
+    /// starts Auto=on/Enabled=on regardless of what the instance was
+    /// configured with, leaving a channel/instance mismatch the grid ANDs
+    /// together (confusing even though not functionally broken) the moment
+    /// it's created.
+    pub fn create_container_with_flags(
+        &self,
+        name: &str,
+        enabled: bool,
+        automation_enabled: bool,
+    ) -> Result<i64> {
+        let id = self.create_container(name)?;
+        self.set_channel_enabled(id, enabled)?;
+        self.set_channel_automation_enabled(id, automation_enabled)?;
+        Ok(id)
     }
 
     /// Rename a channel container.
@@ -4612,6 +4633,30 @@ mod tests {
         let r = row(&store);
         assert_eq!(r.last_title, "");
         assert_eq!(r.last_viewers, -1);
+    }
+
+    #[test]
+    fn create_container_with_flags_seeds_channel_switches() {
+        let store = Store::open_in_memory().unwrap();
+
+        // Plain create_container always defaults both switches on (schema
+        // default) — the mismatch this feature avoids.
+        let plain = store.create_container("Plain").unwrap();
+        let ch = |s: &Store, id: i64| {
+            s.list_channels().unwrap().into_iter().find(|c| c.id == id).unwrap()
+        };
+        assert!(ch(&store, plain).enabled);
+        assert!(ch(&store, plain).automation_enabled);
+
+        // Auto off + Enabled off on the seeding instance -> channel matches.
+        let off = store.create_container_with_flags("Off", false, false).unwrap();
+        assert!(!ch(&store, off).enabled);
+        assert!(!ch(&store, off).automation_enabled);
+
+        // Auto off + Enabled on -> channel matches independently per flag.
+        let mixed = store.create_container_with_flags("Mixed", false, true).unwrap();
+        assert!(!ch(&store, mixed).enabled);
+        assert!(ch(&store, mixed).automation_enabled);
     }
 
     fn sample_video() -> Video {

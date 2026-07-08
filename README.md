@@ -81,6 +81,13 @@ two tools on one URL.
      auto-starts only when **both** Enabled and Auto are on (or a trigger word
      matches).
 
+   When **Add stream** creates a brand-new channel, the channel's Enabled/Auto
+   start out matching the first instance's — so a new instance added with Auto
+   off doesn't leave its channel showing Auto on (both flags AND together, so
+   this was never a functional bug, just a confusing mismatch in the grid).
+   Adding an instance to an *existing* channel never touches the channel's own
+   switches.
+
    Adding a channel fetches its assets/About immediately, and its live state +
    title/game/viewers appear within one poll cycle (≤30s). **✏** renames the
    channel; the per-instance **✏** edits that instance (incl. its URL). **🗑**

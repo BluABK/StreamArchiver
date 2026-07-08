@@ -2106,9 +2106,19 @@ impl StreamArchiverApp {
             .spawn(move || {
                 let t = std::time::Instant::now();
                 let result: Result<SaveRows, String> = (|| {
-                    // Resolve the channel_id, creating a new container if needed.
+                    // Resolve the channel_id, creating a new container if needed. A
+                    // brand-new channel has no other instances yet, so seed its
+                    // Auto/Enabled switches from this first instance rather than
+                    // leaving both at the schema default (true) — see
+                    // `create_container_with_flags`.
                     let channel_id = match new_channel_name {
-                        Some(name) => store.create_container(&name).map_err(|e| e.to_string())?,
+                        Some(name) => store
+                            .create_container_with_flags(
+                                &name,
+                                monitor.enabled,
+                                monitor.automation_enabled,
+                            )
+                            .map_err(|e| e.to_string())?,
                         None => monitor.channel_id,
                     };
                     let mut m = monitor;
