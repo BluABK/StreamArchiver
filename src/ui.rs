@@ -5512,6 +5512,46 @@ fn state_icon(state: &str) -> (&'static str, egui::Color32) {
     }
 }
 
+/// Trigger-word / VOD-state / live-DVR-backfill status badges for the
+/// Streams-tree "state" cell. Shared by the Stream row (rolled up across all
+/// its takes — the only place these are visible for the common single-take
+/// case, since a lone take never gets its own `Vis::Take` sub-row) and each
+/// individual Take row of a multi-take stream.
+#[allow(clippy::too_many_arguments)]
+fn take_status_badges(
+    ui: &mut egui::Ui,
+    trigger_info: &str,
+    vod_not_published: bool,
+    vod_muted_secs: Option<i64>,
+    full_backfilled: bool,
+    head_backfilled: bool,
+) {
+    if !trigger_info.is_empty() {
+        ui.colored_label(
+            egui::Color32::from_rgb(0xe8, 0xc5, 0x4a),
+            egui::RichText::new("⚡").small(),
+        )
+        .on_hover_text(format!("Started by a trigger word: {trigger_info}"));
+    }
+    if vod_not_published {
+        ui.colored_label(egui::Color32::from_rgb(220, 80, 80), "⚠ no VOD")
+            .on_hover_text("No VOD was published — this local recording may be the only surviving copy.");
+    } else if let Some(secs) = vod_muted_secs.filter(|&s| s > 0) {
+        ui.colored_label(egui::Color32::from_rgb(220, 160, 30), "✂ muted")
+            .on_hover_text(format!(
+                "VOD has {} of muted content (DMCA) — local recording is the authoritative archive.",
+                fmt_duration(secs)
+            ));
+    }
+    if full_backfilled {
+        ui.colored_label(egui::Color32::from_rgb(70, 180, 90), "🧩 full")
+            .on_hover_text("Missed start was backfilled from the live VOD and joined with the capture (see {stem}.full.mkv).");
+    } else if head_backfilled {
+        ui.colored_label(egui::Color32::from_rgb(80, 160, 220), "🧩 head")
+            .on_hover_text("Missed start was backfilled from the live VOD ({stem}.head.mkv) — the joined file lands after the recording finishes.");
+    }
+}
+
 /// Render the Streams-tree Name cell: indent by `depth`, a clickable ▶/▼ when
 /// `has_children`, an optional 18 px avatar, then `label`. Returns true if the
 /// disclosure was clicked.
@@ -13919,6 +13959,34 @@ impl StreamArchiverApp {
                                                     ui.colored_label(egui::Color32::from_rgb(220, 140, 30), lbl)
                                                         .on_hover_text("Right-click → Re-remux to MKV.");
                                                 }
+                                                let trigger_info = g
+                                                    .takes
+                                                    .iter()
+                                                    .find(|t| !t.trigger_info.is_empty())
+                                                    .map(|t| t.trigger_info.as_str())
+                                                    .unwrap_or("");
+                                                let vod_not_published = g
+                                                    .takes
+                                                    .iter()
+                                                    .any(|t| t.vod_state.as_deref() == Some("not_published"));
+                                                let vod_muted_secs = g
+                                                    .takes
+                                                    .iter()
+                                                    .filter(|t| t.vod_state.as_deref() == Some("found"))
+                                                    .map(|t| t.vod_muted_secs.unwrap_or(0))
+                                                    .find(|&s| s > 0);
+                                                let full_backfilled =
+                                                    g.takes.iter().any(|t| t.full_path.is_some());
+                                                let head_backfilled =
+                                                    g.takes.iter().any(|t| t.backfill_path.is_some());
+                                                take_status_badges(
+                                                    ui,
+                                                    trigger_info,
+                                                    vod_not_published,
+                                                    vod_muted_secs,
+                                                    full_backfilled,
+                                                    head_backfilled,
+                                                );
                                             }
                                             "game" => {
                                                 meta_value_cell(ui, g.category());
@@ -14277,53 +14345,22 @@ impl StreamArchiverApp {
                                                 } else {
                                                     resp.on_hover_text(&t.status);
                                                 }
-                                                if !t.trigger_info.is_empty() {
-                                                    ui.colored_label(
-                                                        egui::Color32::from_rgb(0xe8, 0xc5, 0x4a),
-                                                        egui::RichText::new("⚡").small(),
-                                                    )
-                                                    .on_hover_text(format!(
-                                                        "Started by a trigger word: {}",
-                                                        t.trigger_info,
-                                                    ));
-                                                }
-                                                // VOD state badge (Twitch only)
-                                                match t.vod_state.as_deref() {
-                                                    Some("not_published") => {
-                                                        ui.colored_label(
-                                                            egui::Color32::from_rgb(220, 80, 80),
-                                                            "⚠ no VOD",
-                                                        ).on_hover_text("No VOD was published — this local recording may be the only surviving copy.");
-                                                    }
-                                                    Some("found") if t.vod_muted_secs.unwrap_or(0) > 0 => {
-                                                        ui.colored_label(
-                                                            egui::Color32::from_rgb(220, 160, 30),
-                                                            "✂ muted",
-                                                        ).on_hover_text(format!(
-                                                            "VOD has {} of muted content (DMCA) — local recording is the authoritative archive.",
-                                                            fmt_duration(t.vod_muted_secs.unwrap_or(0))
-                                                        ));
-                                                    }
-                                                    _ => {}
-                                                }
                                                 // CDN VOD-recovery status now has its own
                                                 // sibling row (Vis::VodJob) below this take —
                                                 // see the "🛟 VOD recovery" row.
-                                                // Live-DVR head backfill badges.
-                                                if t.full_path.is_some() {
-                                                    ui.colored_label(
-                                                        egui::Color32::from_rgb(70, 180, 90),
-                                                        "🧩 full",
-                                                    ).on_hover_text("Missed start was backfilled from the live VOD and joined with the capture — see {stem}.full.mkv (head + live parts kept).");
-                                                } else if t.backfill_path.is_some() {
-                                                    ui.colored_label(
-                                                        egui::Color32::from_rgb(80, 160, 220),
-                                                        "🧩 head",
-                                                    ).on_hover_text("Missed start was backfilled from the live VOD ({stem}.head.mkv) — the joined file lands after the recording finishes.");
-                                                }
                                                 // Post-stream published-VOD download status now
                                                 // has its own sibling row (Vis::VodJob) below
                                                 // this take — see the "📼 VOD backfill" row.
+                                                let vod_muted_secs = (t.vod_state.as_deref() == Some("found"))
+                                                    .then(|| t.vod_muted_secs.unwrap_or(0));
+                                                take_status_badges(
+                                                    ui,
+                                                    &t.trigger_info,
+                                                    t.vod_state.as_deref() == Some("not_published"),
+                                                    vod_muted_secs,
+                                                    t.full_path.is_some(),
+                                                    t.backfill_path.is_some(),
+                                                );
                                                 // In-progress / needs-attention badges
                                                 let needs_remux = t.output_path.ends_with(".ts")
                                                     && t.output_path.contains(".cache");

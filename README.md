@@ -251,7 +251,10 @@ fetched mid-stream carries the **original, un-muted audio**.
 Once the live recording finishes, the head and the capture are **losslessly
 concatenated** (stream copy, no re-encode) into `{stem}.full.mkv` — a true
 full-stream file — and **both parts are kept**. The take shows a **🧩 head**
-badge while only the head exists and **🧩 full** once the join lands. The join
+badge while only the head exists and **🧩 full** once the join lands — visible
+on the stream's row directly for the common single-take case, and rolled up
+onto the stream row (in addition to each take's own row) when a reconnect
+produced more than one take. The join
 is skipped (parts kept, warning logged) if the capture ran at a transcoded
 quality whose codec parameters differ from the source-quality head, and a
 duration sanity check discards a broken join rather than promoting it. An
