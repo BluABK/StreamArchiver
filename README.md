@@ -101,8 +101,14 @@ two tools on one URL.
    a live/recording indicator when **any** instance is live (with a count after
    the icon, e.g. `⏺ 2`, when more than one is), and its Went Live/Started
    On/Duration/Title/Game/Viewers show whichever live instance went live
-   **earliest** — falling back to the most recent past recording once nothing
-   is currently live.
+   **earliest**.
+
+   The instance and channel rows represent **present state only** — once an
+   instance is neither recording nor live, its Went Live/Started On/Duration/
+   Lost time cells go blank rather than showing a past recording's numbers
+   (which would otherwise read as "currently live for 3h" when it isn't).
+   That history isn't lost — it's exactly what expanding the instance's row
+   shows, one row per past stream/take.
 
    When **Add stream** creates a brand-new channel, the channel's Enabled/Auto
    start out matching the first instance's — so a new instance added with Auto

@@ -5509,13 +5509,31 @@ fn recording_cells(row: &MonitorWithChannel, now: i64) -> RecordingCells {
             lost_secs: 0,
         };
     }
+    if !active {
+        // The instance/channel row represents PRESENT state, not history — a
+        // finished take's Went Live/Started On/Duration/Lost time belong on
+        // that take's own Stream/Take row in the expanded tree (see
+        // `take_status_badges` and friends), not here. Neither active above
+        // nor currently live (that returned already) means genuinely idle:
+        // blank every time cell instead of resurfacing whatever recording
+        // happens to be "latest" for this instance.
+        return RecordingCells {
+            active: false,
+            started_on: String::new(),
+            started_secs: 0,
+            duration: String::new(),
+            duration_secs: 0,
+            went_live: String::new(),
+            went_live_secs: 0,
+            went_live_approx: false,
+            lost: String::new(),
+            lost_secs: 0,
+        };
+    }
+    // Active: show the in-progress take's own live-ticking stats.
     let started = row.last_recording_started;
     let started_secs = started.unwrap_or(0);
-    let dur = match (started, row.last_recording_ended, active) {
-        (Some(s), _, true) => Some(now - s),
-        (Some(s), Some(e), false) => Some(e - s),
-        _ => None,
-    };
+    let dur = started.map(|s| now - s);
     let went_live_secs = row.last_recording_went_live.unwrap_or(0);
     let went_live_approx = row.last_recording_went_live_approx;
     let went_live = match row.last_recording_went_live {
@@ -25908,6 +25926,24 @@ mod tests {
         assert!(!cells.active);
         assert_eq!(cells.went_live_secs, 0);
         assert_eq!(cells.started_secs, 0);
+    }
+
+    #[test]
+    fn recording_cells_offline_clears_even_a_real_finished_recording() {
+        // The instance/channel row represents PRESENT state — once neither
+        // recording nor live, Went Live/Started On/Duration/Lost time blank
+        // out even when the instance genuinely DOES have a completed past
+        // recording on file. That history belongs on the take's own row in
+        // the expanded tree, not here (it used to leak through as a
+        // "last_recording_*" fallback regardless of current state).
+        let now = 1_000_100;
+        let row = test_row(1, "offline", Some("completed"), Some(900_000), None, false);
+        let cells = recording_cells(&row, now);
+        assert!(!cells.active);
+        assert_eq!(cells.went_live_secs, 0);
+        assert_eq!(cells.started_secs, 0);
+        assert_eq!(cells.duration_secs, 0);
+        assert_eq!(cells.lost_secs, 0);
     }
 
     #[test]
