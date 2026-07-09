@@ -474,6 +474,10 @@ async fn subscribe_type(
             .await;
         match resp {
             Ok(r) if r.status().is_success() => covered += 1,
+            // Already exists — a prior connection (or a page `existing_subs`
+            // missed, belt-and-braces alongside its own pagination fix below)
+            // already created it. Twitch's own idempotency, not an error.
+            Ok(r) if r.status() == reqwest::StatusCode::CONFLICT => covered += 1,
             Ok(r) => warn!("eventsub: subscribe {event_type} {uid} failed: {}", r.status()),
             Err(e) => warn!("eventsub: subscribe {event_type} {uid} error: {e}"),
         }
@@ -481,6 +485,11 @@ async fn subscribe_type(
     covered
 }
 
+/// All broadcaster user ids with an enabled `event_type` subscription,
+/// across every page — the list endpoint paginates (seen in practice once
+/// online+offline subscriptions together exceed one page), and reading only
+/// the first page made already-subscribed channels look new, causing
+/// spurious 409s on every reconnect.
 async fn existing_subs(
     http: &Client,
     client_id: &str,
@@ -488,24 +497,30 @@ async fn existing_subs(
     event_type: &str,
 ) -> HashSet<String> {
     let mut set = HashSet::new();
-    let resp = http
-        .get(format!("{HELIX}/eventsub/subscriptions"))
-        .header("Client-Id", client_id)
-        .bearer_auth(token)
-        .query(&[("status", "enabled")])
-        .send()
-        .await;
-    if let Ok(r) = resp {
-        if let Ok(v) = r.json::<Value>().await {
-            if let Some(arr) = v["data"].as_array() {
-                for s in arr {
-                    if s["type"].as_str() == Some(event_type) {
-                        if let Some(uid) = s["condition"]["broadcaster_user_id"].as_str() {
-                            set.insert(uid.to_string());
-                        }
+    let mut after: Option<String> = None;
+    loop {
+        let mut req = http
+            .get(format!("{HELIX}/eventsub/subscriptions"))
+            .header("Client-Id", client_id)
+            .bearer_auth(token)
+            .query(&[("status", "enabled")]);
+        if let Some(cursor) = &after {
+            req = req.query(&[("after", cursor.as_str())]);
+        }
+        let Ok(r) = req.send().await else { break };
+        let Ok(v) = r.json::<Value>().await else { break };
+        if let Some(arr) = v["data"].as_array() {
+            for s in arr {
+                if s["type"].as_str() == Some(event_type) {
+                    if let Some(uid) = s["condition"]["broadcaster_user_id"].as_str() {
+                        set.insert(uid.to_string());
                     }
                 }
             }
+        }
+        after = v["pagination"]["cursor"].as_str().filter(|c| !c.is_empty()).map(str::to_string);
+        if after.is_none() {
+            break;
         }
     }
     set
