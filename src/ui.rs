@@ -23747,27 +23747,30 @@ fn draw_alt_image_preview(ctx: &egui::Context) {
     };
 
     let tex_size = tex.size_vec2();
-    let screen = ctx.viewport_rect();
-    // Cap at 85% of the viewport so large banners don't overflow off-screen.
-    let max_size = screen.size() * 0.85;
-    let scale = (max_size.x / tex_size.x.max(1.0))
-        .min(max_size.y / tex_size.y.max(1.0))
-        .min(1.0);
+    let label_text = format!("{} × {} px", tex_size.x as u32, tex_size.y as u32);
+    // Measure the size label so [`alt_preview_layout`] reasons about the
+    // overlay's true footprint (image + frame margins + label). If the real
+    // footprint were bigger than computed, egui's own constrain-to-screen
+    // would shove the area back over the cursor, which must never happen
+    // (see the flicker note on [`alt_preview_layout`]).
+    let label_size = {
+        let font = egui::TextStyle::Small.resolve(&ctx.global_style());
+        ctx.fonts_mut(|f| {
+            f.layout_no_wrap(label_text.clone(), font, egui::Color32::PLACEHOLDER)
+                .size()
+        })
+    };
+    let spacing = ctx.global_style().spacing.item_spacing.y;
+    let Some((overlay, scale)) =
+        alt_preview_layout(tex_size, label_size, spacing, pos, ctx.content_rect())
+    else {
+        // Viewport too small to show a preview anywhere beside the cursor.
+        return;
+    };
     let preview_size = tex_size * scale;
 
-    // Prefer bottom-right of the cursor; flip to the other side when that
-    // would go off-screen.
-    const GAP: f32 = 14.0;
-    let mut tl = pos + egui::vec2(GAP, GAP);
-    if tl.x + preview_size.x > screen.right() - GAP {
-        tl.x = (pos.x - preview_size.x - GAP).max(screen.left() + GAP);
-    }
-    if tl.y + preview_size.y > screen.bottom() - GAP {
-        tl.y = (pos.y - preview_size.y - GAP).max(screen.top() + GAP);
-    }
-
     egui::Area::new(egui::Id::new("alt_img_preview_area"))
-        .fixed_pos(tl)
+        .fixed_pos(overlay.min)
         .order(egui::Order::Tooltip)
         .interactable(false)
         .show(ctx, |ui| {
@@ -23778,17 +23781,92 @@ fn draw_alt_image_preview(ctx: &egui::Context) {
                 .corner_radius(egui::CornerRadius::same(6))
                 .show(ui, |ui| {
                     ui.add(egui::Image::from_texture(&tex).fit_to_exact_size(preview_size));
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} × {} px",
-                            tex_size.x as u32,
-                            tex_size.y as u32
-                        ))
-                        .small()
-                        .weak(),
-                    );
+                    ui.label(egui::RichText::new(label_text).small().weak());
                 });
         });
+}
+
+/// Place the Alt-hover preview overlay: returns the overlay's screen rect and
+/// the scale to draw the image at, or `None` if the viewport is too small to
+/// show a preview at all.
+///
+/// The overlay must never end up under the cursor: despite
+/// `interactable(false)`, egui's hover hit-test still treats the preview area
+/// as the top-most widget at the pointer, un-hovering the thumbnail that
+/// queued it — the preview then vanishes, the thumbnail re-hovers, and the
+/// overlay flickers on/off every other frame (worst in short viewports, where
+/// the old clamp-to-edge placement pushed it back over the cursor).
+fn alt_preview_layout(
+    tex_size: egui::Vec2,
+    label_size: egui::Vec2,
+    spacing: f32,
+    pos: egui::Pos2,
+    screen: egui::Rect,
+) -> Option<(egui::Rect, f32)> {
+    const MARGIN: f32 = 6.0;
+    const GAP: f32 = 14.0;
+    let chrome = egui::vec2(
+        2.0 * MARGIN + 2.0, // +2 slack for frame stroke/pixel rounding
+        2.0 * MARGIN + spacing + label_size.y + 2.0,
+    );
+    let overlay_size = |scale: f32| {
+        egui::vec2(
+            (tex_size.x * scale).max(label_size.x) + chrome.x,
+            tex_size.y * scale + chrome.y,
+        )
+    };
+    // Largest image scale whose overlay fits `avail` (0 = doesn't fit at all).
+    let fit = |avail: egui::Vec2| -> f32 {
+        let w = avail.x - chrome.x;
+        let h = avail.y - chrome.y;
+        if w < label_size.x || h <= 0.0 {
+            return 0.0;
+        }
+        (w / tex_size.x.max(1.0))
+            .min(h / tex_size.y.max(1.0))
+            .min(1.0)
+    };
+
+    let avail = screen.shrink(GAP);
+
+    // Cap at 85% of the viewport so large banners don't overflow off-screen.
+    let mut scale = fit(screen.size() * 0.85);
+
+    // Prefer bottom-right of the cursor; flip to the other side when that
+    // would go off-screen.
+    let mut size = overlay_size(scale);
+    let mut tl = pos + egui::vec2(GAP, GAP);
+    if tl.x + size.x > avail.right() {
+        tl.x = (pos.x - size.x - GAP).max(avail.left());
+    }
+    if tl.y + size.y > avail.bottom() {
+        tl.y = (pos.y - size.y - GAP).max(avail.top());
+    }
+
+    // When neither side of the cursor has room at full size, shrink into
+    // whichever side fits it best instead of covering the cursor.
+    if egui::Rect::from_min_size(tl, size)
+        .expand(GAP / 2.0)
+        .contains(pos)
+    {
+        let regions = [
+            egui::Rect::from_min_max(egui::pos2(pos.x + GAP, avail.top()), avail.right_bottom()),
+            egui::Rect::from_min_max(avail.left_top(), egui::pos2(pos.x - GAP, avail.bottom())),
+            egui::Rect::from_min_max(egui::pos2(avail.left(), pos.y + GAP), avail.right_bottom()),
+            egui::Rect::from_min_max(avail.left_top(), egui::pos2(avail.right(), pos.y - GAP)),
+        ];
+        let (region, region_scale) = regions
+            .iter()
+            .map(|r| (*r, fit(r.size())))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .filter(|(_, s)| *s > 0.0)?;
+        scale = scale.min(region_scale);
+        size = overlay_size(scale);
+        tl = pos + egui::vec2(GAP, GAP);
+        tl.x = tl.x.min(region.right() - size.x).max(region.left());
+        tl.y = tl.y.min(region.bottom() - size.y).max(region.top());
+    }
+    Some((egui::Rect::from_min_size(tl, size), scale))
 }
 
 /// Try to extract a YouTube UC… channel ID from a channel URL.
@@ -25826,7 +25904,8 @@ mod tests {
     use super::{
         Cell, ChatSegment, DateFmt, SortKey, SortLevel, SortState, STREAM_COLS, STREAM_COLUMNS,
         StreamMetaChange, StreamTarget,
-        active_date_fmt, aggregate_stream_changes, build_twitch_segments, channel_cells,
+        active_date_fmt, aggregate_stream_changes, alt_preview_layout, build_twitch_segments,
+        channel_cells,
         channel_live_count,
         channel_primary, chat_file_for_recording, compose_browser_profile, contrast_ratio,
         set_short_ts, streams_col_min_width,
@@ -25983,6 +26062,63 @@ mod tests {
         assert_eq!(cells.started_secs, 0);
         assert_eq!(cells.duration_secs, 0);
         assert_eq!(cells.lost_secs, 0);
+    }
+
+    #[test]
+    fn alt_preview_big_viewport_shows_full_size_beside_cursor() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(2560.0, 1400.0));
+        let pos = egui::pos2(400.0, 400.0);
+        let (rect, scale) = alt_preview_layout(
+            egui::vec2(320.0, 180.0),
+            egui::vec2(80.0, 12.0),
+            4.0,
+            pos,
+            screen,
+        )
+        .expect("plenty of room");
+        assert_eq!(scale, 1.0, "small image should not be downscaled");
+        assert_eq!(rect.min, pos + egui::vec2(14.0, 14.0), "bottom-right of cursor");
+    }
+
+    #[test]
+    fn alt_preview_never_covers_the_cursor_even_in_short_viewports() {
+        // Regression: on a viewport too short to hold the preview beside the
+        // cursor, the old placement clamped it back over the pointer. The
+        // preview's own (non-interactable) Area still wins egui's hover
+        // hit-test, so covering the pointer un-hovers the thumbnail that
+        // queued it — flickering the overlay on/off every other frame. The
+        // overlay must therefore keep clear of the pointer at EVERY cursor
+        // position, shrinking if that's the only way to fit.
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 400.0));
+        let tex = egui::vec2(1920.0, 1080.0); // full-res banner, far bigger than the window
+        for xi in 0..30 {
+            for yi in 0..14 {
+                let pos = egui::pos2(15.0 + xi as f32 * 30.0, 15.0 + yi as f32 * 27.0);
+                let (rect, scale) =
+                    alt_preview_layout(tex, egui::vec2(80.0, 12.0), 4.0, pos, screen)
+                        .unwrap_or_else(|| panic!("no layout at {pos:?}"));
+                assert!(scale > 0.0, "image visible at {pos:?}");
+                assert!(
+                    rect.distance_sq_to_pos(pos) >= 7.0 * 7.0,
+                    "overlay {rect:?} too close to cursor {pos:?} (would steal hover)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn alt_preview_gives_up_when_viewport_cannot_fit_one_beside_the_cursor() {
+        // Absurdly small window: better to show nothing than a flickering
+        // overlay glued to the pointer.
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(60.0, 40.0));
+        let out = alt_preview_layout(
+            egui::vec2(1920.0, 1080.0),
+            egui::vec2(80.0, 12.0),
+            4.0,
+            egui::pos2(30.0, 20.0),
+            screen,
+        );
+        assert!(out.is_none());
     }
 
     #[test]
