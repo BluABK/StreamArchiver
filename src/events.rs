@@ -42,8 +42,11 @@ pub enum BackgroundTaskKind {
     /// Harvesting current CDN hosts from published VODs via GQL.
     RefreshCdnHosts,
     /// Backfilling a late-joined capture's missed beginning from the growing
-    /// live VOD playlist (and the post-stream head+live concat).
-    HeadBackfill,
+    /// live VOD playlist (and the post-stream head+live concat). Carries the
+    /// recording id so the Streams grid can match a specific take's "⏳
+    /// backfilling…" indicator to this task (mirrors `ReorganizeTake`/
+    /// `RecoverVod`).
+    HeadBackfill(i64),
 }
 
 impl BackgroundTaskKind {
@@ -63,7 +66,7 @@ impl BackgroundTaskKind {
             BackgroundTaskKind::RecoverVod(_) => "VOD recovery",
             BackgroundTaskKind::RecoverVodScan => "VOD recovery scan",
             BackgroundTaskKind::RefreshCdnHosts => "Refresh CDN hosts",
-            BackgroundTaskKind::HeadBackfill => "Head backfill",
+            BackgroundTaskKind::HeadBackfill(_) => "Head backfill",
         }
     }
 }

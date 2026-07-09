@@ -5606,6 +5606,8 @@ fn take_status_badges(
     vod_muted_secs: Option<i64>,
     full_backfilled: bool,
     head_backfilled: bool,
+    backfill_running: bool,
+    backfill_queued: bool,
 ) {
     if !trigger_info.is_empty() {
         ui.colored_label(
@@ -5630,7 +5632,25 @@ fn take_status_badges(
     } else if head_backfilled {
         ui.colored_label(egui::Color32::from_rgb(80, 160, 220), "🧩 head")
             .on_hover_text("Missed start was backfilled from the live VOD ({stem}.head.mkv) — the joined file lands after the recording finishes.");
+    } else if backfill_running {
+        ui.colored_label(egui::Color32::from_rgb(80, 160, 220), "⏳ backfilling…")
+            .on_hover_text("Fetching the missed start from the live VOD — check the Background tab for progress.");
+    } else if backfill_queued {
+        ui.colored_label(egui::Color32::from_gray(0xa0), "⏳ backfill queued")
+            .on_hover_text(format!(
+                "Will check for a missed start to backfill from the live VOD shortly \
+                 (waiting ~{}s for the CDN/stream to settle).",
+                crate::downloader::HEAD_BACKFILL_SETTLE_SECS
+            ));
     }
+}
+
+/// Whether a live `HeadBackfill` background task is currently working on
+/// `rec_id` (either the head-fetch or the head+live concat phase).
+fn head_backfill_running(tasks: &[crate::events::BackgroundTask], rec_id: i64) -> bool {
+    tasks.iter().any(|t| {
+        matches!(t.kind, crate::events::BackgroundTaskKind::HeadBackfill(rid) if rid == rec_id)
+    })
 }
 
 /// Render the Streams-tree Name cell: indent by `depth`, a clickable ▶/▼ when
@@ -14190,6 +14210,13 @@ impl StreamArchiverApp {
                                                     g.takes.iter().any(|t| t.full_path.is_some());
                                                 let head_backfilled =
                                                     g.takes.iter().any(|t| t.backfill_path.is_some());
+                                                let backfill_running = g.takes.iter().any(|t| {
+                                                    head_backfill_running(&self.background_tasks, t.id)
+                                                });
+                                                let backfill_queued = g
+                                                    .takes
+                                                    .iter()
+                                                    .any(|t| t.head_backfill_state == "queued");
                                                 take_status_badges(
                                                     ui,
                                                     trigger_info,
@@ -14197,6 +14224,8 @@ impl StreamArchiverApp {
                                                     vod_muted_secs,
                                                     full_backfilled,
                                                     head_backfilled,
+                                                    backfill_running,
+                                                    backfill_queued,
                                                 );
                                             }
                                             "game" => {
@@ -14571,6 +14600,8 @@ impl StreamArchiverApp {
                                                     vod_muted_secs,
                                                     t.full_path.is_some(),
                                                     t.backfill_path.is_some(),
+                                                    head_backfill_running(&self.background_tasks, t.id),
+                                                    t.head_backfill_state == "queued",
                                                 );
                                                 // In-progress / needs-attention badges
                                                 let needs_remux = t.output_path.ends_with(".ts")
@@ -15847,6 +15878,39 @@ impl StreamArchiverApp {
                 });
 
             ui.add_space(12.0);
+
+            // ── Planned (queued head backfills) ─────────────────────────
+            // One-off, per-take work items awaiting `head_backfill_job`'s
+            // fixed settle wait — distinct from the recurring jobs above.
+            // Disappears once the take moves to Active (fetching) or resolves
+            // with nothing to do; see `Recording::head_backfill_state`.
+            let planned = self.core.store.queued_head_backfills().unwrap_or_default();
+            if !planned.is_empty() {
+                ui.strong("Planned");
+                ui.add_space(4.0);
+                egui::Grid::new("bg_planned_grid")
+                    .num_columns(3)
+                    .striped(true)
+                    .spacing([16.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.strong("Channel");
+                        ui.strong("Job");
+                        ui.strong("Starts");
+                        ui.end_row();
+                        for p in &planned {
+                            ui.label(&p.channel);
+                            ui.label("Head backfill");
+                            let eta = p.started_at + crate::downloader::HEAD_BACKFILL_SETTLE_SECS - now;
+                            ui.label(fmt_relative_future(eta)).on_hover_text(
+                                "Waiting for the CDN's live-VOD folder to appear and \
+                                 streamlink's own rewind (if any) to settle before checking \
+                                 whether anything needs backfilling.",
+                            );
+                            ui.end_row();
+                        }
+                    });
+                ui.add_space(12.0);
+            }
 
             // ── Active tasks ─────────────────────────────────────────────
             ui.strong("Active");
@@ -26217,6 +26281,7 @@ mod tests {
             backfill_path: None,
             full_path: None,
             trigger_info: String::new(),
+            head_backfill_state: String::new(),
         }
     }
 

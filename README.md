@@ -272,6 +272,16 @@ duration sanity check discards a broken join rather than promoting it. An
 interrupted join is retried on the next app start. Nothing runs when catch-up
 already zeroed Lost time.
 
+Before any of that, the job intentionally waits ~2 minutes (letting the CDN's
+live-VOD folder appear and streamlink's own rewind settle — this grace period
+applies even when the recording joined right at the live edge, not just a late
+join) before it can even tell whether there's anything to backfill. During
+that window the take's row shows an **⏳ backfill queued** badge, switching to
+**⏳ backfilling…** once the fetch actually starts, so there's always
+something visible from the moment the recording begins — not just once the
+job finishes its settle wait. The **Background** panel's *Planned* section
+lists every currently-queued take with an ETA for when it'll be checked.
+
 **Fetch new head backfill on new take.** A stream reconnect mid-broadcast (a
 new recording "take") loses footage the same way a missed intro does — and
 it's just as recoverable from the same still-growing CDN playlist while the

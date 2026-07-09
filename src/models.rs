@@ -1899,6 +1899,21 @@ pub struct Recording {
     /// (e.g. `title ~ "karaoke"`), empty when it started normally. Drives the
     /// ⚡ badge in the streams table.
     pub trigger_info: String,
+    /// `"queued"` while a head-backfill decision is pending for this take (set
+    /// the instant the job is spawned, cleared the moment it either starts
+    /// fetching or determines nothing is needed) — empty otherwise. Drives the
+    /// "⏳ backfill queued" badge, which exists specifically to cover
+    /// `head_backfill_job`'s ~2 minute settle wait before it does anything
+    /// visible (see `downloader::HEAD_BACKFILL_SETTLE_SECS`).
+    pub head_backfill_state: String,
+}
+
+/// A take awaiting a head-backfill decision — the Background view's "Planned"
+/// section row. See [`Recording::head_backfill_state`].
+#[derive(Clone, Debug)]
+pub struct QueuedHeadBackfill {
+    pub channel: String,
+    pub started_at: i64,
 }
 
 /// A recording whose published VOD came back DMCA-muted — a row of the Issues
@@ -2162,6 +2177,7 @@ mod tests {
             backfill_path: None,
             full_path: None,
             trigger_info: String::new(),
+            head_backfill_state: String::new(),
         }
     }
 

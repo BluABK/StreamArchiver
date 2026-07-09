@@ -34,7 +34,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 52;
+const SCHEMA_VERSION: i64 = 53;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -1387,7 +1387,22 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 52)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 52);
+        if version < 53 {
+            // "queued" while a head-backfill decision is pending for a take —
+            // set the instant the job is spawned, cleared once it either
+            // starts fetching or determines nothing is needed. Drives the
+            // Streams-grid "⏳ backfill queued" badge and the Background
+            // view's "Planned" section, covering `head_backfill_job`'s ~2
+            // minute settle wait, which otherwise has no visible signal at
+            // all. See `downloader::HEAD_BACKFILL_SETTLE_SECS`.
+            conn.execute_batch(
+                "ALTER TABLE recording ADD COLUMN head_backfill_state TEXT NOT NULL DEFAULT '';
+                 CREATE INDEX IF NOT EXISTS idx_recording_head_backfill_queued
+                     ON recording(head_backfill_state) WHERE head_backfill_state = 'queued';",
+            )?;
+            conn.pragma_update(None, "user_version", 53)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 53);
         Ok(())
     }
 
@@ -2566,6 +2581,43 @@ impl Store {
             )
             .optional()?;
         Ok(v.flatten())
+    }
+
+    /// Set/clear a recording's pending-head-backfill marker. `"queued"` while
+    /// `head_backfill_job` hasn't yet decided whether there's anything to
+    /// fetch; `""` once it has (started fetching, or determined nothing was
+    /// needed) — see [`crate::downloader::HEAD_BACKFILL_SETTLE_SECS`].
+    pub fn set_head_backfill_state(&self, id: i64, state: &str) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE recording SET head_backfill_state=?2 WHERE id=?1",
+            params![id, state],
+        )?;
+        Ok(())
+    }
+
+    /// Takes currently awaiting a head-backfill decision (still inside
+    /// `head_backfill_job`'s settle wait / probing), oldest first — feeds the
+    /// Background view's "Planned" section.
+    pub fn queued_head_backfills(&self) -> Result<Vec<crate::models::QueuedHeadBackfill>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT c.name, r.started_at
+             FROM recording r
+             JOIN monitor m ON m.id = r.monitor_id
+             JOIN channel c ON c.id = m.channel_id
+             WHERE r.head_backfill_state = 'queued'
+             ORDER BY r.started_at",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(crate::models::QueuedHeadBackfill {
+                    channel: r.get(0)?,
+                    started_at: r.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Attach the backfilled head file (`{stem}.head.mkv`) to a recording.
@@ -4068,7 +4120,8 @@ impl Store {
                     vod_id, vod_state, vod_muted_secs,
                     recovery_state, recovered_path,
                     vod_dl_state, vod_dl_path, vod_dl_video_id,
-                    backfill_path, full_path, COALESCE(trigger_info, '')
+                    backfill_path, full_path, COALESCE(trigger_info, ''),
+                    head_backfill_state
              FROM recording WHERE monitor_id = ?1 ORDER BY started_at, id",
         )?;
         let rows = stmt
@@ -4105,6 +4158,7 @@ impl Store {
                     backfill_path: r.get(28)?,
                     full_path: r.get(29)?,
                     trigger_info: r.get(30)?,
+                    head_backfill_state: r.get(31)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -4130,7 +4184,8 @@ impl Store {
             vod_id, vod_state, vod_muted_secs,
             recovery_state, recovered_path,
             vod_dl_state, vod_dl_path, vod_dl_video_id,
-            backfill_path, full_path, COALESCE(trigger_info, '')";
+            backfill_path, full_path, COALESCE(trigger_info, ''),
+            head_backfill_state";
 
     fn map_recording_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::models::Recording> {
         Ok(crate::models::Recording {
@@ -4165,6 +4220,7 @@ impl Store {
             backfill_path: r.get(28)?,
             full_path: r.get(29)?,
             trigger_info: r.get(30)?,
+            head_backfill_state: r.get(31)?,
         })
     }
 
@@ -4230,6 +4286,7 @@ impl Store {
                     backfill_path: None,
                     full_path: None,
                     trigger_info: String::new(),
+                    head_backfill_state: String::new(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -4289,6 +4346,7 @@ impl Store {
                     backfill_path: None,
                     full_path: None,
                     trigger_info: String::new(),
+                    head_backfill_state: String::new(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -4370,6 +4428,7 @@ impl Store {
                     backfill_path: None,
                     full_path: None,
                     trigger_info: String::new(),
+                    head_backfill_state: String::new(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -4442,6 +4501,7 @@ impl Store {
                     backfill_path: None,
                     full_path: None,
                     trigger_info: String::new(),
+                    head_backfill_state: String::new(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -4630,6 +4690,7 @@ impl Store {
                     backfill_path: None,
                     full_path: None,
                     trigger_info: String::new(),
+                    head_backfill_state: String::new(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -6461,6 +6522,32 @@ mod tests {
         assert_eq!(r1.id, take1);
         assert_eq!(r1.output_path, "C:/tmp/take1.mkv");
         assert_eq!(r1.stream_id.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn head_backfill_state_roundtrip_and_queued_query() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        let rid = store
+            .insert_recording(mid, 100, "C:/tmp/a.mkv", Some(50), false, Some("s1"), None, "")
+            .unwrap();
+
+        // Fresh recording: not queued.
+        assert!(store.queued_head_backfills().unwrap().is_empty());
+
+        store.set_head_backfill_state(rid, "queued").unwrap();
+        let rec = store.get_recording(rid).unwrap().unwrap();
+        assert_eq!(rec.head_backfill_state, "queued");
+        let planned = store.queued_head_backfills().unwrap();
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].channel, "A");
+        assert_eq!(planned[0].started_at, 100);
+
+        // Clearing drops it out of the queued query but leaves everything else.
+        store.set_head_backfill_state(rid, "").unwrap();
+        assert!(store.queued_head_backfills().unwrap().is_empty());
+        assert_eq!(store.get_recording(rid).unwrap().unwrap().head_backfill_state, "");
     }
 
     #[test]

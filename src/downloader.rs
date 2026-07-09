@@ -83,6 +83,12 @@ const CATCHUP_PROBE_INTERVAL_SECS: u64 = 20;
 /// Treat a from-start capture as caught up once its media is within this many
 /// seconds of the live edge (absorbs fragment lag + approximate go-live times).
 const CATCHUP_TOLERANCE_SECS: i64 = 45;
+/// Fixed grace period `head_backfill_job` waits before doing anything, so the
+/// CDN's live-VOD folder can appear and streamlink's own `--hls-live-restart`
+/// can finish its own rewind attempt — unrelated to how late the recording
+/// joined relative to go-live (even an instant join needs this settle time).
+/// Exposed so the UI can render "starts in ~Ns" for a queued take.
+pub(crate) const HEAD_BACKFILL_SETTLE_SECS: i64 = 120;
 
 /// Wiring for recording advertisement breaks parsed from a live capture's log.
 ///
@@ -3333,6 +3339,10 @@ impl Supervisor {
             let url = row.monitor.url.clone();
             let channel = row.channel.name.clone();
             let channel_id = row.channel.id;
+            // Mark pending immediately (before the job's own settle wait) so
+            // the Streams grid shows "queued" from the very start instead of
+            // going quiet for the first ~2 minutes.
+            let _ = self.store.set_head_backfill_state(rec_id, "queued");
             tokio::spawn(async move {
                 this.head_backfill_job(
                     monitor_id, channel_id, rec_id, capture, final_p, url, channel, sid, wl,
@@ -5170,6 +5180,12 @@ impl Supervisor {
     /// [`Self::maybe_concat_backfill`]. Downloading DURING the stream matters:
     /// DMCA mutes land minutes after stream end and scrub the originals, so
     /// the head fetched now carries the original audio.
+    ///
+    /// Callers mark `Recording.head_backfill_state = "queued"` right as this
+    /// is spawned (before awaiting it) so the Streams grid has something to
+    /// show from the very start — this function clears it back to `""` at
+    /// every exit point once a real determination is made (see
+    /// [`HEAD_BACKFILL_SETTLE_SECS`]).
     #[allow(clippy::too_many_arguments)]
     async fn head_backfill_job(
         &self,
@@ -5199,15 +5215,22 @@ impl Supervisor {
         // the separate "replace old heads" setting later in this function.
         force: bool,
     ) {
-        // Let the CDN folder appear and streamlink's own rewind (if any) settle.
-        for _ in 0..(120 * 4) {
+        // Let the CDN folder appear and streamlink's own rewind (if any) settle
+        // — this is a fixed grace period, not proportional to how late the
+        // recording joined; even an instant join needs it. `Recording.
+        // head_backfill_state == "queued"` (set by the caller right as this
+        // task is spawned) is what covers this window in the UI, since
+        // nothing else here is externally visible until it ends.
+        for _ in 0..(HEAD_BACKFILL_SETTLE_SECS * 4) {
             if self.shutdown.load(Ordering::SeqCst) {
+                let _ = self.store.set_head_backfill_state(rec_id, "");
                 return;
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
         // --hls-live-restart actually rewound to the start → nothing was missed.
         if self.store.recording_lost_secs(rec_id).ok().flatten() == Some(0) {
+            let _ = self.store.set_head_backfill_state(rec_id, "");
             return;
         }
         // The earliest take of a stream always owns the missed HEAD; a later
@@ -5224,15 +5247,19 @@ impl Supervisor {
             && !force
             && !crate::head_backfill::effective_fetch_new_take(&self.store, channel_id, monitor_id)
         {
+            let _ = self.store.set_head_backfill_state(rec_id, "");
             return;
         }
         let Some(login) = crate::detectors::twitch_login(&monitor_url) else {
+            let _ = self.store.set_head_backfill_state(rec_id, "");
             return;
         };
         let Some(out_dir) = final_path.parent().map(Path::to_path_buf) else {
+            let _ = self.store.set_head_backfill_state(rec_id, "");
             return;
         };
         let Some(stem) = final_path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+            let _ = self.store.set_head_backfill_state(rec_id, "");
             return;
         };
 
@@ -5244,6 +5271,7 @@ impl Supervisor {
             if attempt > 0 {
                 for _ in 0..(30 * 4) {
                     if self.shutdown.load(Ordering::SeqCst) {
+                        let _ = self.store.set_head_backfill_state(rec_id, "");
                         return;
                     }
                     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -5258,13 +5286,18 @@ impl Supervisor {
             compute_missed_secs(went_live_at, started_at, captured, missed_reference.unwrap_or_else(now_unix));
         if missed < 60 {
             info!(rec_id, missed, "head backfill: gap too small, skipping");
+            let _ = self.store.set_head_backfill_state(rec_id, "");
             return;
         }
 
+        // The pre-fetch decision is made — from here on the live background
+        // task (below) and, on success, `backfill_path` are the visible
+        // signals; the "queued" pending state has done its job.
+        let _ = self.store.set_head_backfill_state(rec_id, "");
         let task_id = crate::events::next_task_id();
         let _ = self.events.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
             id: task_id,
-            kind: crate::events::BackgroundTaskKind::HeadBackfill,
+            kind: crate::events::BackgroundTaskKind::HeadBackfill(rec_id),
             label: channel.clone(),
             detail: format!("missed ~{missed}s — fetching from the live VOD"),
             started_at: now_unix(),
@@ -5479,6 +5512,7 @@ impl Supervisor {
         };
         let missed_reference =
             if still_recording { None } else { Some(rec.ended_at.unwrap_or(rec.started_at)) };
+        let _ = self.store.set_head_backfill_state(rec_id, "queued");
         self.head_backfill_job(
             rec.monitor_id,
             mw.channel.id,
@@ -5552,7 +5586,7 @@ impl Supervisor {
         let channel = archive_channel_name(&self.store, rec_id).unwrap_or_default();
         let _ = self.events.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
             id: task_id,
-            kind: crate::events::BackgroundTaskKind::HeadBackfill,
+            kind: crate::events::BackgroundTaskKind::HeadBackfill(rec_id),
             label: channel,
             detail: "joining head + live capture".into(),
             started_at: now_unix(),
@@ -5941,6 +5975,7 @@ fn recording_from_detached(row: &DetachedRow) -> Recording {
         backfill_path: None,
         full_path: None,
         trigger_info: String::new(),
+        head_backfill_state: String::new(),
     }
 }
 
