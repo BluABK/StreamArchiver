@@ -2467,6 +2467,12 @@ impl Supervisor {
             return false;
         }
         let trigger_info = trigger_hit.as_ref().map(|h| h.describe()).unwrap_or_default();
+        // The whole matched rule (not just its description), frozen at start
+        // time — the stop-on-unmatch watcher and head-backfill leadtime both
+        // need it, and re-resolving `effective_rules()` live later would let a
+        // mid-broadcast rule edit/reorder silently retarget an already-running
+        // take (rules have no stable id).
+        let trigger_rule = trigger_hit.as_ref().map(|h| h.rule.clone());
         if let Some(hit) = &trigger_hit {
             // Per-rule override: the recording this rule starts captures from
             // the start (or not) regardless of the monitor's own flag. Applied
@@ -2491,7 +2497,7 @@ impl Supervisor {
         }
         let this = self.clone();
         tokio::spawn(async move {
-            this.record(row, went_live_at, approximate, stream_id, thumbnail_url, broadcaster_id, stream_title, trigger_info).await;
+            this.record(row, went_live_at, approximate, stream_id, thumbnail_url, broadcaster_id, stream_title, trigger_info, trigger_rule).await;
         });
         true
     }
@@ -3171,8 +3177,17 @@ impl Supervisor {
         // Human description of the trigger-word match that started this
         // recording (empty when it started normally). Stored on the row.
         trigger_info: String,
+        // The whole matched rule, frozen at start time — `None` when this
+        // wasn't a trigger start. Drives stop-on-unmatch (meta_watcher) and
+        // head-backfill leadtime; also persisted (as JSON) so a re-attach
+        // after an app restart can recover it.
+        trigger_rule: Option<crate::triggers::TriggerRule>,
     ) {
         let monitor_id = row.monitor.id;
+        let trigger_rule_json = trigger_rule
+            .as_ref()
+            .map(|r| serde_json::to_string(r).unwrap_or_default())
+            .unwrap_or_default();
         // Per-stream key for the SABR stall maps. Fully per-stream when a video ID
         // is available (YouTube scrape / API); degrades to per-monitor when not.
         let sabr_key = (monitor_id, stream_id.clone());
@@ -3253,6 +3268,7 @@ impl Supervisor {
                 stream_id.as_deref(),
                 Some(&take_group),
                 &trigger_info,
+                &trigger_rule_json,
             )
             .unwrap_or(0);
         let _ = self
@@ -3296,9 +3312,11 @@ impl Supervisor {
             let sid = stream_id.clone();
             let cname = row.channel.name.clone();
             let tinfo = trigger_info.clone();
+            let trule_json = trigger_rule_json.clone();
             tokio::spawn(async move {
                 this.run_dash_companion(
                     monitor_id, dash_plan, tg, sid, went_live_at, approximate, cname, tinfo,
+                    trule_json,
                 )
                 .await;
             });
@@ -3377,14 +3395,28 @@ impl Supervisor {
             ))
         });
 
+        // Trigger-configured backfill leadtime (0/absent = off) — a fixed,
+        // short lead-in buffer before this take started, for a mid-broadcast
+        // trigger start (e.g. one GDQ segment) rather than the whole missed
+        // stream. Independent of the monitor's own capture_from_start.
+        let lead_secs: Option<i64> = trigger_rule
+            .as_ref()
+            .map(|r| r.lead_secs)
+            .filter(|&l| l > 0);
+
         // Twitch capture-from-start: streamlink's --hls-live-restart only rewinds
         // within its own DVR view and usually misses. The published VOD's
         // playlist, however, already exists on the CDN and grows while the
         // stream is live — a backfill job downloads the missed head from it
         // (pre-mute originals!) and the post-stream concat joins head + live.
+        // A configured trigger leadtime also spawns this job even when
+        // capture_from_start itself is off — that flag drives unrelated
+        // behavior (launch args, the catch-up watcher above, dual capture,
+        // SABR stall handling) a "just this segment" user doesn't want, so
+        // leadtime is checked independently rather than implied by it.
         if rec_id != 0
             && row.monitor.platform() == Platform::Twitch
-            && row.monitor.capture_from_start
+            && (row.monitor.capture_from_start || lead_secs.is_some())
             && let (Some(sid), Some(wl)) = (stream_id.clone(), went_live_at)
         {
             let this = self.clone();
@@ -3400,7 +3432,7 @@ impl Supervisor {
             tokio::spawn(async move {
                 this.head_backfill_job(
                     monitor_id, channel_id, rec_id, capture, final_p, url, channel, sid, wl,
-                    approximate, started_at, None, false,
+                    approximate, started_at, None, false, lead_secs,
                 )
                 .await;
             });
@@ -3431,6 +3463,10 @@ impl Supervisor {
         // gracefully when the source is unavailable. Generic URLs have no source.
         let meta_platform = row.monitor.platform();
         let meta_done = Arc::new(AtomicBool::new(false));
+        // Only armed when the matched rule opted into "only recording while
+        // matching" — a trigger with e.g. just a leadtime configured (but
+        // stop_on_unmatch off) still records until the stream ends, unchanged.
+        let stop_rule = trigger_rule.clone().filter(|r| r.stop_on_unmatch);
         let meta_task = (rec_id != 0 && meta_platform != Platform::Generic).then(|| {
             tokio::spawn(meta_watcher(
                 self.ctx.clone(),
@@ -3443,6 +3479,8 @@ impl Supervisor {
                 meta_platform,
                 meta_done.clone(),
                 self.shutdown.clone(),
+                self.manual_tx.clone(),
+                stop_rule,
             ))
         });
 
@@ -3758,6 +3796,7 @@ impl Supervisor {
         channel_name: String,
         // Same trigger marker as the primary — the companion is part of the take.
         trigger_info: String,
+        trigger_rule_json: String,
     ) {
         if let Some(parent) = plan.capture_path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
@@ -3778,6 +3817,7 @@ impl Supervisor {
                 stream_id.as_deref(),
                 Some(&take_group),
                 &trigger_info,
+                &trigger_rule_json,
             )
             .unwrap_or(0);
         let _ = self.events.send(AppEvent::RecordingStarted {
@@ -4198,6 +4238,17 @@ impl Supervisor {
                 )));
             }
             if m.monitor.platform() != Platform::Generic {
+                // A restart drops the in-memory TriggerRule the original
+                // try_begin/record call matched — recover it (frozen at start
+                // time, not re-resolved from the live rule lists) from the
+                // recording row so stop-on-unmatch survives re-attach too.
+                let stop_rule = self
+                    .store
+                    .get_recording(row.ref_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|r| serde_json::from_str::<crate::triggers::TriggerRule>(&r.trigger_rule_json).ok())
+                    .filter(|r| r.stop_on_unmatch);
                 watchers.push(tokio::spawn(meta_watcher(
                     self.ctx.clone(),
                     self.store.clone(),
@@ -4209,6 +4260,8 @@ impl Supervisor {
                     m.monitor.platform(),
                     watcher_done.clone(),
                     self.shutdown.clone(),
+                    self.manual_tx.clone(),
+                    stop_rule,
                 )));
             }
             // Twitch chat logger is a native in-process task (not a tracked
@@ -5271,6 +5324,11 @@ impl Supervisor {
         // sanity short-circuits below (those are factual, not settings), nor
         // the separate "replace old heads" setting later in this function.
         force: bool,
+        // `Some(n)` = trigger-configured leadtime mode: fetch a fixed n-second
+        // window ending at this take's own start (not the usual "from the
+        // stream's true go-live"), for a mid-broadcast trigger start. `None` =
+        // today's behavior, unchanged.
+        lead_secs: Option<i64>,
     ) {
         // Let the CDN folder appear and streamlink's own rewind (if any) settle
         // — this is a fixed grace period, not proportional to how late the
@@ -5302,6 +5360,7 @@ impl Supervisor {
             .unwrap_or(false);
         if !is_first_take
             && !force
+            && lead_secs.is_none()
             && !crate::head_backfill::effective_fetch_new_take(&self.store, channel_id, monitor_id)
         {
             let _ = self.store.set_head_backfill_state(rec_id, "");
@@ -5339,9 +5398,20 @@ impl Supervisor {
                 break;
             }
         }
-        let mut missed =
-            compute_missed_secs(went_live_at, started_at, captured, missed_reference.unwrap_or_else(now_unix));
-        if missed < 60 {
+        // Lead-time mode: `missed` is the configured fixed window, not derived
+        // from go-live/captured — and it's an explicit user setting, not an
+        // accidental-gap heuristic, so the `< 60s` sanity floor below doesn't
+        // apply to it either.
+        let mut missed = match lead_secs {
+            Some(lead) => lead,
+            None => compute_missed_secs(
+                went_live_at,
+                started_at,
+                captured,
+                missed_reference.unwrap_or_else(now_unix),
+            ),
+        };
+        if lead_secs.is_none() && missed < 60 {
             info!(rec_id, missed, "head backfill: gap too small, skipping");
             let _ = self.store.set_head_backfill_state(rec_id, "");
             return;
@@ -5397,21 +5467,30 @@ impl Supervisor {
             finish(crate::events::TaskOutcome::Failed("live playlist not found".into()));
             return;
         };
-        if captured.is_none() {
+        if lead_secs.is_none() && captured.is_none() {
             // The capture wouldn't probe; the matched folder second is the true
-            // go-live moment — refine the fallback estimate with it.
+            // go-live moment — refine the fallback estimate with it. Not
+            // applicable in lead-time mode: `missed` there is the fixed
+            // configured window, not a "distance since go-live" estimate.
             missed = (started_at - found.matched_epoch).max(0);
         }
 
         // Fetch only the head (+ a few seconds of seam overlap), fresh segments,
-        // no probing needed; `-t` trims the mux to the measured gap.
+        // no probing needed; `-t` trims the mux to the measured gap. In
+        // lead-time mode the slice doesn't start at the playlist's own
+        // beginning (the true go-live) — it starts `lead_secs` before THIS
+        // take's own start, so the CDN playlist (found via the real go-live
+        // anchor, which folder discovery still needs) gets an extra skip
+        // offset instead of being read from position zero.
         let head_secs = missed as f64;
+        let skip_secs = lead_secs.map(|lead| (started_at - went_live_at - lead).max(0) as f64);
         let playlist = match crate::recovery::build_playlist(
             &client,
             &found.url,
             max_conc,
             false,
             Some(head_secs + 4.0),
+            skip_secs,
         )
         .await
         {
@@ -5584,6 +5663,7 @@ impl Supervisor {
             rec.started_at,
             missed_reference,
             true, // force — user-initiated
+            None, // manual re-trigger always backfills from the true go-live
         )
         .await;
     }
@@ -6033,6 +6113,7 @@ fn recording_from_detached(row: &DetachedRow) -> Recording {
         full_path: None,
         trigger_info: String::new(),
         head_backfill_state: String::new(),
+        trigger_rule_json: String::new(),
     }
 }
 
@@ -7841,6 +7922,15 @@ const META_POLL_INTERVAL_SECS: i64 = 60;
 /// since a push-triggered start never had a poll outcome to read one from).
 /// Unlike title/game, the count isn't logged as a "change" — it fluctuates
 /// continuously, so every fetch just overwrites it directly.
+/// Also enforces a trigger rule's "only recording while matching"
+/// (`stop_rule`, `Some` only when the rule that started this recording has
+/// `stop_on_unmatch` on): each cycle re-checks the rule against the freshly-
+/// polled title/game and, once it's been unmatched for `end_delay_secs`,
+/// sends `ManualCommand::Stop` — the same path the Stop button and scheduled-
+/// recording auto-stop already use. The very first poll only seeds a
+/// matching/non-matching baseline (mirrors the title/game baseline logic
+/// below) rather than acting on it, so a slow/lagging metadata read can never
+/// cause an immediate false-stop right after the trigger fires.
 #[allow(clippy::too_many_arguments)]
 async fn meta_watcher(
     ctx: Arc<DetectContext>,
@@ -7853,9 +7943,18 @@ async fn meta_watcher(
     platform: Platform,
     done: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
+    manual_tx: mpsc::UnboundedSender<ManualCommand>,
+    stop_rule: Option<crate::triggers::TriggerRule>,
 ) {
     let mut last_title: Option<String> = None;
     let mut last_game: Option<String> = None;
+    // Stop-on-unmatch state — see the doc comment above. `last_matched: None`
+    // until the baseline poll; `unmatch_since: Some(t)` from the poll that
+    // first observed a matching->non-matching transition, cleared the moment
+    // it matches again.
+    let mut last_matched: Option<bool> = None;
+    let mut unmatch_since: Option<i64> = None;
+    let mut stop_sent = false;
     loop {
         if done.load(Ordering::SeqCst) || shutdown.load(Ordering::SeqCst) {
             return;
@@ -7897,6 +7996,38 @@ async fn meta_watcher(
                 && let Err(e) = store.set_monitor_viewers(monitor_id, v)
             {
                 warn!("update viewers failed: {e:#}");
+            }
+            if let Some(rule) = &stop_rule
+                && !stop_sent
+            {
+                let matches_now = crate::triggers::first_match(
+                    std::slice::from_ref(rule),
+                    Some(meta.title.as_str()),
+                    Some(meta.game.as_str()),
+                )
+                .is_some();
+                match last_matched {
+                    None => last_matched = Some(matches_now), // baseline only, don't act
+                    Some(prev) => {
+                        if matches_now {
+                            unmatch_since = None; // re-matched: cancel any pending stop
+                        } else if prev {
+                            unmatch_since = Some(now_unix());
+                            info!(
+                                monitor_id, rec_id, end_delay_secs = rule.end_delay_secs,
+                                "trigger stop-on-unmatch: no longer matches"
+                            );
+                        }
+                        last_matched = Some(matches_now);
+                    }
+                }
+                if let Some(since) = unmatch_since
+                    && now_unix() - since >= rule.end_delay_secs
+                {
+                    info!(monitor_id, rec_id, "trigger stop-on-unmatch: grace elapsed, stopping");
+                    let _ = manual_tx.send(ManualCommand::Stop(monitor_id));
+                    stop_sent = true;
+                }
             }
             if changed {
                 // Wake the UI so the Changes column / popup refreshes live.

@@ -1915,6 +1915,14 @@ pub struct Recording {
     /// `head_backfill_job`'s ~2 minute settle wait before it does anything
     /// visible (see `downloader::HEAD_BACKFILL_SETTLE_SECS`).
     pub head_backfill_state: String,
+    /// The exact [`crate::triggers::TriggerRule`] (serde JSON) that started
+    /// this recording, frozen at start time — empty = not trigger-started, or
+    /// started by a trigger with no `lead_secs`/`stop_on_unmatch` behavior.
+    /// Rules have no stable id and can be edited/reordered mid-broadcast, so
+    /// this — not a live re-resolve of the current rule lists — is what the
+    /// stop-on-unmatch watcher (and its re-attach-after-restart path) reads.
+    /// `trigger_info` is the human-readable sibling of this column.
+    pub trigger_rule_json: String,
 }
 
 /// A take awaiting a head-backfill decision — the Background view's "Planned"
@@ -2187,6 +2195,7 @@ mod tests {
             full_path: None,
             trigger_info: String::new(),
             head_backfill_state: String::new(),
+            trigger_rule_json: String::new(),
         }
     }
 

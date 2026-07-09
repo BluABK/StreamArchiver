@@ -3114,6 +3114,39 @@ fn trigger_rules_editor(
                 remove = Some(i);
             }
         });
+        ui.horizontal(|ui| {
+            ui.add_space(24.0); // roughly align under the row above
+            ui.label("Lead:");
+            ui.push_id((salt, "lead", i), |ui| {
+                ui.add(egui::DragValue::new(&mut r.lead_secs).range(0..=600).suffix("s"))
+            })
+            .inner
+            .on_hover_text(
+                "Backfill this many seconds from the Twitch live VOD from before \
+                 the match was detected, in case the title/game update landed a \
+                 little late relative to when the segment actually started. \
+                 0 = off. Reuses the head-backfill mechanism, so Twitch only.",
+            );
+            ui.checkbox(&mut r.stop_on_unmatch, "Only while matching").on_hover_text(
+                "Stop this recording once the rule no longer matches, instead of \
+                 recording until the stream ends — e.g. archiving just one game \
+                 segment of a multi-day marathon. Checked on ~60s poll cycles, so \
+                 small End delay values effectively round up to the next check.",
+            );
+            if r.stop_on_unmatch {
+                ui.label("End delay:");
+                ui.push_id((salt, "end_delay", i), |ui| {
+                    ui.add(egui::DragValue::new(&mut r.end_delay_secs).range(0..=3600).suffix("s"))
+                })
+                .inner
+                .on_hover_text(
+                    "Keep recording this many seconds after the rule stops matching \
+                     — a grace period in case the title/game flips back, or the \
+                     update landed a little early. 0 = stop as soon as an unmatch \
+                     is confirmed.",
+                );
+            }
+        });
     }
     if let Some(i) = remove {
         rules.remove(i);
@@ -9133,7 +9166,7 @@ impl StreamArchiverApp {
                         crate::recovery::enumerate_qualities(&client, &found, max_conc).await;
                     let chosen = qualities.first().cloned().unwrap_or_else(|| "chunked".into());
                     let url = found.url.replacen("chunked", &chosen, 1);
-                    match crate::recovery::build_playlist(&client, &url, max_conc, probe_all, None).await {
+                    match crate::recovery::build_playlist(&client, &url, max_conc, probe_all, None, None).await {
                         Ok(r) => RecoverProbe::Found {
                             host: found.host,
                             matched_epoch: found.matched_epoch,
@@ -26324,6 +26357,7 @@ mod tests {
             full_path: None,
             trigger_info: String::new(),
             head_backfill_state: String::new(),
+            trigger_rule_json: String::new(),
         }
     }
 

@@ -428,16 +428,26 @@ struct MediaSeg {
 /// `max_secs` truncates the source playlist to its first N seconds before any
 /// segment work (the head-backfill case: only the missed beginning is wanted,
 /// and the source is a still-growing live playlist).
+///
+/// `skip_secs`, when set, additionally discards that many seconds from the
+/// start before `max_secs` starts counting (the trigger lead-time case: a
+/// bounded window ending at an arbitrary mid-playlist moment, not always
+/// "from position zero" — see `truncate_playlist_window`). Ignored (as if
+/// `None`) unless `max_secs` is also set.
 pub async fn build_playlist(
     client: &reqwest::Client,
     playlist_url: &str,
     max_conc: usize,
     probe_all: bool,
     max_secs: Option<f64>,
+    skip_secs: Option<f64>,
 ) -> anyhow::Result<RecoveredPlaylist> {
     let mut src = client.get(playlist_url).send().await?.error_for_status()?.text().await?;
     if let Some(cap) = max_secs {
-        src = truncate_playlist(&src, cap);
+        src = match skip_secs {
+            Some(skip) => truncate_playlist_window(&src, skip, cap),
+            None => truncate_playlist(&src, cap),
+        };
     }
     let base = playlist_prefix(playlist_url);
 
@@ -568,6 +578,60 @@ fn truncate_playlist(src: &str, max_secs: f64) -> String {
                     .and_then(|s| s.trim().parse::<f64>().ok())
                     .unwrap_or(0.0);
                 out.push_str(ex);
+                out.push('\n');
+            }
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str("#EXT-X-ENDLIST\n");
+    out
+}
+
+/// Like [`truncate_playlist`], but first discards `skip_secs` of media from
+/// the start of the playlist before keeping the next `window_secs` — a
+/// bounded slice around an arbitrary mid-playlist moment (e.g. a fixed lead
+/// time before a trigger match fired mid-broadcast) instead of always "from
+/// position zero." Same segment-boundary rounding (a cut lands on a segment
+/// boundary, up to one segment over on either edge) and same
+/// `#EXT-X-ENDLIST` termination as `truncate_playlist`.
+fn truncate_playlist_window(src: &str, skip_secs: f64, window_secs: f64) -> String {
+    let mut out = String::new();
+    let mut acc = 0.0f64; // total media time walked so far, skip phase included
+    let mut kept = 0.0f64; // media time actually kept, once past the skip phase
+    let mut pending_extinf: Option<&str> = None;
+    for line in src.lines() {
+        let t = line.trim();
+        if t == "#EXT-X-ENDLIST" {
+            break; // re-appended below
+        }
+        if t.starts_with("#EXTINF") {
+            pending_extinf = Some(line);
+            continue;
+        }
+        if is_segment_line(t) {
+            let ex = pending_extinf.take();
+            let dur = ex
+                .and_then(|e| e.trim().strip_prefix("#EXTINF:"))
+                .and_then(|rest| rest.split(',').next())
+                .and_then(|s| s.trim().parse::<f64>().ok())
+                .unwrap_or(0.0);
+            if acc < skip_secs {
+                // Still skipping: discard this segment (and its #EXTINF)
+                // entirely, but still count its duration toward the skip.
+                acc += dur;
+                continue;
+            }
+            if kept >= window_secs {
+                break;
+            }
+            acc += dur;
+            kept += dur;
+            if let Some(e) = ex {
+                out.push_str(e);
                 out.push('\n');
             }
             out.push_str(line);
@@ -884,7 +948,7 @@ pub async fn run_recovery(
     let chosen = resolve_quality(&quality, &quals);
     let playlist_url = swap_quality(&found.url, &chosen);
 
-    let recovered = match build_playlist(&client, &playlist_url, max_conc, probe_all, None).await {
+    let recovered = match build_playlist(&client, &playlist_url, max_conc, probe_all, None, None).await {
         Ok(r) => r,
         Err(e) => {
             finish_fail(format!("playlist build failed: {e}"));
@@ -1328,6 +1392,40 @@ mod tests {
     }
 
     #[test]
+    fn truncate_playlist_window_skips_then_bounds_the_window() {
+        // 5 segments of 10s each (0..50s total).
+        let src = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n\
+                   #EXTINF:10.000,\n0.ts\n#EXTINF:10.000,\n1.ts\n\
+                   #EXTINF:10.000,\n2.ts\n#EXTINF:10.000,\n3.ts\n\
+                   #EXTINF:10.000,\n4.ts\n";
+        // skip 20s (drops 0,1), keep a 15s window (acc 20->30 keeps 2, then
+        // 30->40 keeps 3 since kept(10) < window(15), stops before 4).
+        let out = truncate_playlist_window(src, 20.0, 15.0);
+        assert!(!out.contains("0.ts") && !out.contains("1.ts"), "{out}");
+        assert!(out.contains("2.ts") && out.contains("3.ts"), "{out}");
+        assert!(!out.contains("4.ts"), "{out}");
+        assert!(out.ends_with("#EXT-X-ENDLIST\n"), "{out}");
+        assert!(out.contains("#EXT-X-TARGETDURATION:10"), "{out}");
+    }
+
+    #[test]
+    fn truncate_playlist_window_skip_past_total_length_yields_nothing() {
+        let src = "#EXTM3U\n#EXTINF:10.000,\n0.ts\n#EXTINF:10.000,\n1.ts\n#EXT-X-ENDLIST\n";
+        let out = truncate_playlist_window(src, 100.0, 30.0);
+        assert!(!out.contains("0.ts") && !out.contains("1.ts"), "{out}");
+        assert_eq!(out, "#EXTM3U\n#EXT-X-ENDLIST\n");
+    }
+
+    #[test]
+    fn truncate_playlist_window_zero_skip_matches_plain_truncate() {
+        let src = "#EXTM3U\n#EXTINF:10.000,\n0.ts\n#EXTINF:10.000,\n1.ts\n#EXTINF:10.000,\n2.ts\n";
+        assert_eq!(
+            truncate_playlist_window(src, 0.0, 15.0),
+            truncate_playlist(src, 15.0)
+        );
+    }
+
+    #[test]
     fn playlist_prefix_strips_filename() {
         assert_eq!(
             playlist_prefix("https://host/abc_streamer_123/chunked/index-dvr.m3u8"),
@@ -1418,7 +1516,7 @@ mod tests {
                     .unwrap_or_else(|| panic!("{login} (gql={use_gql}): playlist should resolve"));
                 assert_eq!(found.matched_epoch, true_epoch, "{login} (gql={use_gql}): true start");
 
-                let recovered = build_playlist(&client, &found.url, 16, false, None).await.unwrap();
+                let recovered = build_playlist(&client, &found.url, 16, false, None, None).await.unwrap();
                 eprintln!(
                     "{login} (gql={use_gql}): {}/{} present, {} un-muted, {} muted-fallback, {} missing",
                     recovered.present,

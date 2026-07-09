@@ -619,6 +619,19 @@ polled regardless).
   flag for the recording the rule starts: *Inherit* keeps the instance setting,
   *On* forces the DVR head backfill / live-from-start path (usually what you
   want for unarchived streams), *Off* forces it off.
+- **Lead** — backfill this many seconds from the Twitch live-VOD CDN from
+  *before* the match was detected (reuses the [head backfill](#streams-live-monitoring)
+  mechanism, so **Twitch only**), in case the title/game update landed a
+  little late relative to when the segment actually started. `0` = off.
+- **Only while matching** — instead of recording until the stream itself
+  ends, stop once this rule no longer matches — e.g. archiving just one game
+  segment of a multi-day event like GamesDoneQuick. When on, an **End delay**
+  field appears: keep recording this many seconds after the unmatch before
+  actually stopping, a grace period for a title/game that flips back (or
+  updated a little early). Checked on the same ~60s cycle that logs title/game
+  changes during a recording, so small End delay values effectively round up
+  to the next check. Survives an app restart (a re-attached recording keeps
+  enforcing it).
 - An **enabled** checkbox per rule, so seasonal rules can be kept but parked.
 
 **Three-level control.** Rules resolve through the same inheritance chain as the
@@ -632,10 +645,11 @@ instance overrides in their **Properties** windows ("Trigger words" section).
 **What you see when one fires.** A **⚡ Trigger matched** notification + rich
 toast (which rule matched, the matching title/game text, and what it did); the
 recording and its takes carry a **⚡ badge** (hover shows the match, e.g.
-`title ~ "karaoke" · capture-from-start forced on`); and the take's Properties
-window gets a **Trigger** row. With Auto *on*, rules still run — the per-rule
-*From start* override applies to the automatic recording and the match is
-recorded the same way.
+`title ~ "karaoke" · capture-from-start forced on`, or
+`title ~ "boss rush" · lead 30s · stops when unmatched (+15s)`); and the
+take's Properties window gets a **Trigger** row. With Auto *on*, rules still
+run — the per-rule *From start*/*Lead*/*Only while matching* overrides apply
+to the automatic recording and the match is recorded the same way.
 
 > Platform notes: Twitch (Helix) and Kick polls carry title+category natively.
 > Twitch **EventSub** pushes don't include a title, so a matching-capable

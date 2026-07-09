@@ -79,6 +79,25 @@ pub struct TriggerRule {
     /// recording this rule starts. `None` = keep the monitor's setting.
     #[serde(default)]
     pub capture_from_start: Option<bool>,
+    /// Stop the recording once this rule no longer matches (after
+    /// `end_delay_secs`), instead of recording until the stream itself ends —
+    /// e.g. archiving just one game segment of a multi-day marathon. `false`
+    /// (default) keeps today's "record until the stream ends" behavior.
+    #[serde(default)]
+    pub stop_on_unmatch: bool,
+    /// Backfill this many seconds of Twitch CDN footage from *before* the
+    /// match was detected, in case the title/game update landed a little
+    /// late relative to when the segment actually started. `0` = off.
+    /// Reuses the head-backfill mechanism, so it's Twitch-only.
+    #[serde(default)]
+    pub lead_secs: i64,
+    /// When `stop_on_unmatch` is on, keep recording this many seconds after
+    /// the rule stops matching before actually stopping — a grace period in
+    /// case the title/game flips back (or the update landed a little early).
+    /// `0` = stop as soon as an unmatch is confirmed. Ignored when
+    /// `stop_on_unmatch` is false.
+    #[serde(default)]
+    pub end_delay_secs: i64,
 }
 
 impl Default for TriggerRule {
@@ -89,6 +108,9 @@ impl Default for TriggerRule {
             regex: false,
             pattern: String::new(),
             capture_from_start: None,
+            stop_on_unmatch: false,
+            lead_secs: 0,
+            end_delay_secs: 0,
         }
     }
 }
@@ -259,6 +281,16 @@ impl TriggerHit {
             Some(false) => s.push_str(" · capture-from-start forced off"),
             None => {}
         }
+        if self.rule.lead_secs > 0 {
+            s.push_str(&format!(" · lead {}s", self.rule.lead_secs));
+        }
+        if self.rule.stop_on_unmatch {
+            if self.rule.end_delay_secs > 0 {
+                s.push_str(&format!(" · stops when unmatched (+{}s)", self.rule.end_delay_secs));
+            } else {
+                s.push_str(" · stops when unmatched");
+            }
+        }
         s
     }
 }
@@ -379,6 +411,26 @@ mod tests {
     }
 
     #[test]
+    fn describe_notes_lead_and_stop_on_unmatch() {
+        let mut r = rule(TriggerField::Title, false, "gdq segment");
+        r.lead_secs = 30;
+        let hit = first_match(&[r], Some("gdq segment"), None).unwrap();
+        assert_eq!(hit.describe(), "title ~ \"gdq segment\" · lead 30s");
+
+        let mut r2 = rule(TriggerField::Title, false, "gdq segment");
+        r2.stop_on_unmatch = true;
+        r2.end_delay_secs = 15;
+        let hit2 = first_match(&[r2], Some("gdq segment"), None).unwrap();
+        assert_eq!(hit2.describe(), "title ~ \"gdq segment\" · stops when unmatched (+15s)");
+
+        // stop_on_unmatch with no end delay omits the "+Ns" part.
+        let mut r3 = rule(TriggerField::Title, false, "gdq segment");
+        r3.stop_on_unmatch = true;
+        let hit3 = first_match(&[r3], Some("gdq segment"), None).unwrap();
+        assert_eq!(hit3.describe(), "title ~ \"gdq segment\" · stops when unmatched");
+    }
+
+    #[test]
     fn three_level_resolution_modes() {
         let global = vec![rule(TriggerField::Any, false, "unarchived")];
         let extra = rule(TriggerField::Title, false, "karaoke");
@@ -420,6 +472,9 @@ mod tests {
                 regex: true,
                 pattern: "sing".into(),
                 capture_from_start: Some(true),
+                stop_on_unmatch: true,
+                lead_secs: 30,
+                end_delay_secs: 15,
             }],
         };
         let json = serde_json::to_string(&scope).unwrap();
@@ -435,6 +490,17 @@ mod tests {
         assert_eq!(r.field, TriggerField::Any);
         assert!(!r.regex);
         assert_eq!(r.capture_from_start, None);
+        assert!(!r.stop_on_unmatch);
+        assert_eq!(r.lead_secs, 0);
+        assert_eq!(r.end_delay_secs, 0);
         assert!(TriggerScope::default().is_inherit());
+        // Old JSON missing these fields entirely (pre-this-feature) still
+        // deserializes fine with them defaulted off.
+        let old: TriggerRule = serde_json::from_str(
+            r#"{"enabled":true,"field":"title","regex":false,"pattern":"karaoke"}"#,
+        )
+        .unwrap();
+        assert!(!old.stop_on_unmatch);
+        assert_eq!(old.lead_secs, 0);
     }
 }
