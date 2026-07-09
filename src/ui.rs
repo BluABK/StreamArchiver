@@ -1193,6 +1193,7 @@ impl StreamArchiverApp {
         tray: TrayIcon,
         ui_rx: Receiver<UiCommand>,
         heartbeat: crate::watchdog::Heartbeat,
+        egui_ctx: egui::Context,
     ) -> StreamArchiverApp {
         let events_rx = core.subscribe();
         let autostart = AutoStart::new();
@@ -1606,7 +1607,7 @@ impl StreamArchiverApp {
             pending_reload: None,
             reload_queued: false,
             last_auto_reload: now_unix(),
-            fs_probes: FsProbes::default(),
+            fs_probes: FsProbes::new(egui_ctx),
             videos_refreshed: None,
             videos_rev: 0,
             videos_model_cache: None,
@@ -7056,6 +7057,9 @@ impl eframe::App for StreamArchiverApp {
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
 
         self.pump_messages(ctx);
+        // Install filesystem-probe results the background worker finished
+        // since last frame (never blocks — see `FsProbes`).
+        self.fs_probes.drain_results();
         self.drain_pending_browse();
         self.drain_pending_save();
         self.drain_pending_reload();
@@ -7069,9 +7073,10 @@ impl eframe::App for StreamArchiverApp {
         if now - self.last_auto_reload >= 30 {
             self.last_auto_reload = now;
             self.spawn_pending_reload();
-            // Bound the probe cache: drop everything so paths for deleted
-            // rows don't accumulate (entries re-fill lazily on render).
-            self.fs_probes.clear();
+            // Bound the probe cache: age out entries no longer being rendered.
+            // (Never clear() wholesale — that used to force every visible path
+            // back through a probe in a single frame.)
+            self.fs_probes.evict_unused();
         }
 
         // Keep repainting at 50ms while a background DB load is in-flight so
@@ -24095,82 +24100,199 @@ enum StreamTarget {
 /// they're openable; also filters out the tiny `.state` sidecars (~50 B).
 const SPLIT_AV_MIN_BYTES: u64 = 64 * 1024;
 
-/// How long a cached [`FsProbes`] result stays valid.
+/// How long a delivered [`FsProbes`] result stays fresh; after this the next
+/// access queues a background refresh (the stale value keeps being returned
+/// meanwhile — the UI thread never waits for the disk).
 const FS_PROBE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// TTL cache for the per-row filesystem probes the tables re-run every frame
-/// (in-progress capture scans, Open file/folder button enablement). egui
-/// repaints at full refresh rate under mouse movement, and a synchronous
-/// `File::open` / `read_dir` per row per frame stalls the whole frame — badly
-/// on a sleeping HDD or network share, where a single stat can block for
-/// seconds (and every immediate-viewport window shares the frame). Entries
-/// refresh lazily after [`FS_PROBE_TTL`]; `logic()` clears the maps on its
-/// slow background tick so paths for deleted rows don't accumulate.
-#[derive(Default)]
+/// Entries not accessed for this long are dropped on `logic()`'s slow tick,
+/// so paths for deleted rows don't accumulate.
+const FS_PROBE_EVICT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A probe request shipped to the `fs-probes` worker thread.
+enum ProbeJob {
+    File(std::path::PathBuf),
+    Dir(std::path::PathBuf),
+    Len(std::path::PathBuf),
+    Target(String),
+}
+
+/// A finished probe shipped back from the worker.
+enum ProbeResult {
+    File(std::path::PathBuf, bool),
+    Dir(std::path::PathBuf, bool),
+    Len(std::path::PathBuf, u64),
+    Target(String, Option<StreamTarget>),
+}
+
+struct ProbeSlot<V> {
+    /// When the value was last actually probed (`None` = placeholder still
+    /// awaiting its first worker result).
+    at: Option<std::time::Instant>,
+    /// Last render-path access — drives eviction on the slow tick.
+    used: std::time::Instant,
+    /// A refresh for this key is queued or in-flight (dedups requests, and
+    /// bounds the worker queue to one entry per key even while the disk
+    /// stalls for minutes).
+    pending: bool,
+    v: V,
+}
+
+/// Never-blocking cache for the per-row filesystem probes the tables re-run
+/// every frame (in-progress capture scans, Open file/folder button
+/// enablement). All I/O happens on a single `fs-probes` worker thread;
+/// accessors return the last-known value immediately (a pessimistic
+/// placeholder — `false`/`0`/`None` — on first sight) and queue a background
+/// refresh once the entry is older than [`FS_PROBE_TTL`].
+///
+/// The single worker is deliberate: it serializes probe I/O, so when a disk
+/// stalls only the worker blocks — values go stale but the UI keeps painting.
+/// The old synchronous TTL design froze the whole UI for as long as one stat
+/// took: recordings live on a USB HDD here, and under sustained capture
+/// writes a single `File::open`/`read_dir` against it was observed blocking
+/// for 60+ seconds (the 2026-07-09 "UI frozen" watchdog reports during the
+/// GDQ marathon recording).
 struct FsProbes {
-    files: HashMap<std::path::PathBuf, (std::time::Instant, bool)>,
-    dirs: HashMap<std::path::PathBuf, (std::time::Instant, bool)>,
-    sizes: HashMap<std::path::PathBuf, (std::time::Instant, u64)>,
-    targets: HashMap<String, (std::time::Instant, Option<StreamTarget>)>,
+    files: HashMap<std::path::PathBuf, ProbeSlot<bool>>,
+    dirs: HashMap<std::path::PathBuf, ProbeSlot<bool>>,
+    sizes: HashMap<std::path::PathBuf, ProbeSlot<u64>>,
+    targets: HashMap<String, ProbeSlot<Option<StreamTarget>>>,
+    tx: std::sync::mpsc::Sender<ProbeJob>,
+    rx: std::sync::mpsc::Receiver<ProbeResult>,
+}
+
+/// Return the slot's value, queueing a background refresh when it's a fresh
+/// key or older than [`FS_PROBE_TTL`]. Shared by all four [`FsProbes`] maps.
+fn probe_lookup<K, Q, V>(
+    tx: &std::sync::mpsc::Sender<ProbeJob>,
+    map: &mut HashMap<K, ProbeSlot<V>>,
+    key: &Q,
+    placeholder: V,
+    job: impl Fn(K) -> ProbeJob,
+) -> V
+where
+    K: std::borrow::Borrow<Q> + std::hash::Hash + Eq,
+    Q: std::hash::Hash + Eq + ToOwned<Owned = K> + ?Sized,
+    V: Clone,
+{
+    let now = std::time::Instant::now();
+    if let Some(slot) = map.get_mut(key) {
+        slot.used = now;
+        if !slot.pending && slot.at.is_none_or(|at| now.duration_since(at) >= FS_PROBE_TTL) {
+            slot.pending = true;
+            let _ = tx.send(job(key.to_owned()));
+        }
+        return slot.v.clone();
+    }
+    map.insert(
+        key.to_owned(),
+        ProbeSlot { at: None, used: now, pending: true, v: placeholder.clone() },
+    );
+    let _ = tx.send(job(key.to_owned()));
+    placeholder
 }
 
 impl FsProbes {
-    fn is_file(&mut self, p: &std::path::Path) -> bool {
-        Self::cached(&mut self.files, p, |p| p.is_file())
-    }
-
-    fn is_dir(&mut self, p: &std::path::Path) -> bool {
-        Self::cached(&mut self.dirs, p, |p| p.is_dir())
-    }
-
-    /// Cached directory-entry size (fine for finished files); 0 when missing.
-    fn len(&mut self, p: &std::path::Path) -> u64 {
-        let now = std::time::Instant::now();
-        if let Some((at, v)) = self.sizes.get(p)
-            && now.duration_since(*at) < FS_PROBE_TTL
-        {
-            return *v;
+    fn new(ctx: egui::Context) -> FsProbes {
+        let (job_tx, job_rx) = std::sync::mpsc::channel::<ProbeJob>();
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<ProbeResult>();
+        std::thread::Builder::new()
+            .name("fs-probes".into())
+            .spawn(move || {
+                while let Ok(job) = job_rx.recv() {
+                    let res = match job {
+                        ProbeJob::File(p) => {
+                            let v = p.is_file();
+                            ProbeResult::File(p, v)
+                        }
+                        ProbeJob::Dir(p) => {
+                            let v = p.is_dir();
+                            ProbeResult::Dir(p, v)
+                        }
+                        // Directory-entry size (fine for finished files).
+                        ProbeJob::Len(p) => {
+                            let v = p.metadata().map(|m| m.len()).unwrap_or(0);
+                            ProbeResult::Len(p, v)
+                        }
+                        ProbeJob::Target(s) => {
+                            let t = stream_target_for_active(&s);
+                            ProbeResult::Target(s, t)
+                        }
+                    };
+                    if res_tx.send(res).is_err() {
+                        break; // FsProbes dropped — app shutting down
+                    }
+                    // Paint the fresh value promptly instead of waiting out
+                    // the ≥1 fps idle repaint floor.
+                    ctx.request_repaint();
+                }
+            })
+            .expect("spawn fs-probes thread");
+        FsProbes {
+            files: HashMap::new(),
+            dirs: HashMap::new(),
+            sizes: HashMap::new(),
+            targets: HashMap::new(),
+            tx: job_tx,
+            rx: res_rx,
         }
-        let v = p.metadata().map(|m| m.len()).unwrap_or(0);
-        self.sizes.insert(p.to_path_buf(), (now, v));
-        v
     }
 
-    /// Cached [`stream_target_for_active`] (a `.cache` dir scan plus a
+    /// Last-known `is_file` (false until the first probe lands).
+    fn is_file(&mut self, p: &std::path::Path) -> bool {
+        probe_lookup(&self.tx, &mut self.files, p, false, ProbeJob::File)
+    }
+
+    /// Last-known `is_dir` (false until the first probe lands).
+    fn is_dir(&mut self, p: &std::path::Path) -> bool {
+        probe_lookup(&self.tx, &mut self.dirs, p, false, ProbeJob::Dir)
+    }
+
+    /// Last-known directory-entry size (0 while missing/unprobed).
+    fn len(&mut self, p: &std::path::Path) -> u64 {
+        probe_lookup(&self.tx, &mut self.sizes, p, 0, ProbeJob::Len)
+    }
+
+    /// Last-known [`stream_target_for_active`] (a `.cache` dir scan plus a
     /// `File::open` per candidate — by far the heaviest per-row probe).
     fn target(&mut self, output_path: &str) -> Option<StreamTarget> {
-        let now = std::time::Instant::now();
-        if let Some((at, t)) = self.targets.get(output_path)
-            && now.duration_since(*at) < FS_PROBE_TTL
-        {
-            return t.clone();
-        }
-        let t = stream_target_for_active(output_path);
-        self.targets.insert(output_path.to_string(), (now, t.clone()));
-        t
+        probe_lookup(&self.tx, &mut self.targets, output_path, None, ProbeJob::Target)
     }
 
-    fn cached(
-        map: &mut HashMap<std::path::PathBuf, (std::time::Instant, bool)>,
-        p: &std::path::Path,
-        probe: impl Fn(&std::path::Path) -> bool,
-    ) -> bool {
-        let now = std::time::Instant::now();
-        if let Some((at, v)) = map.get(p)
-            && now.duration_since(*at) < FS_PROBE_TTL
-        {
-            return *v;
+    /// Install finished worker results. Called once per frame from `logic()`;
+    /// results for keys evicted in the meantime are simply dropped.
+    fn drain_results(&mut self) {
+        while let Ok(res) = self.rx.try_recv() {
+            let now = std::time::Instant::now();
+            fn install<K: std::hash::Hash + Eq, V>(
+                map: &mut HashMap<K, ProbeSlot<V>>,
+                key: &K,
+                v: V,
+                now: std::time::Instant,
+            ) {
+                if let Some(slot) = map.get_mut(key) {
+                    slot.v = v;
+                    slot.at = Some(now);
+                    slot.pending = false;
+                }
+            }
+            match res {
+                ProbeResult::File(p, v) => install(&mut self.files, &p, v, now),
+                ProbeResult::Dir(p, v) => install(&mut self.dirs, &p, v, now),
+                ProbeResult::Len(p, v) => install(&mut self.sizes, &p, v, now),
+                ProbeResult::Target(s, t) => install(&mut self.targets, &s, t, now),
+            }
         }
-        let v = probe(p);
-        map.insert(p.to_path_buf(), (now, v));
-        v
     }
 
-    fn clear(&mut self) {
-        self.files.clear();
-        self.dirs.clear();
-        self.sizes.clear();
-        self.targets.clear();
+    /// Drop entries no render path has touched for [`FS_PROBE_EVICT`]
+    /// (deleted rows stop being rendered, stop being accessed, and age out).
+    fn evict_unused(&mut self) {
+        let now = std::time::Instant::now();
+        self.files.retain(|_, s| now.duration_since(s.used) < FS_PROBE_EVICT);
+        self.dirs.retain(|_, s| now.duration_since(s.used) < FS_PROBE_EVICT);
+        self.sizes.retain(|_, s| now.duration_since(s.used) < FS_PROBE_EVICT);
+        self.targets.retain(|_, s| now.duration_since(s.used) < FS_PROBE_EVICT);
     }
 }
 
@@ -25911,6 +26033,7 @@ mod tests {
         set_short_ts, streams_col_min_width,
         fmt_polled, hsl_to_rgb, meta_change_lines, monitor_import_identity, ordered_rows,
         parse_first_party_spans, playable_with, player_is_mpv, readable_color, recording_cells,
+        FS_PROBE_EVICT, FsProbes,
         rgb_to_hsl, set_active_date_fmt, split_browser_profile, stream_target_for_active,
         strip_ctcp_action, twitch_username_color, word_match_segments, yt_channel_id,
     };
@@ -26812,6 +26935,66 @@ mod tests {
                 cache.join("Chan - Movie Night.f140.mkv.sq0.part"),
             ]))
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ----- FsProbes (async stale-while-revalidate cache) -----
+
+    /// Poll `drain + is_file` until it reports `want` or a deadline passes —
+    /// the worker answers on its own thread, so results land asynchronously.
+    fn probes_wait_file(fp: &mut FsProbes, p: &std::path::Path, want: bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            fp.drain_results();
+            if fp.is_file(p) == want {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn fs_probes_serve_placeholder_then_worker_result_then_stale_value() {
+        let (dir, cache) = probe_dir("fsprobes");
+        let file = cache.join("real.ts");
+        std::fs::write(&file, b"x").unwrap();
+        let mut fp = FsProbes::new(egui::Context::default());
+        // First sight: pessimistic placeholder — the calling (UI) thread
+        // must never touch the disk itself.
+        assert!(!fp.is_file(&file));
+        // The worker's answer lands shortly after.
+        assert!(probes_wait_file(&mut fp, &file, true), "worker result never arrived");
+        // Stale-while-revalidate: after deleting the file the cached true is
+        // still served immediately (no blocking re-probe)…
+        std::fs::remove_file(&file).unwrap();
+        assert!(fp.is_file(&file));
+        // …and flips to false once the TTL expires and the refresh lands.
+        assert!(probes_wait_file(&mut fp, &file, false), "refresh never arrived");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fs_probes_evict_only_entries_not_accessed_recently() {
+        let (dir, cache) = probe_dir("fsevict");
+        let file = cache.join("real.ts");
+        std::fs::write(&file, b"x").unwrap();
+        let mut fp = FsProbes::new(egui::Context::default());
+        assert!(probes_wait_file(&mut fp, &file, true));
+        // Recently accessed → survives the slow-tick eviction.
+        fp.evict_unused();
+        assert!(fp.files.contains_key(&file));
+        // Backdate the access stamp (skipped when machine uptime is shorter
+        // than the eviction window — Instant can't represent that past).
+        if let Some(old) = std::time::Instant::now()
+            .checked_sub(FS_PROBE_EVICT + std::time::Duration::from_secs(1))
+        {
+            fp.files.get_mut(&file).unwrap().used = old;
+            fp.evict_unused();
+            assert!(!fp.files.contains_key(&file));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

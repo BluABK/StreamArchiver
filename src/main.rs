@@ -198,6 +198,7 @@ fn main() -> Result<()> {
                 tray,
                 ui_rx,
                 heartbeat,
+                cc.egui_ctx.clone(),
             )))
         }),
     )
