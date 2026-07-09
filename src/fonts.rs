@@ -1,5 +1,6 @@
 //! Install OS fonts that cover non-Latin glyphs (CJK, Hangul, fullwidth `【】`,
-//! emoji, etc.) as *fallbacks* behind egui's bundled default.
+//! emoji, historic scripts like Egyptian Hieroglyphs, etc.) as *fallbacks*
+//! behind egui's bundled default.
 //!
 //! egui's default font is Latin-only, so channel names like Japanese VTuber names
 //! (or `Nimi Nightmare【Phase Connect】`) — and the emoji chat viewers spam — otherwise
@@ -40,8 +41,21 @@ const FONT_GROUPS: &[&[&str]] = &[
     // rasterize (the COLR colour layers are ignored), so modern emoji show as B&W
     // silhouettes instead of tofu.
     &[r"C:\Windows\Fonts\seguiemj.ttf"],
-    // Older emoji + dingbats/symbols Segoe UI Emoji may not cover.
+    // Older emoji + dingbats/symbols Segoe UI Emoji may not cover — also
+    // covers Braille Patterns (the U+2800 "blank" spacer trick) and Enclosed
+    // Alphanumerics (①②③, Ⓐ Ⓑ), so those need no dedicated group.
     &[r"C:\Windows\Fonts\seguisym.ttf"],
+    // Historic scripts (Egyptian Hieroglyphs, Cuneiform, Anatolian Hieroglyphs,
+    // Old Italic, Old Persian, Ugaritic, ...) — stream titles occasionally use
+    // these decoratively (e.g. 𓋼𓍊 𓆏 𓍊𓋼) and would otherwise render as tofu.
+    &[r"C:\Windows\Fonts\seguihis.ttf"],
+    // Mathematical Alphanumeric Symbols (U+1D400-U+1D7FF) — the "fancy text
+    // generator" style people copy-paste into titles/usernames (𝓯𝓪𝓷𝓬𝔂,
+    // 𝕓𝕠𝕝𝕕, 𝔤𝔬𝔱𝔥𝔦𝔠, 𝘪𝘵𝘢𝘭𝘪𝘤, 𝚖𝚘𝚗𝚘𝚜𝚙𝚊𝚌𝚎, ...). `cambria.ttc`'s face 0 (the plain
+    // "Cambria" face this loader always uses) fully covers the block —
+    // verified by inspecting its cmap; the separate "Cambria Math" face
+    // (index 1) isn't needed.
+    &[r"C:\Windows\Fonts\cambria.ttc"],
 ];
 
 #[cfg(target_os = "macos")]
@@ -77,6 +91,19 @@ const FONT_GROUPS: &[&[&str]] = &[
     &[
         "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
         "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
+    ],
+    // Historic scripts (Egyptian Hieroglyphs etc.) — see the Windows group above.
+    &[
+        "/usr/share/fonts/truetype/noto/NotoSansEgyptianHieroglyphs-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansEgyptianHieroglyphs-Regular.ttf",
+    ],
+    // Mathematical Alphanumeric Symbols ("fancy text generator" styles) — see
+    // the Windows Cambria group above. GNU FreeFont's FreeSerif has broad
+    // coverage of this block (unverified on this platform, unlike the Windows
+    // Cambria path — best effort, same as the rest of this Linux list).
+    &[
+        "/usr/share/fonts/truetype/freefont/FreeSerif.ttf",
+        "/usr/share/fonts/gnu-free/FreeSerif.ttf",
     ],
 ];
 
