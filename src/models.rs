@@ -1337,13 +1337,22 @@ pub struct Video {
     pub filename_template: String,
     pub auth_kind: AuthKind,
     pub auth_value: String,
-    /// Audio tracks to capture. Empty = the tool's default; `all`/`*` = every
-    /// track; otherwise a comma-separated list. Honored by streamlink
-    /// (`--hls-audio-select`); yt-dlp/ffmpeg keep what the chosen format carries.
+    /// Audio tracks to download. Empty = the tool's default (one track);
+    /// `all`/`*` = every track; otherwise a comma-separated list of language
+    /// codes, muxed together as separate audio streams (YouTube VODs can carry
+    /// a dub/descriptive-audio track alongside the original). Honored by
+    /// streamlink (`--hls-audio-select`) and yt-dlp (synthesizes a `-f` format
+    /// selector — see `downloader::yt_audio_format_selector` — ignored when
+    /// `quality` is a custom format string, which always wins); ffmpeg keeps
+    /// what the chosen format carries either way.
     pub audio_tracks: String,
-    /// Subtitle tracks to write as sidecars. Empty = none; `all` = every subtitle;
-    /// otherwise a comma-separated language list. Honored by yt-dlp (`--sub-langs`
-    /// + `--write-subs`); streamlink can't mux subtitles.
+    /// Subtitle tracks to download and embed into the file. Empty = none;
+    /// `all` = every subtitle; otherwise a comma-separated language list.
+    /// Honored by yt-dlp (`--sub-langs` fetches them as sidecars, then
+    /// `downloader::embed_subtitles_into_mkv` embeds and deletes them — a Video
+    /// download lands in one flat folder, unlike a live recording's per-channel
+    /// subdir, so a lingering sidecar is just clutter); streamlink can't mux
+    /// subtitles.
     pub subtitle_tracks: String,
     /// Capture chat to a sidecar (yt-dlp `--sub-langs live_chat` → a
     /// `.live_chat.json`, e.g. a YouTube VOD's chat replay). Other tools/sources

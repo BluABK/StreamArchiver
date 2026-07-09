@@ -755,10 +755,14 @@ downloaded VOD** or **Retry download**.
 
 ### Audio & subtitle tracks
 
-To archive as much of a stream as possible, each instance has **Audio tracks** and
-**Subtitle tracks** fields (on the Streams add/edit form — and the same fields are
-on the Videos download form, applying to one-shot VOD/video downloads):
+Both the Streams add/edit form (live recordings) and the Videos download form
+(one-shot VOD/video downloads) have **Audio tracks** and **Subtitle tracks**
+fields, but the two forms handle them differently — live recordings land in
+per-channel subdirs where a sidecar file is unambiguous; Video downloads all
+land in **one flat folder**, where a lingering `clip.en.vtt` next to the file
+is just clutter, so that path embeds instead.
 
+**Streams (live recordings):**
 - **Audio tracks** — which audio tracks to capture, via streamlink's
   `--hls-audio-select`. Empty = the tool's default (one track); **`all`** (or
   `*`) = every audio track; or a comma-separated list of language codes/names
@@ -778,9 +782,24 @@ tracks (not just one per type), and subtitle sidecars are moved along if the fil
 is later renamed (see *Filename media info*), so the tracks you select are the
 tracks you keep.
 
-**New** instances default both to **`all`** (maximum archival). **Existing**
-instances keep their previous behavior (empty) until you edit them. Power-user
-**Extra args** are appended after these, so they can still override.
+**Videos (on-demand downloads):**
+- **Audio tracks** — same field meaning, but for **yt-dlp** it now actually
+  does something: a language (list) synthesizes a `-f` format selector picking
+  those audio-only formats as separate muxed streams (e.g. `en,de` →
+  `bv*+ba[language^=en]+ba[language^=de] --audio-multistreams`), so a YouTube
+  video's dub tracks or descriptive audio come along instead of whatever single
+  track yt-dlp would've defaulted to. Language codes match by *prefix*, so
+  plain `en` also matches `en-US`/`en-GB`. Ignored when **Quality** is set to a
+  custom yt-dlp format string — that always wins outright rather than trying to
+  merge two `-f` selectors. Streamlink/ffmpeg behave the same as above.
+- **Subtitle tracks** — yt-dlp still fetches them the same way, but they're
+  then **embedded into the file itself and the sidecar deleted**, with a
+  `language` tag per stream parsed from the filename. No-op when nothing was
+  fetched.
+
+**New** instances/videos default both fields to **`all`** (maximum archival).
+**Existing** ones keep their previous behavior (empty) until you edit them.
+Power-user **Extra args** are appended after these, so they can still override.
 
 ### Title & category change log
 

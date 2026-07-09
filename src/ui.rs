@@ -8784,19 +8784,25 @@ impl StreamArchiverApp {
                     ui.text_edit_singleline(&mut vf.extra_args);
                     ui.label("Audio tracks");
                     ui.text_edit_singleline(&mut vf.audio_tracks).on_hover_text(
-                        "Audio tracks to capture (streamlink --hls-audio-select). \
-                         Empty = the tool's default; 'all' (or '*') = every track; or a \
-                         comma-separated list of language codes/names. streamlink-only; \
-                         yt-dlp/ffmpeg keep the chosen format's tracks.",
+                        "Audio tracks to download. streamlink: --hls-audio-select. yt-dlp: \
+                         builds a format selector picking those languages together as separate \
+                         muxed tracks (YouTube VODs can carry a dub/descriptive-audio track \
+                         alongside the original) — a plain code like 'en' matches 'en-US'/'en-GB' \
+                         too. Empty = the tool's default (one track); 'all' (or '*') = every \
+                         track; or a comma-separated list of language codes. Ignored for yt-dlp \
+                         when Quality is set to a custom format string (that always wins); \
+                         ffmpeg keeps the chosen format's tracks either way.",
                     );
                     ui.end_row();
 
                     // Subtitle tracks + Log chat.
                     ui.label("Subtitle tracks");
                     ui.text_edit_singleline(&mut vf.subtitle_tracks).on_hover_text(
-                        "Subtitle tracks to download (yt-dlp --sub-langs, written as sidecar \
-                         files next to the video). Empty = none; 'all' (or '*') = every \
-                         subtitle; or a comma-separated list of language codes. yt-dlp-only.",
+                        "Subtitle tracks to download and embed into the video file (yt-dlp \
+                         --sub-langs; embedded, not left as a sidecar next to it, since every \
+                         Video download lands in one flat folder). Empty = none; 'all' (or '*') \
+                         = every subtitle; or a comma-separated list of language codes. \
+                         yt-dlp-only.",
                     );
                     ui.label("Log chat");
                     ui.checkbox(&mut vf.chat_log, "").on_hover_text(

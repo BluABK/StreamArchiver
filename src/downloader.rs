@@ -480,6 +480,35 @@ pub(crate) fn push_track_args(args: &mut Vec<String>, tool: Tool, audio: &str, s
     }
 }
 
+/// Build a yt-dlp `-f` format selector implementing on-demand `audio_tracks`
+/// selection for the Video downloader — YouTube VODs can carry multiple audio
+/// tracks (the original plus dubbed languages, or descriptive audio), and
+/// yt-dlp's own default format selection only ever picks one. Returns `None`
+/// when `audio` is empty (no override — the tool's/`quality` field's own
+/// default wins). The second element is whether `--audio-multistreams` is
+/// required (whenever more than one audio format could be muxed in, so
+/// yt-dlp doesn't silently keep only the highest-priority one).
+///
+/// `[language^=<code>]` (prefix match, not `=` exact match) so a plain "en"
+/// still matches a track tagged "en-US"/"en-GB" — YouTube's exact codes vary
+/// and aren't predictable from the UI alone.
+fn yt_audio_format_selector(audio: &str) -> Option<(String, bool)> {
+    let audio = audio.trim();
+    if audio.is_empty() {
+        return None;
+    }
+    if audio.eq_ignore_ascii_case("all") || audio == "*" {
+        // Every audio-only format (every language) as separate muxed streams.
+        return Some(("bv*+ba.*".to_string(), true));
+    }
+    let codes: Vec<&str> = audio.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    if codes.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = codes.iter().map(|c| format!("ba[language^={c}]")).collect();
+    Some((format!("bv*+{}", parts.join("+")), codes.len() > 1))
+}
+
 /// Returns the URL yt-dlp should receive for a live YouTube recording.
 /// Extract a YouTube video ID from a URL (`watch?v=`, `youtu.be/`, `/live/ID`).
 /// Returns `None` for channel or handle URLs that don't embed a specific video ID.
@@ -1076,9 +1105,21 @@ pub fn build_video_plan(
                 "-o".into(),
                 out_tmpl,
             ];
+            // `quality` is a full escape hatch (a user can type any yt-dlp format
+            // string there) and always wins if set; audio-track selection only
+            // synthesizes its own `-f` when `quality` is left at the default, since
+            // yt-dlp's `-f` isn't cumulative — two of them would just have the last
+            // one win, silently discarding whichever was meant to combine with it.
+            let audio_sel = yt_audio_format_selector(&v.audio_tracks);
             if quality != "best" {
                 args.push("-f".into());
                 args.push(quality);
+            } else if let Some((sel, multistream)) = &audio_sel {
+                args.push("-f".into());
+                args.push(sel.clone());
+                if *multistream {
+                    args.push("--audio-multistreams".into());
+                }
             }
             match auth {
                 AuthSource::CookiesBrowser(b) => {
@@ -1112,9 +1153,12 @@ pub fn build_video_plan(
                 args.push("--extractor-args".into());
                 args.push(ytdlp.sabr.pot_args.clone());
             }
-            // Subtitle + chat (live_chat) sidecars; the post-rename step moves them
-            // with the file. audio_tracks is a no-op for yt-dlp (it keeps the
-            // chosen format's tracks).
+            // Subtitle + chat (live_chat) sidecars, fetched the same way as a live
+            // capture; unlike a live capture, subtitles then get embedded into the
+            // file (below, once it's fully promoted) instead of staying beside it —
+            // audio-track selection was already applied above via `-f`, before
+            // `quality`/extractor-args, since it's format-selection, not a
+            // sidecar-writing flag `push_track_args` handles.
             push_track_args(
                 &mut args,
                 Tool::YtDlp,
@@ -2913,7 +2957,7 @@ impl Supervisor {
             .unwrap_or_default();
         let mut final_path;
         if plan.remux_to_mkv {
-            final_path = promote_capture(&plan).await;
+            final_path = promote_capture(&plan, &self.store.remux_opts()).await;
         } else {
             let produced = if file_len(&plan.capture_path).await > 0 {
                 Some(plan.capture_path.clone())
@@ -2969,6 +3013,16 @@ impl Supervisor {
             }
             if let Some(cache) = cache.as_deref() {
                 purge_cache(cache, &capstem).await;
+            }
+            // Embed subtitle sidecars (per `video.subtitle_tracks`) into the file
+            // itself rather than leaving them beside it — unlike live recordings'
+            // per-channel subdirs, every Video download lands in one flat folder,
+            // where a `.en.vtt` next to the mkv is just clutter. No-ops when there
+            // are none (e.g. subtitle_tracks was empty, or yt-dlp found none).
+            if final_path.extension().and_then(|e| e.to_str()) == Some("mkv") {
+                if let Err(e) = embed_subtitles_into_mkv(&final_path).await {
+                    warn!(video = id, "embed subtitles failed: {e:#}");
+                }
             }
         }
 
@@ -3484,7 +3538,7 @@ impl Supervisor {
         // Promote the finished capture from the hidden `.cache\` up to the output
         // dir (remux .ts→.mkv, or move an already-final container); a failed/0-byte
         // capture is left in `.cache\` for the startup sweep.
-        let mut final_path = promote_capture(&plan).await;
+        let mut final_path = promote_capture(&plan, &self.store.remux_opts()).await;
         let promoted = final_path != plan.capture_path;
         let cache = plan.capture_path.parent().map(Path::to_path_buf);
         // The capture stem (== final stem before any post-rename) used to match this
@@ -3759,7 +3813,7 @@ impl Supervisor {
 
         // Promote the companion out of .cache\ (remux .ts→.mkv) on success; a failed
         // one stays in .cache\ for the sweep.
-        let final_path = promote_capture(&plan).await;
+        let final_path = promote_capture(&plan, &self.store.remux_opts()).await;
         if final_path != plan.capture_path {
             if let Some(cache) = plan.capture_path.parent() {
                 let stem = plan
@@ -4361,15 +4415,18 @@ impl Supervisor {
         let capture_path = PathBuf::from(&row.capture_path);
         let final_pred = PathBuf::from(&row.final_path);
         let mut final_path = if row.remux_to_mkv {
-            promote_capture(&DownloadPlan {
-                program: String::new(),
-                args: Vec::new(),
-                capture_path: capture_path.clone(),
-                final_path: final_pred.clone(),
-                remux_to_mkv: true,
-                writes_own_thumbnail: false,
-                mode: String::new(),
-            })
+            promote_capture(
+                &DownloadPlan {
+                    program: String::new(),
+                    args: Vec::new(),
+                    capture_path: capture_path.clone(),
+                    final_path: final_pred.clone(),
+                    remux_to_mkv: true,
+                    writes_own_thumbnail: false,
+                    mode: String::new(),
+                },
+                &self.store.remux_opts(),
+            )
             .await
         } else {
             // Already-final container: move the predicted file, or the newest
@@ -4722,7 +4779,7 @@ impl Supervisor {
         let ended = now_unix();
 
         // Finalize: promote .cache → output dir, move companions, post-rename, purge.
-        let mut final_path = promote_capture(&plan).await;
+        let mut final_path = promote_capture(&plan, &self.store.remux_opts()).await;
         let promoted = final_path != plan.capture_path;
         let cache = plan.capture_path.parent().map(Path::to_path_buf);
         let capstem = plan
@@ -6683,6 +6740,67 @@ pub async fn embed_thumbnail_into_mkv(mkv: &Path, thumb: &Path) -> anyhow::Resul
     Ok(())
 }
 
+/// Embed every subtitle sidecar (`.vtt`/`.srt`/…, per [`collect_subtitle_sidecars`])
+/// sitting next to `mkv` into the file in-place (remux to a temp file, then
+/// atomically replace the original — same idiom as [`embed_thumbnail_into_mkv`]),
+/// tagging each stream's `language` metadata from the sidecar's `{stem}.<lang>.ext`
+/// filename when present. Deletes the sidecar files on success — for the on-demand
+/// Video downloader specifically (all downloads land in one flat folder, unlike
+/// live recordings' per-channel subdirs), a lingering `.en.vtt` next to the video
+/// is just clutter, not useful. Returns `Ok(false)` (no-op) when there's nothing to
+/// embed, so callers can call this unconditionally after every video download.
+pub async fn embed_subtitles_into_mkv(mkv: &Path) -> anyhow::Result<bool> {
+    let subs = collect_subtitle_sidecars(mkv);
+    if subs.is_empty() {
+        return Ok(false);
+    }
+    let tmp = mkv.with_extension("tmp.mkv");
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-y").arg("-i").arg(mkv);
+    for sub in &subs {
+        cmd.arg("-i").arg(sub);
+    }
+    cmd.arg("-map").arg("0:v?").arg("-map").arg("0:a?").arg("-map").arg("0:s?");
+    for i in 1..=subs.len() {
+        cmd.arg("-map").arg(format!("{i}:s?"));
+    }
+    cmd.arg("-c").arg("copy");
+    for (i, sub) in subs.iter().enumerate() {
+        if let Some(lang) = subtitle_lang_from_name(mkv, sub) {
+            cmd.arg(format!("-metadata:s:s:{i}")).arg(format!("language={lang}"));
+        }
+    }
+    cmd.arg(&tmp)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let out = cmd.output().await?;
+    if !out.status.success() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        let tail = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("ffmpeg embed-subs failed: {}", tail.trim().lines().last().unwrap_or(""));
+    }
+    tokio::fs::rename(&tmp, mkv).await?;
+    for sub in &subs {
+        let _ = tokio::fs::remove_file(sub).await;
+    }
+    Ok(true)
+}
+
+/// Extract the language code from a subtitle sidecar's name relative to `mkv`'s
+/// stem (`{stem}.en.vtt` -> `Some("en")`; `{stem}.vtt` -> `None`, no code present).
+fn subtitle_lang_from_name(mkv: &Path, sub: &Path) -> Option<String> {
+    let stem = mkv.file_stem()?.to_string_lossy().into_owned();
+    let name = sub.file_stem()?.to_string_lossy().into_owned(); // strips only the trailing ext, e.g. "{stem}.en"
+    let prefix = format!("{stem}.");
+    name.strip_prefix(prefix.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+}
+
 /// Reorganize the files for one recording according to `cfg`. When `reverse` is
 /// true, moves files from subdirs back to the base output dir.
 /// Returns the new `output_path` for the video file, or the original if unchanged.
@@ -7344,8 +7462,11 @@ fn is_companion_suffix(rest: &str) -> bool {
 /// Promote a finished capture from the `.cache\` working dir up to its final path
 /// in the output dir: remux (TS→MKV) or move (already-final container), deleting the
 /// cache source on success. A 0-byte/failed capture is left in `.cache\` (returns
-/// the capture path so the caller can tell promotion didn't happen).
-async fn promote_capture(plan: &DownloadPlan) -> PathBuf {
+/// the capture path so the caller can tell promotion didn't happen). `opts` governs
+/// the remux branch's thumbnail/title/subtitle embedding (see [`crate::models::RemuxOpts`]) —
+/// callers should pass `store.remux_opts()`, not a default, or the user's Settings
+/// toggles silently do nothing for this (the automatic) path.
+async fn promote_capture(plan: &DownloadPlan, opts: &crate::models::RemuxOpts) -> PathBuf {
     // yt-dlp SABR dev-build sometimes appends a container extension to the
     // output path even when the template already specifies one — e.g. writing
     // `stem.mkv.mp4` instead of `stem.mkv` because the merged container is MP4.
@@ -7367,7 +7488,7 @@ async fn promote_capture(plan: &DownloadPlan) -> PathBuf {
         // react to on a name-too-long failure, so shorten proactively before
         // the write instead of reactively after it (see path_with_safe_stem).
         let dest = path_with_safe_stem(&plan.final_path);
-        match remux_ts_to_mkv(&effective, &dest, None, &Default::default()).await {
+        match remux_ts_to_mkv(&effective, &dest, None, opts).await {
             Ok(()) => {
                 let _ = tokio::fs::remove_file(&effective).await;
                 dest
@@ -9845,6 +9966,77 @@ mod tests {
         // Not a live capture: no live-stream flags.
         assert!(!plan.args.iter().any(|a| a == "--live-from-start"));
         assert!(plan.args.iter().any(|a| a == "--remux-video"));
+    }
+
+    #[test]
+    fn yt_audio_format_selector_builds_expected_selectors() {
+        assert_eq!(yt_audio_format_selector(""), None);
+        assert_eq!(yt_audio_format_selector("   "), None);
+        assert_eq!(
+            yt_audio_format_selector("all"),
+            Some(("bv*+ba.*".to_string(), true))
+        );
+        assert_eq!(
+            yt_audio_format_selector("*"),
+            Some(("bv*+ba.*".to_string(), true))
+        );
+        // A single language: no --audio-multistreams needed.
+        assert_eq!(
+            yt_audio_format_selector("en"),
+            Some(("bv*+ba[language^=en]".to_string(), false))
+        );
+        // Multiple languages: muxed together, needs --audio-multistreams.
+        assert_eq!(
+            yt_audio_format_selector("en, de"),
+            Some(("bv*+ba[language^=en]+ba[language^=de]".to_string(), true))
+        );
+    }
+
+    #[test]
+    fn ytdlp_video_audio_tracks_select_format() {
+        // A single language picks that track, no --audio-multistreams.
+        let mut v = video(Tool::YtDlp, "https://youtube.com/watch?v=abc");
+        v.audio_tracks = "en".into();
+        let plan = build_video_plan(&v, 1_700_000_000, "", "", "", &AuthSource::None, &[], None, &YtDlpBins::default());
+        assert!(plan.args.iter().any(|a| a == "-f"));
+        assert!(plan.args.iter().any(|a| a == "bv*+ba[language^=en]"));
+        assert!(!plan.args.iter().any(|a| a == "--audio-multistreams"));
+
+        // Multiple languages need --audio-multistreams to keep them all.
+        let mut v2 = video(Tool::YtDlp, "https://youtube.com/watch?v=abc");
+        v2.audio_tracks = "en,de".into();
+        let plan2 = build_video_plan(&v2, 1_700_000_000, "", "", "", &AuthSource::None, &[], None, &YtDlpBins::default());
+        assert!(plan2.args.iter().any(|a| a == "bv*+ba[language^=en]+ba[language^=de]"));
+        assert!(plan2.args.iter().any(|a| a == "--audio-multistreams"));
+
+        // A custom `quality` format string always wins over audio_tracks — two
+        // -f flags would just have the second one silently discard the first.
+        let mut v3 = video(Tool::YtDlp, "https://youtube.com/watch?v=abc");
+        v3.audio_tracks = "en".into();
+        v3.quality = "bestvideo[height<=720]+bestaudio".into();
+        let plan3 = build_video_plan(&v3, 1_700_000_000, "", "", "", &AuthSource::None, &[], None, &YtDlpBins::default());
+        assert!(plan3.args.iter().any(|a| a == "bestvideo[height<=720]+bestaudio"));
+        assert!(!plan3.args.iter().any(|a| a.contains("language^=")));
+
+        // Empty audio_tracks: no -f override at all (tool's own default wins).
+        let plain = video(Tool::YtDlp, "https://youtube.com/watch?v=abc");
+        let plan4 = build_video_plan(&plain, 1_700_000_000, "", "", "", &AuthSource::None, &[], None, &YtDlpBins::default());
+        assert!(!plan4.args.iter().any(|a| a == "-f"));
+    }
+
+    #[test]
+    fn subtitle_lang_from_name_extracts_code() {
+        let mkv = Path::new("C:/vids/My Video.mkv");
+        assert_eq!(
+            subtitle_lang_from_name(mkv, Path::new("C:/vids/My Video.en.vtt")),
+            Some("en".to_string())
+        );
+        assert_eq!(
+            subtitle_lang_from_name(mkv, Path::new("C:/vids/My Video.en-US.vtt")),
+            Some("en-US".to_string())
+        );
+        // No language segment present (bare `{stem}.vtt`) -> no tag.
+        assert_eq!(subtitle_lang_from_name(mkv, Path::new("C:/vids/My Video.vtt")), None);
     }
 
     #[test]
