@@ -7,23 +7,33 @@
 //! * **Direct WebSocket + user token** (Client ID + "Connect with Twitch"
 //!   OAuth): the stored user access token is used directly. No conduit or
 //!   Client Secret required. Twitch caps this at 10 `stream.online`
-//!   subscriptions — sufficient for most users.
+//!   subscriptions — sufficient for most users (each channel also gets a
+//!   `stream.offline` subscription, so the real subscription count is double
+//!   the channel count).
 //!
 //! When both are present the conduit path is preferred (higher channel cap).
 //!
 //! Flow (conduit): app token -> resolve logins to user IDs -> ensure a conduit
-//! -> open the websocket -> bind shard 0 -> subscribe `stream.online` for each
-//! channel -> reconcile current live state via Get Streams -> stream events.
+//! -> open the websocket -> bind shard 0 -> subscribe `stream.online` AND
+//! `stream.offline` for each channel -> reconcile current live state via Get
+//! Streams -> stream events.
 //!
 //! Flow (user token): resolve user IDs -> open websocket -> read welcome ->
-//! subscribe `stream.online` (websocket transport) -> reconcile -> stream events.
+//! subscribe `stream.online`/`stream.offline` (websocket transport) ->
+//! reconcile -> stream events.
 //!
-//! EventSub has no replay, so we reconcile on every (re)connect.
+//! EventSub has no replay, so we reconcile on every (re)connect: any
+//! subscribed channel not currently live clears a stale "live" state (e.g. a
+//! `stream.offline` push missed while disconnected) — this is also why
+//! `stream.offline` is subscribed at all: without it (or a scheduler poll
+//! fallback, which pure `EventSub` deliberately has none of — see
+//! `scheduler.rs`), a channel marked "live" would stay that way forever once
+//! the broadcast actually ended.
 //!
 //! NOTE: This path needs live Twitch credentials + a channel going live to
 //! verify end-to-end; use `--eventsub-test` to exercise it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -37,7 +47,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::app_core::sleep_cancellable;
-use crate::events::LiveSignal;
+use crate::events::{LiveSignal, OfflineSignal};
 use crate::models::{DetectionMethod, Platform};
 use crate::oauth;
 use crate::store::Store;
@@ -52,12 +62,13 @@ const IDLE_RETRY: Duration = Duration::from_secs(30);
 pub async fn run(
     store: Arc<Store>,
     live_tx: UnboundedSender<LiveSignal>,
+    offline_tx: UnboundedSender<OfflineSignal>,
     shutdown: Arc<AtomicBool>,
 ) {
     // Log the "have monitors but no creds" idle reason once, not every retry.
     let mut warned_no_creds = false;
     while !shutdown.load(Ordering::SeqCst) {
-        match run_session(&store, &live_tx, &shutdown, &mut warned_no_creds).await {
+        match run_session(&store, &live_tx, &offline_tx, &shutdown, &mut warned_no_creds).await {
             Ok(true) => warned_no_creds = false, // session ran; reset the one-shot warning
             Ok(false) => sleep_cancellable(IDLE_RETRY, &shutdown).await, // nothing to do
             Err(e) => {
@@ -73,6 +84,7 @@ pub async fn run(
 async fn run_session(
     store: &Arc<Store>,
     live_tx: &UnboundedSender<LiveSignal>,
+    offline_tx: &UnboundedSender<OfflineSignal>,
     shutdown: &Arc<AtomicBool>,
     warned_no_creds: &mut bool,
 ) -> Result<bool> {
@@ -141,22 +153,30 @@ async fn run_session(
         Transport::Conduit { token } => {
             let conduit_id = ensure_conduit(&http, &client_id, token).await?;
             bind_shard(&http, &client_id, token, &conduit_id, &session_id).await?;
-            let n = subscribe_online(&http, &client_id, token, &conduit_id, &uid_to_monitors).await;
+            let sub_transport = json!({ "method": "conduit", "conduit_id": conduit_id });
+            let n_on = subscribe_type(&http, &client_id, token, "stream.online", &sub_transport, &uid_to_monitors).await;
+            let n_off = subscribe_type(&http, &client_id, token, "stream.offline", &sub_transport, &uid_to_monitors).await;
             info!(
-                "eventsub: connected (conduit {conduit_id}); {n}/{} channel(s) subscribed",
+                "eventsub: connected (conduit {conduit_id}); {n_on}/{} channel(s) subscribed \
+                 ({n_off} offline)",
                 uid_to_monitors.len()
             );
         }
         Transport::UserToken { token } => {
-            let n = subscribe_online_ws(&http, &client_id, token, &session_id, &uid_to_monitors).await;
+            let sub_transport = json!({ "method": "websocket", "session_id": session_id });
+            let n_on = subscribe_type(&http, &client_id, token, "stream.online", &sub_transport, &uid_to_monitors).await;
+            let n_off = subscribe_type(&http, &client_id, token, "stream.offline", &sub_transport, &uid_to_monitors).await;
             info!(
-                "eventsub: connected (user-token); {n}/{} channel(s) subscribed",
+                "eventsub: connected (user-token); {n_on}/{} channel(s) subscribed \
+                 ({n_off} offline)",
                 uid_to_monitors.len()
             );
         }
     }
-    // Reconcile: anything already live should start recording now.
-    reconcile(&http, &client_id, token, &login_to_monitors, live_tx).await;
+    // Reconcile: anything already live should start recording now; anything
+    // subscribed but not actually live clears a stale "live" state left over
+    // from before this (re)connect.
+    reconcile(&http, &client_id, token, &login_to_monitors, live_tx, offline_tx).await;
 
     // Event loop. Twitch sends `session_keepalive` every `keepalive` seconds; if
     // none (plus slack) arrives, treat the connection as dead.
@@ -175,7 +195,7 @@ async fn run_session(
         use tokio_tungstenite::tungstenite::Message;
         match msg {
             Message::Text(text) => {
-                if handle_message(&text, &uid_to_monitors, live_tx) {
+                if handle_message(&text, &uid_to_monitors, live_tx, offline_tx) {
                     // session_reconnect — drop out and reconnect fresh.
                     return Ok(true);
                 }
@@ -194,6 +214,7 @@ fn handle_message(
     text: &str,
     uid_to_monitors: &HashMap<String, Vec<i64>>,
     live_tx: &UnboundedSender<LiveSignal>,
+    offline_tx: &UnboundedSender<OfflineSignal>,
 ) -> bool {
     let Ok(v) = serde_json::from_str::<Value>(text) else {
         return false;
@@ -202,21 +223,34 @@ fn handle_message(
         "session_keepalive" => {}
         "session_reconnect" => return true,
         "notification" => {
-            if v["payload"]["subscription"]["type"].as_str() == Some("stream.online") {
-                let event = &v["payload"]["event"];
-                let went_live = event["started_at"].as_str().and_then(parse_ts);
-                let stream_id = event["id"].as_str().map(str::to_string);
-                if let Some(uid) = event["broadcaster_user_id"].as_str() {
-                    if let Some(mons) = uid_to_monitors.get(uid) {
-                        for &mid in mons {
-                            info!("eventsub: stream.online -> monitor {mid}");
-                            let _ = live_tx.send(
-                                LiveSignal::new(mid, went_live, false)
-                                    .with_stream_id(stream_id.clone()),
-                            );
+            let event = &v["payload"]["event"];
+            match v["payload"]["subscription"]["type"].as_str() {
+                Some("stream.online") => {
+                    let went_live = event["started_at"].as_str().and_then(parse_ts);
+                    let stream_id = event["id"].as_str().map(str::to_string);
+                    if let Some(uid) = event["broadcaster_user_id"].as_str() {
+                        if let Some(mons) = uid_to_monitors.get(uid) {
+                            for &mid in mons {
+                                info!("eventsub: stream.online -> monitor {mid}");
+                                let _ = live_tx.send(
+                                    LiveSignal::new(mid, went_live, false)
+                                        .with_stream_id(stream_id.clone()),
+                                );
+                            }
                         }
                     }
                 }
+                Some("stream.offline") => {
+                    if let Some(uid) = event["broadcaster_user_id"].as_str() {
+                        if let Some(mons) = uid_to_monitors.get(uid) {
+                            for &mid in mons {
+                                info!("eventsub: stream.offline -> monitor {mid}");
+                                let _ = offline_tx.send(mid);
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         "revocation" => warn!("eventsub: a subscription was revoked"),
@@ -407,16 +441,19 @@ async fn bind_shard(
     Ok(())
 }
 
-/// Subscribe stream.online for each user id (skipping ones already enabled).
-/// Returns the count of channels covered.
-async fn subscribe_online(
+/// Subscribe `event_type` (`"stream.online"` or `"stream.offline"`) for each
+/// user id (skipping ones already enabled), over the given transport JSON
+/// (`{"method":"conduit","conduit_id":..}` or `{"method":"websocket",
+/// "session_id":..}`). Returns the count of channels covered.
+async fn subscribe_type(
     http: &Client,
     client_id: &str,
     token: &str,
-    conduit_id: &str,
+    event_type: &str,
+    transport: &Value,
     uid_to_monitors: &HashMap<String, Vec<i64>>,
 ) -> usize {
-    let existing = existing_online_subs(http, client_id, token).await;
+    let existing = existing_subs(http, client_id, token, event_type).await;
     let mut covered = 0;
     for uid in uid_to_monitors.keys() {
         if existing.contains(uid) {
@@ -428,66 +465,29 @@ async fn subscribe_online(
             .header("Client-Id", client_id)
             .bearer_auth(token)
             .json(&json!({
-                "type": "stream.online",
+                "type": event_type,
                 "version": "1",
                 "condition": { "broadcaster_user_id": uid },
-                "transport": { "method": "conduit", "conduit_id": conduit_id }
+                "transport": transport
             }))
             .send()
             .await;
         match resp {
             Ok(r) if r.status().is_success() => covered += 1,
-            Ok(r) => warn!("eventsub: subscribe {uid} failed: {}", r.status()),
-            Err(e) => warn!("eventsub: subscribe {uid} error: {e}"),
+            Ok(r) => warn!("eventsub: subscribe {event_type} {uid} failed: {}", r.status()),
+            Err(e) => warn!("eventsub: subscribe {event_type} {uid} error: {e}"),
         }
     }
     covered
 }
 
-/// Like `subscribe_online` but uses the direct WebSocket transport (user-token
-/// mode). The `session_id` from the welcome frame is embedded in each
-/// subscription instead of a conduit id.
-async fn subscribe_online_ws(
+async fn existing_subs(
     http: &Client,
     client_id: &str,
     token: &str,
-    session_id: &str,
-    uid_to_monitors: &HashMap<String, Vec<i64>>,
-) -> usize {
-    let existing = existing_online_subs(http, client_id, token).await;
-    let mut covered = 0;
-    for uid in uid_to_monitors.keys() {
-        if existing.contains(uid) {
-            covered += 1;
-            continue;
-        }
-        let resp = http
-            .post(format!("{HELIX}/eventsub/subscriptions"))
-            .header("Client-Id", client_id)
-            .bearer_auth(token)
-            .json(&json!({
-                "type": "stream.online",
-                "version": "1",
-                "condition": { "broadcaster_user_id": uid },
-                "transport": { "method": "websocket", "session_id": session_id }
-            }))
-            .send()
-            .await;
-        match resp {
-            Ok(r) if r.status().is_success() => covered += 1,
-            Ok(r) => warn!("eventsub: subscribe {uid} failed: {}", r.status()),
-            Err(e) => warn!("eventsub: subscribe {uid} error: {e}"),
-        }
-    }
-    covered
-}
-
-async fn existing_online_subs(
-    http: &Client,
-    client_id: &str,
-    token: &str,
-) -> std::collections::HashSet<String> {
-    let mut set = std::collections::HashSet::new();
+    event_type: &str,
+) -> HashSet<String> {
+    let mut set = HashSet::new();
     let resp = http
         .get(format!("{HELIX}/eventsub/subscriptions"))
         .header("Client-Id", client_id)
@@ -499,7 +499,7 @@ async fn existing_online_subs(
         if let Ok(v) = r.json::<Value>().await {
             if let Some(arr) = v["data"].as_array() {
                 for s in arr {
-                    if s["type"].as_str() == Some("stream.online") {
+                    if s["type"].as_str() == Some(event_type) {
                         if let Some(uid) = s["condition"]["broadcaster_user_id"].as_str() {
                             set.insert(uid.to_string());
                         }
@@ -512,13 +512,19 @@ async fn existing_online_subs(
 }
 
 /// Send a live signal for any subscribed channel that is currently live (covers
-/// the gap since EventSub has no event replay).
+/// the gap since EventSub has no event replay), and an offline signal for any
+/// subscribed channel that isn't — clearing a "live" state left stale from
+/// before this (re)connect (e.g. a `stream.offline` push missed while
+/// disconnected). Only clears within a chunk that actually got a successful
+/// response, so a failed/partial Get Streams call never falsely marks
+/// channels offline.
 async fn reconcile(
     http: &Client,
     client_id: &str,
     token: &str,
     login_to_monitors: &HashMap<String, Vec<i64>>,
     live_tx: &UnboundedSender<LiveSignal>,
+    offline_tx: &UnboundedSender<OfflineSignal>,
 ) {
     let logins: Vec<String> = login_to_monitors.keys().cloned().collect();
     for chunk in logins.chunks(100) {
@@ -530,25 +536,35 @@ async fn reconcile(
             .query(&query)
             .send()
             .await;
-        if let Ok(r) = resp {
-            if let Ok(v) = r.json::<Value>().await {
-                if let Some(arr) = v["data"].as_array() {
-                    for s in arr {
-                        if s["type"].as_str() == Some("live") {
-                            let went_live = s["started_at"].as_str().and_then(parse_ts);
-                            let stream_id = s["id"].as_str().map(str::to_string);
-                            if let Some(login) = s["user_login"].as_str() {
-                                if let Some(mons) = login_to_monitors.get(&login.to_lowercase()) {
-                                    for &mid in mons {
-                                        let _ = live_tx.send(
-                                            LiveSignal::new(mid, went_live, false)
-                                                .with_stream_id(stream_id.clone()),
-                                        );
-                                    }
-                                }
-                            }
+        let Ok(r) = resp else { continue };
+        let Ok(v) = r.json::<Value>().await else { continue };
+        let Some(arr) = v["data"].as_array() else { continue };
+        let mut live_logins: HashSet<String> = HashSet::new();
+        for s in arr {
+            if s["type"].as_str() == Some("live") {
+                let went_live = s["started_at"].as_str().and_then(parse_ts);
+                let stream_id = s["id"].as_str().map(str::to_string);
+                if let Some(login) = s["user_login"].as_str() {
+                    let login = login.to_lowercase();
+                    live_logins.insert(login.clone());
+                    if let Some(mons) = login_to_monitors.get(&login) {
+                        for &mid in mons {
+                            let _ = live_tx.send(
+                                LiveSignal::new(mid, went_live, false)
+                                    .with_stream_id(stream_id.clone()),
+                            );
                         }
                     }
+                }
+            }
+        }
+        for login in chunk {
+            if live_logins.contains(login) {
+                continue;
+            }
+            if let Some(mons) = login_to_monitors.get(login) {
+                for &mid in mons {
+                    let _ = offline_tx.send(mid);
                 }
             }
         }

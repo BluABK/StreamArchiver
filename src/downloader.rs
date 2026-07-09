@@ -1304,10 +1304,12 @@ impl Supervisor {
         }
     }
 
-    /// Consume live signals (from detectors) and manual Start/Stop commands.
+    /// Consume live signals (from detectors), offline pushes (EventSub
+    /// `stream.offline`), and manual Start/Stop commands.
     pub async fn run(
         self,
         mut live_rx: mpsc::UnboundedReceiver<LiveSignal>,
+        mut offline_rx: mpsc::UnboundedReceiver<crate::events::OfflineSignal>,
         mut manual_rx: mpsc::UnboundedReceiver<ManualCommand>,
     ) {
         loop {
@@ -1317,6 +1319,9 @@ impl Supervisor {
                         continue; // draining: don't start new recordings
                     }
                     self.try_begin(signal.monitor_id, signal.went_live_at, signal.approximate, signal.stream_id, signal.thumbnail_url, signal.broadcaster_id, signal.stream_title, signal.stream_game, false, false);
+                }
+                Some(monitor_id) = offline_rx.recv() => {
+                    self.handle_offline_signal(monitor_id);
                 }
                 Some(cmd) = manual_rx.recv() => match cmd {
                     ManualCommand::Start { id, user_initiated } => {
@@ -2439,6 +2444,25 @@ impl Supervisor {
             this.record(row, went_live_at, approximate, stream_id, thumbnail_url, broadcaster_id, stream_title, trigger_info).await;
         });
         true
+    }
+
+    /// EventSub `stream.offline` push: the counterpart to a `LiveSignal` that
+    /// clears rather than starts. A monitor currently owned by an active
+    /// recording keeps its "recording" state — the tool's own exit path sets
+    /// the final status, and a push racing that would otherwise regress the UI
+    /// from "recording" back to "offline" while the file is still being
+    /// finalized. Otherwise (Auto off and/or nothing recording, e.g. Milk's
+    /// case: EventSub only ever stamped "live" and had no way back) mark the
+    /// monitor offline so a stale "live" state doesn't linger forever, since
+    /// pure `DetectionMethod::EventSub` is deliberately excluded from the
+    /// scheduler's poll fallback (`scheduler.rs`'s `handled` set).
+    fn handle_offline_signal(&self, monitor_id: i64) {
+        if self.active.lock().unwrap().contains_key(&monitor_id) {
+            return;
+        }
+        let _ = self
+            .store
+            .set_monitor_check_result(monitor_id, "offline", now_unix());
     }
 
     /// "Start" command: check the channel now and record if live. A

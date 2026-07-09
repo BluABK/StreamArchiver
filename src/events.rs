@@ -290,6 +290,13 @@ impl LiveSignal {
     }
 }
 
+/// A "monitor went offline" push (currently: EventSub `stream.offline`). Payload
+/// is just the monitor id — the consumer re-derives everything else from the
+/// store, and re-checks whether a recording currently owns the monitor before
+/// writing anything (a push racing an in-progress capture must never clobber
+/// "recording").
+pub type OfflineSignal = i64;
+
 /// Commands delivered from the tray thread to the UI/app.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UiCommand {
