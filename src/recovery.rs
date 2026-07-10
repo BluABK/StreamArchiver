@@ -684,6 +684,12 @@ pub async fn mux_playlist_to_mkv(
         None
     };
 
+    // At most 2 CDN-fed muxes write to the recordings drive at once — several
+    // recoveries/head backfills triggering together (e.g. DMCA mutes landing
+    // minutes after a shared stream end) must not stack on top of the live
+    // captures and finalize passes already hitting the same disk (see io_gate).
+    let _gate = crate::io_gate::cdn_mux("cdn-mux").await;
+
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-y")
         .arg("-protocol_whitelist")

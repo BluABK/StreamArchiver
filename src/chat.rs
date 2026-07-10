@@ -37,6 +37,69 @@ async fn wait_stopped(done: &AtomicBool, shutdown: &AtomicBool) {
     }
 }
 
+/// Flush the sidecar buffer at least this often while messages are pending.
+/// Keeps the on-disk file near-live for the chat replay popup's 3s tail poll
+/// while turning per-message write syscalls into a couple of appends per
+/// second — the sidecar lives next to the capture on the recordings drive,
+/// where per-message writes from several busy chats are pure seek churn.
+const FLUSH_EVERY: Duration = Duration::from_secs(2);
+
+/// Flush early once this much is buffered (GDQ-scale chat bursts).
+const FLUSH_BYTES: usize = 32 * 1024;
+
+/// Buffered appender for the `.chat.jsonl` sidecar. The file is opened lazily
+/// on the first flush so a stream with no chat (or a recording that fails
+/// immediately) doesn't leave an empty sidecar; append mode means reconnects
+/// continue the same file rather than truncating it. Worst case on a hard
+/// kill, [`FLUSH_EVERY`] worth of chat is lost — the graceful paths all flush.
+struct ChatSink {
+    path: PathBuf,
+    file: Option<tokio::fs::File>,
+    buf: String,
+    first_buffered: Option<tokio::time::Instant>,
+}
+
+impl ChatSink {
+    fn new(path: PathBuf) -> ChatSink {
+        ChatSink { path, file: None, buf: String::new(), first_buffered: None }
+    }
+
+    fn push(&mut self, json_line: &str) {
+        if self.buf.is_empty() {
+            self.first_buffered = Some(tokio::time::Instant::now());
+        }
+        self.buf.push_str(json_line);
+        self.buf.push('\n');
+    }
+
+    fn should_flush(&self) -> bool {
+        self.buf.len() >= FLUSH_BYTES
+            || self
+                .first_buffered
+                .is_some_and(|t| t.elapsed() >= FLUSH_EVERY)
+    }
+
+    async fn flush(&mut self) -> anyhow::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        if self.file.is_none() {
+            self.file = Some(
+                tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)
+                    .await?,
+            );
+        }
+        let f = self.file.as_mut().unwrap();
+        f.write_all(self.buf.as_bytes()).await?;
+        self.buf.clear();
+        self.first_buffered = None;
+        Ok(())
+    }
+}
+
 /// One logged chat message (serialized as a JSON line in the sidecar).
 #[derive(Serialize)]
 struct ChatLine<'a> {
@@ -128,58 +191,63 @@ async fn session(
         },
     };
 
-    // Opened lazily on the first message so a stream with no chat (or a recording
-    // that fails immediately) doesn't leave an empty sidecar. Append mode means
-    // reconnects continue the same file rather than truncating it.
-    let mut file: Option<tokio::fs::File> = None;
+    // Messages accumulate in the sink and hit disk a couple of times per
+    // second at most (see ChatSink); flushed on every exit path below.
+    let mut sink = ChatSink::new(path.to_path_buf());
 
-    loop {
-        if done.load(Ordering::SeqCst) || shutdown.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-        // 1s read timeout so the stop flags are re-checked even on a quiet chat.
-        let msg = match timeout(Duration::from_secs(1), ws.next()).await {
-            Ok(Some(Ok(m))) => m,
-            Ok(Some(Err(e))) => return Err(e.into()),
-            Ok(None) => return Err(anyhow::anyhow!("chat websocket closed")),
-            Err(_) => continue, // read timeout -> re-check flags
-        };
-        match msg {
-            Message::Text(text) => {
-                // A frame can carry several CRLF-separated IRC lines.
-                for line in text.lines() {
-                    let line = line.trim_end_matches('\r');
-                    if line.is_empty() {
-                        continue;
+    let result: anyhow::Result<()> = async {
+        loop {
+            if done.load(Ordering::SeqCst) || shutdown.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            // 1s read timeout so the stop flags are re-checked even on a quiet
+            // chat — and the flush timer fires even when no message arrives.
+            let msg = match timeout(Duration::from_secs(1), ws.next()).await {
+                Ok(Some(Ok(m))) => m,
+                Ok(Some(Err(e))) => return Err(e.into()),
+                Ok(None) => return Err(anyhow::anyhow!("chat websocket closed")),
+                Err(_) => {
+                    if sink.should_flush() {
+                        sink.flush().await?;
                     }
-                    // Twitch IRC keepalive: reply so the server doesn't drop us.
-                    if let Some(token) = line.strip_prefix("PING ") {
-                        ws.send(Message::Text(format!("PONG {token}").into())).await?;
-                        continue;
-                    }
-                    if let Some(json) = parse_privmsg(line) {
-                        if file.is_none() {
-                            file = Some(
-                                tokio::fs::OpenOptions::new()
-                                    .create(true)
-                                    .append(true)
-                                    .open(path)
-                                    .await?,
-                            );
+                    continue; // read timeout -> re-check flags
+                }
+            };
+            match msg {
+                Message::Text(text) => {
+                    // A frame can carry several CRLF-separated IRC lines.
+                    for line in text.lines() {
+                        let line = line.trim_end_matches('\r');
+                        if line.is_empty() {
+                            continue;
                         }
-                        let f = file.as_mut().unwrap();
-                        f.write_all(json.as_bytes()).await?;
-                        f.write_all(b"\n").await?;
+                        // Twitch IRC keepalive: reply so the server doesn't drop us.
+                        if let Some(token) = line.strip_prefix("PING ") {
+                            ws.send(Message::Text(format!("PONG {token}").into())).await?;
+                            continue;
+                        }
+                        if let Some(json) = parse_privmsg(line) {
+                            sink.push(&json);
+                        }
+                    }
+                    if sink.should_flush() {
+                        sink.flush().await?;
                     }
                 }
+                Message::Ping(payload) => {
+                    let _ = ws.send(Message::Pong(payload)).await;
+                }
+                Message::Close(_) => return Err(anyhow::anyhow!("chat websocket close frame")),
+                _ => {}
             }
-            Message::Ping(payload) => {
-                let _ = ws.send(Message::Pong(payload)).await;
-            }
-            Message::Close(_) => return Err(anyhow::anyhow!("chat websocket close frame")),
-            _ => {}
         }
     }
+    .await;
+
+    // Whatever ended the session (stop flag, socket error, close frame), the
+    // buffered tail must land on disk before the reconnect/finalize.
+    let flushed = sink.flush().await;
+    result.and(flushed)
 }
 
 /// Parse a (possibly tag-prefixed) IRC line into a JSON log line, or `None` if it

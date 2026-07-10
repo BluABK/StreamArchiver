@@ -635,6 +635,9 @@ struct SettingsForm {
     remux_title_template: String,
     /// Embed subtitle sidecar files as MKV subtitle streams on remux.
     remux_embed_subs: bool,
+    /// Post-processing disk throttle: ffmpeg `-readrate` multiplier for
+    /// finalize remuxes/concats/embeds (0 = unthrottled).
+    postproc_readrate: f64,
     // --- File management ---
     /// Split output files into per-type subdirectories.
     file_split_enabled: bool,
@@ -798,9 +801,19 @@ pub struct StreamArchiverApp {
     /// Recordings whose published VOD came back DMCA-muted (post-stream archive) —
     /// un-muted via recovery, awaiting acknowledgement.
     issues_muted_vod: Vec<crate::models::MutedVodIssue>,
-    /// In-flight background load of missing-output-file recordings (spawned off
-    /// the UI thread because `path.exists()` can block on network/slow drives).
-    issues_missing_load: Option<std::sync::mpsc::Receiver<Vec<crate::models::Recording>>>,
+    /// In-flight background Issues scan: (missing-output-file recordings,
+    /// error recordings whose file still exists, error recordings whose file is
+    /// gone). Every `path.exists()` the Issues panel needs runs on this thread —
+    /// against the recordings drive a single stat can block for seconds, so the
+    /// UI thread must never do one (see `FsProbes`).
+    #[allow(clippy::type_complexity)]
+    issues_missing_load: Option<
+        std::sync::mpsc::Receiver<(
+            Vec<crate::models::Recording>,
+            Vec<crate::models::Recording>,
+            Vec<crate::models::Recording>,
+        )>,
+    >,
     issues_refreshed: Option<std::time::Instant>,
     issues_confirm_clear: bool,
     /// The notifications feed window: whether it's open, its last-loaded rows,
@@ -1333,6 +1346,9 @@ impl StreamArchiverApp {
                 if v.is_empty() { "{title}".into() } else { v }
             },
             remux_embed_subs: setting_or_empty(&core, K_REMUX_EMBED_SUBS) == "1",
+            postproc_readrate: setting_or_empty(&core, crate::io_gate::K_POSTPROC_READRATE)
+                .parse::<f64>()
+                .unwrap_or(crate::io_gate::DEFAULT_READRATE),
             file_split_enabled: setting_or_empty(&core, K_FILE_SPLIT_ENABLED) == "1",
             file_split_videos: { let v = setting_or_empty(&core, K_FILE_SPLIT_VIDEOS); if v.is_empty() { "videos".into() } else { v } },
             file_split_subs:   { let v = setting_or_empty(&core, K_FILE_SPLIT_SUBS);   if v.is_empty() { "subs".into()   } else { v } },
@@ -2317,7 +2333,9 @@ impl StreamArchiverApp {
         }
         let store = self.core.store.clone();
         let (tx, rx) = std::sync::mpsc::channel();
-        debug!("spawning reload-rows thread");
+        // trace!, not debug!: this fires every ~30s for the app's whole uptime
+        // (~12k lines/day dominating the daily log file at the debug default).
+        tracing::trace!("spawning reload-rows thread");
         std::thread::Builder::new()
             .name("reload-rows".into())
             .spawn(move || {
@@ -2342,7 +2360,7 @@ impl StreamArchiverApp {
                         .unwrap_or(90);
                     Some(SaveRows { rows, channels, next_streams, yt_quota_today, yt_quota_cutoff, yt_search_today, yt_search_cutoff, new_monitor_id: None })
                 })();
-                debug!(
+                tracing::trace!(
                     elapsed_ms = t.elapsed().as_millis(),
                     ok = result.is_some(),
                     "reload-rows done"
@@ -2360,7 +2378,7 @@ impl StreamArchiverApp {
         };
         match recv {
             Ok(Some(save)) => {
-                debug!(rows = save.rows.len(), "reload-rows result installed");
+                tracing::trace!(rows = save.rows.len(), "reload-rows result installed");
                 self.install_save_rows(save);
                 // Only announce explicit refreshes (F5 sets "Refreshing…") —
                 // background event/timer reloads shouldn't stomp the status line.
@@ -2460,6 +2478,7 @@ impl StreamArchiverApp {
         // Settings (e.g. the date format) feed the cached Streams-view model.
         self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
         let s = &self.settings;
+        let postproc_readrate = format!("{}", s.postproc_readrate.clamp(0.0, 1000.0));
         // Discord import counts as on only when a token backs the toggle.
         let discord_on = s.discord_schedule && !s.discord_token.trim().is_empty();
         // Persist the browser + optional profile as one `browser:profile` value.
@@ -2526,6 +2545,7 @@ impl StreamArchiverApp {
             (K_REMUX_EMBED_TITLE,     if s.remux_embed_title     { "1" } else { "0" }),
             (K_REMUX_TITLE_TEMPLATE, s.remux_title_template.trim()),
             (K_REMUX_EMBED_SUBS,      if s.remux_embed_subs      { "1" } else { "0" }),
+            (crate::io_gate::K_POSTPROC_READRATE, postproc_readrate.as_str()),
             (K_FILE_SPLIT_ENABLED,  if s.file_split_enabled { "1" } else { "0" }),
             (K_FILE_SPLIT_VIDEOS, s.file_split_videos.trim()),
             (K_FILE_SPLIT_SUBS,   s.file_split_subs.trim()),
@@ -2572,6 +2592,8 @@ impl StreamArchiverApp {
         // Apply the (possibly changed) date format + short-timestamp pattern to the live UI.
         set_active_date_fmt(self.settings.date_fmt);
         set_short_ts_pattern(&self.settings.short_ts_fmt);
+        // Apply the post-processing disk throttle to in-flight and future passes.
+        crate::io_gate::set_readrate(self.settings.postproc_readrate);
         self.persist_monitor_defaults();
         self.status = "Settings saved.".into();
     }
@@ -4739,6 +4761,12 @@ struct ChatPopup {
     /// True while a background emoji-download pass is running, so the 3s tail-reload
     /// doesn't pile up overlapping download passes for the same chat.
     loading: Arc<AtomicBool>,
+    /// Consecutive tail-reloads spent in `ChatLoadState::Error`. An errored
+    /// reload retries with a FULL re-read of the sidecar (potentially hundreds
+    /// of MB on the recordings drive), so the retry interval backs off
+    /// exponentially instead of re-reading every 3 seconds forever. Reset on a
+    /// successful load.
+    error_retries: u32,
     /// Cached search-filter result: (lowercased query, message count when
     /// computed, matching message indices). Recomputed only when the query or
     /// the message count changes — the filter used to lowercase every message
@@ -7039,6 +7067,14 @@ fn spawn_browse_file(
 }
 
 impl eframe::App for StreamArchiverApp {
+    /// eframe's default is 30s, and egui state (scroll positions, window
+    /// geometry) changes almost every interaction — so the default rewrites
+    /// the whole ~260 KB `egui_state.ron` twice a minute for the app's entire
+    /// uptime. State is also saved on exit, so a long interval loses nothing.
+    fn auto_save_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(300)
+    }
+
     /// Non-drawing logic. eframe also calls this while the window is hidden when
     /// `request_repaint` was called — which is how the tray's "Open" wakes us.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -14418,12 +14454,14 @@ impl StreamArchiverApp {
                                         }
                                         {
                                             // Latest take with a chat sidecar drives the
-                                            // stream's chat view.
+                                            // stream's chat view. Probe-cache lookups: an
+                                            // open context menu re-runs this every frame.
+                                            let fs = &mut self.fs_probes;
                                             let chat_rec = g
                                                 .takes
                                                 .iter()
                                                 .rev()
-                                                .find(|t| chat_file_for_recording(t).is_some())
+                                                .find(|t| chat_file_for_recording_cached(fs, t).is_some())
                                                 .map(|t| t.id);
                                             if ui
                                                 .add_enabled(
@@ -14836,7 +14874,9 @@ impl StreamArchiverApp {
                                         }
                                         if ui
                                             .add_enabled(
-                                                chat_file_for_recording(t).is_some(),
+                                                // Probe cache: menu closures re-run per frame.
+                                                chat_file_for_recording_cached(&mut self.fs_probes, t)
+                                                    .is_some(),
                                                 egui::Button::new("💬  View chat"),
                                             )
                                             .on_disabled_hover_text(
@@ -17479,7 +17519,7 @@ impl StreamArchiverApp {
             // ── Remux ──────────────────────────────────────────────────────────
             }
 
-            if self.section_shown(SettingsTab::Recording, "Remux", &["remux", "mkv", "thumbnail", "title", "subtitles", "embed", "cover"]) {
+            if self.section_shown(SettingsTab::Recording, "Remux", &["remux", "mkv", "thumbnail", "title", "subtitles", "embed", "cover", "throttle", "readrate", "disk", "speed"]) {
             ui.add_space(12.0);
             ui.heading("Remux");
             ui.label("Controls what gets embedded into MKV files when a recording is finalized (TS→MKV remux).");
@@ -17503,6 +17543,22 @@ impl StreamArchiverApp {
                     ui.end_row();
                     ui.checkbox(&mut self.settings.remux_embed_subs, "Embed subtitle sidecars");
                     ui.label("Copy .srt/.ass/.vtt sidecar files as subtitle streams in the MKV.");
+                    ui.end_row();
+                    ui.horizontal(|ui| {
+                        ui.label("Disk throttle:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings.postproc_readrate)
+                                .range(0.0..=1000.0)
+                                .speed(1.0)
+                                .suffix("× realtime"),
+                        );
+                    });
+                    ui.label(
+                        "Caps how fast finalize remuxes/joins/embeds read + write, so they \
+                         can't starve live recordings on the same drive. 0 = unthrottled. \
+                         30× ≈ a 5h stream finalizing in ~10 min. Needs ffmpeg 5.0+ \
+                         (silently unthrottled on older builds).",
+                    );
                     ui.end_row();
                 });
 
@@ -19151,8 +19207,10 @@ impl StreamArchiverApp {
         // count stays current even when the panel is hidden.
         if let Some(rx) = &self.issues_missing_load {
             match rx.try_recv() {
-                Ok(missing) => {
+                Ok((missing, errors_with_file, errors_no_file)) => {
                     self.issues_missing = missing;
+                    self.issues_errors = errors_with_file;
+                    self.issues_errors_no_file = errors_no_file;
                     self.issues_missing_load = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -19166,31 +19224,26 @@ impl StreamArchiverApp {
         }
 
         // Always refresh so the toolbar button count stays current even when the
-        // panel is closed. Use a slower interval when hidden.
+        // panel is closed — but much less often then: the badge going stale for
+        // a few minutes is fine, and each sweep stats every recording on the
+        // recordings drive (real head seeks while captures are writing).
         let interval = if self.show_issues {
             Duration::from_secs(5)
         } else {
-            Duration::from_secs(60)
+            Duration::from_secs(300)
         };
         let stale = self
             .issues_refreshed
             .map(|t| t.elapsed() >= interval)
             .unwrap_or(true);
         if stale && self.issues_missing_load.is_none() {
-            // Both queries are small and fast — run them synchronously.
+            // DB-only queries (fast, system drive) stay synchronous.
             self.issues_recs = self.core.store.recordings_needing_remux().unwrap_or_default();
             self.issues_stuck = self.core.store.recordings_stuck_in_cache().unwrap_or_default();
             self.issues_muted_vod = self.core.store.recordings_muted_vod_unresolved().unwrap_or_default();
-            // Partition errors: those whose output file is gone from disk go to
-            // issues_errors_no_file (treated as missing), the rest stay in issues_errors.
-            let all_errors = self.core.store.recordings_with_errors().unwrap_or_default();
-            let (with_file, no_file): (Vec<_>, Vec<_>) = all_errors.into_iter().partition(|r| {
-                r.output_path.is_empty() || std::path::Path::new(&r.output_path).exists()
-            });
-            self.issues_errors = with_file;
-            self.issues_errors_no_file = no_file;
-            // The missing-file check calls path.exists() up to 500 times, which
-            // can block for seconds on network drives. Spawn it off the UI thread.
+            // Everything that stats the recordings drive — the up-to-500-path
+            // missing-file sweep AND the error partition — runs off-thread
+            // (one exists() there can block the frame for seconds under load).
             let core = self.core.clone();
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::Builder::new()
@@ -19201,7 +19254,14 @@ impl StreamArchiverApp {
                         .into_iter()
                         .filter(|r| !std::path::Path::new(&r.output_path).exists())
                         .collect();
-                    let _ = tx.send(missing);
+                    // Partition errors: file gone → treated as missing.
+                    let all_errors = core.store.recordings_with_errors().unwrap_or_default();
+                    let (with_file, no_file): (Vec<_>, Vec<_>) =
+                        all_errors.into_iter().partition(|r| {
+                            r.output_path.is_empty()
+                                || std::path::Path::new(&r.output_path).exists()
+                        });
+                    let _ = tx.send((missing, with_file, no_file));
                 })
                 .ok();
             self.issues_missing_load = Some(rx);
@@ -20581,6 +20641,7 @@ impl StreamArchiverApp {
             emote_map,
             twitch_emote_dir,
             loading,
+            error_retries: 0,
             filter_cache: None,
         };
         // One chat window per monitor: re-targeting an already-open window
@@ -20625,6 +20686,20 @@ impl StreamArchiverApp {
 
         // Whether the selected recording is still in progress (chat file is growing).
         let rec_active = popup.recording.as_ref().map_or(false, |r| r.ended_at.is_none());
+        // An errored load retries with a FULL sidecar re-read — back that off
+        // exponentially (3s → 6 → … → capped ~3min) instead of hammering the
+        // recordings drive every tick. Loaded resets the ladder; NoFile stays
+        // on the fast tick (retrying a missing file is one cheap stat, and the
+        // sidecar usually appears seconds into a recording).
+        let errored = matches!(&*popup.load_state.lock().unwrap(), ChatLoadState::Error(_));
+        if !errored && matches!(&*popup.load_state.lock().unwrap(), ChatLoadState::Loaded(_)) {
+            popup.error_retries = 0;
+        }
+        let reload_after = if errored {
+            std::time::Duration::from_secs((CHAT_RELOAD_SECS << popup.error_retries.min(6)).min(180))
+        } else {
+            std::time::Duration::from_secs(CHAT_RELOAD_SECS)
+        };
         // Collect everything needed for a tail-reload before the `show` closure
         // borrows `popup` so we can act on it cleanly afterwards.
         type ReloadInfo = (
@@ -20636,12 +20711,13 @@ impl StreamArchiverApp {
             Arc<AtomicBool>,
         );
         let reload_info: Option<ReloadInfo> =
-            if rec_active
-                && popup.last_reload.elapsed()
-                    >= std::time::Duration::from_secs(CHAT_RELOAD_SECS)
-            {
+            if rec_active && popup.last_reload.elapsed() >= reload_after {
+                // Sidecar located via the probe cache: this runs on the UI
+                // thread every 3s per live popup, and a direct stat against
+                // the recordings drive can block the frame for seconds.
+                let fs = &mut self.fs_probes;
                 popup.recording.as_ref().and_then(|r| {
-                    chat_file_for_recording(r).map(|path| {
+                    chat_file_for_recording_cached(fs, r).map(|path| {
                         (
                             path,
                             r.went_live_at.unwrap_or(r.started_at),
@@ -20678,10 +20754,15 @@ impl StreamArchiverApp {
                     // ── Toolbar ──────────────────────────────────────────────
                     ui.horizontal(|ui| {
                         // Recording picker: only if >1 recording has a chat file.
+                        // Probe-cache lookups: this filter re-runs EVERY FRAME
+                        // over the monitor's whole take history (4 candidate
+                        // paths each) — direct stats here were measured in the
+                        // thousands per second against the recordings drive.
+                        let fs = &mut self.fs_probes;
                         let recs_with_chat: Vec<_> = popup
                             .all_recordings
                             .iter()
-                            .filter(|r| chat_file_for_recording(r).is_some())
+                            .filter(|r| chat_file_for_recording_cached(fs, r).is_some())
                             .collect();
                         if recs_with_chat.len() > 1 {
                             let cur_label = popup
@@ -20914,6 +20995,10 @@ impl StreamArchiverApp {
         // the whole file is never re-read.
         if let Some((path, start_ts, state, emap, tdir, loading)) = reload_info {
             self.chat_popups[idx].last_reload = std::time::Instant::now();
+            if errored {
+                self.chat_popups[idx].error_retries =
+                    self.chat_popups[idx].error_retries.saturating_add(1);
+            }
             self.core.rt.spawn(tail_chat(
                 state,
                 loading,
@@ -22650,7 +22735,8 @@ impl StreamArchiverApp {
                 // Properties window (floats above the central panel)
                 if let Some(ep) = &current_properties {
                     let url = emote_cdn_url(provider, &ep.id, &ep.ext);
-                    let size_bytes = std::fs::metadata(&ep.path).map(|m| m.len()).unwrap_or(0);
+                    // Probe cache: this runs every frame while the window is open.
+                    let size_bytes = self.fs_probes.len(&ep.path);
                     let mut prop_open = true;
                     egui::Window::new("Emote Properties")
                         .collapsible(false)
@@ -23959,8 +24045,13 @@ fn prop_read_manifest_count(path: &std::path::Path) -> usize {
 /// (`clip.chat.jsonl`). We try both forms, plus the legacy pre-`.cache` YouTube name
 /// (`clip.ts.live_chat.json`).
 fn chat_file_for_recording(rec: &Recording) -> Option<std::path::PathBuf> {
+    chat_file_candidates(rec).into_iter().find(|p| p.exists())
+}
+
+/// The candidate sidecar paths [`chat_file_for_recording`] probes, in order.
+fn chat_file_candidates(rec: &Recording) -> [std::path::PathBuf; 4] {
     let base = Path::new(&rec.output_path);
-    let candidates = [
+    [
         // YouTube (yt-dlp append form): `<output_path>.live_chat.json`.
         std::path::PathBuf::from(format!("{}.live_chat.json", rec.output_path)),
         // Twitch native logger (extension replace): `<stem>.chat.jsonl`.
@@ -23969,8 +24060,18 @@ fn chat_file_for_recording(rec: &Recording) -> Option<std::path::PathBuf> {
         base.with_extension("live_chat.json"),
         // Legacy pre-`.cache` YouTube name: `<stem>.ts.live_chat.json`.
         base.with_extension("ts.live_chat.json"),
-    ];
-    candidates.into_iter().find(|p| p.exists())
+    ]
+}
+
+/// [`chat_file_for_recording`] for render paths: existence via the non-blocking
+/// [`FsProbes`] cache, so per-frame callers (the chat popup's recording picker,
+/// the Streams-grid context menus) never stat the recordings drive themselves.
+/// Answers can lag a probe round-trip (~a frame) behind the direct version.
+fn chat_file_for_recording_cached(
+    fs: &mut FsProbes,
+    rec: &Recording,
+) -> Option<std::path::PathBuf> {
+    chat_file_candidates(rec).into_iter().find(|p| fs.is_file(p))
 }
 
 fn fmt_recording_label(rec: &Recording) -> String {

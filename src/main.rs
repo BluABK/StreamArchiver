@@ -21,6 +21,7 @@ mod head_backfill;
 mod hls_preview;
 mod imports;
 mod inspector;
+mod io_gate;
 mod models;
 mod notifications;
 mod oauth;
@@ -123,6 +124,17 @@ fn main() -> Result<()> {
         .filter(|s| !s.is_empty())
         .map(std::path::PathBuf::from);
     watchdog::set_dialog_icon(dialog_icon_path);
+
+    // Post-processing disk throttle (ffmpeg -readrate) from the persisted
+    // setting; updated live when the user changes it in Settings.
+    io_gate::set_readrate(
+        store
+            .get_setting(io_gate::K_POSTPROC_READRATE)
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(io_gate::DEFAULT_READRATE),
+    );
 
     // Crash recovery for on-demand downloads: any left mid-flight is stale.
     // (In-flight live recordings are handled in `core.start()` →
@@ -637,6 +649,8 @@ fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
     // ── rotating file layer ───────────────────────────────────────────────────
     let log_dir = crate::app_paths::logs_dir();
     prune_old_logs(&log_dir, 7);
+    // Per-download tool logs (see downloader::capture_log_path) — same retention.
+    prune_old_logs(&log_dir.join("captures"), 7);
     let file_appender = tracing_appender::rolling::daily(&log_dir, "streamarchiver.log");
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
     let file_layer = tracing_subscriber::fmt::layer()
@@ -666,12 +680,17 @@ fn prune_old_logs(dir: &std::path::Path, keep_days: u64) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().map(|e| e == "log").unwrap_or(false) {
-            if let Ok(meta) = std::fs::metadata(&path) {
-                if meta.modified().map(|m| m < cutoff).unwrap_or(false) {
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
+        // Match both plain `*.log` (capture tool logs) and the daily-rolled
+        // `streamarchiver.log.YYYY-MM-DD` files, whose Path::extension is the
+        // DATE — the old extension-only check never matched them, so rolled
+        // app logs were in fact never pruned (found 11 days on disk).
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_log = name.ends_with(".log") || name.contains(".log.");
+        if is_log
+            && let Ok(meta) = std::fs::metadata(&path)
+            && meta.modified().map(|m| m < cutoff).unwrap_or(false)
+        {
+            let _ = std::fs::remove_file(&path);
         }
     }
 }

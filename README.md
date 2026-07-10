@@ -471,6 +471,28 @@ usable data) and are remuxed losslessly to **`.mkv`** on clean stop. MKV is the
 default; pick TS per channel if you prefer. **MP4 is never produced** (poor for
 interrupted writes).
 
+**Disk-load management.** All bulk post-processing on the recordings drive is
+deliberately bounded so it can never starve (or physically knock out — USB
+enclosures *do* drop off the bus under sustained mixed load) the drive the live
+captures are writing to:
+
+- Full-file ffmpeg passes — the finalize TS→MKV remux, head+live joins,
+  thumbnail/subtitle embeds — run **one at a time**, app-wide. When five takes
+  finish together (a raid ends, a shared event closes), their remuxes queue
+  instead of hammering the disk simultaneously; a finished take just sits as a
+  playable `.ts` in `.cache\` a few minutes longer. The same applies to the
+  leftover finalizes an app restart picks up.
+- CDN-fed muxes (head backfills, VOD recoveries) are capped at **two at a
+  time** — DMCA mutes tend to land for several channels minutes after a shared
+  stream end, and each recovery writes a full stream to the drive.
+- **Disk throttle** (Settings → Recording → Remux, default **30× realtime**)
+  additionally caps how fast each pass reads + writes (ffmpeg `-readrate`,
+  needs ffmpeg 5.0+; silently unthrottled on older builds). At 30× a 5-hour
+  stream finalizes in ~10 minutes while using a fraction of the drive's
+  bandwidth. `0` disables the cap.
+- Tool logs, chat sidecar writes, and the UI's file probes are batched, cached,
+  or kept off the recordings drive entirely (see *Data & locations*).
+
 ### Issues panel & re-remux
 
 ![Issues panel listing a recording that needs a re-remux](doc/screenshots/issues-panel.png)
@@ -481,7 +503,7 @@ The **⚠ Issues** button in the toolbar (turns amber with a count when issues e
 - **Empty capture** — the capture file is 0 bytes (nothing to recover); Re-remux is disabled.
 - **Remux failed** — a previous re-remux attempt failed; hover the status cell for the ffmpeg error. The button is locked to avoid re-triggering a known-bad file.
 
-The Issues panel refreshes every 5 s while open and every 30 s while closed, so the count on the button stays current. **⟳ Refresh** forces an immediate rescan.
+The Issues panel refreshes every 5 s while open and every 5 min while closed (each sweep stats every recording on disk, so the closed-panel badge is kept deliberately lazy). **⟳ Refresh** forces an immediate rescan.
 
 **In-tree badges.** The recording tree also surfaces the same issue as a **⚠ needs remux** badge at the take row, rolling up to the stream, instance, and channel rows, so you can see there is a problem without opening the panel.
 
@@ -1473,6 +1495,12 @@ Both SABR paths are **mpv-only**; other players get the DASH companion's `.ts`
   files share the recording's stem: `{stem}.vod.mkv` (downloaded published VOD),
   `{stem}.head.mkv` (backfilled missed start), `{stem}.full.mkv` (head + live
   joined), and a recovered VOD from CDN recovery.
+- App logs: `%APPDATA%\StreamArchiver\data\logs\` (daily-rotated, 7-day
+  retention). Per-download tool output (`streamlink`/`yt-dlp`/`ffmpeg`
+  stdout+stderr) lands in `logs\captures\` on the same drive — *not* next to
+  the recording — so its constant small appends and tail-reads never touch the
+  recordings disk; same 7-day retention (previously these were deleted at
+  finalize, so surviving a week is a debugging upgrade).
 - Asset cache: `%APPDATA%\StreamArchiver\data\asset-cache\` (see *Channel assets &
   change history*):
   - `channel_assets\{name}\{platform}\{account}\` — per channel + platform +

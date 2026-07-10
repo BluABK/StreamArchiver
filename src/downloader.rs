@@ -1305,6 +1305,27 @@ pub struct Supervisor {
     /// already running — while letting a same-platform sibling account fetch
     /// concurrently.
     running_asset_fetches: Arc<Mutex<HashSet<(String, String, String)>>>,
+    /// rec_ids with a head+live concat currently in flight. Every finalize path
+    /// (finish, re-attach, head-backfill completion, supersede, startup healing)
+    /// spawns `maybe_concat_backfill` independently and they all derive the SAME
+    /// `.cache\{stem}.full.mkv` temp path — two racing joins would interleave
+    /// writes into one file AND double the multi-GB disk pass. First caller
+    /// wins; later ones return immediately (the winner's own post-concat DB
+    /// re-check keeps the result correct).
+    running_concats: Arc<Mutex<HashSet<i64>>>,
+}
+
+/// RAII guard removing a rec_id from [`Supervisor::running_concats`] on drop,
+/// so every early-return in `maybe_concat_backfill` releases the slot.
+struct ConcatGuard {
+    set: Arc<Mutex<HashSet<i64>>>,
+    id: i64,
+}
+
+impl Drop for ConcatGuard {
+    fn drop(&mut self) {
+        self.set.lock().unwrap().remove(&self.id);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1351,6 +1372,7 @@ impl Supervisor {
             sabr_dvr_exceeded: Arc::new(Mutex::new(HashSet::new())),
             sabr_stall_count: Arc::new(Mutex::new(HashMap::new())),
             running_asset_fetches: Arc::new(Mutex::new(HashSet::new())),
+            running_concats: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -2668,7 +2690,7 @@ impl Supervisor {
         // no kill_on_drop, and output to a log file so the sidecar survives an app
         // restart and a relaunch can re-attach. yt-dlp writes the `.live_chat.json`
         // directly; this log only captures its diagnostics.
-        let log_path = plan.capture_path.with_extension("chat.log");
+        let log_path = capture_log_path(&plan.capture_path, "chat.log");
         let (out_h, err_h) = match open_log_pair(&log_path) {
             Ok(p) => p,
             Err(e) => {
@@ -3025,6 +3047,9 @@ impl Supervisor {
             // per-channel subdirs, every Video download lands in one flat folder,
             // where a `.en.vtt` next to the mkv is just clutter. No-ops when there
             // are none (e.g. subtitle_tracks was empty, or yt-dlp found none).
+            // No overlap with the remux pass's own embedding: sidecars are a
+            // yt-dlp-only output and yt-dlp video plans never set remux_to_mkv,
+            // so a video reaches at most ONE embedding pass (audited 2026-07-10).
             if final_path.extension().and_then(|e| e.to_str()) == Some("mkv") {
                 if let Err(e) = embed_subtitles_into_mkv(&final_path).await {
                     warn!(video = id, "embed subtitles failed: {e:#}");
@@ -5673,6 +5698,11 @@ impl Supervisor {
     /// callable from every completion path — whichever of {backfill done, live
     /// finalize, startup healing} runs last performs the join.
     pub async fn maybe_concat_backfill(&self, rec_id: i64) {
+        // One join per recording at a time — see `running_concats`.
+        if !self.running_concats.lock().unwrap().insert(rec_id) {
+            return;
+        }
+        let _guard = ConcatGuard { set: self.running_concats.clone(), id: rec_id };
         let Some((status, live_path, backfill, full)) =
             self.store.backfill_concat_info(rec_id).ok().flatten()
         else {
@@ -5744,10 +5774,22 @@ impl Supervisor {
             return;
         }
         // Duration sanity: a silently-broken concat (e.g. only one part copied)
-        // is discarded rather than promoted.
+        // is discarded rather than promoted. Head/live durations come from the
+        // compatibility probes above — only the new full.mkv needs an ffprobe
+        // (2 fewer multi-GB-file header reads on the busy recordings drive).
+        let part_dur = |info: &Option<MediaInfo>, p: &Path| {
+            let known = info.as_ref().and_then(|i| i.duration_secs);
+            let p = p.to_path_buf();
+            async move {
+                match known {
+                    Some(d) => d,
+                    None => media_duration_secs(&p).await.unwrap_or(0),
+                }
+            }
+        };
         let (head_d, live_d, full_d) = (
-            media_duration_secs(&head_p).await.unwrap_or(0),
-            media_duration_secs(&live_p).await.unwrap_or(0),
+            part_dur(&head_info, &head_p).await,
+            part_dur(&live_info, &live_p).await,
             media_duration_secs(&tmp_full).await.unwrap_or(0),
         );
         let expected = head_d + live_d;
@@ -5803,7 +5845,7 @@ impl Supervisor {
         // than a pipe it reads: a pipe dies with the parent, but a file the child
         // owns keeps growing after the app detaches/quits — and a later launch can
         // re-open and re-tail it. Lives next to the capture under `.cache\`.
-        let log_path = plan.capture_path.with_extension("log");
+        let log_path = capture_log_path(&plan.capture_path, "log");
         let (out_h, err_h) = match open_log_pair(&log_path) {
             Ok(p) => p,
             Err(e) => {
@@ -6153,13 +6195,32 @@ async fn line_aligned_tail_offset(path: &Path) -> u64 {
 }
 
 /// Read the last `max_lines` lines of a tool log — the failure-reason excerpt
-/// stored on the finished recording/video row.
+/// stored on the finished recording/video row. Reads only a bounded window
+/// from the end of the file (an hours-long yt-dlp progress log can reach tens
+/// of MB, and this runs at finalize — the worst moment for an extra full-file
+/// read on the recordings drive).
 async fn read_log_tail(path: &Path, max_lines: usize) -> String {
-    let data = tokio::fs::read(path).await.unwrap_or_default();
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    // 80 lines of tool output fit comfortably in 64 KiB.
+    const TAIL_WINDOW: u64 = 64 * 1024;
+    let Ok(mut f) = tokio::fs::File::open(path).await else {
+        return String::new();
+    };
+    let len = f.metadata().await.map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(TAIL_WINDOW);
+    if f.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+        return String::new();
+    }
+    let mut data = Vec::with_capacity(TAIL_WINDOW as usize);
+    if f.read_to_end(&mut data).await.is_err() {
+        return String::new();
+    }
     let text = String::from_utf8_lossy(&data);
     let lines: Vec<&str> = text.lines().collect();
-    let start = lines.len().saturating_sub(max_lines);
-    lines[start..].join("\n")
+    // Drop the first line of a mid-file window: it's almost certainly partial.
+    let skip_partial = usize::from(start > 0 && lines.len() > max_lines);
+    let start_line = lines.len().saturating_sub(max_lines).max(skip_partial);
+    lines[start_line..].join("\n")
 }
 
 /// Spawn the ad-break processor for an [`AdSink`], returning the channel the log
@@ -6414,33 +6475,50 @@ async fn concat_mkvs(
     let list = format!("ffconcat version 1.0\n{}\n{}\n", entry(head), entry(tail));
     tokio::fs::write(&list_path, list).await?;
 
-    let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-y")
-        .arg("-fflags")
-        .arg("+genpts")
-        .arg("-f")
-        .arg("concat")
-        .arg("-safe")
-        .arg("0")
-        .arg("-i")
-        .arg(&list_path)
-        .arg("-map")
-        .arg("0:v?")
-        .arg("-map")
-        .arg("0:a?")
-        .arg("-c")
-        .arg("copy")
-        .arg("-avoid_negative_ts")
-        .arg("make_zero")
-        .arg(dst)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
+    // One full-file pass at a time on the recordings drive (see io_gate).
+    let _gate = crate::io_gate::local_pass("concat").await;
+    let out = loop {
+        let readrate = crate::io_gate::readrate();
+        let mut cmd = Command::new("ffmpeg");
+        cmd.arg("-y")
+            .arg("-fflags")
+            .arg("+genpts");
+        if let Some(rate) = readrate {
+            cmd.arg("-readrate").arg(format!("{rate}"));
+        }
+        cmd.arg("-f")
+            .arg("concat")
+            .arg("-safe")
+            .arg("0")
+            .arg("-i")
+            .arg(&list_path)
+            .arg("-map")
+            .arg("0:v?")
+            .arg("-map")
+            .arg("0:a?")
+            .arg("-c")
+            .arg("copy")
+            .arg("-avoid_negative_ts")
+            .arg("make_zero")
+            .arg(dst)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        cmd.creation_flags(CREATE_NO_WINDOW);
 
-    let out = cmd.output().await;
+        let out = cmd.output().await;
+        if let Ok(out) = &out
+            && !out.status.success()
+            && readrate.is_some()
+            && crate::io_gate::is_readrate_error(&String::from_utf8_lossy(&out.stderr))
+        {
+            crate::io_gate::mark_readrate_unsupported();
+            continue; // retry once without the throttle (latch is process-wide)
+        }
+        break out;
+    };
     let _ = tokio::fs::remove_file(&list_path).await;
     let out = out?;
     if out.status.success() {
@@ -6471,6 +6549,10 @@ pub async fn remux_ts_to_mkv(
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
+    // One full-file pass at a time on the recordings drive (see io_gate).
+    let gate = crate::io_gate::local_pass("remux").await;
+    let readrate = crate::io_gate::readrate();
+
     // Get total duration so we can compute a percentage from ffmpeg's output.
     let total_us: Option<i64> = if progress_tx.is_some() {
         media_duration_secs(src).await.map(|s| s * 1_000_000)
@@ -6492,9 +6574,13 @@ pub async fn remux_ts_to_mkv(
     };
 
     let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-y")
-        .arg("-i")
-        .arg(src);
+    cmd.arg("-y");
+    // Throttle how fast ffmpeg reads (and therefore writes) so this pass
+    // can't saturate the drive live captures are writing to.
+    if let Some(rate) = readrate {
+        cmd.arg("-readrate").arg(format!("{rate}"));
+    }
+    cmd.arg("-i").arg(src);
 
     // Add subtitle sidecar inputs before -map flags so we can reference them.
     for sub in &subs {
@@ -6624,6 +6710,14 @@ pub async fn remux_ts_to_mkv(
     if status.success() {
         Ok(())
     } else {
+        // Older ffmpeg (< 5.0) rejects -readrate outright: latch that
+        // process-wide and retry this pass once without the throttle.
+        // Release the gate first — the retry re-acquires it (1 permit).
+        if readrate.is_some() && crate::io_gate::is_readrate_error(&stderr_lines.join("\n")) {
+            crate::io_gate::mark_readrate_unsupported();
+            drop(gate);
+            return Box::pin(remux_ts_to_mkv(src, dst, progress_tx, opts)).await;
+        }
         let code = status.code().unwrap_or(-1);
         // Grab the last few non-empty lines of stderr — ffmpeg prints the
         // relevant error at the end (e.g. "Invalid data found when processing input").
@@ -6795,23 +6889,39 @@ pub async fn embed_thumbnail_into_mkv(mkv: &Path, thumb: &Path) -> anyhow::Resul
         _      => "image/jpeg",
     };
     let cover_name = format!("cover.{ext}");
-    let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-y")
-        .arg("-i").arg(mkv)
-        .arg("-i").arg(thumb)
-        .arg("-map").arg("0")
-        .arg("-c").arg("copy")
-        .arg("-attach").arg(thumb)
-        .arg("-metadata:s:t").arg(format!("mimetype={mime}"))
-        .arg("-metadata:s:t").arg(format!("filename={cover_name}"))
-        .arg(&tmp)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    let out = cmd.output().await?;
+    // One full-file pass at a time on the recordings drive (see io_gate).
+    let _gate = crate::io_gate::local_pass("embed-thumbnail").await;
+    let out = loop {
+        let readrate = crate::io_gate::readrate();
+        let mut cmd = Command::new("ffmpeg");
+        cmd.arg("-y");
+        if let Some(rate) = readrate {
+            cmd.arg("-readrate").arg(format!("{rate}"));
+        }
+        cmd.arg("-i").arg(mkv)
+            .arg("-i").arg(thumb)
+            .arg("-map").arg("0")
+            .arg("-c").arg("copy")
+            .arg("-attach").arg(thumb)
+            .arg("-metadata:s:t").arg(format!("mimetype={mime}"))
+            .arg("-metadata:s:t").arg(format!("filename={cover_name}"))
+            .arg(&tmp)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        let out = cmd.output().await?;
+        if !out.status.success()
+            && readrate.is_some()
+            && crate::io_gate::is_readrate_error(&String::from_utf8_lossy(&out.stderr))
+        {
+            crate::io_gate::mark_readrate_unsupported();
+            continue; // retry without the throttle
+        }
+        break out;
+    };
     if !out.status.success() {
         let _ = tokio::fs::remove_file(&tmp).await;
         let tail = String::from_utf8_lossy(&out.stderr);
@@ -6836,29 +6946,46 @@ pub async fn embed_subtitles_into_mkv(mkv: &Path) -> anyhow::Result<bool> {
         return Ok(false);
     }
     let tmp = mkv.with_extension("tmp.mkv");
-    let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-y").arg("-i").arg(mkv);
-    for sub in &subs {
-        cmd.arg("-i").arg(sub);
-    }
-    cmd.arg("-map").arg("0:v?").arg("-map").arg("0:a?").arg("-map").arg("0:s?");
-    for i in 1..=subs.len() {
-        cmd.arg("-map").arg(format!("{i}:s?"));
-    }
-    cmd.arg("-c").arg("copy");
-    for (i, sub) in subs.iter().enumerate() {
-        if let Some(lang) = subtitle_lang_from_name(mkv, sub) {
-            cmd.arg(format!("-metadata:s:s:{i}")).arg(format!("language={lang}"));
+    // One full-file pass at a time on the recordings drive (see io_gate).
+    let _gate = crate::io_gate::local_pass("embed-subs").await;
+    let out = loop {
+        let readrate = crate::io_gate::readrate();
+        let mut cmd = Command::new("ffmpeg");
+        cmd.arg("-y");
+        if let Some(rate) = readrate {
+            cmd.arg("-readrate").arg(format!("{rate}"));
         }
-    }
-    cmd.arg(&tmp)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    let out = cmd.output().await?;
+        cmd.arg("-i").arg(mkv);
+        for sub in &subs {
+            cmd.arg("-i").arg(sub);
+        }
+        cmd.arg("-map").arg("0:v?").arg("-map").arg("0:a?").arg("-map").arg("0:s?");
+        for i in 1..=subs.len() {
+            cmd.arg("-map").arg(format!("{i}:s?"));
+        }
+        cmd.arg("-c").arg("copy");
+        for (i, sub) in subs.iter().enumerate() {
+            if let Some(lang) = subtitle_lang_from_name(mkv, sub) {
+                cmd.arg(format!("-metadata:s:s:{i}")).arg(format!("language={lang}"));
+            }
+        }
+        cmd.arg(&tmp)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        let out = cmd.output().await?;
+        if !out.status.success()
+            && readrate.is_some()
+            && crate::io_gate::is_readrate_error(&String::from_utf8_lossy(&out.stderr))
+        {
+            crate::io_gate::mark_readrate_unsupported();
+            continue; // retry without the throttle
+        }
+        break out;
+    };
     if !out.status.success() {
         let _ = tokio::fs::remove_file(&tmp).await;
         let tail = String::from_utf8_lossy(&out.stderr);
@@ -7142,6 +7269,9 @@ pub struct MediaInfo {
     pub fps: String,    // rounded whole number, e.g. "60"
     pub vcodec: String, // e.g. "h264"
     pub acodec: String, // e.g. "aac", "opus"
+    /// Container duration in whole seconds, when ffprobe reported one — lets
+    /// callers that already probed avoid a second ffprobe pass just for length.
+    pub duration_secs: Option<i64>,
 }
 
 /// True if `template` uses any media-info variable (so we only probe when needed).
@@ -7292,7 +7422,7 @@ async fn probe_media(target: &str) -> Option<MediaInfo> {
     let mut cmd = Command::new("ffprobe");
     cmd.args([
         "-v", "error",
-        "-show_entries", "stream=codec_type,codec_name,width,height,r_frame_rate",
+        "-show_entries", "stream=codec_type,codec_name,width,height,r_frame_rate:format=duration",
         "-of", "json",
     ])
     .arg(target)
@@ -7336,6 +7466,10 @@ async fn probe_media(target: &str) -> Option<MediaInfo> {
             _ => {}
         }
     }
+    info.duration_secs = json["format"]["duration"]
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|d| d.round() as i64);
     // Require real pixel dimensions (ffprobe can report "N/A" for odd inputs).
     if info.width.parse::<u32>().is_err() || info.height.parse::<u32>().is_err() {
         return None;
@@ -7538,6 +7672,27 @@ fn is_companion_suffix(rest: &str) -> bool {
         .map(str::to_string)
         .unwrap_or_else(|| lower.clone());
     SUBTITLE_EXTS.contains(&ext.as_str()) || THUMBNAIL_EXTS.contains(&ext.as_str())
+}
+
+/// Where a download tool's combined stdout+stderr log lives: under the app-data
+/// logs dir on the system drive, NOT next to the capture. The tool appends to
+/// it continuously and the app tail-polls it 4×/s per active download — pure
+/// seek churn when it sat in `.cache\` on the recordings HDD, interleaved with
+/// the capture writes themselves. The detached-process registry stores this
+/// absolute path, so re-attach after a restart works for both new rows and
+/// pre-relocation rows still pointing into `.cache\`. Pruned after 7 days at
+/// startup alongside the app logs (previously the log was purged at finalize —
+/// keeping it a week is a debugging improvement, not a regression).
+fn capture_log_path(capture_path: &Path, suffix: &str) -> PathBuf {
+    let dir = crate::app_paths::logs_dir().join("captures");
+    let _ = std::fs::create_dir_all(&dir);
+    // Capture file names carry channel + timestamp (+ .dash infix for the
+    // companion), so appending the suffix keeps sibling legs distinct.
+    let name = capture_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "capture".into());
+    dir.join(format!("{name}.{suffix}"))
 }
 
 /// Promote a finished capture from the `.cache\` working dir up to its final path
@@ -7868,9 +8023,16 @@ async fn catch_up_watcher(
     went_live: i64,
     done: Arc<AtomicBool>,
 ) {
+    // Each probe is a fresh ffprobe over the growing multi-GB capture (header
+    // read + tail seeks) on the recordings drive, so the cadence adapts: the
+    // measured deficit bounds how soon catch-up could possibly happen — a
+    // capture 2h behind can't catch up in the next 20s, so probing it every
+    // 20s is pure wasted reads. Only the cosmetic lost-time flip is delayed.
+    let mut interval_secs = CATCHUP_PROBE_INTERVAL_SECS as i64;
+    const MAX_PROBE_INTERVAL_SECS: i64 = 180;
     loop {
         // Interruptible wait between probes (checks `done` every 250ms).
-        for _ in 0..(CATCHUP_PROBE_INTERVAL_SECS * 4) {
+        for _ in 0..(interval_secs * 4) {
             if done.load(Ordering::SeqCst) {
                 return;
             }
@@ -7892,6 +8054,14 @@ async fn catch_up_watcher(
                 });
                 return;
             }
+            let deficit = elapsed - captured;
+            interval_secs =
+                (deficit / 4).clamp(CATCHUP_PROBE_INTERVAL_SECS as i64, MAX_PROBE_INTERVAL_SECS);
+        } else {
+            // Growing TS refused a duration (documented ffprobe behavior early
+            // on) — ease off gradually rather than re-paying the failed read
+            // every base interval.
+            interval_secs = (interval_secs * 2).min(MAX_PROBE_INTERVAL_SECS);
         }
     }
 }
