@@ -746,6 +746,7 @@ fn sampler_loop() {
     let mut prev_cells = snapshot().cells;
     let mut prev_self = crate::platform::self_io_counters().unwrap_or_default();
     let mut seen: HashMap<u32, SeenProc> = HashMap::new();
+    let mut prev_disks: HashMap<char, (u64, u64)> = HashMap::new();
     let mut log_buf: Vec<String> = Vec::new();
     let session_log = sample_log_dir().join(format!(
         "session-{}.jsonl",
@@ -892,7 +893,7 @@ fn sampler_loop() {
             procs,
             unattributed_bps: (unattributed_bps as f64 / interval_secs) as u64,
             db_bytes,
-            disks: sample_disks(),
+            disks: sample_disks(&mut prev_disks, interval_secs),
         };
 
         // --- JSONL sample log (buffered; appdata drive only) ---
@@ -917,9 +918,31 @@ fn sampler_loop() {
     }
 }
 
-/// Physical-disk readings (stubbed until the DISK_PERFORMANCE step lands).
-fn sample_disks() -> Vec<DiskSample> {
-    Vec::new()
+/// Physical-disk readings for the recordings drive(s) + the appdata drive.
+/// Cumulative counters → B/s via `prev`; drives whose disk-performance query
+/// fails (no diskperf filter, USB oddities) are simply absent — the UI shows
+/// "n/a". Recordings drives sort first.
+fn sample_disks(prev: &mut HashMap<char, (u64, u64)>, interval_secs: f64) -> Vec<DiskSample> {
+    let mut letters: Vec<char> = RECORDINGS_DRIVES.read().clone();
+    if let Some(l) = drive_letter(data_dir_cached()) {
+        if !letters.contains(&l) {
+            letters.push(l);
+        }
+    }
+    let mut out = Vec::with_capacity(letters.len());
+    for letter in letters {
+        let Some(perf) = crate::platform::disk_performance(letter) else { continue };
+        let (pr, pw) = prev
+            .insert(letter, (perf.bytes_read, perf.bytes_written))
+            .unwrap_or((perf.bytes_read, perf.bytes_written));
+        out.push(DiskSample {
+            letter,
+            read_bps: (perf.bytes_read.saturating_sub(pr) as f64 / interval_secs) as u64,
+            write_bps: (perf.bytes_written.saturating_sub(pw) as f64 / interval_secs) as u64,
+            queue_depth: perf.queue_depth,
+        });
+    }
+    out
 }
 
 fn flush_sample_log(path: &Path, buf: &mut Vec<String>) {

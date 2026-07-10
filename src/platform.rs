@@ -380,6 +380,106 @@ pub fn self_io_counters() -> Option<ProcIo> {
     None
 }
 
+/// Cumulative physical-disk performance counters (`IOCTL_DISK_PERFORMANCE`).
+/// The interesting live number is `queue_depth` — sustained depth on a USB
+/// enclosure is the early-warning signal before it drops off the bus.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct DiskPerf {
+    pub bytes_read: u64,
+    pub bytes_written: u64,
+    pub queue_depth: u32,
+    /// Cumulative 100ns idle ticks (busy% can be derived from the delta).
+    pub idle_time_100ns: u64,
+}
+
+/// Query the physical disk backing drive `letter` (e.g. `'A'`).
+///
+/// Opens the volume with access 0 (no admin needed), resolves its physical
+/// device number, then queries `\\.\PhysicalDriveN`. Returns `None` when the
+/// disk-performance filter is unavailable (`ERROR_INVALID_FUNCTION` on some
+/// stacks) or the drive doesn't exist — callers must degrade to "n/a".
+/// Counters are disk-wide: other volumes on the same spindle are included
+/// (that's the point — it's the spindle that saturates).
+#[cfg(windows)]
+pub fn disk_performance(letter: char) -> Option<DiskPerf> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Storage::FileSystem::{
+        FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::Win32::System::IO::DeviceIoControl;
+    use windows::Win32::System::Ioctl::{
+        DISK_PERFORMANCE, IOCTL_DISK_PERFORMANCE, IOCTL_STORAGE_GET_DEVICE_NUMBER,
+        STORAGE_DEVICE_NUMBER,
+    };
+
+    fn open_raw(path: &str) -> Option<HANDLE> {
+        use windows::Win32::Storage::FileSystem::CreateFileW;
+        let wide = to_wide(path);
+        unsafe {
+            CreateFileW(
+                windows::core::PCWSTR(wide.as_ptr()),
+                0, // access 0: query attributes only — no admin required
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAGS_AND_ATTRIBUTES(0),
+                None,
+            )
+            .ok()
+        }
+    }
+
+    if !letter.is_ascii_alphabetic() {
+        return None;
+    }
+    unsafe {
+        // Volume → physical device number.
+        let vol = open_raw(&format!("\\\\.\\{}:", letter.to_ascii_uppercase()))?;
+        let mut devnum = STORAGE_DEVICE_NUMBER::default();
+        let mut returned = 0u32;
+        let res = DeviceIoControl(
+            vol,
+            IOCTL_STORAGE_GET_DEVICE_NUMBER,
+            None,
+            0,
+            Some(&mut devnum as *mut _ as *mut _),
+            std::mem::size_of::<STORAGE_DEVICE_NUMBER>() as u32,
+            Some(&mut returned),
+            None,
+        );
+        let _ = CloseHandle(vol);
+        res.ok()?;
+
+        // Physical drive → performance counters.
+        let disk = open_raw(&format!("\\\\.\\PhysicalDrive{}", devnum.DeviceNumber))?;
+        let mut perf = DISK_PERFORMANCE::default();
+        let res = DeviceIoControl(
+            disk,
+            IOCTL_DISK_PERFORMANCE,
+            None,
+            0,
+            Some(&mut perf as *mut _ as *mut _),
+            std::mem::size_of::<DISK_PERFORMANCE>() as u32,
+            Some(&mut returned),
+            None,
+        );
+        let _ = CloseHandle(disk);
+        res.ok()?;
+
+        Some(DiskPerf {
+            bytes_read: perf.BytesRead.max(0) as u64,
+            bytes_written: perf.BytesWritten.max(0) as u64,
+            queue_depth: perf.QueueDepth,
+            idle_time_100ns: perf.IdleTime.max(0) as u64,
+        })
+    }
+}
+
+#[cfg(not(windows))]
+pub fn disk_performance(_letter: char) -> Option<DiskPerf> {
+    None
+}
+
 /// Forcefully kill a process and its entire child tree by PID.
 ///
 /// Uses a Toolhelp snapshot to find descendants (by parent PID) and terminates
@@ -536,6 +636,16 @@ mod tests {
     fn process_io_counters_work_for_own_pid() {
         let io = process_io_counters(std::process::id()).expect("own pid counters");
         assert!(io.read_ops + io.write_ops + io.other_ops > 0);
+    }
+
+    #[test]
+    fn disk_performance_smoke() {
+        // Must not panic; when the diskperf filter answers (normal on Win11),
+        // a system drive that has booted the OS has non-zero traffic.
+        if let Some(p) = disk_performance('C') {
+            assert!(p.bytes_read > 0 || p.bytes_written > 0);
+        }
+        assert!(disk_performance('!').is_none());
     }
 
     #[test]
