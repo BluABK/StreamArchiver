@@ -22,6 +22,7 @@ mod hls_preview;
 mod imports;
 mod inspector;
 mod io_gate;
+mod iomon;
 mod models;
 mod notifications;
 mod oauth;

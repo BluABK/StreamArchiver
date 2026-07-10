@@ -274,30 +274,22 @@ pub fn wait_pid(_pid: u32, _shutdown: &std::sync::atomic::AtomicBool) -> Option<
     None
 }
 
-/// Forcefully kill a process and its entire child tree by PID.
-///
-/// Uses a Toolhelp snapshot to find descendants (by parent PID) and terminates
-/// children before parents. This reliably reaches grandchildren (e.g. the ffmpeg
-/// a yt-dlp launcher spawned) even when a Python console-script wrapper created
-/// its child with `CREATE_BREAKAWAY_FROM_JOB`, which escapes a Job Object.
+/// Snapshot `(pid, parent_pid)` for every process on the system (Toolhelp).
+/// Shared by [`kill_process_tree`] and the I/O monitor's child sampler (both
+/// need to find the grandchildren a launcher like yt-dlp spawned).
 #[cfg(windows)]
-pub fn kill_process_tree(pid: u32) {
+pub fn process_children_snapshot() -> Vec<(u32, u32)> {
     use std::mem::size_of;
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
         TH32CS_SNAPPROCESS,
     };
-    use windows::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
 
-    if pid == 0 {
-        return;
-    }
-    // Snapshot (pid, parent_pid) for all processes.
     let mut pairs: Vec<(u32, u32)> = Vec::new();
     unsafe {
         let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
-            return;
+            return pairs;
         };
         let mut entry = PROCESSENTRY32W {
             dwSize: size_of::<PROCESSENTRY32W>() as u32,
@@ -313,6 +305,97 @@ pub fn kill_process_tree(pid: u32) {
         }
         let _ = CloseHandle(snap);
     }
+    pairs
+}
+
+#[cfg(not(windows))]
+pub fn process_children_snapshot() -> Vec<(u32, u32)> {
+    Vec::new()
+}
+
+/// Cumulative I/O counters of one process (`GetProcessIoCounters`).
+///
+/// Note: these count **all** I/O the process issued, including sockets — for
+/// a capture tool the read side is mostly CDN network traffic while the write
+/// side is the file it records. Callers that care about disk load should lean
+/// on the write counters (or the physical-disk stats) accordingly.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct ProcIo {
+    pub read_ops: u64,
+    pub write_ops: u64,
+    pub other_ops: u64,
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+    pub other_bytes: u64,
+}
+
+#[cfg(windows)]
+fn io_counters_from(handle: windows::Win32::Foundation::HANDLE) -> Option<ProcIo> {
+    use windows::Win32::System::Threading::{GetProcessIoCounters, IO_COUNTERS};
+    unsafe {
+        let mut c = IO_COUNTERS::default();
+        GetProcessIoCounters(handle, &mut c).ok()?;
+        Some(ProcIo {
+            read_ops: c.ReadOperationCount,
+            write_ops: c.WriteOperationCount,
+            other_ops: c.OtherOperationCount,
+            read_bytes: c.ReadTransferCount,
+            write_bytes: c.WriteTransferCount,
+            other_bytes: c.OtherTransferCount,
+        })
+    }
+}
+
+/// Cumulative I/O counters of `pid`, or `None` if it can't be opened (an
+/// exited process is the normal case — callers drop it silently).
+#[cfg(windows)]
+pub fn process_io_counters(pid: u32) -> Option<ProcIo> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    if pid == 0 {
+        return None;
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let res = io_counters_from(handle);
+        let _ = CloseHandle(handle);
+        res
+    }
+}
+
+#[cfg(not(windows))]
+pub fn process_io_counters(_pid: u32) -> Option<ProcIo> {
+    None
+}
+
+/// Cumulative I/O counters of this process (pseudo-handle; nothing to close).
+#[cfg(windows)]
+pub fn self_io_counters() -> Option<ProcIo> {
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    unsafe { io_counters_from(GetCurrentProcess()) }
+}
+
+#[cfg(not(windows))]
+pub fn self_io_counters() -> Option<ProcIo> {
+    None
+}
+
+/// Forcefully kill a process and its entire child tree by PID.
+///
+/// Uses a Toolhelp snapshot to find descendants (by parent PID) and terminates
+/// children before parents. This reliably reaches grandchildren (e.g. the ffmpeg
+/// a yt-dlp launcher spawned) even when a Python console-script wrapper created
+/// its child with `CREATE_BREAKAWAY_FROM_JOB`, which escapes a Job Object.
+#[cfg(windows)]
+pub fn kill_process_tree(pid: u32) {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+
+    if pid == 0 {
+        return;
+    }
+    // Snapshot (pid, parent_pid) for all processes.
+    let pairs = process_children_snapshot();
 
     // BFS to collect the target and all descendants.
     let mut tree = vec![pid];
@@ -429,5 +512,36 @@ impl AutoStart {
 impl Default for AutoStart {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn self_io_counters_nonzero_and_monotonic() {
+        let before = self_io_counters().expect("self counters");
+        // Do some real I/O so the counters must move.
+        let path = std::env::temp_dir().join(format!("sa-procio-{}.tmp", std::process::id()));
+        std::fs::write(&path, vec![0u8; 64 * 1024]).unwrap();
+        let _ = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let after = self_io_counters().expect("self counters");
+        assert!(after.write_bytes >= before.write_bytes + 64 * 1024);
+        assert!(after.read_ops >= before.read_ops);
+    }
+
+    #[test]
+    fn process_io_counters_work_for_own_pid() {
+        let io = process_io_counters(std::process::id()).expect("own pid counters");
+        assert!(io.read_ops + io.write_ops + io.other_ops > 0);
+    }
+
+    #[test]
+    fn children_snapshot_contains_self() {
+        let pairs = process_children_snapshot();
+        let me = std::process::id();
+        assert!(pairs.iter().any(|&(p, _)| p == me));
     }
 }
