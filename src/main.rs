@@ -687,7 +687,8 @@ fn prune_old_logs(dir: &std::path::Path, keep_days: u64) {
         // DATE — the old extension-only check never matched them, so rolled
         // app logs were in fact never pruned (found 11 days on disk).
         let name = entry.file_name().to_string_lossy().into_owned();
-        let is_log = name.ends_with(".log") || name.contains(".log.");
+        let is_log =
+            name.ends_with(".log") || name.contains(".log.") || name.ends_with(".jsonl");
         if is_log
             && let Ok(meta) = crate::iomon::fs::metadata_sync(Cat::AppLog, &path)
             && meta.modified().map(|m| m < cutoff).unwrap_or(false)

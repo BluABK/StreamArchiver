@@ -531,7 +531,7 @@ pub struct ChildInfo {
     /// Program: streamlink / yt-dlp / ffmpeg / ffprobe / ...
     pub tool: String,
     /// capture / chat / remux / concat / embed / recovery / probe / ...
-    pub purpose: &'static str,
+    pub purpose: String,
     /// Region of the file the tool works against.
     pub region: Region,
     /// OS process creation time (see `platform::process_start_time`) so a
@@ -572,6 +572,32 @@ impl Drop for ChildGuard {
 pub fn track_child(pid: u32, info: ChildInfo) -> ChildGuard {
     register_child(pid, info);
     ChildGuard(pid)
+}
+
+/// Convenience for post-processing passes: register a just-spawned tool
+/// against the file it works on. `None` pid (spawn raced its exit) → no-op.
+/// Skips the PID-recycle guard — these are held for one child's lifetime.
+pub fn track_tool(
+    pid: Option<u32>,
+    tool: &str,
+    purpose: &str,
+    target: &Path,
+) -> Option<ChildGuard> {
+    pid.map(|pid| {
+        track_child(
+            pid,
+            ChildInfo {
+                label: target
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                tool: tool.to_string(),
+                purpose: purpose.to_string(),
+                region: classify(target),
+                proc_start: 0,
+            },
+        )
+    })
 }
 
 // ===== Sampler (1 s cadence): self + child process I/O, history, JSONL =====
@@ -834,7 +860,7 @@ fn sampler_loop() {
                 pid,
                 label: info.label,
                 tool: info.tool,
-                purpose: info.purpose.to_string(),
+                purpose: info.purpose,
                 region: info.region,
                 read_bps,
                 write_bps,
@@ -1259,6 +1285,60 @@ mod tests {
         let ring = snapshot().ring;
         assert!(ring.len() <= OPS_RING_CAP);
         assert!(!ring.is_empty());
+    }
+
+    #[test]
+    fn sample_jsonl_roundtrip() {
+        let s = Sample {
+            at_ms: 1_752_000_000_000,
+            self_read_bps: 1,
+            self_write_bps: 2,
+            child_read_bps: 3,
+            child_write_bps: 4,
+            per_region: [(1, 2), (3, 4), (5, 6), (7, 8)],
+            per_cat: vec![(9, 10); CAT_COUNT],
+            procs: vec![ProcSample {
+                pid: 1234,
+                label: "chan".into(),
+                tool: "streamlink".into(),
+                purpose: "live capture".into(),
+                region: Region::Recordings,
+                read_bps: 11,
+                write_bps: 12,
+                total_read: 13,
+                total_write: 14,
+                descendants: 1,
+            }],
+            unattributed_bps: 15,
+            db_bytes: 16,
+            disks: vec![DiskSample { letter: 'A', read_bps: 17, write_bps: 18, queue_depth: 2 }],
+        };
+        let line = serde_json::to_string(&s).unwrap();
+        let back: Sample = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.at_ms, s.at_ms);
+        assert_eq!(back.per_region, s.per_region);
+        assert_eq!(back.procs.len(), 1);
+        assert_eq!(back.procs[0].pid, 1234);
+        assert_eq!(back.disks[0].letter, 'A');
+        assert_eq!(back.disks[0].queue_depth, 2);
+    }
+
+    #[test]
+    fn child_registry_register_unregister() {
+        let info = ChildInfo {
+            label: "x".into(),
+            tool: "ffmpeg".into(),
+            purpose: "test".into(),
+            region: Region::Other,
+            proc_start: 0,
+        };
+        {
+            let _g = track_child(99_999_999, info.clone());
+            assert!(
+                CHILDREN.lock().as_ref().map(|m| m.contains_key(&99_999_999)).unwrap_or(false)
+            );
+        }
+        assert!(!CHILDREN.lock().as_ref().map(|m| m.contains_key(&99_999_999)).unwrap_or(false));
     }
 
     #[test]

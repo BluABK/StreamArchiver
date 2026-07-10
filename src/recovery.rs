@@ -717,6 +717,7 @@ pub async fn mux_playlist_to_mkv(
     cmd.creation_flags(CREATE_NO_WINDOW);
 
     let mut child = cmd.spawn()?;
+    let _io_guard = crate::iomon::track_tool(child.id(), "ffmpeg", "cdn-mux", dst);
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
 

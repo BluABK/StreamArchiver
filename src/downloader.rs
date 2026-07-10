@@ -2747,6 +2747,26 @@ impl Supervisor {
                 warn!(monitor_id, "register chat detached failed: {e:#}");
             }
         }
+        // I/O-monitor registration; guard drops after the wait below.
+        let _io_guard = (pid != 0).then(|| {
+            crate::iomon::track_child(
+                pid,
+                crate::iomon::ChildInfo {
+                    label: plan
+                        .capture_path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    tool: Path::new(&plan.program)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| plan.program.clone()),
+                    purpose: "chat capture".to_string(),
+                    region: crate::iomon::classify(&plan.capture_path),
+                    proc_start: crate::platform::process_start_time(pid).unwrap_or(0),
+                },
+            )
+        });
         info!(monitor_id, "chat download started");
         // Fire any event so the UI repaints and shows the chat-active indicator.
         let _ = self.events.send(AppEvent::MonitorState {
@@ -4168,6 +4188,24 @@ impl Supervisor {
             DetachedKind::Video => row.ref_id,
             _ => row.monitor_id.unwrap_or(row.ref_id),
         };
+        // Re-attached tools get I/O-sampled like fresh spawns; the guard drops
+        // (deregisters) when this function returns after the wait — on every
+        // branch, including the chat early-returns.
+        let _io_guard = (row.pid != 0).then(|| {
+            crate::iomon::track_child(
+                row.pid,
+                crate::iomon::ChildInfo {
+                    label: Path::new(&row.capture_path)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    tool: "re-attached".to_string(),
+                    purpose: format!("{} (re-attached)", row.kind.as_str()),
+                    region: crate::iomon::classify(Path::new(&row.capture_path)),
+                    proc_start: row.proc_start,
+                },
+            )
+        });
         if let Some(mid) = row.monitor_id {
             let state = if row.kind == DetachedKind::Chat {
                 "chat_active"
@@ -5898,6 +5936,33 @@ impl Supervisor {
         if pid != 0 {
             active.lock().unwrap().insert(id, pid);
         }
+        // I/O-monitor registration for this tool + its descendants; the guard
+        // drops (deregisters) when this function returns after child.wait().
+        let _io_guard = (pid != 0).then(|| {
+            crate::iomon::track_child(
+                pid,
+                crate::iomon::ChildInfo {
+                    label: plan
+                        .capture_path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    tool: Path::new(&plan.program)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| plan.program.clone()),
+                    purpose: if detach.secondary {
+                        "capture (companion)".to_string()
+                    } else if detach.kind == DetachedKind::Video {
+                        "video download".to_string()
+                    } else {
+                        "live capture".to_string()
+                    },
+                    region: crate::iomon::classify(&plan.capture_path),
+                    proc_start,
+                },
+            )
+        });
 
         // Persist a registry row right after the spawn — synchronously, before the
         // first `.await` (child.wait below) — so a clean detach always has a row, and
@@ -6535,7 +6600,14 @@ async fn concat_mkvs(
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
 
-        let out = cmd.output().await;
+        // spawn + wait_with_output (≡ output()) so the PID is sampleable.
+        let out = match cmd.spawn() {
+            Ok(mut child) => {
+                let _io_guard = crate::iomon::track_tool(child.id(), "ffmpeg", "concat", dst);
+                child.wait_with_output().await
+            }
+            Err(e) => Err(e),
+        };
         if let Ok(out) = &out
             && !out.status.success()
             && readrate.is_some()
@@ -6667,6 +6739,7 @@ pub async fn remux_ts_to_mkv(
     cmd.creation_flags(CREATE_NO_WINDOW);
 
     let mut child = cmd.spawn()?;
+    let _io_guard = crate::iomon::track_tool(child.id(), "ffmpeg", "remux", dst);
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
 
@@ -6939,7 +7012,10 @@ pub async fn embed_thumbnail_into_mkv(mkv: &Path, thumb: &Path) -> anyhow::Resul
             .kill_on_drop(true);
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
-        let out = cmd.output().await?;
+        // spawn + wait_with_output (≡ output()) so the PID is sampleable.
+        let mut child = cmd.spawn()?;
+        let _io_guard = crate::iomon::track_tool(child.id(), "ffmpeg", "embed-thumbnail", mkv);
+        let out = child.wait_with_output().await?;
         if !out.status.success()
             && readrate.is_some()
             && crate::io_gate::is_readrate_error(&String::from_utf8_lossy(&out.stderr))
@@ -7003,7 +7079,10 @@ pub async fn embed_subtitles_into_mkv(mkv: &Path) -> anyhow::Result<bool> {
             .kill_on_drop(true);
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
-        let out = cmd.output().await?;
+        // spawn + wait_with_output (≡ output()) so the PID is sampleable.
+        let mut child = cmd.spawn()?;
+        let _io_guard = crate::iomon::track_tool(child.id(), "ffmpeg", "embed-subs", mkv);
+        let out = child.wait_with_output().await?;
         if !out.status.success()
             && readrate.is_some()
             && crate::io_gate::is_readrate_error(&String::from_utf8_lossy(&out.stderr))

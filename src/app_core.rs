@@ -139,6 +139,38 @@ impl AppCore {
 
     /// Spawn background services (poll scheduler + download supervisor).
     pub fn start(&self) {
+        // I/O monitor: register the recordings roots for region classification,
+        // apply the persisted sample-log toggle, and start the 1 s process/disk
+        // sampler (here rather than the GUI path so headless runs sample too).
+        {
+            let mut roots: Vec<std::path::PathBuf> = self
+                .store
+                .all_output_dirs()
+                .unwrap_or_default()
+                .into_iter()
+                .map(std::path::PathBuf::from)
+                .collect();
+            roots.push(
+                self.store
+                    .get_setting("default_output_dir") // ui.rs K_DEFAULT_OUT
+                    .ok()
+                    .flatten()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(crate::app_paths::default_output_dir),
+            );
+            crate::iomon::set_recordings_roots(roots);
+            crate::iomon::set_sample_logging(
+                self.store
+                    .get_setting(crate::iomon::K_IOMON_LOG)
+                    .ok()
+                    .flatten()
+                    .map(|v| v == "1")
+                    .unwrap_or(crate::iomon::SAMPLE_LOG_DEFAULT),
+            );
+            crate::iomon::start_sampler();
+        }
+
         let (live_tx, live_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::events::LiveSignal>();
         let (offline_tx, offline_rx) =
