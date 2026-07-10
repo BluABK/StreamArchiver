@@ -7,6 +7,7 @@ use serde::Deserialize;
 use tracing::warn;
 
 use crate::browser_ua::BrowserFingerprint;
+use crate::iomon::Cat;
 use crate::models::now_unix;
 
 // ---------- Cache stamps ----------
@@ -14,7 +15,7 @@ use crate::models::now_unix;
 /// True if the channel asset directory has not been fetched in the last 24 hours.
 pub fn should_refetch_assets(asset_dir: &Path) -> bool {
     let stamp = asset_dir.join(".assets_fetched_at");
-    match std::fs::read_to_string(&stamp) {
+    match crate::iomon::fs::read_to_string_sync(Cat::AssetCache, &stamp) {
         Ok(s) => {
             let fetched: i64 = s.trim().parse().unwrap_or(0);
             now_unix() - fetched > 86_400
@@ -24,7 +25,7 @@ pub fn should_refetch_assets(asset_dir: &Path) -> bool {
 }
 
 fn write_fetched_stamp(asset_dir: &Path) {
-    let _ = std::fs::write(asset_dir.join(".assets_fetched_at"), now_unix().to_string());
+    let _ = crate::iomon::fs::write_sync(Cat::AssetCache, asset_dir.join(".assets_fetched_at"), now_unix().to_string());
 }
 
 /// True if this channel's assets have been fetched at least once (the freshness
@@ -39,7 +40,7 @@ fn assets_ever_fetched(asset_dir: &Path) -> bool {
 
 fn should_refetch_global_badges(platform_dir: &Path) -> bool {
     let stamp = platform_dir.join("twitch").join(".global_badges_fetched_at");
-    match std::fs::read_to_string(&stamp) {
+    match crate::iomon::fs::read_to_string_sync(Cat::AssetCache, &stamp) {
         Ok(s) => s.trim().parse::<i64>().map(|t| now_unix() - t > 86_400).unwrap_or(true),
         Err(_) => true,
     }
@@ -47,8 +48,8 @@ fn should_refetch_global_badges(platform_dir: &Path) -> bool {
 
 fn write_global_badges_stamp(platform_dir: &Path) {
     let dir = platform_dir.join("twitch");
-    let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(dir.join(".global_badges_fetched_at"), now_unix().to_string());
+    let _ = crate::iomon::fs::create_dir_all_sync(Cat::AssetCache, &dir);
+    let _ = crate::iomon::fs::write_sync(Cat::AssetCache, dir.join(".global_badges_fetched_at"), now_unix().to_string());
 }
 
 // ---------- Core utility ----------
@@ -194,7 +195,7 @@ pub(crate) fn migrate_assets_root(
     if stamp.exists() {
         return;
     }
-    let Ok(channels) = std::fs::read_dir(root) else { return };
+    let Ok(channels) = crate::iomon::fs::read_dir_sync(Cat::AssetCache, root) else { return };
     for chan in channels.flatten() {
         let chan_dir = chan.path();
         if !chan_dir.is_dir() {
@@ -208,7 +209,7 @@ pub(crate) fn migrate_assets_root(
             }
             let platform = Platform::parse(plat_name);
             // Legacy payload present directly in the platform dir?
-            let legacy: Vec<PathBuf> = std::fs::read_dir(&plat_dir)
+            let legacy: Vec<PathBuf> = crate::iomon::fs::read_dir_sync(Cat::AssetCache, &plat_dir)
                 .into_iter()
                 .flatten()
                 .flatten()
@@ -229,14 +230,14 @@ pub(crate) fn migrate_assets_root(
                 continue;
             };
             let account_dir = plat_dir.join(account_slug(url, platform));
-            let _ = std::fs::create_dir_all(&account_dir);
+            let _ = crate::iomon::fs::create_dir_all_sync(Cat::AssetCache, &account_dir);
             for src in legacy {
                 let Some(fname) = src.file_name() else { continue };
                 let dest = account_dir.join(fname);
                 if dest.exists() {
                     continue; // a newer account-side copy exists — keep both, prefer it
                 }
-                if let Err(e) = std::fs::rename(&src, &dest) {
+                if let Err(e) = crate::iomon::fs::rename_sync(Cat::AssetCache, &src, &dest) {
                     warn!("asset migration: could not move {} -> {}: {e}", src.display(), dest.display());
                 }
             }
@@ -246,7 +247,7 @@ pub(crate) fn migrate_assets_root(
             );
         }
     }
-    let _ = std::fs::write(&stamp, now_unix().to_string());
+    let _ = crate::iomon::fs::write_sync(Cat::AssetCache, &stamp, now_unix().to_string());
 }
 
 /// Find `{prefix}*` under ANY account subdir of `{name}/{platform}/` (then the
@@ -258,7 +259,7 @@ pub fn find_asset_any_account(
     prefix: &str,
 ) -> Option<PathBuf> {
     let root = legacy_platform_dir(name, platform);
-    if let Ok(entries) = std::fs::read_dir(&root) {
+    if let Ok(entries) = crate::iomon::fs::read_dir_sync(Cat::AssetCache, &root) {
         for e in entries.flatten() {
             let p = e.path();
             if p.is_dir()
@@ -279,7 +280,7 @@ pub fn find_asset_any_account(
 /// extension. Skips the `history/` subdir and archived `{stem}_{ts}.ext` variants
 /// since those don't start with `{stem}.`.
 pub(crate) fn find_asset(dir: &Path, prefix: &str) -> Option<PathBuf> {
-    std::fs::read_dir(dir)
+    crate::iomon::fs::read_dir_sync(Cat::AssetCache, dir)
         .ok()?
         .flatten()
         .map(|e| e.path())
@@ -313,14 +314,14 @@ pub fn ensure_scaled_icon(asset_dir: &Path, px: u32) -> Option<PathBuf> {
 
     if out.exists() {
         // Regenerate only if the source icon was updated after the last scale.
-        let src_mtime = std::fs::metadata(&src).ok()?.modified().ok()?;
-        let out_mtime = std::fs::metadata(&out).ok()?.modified().ok()?;
+        let src_mtime = crate::iomon::fs::metadata_sync(Cat::AssetCache, &src).ok()?.modified().ok()?;
+        let out_mtime = crate::iomon::fs::metadata_sync(Cat::AssetCache, &out).ok()?.modified().ok()?;
         if out_mtime >= src_mtime {
             return Some(out);
         }
     }
 
-    let bytes = std::fs::read(&src).ok()?;
+    let bytes = crate::iomon::fs::read_sync(Cat::AssetCache, &src).ok()?;
     let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
     if img.width() <= px && img.height() <= px {
         return Some(src);
@@ -338,14 +339,14 @@ pub(crate) async fn download_image(client: &Client, url: &str, dest: &Path) -> R
         url.to_string()
     };
     if let Some(parent) = dest.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+        crate::iomon::fs::create_dir_all(Cat::AssetCache, parent).await?;
     }
     let resp = client.get(&url).send().await?;
     if !resp.status().is_success() {
         bail!("HTTP {} for {}", resp.status(), url);
     }
     let bytes = resp.bytes().await?;
-    tokio::fs::write(dest, bytes).await?;
+    crate::iomon::fs::write(Cat::AssetCache, dest, bytes).await?;
     Ok(())
 }
 
@@ -354,7 +355,7 @@ pub(crate) async fn download_image(client: &Client, url: &str, dest: &Path) -> R
 /// `icon_<ts>.png` (those use `{stem}_`, not `{stem}.`).
 async fn current_asset(dir: &Path, stem: &str) -> Option<PathBuf> {
     let prefix = format!("{stem}.");
-    let mut rd = tokio::fs::read_dir(dir).await.ok()?;
+    let mut rd = crate::iomon::fs::read_dir(Cat::AssetCache, dir).await.ok()?;
     while let Ok(Some(entry)) = rd.next_entry().await {
         if entry.file_name().to_string_lossy().starts_with(&prefix) {
             return Some(entry.path());
@@ -384,7 +385,7 @@ async fn download_image_archival(
     } else {
         url.to_string()
     };
-    tokio::fs::create_dir_all(dir).await?;
+    crate::iomon::fs::create_dir_all(Cat::AssetCache, dir).await?;
     let resp = client.get(&url).send().await?;
     if !resp.status().is_success() {
         bail!("HTTP {} for {}", resp.status(), url);
@@ -400,13 +401,13 @@ async fn download_image_archival(
 /// `history/{stem}_{retired_at}.{old_ext}` so it is never lost.
 async fn archive_and_write(dir: &Path, stem: &str, ext: &str, bytes: &[u8]) -> Result<()> {
     if let Some(cur_path) = current_asset(dir, stem).await {
-        match tokio::fs::read(&cur_path).await {
+        match crate::iomon::fs::read(Cat::AssetCache, &cur_path).await {
             // Unchanged since last fetch — leave everything as-is.
             Ok(cur) if cur == bytes => return Ok(()),
             // Changed — archive the old version before it's overwritten.
             Ok(_) => {
                 let hist = dir.join("history");
-                tokio::fs::create_dir_all(&hist).await?;
+                crate::iomon::fs::create_dir_all(Cat::AssetCache, &hist).await?;
                 let cur_ext = cur_path
                     .extension()
                     .and_then(|e| e.to_str())
@@ -417,16 +418,16 @@ async fn archive_and_write(dir: &Path, stem: &str, ext: &str, bytes: &[u8]) -> R
                 let ts = now_unix();
                 let mut archived = hist.join(format!("{stem}_{ts}.{cur_ext}"));
                 let mut n = 1;
-                while tokio::fs::try_exists(&archived).await.unwrap_or(false) {
+                while crate::iomon::fs::try_exists(Cat::AssetCache, &archived).await.unwrap_or(false) {
                     n += 1;
                     archived = hist.join(format!("{stem}_{ts}_{n}.{cur_ext}"));
                 }
                 // Move the old canonical into history (rename; fall back to
                 // copy+remove if the move fails). This also clears a stale
                 // canonical whose extension differs from the new one.
-                if tokio::fs::rename(&cur_path, &archived).await.is_err() {
-                    tokio::fs::copy(&cur_path, &archived).await?;
-                    let _ = tokio::fs::remove_file(&cur_path).await;
+                if crate::iomon::fs::rename(Cat::AssetCache, &cur_path, &archived).await.is_err() {
+                    crate::iomon::fs::copy(Cat::AssetCache, &cur_path, &archived).await?;
+                    let _ = crate::iomon::fs::remove_file(Cat::AssetCache, &cur_path).await;
                 }
                 // Log the replacement so the change-history can show it. `stem` is
                 // "icon"/"banner"; `id` points at the archived previous version.
@@ -455,7 +456,7 @@ async fn archive_and_write(dir: &Path, stem: &str, ext: &str, bytes: &[u8]) -> R
         }
     }
 
-    tokio::fs::write(dir.join(format!("{stem}.{ext}")), bytes).await?;
+    crate::iomon::fs::write(Cat::AssetCache, dir.join(format!("{stem}.{ext}")), bytes).await?;
     Ok(())
 }
 
@@ -510,7 +511,7 @@ async fn fetch_twitch_channel_assets(
         bail!("no Helix user for id {broadcaster_id}");
     };
 
-    tokio::fs::create_dir_all(asset_dir).await?;
+    crate::iomon::fs::create_dir_all(Cat::AssetCache, asset_dir).await?;
 
     let icon_ext = ext_from_url(&user.profile_image_url).unwrap_or("jpg");
     if let Err(e) =
@@ -605,7 +606,7 @@ async fn fetch_twitch_badges(
     // Global badges are shared across all Twitch channels — fetch once per 24h.
     if should_refetch_global_badges(platform_dir) {
         let global_dir = platform_dir.join("twitch").join("global_badges");
-        tokio::fs::create_dir_all(&global_dir).await?;
+        crate::iomon::fs::create_dir_all(Cat::AssetCache, &global_dir).await?;
         match fetch_helix_badges(
             client,
             client_id,
@@ -623,7 +624,7 @@ async fn fetch_twitch_badges(
     // Channel-specific badges go per-channel.
     if !broadcaster_id.is_empty() {
         let badge_dir = asset_dir.join("badges");
-        tokio::fs::create_dir_all(&badge_dir).await?;
+        crate::iomon::fs::create_dir_all(Cat::AssetCache, &badge_dir).await?;
         let url = format!(
             "https://api.twitch.tv/helix/chat/badges?broadcaster_id={broadcaster_id}"
         );
@@ -667,7 +668,7 @@ async fn fetch_twitch_emotes(
         return Ok(());
     }
     let emote_dir = asset_dir.join("emotes").join("twitch");
-    tokio::fs::create_dir_all(&emote_dir).await?;
+    crate::iomon::fs::create_dir_all(Cat::AssetCache, &emote_dir).await?;
 
     let url = format!(
         "https://api.twitch.tv/helix/chat/emotes?broadcaster_id={broadcaster_id}"
@@ -723,7 +724,7 @@ async fn fetch_twitch_emotes(
     if !manifest.is_empty() {
         record_manifest_change(asset_dir, "twitch", &manifest).await;
         if let Ok(json) = serde_json::to_string(&manifest) {
-            let _ = tokio::fs::write(asset_dir.join("emotes").join("twitch.json"), json).await;
+            let _ = crate::iomon::fs::write(Cat::AssetCache, asset_dir.join("emotes").join("twitch.json"), json).await;
         }
     }
 
@@ -756,7 +757,7 @@ pub(crate) struct EmoteManifestEntry {
 /// fetch can leave a 0-byte file; treating that as absent lets a later pass repair
 /// it instead of the `exists()` guard pinning the corrupt file forever.
 fn asset_present(path: &Path) -> bool {
-    std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
+    crate::iomon::fs::metadata_sync(Cat::AssetCache, path).map(|m| m.len() > 0).unwrap_or(false)
 }
 
 /// Sanitize an emote code for use as a filename component. Keeps alphanumerics,
@@ -894,7 +895,7 @@ where
 /// harmless warning. Explicitly flushed before returning: `tokio::fs::File`
 /// dispatches writes to a background blocking-thread-pool task, and without an
 /// explicit flush a caller that immediately reads the file back (e.g. via
-/// `std::fs::read_to_string`, as the UI's synchronous `read_asset_changes` does)
+/// a synchronous `read_to_string`, as the UI's `read_asset_changes` does)
 /// can race ahead of it — the write reports success while the bytes aren't
 /// visible yet, which is exactly what made this function's own test flaky under
 /// heavy parallel load (many tests contending for that same thread pool).
@@ -909,14 +910,17 @@ async fn append_asset_changes(asset_dir: &Path, changes: &[AssetChange]) {
             buf.push('\n');
         }
     }
-    if buf.is_empty() || tokio::fs::create_dir_all(asset_dir).await.is_err() {
+    if buf.is_empty() || crate::iomon::fs::create_dir_all(Cat::AssetCache, asset_dir).await.is_err() {
         return;
     }
     use tokio::io::AsyncWriteExt;
     let path = asset_dir.join("asset_changes.jsonl");
-    let mut opts = tokio::fs::OpenOptions::new();
-    opts.create(true).append(true);
-    if let Ok(mut f) = retry_transient(|| opts.open(&path)).await {
+    let open = || {
+        crate::iomon::fs::open_with(Cat::AssetCache, &path, |o| {
+            o.create(true).append(true);
+        })
+    };
+    if let Ok(mut f) = retry_transient(open).await {
         let _ = f.write_all(buf.as_bytes()).await;
         let _ = f.flush().await;
     }
@@ -927,7 +931,7 @@ async fn append_asset_changes(asset_dir: &Path, changes: &[AssetChange]) {
 /// a missing file yields an empty vec. Synchronous — the UI calls it directly on
 /// popup-open (the file is tiny: a handful of lines per refetch).
 pub fn read_asset_changes(asset_dir: &Path) -> Vec<AssetChange> {
-    let Ok(s) = std::fs::read_to_string(asset_dir.join("asset_changes.jsonl")) else {
+    let Ok(s) = crate::iomon::fs::read_to_string_sync(Cat::AssetCache, asset_dir.join("asset_changes.jsonl")) else {
         return Vec::new();
     };
     s.lines()
@@ -958,7 +962,7 @@ async fn record_manifest_change(asset_dir: &Path, provider: &str, new: &[EmoteMa
             if attempt > 0 {
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             }
-            match tokio::fs::read_to_string(&manifest_path).await {
+            match crate::iomon::fs::read_to_string(Cat::AssetCache, &manifest_path).await {
                 Ok(s) => {
                     outcome = Some(s);
                     break;
@@ -986,14 +990,14 @@ async fn record_manifest_change(asset_dir: &Path, provider: &str, new: &[EmoteMa
     // Snapshot the prior manifest (full archival) before it's overwritten. Written
     // from the in-memory bytes, not a rename, so the canonical path stays valid.
     let hist = emotes_dir.join("history");
-    if tokio::fs::create_dir_all(&hist).await.is_ok() {
+    if crate::iomon::fs::create_dir_all(Cat::AssetCache, &hist).await.is_ok() {
         let mut dest = hist.join(format!("{provider}_{at}.json"));
         let mut n = 1;
-        while tokio::fs::try_exists(&dest).await.unwrap_or(false) {
+        while crate::iomon::fs::try_exists(Cat::AssetCache, &dest).await.unwrap_or(false) {
             n += 1;
             dest = hist.join(format!("{provider}_{at}_{n}.json"));
         }
-        let _ = retry_transient(|| tokio::fs::write(&dest, old_json.as_bytes())).await;
+        let _ = retry_transient(|| crate::iomon::fs::write(Cat::AssetCache, &dest, old_json.as_bytes())).await;
     }
     append_asset_changes(asset_dir, &changes).await;
 }
@@ -1048,7 +1052,7 @@ async fn fetch_bttv_emotes(
     // Channel emotes — per-channel directory
     if !r.channel_emotes.is_empty() {
         let dir = asset_dir.join("emotes").join("bttv");
-        tokio::fs::create_dir_all(&dir).await?;
+        crate::iomon::fs::create_dir_all(Cat::AssetCache, &dir).await?;
         for emote in &r.channel_emotes {
             manifest.push(EmoteManifestEntry {
                 name: emote.code.clone(),
@@ -1081,7 +1085,7 @@ async fn fetch_bttv_emotes(
     // Shared emotes — global dedup cache
     if !r.shared_emotes.is_empty() {
         let global_dir = platform_dir.join("bttv").join("emotes");
-        tokio::fs::create_dir_all(&global_dir).await?;
+        crate::iomon::fs::create_dir_all(Cat::AssetCache, &global_dir).await?;
         for emote in &r.shared_emotes {
             manifest.push(EmoteManifestEntry {
                 name: emote.code.clone(),
@@ -1114,11 +1118,11 @@ async fn fetch_bttv_emotes(
     // Write manifest listing all active emote IDs for this channel
     if !manifest.is_empty() {
         let manifest_dir = asset_dir.join("emotes");
-        tokio::fs::create_dir_all(&manifest_dir).await?;
+        crate::iomon::fs::create_dir_all(Cat::AssetCache, &manifest_dir).await?;
         // Record added/removed codes against the previous manifest before overwriting.
         record_manifest_change(asset_dir, "bttv", &manifest).await;
         if let Ok(json) = serde_json::to_string(&manifest) {
-            let _ = tokio::fs::write(manifest_dir.join("bttv.json"), json).await;
+            let _ = crate::iomon::fs::write(Cat::AssetCache, manifest_dir.join("bttv.json"), json).await;
         }
     }
 
@@ -1153,7 +1157,7 @@ async fn fetch_ffz_emotes(
     };
 
     let global_dir = platform_dir.join("ffz").join("emotes");
-    tokio::fs::create_dir_all(&global_dir).await?;
+    crate::iomon::fs::create_dir_all(Cat::AssetCache, &global_dir).await?;
 
     let mut manifest: Vec<EmoteManifestEntry> = Vec::new();
 
@@ -1205,10 +1209,10 @@ async fn fetch_ffz_emotes(
 
     if !manifest.is_empty() {
         let manifest_dir = asset_dir.join("emotes");
-        tokio::fs::create_dir_all(&manifest_dir).await?;
+        crate::iomon::fs::create_dir_all(Cat::AssetCache, &manifest_dir).await?;
         record_manifest_change(asset_dir, "ffz", &manifest).await;
         if let Ok(json) = serde_json::to_string(&manifest) {
-            let _ = tokio::fs::write(manifest_dir.join("ffz.json"), json).await;
+            let _ = crate::iomon::fs::write(Cat::AssetCache, manifest_dir.join("ffz.json"), json).await;
         }
     }
 
@@ -1243,7 +1247,7 @@ async fn fetch_7tv_emotes(
     };
 
     let global_dir = platform_dir.join("7tv").join("emotes");
-    tokio::fs::create_dir_all(&global_dir).await?;
+    crate::iomon::fs::create_dir_all(Cat::AssetCache, &global_dir).await?;
 
     let mut manifest: Vec<EmoteManifestEntry> = Vec::new();
 
@@ -1278,10 +1282,10 @@ async fn fetch_7tv_emotes(
 
     if !manifest.is_empty() {
         let manifest_dir = asset_dir.join("emotes");
-        tokio::fs::create_dir_all(&manifest_dir).await?;
+        crate::iomon::fs::create_dir_all(Cat::AssetCache, &manifest_dir).await?;
         record_manifest_change(asset_dir, "7tv", &manifest).await;
         if let Ok(json) = serde_json::to_string(&manifest) {
-            let _ = tokio::fs::write(manifest_dir.join("7tv.json"), json).await;
+            let _ = crate::iomon::fs::write(Cat::AssetCache, manifest_dir.join("7tv.json"), json).await;
         }
     }
 
@@ -1318,7 +1322,7 @@ async fn fetch_youtube_channel_assets(
         bail!("YouTube channel not found: {channel_id}");
     }
 
-    tokio::fs::create_dir_all(asset_dir).await?;
+    crate::iomon::fs::create_dir_all(Cat::AssetCache, asset_dir).await?;
 
     // Profile picture (highest available resolution)
     let icon_url = item["snippet"]["thumbnails"]["high"]["url"]
@@ -1370,7 +1374,7 @@ async fn fetch_kick_channel_assets(
     }
     let v: serde_json::Value = resp.json().await?;
 
-    tokio::fs::create_dir_all(asset_dir).await?;
+    crate::iomon::fs::create_dir_all(Cat::AssetCache, asset_dir).await?;
 
     if let Some(url) = v["user"]["profile_pic"].as_str() {
         let ext = ext_from_url(url).unwrap_or("jpg");
@@ -1501,16 +1505,16 @@ async fn fetch_twitch_name_color(
     let color = v["data"][0]["color"].as_str().unwrap_or("").trim().to_string();
     let dest = asset_dir.join("name_color.txt");
     // Read the previous colour first so we can log a transition (and only a real one).
-    let old_color = std::fs::read_to_string(&dest)
+    let old_color = crate::iomon::fs::read_to_string_sync(Cat::AssetCache, &dest)
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
     if color.is_empty() {
         // Broadcaster cleared their colour — drop any stale cache so the UI reverts
         // to the automatic palette instead of tinting with a colour no longer used.
-        let _ = tokio::fs::remove_file(&dest).await;
+        let _ = crate::iomon::fs::remove_file(Cat::AssetCache, &dest).await;
     } else {
-        tokio::fs::create_dir_all(asset_dir).await?;
-        let _ = tokio::fs::write(&dest, &color).await;
+        crate::iomon::fs::create_dir_all(Cat::AssetCache, asset_dir).await?;
+        let _ = crate::iomon::fs::write(Cat::AssetCache, &dest, &color).await;
     }
     // Only log a transition once a baseline exists. On the first-ever fetch the
     // stamp is absent, so a name colour appearing for the first time is the baseline
@@ -1616,7 +1620,7 @@ async fn fetch_youtube_page_banner(
     let banner_url = youtube_banner_from_page_data(&data)
         .ok_or_else(|| anyhow::anyhow!("no banner found in ytInitialData"))?;
     let ext = ext_from_url(&banner_url).unwrap_or("jpg");
-    tokio::fs::create_dir_all(asset_dir).await?;
+    crate::iomon::fs::create_dir_all(Cat::AssetCache, asset_dir).await?;
     download_image_archival(client, &banner_url, asset_dir, "banner", ext).await
 }
 
@@ -1950,14 +1954,14 @@ async fn download_about_image(
     let ext = ext_from_url(url).unwrap_or("png");
     let tmp = about_dir.join(format!("tmp.{ext}"));
     download_image(client, url, &tmp).await.ok()?;
-    let bytes = tokio::fs::read(&tmp).await.ok()?;
+    let bytes = crate::iomon::fs::read(Cat::AssetCache, &tmp).await.ok()?;
     let hash = crate::detectors::fnv64(&bytes).to_string();
     let dest = about_dir.join(format!("{hash}.{ext}"));
-    if tokio::fs::try_exists(&dest).await.unwrap_or(false) {
-        let _ = tokio::fs::remove_file(&tmp).await;
-    } else if tokio::fs::rename(&tmp, &dest).await.is_err() {
-        let _ = tokio::fs::write(&dest, &bytes).await;
-        let _ = tokio::fs::remove_file(&tmp).await;
+    if crate::iomon::fs::try_exists(Cat::AssetCache, &dest).await.unwrap_or(false) {
+        let _ = crate::iomon::fs::remove_file(Cat::AssetCache, &tmp).await;
+    } else if crate::iomon::fs::rename(Cat::AssetCache, &tmp, &dest).await.is_err() {
+        let _ = crate::iomon::fs::write(Cat::AssetCache, &dest, &bytes).await;
+        let _ = crate::iomon::fs::remove_file(Cat::AssetCache, &tmp).await;
     }
     Some((hash, dest))
 }
@@ -1994,7 +1998,7 @@ async fn persist_about_snapshot(
     }
     let about_dir = asset_dir.join("about");
     if panels.iter().any(|p| !p.image_url.is_empty()) {
-        tokio::fs::create_dir_all(&about_dir).await?;
+        crate::iomon::fs::create_dir_all(Cat::AssetCache, &about_dir).await?;
     }
     for p in &mut panels {
         if p.image_url.is_empty() {
@@ -2144,6 +2148,8 @@ async fn fetch_youtube_about(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
 
     /// A fresh, unique temp directory for a test. Combines the pid, a
