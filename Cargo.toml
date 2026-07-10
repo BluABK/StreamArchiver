@@ -31,6 +31,7 @@ windows = { version = "0.62", features = ["Win32_System_JobObjects", "Win32_Foun
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "ico"] }
 regex-lite = "0.1.9"
 egui_commonmark = "0.23"
+egui_plot = "0.35"
 
 [build-dependencies]
 embed-manifest = "1.4"

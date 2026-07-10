@@ -116,7 +116,19 @@ enum View {
     Background,
     Settings,
     Stats,
+    IoMonitor,
     Debug,
+}
+
+/// Which series set the I/O tab's rate graph shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IoPlotMetric {
+    /// Write B/s: tools, app, physical disks.
+    Write,
+    /// Read B/s (capture-tool reads are mostly CDN network).
+    Read,
+    /// Physical-disk queue depth (the USB-drop early-warning signal).
+    Queue,
 }
 
 /// The Schedule tab's calendar granularity.
@@ -637,6 +649,9 @@ struct SettingsForm {
     /// Post-processing disk throttle: ffmpeg `-readrate` multiplier for
     /// finalize remuxes/concats/embeds (0 = unthrottled).
     postproc_readrate: f64,
+    /// Write 1 s I/O-monitor samples to a JSONL log under the appdata logs
+    /// dir (default on — post-mortems need the data to already exist).
+    iomon_sample_log: bool,
     // --- File management ---
     /// Split output files into per-type subdirectories.
     file_split_enabled: bool,
@@ -1186,6 +1201,18 @@ pub struct StreamArchiverApp {
     confirm_quit_stop: bool,
     /// Cached (ocr_stats, global_stats) for the Stats view; None = not yet loaded.
     stats_snapshot: Option<(OcrStats, GlobalStats)>,
+    /// I/O tab: cached sampler history + counters snapshot (refreshed ~1×/s
+    /// while the tab is open — never cloned per frame).
+    io_hist: Vec<crate::iomon::Sample>,
+    io_snap: Option<crate::iomon::CountersSnapshot>,
+    io_refreshed: Option<std::time::Instant>,
+    /// I/O tab: which series the rate graph shows.
+    io_plot_metric: IoPlotMetric,
+    /// I/O tab: recent-operations log filters.
+    io_ops_cat: Option<crate::iomon::Cat>,
+    io_ops_region: Option<crate::iomon::Region>,
+    /// I/O tab: category-table sort (column index, ascending).
+    io_cat_sort: (usize, bool),
     /// Channel id to scroll into view on the next Streams render, after a save
     /// adds a new channel. Cleared once consumed. None = no pending scroll.
     scroll_to_channel: Option<i64>,
@@ -1348,6 +1375,10 @@ impl StreamArchiverApp {
             postproc_readrate: setting_or_empty(&core, crate::io_gate::K_POSTPROC_READRATE)
                 .parse::<f64>()
                 .unwrap_or(crate::io_gate::DEFAULT_READRATE),
+            iomon_sample_log: {
+                let v = setting_or_empty(&core, crate::iomon::K_IOMON_LOG);
+                if v.is_empty() { crate::iomon::SAMPLE_LOG_DEFAULT } else { v == "1" }
+            },
             file_split_enabled: setting_or_empty(&core, K_FILE_SPLIT_ENABLED) == "1",
             file_split_videos: { let v = setting_or_empty(&core, K_FILE_SPLIT_VIDEOS); if v.is_empty() { "videos".into() } else { v } },
             file_split_subs:   { let v = setting_or_empty(&core, K_FILE_SPLIT_SUBS);   if v.is_empty() { "subs".into()   } else { v } },
@@ -1674,6 +1705,13 @@ impl StreamArchiverApp {
             debug_test_title: "Test Stream Title".into(),
             debug_test_game: "Just Chatting".into(),
             stats_snapshot: None,
+            io_hist: Vec::new(),
+            io_snap: None,
+            io_refreshed: None,
+            io_plot_metric: IoPlotMetric::Write,
+            io_ops_cat: None,
+            io_ops_region: None,
+            io_cat_sort: (2, false), // write B/s, descending
             scroll_to_channel: None,
             show_rename_dialog: false,
             rename_rec_id: None,
@@ -2545,6 +2583,7 @@ impl StreamArchiverApp {
             (K_REMUX_TITLE_TEMPLATE, s.remux_title_template.trim()),
             (K_REMUX_EMBED_SUBS,      if s.remux_embed_subs      { "1" } else { "0" }),
             (crate::io_gate::K_POSTPROC_READRATE, postproc_readrate.as_str()),
+            (crate::iomon::K_IOMON_LOG, if s.iomon_sample_log { "1" } else { "0" }),
             (K_FILE_SPLIT_ENABLED,  if s.file_split_enabled { "1" } else { "0" }),
             (K_FILE_SPLIT_VIDEOS, s.file_split_videos.trim()),
             (K_FILE_SPLIT_SUBS,   s.file_split_subs.trim()),
@@ -2593,6 +2632,24 @@ impl StreamArchiverApp {
         set_short_ts_pattern(&self.settings.short_ts_fmt);
         // Apply the post-processing disk throttle to in-flight and future passes.
         crate::io_gate::set_readrate(self.settings.postproc_readrate);
+        // I/O monitor: apply the sample-log toggle and re-register the
+        // recordings roots (the default output dir may have changed).
+        crate::iomon::set_sample_logging(self.settings.iomon_sample_log);
+        {
+            let mut roots: Vec<std::path::PathBuf> = self
+                .core
+                .store
+                .all_output_dirs()
+                .unwrap_or_default()
+                .into_iter()
+                .map(std::path::PathBuf::from)
+                .collect();
+            let d = self.settings.default_output_dir.trim();
+            if !d.is_empty() {
+                roots.push(std::path::PathBuf::from(d));
+            }
+            crate::iomon::set_recordings_roots(roots);
+        }
         self.persist_monitor_defaults();
         self.status = "Settings saved.".into();
     }
@@ -4941,6 +4998,81 @@ fn fmt_viewers(n: i64) -> String {
 }
 
 /// Human-readable byte size (B / KB / MB / GB).
+/// Plain-text dump of the I/O monitor state for the "Copy summary" button.
+fn io_summary_text(
+    snap: &crate::iomon::CountersSnapshot,
+    latest: Option<&crate::iomon::Sample>,
+) -> String {
+    use crate::iomon::{Cat, Region};
+    let mut out = format!(
+        "StreamArchiver I/O summary — {}\n",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+    );
+    if let Some(s) = latest {
+        out.push_str(&format!(
+            "tools: read {}/s write {}/s | app: read {}/s write {}/s | unattributed {}/s | db+wal {}\n",
+            fmt_bytes(s.child_read_bps as i64),
+            fmt_bytes(s.child_write_bps as i64),
+            fmt_bytes(s.self_read_bps as i64),
+            fmt_bytes(s.self_write_bps as i64),
+            fmt_bytes(s.unattributed_bps as i64),
+            fmt_bytes(s.db_bytes as i64),
+        ));
+        for d in &s.disks {
+            out.push_str(&format!(
+                "disk {}: read {}/s write {}/s queue {}\n",
+                d.letter,
+                fmt_bytes(d.read_bps as i64),
+                fmt_bytes(d.write_bps as i64),
+                d.queue_depth
+            ));
+        }
+        for p in &s.procs {
+            out.push_str(&format!(
+                "proc {} [{} pid {} {}]: read {}/s write {}/s (total {} / {})\n",
+                p.label,
+                p.tool,
+                p.pid,
+                p.purpose,
+                fmt_bytes(p.read_bps as i64),
+                fmt_bytes(p.write_bps as i64),
+                fmt_bytes(p.total_read as i64),
+                fmt_bytes(p.total_write as i64),
+            ));
+        }
+    }
+    out.push_str("\nregion | total read | total written | ops | slow\n");
+    for region in Region::ALL {
+        let t = snap.region_total(region);
+        out.push_str(&format!(
+            "{} | {} | {} | {} | {}\n",
+            region.label(),
+            fmt_bytes(t.read_bytes as i64),
+            fmt_bytes(t.write_bytes as i64),
+            t.ops(),
+            t.slow_ops
+        ));
+    }
+    out.push_str("\ncategory | total read | total written | ops | slow | max op | time\n");
+    for cat in Cat::ALL {
+        let t = snap.cat_total(cat);
+        if t.ops() == 0 {
+            continue;
+        }
+        out.push_str(&format!(
+            "{} | {} | {} | {} | {} | {} | {:.1}s\n",
+            cat.label(),
+            fmt_bytes(t.read_bytes as i64),
+            fmt_bytes(t.write_bytes as i64),
+            t.ops(),
+            t.slow_ops,
+            fmt_bytes(t.max_op_bytes as i64),
+            t.total_ns as f64 / 1e9
+        ));
+    }
+    out
+}
+
 fn fmt_bytes(bytes: i64) -> String {
     let b = bytes.max(0) as f64;
     const KB: f64 = 1024.0;
@@ -7180,6 +7312,7 @@ impl eframe::App for StreamArchiverApp {
                     if ui.selectable_value(&mut self.view, View::Stats, "Stats").clicked() {
                         self.stats_snapshot = None; // force reload on tab open
                     }
+                    ui.selectable_value(&mut self.view, View::IoMonitor, "I/O");
                     if debug_view_enabled() {
                         ui.selectable_value(&mut self.view, View::Debug, "Debug");
                     }
@@ -7370,6 +7503,7 @@ impl eframe::App for StreamArchiverApp {
             View::Background => self.background_view(ui),
             View::Settings => self.settings_view(ui),
             View::Stats => self.stats_view(ui),
+            View::IoMonitor => self.io_view(ui),
             View::Debug => self.debug_view(ui),
         });
 
@@ -7410,7 +7544,7 @@ impl eframe::App for StreamArchiverApp {
                         ui.close();
                     }
                 }
-                View::Videos | View::Stats | View::Debug | View::Posts => {}
+                View::Videos | View::Stats | View::IoMonitor | View::Debug | View::Posts => {}
             }
         });
         if ctx_add_stream {
@@ -17559,6 +17693,13 @@ impl StreamArchiverApp {
                          (silently unthrottled on older builds).",
                     );
                     ui.end_row();
+                    ui.checkbox(&mut self.settings.iomon_sample_log, "I/O sample log");
+                    ui.label(
+                        "Write the I/O monitor's 1s samples to a JSONL under the appdata \
+                         logs folder (system drive) so drive stalls and disconnects can be \
+                         analyzed after the fact. ~2-5 MB/day, pruned after 14 days.",
+                    );
+                    ui.end_row();
                 });
 
             // ── File Management ────────────────────────────────────────────────
@@ -17921,6 +18062,385 @@ impl StreamArchiverApp {
                 });
             } // end Diagnostics section guard
 
+            ui.add_space(16.0);
+        });
+    }
+
+    /// The I/O tab: live disk-load monitor — per-drive/per-category rates,
+    /// per-process tool I/O, physical-disk queue depth, and a recent-ops log.
+    /// All data comes from `iomon`'s atomics/rings/sampler; this fn never
+    /// touches the filesystem.
+    fn io_view(&mut self, ui: &mut egui::Ui) {
+        use crate::iomon::{self, Cat, Region};
+        // Live tab: tick once a second, refresh the cached copies at most 1×/s.
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+        let stale = self
+            .io_refreshed
+            .map(|t| t.elapsed().as_millis() >= 900)
+            .unwrap_or(true);
+        if stale {
+            self.io_hist = iomon::history();
+            self.io_snap = Some(iomon::snapshot());
+            self.io_refreshed = Some(std::time::Instant::now());
+        }
+        let latest = self.io_hist.last().cloned();
+        let Some(snap) = self.io_snap.clone() else { return };
+        let bps = |v: u64| format!("{}/s", fmt_bytes(v as i64));
+
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            // ── Totals strip ─────────────────────────────────────────────
+            ui.horizontal_wrapped(|ui| {
+                ui.heading("I/O monitor");
+                ui.separator();
+                match &latest {
+                    Some(s) => {
+                        ui.label(format!("tools ↓{} ↑{}", bps(s.child_read_bps), bps(s.child_write_bps)))
+                            .on_hover_text("All spawned capture/post-processing tools + their descendants. Read side of capture tools is mostly CDN network.");
+                        ui.separator();
+                        ui.label(format!("app ↓{} ↑{}", bps(s.self_read_bps), bps(s.self_write_bps)))
+                            .on_hover_text("This process (GetProcessIoCounters) — includes network sockets.");
+                        ui.separator();
+                        ui.label(format!("unattributed {}", bps(s.unattributed_bps)))
+                            .on_hover_text("App-process I/O the in-process instrumentation didn't classify: the app's own network traffic (API polls, image downloads), SQLite internals, the tracing log writer, egui persistence.");
+                        ui.separator();
+                        ui.label(format!("db+wal {}", fmt_bytes(s.db_bytes as i64)));
+                        let age = chrono::Utc::now().timestamp_millis() - s.at_ms;
+                        if age > 5_000 {
+                            ui.separator();
+                            ui.colored_label(ui.visuals().warn_fg_color, format!("sampler stalled? last sample {}s ago", age / 1000));
+                        }
+                    }
+                    None => {
+                        ui.label("sampler warming up…");
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.button("📋 Copy summary").clicked() {
+                    ui.ctx().copy_text(io_summary_text(&snap, latest.as_ref()));
+                }
+                if ui.button("📂 Open sample log folder").clicked() {
+                    crate::platform::open_path(&iomon::sample_log_dir());
+                }
+                let fin = iomon::finished_child_totals();
+                ui.label(format!(
+                    "session: {} finished tool(s), ↓{} ↑{}",
+                    fin.count,
+                    fmt_bytes(fin.read_bytes as i64),
+                    fmt_bytes(fin.write_bytes as i64)
+                ));
+                if !iomon::sample_logging() {
+                    ui.colored_label(ui.visuals().weak_text_color(), "sample log off (Settings → Recording)");
+                }
+            });
+            ui.separator();
+
+            // ── Rate graph ───────────────────────────────────────────────
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.io_plot_metric, IoPlotMetric::Write, "Write B/s");
+                ui.selectable_value(&mut self.io_plot_metric, IoPlotMetric::Read, "Read B/s");
+                ui.selectable_value(&mut self.io_plot_metric, IoPlotMetric::Queue, "Disk queue depth");
+            });
+            let metric = self.io_plot_metric;
+            let now_ms = latest.as_ref().map(|s| s.at_ms).unwrap_or(0);
+            fn pts_of(
+                hist: &[iomon::Sample],
+                now_ms: i64,
+                f: impl Fn(&iomon::Sample) -> f64,
+            ) -> Vec<[f64; 2]> {
+                hist.iter()
+                    .map(|s| [(s.at_ms - now_ms) as f64 / 1000.0, f(s)])
+                    .collect()
+            }
+            // Series: (name, points)
+            let mut series: Vec<(String, Vec<[f64; 2]>)> = Vec::new();
+            match metric {
+                IoPlotMetric::Write => {
+                    series.push(("tools".into(), pts_of(&self.io_hist, now_ms, |s| s.child_write_bps as f64)));
+                    series.push(("app".into(), pts_of(&self.io_hist, now_ms, |s| s.self_write_bps as f64)));
+                    series.push((
+                        "recordings (in-app)".into(),
+                        pts_of(&self.io_hist, now_ms, |s| s.per_region[Region::Recordings as usize].1 as f64),
+                    ));
+                }
+                IoPlotMetric::Read => {
+                    series.push(("tools".into(), pts_of(&self.io_hist, now_ms, |s| s.child_read_bps as f64)));
+                    series.push(("app".into(), pts_of(&self.io_hist, now_ms, |s| s.self_read_bps as f64)));
+                    series.push((
+                        "recordings (in-app)".into(),
+                        pts_of(&self.io_hist, now_ms, |s| s.per_region[Region::Recordings as usize].0 as f64),
+                    ));
+                }
+                IoPlotMetric::Queue => {}
+            }
+            // Per-physical-disk series (letters present in the history).
+            let mut letters: Vec<char> = Vec::new();
+            for s in &self.io_hist {
+                for d in &s.disks {
+                    if !letters.contains(&d.letter) {
+                        letters.push(d.letter);
+                    }
+                }
+            }
+            for l in letters {
+                let pts = pts_of(&self.io_hist, now_ms, |s| {
+                    s.disks
+                        .iter()
+                        .find(|d| d.letter == l)
+                        .map(|d| match metric {
+                            IoPlotMetric::Write => d.write_bps as f64,
+                            IoPlotMetric::Read => d.read_bps as f64,
+                            IoPlotMetric::Queue => d.queue_depth as f64,
+                        })
+                        .unwrap_or(0.0)
+                });
+                series.push((format!("disk {l}:"), pts));
+            }
+            let is_bytes = metric != IoPlotMetric::Queue;
+            egui_plot::Plot::new("io_rate_plot")
+                .height(200.0)
+                .legend(egui_plot::Legend::default())
+                .allow_scroll(false)
+                .include_y(0.0)
+                .x_axis_formatter(|mark, _| format!("{:.0}s", mark.value))
+                .y_axis_formatter(move |mark, _| {
+                    if is_bytes {
+                        format!("{}/s", fmt_bytes(mark.value.max(0.0) as i64))
+                    } else {
+                        format!("{:.0}", mark.value)
+                    }
+                })
+                .label_formatter(move |name, value| {
+                    let v = if is_bytes {
+                        format!("{}/s", fmt_bytes(value.y.max(0.0) as i64))
+                    } else {
+                        format!("{:.0}", value.y)
+                    };
+                    format!("{name}\n{:.0}s: {v}", value.x)
+                })
+                .show(ui, |plot_ui| {
+                    for (name, pts) in series {
+                        plot_ui.line(egui_plot::Line::new(name, egui_plot::PlotPoints::from(pts)));
+                    }
+                });
+            ui.separator();
+
+            // ── Storage regions + physical disks ─────────────────────────
+            ui.columns(2, |cols| {
+                cols[0].strong("In-app I/O by storage region");
+                egui::Grid::new("io_regions").striped(true).min_col_width(60.0).show(&mut cols[0], |ui| {
+                    ui.weak("region");
+                    ui.weak("read");
+                    ui.weak("write");
+                    ui.weak("total read");
+                    ui.weak("total written");
+                    ui.weak("slow ops");
+                    ui.end_row();
+                    for region in Region::ALL {
+                        let tot = snap.region_total(region);
+                        let (r, w) = latest.as_ref().map(|s| s.per_region[region as usize]).unwrap_or((0, 0));
+                        if region == Region::Recordings {
+                            ui.colored_label(ui.visuals().warn_fg_color, region.label());
+                        } else {
+                            ui.label(region.label());
+                        }
+                        ui.label(bps(r));
+                        ui.label(bps(w));
+                        ui.label(fmt_bytes(tot.read_bytes as i64));
+                        ui.label(fmt_bytes(tot.write_bytes as i64));
+                        ui.label(tot.slow_ops.to_string());
+                        ui.end_row();
+                    }
+                });
+                cols[1].strong("Physical disks (whole spindle, all processes)");
+                match latest.as_ref().filter(|s| !s.disks.is_empty()) {
+                    Some(s) => {
+                        egui::Grid::new("io_disks").striped(true).min_col_width(60.0).show(&mut cols[1], |ui| {
+                            ui.weak("disk");
+                            ui.weak("read");
+                            ui.weak("write");
+                            ui.weak("queue depth");
+                            ui.end_row();
+                            for d in &s.disks {
+                                ui.label(format!("{}:", d.letter));
+                                ui.label(bps(d.read_bps));
+                                ui.label(bps(d.write_bps));
+                                if d.queue_depth >= 4 {
+                                    ui.colored_label(ui.visuals().error_fg_color, d.queue_depth.to_string());
+                                } else {
+                                    ui.label(d.queue_depth.to_string());
+                                }
+                                ui.end_row();
+                            }
+                        });
+                        cols[1].weak("Sustained queue depth on the USB enclosure is the early-warning signal before it drops off the bus.");
+                    }
+                    None => {
+                        cols[1].weak("n/a (disk performance counters unavailable)");
+                    }
+                }
+            });
+            ui.separator();
+
+            // ── Per-process table ────────────────────────────────────────
+            ui.strong("Tool processes (1s samples; descendants rolled up)");
+            match latest.as_ref().filter(|s| !s.procs.is_empty()) {
+                Some(s) => {
+                    egui::Grid::new("io_procs").striped(true).min_col_width(60.0).show(ui, |ui| {
+                        ui.weak("what");
+                        ui.weak("tool");
+                        ui.weak("pid");
+                        ui.weak("purpose");
+                        ui.weak("region");
+                        ui.weak("read");
+                        ui.weak("write");
+                        ui.weak("total read");
+                        ui.weak("total written");
+                        ui.weak("procs");
+                        ui.end_row();
+                        for p in &s.procs {
+                            ui.label(&p.label);
+                            ui.label(&p.tool);
+                            ui.label(p.pid.to_string());
+                            ui.label(&p.purpose);
+                            ui.label(p.region.label());
+                            ui.label(bps(p.read_bps));
+                            ui.label(bps(p.write_bps));
+                            ui.label(fmt_bytes(p.total_read as i64));
+                            ui.label(fmt_bytes(p.total_write as i64));
+                            ui.label((1 + p.descendants).to_string());
+                            ui.end_row();
+                        }
+                    });
+                }
+                None => {
+                    ui.weak("no tool processes running");
+                }
+            }
+            ui.separator();
+
+            // ── Per-category table (click headers to sort) ───────────────
+            ui.strong("In-app I/O by category");
+            let cat_bps = |cat: Cat| -> (u64, u64) {
+                latest.as_ref().map(|s| s.per_cat[cat as usize]).unwrap_or((0, 0))
+            };
+            let mut rows: Vec<(Cat, crate::iomon::CellSnap, (u64, u64))> = Cat::ALL
+                .iter()
+                .map(|&c| (c, snap.cat_total(c), cat_bps(c)))
+                .collect();
+            let (sort_col, asc) = self.io_cat_sort;
+            rows.sort_by_key(|(c, t, (rb, wb))| {
+                let k = match sort_col {
+                    1 => *rb as u128,
+                    2 => *wb as u128,
+                    3 => t.ops() as u128,
+                    4 => t.bytes() as u128,
+                    5 => t.max_op_bytes as u128,
+                    6 => t.slow_ops as u128,
+                    7 => t.total_ns as u128,
+                    _ => return (0u128, c.label().to_string()),
+                };
+                (if asc { k } else { u128::MAX - k }, c.label().to_string())
+            });
+            let header = |ui: &mut egui::Ui, idx: usize, label: &str, sort: &mut (usize, bool)| {
+                let marker = if sort.0 == idx { if sort.1 { " ⏶" } else { " ⏷" } } else { "" };
+                if ui.button(format!("{label}{marker}")).clicked() {
+                    *sort = if sort.0 == idx { (idx, !sort.1) } else { (idx, false) };
+                }
+            };
+            let mut sort = self.io_cat_sort;
+            egui::Grid::new("io_cats").striped(true).min_col_width(60.0).show(ui, |ui| {
+                header(ui, 0, "category", &mut sort);
+                header(ui, 1, "read", &mut sort);
+                header(ui, 2, "write", &mut sort);
+                header(ui, 3, "ops", &mut sort);
+                header(ui, 4, "total bytes", &mut sort);
+                header(ui, 5, "max op", &mut sort);
+                header(ui, 6, "slow", &mut sort);
+                header(ui, 7, "time", &mut sort);
+                ui.end_row();
+                for (cat, tot, (rb, wb)) in &rows {
+                    if tot.ops() == 0 && *rb == 0 && *wb == 0 {
+                        continue; // nothing ever happened in this category
+                    }
+                    ui.label(cat.label());
+                    ui.label(bps(*rb));
+                    ui.label(bps(*wb));
+                    ui.label(tot.ops().to_string());
+                    ui.label(fmt_bytes(tot.bytes() as i64));
+                    ui.label(fmt_bytes(tot.max_op_bytes as i64));
+                    if tot.slow_ops > 0 {
+                        ui.colored_label(ui.visuals().warn_fg_color, tot.slow_ops.to_string());
+                    } else {
+                        ui.label("0");
+                    }
+                    ui.label(format!("{:.1}s", tot.total_ns as f64 / 1e9))
+                        .on_hover_text("Cumulative wall time spent inside filesystem calls (for the database: lock hold time).");
+                    ui.end_row();
+                }
+            });
+            self.io_cat_sort = sort;
+            ui.separator();
+
+            // ── Recent operations ────────────────────────────────────────
+            ui.horizontal(|ui| {
+                ui.strong("Recent operations");
+                ui.separator();
+                egui::ComboBox::from_id_salt("io_ops_cat")
+                    .selected_text(self.io_ops_cat.map(|c| c.label()).unwrap_or("all categories"))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.io_ops_cat, None, "all categories");
+                        for c in Cat::ALL {
+                            ui.selectable_value(&mut self.io_ops_cat, Some(c), c.label());
+                        }
+                    });
+                egui::ComboBox::from_id_salt("io_ops_region")
+                    .selected_text(self.io_ops_region.map(|r| r.label()).unwrap_or("all regions"))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.io_ops_region, None, "all regions");
+                        for r in Region::ALL {
+                            ui.selectable_value(&mut self.io_ops_region, Some(r), r.label());
+                        }
+                    });
+                ui.weak("(newest first; slow ops highlighted; database ops are counters-only)");
+            });
+            let ops_cat = self.io_ops_cat;
+            let ops_region = self.io_ops_region;
+            egui::ScrollArea::vertical()
+                .id_salt("io_ops_scroll")
+                .max_height(300.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for r in snap.ring.iter().rev() {
+                        if ops_cat.is_some_and(|c| c != r.cat) {
+                            continue;
+                        }
+                        if ops_region.is_some_and(|reg| reg != r.region) {
+                            continue;
+                        }
+                        let time = chrono::DateTime::from_timestamp_millis(r.at_ms)
+                            .map(|t| t.with_timezone(&chrono::Local).format("%H:%M:%S%.3f").to_string())
+                            .unwrap_or_default();
+                        let ms = r.dur_us as f64 / 1000.0;
+                        let line = format!(
+                            "{time}  {:<18} {:<6} {:<16} {:>10}  {:>8.1}ms  [{}]  {}",
+                            r.cat.label(),
+                            r.kind.label(),
+                            r.region.label(),
+                            fmt_bytes(r.bytes as i64),
+                            ms,
+                            r.thread,
+                            r.path
+                        );
+                        let slow = ms >= crate::iomon::SLOW_OP_MS as f64;
+                        let text = egui::RichText::new(line).monospace().size(11.0);
+                        if slow {
+                            ui.colored_label(ui.visuals().warn_fg_color, text);
+                        } else {
+                            ui.label(text);
+                        }
+                    }
+                });
             ui.add_space(16.0);
         });
     }

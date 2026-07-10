@@ -388,8 +388,6 @@ pub struct DiskPerf {
     pub bytes_read: u64,
     pub bytes_written: u64,
     pub queue_depth: u32,
-    /// Cumulative 100ns idle ticks (busy% can be derived from the delta).
-    pub idle_time_100ns: u64,
 }
 
 /// Query the physical disk backing drive `letter` (e.g. `'A'`).
@@ -470,7 +468,6 @@ pub fn disk_performance(letter: char) -> Option<DiskPerf> {
             bytes_read: perf.BytesRead.max(0) as u64,
             bytes_written: perf.BytesWritten.max(0) as u64,
             queue_depth: perf.QueueDepth,
-            idle_time_100ns: perf.IdleTime.max(0) as u64,
         })
     }
 }

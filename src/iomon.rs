@@ -301,10 +301,10 @@ pub fn classify(path: &Path) -> Region {
         return Region::Temp;
     }
     // Same drive as a recordings root still hits the same spindle.
-    if let Some(letter) = drive_letter(path) {
-        if RECORDINGS_DRIVES.read().contains(&letter) {
-            return Region::Recordings;
-        }
+    if let Some(letter) = drive_letter(path)
+        && RECORDINGS_DRIVES.read().contains(&letter)
+    {
+        return Region::Recordings;
     }
     Region::Other
 }
@@ -473,6 +473,7 @@ pub struct CountersSnapshot {
 }
 
 impl CountersSnapshot {
+    #[cfg_attr(not(test), allow(dead_code))] // exercised by the unit tests
     pub fn cell(&self, cat: Cat, region: Region) -> &CellSnap {
         &self.cells[cat as usize][region as usize]
     }
@@ -710,11 +711,6 @@ pub fn history() -> Vec<Sample> {
     HISTORY.lock().iter().cloned().collect()
 }
 
-/// The most recent sample only (cheap enough for per-frame use).
-pub fn latest_sample() -> Option<Sample> {
-    HISTORY.lock().back().cloned()
-}
-
 pub fn finished_child_totals() -> FinishedChildTotals {
     *FINISHED.lock()
 }
@@ -870,7 +866,7 @@ fn sampler_loop() {
                 descendants: alive.saturating_sub(1),
             });
         }
-        procs.sort_by(|a, b| (b.write_bps + b.read_bps).cmp(&(a.write_bps + a.read_bps)));
+        procs.sort_by_key(|p| std::cmp::Reverse(p.write_bps + p.read_bps));
 
         // --- db + wal size (C:) ---
         let db_path = crate::app_paths::db_path();
@@ -924,10 +920,10 @@ fn sampler_loop() {
 /// "n/a". Recordings drives sort first.
 fn sample_disks(prev: &mut HashMap<char, (u64, u64)>, interval_secs: f64) -> Vec<DiskSample> {
     let mut letters: Vec<char> = RECORDINGS_DRIVES.read().clone();
-    if let Some(l) = drive_letter(data_dir_cached()) {
-        if !letters.contains(&l) {
-            letters.push(l);
-        }
+    if let Some(l) = drive_letter(data_dir_cached())
+        && !letters.contains(&l)
+    {
+        letters.push(l);
     }
     let mut out = Vec::with_capacity(letters.len());
     for letter in letters {
@@ -977,7 +973,9 @@ fn flush_sample_log(path: &Path, buf: &mut Vec<String>) {
 ///
 /// `clippy.toml` disallows the raw functions everywhere else, so this module
 /// is the only place in the app that touches `std::fs`/`tokio::fs` directly.
-#[allow(clippy::disallowed_methods)]
+/// Kept API-complete even where no call site exists yet — the clippy `reason`
+/// strings point future code here (hence the dead_code allow).
+#[allow(clippy::disallowed_methods, dead_code)]
 pub mod fs {
     use std::io;
     use std::path::Path;

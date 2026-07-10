@@ -652,6 +652,8 @@ fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
     prune_old_logs(&log_dir, 7);
     // Per-download tool logs (see downloader::capture_log_path) — same retention.
     prune_old_logs(&log_dir.join("captures"), 7);
+    // I/O-monitor JSONL sample logs (bigger files, longer post-mortem window).
+    prune_old_logs(&log_dir.join("iomon"), iomon::SAMPLE_LOG_KEEP_DAYS);
     let file_appender = tracing_appender::rolling::daily(&log_dir, "streamarchiver.log");
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
     let file_layer = tracing_subscriber::fmt::layer()
