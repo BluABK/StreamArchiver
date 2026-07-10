@@ -493,6 +493,39 @@ captures are writing to:
 - Tool logs, chat sidecar writes, and the UI's file probes are batched, cached,
   or kept off the recordings drive entirely (see *Data & locations*).
 
+### I/O monitor (the **I/O** tab)
+
+Every filesystem operation the app performs — and every byte its spawned tools
+move — is tracked, so disk-load problems on the recordings drive can be *seen*
+rather than reconstructed after a crash:
+
+- **In-app operations** all flow through one instrumented layer, categorized by
+  purpose (chat sidecars, log tails, promote/renames, cache sweeps, asset
+  cache, fs probes, database, …) and by storage region (recordings drive /
+  appdata / temp). A clippy lint (`clippy.toml` `disallowed-methods`) makes it
+  impossible for new code to bypass the layer unnoticed.
+- **Tool processes** (streamlink / yt-dlp / ffmpeg — including the ffmpeg a
+  yt-dlp launcher spawns) are sampled once a second via per-PID Windows I/O
+  counters, each labeled with what it's doing and which file it works on. Note
+  the *read* side of a capture tool is mostly CDN network traffic; the *write*
+  side is the disk-relevant number.
+- **Physical-disk counters** report true bytes/sec and **queue depth** per
+  drive (whole spindle, all processes — catches OS write-cache flushes too).
+  Sustained queue depth on a USB enclosure is the early-warning signal before
+  it drops off the bus; the tab flags depth ≥ 4 in red.
+
+The **I/O** tab shows live totals, a 30-minute rate graph (write/read/queue
+series per drive, hover for values), per-region and per-category tables
+(cumulative bytes, slow-op counts, max single op), a per-process table, and a
+filterable recent-operations log — operations slower than 100 ms are
+highlighted, and the thread column exposes anything touching the disk from the
+UI thread. **📋 Copy summary** exports the state as text.
+
+**Sample log** (Settings → Recording, default **on**): the 1 s samples are also
+appended to a JSONL under `logs\iomon\` on the system drive (~2–5 MB/day,
+pruned after 14 days), so an overnight stall or a drive disconnect can be
+analyzed after the fact even if the app died with it.
+
 ### Issues panel & re-remux
 
 ![Issues panel listing a recording that needs a re-remux](doc/screenshots/issues-panel.png)
@@ -1500,7 +1533,9 @@ Both SABR paths are **mpv-only**; other players get the DASH companion's `.ts`
   stdout+stderr) lands in `logs\captures\` on the same drive — *not* next to
   the recording — so its constant small appends and tail-reads never touch the
   recordings disk; same 7-day retention (previously these were deleted at
-  finalize, so surviving a week is a debugging upgrade).
+  finalize, so surviving a week is a debugging upgrade). The I/O monitor's 1 s
+  sample log (see *I/O monitor*) lands in `logs\iomon\session-*.jsonl`, 14-day
+  retention.
 - Asset cache: `%APPDATA%\StreamArchiver\data\asset-cache\` (see *Channel assets &
   change history*):
   - `channel_assets\{name}\{platform}\{account}\` — per channel + platform +
