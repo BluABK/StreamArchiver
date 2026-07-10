@@ -23,6 +23,7 @@ use tracing::{info, warn};
 
 use crate::detectors::{DetectContext, DetectItem, DetectOutcome};
 use crate::events::{AppEvent, EventTx, LiveSignal, ManualCommand};
+use crate::iomon::Cat;
 use crate::models::{
     AuthKind, Container, DetachedKind, DetachedRow, DetectionMethod, K_FILENAME_MEDIA,
     MediaInfoMode, Monitor, MonitorWithChannel, Platform, Recording, SabrCodecPref, Tool, Video,
@@ -717,7 +718,7 @@ fn sabr_state_exists(output_path: &str) -> bool {
         return false;
     };
     let prefix = format!("{stem}.");
-    let Ok(rd) = std::fs::read_dir(cache_dir(dir)) else {
+    let Ok(rd) = crate::iomon::fs::read_dir_sync(Cat::FsProbe, cache_dir(dir)) else {
         return false;
     };
     for entry in rd.flatten() {
@@ -1449,7 +1450,7 @@ impl Supervisor {
                             let final_ = path_with_safe_stem(&final_);
                             match remux_ts_to_mkv(&capture, &final_, Some((tx2, task_id)), &Default::default()).await {
                                 Ok(()) => {
-                                    let _ = tokio::fs::remove_file(&capture).await;
+                                    let _ = crate::iomon::fs::remove_file(Cat::CacheSweep, &capture).await;
                                     let path_s = final_.to_string_lossy();
                                     if let Err(e) = store.update_recording_output_path(rec_id, &path_s) {
                                         warn!("re-remux: DB update failed for rec_id={rec_id}: {e:#}");
@@ -1517,7 +1518,7 @@ impl Supervisor {
                                 });
                                 match remux_ts_to_mkv(&ts, &mkv, None, &opts).await {
                                     Ok(()) => {
-                                        let _ = tokio::fs::remove_file(&ts).await;
+                                        let _ = crate::iomon::fs::remove_file(Cat::CacheSweep, &ts).await;
                                         if mkv != planned_mkv {
                                             let _ = store.update_recording_output_path(*rec_id, &mkv.to_string_lossy());
                                         }
@@ -1711,7 +1712,7 @@ impl Supervisor {
                                 .extension()
                                 .map(|e| e.to_string_lossy().into_owned())
                                 .unwrap_or_default();
-                            let _ = tokio::fs::create_dir_all(&output_dir).await;
+                            let _ = crate::iomon::fs::create_dir_all(Cat::DirSetup, &output_dir).await;
                             match rename_or_shorten(&capture, &output_dir, &stem, &ext).await {
                                 Ok(actual) => {
                                     if let Err(e) = store
@@ -2938,11 +2939,11 @@ impl Supervisor {
             pre_media.as_ref(), &ytdlp_bins,
         );
         if let Some(parent) = plan.capture_path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
+            let _ = crate::iomon::fs::create_dir_all(Cat::DirSetup, parent).await;
             crate::platform::set_hidden(parent); // mark the .cache\ working dir hidden
         }
         if let Some(out_dir) = plan.final_path.parent() {
-            let _ = tokio::fs::create_dir_all(out_dir).await;
+            let _ = crate::iomon::fs::create_dir_all(Cat::DirSetup, out_dir).await;
         }
         let label = if !video.title.trim().is_empty() {
             video.title.clone()
@@ -2998,7 +2999,7 @@ impl Supervisor {
                         src.file_name().map(|n| n.to_os_string()).unwrap_or_default(),
                     );
                     if let Some(p) = dest.parent() {
-                        let _ = tokio::fs::create_dir_all(p).await;
+                        let _ = crate::iomon::fs::create_dir_all(Cat::DirSetup, p).await;
                     }
                     // The download landing on disk matters more than a fully-
                     // descriptive name — see rename_or_shorten.
@@ -3271,12 +3272,12 @@ impl Supervisor {
         let started_at = now_unix();
         let plan = build_plan(&row, started_at, &auth, &ytdlp_global_args, stream_id.as_deref(), stream_title.as_deref().unwrap_or(""), pre_media.as_ref(), went_live_at.unwrap_or(0), &ytdlp_bins);
         if let Some(parent) = plan.capture_path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
+            let _ = crate::iomon::fs::create_dir_all(Cat::DirSetup, parent).await;
             crate::platform::set_hidden(parent); // mark the .cache\ working dir hidden
         }
         // Also ensure the output dir exists (the final file is promoted there).
         if let Some(out_dir) = plan.final_path.parent() {
-            let _ = tokio::fs::create_dir_all(out_dir).await;
+            let _ = crate::iomon::fs::create_dir_all(Cat::DirSetup, out_dir).await;
         }
 
         // A take key links the recordings of this capture attempt: the primary
@@ -3824,11 +3825,11 @@ impl Supervisor {
         trigger_rule_json: String,
     ) {
         if let Some(parent) = plan.capture_path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
+            let _ = crate::iomon::fs::create_dir_all(Cat::DirSetup, parent).await;
             crate::platform::set_hidden(parent);
         }
         if let Some(out_dir) = plan.final_path.parent() {
-            let _ = tokio::fs::create_dir_all(out_dir).await;
+            let _ = crate::iomon::fs::create_dir_all(Cat::DirSetup, out_dir).await;
         }
         let started_at = now_unix();
         let rec_id = self
@@ -4103,10 +4104,10 @@ impl Supervisor {
             }
 
             // Otherwise finalize when there's a usable capture on disk…
-            let has_capture = std::fs::metadata(&row.capture_path)
+            let has_capture = crate::iomon::fs::metadata_sync(Cat::Startup, &row.capture_path)
                 .map(|m| m.len() > 0)
                 .unwrap_or(false)
-                || std::fs::metadata(&row.final_path)
+                || crate::iomon::fs::metadata_sync(Cat::Startup, &row.final_path)
                     .map(|m| m.len() > 0)
                     .unwrap_or(false);
             if has_capture {
@@ -4520,7 +4521,7 @@ impl Supervisor {
                         src.file_name().map(|n| n.to_os_string()).unwrap_or_default(),
                     );
                     if let Some(p) = dest.parent() {
-                        let _ = tokio::fs::create_dir_all(p).await;
+                        let _ = crate::iomon::fs::create_dir_all(Cat::DirSetup, p).await;
                     }
                     // The download landing on disk matters more than a fully-
                     // descriptive name — see rename_or_shorten.
@@ -4816,7 +4817,7 @@ impl Supervisor {
             return;
         }
         if let Some(parent) = plan.capture_path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
+            let _ = crate::iomon::fs::create_dir_all(Cat::DirSetup, parent).await;
             crate::platform::set_hidden(parent);
         }
         let _ = self
@@ -4979,7 +4980,7 @@ impl Supervisor {
         let now = std::time::SystemTime::now();
         for d in dirs {
             let cache = cache_dir(Path::new(&d));
-            let Ok(mut rd) = tokio::fs::read_dir(&cache).await else {
+            let Ok(mut rd) = crate::iomon::fs::read_dir(Cat::CacheSweep, &cache).await else {
                 continue;
             };
             let mut removed = 0u32;
@@ -5000,14 +5001,14 @@ impl Supervisor {
                     .and_then(|m| now.duration_since(m).ok())
                     .map(|age| age.as_secs() >= CACHE_MAX_AGE_SECS)
                     .unwrap_or(false);
-                if stale && meta.is_file() && tokio::fs::remove_file(entry.path()).await.is_ok() {
+                if stale && meta.is_file() && crate::iomon::fs::remove_file(Cat::CacheSweep, entry.path()).await.is_ok() {
                     removed += 1;
                 }
             }
             if removed > 0 {
                 info!("swept {removed} stale .cache file(s) from {d}");
             }
-            let _ = tokio::fs::remove_dir(&cache).await; // only if now empty
+            let _ = crate::iomon::fs::remove_dir(Cat::CacheSweep, &cache).await; // only if now empty
         }
     }
 
@@ -5206,10 +5207,10 @@ impl Supervisor {
             // AV scanner briefly holding the fresh .vod.mkv).
             let live = PathBuf::from(&live_path);
             let backup = live.with_extension("pre-vod.bak");
-            match tokio::fs::rename(&live, &backup).await {
-                Ok(()) => match tokio::fs::rename(final_path, &live).await {
+            match crate::iomon::fs::rename(Cat::Promote, &live, &backup).await {
+                Ok(()) => match crate::iomon::fs::rename(Cat::Promote, final_path, &live).await {
                     Ok(()) => {
-                        let _ = tokio::fs::remove_file(&backup).await;
+                        let _ = crate::iomon::fs::remove_file(Cat::Promote, &backup).await;
                         let live_s = live.to_string_lossy().into_owned();
                         let _ = self.store.update_recording_output_path(rec_id, &live_s);
                         let _ = self.store.set_recording_vod_archived(rec_id, &live_s, "replaced");
@@ -5217,7 +5218,7 @@ impl Supervisor {
                     }
                     Err(e) => {
                         // Put the live capture back; the VOD stays alongside.
-                        let _ = tokio::fs::rename(&backup, &live).await;
+                        let _ = crate::iomon::fs::rename(Cat::Promote, &backup, &live).await;
                         warn!(rec_id, "vod archive: replace rename failed: {e:#} (live restored, VOD kept alongside)");
                     }
                 },
@@ -5527,10 +5528,10 @@ impl Supervisor {
             }
         };
         let cache = cache_dir(&out_dir);
-        let _ = tokio::fs::create_dir_all(&cache).await;
+        let _ = crate::iomon::fs::create_dir_all(Cat::Recovery, &cache).await;
         crate::platform::set_hidden(&cache);
         let pl_path = cache.join(format!("{stem}.head.m3u8"));
-        if let Err(e) = tokio::fs::write(&pl_path, &playlist.text).await {
+        if let Err(e) = crate::iomon::fs::write(Cat::Recovery, &pl_path, &playlist.text).await {
             warn!(rec_id, "head backfill: cannot write playlist: {e:#}");
             finish(crate::events::TaskOutcome::Failed(format!("write playlist: {e}")));
             return;
@@ -5546,11 +5547,11 @@ impl Supervisor {
         {
             warn!(rec_id, "head backfill: mux failed: {e:#}");
             finish(crate::events::TaskOutcome::Failed(format!("mux: {e:#}")));
-            let _ = tokio::fs::remove_file(&tmp_head).await;
-            let _ = tokio::fs::remove_file(&pl_path).await;
+            let _ = crate::iomon::fs::remove_file(Cat::Recovery, &tmp_head).await;
+            let _ = crate::iomon::fs::remove_file(Cat::Recovery, &pl_path).await;
             return;
         }
-        let _ = tokio::fs::remove_file(&pl_path).await;
+        let _ = crate::iomon::fs::remove_file(Cat::Recovery, &pl_path).await;
         let muted_used = playlist.muted_used;
         match rename_or_shorten(&tmp_head, &out_dir, &stem, "head.mkv").await {
             Ok(dest) => {
@@ -5616,7 +5617,7 @@ impl Supervisor {
             // before the head file disappears out from under it.
             self.maybe_concat_backfill(old_id).await;
             let path = PathBuf::from(&old_path);
-            let removed = match tokio::fs::remove_file(&path).await {
+            let removed = match crate::iomon::fs::remove_file(Cat::CacheSweep, &path).await {
                 Ok(()) => true,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
                 Err(e) => {
@@ -5662,7 +5663,7 @@ impl Supervisor {
         let capture_path = if still_recording {
             let mut found = None;
             for c in live_capture_candidates(&final_path) {
-                if tokio::fs::metadata(&c).await.is_ok() {
+                if crate::iomon::fs::metadata(Cat::CacheSweep, &c).await.is_ok() {
                     found = Some(c);
                     break;
                 }
@@ -5765,12 +5766,12 @@ impl Supervisor {
         };
 
         let cache = cache_dir(&out_dir);
-        let _ = tokio::fs::create_dir_all(&cache).await;
+        let _ = crate::iomon::fs::create_dir_all(Cat::Promote, &cache).await;
         let tmp_full = cache.join(format!("{stem}.full.mkv"));
         if let Err(e) = concat_mkvs(&cache, &head_p, &live_p, &tmp_full).await {
             warn!(rec_id, "head concat failed: {e:#}");
             finish(crate::events::TaskOutcome::Failed(format!("{e:#}")));
-            let _ = tokio::fs::remove_file(&tmp_full).await;
+            let _ = crate::iomon::fs::remove_file(Cat::Promote, &tmp_full).await;
             return;
         }
         // Duration sanity: a silently-broken concat (e.g. only one part copied)
@@ -5801,7 +5802,7 @@ impl Supervisor {
             finish(crate::events::TaskOutcome::Failed(format!(
                 "joined duration {full_d}s vs expected {expected}s"
             )));
-            let _ = tokio::fs::remove_file(&tmp_full).await;
+            let _ = crate::iomon::fs::remove_file(Cat::Promote, &tmp_full).await;
             return;
         }
         // Idempotency: another completion path may have joined while we muxed.
@@ -5809,7 +5810,7 @@ impl Supervisor {
             self.store.backfill_concat_info(rec_id).ok().flatten(),
             Some((_, _, _, Some(_)))
         ) {
-            let _ = tokio::fs::remove_file(&tmp_full).await;
+            let _ = crate::iomon::fs::remove_file(Cat::Promote, &tmp_full).await;
             finish(crate::events::TaskOutcome::Completed);
             return;
         }
@@ -6499,7 +6500,7 @@ async fn concat_mkvs(
         .unwrap_or_else(|| "concat".into());
     let list_path = list_dir.join(format!("{stem}.concat.txt"));
     let list = format!("ffconcat version 1.0\n{}\n{}\n", entry(head), entry(tail));
-    tokio::fs::write(&list_path, list).await?;
+    crate::iomon::fs::write(Cat::ConcatList, &list_path, list).await?;
 
     // One full-file pass at a time on the recordings drive (see io_gate).
     let _gate = crate::io_gate::local_pass("concat").await;
@@ -6545,7 +6546,7 @@ async fn concat_mkvs(
         }
         break out;
     };
-    let _ = tokio::fs::remove_file(&list_path).await;
+    let _ = crate::iomon::fs::remove_file(Cat::ConcatList, &list_path).await;
     let out = out?;
     if out.status.success() {
         Ok(())
@@ -6767,7 +6768,7 @@ pub async fn remux_ts_to_mkv(
 }
 
 async fn file_len(path: &Path) -> u64 {
-    tokio::fs::metadata(path)
+    crate::iomon::fs::metadata(Cat::FsProbe, path)
         .await
         .map(|m| m.len())
         .unwrap_or(0)
@@ -6791,7 +6792,7 @@ const CAPTURE_STALL_KILL_SECS: u64 = 60 * 60;
 /// directory entry, which NTFS updates lazily while a writer holds the file
 /// open; opening the file queries the handle, which is always current.
 async fn open_len_mtime(p: &Path) -> Option<(u64, i64)> {
-    let f = tokio::fs::File::open(p).await.ok()?;
+    let f = crate::iomon::fs::open(Cat::FsProbe, p).await.ok()?;
     let md = f.metadata().await.ok()?;
     let mtime = md
         .modified()
@@ -6822,7 +6823,7 @@ async fn stall_sample(log_path: &Path, capture_path: &Path) -> StallSample {
     let mut has_capture = false;
     if let (Some(dir), Some(stem)) = (capture_path.parent(), capture_path.file_stem()) {
         let stem = stem.to_string_lossy().into_owned();
-        if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
+        if let Ok(mut rd) = crate::iomon::fs::read_dir(Cat::FsProbe, dir).await {
             while let Ok(Some(e)) = rd.next_entry().await {
                 let name = e.file_name().to_string_lossy().into_owned();
                 // Only THIS capture's own outputs count: the rest after the
@@ -6949,11 +6950,11 @@ pub async fn embed_thumbnail_into_mkv(mkv: &Path, thumb: &Path) -> anyhow::Resul
         break out;
     };
     if !out.status.success() {
-        let _ = tokio::fs::remove_file(&tmp).await;
+        let _ = crate::iomon::fs::remove_file(Cat::Thumbnail, &tmp).await;
         let tail = String::from_utf8_lossy(&out.stderr);
         anyhow::bail!("ffmpeg embed-thumbnail failed: {}", tail.trim().lines().last().unwrap_or(""));
     }
-    tokio::fs::rename(&tmp, mkv).await?;
+    crate::iomon::fs::rename(Cat::Thumbnail, &tmp, mkv).await?;
     Ok(())
 }
 
@@ -7013,13 +7014,13 @@ pub async fn embed_subtitles_into_mkv(mkv: &Path) -> anyhow::Result<bool> {
         break out;
     };
     if !out.status.success() {
-        let _ = tokio::fs::remove_file(&tmp).await;
+        let _ = crate::iomon::fs::remove_file(Cat::Thumbnail, &tmp).await;
         let tail = String::from_utf8_lossy(&out.stderr);
         anyhow::bail!("ffmpeg embed-subs failed: {}", tail.trim().lines().last().unwrap_or(""));
     }
-    tokio::fs::rename(&tmp, mkv).await?;
+    crate::iomon::fs::rename(Cat::Thumbnail, &tmp, mkv).await?;
     for sub in &subs {
-        let _ = tokio::fs::remove_file(sub).await;
+        let _ = crate::iomon::fs::remove_file(Cat::Thumbnail, sub).await;
     }
     Ok(true)
 }
@@ -7100,7 +7101,7 @@ pub async fn reorganize_recording_files(
         return Ok(None);
     }
 
-    if let Err(e) = tokio::fs::create_dir_all(&target_dir).await {
+    if let Err(e) = crate::iomon::fs::create_dir_all(Cat::Promote, &target_dir).await {
         anyhow::bail!("create_dir_all {:?}: {e:#}", target_dir);
     }
     let file_name = match current.file_name().and_then(|n| n.to_str()) {
@@ -7108,7 +7109,7 @@ pub async fn reorganize_recording_files(
         None => return Ok(None),
     };
     let new_video_path = target_dir.join(&file_name);
-    tokio::fs::rename(&current, &new_video_path).await?;
+    crate::iomon::fs::rename(Cat::Promote, &current, &new_video_path).await?;
 
     // Move companion files (subs, thumbnail, chat) to their own dirs.
     if cfg.enabled && !reverse {
@@ -7121,7 +7122,7 @@ pub async fn reorganize_recording_files(
             let sub_dir = base_dir.join(sub);
             move_companions(&sub_dir, &base_dir, &stem).await;
             // Try to remove the empty sub-dir (best effort; only our dirs).
-            let _ = tokio::fs::remove_dir(&sub_dir).await;
+            let _ = crate::iomon::fs::remove_dir(Cat::Promote, &sub_dir).await;
         }
     } else {
         // Normal companion move: keep everything together with the video.
@@ -7139,7 +7140,7 @@ pub async fn reorganize_recording_files(
 /// based on `cfg`. Best-effort — skips files that can't be moved.
 async fn move_companions_to_subdirs(from_dir: &Path, base_dir: &Path, stem: &str, cfg: &crate::models::SubdirConfig) {
     let prefix = format!("{stem}.");
-    let mut rd = match tokio::fs::read_dir(from_dir).await {
+    let mut rd = match crate::iomon::fs::read_dir(Cat::Promote, from_dir).await {
         Ok(rd) => rd,
         Err(_) => return,
     };
@@ -7166,9 +7167,9 @@ async fn move_companions_to_subdirs(from_dir: &Path, base_dir: &Path, stem: &str
         };
         if let Some(sub) = target_sub {
             let target_dir = base_dir.join(sub);
-            let _ = tokio::fs::create_dir_all(&target_dir).await;
+            let _ = crate::iomon::fs::create_dir_all(Cat::Promote, &target_dir).await;
             let dst = target_dir.join(&name);
-            let _ = tokio::fs::rename(entry.path(), dst).await;
+            let _ = crate::iomon::fs::rename(Cat::Promote, entry.path(), dst).await;
         }
     }
 }
@@ -7182,7 +7183,7 @@ pub(crate) async fn sweep_companion_files(dir: &Path, cfg: &crate::models::Subdi
     if !cfg.enabled {
         return;
     }
-    let mut rd = match tokio::fs::read_dir(dir).await {
+    let mut rd = match crate::iomon::fs::read_dir(Cat::Promote, dir).await {
         Ok(rd) => rd,
         Err(_) => return,
     };
@@ -7211,9 +7212,9 @@ pub(crate) async fn sweep_companion_files(dir: &Path, cfg: &crate::models::Subdi
         };
         if let Some(sub) = target_sub {
             let target_dir = dir.join(sub);
-            let _ = tokio::fs::create_dir_all(&target_dir).await;
+            let _ = crate::iomon::fs::create_dir_all(Cat::Promote, &target_dir).await;
             let dst = target_dir.join(&name);
-            let _ = tokio::fs::rename(entry.path(), dst).await;
+            let _ = crate::iomon::fs::rename(Cat::Promote, entry.path(), dst).await;
         }
     }
 }
@@ -7254,11 +7255,11 @@ pub async fn rename_recording_files(
     }
 
     let new_file = dir.join(format!("{new_stem_clean}.{ext}"));
-    tokio::fs::rename(&current, &new_file).await?;
+    crate::iomon::fs::rename(Cat::Promote, &current, &new_file).await?;
 
     // Rename companion files.
     let prefix_old = format!("{old_stem}.");
-    let mut rd = match tokio::fs::read_dir(&dir).await {
+    let mut rd = match crate::iomon::fs::read_dir(Cat::Promote, &dir).await {
         Ok(rd) => rd,
         Err(_) => {
             let new_path = new_file.to_string_lossy().into_owned();
@@ -7275,7 +7276,7 @@ pub async fn rename_recording_files(
             if is_companion_suffix(rest) {
                 let new_name = format!("{new_stem_clean}.{rest}");
                 let dst = dir.join(&new_name);
-                let _ = tokio::fs::rename(entry.path(), dst).await;
+                let _ = crate::iomon::fs::rename(Cat::Promote, entry.path(), dst).await;
             }
         }
     }
@@ -7655,7 +7656,7 @@ fn collect_subtitle_sidecars(src: &Path) -> Vec<PathBuf> {
     let stem = match src.file_stem() { Some(s) => s.to_string_lossy().into_owned(), None => return Vec::new() };
     let prefix = format!("{stem}.");
     let mut subs = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(dir) {
+    if let Ok(rd) = crate::iomon::fs::read_dir_sync(Cat::Thumbnail, dir) {
         for entry in rd.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             if !name.starts_with(&prefix) {
@@ -7711,7 +7712,7 @@ fn is_companion_suffix(rest: &str) -> bool {
 /// keeping it a week is a debugging improvement, not a regression).
 fn capture_log_path(capture_path: &Path, suffix: &str) -> PathBuf {
     let dir = crate::app_paths::logs_dir().join("captures");
-    let _ = std::fs::create_dir_all(&dir);
+    let _ = crate::iomon::fs::create_dir_all_sync(Cat::ToolLog, &dir);
     // Capture file names carry channel + timestamp (+ .dash infix for the
     // companion), so appending the suffix keeps sibling legs distinct.
     let name = capture_path
@@ -7752,7 +7753,7 @@ async fn promote_capture(plan: &DownloadPlan, opts: &crate::models::RemuxOpts) -
         let dest = path_with_safe_stem(&plan.final_path);
         match remux_ts_to_mkv(&effective, &dest, None, opts).await {
             Ok(()) => {
-                let _ = tokio::fs::remove_file(&effective).await;
+                let _ = crate::iomon::fs::remove_file(Cat::Promote, &effective).await;
                 dest
             }
             Err(e) => {
@@ -7767,7 +7768,7 @@ async fn promote_capture(plan: &DownloadPlan, opts: &crate::models::RemuxOpts) -
         // to a shortened one rather than leaving a completed capture stuck
         // (and, after 24h, swept as stale) in the hidden `.cache\`.
         if let Some(parent) = plan.final_path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
+            let _ = crate::iomon::fs::create_dir_all(Cat::Promote, parent).await;
         }
         let dir = plan.final_path.parent().unwrap_or_else(|| Path::new("."));
         let stem = plan
@@ -7795,7 +7796,7 @@ async fn promote_capture(plan: &DownloadPlan, opts: &crate::models::RemuxOpts) -
 /// Best-effort; never clobbers an existing target.
 async fn move_companions(from_dir: &Path, to_dir: &Path, stem: &str) {
     let prefix = format!("{stem}.");
-    let mut rd = match tokio::fs::read_dir(from_dir).await {
+    let mut rd = match crate::iomon::fs::read_dir(Cat::Promote, from_dir).await {
         Ok(rd) => rd,
         Err(_) => return,
     };
@@ -7811,7 +7812,7 @@ async fn move_companions(from_dir: &Path, to_dir: &Path, stem: &str) {
         if to.exists() {
             continue;
         }
-        match tokio::fs::rename(entry.path(), &to).await {
+        match crate::iomon::fs::rename(Cat::Promote, entry.path(), &to).await {
             Ok(()) => {}
             Err(e) if is_name_too_long(&e) => {
                 if let Err(e) = rename_or_shorten(&entry.path(), to_dir, stem, rest).await {
@@ -7828,15 +7829,15 @@ async fn move_companions(from_dir: &Path, to_dir: &Path, stem: &str) {
 /// the cache dir if it is now empty. Best-effort.
 async fn purge_cache(cache: &Path, stem: &str) {
     let prefix = format!("{stem}.");
-    if let Ok(mut rd) = tokio::fs::read_dir(cache).await {
+    if let Ok(mut rd) = crate::iomon::fs::read_dir(Cat::CacheSweep, cache).await {
         while let Ok(Some(entry)) = rd.next_entry().await {
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.starts_with(&prefix) {
-                let _ = tokio::fs::remove_file(entry.path()).await;
+                let _ = crate::iomon::fs::remove_file(Cat::CacheSweep, entry.path()).await;
             }
         }
     }
-    let _ = tokio::fs::remove_dir(cache).await; // only if empty
+    let _ = crate::iomon::fs::remove_dir(Cat::CacheSweep, cache).await; // only if empty
 }
 
 /// When the main recording file is renamed, move its companion sidecars
@@ -7849,7 +7850,7 @@ async fn rename_companion_sidecars(dir: &Path, old_stem: &str, new_stem: &str) {
         return;
     }
     let prefix = format!("{old_stem}.");
-    let mut rd = match tokio::fs::read_dir(dir).await {
+    let mut rd = match crate::iomon::fs::read_dir(Cat::Promote, dir).await {
         Ok(rd) => rd,
         Err(_) => return,
     };
@@ -7878,7 +7879,7 @@ async fn rename_companion_sidecars(dir: &Path, old_stem: &str, new_stem: &str) {
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 delay_ms *= 2; // 500 → 1000 → 2000 → 4000 ms
             }
-            match tokio::fs::rename(&src, &to).await {
+            match crate::iomon::fs::rename(Cat::Promote, &src, &to).await {
                 Ok(()) => { last_err = None; renamed = true; break; }
                 Err(e) if e.raw_os_error() == Some(32)  // Windows: SHARING_VIOLATION
                        || e.raw_os_error() == Some(16)  // Unix: EBUSY
@@ -8255,7 +8256,7 @@ async fn newest_with_stem(predicted: &Path) -> Option<PathBuf> {
     let dir = predicted.parent()?;
     let stem = predicted.file_stem()?.to_string_lossy().into_owned();
     let mut best: Option<(u64, PathBuf)> = None;
-    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
+    let mut entries = crate::iomon::fs::read_dir(Cat::FsProbe, dir).await.ok()?;
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with(&stem) && plausible_media_output(&name[stem.len()..]) {
@@ -8596,7 +8597,7 @@ async fn rename_or_shorten(
     suffix: &str,
 ) -> std::io::Result<PathBuf> {
     let to = dir.join(format!("{stem}.{suffix}"));
-    match tokio::fs::rename(from, &to).await {
+    match crate::iomon::fs::rename(Cat::Promote, from, &to).await {
         Ok(()) => Ok(to),
         Err(e) if !is_name_too_long(&e) => Err(e),
         Err(first_err) => {
@@ -8612,7 +8613,7 @@ async fn rename_or_shorten(
                     // siblings that independently compute the same candidate.
                     return Err(first_err);
                 }
-                match tokio::fs::rename(from, &candidate).await {
+                match crate::iomon::fs::rename(Cat::Promote, from, &candidate).await {
                     Ok(()) => {
                         warn!(
                             "shortened an over-long filename to fit the filesystem: {} -> {}",
@@ -9095,6 +9096,8 @@ async fn poll_twitch_vod_muted(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
     use crate::models::{Channel, Container, DetectionMethod, Monitor, Tool};
 
