@@ -1023,7 +1023,7 @@ impl DetectContext {
         path: &Path,
         cfg: &ChannelSourceConfig,
     ) -> Option<Vec<ScheduleSegment>> {
-        let bytes = tokio::fs::read(path).await.ok()?;
+        let bytes = crate::iomon::fs::read(crate::iomon::Cat::Detector, path).await.ok()?;
         let hash = fnv64(&bytes);
         let key = (monitor_id, source_id.to_string());
         if let Some((cached, segs)) = self.ocr_cache.lock().await.get(&key) {
@@ -1346,18 +1346,19 @@ impl DetectContext {
         crate::assets::download_image(&self.http, img_url, &tmp)
             .await
             .ok()?;
-        let bytes = tokio::fs::read(&tmp).await.ok()?;
+        use crate::iomon::Cat;
+        let bytes = crate::iomon::fs::read(Cat::Detector, &tmp).await.ok()?;
         let content_hash = fnv64(&bytes).to_string();
 
         // Content-addressed final path: every distinct image kept (durable archive).
         let dest = self.schedule_src_path(row, &format!("community_{content_hash}"), ext);
-        if tokio::fs::try_exists(&dest).await.unwrap_or(false) {
+        if crate::iomon::fs::try_exists(Cat::Detector, &dest).await.unwrap_or(false) {
             // Already archived (identical bytes) — drop the temp, keep the original.
-            let _ = tokio::fs::remove_file(&tmp).await;
-        } else if tokio::fs::rename(&tmp, &dest).await.is_err() {
+            let _ = crate::iomon::fs::remove_file(Cat::Detector, &tmp).await;
+        } else if crate::iomon::fs::rename(Cat::Detector, &tmp, &dest).await.is_err() {
             // Rename failed (e.g. cross-device) — fall back to a copy.
-            let _ = tokio::fs::write(&dest, &bytes).await;
-            let _ = tokio::fs::remove_file(&tmp).await;
+            let _ = crate::iomon::fs::write(Cat::Detector, &dest, &bytes).await;
+            let _ = crate::iomon::fs::remove_file(Cat::Detector, &tmp).await;
         }
 
         self.store
@@ -1388,14 +1389,15 @@ impl DetectContext {
             crate::assets::channel_asset_dir(&row.channel.name, platform, &account).join("posts");
         let tmp = posts_dir.join(format!("tmp.{ext}"));
         crate::assets::download_image(&self.http, img_url, &tmp).await.ok()?;
-        let bytes = tokio::fs::read(&tmp).await.ok()?;
+        use crate::iomon::Cat;
+        let bytes = crate::iomon::fs::read(Cat::Detector, &tmp).await.ok()?;
         let content_hash = fnv64(&bytes).to_string();
         let dest = posts_dir.join(format!("{content_hash}.{ext}"));
-        if tokio::fs::try_exists(&dest).await.unwrap_or(false) {
-            let _ = tokio::fs::remove_file(&tmp).await;
-        } else if tokio::fs::rename(&tmp, &dest).await.is_err() {
-            let _ = tokio::fs::write(&dest, &bytes).await;
-            let _ = tokio::fs::remove_file(&tmp).await;
+        if crate::iomon::fs::try_exists(Cat::Detector, &dest).await.unwrap_or(false) {
+            let _ = crate::iomon::fs::remove_file(Cat::Detector, &tmp).await;
+        } else if crate::iomon::fs::rename(Cat::Detector, &tmp, &dest).await.is_err() {
+            let _ = crate::iomon::fs::write(Cat::Detector, &dest, &bytes).await;
+            let _ = crate::iomon::fs::remove_file(Cat::Detector, &tmp).await;
         }
         Some((content_hash, dest))
     }

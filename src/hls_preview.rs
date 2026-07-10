@@ -119,7 +119,7 @@ fn tfdt_time(f: &mut File, moof_off: u64, moof_size: u64) -> Option<u64> {
 impl Scanner {
     /// Open a growing file, verifying it starts with an ISOBMFF `ftyp`.
     fn open(path: &Path) -> Option<Scanner> {
-        let mut file = File::open(path).ok()?;
+        let mut file = crate::iomon::fs::open_sync(crate::iomon::Cat::Preview, path).ok()?;
         let (_, typ) = box_header(&mut file, 0)?;
         if &typ != b"ftyp" {
             return None;
@@ -217,17 +217,18 @@ impl Scanner {
 /// open file fails with a sharing violation. A skipped cycle just means the
 /// playlist lags one update.
 fn replace_playlist(dst: &Path, content: &str) {
+    use crate::iomon::Cat;
     let tmp = dst.with_extension("m3u8.tmp");
-    if std::fs::write(&tmp, content).is_err() {
+    if crate::iomon::fs::write_sync(Cat::Preview, &tmp, content).is_err() {
         return;
     }
     for _ in 0..10 {
-        if std::fs::rename(&tmp, dst).is_ok() {
+        if crate::iomon::fs::rename_sync(Cat::Preview, &tmp, dst).is_ok() {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(30));
     }
-    let _ = std::fs::remove_file(&tmp);
+    let _ = crate::iomon::fs::remove_file_sync(Cat::Preview, &tmp);
 }
 
 /// Render a media playlist over the scanner's segments. `media_uri` is the

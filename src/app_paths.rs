@@ -4,13 +4,30 @@ use std::path::PathBuf;
 
 use directories::{ProjectDirs, UserDirs};
 
+/// `create_dir_all` with manual I/O-monitor accounting instead of the
+/// `iomon::fs` facade: `iomon::classify` resolves the data dir through these
+/// very helpers, so routing them through the facade (which classifies) would
+/// re-enter that lazy initialization.
+#[allow(clippy::disallowed_methods)]
+fn ensure_dir(dir: &std::path::Path) {
+    let start = std::time::Instant::now();
+    let _ = std::fs::create_dir_all(dir);
+    crate::iomon::record_region(
+        crate::iomon::Cat::Startup,
+        crate::iomon::Region::AppData,
+        crate::iomon::OpKind::Create,
+        0,
+        start.elapsed(),
+    );
+}
+
 /// Resolve (and create) the application data directory, e.g.
 /// `%APPDATA%\StreamArchiver\data` on Windows.
 pub fn data_dir() -> PathBuf {
     let dir = ProjectDirs::from("", "", "StreamArchiver")
         .map(|p| p.data_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("./streamarchiver-data"));
-    let _ = std::fs::create_dir_all(&dir);
+    ensure_dir(&dir);
     dir
 }
 
@@ -38,7 +55,7 @@ pub fn default_output_dir() -> PathBuf {
 /// e.g. `%APPDATA%\StreamArchiver\data\asset-cache\` on Windows.
 pub fn asset_cache_dir() -> PathBuf {
     let dir = data_dir().join("asset-cache");
-    let _ = std::fs::create_dir_all(&dir);
+    ensure_dir(&dir);
     dir
 }
 
@@ -46,13 +63,13 @@ pub fn asset_cache_dir() -> PathBuf {
 /// e.g. `%APPDATA%\StreamArchiver\data\asset-cache\platform_assets\`.
 pub fn platform_assets_dir() -> PathBuf {
     let dir = asset_cache_dir().join("platform_assets");
-    let _ = std::fs::create_dir_all(&dir);
+    ensure_dir(&dir);
     dir
 }
 
 /// Directory for rotating log files, e.g. `%APPDATA%\StreamArchiver\data\logs\`.
 pub fn logs_dir() -> PathBuf {
     let dir = data_dir().join("logs");
-    let _ = std::fs::create_dir_all(&dir);
+    ensure_dir(&dir);
     dir
 }

@@ -899,7 +899,7 @@ fn show_task_dialog_win32(
 /// Win32 memory handle types across crate versions).
 fn copy_to_clipboard(text: &str) {
     let tmp = std::env::temp_dir().join("streamarchiver_crash_detail.txt");
-    if std::fs::write(&tmp, text).is_ok() {
+    if crate::iomon::fs::write_sync(crate::iomon::Cat::Startup, &tmp, text).is_ok() {
         let _ = std::process::Command::new("powershell")
             .args([
                 "-NoProfile",

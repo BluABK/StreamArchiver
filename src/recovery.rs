@@ -647,7 +647,7 @@ fn truncate_playlist_window(src: &str, skip_secs: f64, window_secs: f64) -> Stri
 
 /// Sum the `#EXTINF:<secs>,` durations in a playlist file (for progress %).
 async fn playlist_duration_secs(path: &Path) -> Option<f64> {
-    let text = tokio::fs::read_to_string(path).await.ok()?;
+    let text = crate::iomon::fs::read_to_string(crate::iomon::Cat::Recovery, path).await.ok()?;
     let mut total = 0.0f64;
     for line in text.lines() {
         if let Some(secs) = line
@@ -990,14 +990,15 @@ pub async fn run_recovery(
         }
     };
 
-    if let Err(e) = tokio::fs::create_dir_all(&out_dir).await {
+    use crate::iomon::Cat;
+    if let Err(e) = crate::iomon::fs::create_dir_all(Cat::Recovery, &out_dir).await {
         finish_fail(format!("cannot create output dir: {e}"));
         return;
     }
     let cache = out_dir.join(".cache");
-    let _ = tokio::fs::create_dir_all(&cache).await;
+    let _ = crate::iomon::fs::create_dir_all(Cat::Recovery, &cache).await;
     let temp_playlist = cache.join(format!("{base_stem}.m3u8"));
-    if let Err(e) = tokio::fs::write(&temp_playlist, &recovered.text).await {
+    if let Err(e) = crate::iomon::fs::write(Cat::Recovery, &temp_playlist, &recovered.text).await {
         finish_fail(format!("cannot write playlist: {e}"));
         return;
     }
@@ -1006,12 +1007,15 @@ pub async fn run_recovery(
     let dst = out_dir.join(format!("{final_stem}.mkv"));
 
     let mux = mux_playlist_to_mkv(&temp_playlist, &dst, Some((events.clone(), task_id)), None).await;
-    let _ = tokio::fs::remove_file(&temp_playlist).await;
+    let _ = crate::iomon::fs::remove_file(Cat::Recovery, &temp_playlist).await;
 
     match mux {
         Ok(()) => {
             let state = if recovered.missing == 0 { "recovered" } else { "partial" };
-            let bytes = tokio::fs::metadata(&dst).await.map(|m| m.len() as i64).unwrap_or(0);
+            let bytes = crate::iomon::fs::metadata(Cat::Recovery, &dst)
+                .await
+                .map(|m| m.len() as i64)
+                .unwrap_or(0);
             match &sink {
                 RecoverySink::Recording(id) => {
                     let _ = store.set_recording_recovered(*id, &dst.to_string_lossy(), state);

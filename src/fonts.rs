@@ -115,7 +115,7 @@ pub fn install_unicode_fonts(ctx: &egui::Context) {
 
     for group in FONT_GROUPS {
         for path in *group {
-            match std::fs::read(path) {
+            match crate::iomon::fs::read_sync(crate::iomon::Cat::Startup, path) {
                 Ok(bytes) => {
                     let key = format!("sys:{path}");
                     fonts

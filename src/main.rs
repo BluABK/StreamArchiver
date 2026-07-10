@@ -492,7 +492,7 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         if let Some(parent) = plan.capture_path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
+            let _ = crate::iomon::fs::create_dir_all(crate::iomon::Cat::DirSetup, parent).await;
         }
         let mut cmd = tokio::process::Command::new(&plan.program);
         cmd.args(&plan.args)
@@ -512,7 +512,7 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-        let ts_len = tokio::fs::metadata(&plan.capture_path)
+        let ts_len = crate::iomon::fs::metadata(crate::iomon::Cat::Other, &plan.capture_path)
             .await
             .map(|m| m.len())
             .unwrap_or(0);
@@ -523,7 +523,7 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
         if plan.remux_to_mkv && ts_len > 0 {
             match downloader::remux_ts_to_mkv(&plan.capture_path, &plan.final_path, None, &Default::default()).await {
                 Ok(()) => {
-                    let mkv = tokio::fs::metadata(&plan.final_path)
+                    let mkv = crate::iomon::fs::metadata(crate::iomon::Cat::Other, &plan.final_path)
                         .await
                         .map(|m| m.len())
                         .unwrap_or(0);
@@ -678,7 +678,8 @@ fn prune_old_logs(dir: &std::path::Path, keep_days: u64) {
     let cutoff = std::time::SystemTime::now()
         .checked_sub(std::time::Duration::from_secs(keep_days * 86_400))
         .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    use crate::iomon::Cat;
+    let Ok(entries) = crate::iomon::fs::read_dir_sync(Cat::AppLog, dir) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
         // Match both plain `*.log` (capture tool logs) and the daily-rolled
@@ -688,10 +689,10 @@ fn prune_old_logs(dir: &std::path::Path, keep_days: u64) {
         let name = entry.file_name().to_string_lossy().into_owned();
         let is_log = name.ends_with(".log") || name.contains(".log.");
         if is_log
-            && let Ok(meta) = std::fs::metadata(&path)
+            && let Ok(meta) = crate::iomon::fs::metadata_sync(Cat::AppLog, &path)
             && meta.modified().map(|m| m < cutoff).unwrap_or(false)
         {
-            let _ = std::fs::remove_file(&path);
+            let _ = crate::iomon::fs::remove_file_sync(Cat::AppLog, &path);
         }
     }
 }
