@@ -702,7 +702,11 @@ toast (which rule matched, the matching title/game text, and what it did); the
 recording and its takes carry a **⚡ badge** (hover shows the match, e.g.
 `title ~ "karaoke" · capture-from-start forced on`, or
 `title ~ "boss rush" · lead 30s · stops when unmatched (+15s)`); and the
-take's Properties window gets a **Trigger** row. With Auto *on*, rules still
+take's Properties window gets a **Trigger** row. While the recording is
+running, the ⚡ badge also bubbles up to the instance row and the (collapsed)
+channel row — same for the 💬 chat-download badge — so a trigger-started
+recording is visible without expanding the tree; once it ends, the badges stay
+on the stream/take history rows only. With Auto *on*, rules still
 run — the per-rule *From start*/*Lead*/*Only while matching* overrides apply
 to the automatic recording and the match is recorded the same way.
 

@@ -13428,6 +13428,10 @@ impl StreamArchiverApp {
         // Snapshot which monitors have a live capture process (state dots/tints).
         let active_ids: HashSet<i64> =
             self.core.active.lock().unwrap().keys().copied().collect();
+        // Snapshot which monitors have a live-chat download running (💬 badge on
+        // instance rows, bubbled up to their channel row while active).
+        let active_chat_ids: HashSet<i64> =
+            self.core.active_chats.lock().unwrap().keys().copied().collect();
 
         // ── Frame-invariant view data, cached across repaints ────────────────
         // Rebuilding this every frame — cloning every Channel, re-grouping every
@@ -14040,6 +14044,73 @@ impl StreamArchiverApp {
                                                             .on_hover_text(fail_hover(&p.last_recording_log));
                                                     }
                                                 }
+                                                // Bubble the instances' live badges up while
+                                                // they're active — a collapsed channel otherwise
+                                                // hides that a recording was trigger-started or
+                                                // that a chat download is still running.
+                                                // Present-state only: both vanish when the
+                                                // instance goes idle (history stays on the
+                                                // stream/take rows).
+                                                let trig_mons: Vec<&&MonitorWithChannel> = mons
+                                                    .iter()
+                                                    .filter(|m| {
+                                                        active_ids.contains(&m.monitor.id)
+                                                            && !m.last_recording_trigger.is_empty()
+                                                    })
+                                                    .collect();
+                                                if !trig_mons.is_empty() {
+                                                    let label = if trig_mons.len() > 1 {
+                                                        format!("⚡ {}", trig_mons.len())
+                                                    } else {
+                                                        "⚡".to_string()
+                                                    };
+                                                    let hover = if trig_mons.len() == 1 {
+                                                        format!(
+                                                            "Recording started by a trigger word: {}",
+                                                            trig_mons[0].last_recording_trigger
+                                                        )
+                                                    } else {
+                                                        let lines: Vec<String> = trig_mons
+                                                            .iter()
+                                                            .map(|m| {
+                                                                format!(
+                                                                    "{}: {}",
+                                                                    instance_label(&m.monitor.url),
+                                                                    m.last_recording_trigger
+                                                                )
+                                                            })
+                                                            .collect();
+                                                        format!(
+                                                            "Recordings started by trigger words:\n{}",
+                                                            lines.join("\n")
+                                                        )
+                                                    };
+                                                    ui.colored_label(
+                                                        egui::Color32::from_rgb(0xe8, 0xc5, 0x4a),
+                                                        egui::RichText::new(label).small(),
+                                                    )
+                                                    .on_hover_text(hover);
+                                                }
+                                                let chat_count = mons
+                                                    .iter()
+                                                    .filter(|m| active_chat_ids.contains(&m.monitor.id))
+                                                    .count();
+                                                if chat_count > 0 {
+                                                    let label = if chat_count > 1 {
+                                                        format!("💬 {chat_count}")
+                                                    } else {
+                                                        "💬".to_string()
+                                                    };
+                                                    ui.colored_label(
+                                                        egui::Color32::from_rgb(0x4a, 0xc2, 0xff),
+                                                        egui::RichText::new(label).small(),
+                                                    )
+                                                    .on_hover_text(if chat_count > 1 {
+                                                        format!("{chat_count} live-chat downloads are running.")
+                                                    } else {
+                                                        "A live-chat download is running.".to_string()
+                                                    });
+                                                }
                                                 let chan_needs_remux: usize = e.rows.iter()
                                                     .filter_map(|&ri| groups.get(&self.rows[ri].monitor.id))
                                                     .flat_map(|gs| gs.iter())
@@ -14164,12 +14235,7 @@ impl StreamArchiverApp {
                                 let row = &self.rows[ri];
                                 let mid = row.monitor.id;
                                 let recording = active_ids.contains(&mid);
-                                let chat_active = self
-                                    .core
-                                    .active_chats
-                                    .lock()
-                                    .unwrap()
-                                    .contains_key(&mid);
+                                let chat_active = active_chat_ids.contains(&mid);
                                 let is_selected = selected_monitor == Some(mid);
                                 let has_hist = row.recording_count > 0;
                                 let expanded = exp_instances.contains(&mid);
