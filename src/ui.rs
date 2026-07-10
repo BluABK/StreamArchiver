@@ -5,7 +5,6 @@
 //! tray "Quit" item triggers a real close.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::path::Path;
 use std::sync::mpsc::Receiver;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -20019,7 +20018,7 @@ impl StreamArchiverApp {
             if let Some(rec) = self.issues_recs.get(i).cloned() {
                 let path = std::path::Path::new(&rec.output_path);
                 if path.exists() {
-                    let _ = std::fs::remove_file(path);
+                    let _ = crate::iomon::fs::remove_file_sync(crate::iomon::Cat::RecordingDelete, path);
                 }
                 let _ = self.core.store.clear_recording_capture(rec.id);
                 self.issues_recs.retain(|r| r.id != rec.id);
@@ -20032,7 +20031,7 @@ impl StreamArchiverApp {
             for rec in empties {
                 let path = std::path::Path::new(&rec.output_path);
                 if path.exists() {
-                    let _ = std::fs::remove_file(path);
+                    let _ = crate::iomon::fs::remove_file_sync(crate::iomon::Cat::RecordingDelete, path);
                 }
                 let _ = self.core.store.clear_recording_capture(rec.id);
                 self.issues_recs.retain(|r| r.id != rec.id);
@@ -20058,7 +20057,7 @@ impl StreamArchiverApp {
             for rec in all {
                 let path = std::path::Path::new(&rec.output_path);
                 if path.exists() {
-                    let _ = std::fs::remove_file(path);
+                    let _ = crate::iomon::fs::remove_file_sync(crate::iomon::Cat::RecordingDelete, path);
                 }
                 let _ = self.core.store.clear_recording_capture(rec.id);
             }
@@ -20120,7 +20119,7 @@ impl StreamArchiverApp {
             if let Some(rec) = self.issues_errors.get(k).cloned() {
                 let path = std::path::Path::new(&rec.output_path);
                 if path.exists() {
-                    let _ = std::fs::remove_file(path);
+                    let _ = crate::iomon::fs::remove_file_sync(crate::iomon::Cat::RecordingDelete, path);
                 }
                 let _ = self.core.store.clear_recording_capture(rec.id);
                 self.issues_errors.retain(|r| r.id != rec.id);
@@ -20130,7 +20129,7 @@ impl StreamArchiverApp {
             if let Some(rec) = self.issues_errors.get(k).cloned() {
                 let path = std::path::Path::new(&rec.output_path);
                 if path.exists() {
-                    let _ = std::fs::remove_file(path);
+                    let _ = crate::iomon::fs::remove_file_sync(crate::iomon::Cat::RecordingDelete, path);
                 }
                 let _ = self.core.store.delete_recording(rec.id);
                 self.issues_errors.retain(|r| r.id != rec.id);
@@ -20141,7 +20140,7 @@ impl StreamArchiverApp {
             for rec in all {
                 let path = std::path::Path::new(&rec.output_path);
                 if path.exists() {
-                    let _ = std::fs::remove_file(path);
+                    let _ = crate::iomon::fs::remove_file_sync(crate::iomon::Cat::RecordingDelete, path);
                 }
                 let _ = self.core.store.delete_recording(rec.id);
             }
@@ -21057,7 +21056,7 @@ impl StreamArchiverApp {
             let epoch_at = self.emote_epoch.clone();
             let ctx2 = ctx.clone();
             self.core.rt.spawn_blocking(move || {
-                let decoded = std::fs::read(&path).ok().and_then(|b| crate::emote_anim::decode(&b));
+                let decoded = crate::iomon::fs::read_sync(crate::iomon::Cat::AssetCache, &path).ok().and_then(|b| crate::emote_anim::decode(&b));
                 let entry = match decoded {
                     Some((imgs, delays)) => crate::emote_anim::EmoteLoad::Decoded(imgs, delays),
                     None => crate::emote_anim::EmoteLoad::Failed,
@@ -23122,7 +23121,7 @@ fn import_row_matches(row: &ImportRow, q: &str) -> bool {
 /// no colour or assets haven't been fetched.
 fn load_twitch_name_color(name: &str, account: &str) -> Option<egui::Color32> {
     for dir in crate::assets::asset_read_dirs(name, Platform::Twitch, account) {
-        if let Ok(s) = std::fs::read_to_string(dir.join("name_color.txt")) {
+        if let Ok(s) = crate::iomon::fs::read_to_string_sync(crate::iomon::Cat::AssetCache, dir.join("name_color.txt")) {
             return parse_chat_hex_color(s.trim());
         }
     }
@@ -23156,7 +23155,7 @@ fn build_emote_map(name: &str, account: &str) -> HashMap<String, std::path::Path
     let mut map: HashMap<String, std::path::PathBuf> = HashMap::new();
 
     let load = |file: &str| -> Vec<EmoteManifestEntry> {
-        std::fs::read_to_string(emotes_dir.join(file))
+        crate::iomon::fs::read_to_string_sync(crate::iomon::Cat::AssetCache, emotes_dir.join(file))
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
@@ -23252,7 +23251,7 @@ fn load_image_texture(
     ctx: &egui::Context,
     key: &str,
 ) -> Option<(egui::TextureHandle, (u32, u32))> {
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = crate::iomon::fs::read_sync(crate::iomon::Cat::AssetCache, path).ok()?;
     let img = decode_rgba_bounded(&bytes)?;
     let (w, h) = (img.width(), img.height());
     let color_image =
@@ -23360,7 +23359,7 @@ fn enumerate_provider_emotes(name: &str, account: &str, provider: EmoteProvider)
         let manifest_path = emotes_dir.join("twitch.json");
         if manifest_path.exists() {
             let entries: Vec<EmoteManifestEntry> =
-                std::fs::read_to_string(&manifest_path)
+                crate::iomon::fs::read_to_string_sync(crate::iomon::Cat::AssetCache, &manifest_path)
                     .ok()
                     .and_then(|s| serde_json::from_str(&s).ok())
                     .unwrap_or_default();
@@ -23370,7 +23369,7 @@ fn enumerate_provider_emotes(name: &str, account: &str, provider: EmoteProvider)
                 .filter(|e| !e.name.trim().is_empty())
                 .map(|e| {
                     let path = resolve_path(twitch_dir.clone(), &e);
-                    let exists = std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false);
+                    let exists = crate::iomon::fs::metadata_sync(crate::iomon::Cat::AssetCache, &path).map(|m| m.len() > 0).unwrap_or(false);
                     ViewerEmote { name: e.name, id: e.id, ext: e.ext, path, exists }
                 })
                 .collect();
@@ -23378,7 +23377,7 @@ fn enumerate_provider_emotes(name: &str, account: &str, provider: EmoteProvider)
             return out;
         }
         // No manifest yet — dir-list fallback (shows numeric id as name)
-        let mut out: Vec<ViewerEmote> = std::fs::read_dir(emotes_dir.join("twitch"))
+        let mut out: Vec<ViewerEmote> = crate::iomon::fs::read_dir_sync(crate::iomon::Cat::AssetCache, emotes_dir.join("twitch"))
             .into_iter()
             .flatten()
             .flatten()
@@ -23405,7 +23404,7 @@ fn enumerate_provider_emotes(name: &str, account: &str, provider: EmoteProvider)
 
     let Some(manifest_file) = provider.manifest() else { return Vec::new() };
     let entries: Vec<EmoteManifestEntry> =
-        std::fs::read_to_string(emotes_dir.join(manifest_file))
+        crate::iomon::fs::read_to_string_sync(crate::iomon::Cat::AssetCache, emotes_dir.join(manifest_file))
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
@@ -23436,7 +23435,7 @@ fn enumerate_provider_emotes(name: &str, account: &str, provider: EmoteProvider)
         .map(|e| {
             let path = resolve(&e);
             // Mirror `assets::asset_present`: a 0-byte file is treated as absent.
-            let exists = std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false);
+            let exists = crate::iomon::fs::metadata_sync(crate::iomon::Cat::AssetCache, &path).map(|m| m.len() > 0).unwrap_or(false);
             ViewerEmote { name: e.name, id: e.id, ext: e.ext, path, exists }
         })
         .collect();
@@ -23683,7 +23682,7 @@ fn resolve_channel_icon(
 /// These are the older profile pics / banners kept when the channel changed them.
 fn prop_variant_count(asset_dir: &std::path::Path, stem: &str) -> usize {
     let prefix = format!("{stem}_");
-    std::fs::read_dir(asset_dir.join("history"))
+    crate::iomon::fs::read_dir_sync(crate::iomon::Cat::AssetCache, asset_dir.join("history"))
         .map(|rd| {
             rd.flatten()
                 .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
@@ -23713,7 +23712,7 @@ fn asset_status_cell(ui: &mut egui::Ui, present: bool, variants: usize) {
 /// Short "last fetched" label for an asset dir's `.assets_fetched_at` stamp.
 /// Returns `"never"` when the stamp is missing/unparseable.
 fn fmt_asset_stamp(asset_dir: &std::path::Path) -> String {
-    std::fs::read_to_string(asset_dir.join(".assets_fetched_at"))
+    crate::iomon::fs::read_to_string_sync(crate::iomon::Cat::AssetCache, asset_dir.join(".assets_fetched_at"))
         .ok()
         .and_then(|s| s.trim().parse::<i64>().ok())
         .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
@@ -23733,7 +23732,7 @@ fn load_channel_icon(
     key: &str,
 ) -> Option<egui::TextureHandle> {
     let entry = prop_find_first(asset_dir, "icon.")?;
-    let bytes = std::fs::read(&entry).ok()?;
+    let bytes = crate::iomon::fs::read_sync(crate::iomon::Cat::AssetCache, &entry).ok()?;
     let img = decode_rgba_bounded(&bytes)?;
     let size = [img.width() as usize, img.height() as usize];
     let color_image =
@@ -23755,7 +23754,7 @@ fn load_channel_icon_small(
     key: &str,
 ) -> Option<egui::TextureHandle> {
     let path = crate::assets::ensure_scaled_icon(asset_dir, 64)?;
-    let bytes = std::fs::read(&path).ok()?;
+    let bytes = crate::iomon::fs::read_sync(crate::iomon::Cat::AssetCache, &path).ok()?;
     let img = decode_rgba_bounded(&bytes)?;
     let size = [img.width() as usize, img.height() as usize];
     let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &img.into_raw());
@@ -23975,7 +23974,7 @@ fn extract_yt_channel_id(url: &str) -> Option<String> {
 
 /// Find the first entry in `dir` whose filename starts with `prefix`.
 fn prop_find_first(dir: &std::path::Path, prefix: &str) -> Option<std::path::PathBuf> {
-    std::fs::read_dir(dir)
+    crate::iomon::fs::read_dir_sync(crate::iomon::Cat::AssetCache, dir)
         .ok()?
         .flatten()
         .find(|e| e.file_name().to_string_lossy().starts_with(prefix))
@@ -23984,7 +23983,7 @@ fn prop_find_first(dir: &std::path::Path, prefix: &str) -> Option<std::path::Pat
 
 /// Count files (non-recursive) in `dir`.
 fn prop_count_dir_files(dir: &std::path::Path) -> usize {
-    std::fs::read_dir(dir)
+    crate::iomon::fs::read_dir_sync(crate::iomon::Cat::AssetCache, dir)
         .into_iter()
         .flatten()
         .flatten()
@@ -23997,7 +23996,7 @@ fn prop_count_nested_dirs(root: &std::path::Path, depth: usize) -> usize {
     if depth == 0 || !root.is_dir() {
         return 0;
     }
-    std::fs::read_dir(root)
+    crate::iomon::fs::read_dir_sync(crate::iomon::Cat::AssetCache, root)
         .into_iter()
         .flatten()
         .flatten()
@@ -24028,7 +24027,7 @@ fn prop_truncate_path(p: &str, max_chars: usize) -> String {
 /// Read the length of a JSON-array manifest file (BTTV/FFZ/7TV emote manifests).
 /// Returns 0 if the file is absent or unparseable.
 fn prop_read_manifest_count(path: &std::path::Path) -> usize {
-    std::fs::read_to_string(path)
+    crate::iomon::fs::read_to_string_sync(crate::iomon::Cat::AssetCache, path)
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .and_then(|v| v.as_array().map(|a| a.len()))
@@ -24620,10 +24619,10 @@ fn preview_root() -> std::path::PathBuf {
 /// the files linger until this runs on the next preview).
 fn sweep_stale_previews() {
     let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 3600);
-    let Ok(rd) = std::fs::read_dir(preview_root()) else { return };
+    let Ok(rd) = crate::iomon::fs::read_dir_sync(crate::iomon::Cat::Preview, preview_root()) else { return };
     for entry in rd.flatten() {
         if entry.metadata().and_then(|m| m.modified()).map(|t| t < cutoff).unwrap_or(false) {
-            let _ = std::fs::remove_dir_all(entry.path());
+            let _ = crate::iomon::fs::remove_dir_all_sync(crate::iomon::Cat::Preview, entry.path());
         }
     }
 }
@@ -24662,7 +24661,7 @@ fn spawn_live_preview(
 
     let tmp = preview_root().join(format!("{}-{}", m.id, crate::models::now_unix()));
     let cache = tmp.join(".cache");
-    if let Err(e) = std::fs::create_dir_all(&cache) {
+    if let Err(e) = crate::iomon::fs::create_dir_all_sync(crate::iomon::Cat::Preview, &cache) {
         return Some(format!("Failed to create preview dir: {e}"));
     }
 
@@ -24715,12 +24714,12 @@ fn spawn_live_preview(
     };
 
     let log_path = tmp.join("preview.log");
-    let (log_out, log_err) = match std::fs::File::create(&log_path)
+    let (log_out, log_err) = match crate::iomon::fs::create_sync(crate::iomon::Cat::Preview, &log_path)
         .and_then(|f| Ok((f.try_clone()?, f)))
     {
         Ok(pair) => pair,
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&tmp);
+            let _ = crate::iomon::fs::remove_dir_all_sync(crate::iomon::Cat::Preview, &tmp);
             return Some(format!("Failed to create preview log: {e}"));
         }
     };
@@ -24734,7 +24733,7 @@ fn spawn_live_preview(
     {
         Ok(c) => c,
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&tmp);
+            let _ = crate::iomon::fs::remove_dir_all_sync(crate::iomon::Cat::Preview, &tmp);
             warn!(%line, "live-preview: failed to spawn downloader: {e}");
             return Some(format!("Failed to launch downloader for live preview: {e}"));
         }
@@ -24757,7 +24756,7 @@ fn spawn_live_preview(
             let _ = dl.kill(); // fallback; no-op if taskkill got it
             let _ = dl.wait();
             for _ in 0..10 {
-                if std::fs::remove_dir_all(tmp).is_ok() {
+                if crate::iomon::fs::remove_dir_all_sync(crate::iomon::Cat::Preview, tmp).is_ok() {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));
@@ -24765,7 +24764,7 @@ fn spawn_live_preview(
         };
         // Lossy read: yt-dlp's console output isn't guaranteed UTF-8.
         let log_tail = |tmp: &std::path::Path| -> String {
-            let bytes = std::fs::read(tmp.join("preview.log")).unwrap_or_default();
+            let bytes = crate::iomon::fs::read_sync(crate::iomon::Cat::Preview, tmp.join("preview.log")).unwrap_or_default();
             let s = String::from_utf8_lossy(&bytes);
             let cut = s.char_indices().rev().nth(599).map(|(i, _)| i).unwrap_or(0);
             s[cut..].to_string()
@@ -24773,7 +24772,7 @@ fn spawn_live_preview(
         // What the downloader has produced so far (true handle sizes — the
         // dir-entry sizes are stale for open files), for timeout diagnostics.
         let cache_listing = |tmp: &std::path::Path| -> String {
-            let Ok(rd) = std::fs::read_dir(tmp.join(".cache")) else { return String::new() };
+            let Ok(rd) = crate::iomon::fs::read_dir_sync(crate::iomon::Cat::Preview, tmp.join(".cache")) else { return String::new() };
             rd.flatten()
                 .map(|e| {
                     let len = live_file_len(&e.path()).unwrap_or(0);
@@ -25033,7 +25032,7 @@ fn copy_emote_image_to_clipboard(path: &std::path::Path) {
     };
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 
-    let Ok(bytes) = std::fs::read(path) else { return };
+    let Ok(bytes) = crate::iomon::fs::read_sync(crate::iomon::Cat::AssetCache, path) else { return };
 
     let fmt_name: Vec<u16> = "PNG\0".encode_utf16().collect();
     let fmt = unsafe { RegisterClipboardFormatW(windows::core::PCWSTR(fmt_name.as_ptr())) };
@@ -25784,9 +25783,9 @@ async fn download_emoji_images(fetches: &[EmojiFetch]) {
                 Ok(resp) if resp.status().is_success() => {
                     if let Ok(bytes) = resp.bytes().await {
                         if let Some(parent) = f.dest.parent() {
-                            let _ = tokio::fs::create_dir_all(parent).await;
+                            let _ = crate::iomon::fs::create_dir_all(crate::iomon::Cat::AssetCache, parent).await;
                         }
-                        if tokio::fs::write(&f.dest, &bytes).await.is_ok() {
+                        if crate::iomon::fs::write(crate::iomon::Cat::AssetCache, &f.dest, &bytes).await.is_ok() {
                             got = true;
                             break;
                         }
@@ -25804,9 +25803,9 @@ async fn download_emoji_images(fetches: &[EmojiFetch]) {
         if !got && !network_error {
             let marker = f.dest.with_extension("404");
             if let Some(parent) = marker.parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
+                let _ = crate::iomon::fs::create_dir_all(crate::iomon::Cat::AssetCache, parent).await;
             }
-            let _ = tokio::fs::write(&marker, b"").await;
+            let _ = crate::iomon::fs::write(crate::iomon::Cat::AssetCache, &marker, b"").await;
         }
     }
 }
@@ -26158,6 +26157,7 @@ fn parse_twitch_chat_line(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use super::{
         Cell, ChatSegment, DateFmt, SortKey, SortLevel, SortState, STREAM_COLS, STREAM_COLUMNS,
         StreamMetaChange, StreamTarget,
