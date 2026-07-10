@@ -22,6 +22,7 @@
 //! never blocks a hot path (a contended push is dropped; the atomic counters
 //! never miss).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -518,6 +519,407 @@ pub fn snapshot() -> CountersSnapshot {
     CountersSnapshot { cells, ring }
 }
 
+// ===== Child-process registry =====
+
+/// What a registered child process is, for the per-process table and for
+/// attributing its I/O to a storage region (approximate: a process's
+/// `IO_COUNTERS` are not per-volume, so we attribute by its target path).
+#[derive(Clone, Debug)]
+pub struct ChildInfo {
+    /// Channel / video / job name shown in the per-process table.
+    pub label: String,
+    /// Program: streamlink / yt-dlp / ffmpeg / ffprobe / ...
+    pub tool: String,
+    /// capture / chat / remux / concat / embed / recovery / probe / ...
+    pub purpose: &'static str,
+    /// Region of the file the tool works against.
+    pub region: Region,
+    /// OS process creation time (see `platform::process_start_time`) so a
+    /// recycled PID is never attributed; 0 = unknown (skip the check).
+    pub proc_start: u64,
+}
+
+static CHILDREN: Mutex<Option<HashMap<u32, ChildInfo>>> = Mutex::new(None);
+
+/// Register a spawned tool for I/O sampling. Pair with [`unregister_child`]
+/// (or use [`track_child`] for RAII).
+pub fn register_child(pid: u32, info: ChildInfo) {
+    if pid == 0 {
+        return;
+    }
+    CHILDREN.lock().get_or_insert_with(HashMap::new).insert(pid, info);
+}
+
+/// Remove a child from sampling. Its last-sampled totals are folded into the
+/// session's finished-children counters by the sampler (so lifetime totals
+/// don't shrink when a capture ends).
+pub fn unregister_child(pid: u32) {
+    if let Some(map) = CHILDREN.lock().as_mut() {
+        map.remove(&pid);
+    }
+}
+
+/// RAII registration for short-lived tools (ffprobe, embed passes).
+pub struct ChildGuard(u32);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        unregister_child(self.0);
+    }
+}
+
+/// Register `pid` and get a guard that unregisters on drop.
+pub fn track_child(pid: u32, info: ChildInfo) -> ChildGuard {
+    register_child(pid, info);
+    ChildGuard(pid)
+}
+
+// ===== Sampler (1 s cadence): self + child process I/O, history, JSONL =====
+
+/// Seconds between samples.
+const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+/// In-memory history depth: 30 min at 1 s.
+const HISTORY_LEN: usize = 1800;
+/// JSONL sample-log flush cadence (samples).
+const SAMPLE_LOG_FLUSH_EVERY: usize = 10;
+/// Days of iomon sample logs kept (pruned at startup with the other logs).
+pub const SAMPLE_LOG_KEEP_DAYS: u64 = 14;
+
+/// Settings key: write 1 s samples to a JSONL under the appdata logs dir.
+pub const K_IOMON_LOG: &str = "iomon_sample_log";
+/// The sample log defaults to ON: post-mortems of overnight drive stalls
+/// only work if the data was already being collected.
+pub const SAMPLE_LOG_DEFAULT: bool = true;
+
+static SAMPLE_LOG_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(SAMPLE_LOG_DEFAULT);
+
+/// Enable/disable the JSONL sample log (startup + settings save).
+pub fn set_sample_logging(on: bool) {
+    SAMPLE_LOG_ENABLED.store(on, Ordering::Relaxed);
+}
+
+pub fn sample_logging() -> bool {
+    SAMPLE_LOG_ENABLED.load(Ordering::Relaxed)
+}
+
+/// One process's contribution within a [`Sample`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProcSample {
+    pub pid: u32,
+    pub label: String,
+    pub tool: String,
+    pub purpose: String,
+    pub region: Region,
+    /// Bytes/sec since the previous sample. Read side of capture tools is
+    /// mostly network (CDN) — the write side is the disk-relevant number.
+    pub read_bps: u64,
+    pub write_bps: u64,
+    /// Cumulative transfer since the process started.
+    pub total_read: u64,
+    pub total_write: u64,
+    /// Live descendant processes rolled into this row (yt-dlp → ffmpeg).
+    pub descendants: u32,
+}
+
+/// A physical-disk reading (filled in by `platform::disk_performance`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DiskSample {
+    /// Drive letter the reading was resolved from (e.g. 'A').
+    pub letter: char,
+    pub read_bps: u64,
+    pub write_bps: u64,
+    pub queue_depth: u32,
+}
+
+/// One 1 s observation of everything.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Sample {
+    /// Wall-clock ms (unix epoch).
+    pub at_ms: i64,
+    /// This process (includes SQLite, tracing, the UI — and its *network*
+    /// I/O: `IO_COUNTERS` count sockets too).
+    pub self_read_bps: u64,
+    pub self_write_bps: u64,
+    /// Sum over live child trees.
+    pub child_read_bps: u64,
+    pub child_write_bps: u64,
+    /// Instrumented in-process (read, write) B/s per region (from the
+    /// category counters — real file bytes, no network).
+    pub per_region: [(u64, u64); REGION_COUNT],
+    /// Instrumented (read, write) B/s per category.
+    pub per_cat: Vec<(u64, u64)>,
+    /// Per live child-process rates (grandchildren rolled up).
+    pub procs: Vec<ProcSample>,
+    /// Self-process B/s the in-process instrumentation didn't account for:
+    /// SQLite, the tracing appender, egui persistence — and all of the app's
+    /// own network traffic (API polls, image downloads).
+    pub unattributed_bps: u64,
+    /// Current size of the SQLite db + WAL (bytes).
+    pub db_bytes: u64,
+    /// Physical-disk readings (recordings drive first), when available.
+    pub disks: Vec<DiskSample>,
+}
+
+/// Session totals for children that already exited (folded on unregister so
+/// lifetime numbers don't shrink when a capture ends).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FinishedChildTotals {
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+    pub count: u64,
+}
+
+static HISTORY: Mutex<std::collections::VecDeque<Sample>> =
+    Mutex::new(std::collections::VecDeque::new());
+static FINISHED: Mutex<FinishedChildTotals> = Mutex::new(FinishedChildTotals {
+    read_bytes: 0,
+    write_bytes: 0,
+    count: 0,
+});
+
+/// Copy of the sample history, oldest → newest. UI-side callers should cache
+/// this and refresh ~1×/s rather than cloning every frame.
+pub fn history() -> Vec<Sample> {
+    HISTORY.lock().iter().cloned().collect()
+}
+
+/// The most recent sample only (cheap enough for per-frame use).
+pub fn latest_sample() -> Option<Sample> {
+    HISTORY.lock().back().cloned()
+}
+
+pub fn finished_child_totals() -> FinishedChildTotals {
+    *FINISHED.lock()
+}
+
+/// Where the current session's JSONL sample log lives (dir is created by the
+/// sampler on first write).
+pub fn sample_log_dir() -> PathBuf {
+    crate::app_paths::logs_dir().join("iomon")
+}
+
+/// Per-PID state the sampler carries between ticks (last cumulative counters,
+/// for delta rates and for folding into the finished totals on exit).
+struct SeenProc {
+    last: crate::platform::ProcIo,
+}
+
+/// Start the background sampler thread (idempotent).
+pub fn start_sampler() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("io-sampler".into())
+            .spawn(sampler_loop)
+            .expect("spawn io-sampler thread");
+    });
+}
+
+fn sampler_loop() {
+    let mut prev_cells = snapshot().cells;
+    let mut prev_self = crate::platform::self_io_counters().unwrap_or_default();
+    let mut seen: HashMap<u32, SeenProc> = HashMap::new();
+    let mut log_buf: Vec<String> = Vec::new();
+    let session_log = sample_log_dir().join(format!(
+        "session-{}.jsonl",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    ));
+    loop {
+        std::thread::sleep(SAMPLE_INTERVAL);
+        let interval_secs = SAMPLE_INTERVAL.as_secs_f64();
+
+        // --- in-process instrumented deltas (per region / per category) ---
+        let cells = snapshot().cells;
+        let mut per_region = [(0u64, 0u64); REGION_COUNT];
+        let mut per_cat = vec![(0u64, 0u64); CAT_COUNT];
+        let mut instrumented_bytes = 0u64;
+        for (ci, row) in cells.iter().enumerate() {
+            for (ri, cell) in row.iter().enumerate() {
+                let d = cell.delta(&prev_cells[ci][ri]);
+                per_region[ri].0 += d.read_bytes;
+                per_region[ri].1 += d.write_bytes;
+                per_cat[ci].0 += d.read_bytes;
+                per_cat[ci].1 += d.write_bytes;
+                instrumented_bytes += d.read_bytes + d.write_bytes;
+            }
+        }
+        prev_cells = cells;
+
+        // --- self process ---
+        let self_now = crate::platform::self_io_counters().unwrap_or(prev_self);
+        let self_read_bps = self_now.read_bytes.saturating_sub(prev_self.read_bytes);
+        let self_write_bps = self_now.write_bytes.saturating_sub(prev_self.write_bytes);
+        prev_self = self_now;
+        let unattributed_bps = (self_read_bps + self_write_bps).saturating_sub(instrumented_bytes);
+
+        // --- children (registered roots + their live descendants) ---
+        let registered: Vec<(u32, ChildInfo)> = CHILDREN
+            .lock()
+            .as_ref()
+            .map(|m| m.iter().map(|(p, i)| (*p, i.clone())).collect())
+            .unwrap_or_default();
+        // Fold children that disappeared since the last tick into the
+        // session totals before dropping their state.
+        let live_pids: std::collections::HashSet<u32> =
+            registered.iter().map(|(p, _)| *p).collect();
+        seen.retain(|pid, sp| {
+            if live_pids.contains(pid) {
+                return true;
+            }
+            let mut fin = FINISHED.lock();
+            fin.read_bytes += sp.last.read_bytes;
+            fin.write_bytes += sp.last.write_bytes;
+            fin.count += 1;
+            false
+        });
+
+        // One Toolhelp snapshot per tick, shared by every tree walk.
+        let pairs = if registered.is_empty() {
+            Vec::new()
+        } else {
+            crate::platform::process_children_snapshot()
+        };
+        let mut procs: Vec<ProcSample> = Vec::with_capacity(registered.len());
+        let (mut child_read_bps, mut child_write_bps) = (0u64, 0u64);
+        for (pid, info) in registered {
+            // PID-recycle guard: a mismatching creation time means a new
+            // process wears this number now — drop the registration.
+            if info.proc_start != 0 {
+                match crate::platform::process_start_time(pid) {
+                    Some(st) if st == info.proc_start => {}
+                    Some(_) => {
+                        unregister_child(pid);
+                        continue;
+                    }
+                    None => continue, // exited — folded next tick
+                }
+            }
+            // BFS the live descendants (yt-dlp spawns the ffmpeg that does
+            // the real writing).
+            let mut tree = vec![pid];
+            let mut i = 0;
+            while i < tree.len() {
+                let cur = tree[i];
+                for &(p, parent) in &pairs {
+                    if parent == cur && !tree.contains(&p) {
+                        tree.push(p);
+                    }
+                }
+                i += 1;
+            }
+            let mut now = crate::platform::ProcIo::default();
+            let mut alive = 0u32;
+            for &p in &tree {
+                if let Some(io) = crate::platform::process_io_counters(p) {
+                    now.read_bytes += io.read_bytes;
+                    now.write_bytes += io.write_bytes;
+                    now.read_ops += io.read_ops;
+                    now.write_ops += io.write_ops;
+                    alive += 1;
+                }
+            }
+            if alive == 0 {
+                continue; // whole tree gone — folded next tick via `seen`
+            }
+            let entry = seen
+                .entry(pid)
+                .or_insert_with(|| SeenProc { last: crate::platform::ProcIo::default() });
+            let read_bps = now.read_bytes.saturating_sub(entry.last.read_bytes);
+            let write_bps = now.write_bytes.saturating_sub(entry.last.write_bytes);
+            entry.last = now;
+            child_read_bps += read_bps;
+            child_write_bps += write_bps;
+            procs.push(ProcSample {
+                pid,
+                label: info.label,
+                tool: info.tool,
+                purpose: info.purpose.to_string(),
+                region: info.region,
+                read_bps,
+                write_bps,
+                total_read: now.read_bytes,
+                total_write: now.write_bytes,
+                descendants: alive.saturating_sub(1),
+            });
+        }
+        procs.sort_by(|a, b| (b.write_bps + b.read_bps).cmp(&(a.write_bps + a.read_bps)));
+
+        // --- db + wal size (C:) ---
+        let db_path = crate::app_paths::db_path();
+        let wal = {
+            let mut w = db_path.as_os_str().to_owned();
+            w.push("-wal");
+            PathBuf::from(w)
+        };
+        let db_bytes = fs::metadata_sync(Cat::Db, &db_path).map(|m| m.len()).unwrap_or(0)
+            + fs::metadata_sync(Cat::Db, &wal).map(|m| m.len()).unwrap_or(0);
+
+        let sample = Sample {
+            at_ms: chrono::Utc::now().timestamp_millis(),
+            self_read_bps: (self_read_bps as f64 / interval_secs) as u64,
+            self_write_bps: (self_write_bps as f64 / interval_secs) as u64,
+            child_read_bps: (child_read_bps as f64 / interval_secs) as u64,
+            child_write_bps: (child_write_bps as f64 / interval_secs) as u64,
+            per_region,
+            per_cat,
+            procs,
+            unattributed_bps: (unattributed_bps as f64 / interval_secs) as u64,
+            db_bytes,
+            disks: sample_disks(),
+        };
+
+        // --- JSONL sample log (buffered; appdata drive only) ---
+        if sample_logging() {
+            if let Ok(line) = serde_json::to_string(&sample) {
+                log_buf.push(line);
+            }
+            if log_buf.len() >= SAMPLE_LOG_FLUSH_EVERY {
+                flush_sample_log(&session_log, &mut log_buf);
+            }
+        } else if !log_buf.is_empty() {
+            flush_sample_log(&session_log, &mut log_buf);
+        }
+
+        {
+            let mut hist = HISTORY.lock();
+            if hist.len() >= HISTORY_LEN {
+                hist.pop_front();
+            }
+            hist.push_back(sample);
+        }
+    }
+}
+
+/// Physical-disk readings (stubbed until the DISK_PERFORMANCE step lands).
+fn sample_disks() -> Vec<DiskSample> {
+    Vec::new()
+}
+
+fn flush_sample_log(path: &Path, buf: &mut Vec<String>) {
+    use std::io::Write;
+    if buf.is_empty() {
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all_sync(Cat::IoMonLog, dir);
+    }
+    let mut text = buf.join("\n");
+    text.push('\n');
+    buf.clear();
+    let start = Instant::now();
+    if let Ok(mut f) = fs::open_with_sync(Cat::IoMonLog, path, |o| {
+        o.create(true).append(true);
+    }) {
+        let bytes = text.len() as u64;
+        let res = f.write_all(text.as_bytes());
+        record_region(Cat::IoMonLog, Region::AppData, OpKind::Write, bytes, start.elapsed());
+        if let Err(e) = res {
+            tracing::warn!("iomon sample log write failed: {e}");
+        }
+    }
+}
+
 // ===== Instrumented filesystem facade =====
 
 /// Timed, counted wrappers over `std::fs`/`tokio::fs`. Every function takes
@@ -737,6 +1139,21 @@ pub mod fs {
         let start = Instant::now();
         let res = std::fs::metadata(path);
         done(cat, path, OpKind::Meta, start, 0, res)
+    }
+
+    /// `Path::exists` semantics (false on any error), counted as a meta op.
+    pub fn exists_sync(cat: Cat, path: impl AsRef<Path>) -> bool {
+        metadata_sync(cat, path).is_ok()
+    }
+
+    /// `Path::is_file` semantics, counted as a meta op.
+    pub fn is_file_sync(cat: Cat, path: impl AsRef<Path>) -> bool {
+        metadata_sync(cat, path).map(|m| m.is_file()).unwrap_or(false)
+    }
+
+    /// `Path::is_dir` semantics, counted as a meta op.
+    pub fn is_dir_sync(cat: Cat, path: impl AsRef<Path>) -> bool {
+        metadata_sync(cat, path).map(|m| m.is_dir()).unwrap_or(false)
     }
 
     pub fn read_dir_sync(cat: Cat, path: impl AsRef<Path>) -> io::Result<std::fs::ReadDir> {

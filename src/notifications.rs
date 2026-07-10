@@ -156,7 +156,10 @@ fn handle(store: &Store, ev: AppEvent) {
             // opts in and the file has been fetched. The fetch is concurrent so
             // check existence here rather than assuming it's ready.
             if row.monitor.thumbnail_in_toast {
-                if let Some(path) = thumbnail_path.as_ref().filter(|p| p.exists()) {
+                if let Some(path) = thumbnail_path
+                    .as_ref()
+                    .filter(|p| crate::iomon::fs::exists_sync(crate::iomon::Cat::AssetCache, p))
+                {
                     content.hero = Some(path.clone());
                 }
             }

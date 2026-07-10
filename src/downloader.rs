@@ -1506,7 +1506,7 @@ impl Supervisor {
                                 // under the ORIGINAL stem — only the destination we're
                                 // about to write gets proactively shortened.
                                 let ts = planned_mkv.with_extension("ts");
-                                if !ts.exists() {
+                                if !crate::iomon::fs::exists_sync(Cat::FsProbe, &ts) {
                                     done += 1;
                                     continue;
                                 }
@@ -1755,7 +1755,7 @@ impl Supervisor {
                             let mut embedded = 0usize;
                             for (i, (rec_id, output_path)) in recs.iter().enumerate() {
                                 let mkv = PathBuf::from(output_path);
-                                if !mkv.exists() { continue; }
+                                if !crate::iomon::fs::exists_sync(Cat::Thumbnail, &mkv) { continue; }
                                 let _ = tx.send(AppEvent::BackgroundTaskProgress {
                                     id: task_id,
                                     progress: Some(i as f32 / total as f32),
@@ -1808,7 +1808,7 @@ impl Supervisor {
                             let mut fetched = 0usize;
                             for (i, (rec_id, output_path, _stream_id)) in recs.iter().enumerate() {
                                 let output = PathBuf::from(output_path);
-                                if !output.exists() { continue; }
+                                if !crate::iomon::fs::exists_sync(Cat::Thumbnail, &output) { continue; }
                                 // Skip if a thumbnail sidecar already exists.
                                 if find_thumbnail_for(&output).is_some() { continue; }
                                 let _ = tx.send(AppEvent::BackgroundTaskProgress {
@@ -5716,8 +5716,8 @@ impl Supervisor {
         let head_p = PathBuf::from(&head);
         let live_p = PathBuf::from(&live_path);
         if !live_path.to_ascii_lowercase().ends_with(".mkv")
-            || !head_p.is_file()
-            || !live_p.is_file()
+            || !crate::iomon::fs::is_file_sync(Cat::Promote, &head_p)
+            || !crate::iomon::fs::is_file_sync(Cat::Promote, &live_p)
         {
             return;
         }
@@ -7062,7 +7062,7 @@ pub async fn reorganize_recording_files(
     };
     let base_dir = PathBuf::from(&output_dir);
 
-    if !current.exists() {
+    if !crate::iomon::fs::exists_sync(Cat::Promote, &current) {
         // Video file is gone (failed recording, external move, etc.).
         // Still try to sort companion files in the directory the video was supposed to land in.
         if cfg.enabled && !reverse {
@@ -7235,7 +7235,7 @@ pub async fn rename_recording_files(
         return Ok(None);
     }
     let current = PathBuf::from(&output_path);
-    if !current.exists() {
+    if !crate::iomon::fs::exists_sync(Cat::Promote, &current) {
         anyhow::bail!("output file not found: {}", current.display());
     }
     let dir = match current.parent() {
@@ -7642,7 +7642,7 @@ fn find_thumbnail_for(src: &Path) -> Option<PathBuf> {
     let stem = src.file_stem()?.to_string_lossy();
     for suffix in &["thumbnail.jpg", "webp", "jpg", "png", "jpeg"] {
         let candidate = dir.join(format!("{stem}.{suffix}"));
-        if candidate.exists() {
+        if crate::iomon::fs::exists_sync(Cat::Thumbnail, &candidate) {
             return Some(candidate);
         }
     }
@@ -7809,7 +7809,7 @@ async fn move_companions(from_dir: &Path, to_dir: &Path, stem: &str) {
             continue;
         }
         let to = to_dir.join(&name);
-        if to.exists() {
+        if crate::iomon::fs::exists_sync(Cat::Promote, &to) {
             continue;
         }
         match crate::iomon::fs::rename(Cat::Promote, entry.path(), &to).await {
@@ -7863,7 +7863,7 @@ async fn rename_companion_sidecars(dir: &Path, old_stem: &str, new_stem: &str) {
             continue;
         }
         let to = dir.join(format!("{new_stem}.{rest}"));
-        if to.exists() {
+        if crate::iomon::fs::exists_sync(Cat::Promote, &to) {
             continue; // don't clobber an unrelated existing file
         }
         // Retry with exponential backoff: on Windows the chat downloader
@@ -8462,7 +8462,7 @@ fn expand_template(template: &str, v: &TemplateVars) -> String {
 pub(crate) fn unique_stem(dir: &Path, stem: &str, ext: &str, ignore: Option<&Path>) -> String {
     let taken = |s: &str| {
         let p = dir.join(format!("{s}.{ext}"));
-        Some(p.as_path()) != ignore && p.exists()
+        Some(p.as_path()) != ignore && crate::iomon::fs::exists_sync(Cat::FsProbe, &p)
     };
     if !taken(stem) {
         return stem.to_string();
@@ -8607,7 +8607,7 @@ async fn rename_or_shorten(
                     continue; // this budget doesn't shorten it any further
                 }
                 let candidate = dir.join(format!("{short_stem}.{suffix}"));
-                if candidate.exists() {
+                if crate::iomon::fs::exists_sync(Cat::Promote, &candidate) {
                     // Don't clobber it, and don't disambiguate with a numeric
                     // suffix here — that would itself desync this file from
                     // siblings that independently compute the same candidate.

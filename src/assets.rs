@@ -35,7 +35,7 @@ fn write_fetched_stamp(asset_dir: &Path) {
 /// run, so during the first run this returns false and the first-seen colour is
 /// recorded silently — matching how emote/icon/banner baselines are silent.
 fn assets_ever_fetched(asset_dir: &Path) -> bool {
-    asset_dir.join(".assets_fetched_at").exists()
+    crate::iomon::fs::exists_sync(Cat::AssetCache, asset_dir.join(".assets_fetched_at"))
 }
 
 fn should_refetch_global_badges(platform_dir: &Path) -> bool {
@@ -188,23 +188,23 @@ pub(crate) fn migrate_assets_root(
     first_urls: &std::collections::HashMap<(String, crate::models::Platform), String>,
 ) {
     use crate::models::Platform;
-    if !root.is_dir() {
+    if !crate::iomon::fs::is_dir_sync(Cat::AssetCache, root) {
         return; // nothing fetched yet — first run populates account dirs directly
     }
     let stamp = root.join(".accounts_migrated");
-    if stamp.exists() {
+    if crate::iomon::fs::exists_sync(Cat::AssetCache, &stamp) {
         return;
     }
     let Ok(channels) = crate::iomon::fs::read_dir_sync(Cat::AssetCache, root) else { return };
     for chan in channels.flatten() {
         let chan_dir = chan.path();
-        if !chan_dir.is_dir() {
+        if !crate::iomon::fs::is_dir_sync(Cat::AssetCache, &chan_dir) {
             continue;
         }
         let chan_key = chan.file_name().to_string_lossy().into_owned();
         for plat_name in ["twitch", "youtube", "kick", "generic"] {
             let plat_dir = chan_dir.join(plat_name);
-            if !plat_dir.is_dir() {
+            if !crate::iomon::fs::is_dir_sync(Cat::AssetCache, &plat_dir) {
                 continue;
             }
             let platform = Platform::parse(plat_name);
@@ -234,7 +234,7 @@ pub(crate) fn migrate_assets_root(
             for src in legacy {
                 let Some(fname) = src.file_name() else { continue };
                 let dest = account_dir.join(fname);
-                if dest.exists() {
+                if crate::iomon::fs::exists_sync(Cat::AssetCache, &dest) {
                     continue; // a newer account-side copy exists — keep both, prefer it
                 }
                 if let Err(e) = crate::iomon::fs::rename_sync(Cat::AssetCache, &src, &dest) {
@@ -262,7 +262,7 @@ pub fn find_asset_any_account(
     if let Ok(entries) = crate::iomon::fs::read_dir_sync(Cat::AssetCache, &root) {
         for e in entries.flatten() {
             let p = e.path();
-            if p.is_dir()
+            if crate::iomon::fs::is_dir_sync(Cat::AssetCache, &p)
                 && !p.file_name().is_some_and(|n| {
                     matches!(n.to_str(), Some("history" | "emotes" | "badges" | "posts" | "schedule_src"))
                 })
@@ -312,7 +312,7 @@ pub fn ensure_scaled_icon(asset_dir: &Path, px: u32) -> Option<PathBuf> {
     let out = asset_dir.join(format!("icon_{px}.png"));
     let src = find_asset(asset_dir, "icon.")?;
 
-    if out.exists() {
+    if crate::iomon::fs::exists_sync(Cat::AssetCache, &out) {
         // Regenerate only if the source icon was updated after the last scale.
         let src_mtime = crate::iomon::fs::metadata_sync(Cat::AssetCache, &src).ok()?.modified().ok()?;
         let out_mtime = crate::iomon::fs::metadata_sync(Cat::AssetCache, &out).ok()?.modified().ok()?;
@@ -560,7 +560,7 @@ async fn download_badge_set(client: &Client, set: &HelixBadgeSet, badge_dir: &Pa
             (&ver.image_url_4x, "4x.png"),
         ] {
             let dest = dir.join(fname);
-            if dest.exists() {
+            if crate::iomon::fs::exists_sync(Cat::AssetCache, &dest) {
                 continue;
             }
             if let Err(e) = download_image(client, url, &dest).await {

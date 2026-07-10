@@ -6946,7 +6946,7 @@ fn build_platform_asset_status(name: &str, accounts: &[AssetAccount]) -> Vec<Pla
             // Read from the account dir; fall back to the legacy pre-account
             // dir so a not-yet-refetched channel still shows its assets.
             let dirs = crate::assets::asset_read_dirs(name, acc.platform, &acc.account);
-            let pdir = if dirs[0].exists() { dirs[0].clone() } else { dirs[1].clone() };
+            let pdir = if crate::iomon::fs::exists_sync(crate::iomon::Cat::AssetCache, &dirs[0]) { dirs[0].clone() } else { dirs[1].clone() };
             let mut emotes = prop_count_dir_files(&pdir.join("emotes").join("twitch"));
             for src in &["bttv", "ffz", "7tv"] {
                 emotes += prop_read_manifest_count(&pdir.join("emotes").join(format!("{src}.json")));
@@ -7034,7 +7034,7 @@ fn spawn_browse_folder(
         .name("browse-folder".into())
         .spawn(move || {
             let mut dialog = rfd::FileDialog::new();
-            if !current.trim().is_empty() && std::path::Path::new(&current).exists() {
+            if !current.trim().is_empty() && crate::iomon::fs::exists_sync(crate::iomon::Cat::FsProbe, &current) {
                 dialog = dialog.set_directory(&current);
             }
             let _ = tx.send(dialog.pick_folder().map(|p| p.to_string_lossy().to_string()));
@@ -7055,7 +7055,7 @@ fn spawn_browse_file(
         .spawn(move || {
             let mut dialog = rfd::FileDialog::new();
             if let Some(parent) = std::path::Path::new(&current).parent() {
-                if parent.is_dir() {
+                if crate::iomon::fs::is_dir_sync(crate::iomon::Cat::FsProbe, parent) {
                     dialog = dialog.set_directory(parent);
                 }
             }
@@ -19251,14 +19251,14 @@ impl StreamArchiverApp {
                     let candidates = core.store.recordings_with_final_path().unwrap_or_default();
                     let missing: Vec<_> = candidates
                         .into_iter()
-                        .filter(|r| !std::path::Path::new(&r.output_path).exists())
+                        .filter(|r| !crate::iomon::fs::exists_sync(crate::iomon::Cat::FsProbe, &r.output_path))
                         .collect();
                     // Partition errors: file gone → treated as missing.
                     let all_errors = core.store.recordings_with_errors().unwrap_or_default();
                     let (with_file, no_file): (Vec<_>, Vec<_>) =
                         all_errors.into_iter().partition(|r| {
                             r.output_path.is_empty()
-                                || std::path::Path::new(&r.output_path).exists()
+                                || crate::iomon::fs::exists_sync(crate::iomon::Cat::FsProbe, &r.output_path)
                         });
                     let _ = tx.send((missing, with_file, no_file));
                 })
@@ -20017,7 +20017,7 @@ impl StreamArchiverApp {
         if let Some(Act::Delete(i)) = act {
             if let Some(rec) = self.issues_recs.get(i).cloned() {
                 let path = std::path::Path::new(&rec.output_path);
-                if path.exists() {
+                if crate::iomon::fs::exists_sync(crate::iomon::Cat::RecordingDelete, path) {
                     let _ = crate::iomon::fs::remove_file_sync(crate::iomon::Cat::RecordingDelete, path);
                 }
                 let _ = self.core.store.clear_recording_capture(rec.id);
@@ -20026,11 +20026,11 @@ impl StreamArchiverApp {
         }
         if let Some(Act::ClearEmpties) = act {
             let empties: Vec<_> = self.issues_recs.iter().filter(|r| {
-                std::path::Path::new(&r.output_path).metadata().map(|m| m.len()).unwrap_or(0) == 0
+                crate::iomon::fs::metadata_sync(crate::iomon::Cat::RecordingDelete, &r.output_path).map(|m| m.len()).unwrap_or(0) == 0
             }).cloned().collect();
             for rec in empties {
                 let path = std::path::Path::new(&rec.output_path);
-                if path.exists() {
+                if crate::iomon::fs::exists_sync(crate::iomon::Cat::RecordingDelete, path) {
                     let _ = crate::iomon::fs::remove_file_sync(crate::iomon::Cat::RecordingDelete, path);
                 }
                 let _ = self.core.store.clear_recording_capture(rec.id);
@@ -20056,7 +20056,7 @@ impl StreamArchiverApp {
             let all: Vec<_> = self.issues_recs.drain(..).collect();
             for rec in all {
                 let path = std::path::Path::new(&rec.output_path);
-                if path.exists() {
+                if crate::iomon::fs::exists_sync(crate::iomon::Cat::RecordingDelete, path) {
                     let _ = crate::iomon::fs::remove_file_sync(crate::iomon::Cat::RecordingDelete, path);
                 }
                 let _ = self.core.store.clear_recording_capture(rec.id);
@@ -20118,7 +20118,7 @@ impl StreamArchiverApp {
         if let Some(Act::DeleteError(k)) = act {
             if let Some(rec) = self.issues_errors.get(k).cloned() {
                 let path = std::path::Path::new(&rec.output_path);
-                if path.exists() {
+                if crate::iomon::fs::exists_sync(crate::iomon::Cat::RecordingDelete, path) {
                     let _ = crate::iomon::fs::remove_file_sync(crate::iomon::Cat::RecordingDelete, path);
                 }
                 let _ = self.core.store.clear_recording_capture(rec.id);
@@ -20128,7 +20128,7 @@ impl StreamArchiverApp {
         if let Some(Act::ClearError(k)) = act {
             if let Some(rec) = self.issues_errors.get(k).cloned() {
                 let path = std::path::Path::new(&rec.output_path);
-                if path.exists() {
+                if crate::iomon::fs::exists_sync(crate::iomon::Cat::RecordingDelete, path) {
                     let _ = crate::iomon::fs::remove_file_sync(crate::iomon::Cat::RecordingDelete, path);
                 }
                 let _ = self.core.store.delete_recording(rec.id);
@@ -20139,7 +20139,7 @@ impl StreamArchiverApp {
             let all: Vec<_> = self.issues_errors.drain(..).collect();
             for rec in all {
                 let path = std::path::Path::new(&rec.output_path);
-                if path.exists() {
+                if crate::iomon::fs::exists_sync(crate::iomon::Cat::RecordingDelete, path) {
                     let _ = crate::iomon::fs::remove_file_sync(crate::iomon::Cat::RecordingDelete, path);
                 }
                 let _ = self.core.store.delete_recording(rec.id);
@@ -21359,7 +21359,7 @@ impl StreamArchiverApp {
                             .clicked()
                         {
                             let dir = channel_asset_dir(&ch.name, acc.platform, &acc.account);
-                            let target = if dir.is_dir() {
+                            let target = if crate::iomon::fs::is_dir_sync(crate::iomon::Cat::AssetCache, &dir) {
                                 dir
                             } else {
                                 // Nothing fetched yet — fall back to the channel root.
@@ -23141,11 +23141,11 @@ fn load_twitch_name_color(name: &str, account: &str) -> Option<egui::Color32> {
 fn twitch_emotes_dir(name: &str, account: &str) -> std::path::PathBuf {
     let [primary, legacy] = crate::assets::asset_read_dirs(name, Platform::Twitch, account);
     let primary = primary.join("emotes");
-    if primary.exists() {
+    if crate::iomon::fs::exists_sync(crate::iomon::Cat::AssetCache, &primary) {
         return primary;
     }
     let legacy = legacy.join("emotes");
-    if legacy.exists() { legacy } else { primary }
+    if crate::iomon::fs::exists_sync(crate::iomon::Cat::AssetCache, &legacy) { legacy } else { primary }
 }
 
 fn build_emote_map(name: &str, account: &str) -> HashMap<String, std::path::PathBuf> {
@@ -23168,7 +23168,7 @@ fn build_emote_map(name: &str, account: &str) -> HashMap<String, std::path::Path
                 continue;
             }
             let path = resolve(&e);
-            if path.exists() {
+            if crate::iomon::fs::exists_sync(crate::iomon::Cat::AssetCache, &path) {
                 map.entry(e.name).or_insert(path);
             }
         }
@@ -23345,7 +23345,7 @@ fn enumerate_provider_emotes(name: &str, account: &str, provider: EmoteProvider)
     let resolve_path = |base: std::path::PathBuf, e: &EmoteManifestEntry| -> std::path::PathBuf {
         let new_name = format!("{}_{}.{}", e.id, sanitize_emote_name(&e.name), e.ext);
         let new_path = base.join(&new_name);
-        if new_path.exists() {
+        if crate::iomon::fs::exists_sync(crate::iomon::Cat::AssetCache, &new_path) {
             new_path
         } else {
             base.join(format!("{}.{}", e.id, e.ext))
@@ -23357,7 +23357,7 @@ fn enumerate_provider_emotes(name: &str, account: &str, provider: EmoteProvider)
     // so existing `{id}.{ext}` files still appear, shown with the numeric id as name.
     if provider == EmoteProvider::Twitch {
         let manifest_path = emotes_dir.join("twitch.json");
-        if manifest_path.exists() {
+        if crate::iomon::fs::exists_sync(crate::iomon::Cat::AssetCache, &manifest_path) {
             let entries: Vec<EmoteManifestEntry> =
                 crate::iomon::fs::read_to_string_sync(crate::iomon::Cat::AssetCache, &manifest_path)
                     .ok()
@@ -23382,7 +23382,7 @@ fn enumerate_provider_emotes(name: &str, account: &str, provider: EmoteProvider)
             .flatten()
             .flatten()
             .map(|e| e.path())
-            .filter(|p| p.is_file())
+            .filter(|p| crate::iomon::fs::is_file_sync(crate::iomon::Cat::AssetCache, p))
             .map(|p| {
                 let stem = p
                     .file_stem()
@@ -23987,13 +23987,13 @@ fn prop_count_dir_files(dir: &std::path::Path) -> usize {
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| e.path().is_file())
+        .filter(|e| crate::iomon::fs::is_file_sync(crate::iomon::Cat::AssetCache, e.path()))
         .count()
 }
 
 /// Count directories at exactly `depth` levels below `root`.
 fn prop_count_nested_dirs(root: &std::path::Path, depth: usize) -> usize {
-    if depth == 0 || !root.is_dir() {
+    if depth == 0 || !crate::iomon::fs::is_dir_sync(crate::iomon::Cat::AssetCache, root) {
         return 0;
     }
     crate::iomon::fs::read_dir_sync(crate::iomon::Cat::AssetCache, root)
@@ -24002,7 +24002,7 @@ fn prop_count_nested_dirs(root: &std::path::Path, depth: usize) -> usize {
         .flatten()
         .map(|e| {
             if depth == 1 {
-                if e.path().is_dir() { 1 } else { 0 }
+                if crate::iomon::fs::is_dir_sync(crate::iomon::Cat::AssetCache, e.path()) { 1 } else { 0 }
             } else {
                 prop_count_nested_dirs(&e.path(), depth - 1)
             }
@@ -24044,7 +24044,7 @@ fn prop_read_manifest_count(path: &std::path::Path) -> usize {
 /// (`clip.chat.jsonl`). We try both forms, plus the legacy pre-`.cache` YouTube name
 /// (`clip.ts.live_chat.json`).
 fn chat_file_for_recording(rec: &Recording) -> Option<std::path::PathBuf> {
-    chat_file_candidates(rec).into_iter().find(|p| p.exists())
+    chat_file_candidates(rec).into_iter().find(|p| crate::iomon::fs::exists_sync(crate::iomon::Cat::ChatSidecar, p))
 }
 
 /// The candidate sidecar paths [`chat_file_for_recording`] probes, in order.
@@ -25496,7 +25496,7 @@ fn find_emote_file(dir: &Path, stem: &str) -> Option<std::path::PathBuf> {
     ["png", "gif", "webp"]
         .iter()
         .map(|ext| dir.join(format!("{stem}.{ext}")))
-        .find(|p| p.exists())
+        .find(|p| crate::iomon::fs::exists_sync(crate::iomon::Cat::AssetCache, p))
 }
 
 /// An emoji image not yet on disk that the renderer would otherwise show as a
@@ -25532,11 +25532,11 @@ fn emoji_split(text: &str, fetches: &mut Vec<EmojiFetch>) -> Vec<ChatSegment> {
         if is_emoji {
             let key = crate::emoji::cache_key(slice);
             let dest = emoji_dir.join(format!("{key}.png"));
-            let file = dest.exists().then(|| dest.clone());
+            let file = crate::iomon::fs::exists_sync(crate::iomon::Cat::AssetCache, &dest).then(|| dest.clone());
             // Skip re-fetching emoji we've already failed to download (a `.404`
             // marker), so a liberal false-positive / missing asset isn't re-requested
             // on every live tail-reload.
-            if file.is_none() && !emoji_dir.join(format!("{key}.404")).exists() {
+            if file.is_none() && !crate::iomon::fs::exists_sync(crate::iomon::Cat::AssetCache, emoji_dir.join(format!("{key}.404"))) {
                 fetches.push(EmojiFetch {
                     dest: dest.clone(),
                     urls: crate::emoji::twemoji_url_candidates(slice),
@@ -25741,7 +25741,7 @@ async fn upgrade_pending_emotes(state: &Arc<Mutex<ChatLoadState>>) {
         return;
     }
     let on_disk: HashSet<std::path::PathBuf> = tokio::task::spawn_blocking(move || {
-        pending.into_iter().filter(|p| p.exists()).collect()
+        pending.into_iter().filter(|p| crate::iomon::fs::exists_sync(crate::iomon::Cat::AssetCache, p)).collect()
     })
     .await
     .unwrap_or_default();
@@ -25773,7 +25773,7 @@ async fn download_emoji_images(fetches: &[EmojiFetch]) {
         return;
     };
     for f in fetches.iter().take(300) {
-        if f.dest.exists() {
+        if crate::iomon::fs::exists_sync(crate::iomon::Cat::AssetCache, &f.dest) {
             continue;
         }
         let mut got = false;
@@ -26063,7 +26063,7 @@ fn yt_action_to_msg(
                                 crate::downloader::sanitize_filename(id),
                                 url_ext(url)
                             ));
-                        if dest.exists() {
+                        if crate::iomon::fs::exists_sync(crate::iomon::Cat::AssetCache, &dest) {
                             Some(dest)
                         } else {
                             fetches.push(EmojiFetch {

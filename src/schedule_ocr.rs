@@ -236,7 +236,7 @@ struct OcrEvent {
 /// OCR a schedule image. Always returns an `OcrRunResult` so callers can accumulate
 /// stats even on failure; `result.segments` is `None` when nothing parseable came back.
 pub async fn ocr_schedule_image(image_path: &Path, opts: &OcrOpts) -> OcrRunResult {
-    if !image_path.exists() {
+    if !crate::iomon::fs::exists_sync(crate::iomon::Cat::Detector, image_path) {
         debug!("OCR: image not found: {}", image_path.display());
         return OcrRunResult { segments: None, cli_calls: vec![], cli_failures: 0, parse_failures: 0 };
     }

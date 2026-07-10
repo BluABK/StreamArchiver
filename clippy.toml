@@ -1,0 +1,60 @@
+# Every filesystem operation must go through `crate::iomon::fs` (or call
+# `crate::iomon::record*` directly for handle-level streaming I/O) so the I/O
+# monitor sees it — see src/iomon.rs. Test fixtures, build.rs, and the facade
+# itself opt out with #[allow(clippy::disallowed_methods)].
+disallowed-methods = [
+    # --- std::fs free functions ---
+    { path = "std::fs::read", reason = "use crate::iomon::fs::read_sync so the I/O monitor sees it" },
+    { path = "std::fs::read_to_string", reason = "use crate::iomon::fs::read_to_string_sync so the I/O monitor sees it" },
+    { path = "std::fs::write", reason = "use crate::iomon::fs::write_sync so the I/O monitor sees it" },
+    { path = "std::fs::copy", reason = "use crate::iomon::fs::copy_sync so the I/O monitor sees it" },
+    { path = "std::fs::rename", reason = "use crate::iomon::fs::rename_sync so the I/O monitor sees it" },
+    { path = "std::fs::remove_file", reason = "use crate::iomon::fs::remove_file_sync so the I/O monitor sees it" },
+    { path = "std::fs::remove_dir", reason = "use crate::iomon::fs::remove_dir_sync so the I/O monitor sees it" },
+    { path = "std::fs::remove_dir_all", reason = "use crate::iomon::fs::remove_dir_all_sync so the I/O monitor sees it" },
+    { path = "std::fs::create_dir", reason = "use crate::iomon::fs::create_dir_all_sync so the I/O monitor sees it" },
+    { path = "std::fs::create_dir_all", reason = "use crate::iomon::fs::create_dir_all_sync so the I/O monitor sees it" },
+    { path = "std::fs::read_dir", reason = "use crate::iomon::fs::read_dir_sync so the I/O monitor sees it" },
+    { path = "std::fs::metadata", reason = "use crate::iomon::fs::metadata_sync so the I/O monitor sees it" },
+    { path = "std::fs::symlink_metadata", reason = "use crate::iomon::fs::metadata_sync so the I/O monitor sees it" },
+    { path = "std::fs::canonicalize", reason = "route through crate::iomon::fs (add a wrapper) so the I/O monitor sees it" },
+    { path = "std::fs::hard_link", reason = "route through crate::iomon::fs (add a wrapper) so the I/O monitor sees it" },
+    { path = "std::fs::exists", reason = "use crate::iomon::fs::exists_sync so the I/O monitor sees it" },
+    # --- std::fs constructors ---
+    { path = "std::fs::File::open", reason = "use crate::iomon::fs::open_sync so the I/O monitor sees it" },
+    { path = "std::fs::File::create", reason = "use crate::iomon::fs::create_sync so the I/O monitor sees it" },
+    { path = "std::fs::File::create_new", reason = "use crate::iomon::fs::open_with_sync so the I/O monitor sees it" },
+    { path = "std::fs::File::options", reason = "use crate::iomon::fs::open_with_sync so the I/O monitor sees it" },
+    { path = "std::fs::OpenOptions::new", reason = "use crate::iomon::fs::open_with_sync so the I/O monitor sees it" },
+    # --- Path probe methods (each is a stat syscall) ---
+    { path = "std::path::Path::exists", reason = "use crate::iomon::fs::exists_sync so the I/O monitor sees it" },
+    { path = "std::path::Path::try_exists", reason = "use crate::iomon::fs::exists_sync so the I/O monitor sees it" },
+    { path = "std::path::Path::is_file", reason = "use crate::iomon::fs::is_file_sync so the I/O monitor sees it" },
+    { path = "std::path::Path::is_dir", reason = "use crate::iomon::fs::is_dir_sync so the I/O monitor sees it" },
+    { path = "std::path::Path::metadata", reason = "use crate::iomon::fs::metadata_sync so the I/O monitor sees it" },
+    { path = "std::path::Path::symlink_metadata", reason = "use crate::iomon::fs::metadata_sync so the I/O monitor sees it" },
+    { path = "std::path::Path::read_dir", reason = "use crate::iomon::fs::read_dir_sync so the I/O monitor sees it" },
+    { path = "std::path::Path::canonicalize", reason = "route through crate::iomon::fs (add a wrapper) so the I/O monitor sees it" },
+    # --- tokio::fs free functions ---
+    { path = "tokio::fs::read", reason = "use crate::iomon::fs::read so the I/O monitor sees it" },
+    { path = "tokio::fs::read_to_string", reason = "use crate::iomon::fs::read_to_string so the I/O monitor sees it" },
+    { path = "tokio::fs::write", reason = "use crate::iomon::fs::write so the I/O monitor sees it" },
+    { path = "tokio::fs::copy", reason = "use crate::iomon::fs::copy so the I/O monitor sees it" },
+    { path = "tokio::fs::rename", reason = "use crate::iomon::fs::rename so the I/O monitor sees it" },
+    { path = "tokio::fs::remove_file", reason = "use crate::iomon::fs::remove_file so the I/O monitor sees it" },
+    { path = "tokio::fs::remove_dir", reason = "use crate::iomon::fs::remove_dir so the I/O monitor sees it" },
+    { path = "tokio::fs::remove_dir_all", reason = "use crate::iomon::fs::remove_dir_all so the I/O monitor sees it" },
+    { path = "tokio::fs::create_dir", reason = "use crate::iomon::fs::create_dir_all so the I/O monitor sees it" },
+    { path = "tokio::fs::create_dir_all", reason = "use crate::iomon::fs::create_dir_all so the I/O monitor sees it" },
+    { path = "tokio::fs::read_dir", reason = "use crate::iomon::fs::read_dir so the I/O monitor sees it" },
+    { path = "tokio::fs::metadata", reason = "use crate::iomon::fs::metadata so the I/O monitor sees it" },
+    { path = "tokio::fs::symlink_metadata", reason = "use crate::iomon::fs::metadata so the I/O monitor sees it" },
+    { path = "tokio::fs::canonicalize", reason = "route through crate::iomon::fs (add a wrapper) so the I/O monitor sees it" },
+    { path = "tokio::fs::try_exists", reason = "use crate::iomon::fs::try_exists so the I/O monitor sees it" },
+    { path = "tokio::fs::hard_link", reason = "route through crate::iomon::fs (add a wrapper) so the I/O monitor sees it" },
+    # --- tokio::fs constructors ---
+    { path = "tokio::fs::File::open", reason = "use crate::iomon::fs::open so the I/O monitor sees it" },
+    { path = "tokio::fs::File::create", reason = "use crate::iomon::fs::create so the I/O monitor sees it" },
+    { path = "tokio::fs::File::options", reason = "use crate::iomon::fs::open_with so the I/O monitor sees it" },
+    { path = "tokio::fs::OpenOptions::new", reason = "use crate::iomon::fs::open_with so the I/O monitor sees it" },
+]

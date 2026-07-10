@@ -17,6 +17,10 @@
 //! files change — i.e. on every real rebuild — keeping the counter/timestamp
 //! fresh.
 
+// Build scripts run on the host, outside the app's I/O-monitor facade
+// (clippy.toml disallowed-methods targets the app's runtime fs use).
+#![allow(clippy::disallowed_methods)]
+
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
