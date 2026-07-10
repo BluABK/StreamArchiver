@@ -502,6 +502,16 @@ impl std::ops::DerefMut for DbGuard<'_> {
 
 impl Drop for DbGuard<'_> {
     fn drop(&mut self) {
+        // Count every DB access (ops + cumulative hold time) at the single
+        // chokepoint all queries pass through; byte-level growth is sampled
+        // from the db/WAL file sizes by the I/O monitor instead.
+        crate::iomon::record_region(
+            crate::iomon::Cat::Db,
+            crate::iomon::Region::AppData,
+            crate::iomon::OpKind::Meta,
+            0,
+            self.acquired_at.elapsed(),
+        );
         let ms = self.acquired_at.elapsed().as_millis();
         if ms >= 200 {
             tracing::warn!(

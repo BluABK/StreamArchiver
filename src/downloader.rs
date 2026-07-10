@@ -6038,12 +6038,14 @@ impl ReattachItem {
 /// stderr). Append mode lets both streams interleave into a single growing file
 /// without clobbering each other, and the child keeps writing after we detach.
 fn open_log_pair(path: &Path) -> std::io::Result<(std::fs::File, std::fs::File)> {
-    use std::fs::OpenOptions;
+    use crate::iomon::Cat;
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        let _ = crate::iomon::fs::create_dir_all_sync(Cat::ToolLog, parent);
     }
-    let _ = std::fs::File::create(path)?; // truncate any leftover
-    let out = OpenOptions::new().create(true).append(true).open(path)?;
+    let _ = crate::iomon::fs::create_sync(Cat::ToolLog, path)?; // truncate any leftover
+    let out = crate::iomon::fs::open_with_sync(Cat::ToolLog, path, |o| {
+        o.create(true).append(true);
+    })?;
     let err = out.try_clone()?;
     Ok((out, err))
 }
@@ -6062,9 +6064,11 @@ async fn tail_log(
     done: Arc<AtomicBool>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    // Where the log lives, classified once for the per-read accounting below.
+    let log_region = crate::iomon::classify(&path);
     // The log is created before the spawn, but tolerate a brief absence.
     let mut file = loop {
-        match tokio::fs::File::open(&path).await {
+        match crate::iomon::fs::open(crate::iomon::Cat::LogRead, &path).await {
             Ok(f) => break f,
             Err(_) => {
                 if done.load(Ordering::SeqCst) {
@@ -6095,7 +6099,15 @@ async fn tail_log(
         tracing::trace!(target: "streamarchiver::recproc", "{line}");
     };
     loop {
+        let read_start = std::time::Instant::now();
         let n = file.read(&mut buf).await.unwrap_or(0);
+        crate::iomon::record_region(
+            crate::iomon::Cat::LogRead,
+            log_region,
+            crate::iomon::OpKind::Read,
+            n as u64,
+            read_start.elapsed(),
+        );
         if n == 0 {
             if done.load(Ordering::SeqCst) {
                 // Process exited and we've drained to EOF: flush any trailing
@@ -6165,8 +6177,9 @@ fn recording_from_detached(row: &DetachedRow) -> Recording {
 /// length. Only the trailing line is re-read, which is safe: ad inserts are
 /// idempotent and progress parsing is overwrite-only.
 async fn line_aligned_tail_offset(path: &Path) -> u64 {
+    use crate::iomon::Cat;
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
-    let len = match tokio::fs::metadata(path).await {
+    let len = match crate::iomon::fs::metadata(Cat::LogRead, path).await {
         Ok(m) => m.len(),
         Err(_) => return 0,
     };
@@ -6175,14 +6188,17 @@ async fn line_aligned_tail_offset(path: &Path) -> u64 {
     }
     let window = len.min(64 * 1024);
     let start = len - window;
-    let Ok(mut f) = tokio::fs::File::open(path).await else {
+    let Ok(mut f) = crate::iomon::fs::open(Cat::LogRead, path).await else {
         return len;
     };
     if f.seek(std::io::SeekFrom::Start(start)).await.is_err() {
         return len;
     }
     let mut buf = vec![0u8; window as usize];
-    if f.read_exact(&mut buf).await.is_err() {
+    let read_start = std::time::Instant::now();
+    let read_res = f.read_exact(&mut buf).await;
+    crate::iomon::record(Cat::LogRead, path, crate::iomon::OpKind::Read, window, read_start.elapsed());
+    if read_res.is_err() {
         return len;
     }
     if buf.last() == Some(&b'\n') {
@@ -6200,10 +6216,11 @@ async fn line_aligned_tail_offset(path: &Path) -> u64 {
 /// of MB, and this runs at finalize — the worst moment for an extra full-file
 /// read on the recordings drive).
 async fn read_log_tail(path: &Path, max_lines: usize) -> String {
+    use crate::iomon::Cat;
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     // 80 lines of tool output fit comfortably in 64 KiB.
     const TAIL_WINDOW: u64 = 64 * 1024;
-    let Ok(mut f) = tokio::fs::File::open(path).await else {
+    let Ok(mut f) = crate::iomon::fs::open(Cat::LogRead, path).await else {
         return String::new();
     };
     let len = f.metadata().await.map(|m| m.len()).unwrap_or(0);
@@ -6212,7 +6229,16 @@ async fn read_log_tail(path: &Path, max_lines: usize) -> String {
         return String::new();
     }
     let mut data = Vec::with_capacity(TAIL_WINDOW as usize);
-    if f.read_to_end(&mut data).await.is_err() {
+    let read_start = std::time::Instant::now();
+    let read_res = f.read_to_end(&mut data).await;
+    crate::iomon::record(
+        Cat::LogRead,
+        path,
+        crate::iomon::OpKind::Read,
+        data.len() as u64,
+        read_start.elapsed(),
+    );
+    if read_res.is_err() {
         return String::new();
     }
     let text = String::from_utf8_lossy(&data);

@@ -24301,20 +24301,29 @@ impl FsProbes {
             .name("fs-probes".into())
             .spawn(move || {
                 while let Ok(job) = job_rx.recv() {
+                    use crate::iomon::Cat;
                     let res = match job {
                         ProbeJob::File(p) => {
-                            let v = p.is_file();
+                            let v = crate::iomon::fs::metadata_sync(Cat::FsProbe, &p)
+                                .map(|m| m.is_file())
+                                .unwrap_or(false);
                             ProbeResult::File(p, v)
                         }
                         ProbeJob::Dir(p) => {
-                            let v = p.is_dir();
+                            let v = crate::iomon::fs::metadata_sync(Cat::FsProbe, &p)
+                                .map(|m| m.is_dir())
+                                .unwrap_or(false);
                             ProbeResult::Dir(p, v)
                         }
                         // Directory-entry size (fine for finished files).
                         ProbeJob::Len(p) => {
-                            let v = p.metadata().map(|m| m.len()).unwrap_or(0);
+                            let v = crate::iomon::fs::metadata_sync(Cat::FsProbe, &p)
+                                .map(|m| m.len())
+                                .unwrap_or(0);
                             ProbeResult::Len(p, v)
                         }
+                        // stream_target_for_active's own read_dir/open calls
+                        // are accounted individually (Cat::FsProbe) inside.
                         ProbeJob::Target(s) => {
                             let t = stream_target_for_active(&s);
                             ProbeResult::Target(s, t)
@@ -24405,7 +24414,10 @@ impl FsProbes {
 /// (verified against a live download: dir entry 0, handle size 5 MB).
 /// Opening the file queries the handle, which is always current.
 fn live_file_len(p: &std::path::Path) -> Option<u64> {
-    let md = std::fs::File::open(p).ok()?.metadata().ok()?;
+    let md = crate::iomon::fs::open_sync(crate::iomon::Cat::FsProbe, p)
+        .ok()?
+        .metadata()
+        .ok()?;
     md.is_file().then(|| md.len())
 }
 
@@ -24442,7 +24454,10 @@ fn stream_target_for_active(output_path: &str) -> Option<StreamTarget> {
     let mut best: std::collections::HashMap<u64, (Option<u64>, std::path::PathBuf, u64)> =
         std::collections::HashMap::new();
     let prefix = format!("{stem}.");
-    for entry in std::fs::read_dir(&cache_dir).ok()?.flatten() {
+    for entry in crate::iomon::fs::read_dir_sync(crate::iomon::Cat::FsProbe, &cache_dir)
+        .ok()?
+        .flatten()
+    {
         let name = entry.file_name().to_string_lossy().into_owned();
         let Some(rest) = name.strip_prefix(&prefix) else { continue };
         if rest.ends_with(".state") || rest.ends_with(".log") || rest.ends_with(".ytdl") {
@@ -25595,7 +25610,8 @@ fn parse_chat_chunk(
     // slurp held roughly 2x the file size in RAM for a marathon stream's
     // phase-2 parse.
     const WINDOW: usize = 8 * 1024 * 1024;
-    let mut f = File::open(path)?;
+    let chat_region = crate::iomon::classify(path);
+    let mut f = crate::iomon::fs::open_sync(crate::iomon::Cat::ChatSidecar, path)?;
     let len = f.metadata()?.len();
     let end = to.unwrap_or(len).min(len);
     if from >= end {
@@ -25614,7 +25630,16 @@ fn parse_chat_chunk(
         let take = WINDOW.min((end - pos) as usize);
         let old_len = buf.len();
         buf.resize(old_len + take, 0);
-        f.read_exact(&mut buf[old_len..])?;
+        let read_start = std::time::Instant::now();
+        let read_res = f.read_exact(&mut buf[old_len..]);
+        crate::iomon::record_region(
+            crate::iomon::Cat::ChatSidecar,
+            chat_region,
+            crate::iomon::OpKind::Read,
+            take as u64,
+            read_start.elapsed(),
+        );
+        read_res?;
         pos += take as u64;
         let complete = match buf.iter().rposition(|&b| b == b'\n') {
             Some(i) => i + 1,
@@ -25654,14 +25679,23 @@ fn parse_chat_chunk(
 /// the phase-1 tail parse starts. 0 for small files (just parse everything).
 fn chat_tail_start(path: &Path) -> anyhow::Result<u64> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut f = File::open(path)?;
+    let mut f = crate::iomon::fs::open_sync(crate::iomon::Cat::ChatSidecar, path)?;
     let len = f.metadata()?.len();
     if len <= CHAT_TAIL_BYTES {
         return Ok(0);
     }
     f.seek(SeekFrom::Start(len - CHAT_TAIL_BYTES))?;
     let mut buf = vec![0u8; CHAT_TAIL_BYTES as usize];
-    f.read_exact(&mut buf)?;
+    let read_start = std::time::Instant::now();
+    let read_res = f.read_exact(&mut buf);
+    crate::iomon::record(
+        crate::iomon::Cat::ChatSidecar,
+        path,
+        crate::iomon::OpKind::Read,
+        CHAT_TAIL_BYTES,
+        read_start.elapsed(),
+    );
+    read_res?;
     Ok(match buf.iter().position(|&b| b == b'\n') {
         Some(i) => len - CHAT_TAIL_BYTES + i as u64 + 1,
         None => 0, // no boundary in the tail (one giant line) — parse it all

@@ -390,6 +390,11 @@ fn record_inner(
         }
     }
 
+    // DB guard drops fire hundreds of times a second under load and carry no
+    // path — counters only, unless slow (a slow DB hold is worth surfacing).
+    if matches!(cat, Cat::Db) && !slow {
+        return;
+    }
     // Ring push: try_lock so no hot path (or panic path) ever blocks here.
     // A contended push is dropped — the atomic counters above never miss.
     if let Some(mut ring) = OPS_RING.try_lock() {

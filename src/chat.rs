@@ -54,6 +54,9 @@ const FLUSH_BYTES: usize = 32 * 1024;
 /// kill, [`FLUSH_EVERY`] worth of chat is lost — the graceful paths all flush.
 struct ChatSink {
     path: PathBuf,
+    /// Storage region of `path`, classified once (the sidecar never moves
+    /// during a session) so per-flush accounting skips re-classification.
+    region: crate::iomon::Region,
     file: Option<tokio::fs::File>,
     buf: String,
     first_buffered: Option<tokio::time::Instant>,
@@ -61,7 +64,8 @@ struct ChatSink {
 
 impl ChatSink {
     fn new(path: PathBuf) -> ChatSink {
-        ChatSink { path, file: None, buf: String::new(), first_buffered: None }
+        let region = crate::iomon::classify(&path);
+        ChatSink { path, region, file: None, buf: String::new(), first_buffered: None }
     }
 
     fn push(&mut self, json_line: &str) {
@@ -85,15 +89,23 @@ impl ChatSink {
         }
         if self.file.is_none() {
             self.file = Some(
-                tokio::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&self.path)
-                    .await?,
+                crate::iomon::fs::open_with(crate::iomon::Cat::ChatSidecar, &self.path, |o| {
+                    o.create(true).append(true);
+                })
+                .await?,
             );
         }
-        let f = self.file.as_mut().unwrap();
-        f.write_all(self.buf.as_bytes()).await?;
+        let bytes = self.buf.len() as u64;
+        let start = std::time::Instant::now();
+        let res = self.file.as_mut().unwrap().write_all(self.buf.as_bytes()).await;
+        crate::iomon::record_region(
+            crate::iomon::Cat::ChatSidecar,
+            self.region,
+            crate::iomon::OpKind::Write,
+            bytes,
+            start.elapsed(),
+        );
+        res?;
         self.buf.clear();
         self.first_buffered = None;
         Ok(())
