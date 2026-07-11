@@ -324,7 +324,17 @@ stream, or take — for a context menu with that row's actions. For an instance:
 Start/Stop recording, **Stream in player** / **Play new instance** (see
 [Watching in a media player](#watching-in-a-media-player)), **Open channel URL**
 (browser), **Open output folder** (file manager), **Copy URL**, Edit…, Add tool
-instance, Enable/Disable, and Delete. A stream/take row's menu offers Open folder
+instance, Enable/Disable, and Delete.
+
+**Stopping holds the restart.** A manual **⏹ Stop** doesn't just stop the take
+— it also suppresses every automatic restart (polls, pushes, trigger rules)
+until the channel goes offline and starts a **new** broadcast, so Auto can't
+immediately re-record the stream you just stopped. **Stop for 6 hours** /
+**Stop for 12 hours** hold for a fixed time instead, regardless of
+offline/online cycles. A held instance shows a **✋** badge in its State cell
+(hover for when the hold ends); **▶ Start** always clears the hold. Holds
+survive an app restart. Automated stops (a trigger's *only-while-matching*
+auto-stop, scheduled stops, the quality-upgrade restart) never hold. A stream/take row's menu offers Open folder
 / Open file / Stream in player / Play new instance / Copy path (and Delete for
 a take). The inline per-row buttons (▶/⏹ ⏵ ▷ ✏ ➕ 🗑) do the same.
 
@@ -498,7 +508,10 @@ captures are writing to:
   additionally caps how fast each pass reads + writes (ffmpeg `-readrate`,
   needs ffmpeg 5.0+; silently unthrottled on older builds). At 30× a 5-hour
   stream finalizes in ~10 minutes while using a fraction of the drive's
-  bandwidth. `0` disables the cap.
+  bandwidth. `0` disables the cap. `-readrate` paces against the input's own
+  timestamps, which ad-break cuts can break (ffmpeg then *crawls* below
+  realtime, wedging the queue for hours) — a pacing watchdog detects a remux
+  falling hopelessly behind and retries that one file unthrottled.
 - Tool logs, chat sidecar writes, and the UI's file probes are batched, cached,
   or kept off the recordings drive entirely (see *Data & locations*).
 - **Download rate limit** (Settings → Defaults, default **off**): a yt-dlp

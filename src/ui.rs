@@ -6202,7 +6202,8 @@ fn channel_cells(
 #[derive(Default)]
 struct RowActions {
     start: Option<i64>,                 // monitor id
-    stop: Option<i64>,                  // monitor id
+    /// `(monitor id, hold hours)` — `None` hours = hold until a new broadcast.
+    stop: Option<(i64, Option<i64>)>,
     stop_chat: Option<i64>,             // monitor id
     view_chat: Option<i64>,             // monitor id
     edit: Option<i64>,                  // monitor id
@@ -6252,6 +6253,9 @@ fn render_instance_row(
     // to this row's monitor_id in the "scheduled_rec" cell. The table is
     // small, so a per-row filter is cheaper than threading a prebuilt map.
     sched_recs: &[ScheduledRecordingWithNames],
+    // Pre-formatted stop-hold description when a user Stop is suppressing
+    // automatic restarts for this monitor (the ✋ state badge).
+    stop_hold: Option<String>,
     order: &[usize],
     a: &mut RowActions,
 ) -> bool {
@@ -6262,8 +6266,37 @@ fn render_instance_row(
     let add_menu = |ui: &mut egui::Ui, a: &mut RowActions| {
         ui.set_min_width(180.0);
         if recording {
-            if ui.button("⏹  Stop recording").clicked() {
-                a.stop = Some(m.id);
+            if ui
+                .button("⏹  Stop recording")
+                .on_hover_text(
+                    "Stops the take and holds automatic restarts until this channel \
+                     goes offline and starts a NEW broadcast. ▶ Start clears the hold.",
+                )
+                .clicked()
+            {
+                a.stop = Some((m.id, None));
+                ui.close();
+            }
+            if ui
+                .button("⏹  Stop for 6 hours")
+                .on_hover_text(
+                    "Stops the take and holds automatic restarts for 6 hours, \
+                     regardless of offline/online cycles. ▶ Start clears the hold.",
+                )
+                .clicked()
+            {
+                a.stop = Some((m.id, Some(6)));
+                ui.close();
+            }
+            if ui
+                .button("⏹  Stop for 12 hours")
+                .on_hover_text(
+                    "Stops the take and holds automatic restarts for 12 hours, \
+                     regardless of offline/online cycles. ▶ Start clears the hold.",
+                )
+                .clicked()
+            {
+                a.stop = Some((m.id, Some(12)));
                 ui.close();
             }
         } else if ui.button("▶  Start recording").clicked() {
@@ -6435,9 +6468,13 @@ fn render_instance_row(
                 ui.push_id(m.id, |ui| {
                     let mut btns: Vec<egui::Response> = Vec::with_capacity(6);
                     if recording {
-                        let b = ui.small_button("⏹").on_hover_text("Stop / abort recording");
+                        let b = ui.small_button("⏹").on_hover_text(
+                            "Stop / abort recording — holds automatic restarts until this \
+                             channel starts a NEW broadcast (▶ Start clears the hold). \
+                             Right-click the row for timed holds (6 h / 12 h).",
+                        );
                         if b.clicked() {
-                            a.stop = Some(m.id);
+                            a.stop = Some((m.id, None));
                         }
                         btns.push(b);
                     } else {
@@ -6589,6 +6626,15 @@ fn render_instance_row(
                             "Live-chat download is still running.\n\
                              Right-click → Stop chat download to abort it.",
                         );
+                    }
+                    if let Some(desc) = &stop_hold {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xd0, 0xa0, 0x40),
+                            egui::RichText::new("✋").small(),
+                        )
+                        .on_hover_text(format!(
+                            "Manually stopped — auto-record is held {desc}. ▶ Start clears the hold."
+                        ));
                     }
                     if recording && !row.last_recording_trigger.is_empty() {
                         ui.colored_label(
@@ -13526,6 +13572,9 @@ impl StreamArchiverApp {
         // instance rows, bubbled up to their channel row while active).
         let active_chat_ids: HashSet<i64> =
             self.core.active_chats.lock().unwrap().keys().copied().collect();
+        // Snapshot the stop-holds (user Stop suppressing auto-restart — ✋ badge).
+        let stop_holds_snapshot: HashMap<i64, crate::downloader::StopHold> =
+            self.core.stop_holds.lock().unwrap().clone();
 
         // ── Frame-invariant view data, cached across repaints ────────────────
         // Rebuilding this every frame — cloning every Channel, re-grouping every
@@ -14409,6 +14458,14 @@ impl StreamArchiverApp {
                                         .max_by_key(|t| t.started_at)
                                         .map(|t| t.id)
                                 });
+                                let stop_hold_desc = stop_holds_snapshot.get(&mid).map(|h| match h {
+                                    crate::downloader::StopHold::Until(t) => {
+                                        format!("until {}", fmt_datetime_short(*t))
+                                    }
+                                    crate::downloader::StopHold::FreshStream { .. } => {
+                                        "until this channel starts a new broadcast".to_string()
+                                    }
+                                });
                                 if render_instance_row(
                                     &mut tr, row, &ptex, now, recording, chat_active,
                                     tint, output_dir_ok, depth, has_hist, expanded,
@@ -14417,6 +14474,7 @@ impl StreamArchiverApp {
                                     instance_avatars.get(&mid),
                                     inst_latest_rec_id,
                                     &self.scheduled_recordings,
+                                    stop_hold_desc,
                                     &col_order, &mut acts,
                                 ) {
                                     toggle_instance = Some(mid);
@@ -15648,9 +15706,13 @@ impl StreamArchiverApp {
             self.core.manual(ManualCommand::Start { id, user_initiated: true });
             self.status = "Checking channel… will record if live.".into();
         }
-        if let Some(id) = acts.stop {
-            self.core.manual(ManualCommand::Stop(id));
-            self.status = "Stopping recording…".into();
+        if let Some((id, hours)) = acts.stop {
+            self.core
+                .manual(ManualCommand::StopHoldFor { monitor_id: id, hours });
+            self.status = match hours {
+                Some(h) => format!("Stopping — auto-record held for {h} hours."),
+                None => "Stopping — auto-record held until a new broadcast.".into(),
+            };
         }
         if let Some(id) = acts.stop_chat {
             self.core.manual(ManualCommand::StopChat(id));

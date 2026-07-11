@@ -1362,6 +1362,47 @@ pub struct Supervisor {
     /// the quality-upgrade watcher — an upgrade fires at most once per stream
     /// so a flapping rendition list can never cause a restart loop.
     quality_upgraded: Arc<Mutex<HashSet<String>>>,
+    /// Monitors whose automatic restarts are suppressed after a user Stop —
+    /// see [`StopHold`]. Shared with the UI (state-cell badge) and persisted
+    /// across restarts (`K_STOP_HOLDS`).
+    stop_holds: StopHolds,
+}
+
+/// Why automatic restarts are suppressed for a monitor after a user Stop.
+/// Blocks every automatic start path — polls, pushes, and trigger rules; a
+/// manual ▶ Start always clears it.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum StopHold {
+    /// Until a NEW broadcast appears: a different stream id, or a newer
+    /// go-live time (i.e. the channel went offline and live again).
+    FreshStream {
+        stream_id: Option<String>,
+        went_live_at: Option<i64>,
+    },
+    /// Until this unix timestamp, regardless of offline/online cycles.
+    Until(i64),
+}
+
+pub type StopHolds = Arc<Mutex<HashMap<i64, StopHold>>>;
+
+/// Settings key persisting the stop-holds across restarts (JSON pairs).
+const K_STOP_HOLDS: &str = "manual_stop_holds";
+
+fn load_stop_holds(store: &Store) -> HashMap<i64, StopHold> {
+    store
+        .get_setting(K_STOP_HOLDS)
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_str::<Vec<(i64, StopHold)>>(&v).ok())
+        .map(|v| v.into_iter().collect())
+        .unwrap_or_default()
+}
+
+fn persist_stop_holds(store: &Store, holds: &HashMap<i64, StopHold>) {
+    let pairs: Vec<(&i64, &StopHold)> = holds.iter().collect();
+    if let Ok(json) = serde_json::to_string(&pairs) {
+        let _ = store.set_setting(K_STOP_HOLDS, &json);
+    }
 }
 
 /// RAII guard removing a rec_id from [`Supervisor::running_concats`] on drop,
@@ -1398,7 +1439,10 @@ impl Supervisor {
         ctx: Arc<DetectContext>,
         ad_active: AdActive,
         max_concurrent: usize,
+        stop_holds: StopHolds,
     ) -> Supervisor {
+        // Restore the persisted holds into the shared map (the UI reads it).
+        *stop_holds.lock().unwrap() = load_stop_holds(&store);
         Supervisor {
             store,
             events,
@@ -1423,6 +1467,7 @@ impl Supervisor {
             running_asset_fetches: Arc::new(Mutex::new(HashSet::new())),
             running_concats: Arc::new(Mutex::new(HashSet::new())),
             quality_upgraded: Arc::new(Mutex::new(HashSet::new())),
+            stop_holds,
         }
     }
 
@@ -1451,6 +1496,9 @@ impl Supervisor {
                         tokio::spawn(async move { this.manual_start(id, user_initiated).await });
                     }
                     ManualCommand::Stop(id) => self.manual_stop(id),
+                    ManualCommand::StopHoldFor { monitor_id, hours } => {
+                        self.manual_stop_hold(monitor_id, hours)
+                    }
                     ManualCommand::StartVideo(id) => {
                         if !self.shutdown.load(Ordering::SeqCst) {
                             let this = self.clone();
@@ -2446,6 +2494,16 @@ impl Supervisor {
         bypass_backoff: bool,
         forced: bool,
     ) -> bool {
+        // Manual-stop hold: a user Stop means "leave this alone" — no
+        // automatic restart (poll, push, or trigger rule) until a NEW
+        // broadcast appears or the timed hold expires. A manual ▶ Start
+        // clears it before reaching here (`manual_start`).
+        if let Some(reason) =
+            self.stop_hold_blocks(monitor_id, stream_id.as_deref(), went_live_at)
+        {
+            tracing::debug!(monitor_id, "auto start suppressed: {reason}");
+            return false;
+        }
         {
             let mut active = self.active.lock().unwrap();
             if active.contains_key(&monitor_id) {
@@ -2615,6 +2673,10 @@ impl Supervisor {
         if self.active.lock().unwrap().contains_key(&monitor_id) {
             return; // already recording
         }
+        // An explicit user Start overrides (and removes) any stop-hold.
+        if user_initiated {
+            self.clear_stop_hold(monitor_id);
+        }
         let row = match self.store.get_monitor_with_channel(monitor_id) {
             Ok(Some(r)) => r,
             _ => return,
@@ -2708,6 +2770,78 @@ impl Supervisor {
             );
             info!(monitor_id, "manual stop");
         }
+    }
+
+    /// User Stop with restart suppression: stop the active take (if any) and
+    /// hold automatic restarts — `hours: None` until a NEW broadcast appears
+    /// (the channel goes offline and live again), `Some(h)` for a fixed
+    /// number of hours regardless of stream cycles. A manual ▶ Start clears
+    /// the hold. Automated stops (trigger stop-on-unmatch, scheduled stops,
+    /// the quality-upgrade restart) use plain [`manual_stop`] and never hold.
+    pub fn manual_stop_hold(&self, monitor_id: i64, hours: Option<i64>) {
+        let hold = match hours {
+            Some(h) => StopHold::Until(now_unix() + h * 3600),
+            None => {
+                let (stream_id, went_live_at) = self
+                    .store
+                    .latest_stream_identity(monitor_id)
+                    .ok()
+                    .flatten()
+                    .unwrap_or((None, None));
+                StopHold::FreshStream { stream_id, went_live_at }
+            }
+        };
+        {
+            let mut holds = self.stop_holds.lock().unwrap();
+            holds.insert(monitor_id, hold);
+            persist_stop_holds(&self.store, &holds);
+        }
+        info!(monitor_id, hours, "manual stop with restart hold");
+        self.manual_stop(monitor_id);
+    }
+
+    /// Remove a monitor's stop-hold (manual ▶ Start, or expiry).
+    fn clear_stop_hold(&self, monitor_id: i64) {
+        let mut holds = self.stop_holds.lock().unwrap();
+        if holds.remove(&monitor_id).is_some() {
+            persist_stop_holds(&self.store, &holds);
+            info!(monitor_id, "stop hold cleared");
+        }
+    }
+
+    /// `Some(reason)` when an automatic start must be suppressed by a stop
+    /// hold; expired/superseded holds are removed here as a side effect.
+    fn stop_hold_blocks(
+        &self,
+        monitor_id: i64,
+        stream_id: Option<&str>,
+        went_live_at: Option<i64>,
+    ) -> Option<String> {
+        let mut holds = self.stop_holds.lock().unwrap();
+        let hold = holds.get(&monitor_id)?.clone();
+        let expired = match &hold {
+            StopHold::Until(t) => now_unix() >= *t,
+            StopHold::FreshStream { stream_id: held_sid, went_live_at: held_wl } => {
+                // A NEW broadcast = a different stream id, or a strictly newer
+                // go-live. Unknown identities on either side keep the hold —
+                // never resume on a guess.
+                let new_sid = matches!(
+                    (held_sid.as_deref(), stream_id),
+                    (Some(h), Some(n)) if h != n
+                );
+                let newer_wl = matches!((held_wl, went_live_at), (Some(h), Some(n)) if n > *h);
+                new_sid || newer_wl
+            }
+        };
+        if expired {
+            holds.remove(&monitor_id);
+            persist_stop_holds(&self.store, &holds);
+            return None;
+        }
+        Some(match hold {
+            StopHold::Until(t) => format!("held until unix {t}"),
+            StopHold::FreshStream { .. } => "held until a new broadcast".to_string(),
+        })
     }
 
     /// Watch a young Twitch `best`-quality capture for a better rendition
@@ -7110,11 +7244,24 @@ pub async fn remux_ts_to_mkv(
     progress_tx: Option<(EventTx, u64)>,
     opts: &crate::models::RemuxOpts,
 ) -> anyhow::Result<()> {
+    remux_ts_to_mkv_impl(src, dst, progress_tx, opts, true).await
+}
+
+/// `allow_readrate: false` = the pacing-collapse retry (see below): the
+/// throttle is skipped for THIS file only, unlike the process-wide
+/// unsupported-flag latch.
+async fn remux_ts_to_mkv_impl(
+    src: &Path,
+    dst: &Path,
+    progress_tx: Option<(EventTx, u64)>,
+    opts: &crate::models::RemuxOpts,
+    allow_readrate: bool,
+) -> anyhow::Result<()> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     // One full-file pass at a time on the recordings drive (see io_gate).
     let gate = crate::io_gate::local_pass("remux").await;
-    let readrate = crate::io_gate::readrate();
+    let readrate = if allow_readrate { crate::io_gate::readrate() } else { None };
 
     // Get total duration so we can compute a percentage from ffmpeg's output.
     let total_us: Option<i64> = if progress_tx.is_some() {
@@ -7217,6 +7364,16 @@ pub async fn remux_ts_to_mkv(
         lines
     });
 
+    // `-readrate` paces reading against the INPUT'S OWN timestamps. A TS with
+    // timestamp discontinuities (streamlink's ad-break cuts, PTS wraps) can
+    // make ffmpeg believe it's hours "ahead of schedule" and sleep — observed
+    // crawling at 0.6× realtime instead of 30×, wedging the 1-permit gate for
+    // hours and leaving the take looking stuck "recording". If the media
+    // position falls hopelessly behind wall clock, kill and retry this one
+    // file without the throttle (still serialized by the gate).
+    let pace_started = std::time::Instant::now();
+    let mut pacing_broken = false;
+
     // Read stdout for progress events.  ffmpeg's -progress writes one key=value
     // per line; a block ends with `progress=continue` (or `progress=end`).
     // `out_time_ms` is microseconds despite the name (historical ffmpeg quirk).
@@ -7258,6 +7415,19 @@ pub async fn remux_ts_to_mkv(
                                 info,
                             });
                         }
+                        // Pacing watchdog: with a working -readrate the media
+                        // position advances at ~readrate× wall clock (disk
+                        // pressure might drag it lower, but never below a few
+                        // × realtime). Under 2× after 3 minutes = the pacing
+                        // math is broken for this file.
+                        if readrate.is_some() && !pacing_broken {
+                            let elapsed = pace_started.elapsed().as_secs_f64();
+                            let media_s = blk_us.unwrap_or(0) as f64 / 1e6;
+                            if elapsed > 180.0 && media_s < elapsed * 2.0 {
+                                pacing_broken = true;
+                                let _ = child.start_kill();
+                            }
+                        }
                         // Reset for next block.
                         blk_frame.clear(); blk_fps.clear();
                         blk_speed.clear(); blk_pos.clear(); blk_us = None;
@@ -7271,6 +7441,18 @@ pub async fn remux_ts_to_mkv(
     let status = child.wait().await?;
     let stderr_lines = stderr_task.await.unwrap_or_default();
 
+    if pacing_broken {
+        // Release the gate first — the retry re-acquires it (1 permit).
+        drop(gate);
+        warn!(
+            "remux: -readrate pacing collapsed (media time far behind wall clock — \
+             timestamp discontinuities in the source, e.g. ad-break cuts); retrying \
+             without the throttle: {}",
+            src.display()
+        );
+        return Box::pin(remux_ts_to_mkv_impl(src, dst, progress_tx, opts, false)).await;
+    }
+
     if status.success() {
         Ok(())
     } else {
@@ -7280,7 +7462,7 @@ pub async fn remux_ts_to_mkv(
         if readrate.is_some() && crate::io_gate::is_readrate_error(&stderr_lines.join("\n")) {
             crate::io_gate::mark_readrate_unsupported();
             drop(gate);
-            return Box::pin(remux_ts_to_mkv(src, dst, progress_tx, opts)).await;
+            return Box::pin(remux_ts_to_mkv_impl(src, dst, progress_tx, opts, true)).await;
         }
         let code = status.code().unwrap_or(-1);
         // Grab the last few non-empty lines of stderr — ffmpeg prints the

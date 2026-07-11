@@ -4267,6 +4267,25 @@ impl Store {
         Ok(row)
     }
 
+    /// The newest recording's `(stream_id, went_live_at)` for a monitor — the
+    /// broadcast identity a manual stop-hold is anchored to ("don't restart
+    /// until a NEW stream" = a different id / newer go-live than this).
+    pub fn latest_stream_identity(
+        &self,
+        monitor_id: i64,
+    ) -> Result<Option<(Option<String>, Option<i64>)>> {
+        let conn = self.db();
+        let row = conn
+            .query_row(
+                "SELECT stream_id, went_live_at FROM recording
+                 WHERE monitor_id = ?1 ORDER BY started_at DESC LIMIT 1",
+                params![monitor_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     /// Recordings whose head backfill exists but can't be losslessly joined
     /// with the live capture (differing codec parameters — typically the live
     /// take joined before Twitch listed the source rendition, so it captured

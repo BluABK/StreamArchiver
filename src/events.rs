@@ -403,6 +403,12 @@ pub enum ManualCommand {
     /// unless the owning channel is currently live (the CDN's growing live
     /// playlist this depends on stops being pre-mute-safe once the stream ends).
     BackfillHeadNow(i64),
+    /// User Stop with restart suppression: stop the take and hold automatic
+    /// restarts — `hours: None` until the channel starts a NEW broadcast,
+    /// `Some(h)` for a fixed number of hours. Manual Start clears the hold.
+    /// Automated stops (trigger stop-on-unmatch, scheduled auto-stop, quality
+    /// upgrade) use plain `Stop` and never hold.
+    StopHoldFor { monitor_id: i64, hours: Option<i64> },
     /// Re-fetch a mismatched head backfill at the LIVE capture's own rendition
     /// (the Issues fix for `head_backfill_state == "mismatch"`): the live take
     /// joined before Twitch listed the source rendition, so the source-quality

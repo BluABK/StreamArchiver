@@ -76,6 +76,9 @@ pub struct AppCore {
     pub video_speed: crate::downloader::VideoSpeed,
     /// monitor_id -> unix time the current ad break ends (for the UI row tint).
     pub ad_active: crate::downloader::AdActive,
+    /// monitor_id -> stop-hold (user Stop suppressing automatic restarts).
+    /// Written by the supervisor, read by the UI for the ✋ state badge.
+    pub stop_holds: crate::downloader::StopHolds,
     /// Set during shutdown so the scheduler/supervisor stop starting new work.
     pub shutdown: Arc<AtomicBool>,
     /// Set by a "Quit & stop recordings" action so the exit path kills the tool
@@ -121,6 +124,7 @@ impl AppCore {
             video_progress: Arc::new(Mutex::new(HashMap::new())),
             video_speed: Arc::new(Mutex::new(HashMap::new())),
             ad_active: Arc::new(Mutex::new(HashMap::new())),
+            stop_holds: Arc::new(Mutex::new(HashMap::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             force_stop_on_quit: AtomicBool::new(false),
             manual_tx: Mutex::new(None),
@@ -282,6 +286,7 @@ impl AppCore {
             ctx,
             self.ad_active.clone(),
             max_concurrent,
+            self.stop_holds.clone(),
         );
         // Crash/restart recovery, in two synchronous passes so reservations land
         // before detection can fire:
