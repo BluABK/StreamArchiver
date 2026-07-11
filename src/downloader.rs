@@ -6602,7 +6602,7 @@ async fn concat_mkvs(
 
         // spawn + wait_with_output (≡ output()) so the PID is sampleable.
         let out = match cmd.spawn() {
-            Ok(mut child) => {
+            Ok(child) => {
                 let _io_guard = crate::iomon::track_tool(child.id(), "ffmpeg", "concat", dst);
                 child.wait_with_output().await
             }
@@ -7013,7 +7013,7 @@ pub async fn embed_thumbnail_into_mkv(mkv: &Path, thumb: &Path) -> anyhow::Resul
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
         // spawn + wait_with_output (≡ output()) so the PID is sampleable.
-        let mut child = cmd.spawn()?;
+        let child = cmd.spawn()?;
         let _io_guard = crate::iomon::track_tool(child.id(), "ffmpeg", "embed-thumbnail", mkv);
         let out = child.wait_with_output().await?;
         if !out.status.success()
@@ -7080,7 +7080,7 @@ pub async fn embed_subtitles_into_mkv(mkv: &Path) -> anyhow::Result<bool> {
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
         // spawn + wait_with_output (≡ output()) so the PID is sampleable.
-        let mut child = cmd.spawn()?;
+        let child = cmd.spawn()?;
         let _io_guard = crate::iomon::track_tool(child.id(), "ffmpeg", "embed-subs", mkv);
         let out = child.wait_with_output().await?;
         if !out.status.success()
