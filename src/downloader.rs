@@ -1358,6 +1358,10 @@ pub struct Supervisor {
     /// wins; later ones return immediately (the winner's own post-concat DB
     /// re-check keeps the result correct).
     running_concats: Arc<Mutex<HashSet<i64>>>,
+    /// Streams (keyed `"{monitor_id}:{stream_id}"`) already restarted once by
+    /// the quality-upgrade watcher — an upgrade fires at most once per stream
+    /// so a flapping rendition list can never cause a restart loop.
+    quality_upgraded: Arc<Mutex<HashSet<String>>>,
 }
 
 /// RAII guard removing a rec_id from [`Supervisor::running_concats`] on drop,
@@ -1418,6 +1422,7 @@ impl Supervisor {
             sabr_stall_count: Arc::new(Mutex::new(HashMap::new())),
             running_asset_fetches: Arc::new(Mutex::new(HashSet::new())),
             running_concats: Arc::new(Mutex::new(HashSet::new())),
+            quality_upgraded: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -2705,6 +2710,95 @@ impl Supervisor {
         }
     }
 
+    /// Watch a young Twitch `best`-quality capture for a better rendition
+    /// appearing after join: Twitch's master playlist often lists only
+    /// transcodes for the first moments of a broadcast, so a capture that
+    /// joins seconds after go-live can lock onto e.g. 720p60 while the source
+    /// (1080p60) shows up shortly after — and the VOD/head backfill is always
+    /// source, which is how head/live joins end up mismatched. When a better
+    /// rendition appears within the first checks, the take is stopped like
+    /// the Stop button (finalizes as "stopped") with a SHORT backoff so
+    /// automation restarts it at the better quality; the new take's head
+    /// backfill covers the seam — at source on both sides, so it joins into
+    /// a complete `full.mkv` at the better quality. At most one restart per
+    /// stream (see `quality_upgraded`).
+    async fn quality_upgrade_watcher(
+        self,
+        monitor_id: i64,
+        stream_key: String,
+        url: String,
+        capture_path: PathBuf,
+        channel: String,
+    ) {
+        // First check after the rendition list has had time to fill in;
+        // second catches a late transcode→source flip.
+        const CHECKS_AT_SECS: [u64; 2] = [180, 480];
+        let mut elapsed = 0u64;
+        for at in CHECKS_AT_SECS {
+            while elapsed < at {
+                if self.shutdown.load(Ordering::SeqCst) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                elapsed += 2;
+                if !self.active.lock().unwrap().contains_key(&monitor_id) {
+                    return; // take ended on its own
+                }
+            }
+            if self.quality_upgraded.lock().unwrap().contains(&stream_key) {
+                return;
+            }
+            // What the capture is actually recording (the growing TS probes
+            // fine once a few seconds exist).
+            let Some(current) = probe_media(&capture_path.to_string_lossy()).await else {
+                continue;
+            };
+            let (Ok(cur_h), Ok(cur_fps)) =
+                (current.height.parse::<i64>(), current.fps.parse::<f64>())
+            else {
+                continue;
+            };
+            let cur_fps = cur_fps.round() as i64;
+            // What Twitch offers right now.
+            let Some((best_h, best_fps, name)) = best_available_rendition(&url).await else {
+                continue;
+            };
+            if (best_h, best_fps) <= (cur_h, cur_fps) {
+                continue; // already recording the best on offer
+            }
+            if !self.quality_upgraded.lock().unwrap().insert(stream_key.clone()) {
+                return;
+            }
+            info!(
+                monitor_id,
+                "quality upgrade: {name} appeared (capturing {cur_h}p{cur_fps}) — restarting the take"
+            );
+            let _ = self.events.send(AppEvent::QualityUpgraded {
+                monitor_id,
+                channel: channel.clone(),
+                from: format!("{cur_h}p{cur_fps}"),
+                to: name,
+            });
+            // Stop like the Stop button (tombstone → finalizes as "stopped"),
+            // but with a short backoff: the next poll restarts the capture at
+            // the better quality within roughly a minute.
+            self.stopping_monitors.lock().unwrap().insert(monitor_id);
+            let pid = self.active.lock().unwrap().get(&monitor_id).copied();
+            if let Some(pid) = pid.filter(|&p| p > 0) {
+                crate::platform::kill_process_tree(pid);
+            }
+            let companion = self.active_secondary.lock().unwrap().get(&monitor_id).copied();
+            if let Some(p) = companion.filter(|&p| p > 0) {
+                crate::platform::kill_process_tree(p);
+            }
+            self.backoff.lock().unwrap().insert(
+                monitor_id,
+                BackoffEntry { fails: 0, until: Instant::now() + Duration::from_secs(10) },
+            );
+            return;
+        }
+    }
+
     /// Stop the live-chat sidecar download for a monitor, if one is running.
     fn stop_chat_download(&self, monitor_id: i64) {
         let pid = self.active_chats.lock().unwrap().get(&monitor_id).copied();
@@ -3585,6 +3679,33 @@ impl Supervisor {
                 stop_rule,
             ))
         });
+
+        // Restart-at-better-quality watcher: a Twitch capture that joins
+        // seconds after go-live often sees only transcodes (the source
+        // rendition is listed late) and locks onto e.g. 720p60 while the
+        // stream is really 1080p60 — which is also why its head backfill
+        // (always source) can't join it. Only for `best`-quality streamlink
+        // captures; once per stream; default on (K_QUALITY_UPGRADE).
+        if row.monitor.tool == Tool::Streamlink
+            && row.monitor.platform() == Platform::Twitch
+            && resolved_quality(&row.monitor.quality) == "best"
+            && self
+                .store
+                .get_setting(K_QUALITY_UPGRADE)
+                .ok()
+                .flatten()
+                .as_deref()
+                != Some("0")
+        {
+            let this = self.clone();
+            let key = format!("{monitor_id}:{}", stream_id.clone().unwrap_or_default());
+            let url = row.monitor.url.clone();
+            let capture = plan.capture_path.clone();
+            let channel = row.channel.name.clone();
+            tokio::spawn(async move {
+                this.quality_upgrade_watcher(monitor_id, key, url, capture, channel).await;
+            });
+        }
 
         // Twitch chat -> a native anonymous IRC-over-WebSocket logger, written as
         // a `.chat.jsonl` sidecar in the OUTPUT dir (next to the final file, not in
@@ -6778,6 +6899,52 @@ async fn resolve_meta(video: &Video, auth: &AuthSource) -> (String, String, Stri
     let channel = clean(lines.next().unwrap_or(""));
     let id = clean(lines.next().unwrap_or(""));
     (title, channel, id)
+}
+
+/// Settings key: restart a young Twitch `best` capture when a better rendition
+/// appears after join (`"0"` disables; default on — see
+/// `Supervisor::quality_upgrade_watcher`).
+pub const K_QUALITY_UPGRADE: &str = "quality_upgrade_restart";
+
+/// Parse a Twitch rendition name (`"720p60"`, `"1080p"`, `"480p30"`) into
+/// `(height, fps)`; fps defaults to 30 when unstated. Aliases (`best`,
+/// `worst`, `audio_only`) don't parse and return `None`.
+fn parse_rendition(name: &str) -> Option<(i64, i64)> {
+    let (h, rest) = name.split_once('p')?;
+    let h: i64 = h.parse().ok()?;
+    let fps: i64 = if rest.is_empty() { 30 } else { rest.parse().ok()? };
+    Some((h, fps))
+}
+
+/// The best rendition Twitch currently lists for `url`, via
+/// `streamlink --json` (metadata only, nothing downloaded):
+/// `(height, fps, name)`. `None` on any failure — callers treat that as
+/// "nothing better known".
+async fn best_available_rendition(url: &str) -> Option<(i64, i64, String)> {
+    let mut cmd = Command::new("streamlink");
+    cmd.arg("--json")
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let out = tokio::time::timeout(Duration::from_secs(30), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let streams = v.get("streams")?.as_object()?;
+    let mut best: Option<(i64, i64, String)> = None;
+    for name in streams.keys() {
+        if let Some((h, fps)) = parse_rendition(name)
+            && best.as_ref().map(|&(bh, bf, _)| (h, fps) > (bh, bf)).unwrap_or(true)
+        {
+            best = Some((h, fps, name.clone()));
+        }
+    }
+    best
 }
 
 /// Probe available formats/qualities for a URL with the given tool, returning
@@ -10882,6 +11049,17 @@ mod tests {
         assert!(plan.remux_to_mkv);
         // No live-only retry flags for a VOD.
         assert!(!plan.args.iter().any(|a| a == "--retry-streams"));
+    }
+
+    #[test]
+    fn parse_rendition_heights_fps_and_aliases() {
+        assert_eq!(parse_rendition("720p60"), Some((720, 60)));
+        assert_eq!(parse_rendition("1080p"), Some((1080, 30)));
+        assert_eq!(parse_rendition("480p30"), Some((480, 30)));
+        assert_eq!(parse_rendition("best"), None);
+        assert_eq!(parse_rendition("worst"), None);
+        assert_eq!(parse_rendition("audio_only"), None);
+        assert_eq!(parse_rendition("chunked"), None);
     }
 
     #[test]

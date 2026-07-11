@@ -161,6 +161,15 @@ pub enum AppEvent {
         monitor_id: i64,
         state: String,
     },
+    /// A better rendition appeared shortly after the capture joined (Twitch
+    /// lists the source quality late) — the take was stopped so automation
+    /// restarts it at the better quality.
+    QualityUpgraded {
+        monitor_id: i64,
+        channel: String,
+        from: String,
+        to: String,
+    },
     /// A trigger-word rule matched a live stream's title/game and a recording
     /// is starting because of it (or, with Auto on, its per-rule overrides
     /// were applied to the normal start).

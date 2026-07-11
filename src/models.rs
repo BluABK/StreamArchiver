@@ -1103,14 +1103,18 @@ pub enum NotificationKind {
     VodMuted,
     /// A trigger-word rule matched the live title/game and started a recording.
     TriggerMatched,
+    /// A better rendition appeared after the capture joined (Twitch lists the
+    /// source quality late) — the take was restarted to record at it.
+    QualityUpgrade,
 }
 
 impl NotificationKind {
     /// Every kind, in feed-filter display order.
-    pub const ALL: [NotificationKind; 9] = [
+    pub const ALL: [NotificationKind; 10] = [
         NotificationKind::WentLive,
         NotificationKind::TriggerMatched,
         NotificationKind::RecordingFinished,
+        NotificationKind::QualityUpgrade,
         NotificationKind::Error,
         NotificationKind::TaskFailed,
         NotificationKind::ScheduleAdded,
@@ -1131,6 +1135,7 @@ impl NotificationKind {
             NotificationKind::YoutubePost => "youtube_post",
             NotificationKind::VodMuted => "vod_muted",
             NotificationKind::TriggerMatched => "trigger_matched",
+            NotificationKind::QualityUpgrade => "quality_upgrade",
         }
     }
 
@@ -1151,6 +1156,7 @@ impl NotificationKind {
             NotificationKind::YoutubePost => "YouTube post",
             NotificationKind::VodMuted => "VOD muted",
             NotificationKind::TriggerMatched => "Trigger matched",
+            NotificationKind::QualityUpgrade => "Quality upgrade",
         }
     }
 
@@ -1167,6 +1173,7 @@ impl NotificationKind {
             NotificationKind::YoutubePost => "📣",
             NotificationKind::VodMuted => "✂",
             NotificationKind::TriggerMatched => "⚡",
+            NotificationKind::QualityUpgrade => "⬆",
         }
     }
 }

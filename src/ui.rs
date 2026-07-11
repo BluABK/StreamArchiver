@@ -694,6 +694,9 @@ struct SettingsForm {
     /// Fetch a fresh, full head backfill for a later take (a reconnect
     /// mid-broadcast), not just the stream's first take. Default on.
     head_backfill_fetch_new_take: bool,
+    /// Restart a young Twitch `best` capture when a better rendition appears
+    /// after join (Twitch lists the source quality late). Default on.
+    quality_upgrade_restart: bool,
     /// Once a fresh head passes its integrity checks, delete older takes'
     /// now-redundant head files for the same stream. Default on.
     head_backfill_replace_old: bool,
@@ -1415,6 +1418,13 @@ impl StreamArchiverApp {
             head_backfill_fetch_new_take: core
                 .store
                 .get_setting(crate::head_backfill::K_HEAD_BACKFILL_FETCH)
+                .ok()
+                .flatten()
+                .is_none_or(|v| v != "0"),
+            // Default ON, same convention.
+            quality_upgrade_restart: core
+                .store
+                .get_setting(crate::downloader::K_QUALITY_UPGRADE)
                 .ok()
                 .flatten()
                 .is_none_or(|v| v != "0"),
@@ -2621,6 +2631,7 @@ impl StreamArchiverApp {
             (crate::vod_archive::K_VOD_DL_ENABLED, if s.vod_dl_enabled { "1" } else { "0" }),
             (crate::vod_archive::K_VOD_DL_REPLACE, if s.vod_dl_replace { "1" } else { "0" }),
             (crate::head_backfill::K_HEAD_BACKFILL_FETCH, if s.head_backfill_fetch_new_take { "1" } else { "0" }),
+            (crate::downloader::K_QUALITY_UPGRADE, if s.quality_upgrade_restart { "1" } else { "0" }),
             (crate::head_backfill::K_HEAD_BACKFILL_REPLACE, if s.head_backfill_replace_old { "1" } else { "0" }),
         ];
         for (k, v) in pairs {
@@ -17951,6 +17962,19 @@ impl StreamArchiverApp {
                  per-channel (channel Properties) or per-instance (edit instance).",
             );
             ui.add_space(6.0);
+            ui.checkbox(
+                &mut self.settings.quality_upgrade_restart,
+                "Restart the take when a better quality appears (Twitch)",
+            )
+            .on_hover_text(
+                "A capture that joins seconds after go-live often sees only transcodes — \
+                 Twitch lists the source rendition late — and locks onto e.g. 720p60 while \
+                 the stream is really 1080p60 (also why its head backfill, which is always \
+                 source, can't be joined with it). With this on, `best`-quality streamlink \
+                 captures re-check a few minutes in and restart once at the better \
+                 rendition; the new take's head backfill covers the seam and joins into a \
+                 complete full.mkv at the better quality.",
+            );
             ui.checkbox(
                 &mut self.settings.head_backfill_fetch_new_take,
                 "Fetch new head backfill on new take",

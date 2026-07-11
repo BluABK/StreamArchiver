@@ -293,6 +293,25 @@ fn handle(store: &Store, ev: AppEvent) {
             };
             (content, meta)
         }
+        AppEvent::QualityUpgraded { monitor_id, channel, from, to } => {
+            let content = ToastContent::text(
+                "⬆ Recording quality upgrade".to_string(),
+                format!(
+                    "{channel}: {to} appeared after the capture joined at {from} — \
+                     restarting the take at the better quality (the head backfill \
+                     covers the seam)."
+                ),
+            );
+            let meta = NotifMeta {
+                kind: NotificationKind::QualityUpgrade,
+                severity: "info",
+                monitor_id: Some(monitor_id),
+                channel,
+                recording_id: None,
+                ref_key: format!("quality_upgrade:{monitor_id}:{to}"),
+            };
+            (content, meta)
+        }
         _ => return,
     };
 
