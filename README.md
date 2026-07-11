@@ -367,7 +367,7 @@ gains two playback actions, as inline buttons and context-menu entries:
 
 - **⏵ Stream in player** — open *this* recording in the player. For a finished
   take that's simply the output file; for an **in-progress** recording it opens
-  the growing capture straight out of `.cache\`, so you can watch a recording
+  the growing capture straight out of `.sa-cache\`, so you can watch a recording
   **from the start while it is still being captured**. On the instance and
   stream rows it prefers the active capture and falls back to the most recent
   finished file.
@@ -503,7 +503,7 @@ captures are writing to:
   thumbnail/subtitle embeds — run **one at a time**, app-wide. When five takes
   finish together (a raid ends, a shared event closes), their remuxes queue
   instead of hammering the disk simultaneously; a finished take just sits as a
-  playable `.ts` in `.cache\` a few minutes longer. The same applies to the
+  playable `.ts` in `.sa-cache\` a few minutes longer. The same applies to the
   leftover finalizes an app restart picks up.
 - CDN-fed muxes (head backfills, VOD recoveries) are capped at **two at a
   time** — DMCA mutes tend to land for several channels minutes after a shared
@@ -588,7 +588,8 @@ The **⚠ Issues** button in the toolbar (turns amber with a count when issues e
 
   A startup **repair pass** feeds this section: any recording whose row claims
   a final output file that isn't actually on disk (the app died before or
-  during the finalize remux) has its `.cache\` folder checked — if the capture
+  during the finalize remux) has its working folder checked (`.sa-cache\`, or
+  the pre-rename `.cache\`) — if the capture
   survived there, the row is retargeted to it (a `.ts` lands here; an
   already-final container lands under *stuck in cache*) instead of being
   mislabeled "gone", and its capture is protected from the 24 h cache sweep.
@@ -600,7 +601,7 @@ The **⚠ Issues** button in the toolbar (turns amber with a count when issues e
 - **🧩 Unmerged split captures (recoverable)** — the download tool died before
   merging its per-format files (SABR/DASH write video and audio separately and
   merge at the very end), so the final file was never written and the take
-  finalized as 0 bytes — but the media survived as parts in `.cache\`. Never
+  finalized as 0 bytes — but the media survived as parts in `.sa-cache\`. Never
   listed as plain "gone": the **Merge into MKV** button losslessly muxes the
   parts into the final file (gated + throttled like any finalize pass, with a
   live progress bar in Background jobs and the same pacing watchdog as the
@@ -1398,7 +1399,7 @@ Notes:
 - **Very long titles are shortened automatically** (marked with `...`) so the
   resulting filename stays under NTFS's per-component limit and — separately —
   so the working path streamlink/yt-dlp actually write to (under the hidden
-  `.cache\` folder) stays under Windows' 260-character path limit for those
+  `.sa-cache\` folder) stays under Windows' 260-character path limit for those
   Python tools. Both caps apply to live recordings and on-demand downloads
   alike; you shouldn't ever see a recording fail to start over a long title.
 
@@ -1611,6 +1612,14 @@ Both SABR paths are **mpv-only**; other players get the DASH companion's `.ts`
   files share the recording's stem: `{stem}.vod.mkv` (downloaded published VOD),
   `{stem}.head.mkv` (backfilled missed start), `{stem}.full.mkv` (head + live
   joined), and a recovered VOD from CDN recovery.
+- In-progress captures live in a hidden **`.sa-cache\`** working folder inside
+  each output dir and are promoted up on finish. The name is deliberately
+  app-unique so backup tools that only support global folder-name exclusions
+  (e.g. Backblaze) can exclude exactly it — add **`.sa-cache`** to your backup
+  exclusions to keep multi-GB transient capture files out of backups and off
+  the spindle during recording. (Pre-rename `.cache\` folders are still read
+  from — stranded captures, split parts, SABR resume state — and drain away:
+  nothing new is written there and the startup sweep removes them once empty.)
 - App logs: `%APPDATA%\StreamArchiver\data\logs\` (daily-rotated, 7-day
   retention). Per-download tool output (`streamlink`/`yt-dlp`/`ffmpeg`
   stdout+stderr) lands in `logs\captures\` on the same drive — *not* next to

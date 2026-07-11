@@ -14260,7 +14260,7 @@ impl StreamArchiverApp {
                                                     .flat_map(|g| g.takes.iter())
                                                     .filter(|t| {
                                                         t.output_path.ends_with(".ts")
-                                                            && t.output_path.contains(".cache")
+                                                            && crate::downloader::path_in_cache(&t.output_path)
                                                     })
                                                     .count();
                                                 if chan_needs_remux > 0 {
@@ -14398,7 +14398,7 @@ impl StreamArchiverApp {
                                             .flat_map(|g| g.takes.iter())
                                             .filter(|t| {
                                                 t.output_path.ends_with(".ts")
-                                                    && t.output_path.contains(".cache")
+                                                    && crate::downloader::path_in_cache(&t.output_path)
                                             })
                                             .count()
                                     })
@@ -14628,7 +14628,7 @@ impl StreamArchiverApp {
                                                 }
                                                 let nr = g.takes.iter().filter(|t| {
                                                     t.output_path.ends_with(".ts")
-                                                        && t.output_path.contains(".cache")
+                                                        && crate::downloader::path_in_cache(&t.output_path)
                                                 }).count();
                                                 if nr > 0 {
                                                     let lbl = if nr == 1 {
@@ -15056,7 +15056,7 @@ impl StreamArchiverApp {
                                                 );
                                                 // In-progress / needs-attention badges
                                                 let needs_remux = t.output_path.ends_with(".ts")
-                                                    && t.output_path.contains(".cache");
+                                                    && crate::downloader::path_in_cache(&t.output_path);
                                                 let remuxing = self.background_tasks.iter().any(|bt| {
                                                     bt.kind == crate::events::BackgroundTaskKind::Remux
                                                         && bt.id == t.id as u64
@@ -15129,7 +15129,7 @@ impl StreamArchiverApp {
                                         // Offer re-remux when the finalized file is still a .ts
                                         // (the automatic remux failed at recording end).
                                         let needs_remux = t.output_path.ends_with(".ts")
-                                            && t.output_path.contains(".cache");
+                                            && crate::downloader::path_in_cache(&t.output_path);
                                         if needs_remux {
                                             let remux_dest = std::path::Path::new(&t.output_path)
                                                 .parent() // .cache/
@@ -20772,10 +20772,10 @@ impl StreamArchiverApp {
                                             "status" => {
                                                 ui.colored_label(
                                                     egui::Color32::from_rgb(200, 150, 60),
-                                                    "⚠ stuck in .cache",
+                                                    "⚠ stuck in cache",
                                                 ).on_hover_text(
                                                     "The recording finished successfully, but moving it out \
-                                                     of the hidden .cache\\ working folder failed — most \
+                                                     of the hidden working folder failed — most \
                                                      commonly because the filename was too long for the \
                                                      filesystem. The file is safe; it just isn't where it \
                                                      should be yet.",
@@ -25532,11 +25532,19 @@ fn live_file_len(p: &std::path::Path) -> Option<u64> {
 fn stream_target_for_active(output_path: &str) -> Option<StreamTarget> {
     let final_path = std::path::Path::new(output_path);
     let stem = final_path.file_stem()?.to_string_lossy().into_owned();
-    let cache_dir = final_path.parent()?.join(".cache");
-    for ext in [".ts", ".mkv", ".mkv.mp4"] {
-        let candidate = cache_dir.join(format!("{stem}{ext}"));
-        if live_file_len(&candidate).unwrap_or(0) > 0 {
-            return Some(StreamTarget::Growing(candidate));
+    // Current working-dir name first, legacy `.cache\` second — takes started
+    // under an older build (incl. re-attached ones) still write to the latter.
+    let parent = final_path.parent()?;
+    let cache_dirs = [
+        parent.join(crate::downloader::CACHE_DIR_NAME),
+        parent.join(crate::downloader::LEGACY_CACHE_DIR_NAME),
+    ];
+    for cache_dir in &cache_dirs {
+        for ext in [".ts", ".mkv", ".mkv.mp4"] {
+            let candidate = cache_dir.join(format!("{stem}{ext}"));
+            if live_file_len(&candidate).unwrap_or(0) > 0 {
+                return Some(StreamTarget::Growing(candidate));
+            }
         }
     }
     // SABR split scan: group candidates by format id, keep the best file per
@@ -25546,10 +25554,12 @@ fn stream_target_for_active(output_path: &str) -> Option<StreamTarget> {
     let mut best: std::collections::HashMap<u64, (Option<u64>, std::path::PathBuf, u64)> =
         std::collections::HashMap::new();
     let prefix = format!("{stem}.");
-    for entry in crate::iomon::fs::read_dir_sync(crate::iomon::Cat::FsProbe, &cache_dir)
-        .ok()?
-        .flatten()
-    {
+    for entry in cache_dirs.iter().flat_map(|d| {
+        crate::iomon::fs::read_dir_sync(crate::iomon::Cat::FsProbe, d)
+            .into_iter()
+            .flatten()
+            .flatten()
+    }) {
         let name = entry.file_name().to_string_lossy().into_owned();
         let Some(rest) = name.strip_prefix(&prefix) else { continue };
         if rest.ends_with(".state") || rest.ends_with(".log") || rest.ends_with(".ytdl") {
@@ -25753,7 +25763,7 @@ fn spawn_live_preview(
     }
 
     let tmp = preview_root().join(format!("{}-{}", m.id, crate::models::now_unix()));
-    let cache = tmp.join(".cache");
+    let cache = tmp.join(crate::downloader::CACHE_DIR_NAME);
     if let Err(e) = crate::iomon::fs::create_dir_all_sync(crate::iomon::Cat::Preview, &cache) {
         return Some(format!("Failed to create preview dir: {e}"));
     }
@@ -25865,7 +25875,7 @@ fn spawn_live_preview(
         // What the downloader has produced so far (true handle sizes — the
         // dir-entry sizes are stale for open files), for timeout diagnostics.
         let cache_listing = |tmp: &std::path::Path| -> String {
-            let Ok(rd) = crate::iomon::fs::read_dir_sync(crate::iomon::Cat::Preview, tmp.join(".cache")) else { return String::new() };
+            let Ok(rd) = crate::iomon::fs::read_dir_sync(crate::iomon::Cat::Preview, tmp.join(crate::downloader::CACHE_DIR_NAME)) else { return String::new() };
             rd.flatten()
                 .map(|e| {
                     let len = live_file_len(&e.path()).unwrap_or(0);

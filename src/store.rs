@@ -3983,6 +3983,7 @@ impl Store {
              WHERE output_path != ''
                AND output_path NOT LIKE '%.ts'
                AND output_path NOT LIKE '%.cache%'
+               AND output_path NOT LIKE '%.sa-cache%'
                AND (status = 'orphaned'
                     OR (status IN ('completed', 'ended', 'stopped', 'failed') AND bytes = 0))",
         )?;
@@ -4349,7 +4350,7 @@ impl Store {
                     take_group, COALESCE(log_excerpt, '')
              FROM recording
              WHERE output_path LIKE '%.ts'
-               AND output_path LIKE '%.cache%'
+               AND (output_path LIKE '%.cache%' OR output_path LIKE '%.sa-cache%')
              ORDER BY started_at DESC",
         )?;
         let rows = stmt
@@ -4409,7 +4410,7 @@ impl Store {
                     take_group, COALESCE(log_excerpt, '')
              FROM recording
              WHERE status = 'completed'
-               AND output_path LIKE '%.cache%'
+               AND (output_path LIKE '%.cache%' OR output_path LIKE '%.sa-cache%')
                AND output_path NOT LIKE '%.ts'
              ORDER BY started_at DESC",
         )?;
@@ -4466,7 +4467,8 @@ impl Store {
     pub fn stems_in_cache(&self) -> Result<Vec<String>> {
         let conn = self.db();
         let mut stmt = conn.prepare(
-            "SELECT output_path FROM recording WHERE output_path LIKE '%.cache%'",
+            "SELECT output_path FROM recording
+             WHERE output_path LIKE '%.cache%' OR output_path LIKE '%.sa-cache%'",
         )?;
         let stems = stmt
             .query_map([], |r| r.get::<_, String>(0))?
@@ -4562,11 +4564,13 @@ impl Store {
                     take_group, COALESCE(log_excerpt, ''), exit_code
              FROM recording
              WHERE status IN ('failed', 'aborted', 'orphaned')
-               AND NOT (output_path LIKE '%.ts' AND output_path LIKE '%.cache%')
+               AND NOT (output_path LIKE '%.ts'
+                        AND (output_path LIKE '%.cache%' OR output_path LIKE '%.sa-cache%'))
                AND NOT (status = 'orphaned'
                         AND output_path != ''
                         AND output_path NOT LIKE '%.ts'
-                        AND output_path NOT LIKE '%.cache%')
+                        AND output_path NOT LIKE '%.cache%'
+                        AND output_path NOT LIKE '%.sa-cache%')
              ORDER BY started_at DESC
              LIMIT 200",
         )?;

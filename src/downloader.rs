@@ -690,15 +690,46 @@ fn build_dash_companion_plan(
     }
 }
 
-/// The hidden working directory for in-progress captures, a `.cache` subfolder of
-/// the output dir (same volume, so promotion to the parent is a fast rename). The
+/// Name of the hidden working dir for in-progress captures. Deliberately
+/// app-unique (".sa-cache", NOT ".cache") so backup tools that only support
+/// global folder-NAME exclusions (e.g. Backblaze — no per-drive dir rules)
+/// can exclude it without touching unrelated ".cache" dirs elsewhere.
+pub const CACHE_DIR_NAME: &str = ".sa-cache";
+
+/// The pre-2026-07-11 working-dir name. Never used for NEW captures; every
+/// lookup (stranded captures, split parts, SABR resume state, sidecars, the
+/// startup sweep) keeps checking it until the old dirs drain empty and the
+/// sweep removes them.
+pub const LEGACY_CACHE_DIR_NAME: &str = ".cache";
+
+/// The hidden working directory for in-progress captures, a subfolder of the
+/// output dir (same volume, so promotion to the parent is a fast rename). The
 /// `.`-prefix hides it on Unix; [`crate::platform::set_hidden`] adds the Windows
 /// hidden attribute when the dir is created.
-fn cache_dir(output_dir: &Path) -> PathBuf {
-    output_dir.join(".cache")
+pub(crate) fn cache_dir(output_dir: &Path) -> PathBuf {
+    output_dir.join(CACHE_DIR_NAME)
 }
 
-/// Best-effort growing `.cache` file candidates for a still-recording take,
+/// Both possible working dirs next to an output dir — the current name first,
+/// then the legacy one. Lookups of files that may PRE-DATE the rename go
+/// through this; producers of new files use [`cache_dir`] directly.
+fn cache_dir_candidates(output_dir: &Path) -> [PathBuf; 2] {
+    [output_dir.join(CACHE_DIR_NAME), output_dir.join(LEGACY_CACHE_DIR_NAME)]
+}
+
+/// True if `name` is a capture working-dir name (current or legacy).
+pub fn is_cache_dir_name(name: &std::ffi::OsStr) -> bool {
+    name == CACHE_DIR_NAME || name == LEGACY_CACHE_DIR_NAME
+}
+
+/// True if a stored path string points into a capture working dir (current or
+/// legacy name) — the string-level counterpart of [`is_cache_dir_name`] for
+/// DB `output_path` values.
+pub fn path_in_cache(path: &str) -> bool {
+    path.contains(CACHE_DIR_NAME) || path.contains(LEGACY_CACHE_DIR_NAME)
+}
+
+/// Best-effort growing working-dir file candidates for a still-recording take,
 /// keyed off its predicted final path's stem (mirrors how `build_plan`
 /// derives `capture_path`, without needing to re-derive SABR/container state
 /// — the caller just probes each candidate and uses whichever exists). Used
@@ -709,8 +740,12 @@ fn live_capture_candidates(final_path: &Path) -> Vec<PathBuf> {
     else {
         return Vec::new();
     };
-    let cache = cache_dir(dir);
-    vec![cache.join(format!("{stem}.ts")), cache.join(format!("{stem}.mkv"))]
+    cache_dir_candidates(dir)
+        .iter()
+        .flat_map(|cache| {
+            [cache.join(format!("{stem}.ts")), cache.join(format!("{stem}.mkv"))]
+        })
+        .collect()
 }
 
 /// Head-backfill's "missed" length: prefer measuring the capture's own
@@ -731,30 +766,38 @@ fn compute_missed_secs(went_live_at: i64, started_at: i64, captured: Option<i64>
 /// Stale `.cache\` working files are swept after this age on startup.
 const CACHE_MAX_AGE_SECS: u64 = 24 * 3600;
 
-/// True if a recording's `.cache\` still holds SABR resume state (`.state` /
-/// `.sq0.part` / `.part`) for its stem — i.e. an interrupted SABR capture that can
-/// be continued. Derived synchronously from the recording's stored output path.
-fn sabr_state_exists(output_path: &str) -> bool {
+/// The working dir (current or legacy name) that still holds SABR resume
+/// state (`.state` / `.sq0.part` / `.part`) for the recording's stem — i.e.
+/// an interrupted SABR capture that can be continued, AND where its surviving
+/// files actually live (a pre-rename capture resumes in the legacy dir so
+/// yt-dlp's `-o` matches the original). Derived synchronously from the
+/// recording's stored output path.
+fn sabr_state_dir(output_path: &str) -> Option<PathBuf> {
     let p = Path::new(output_path);
-    let (Some(dir), Some(stem)) = (
-        p.parent(),
-        p.file_stem().map(|s| s.to_string_lossy().into_owned()),
-    ) else {
-        return false;
-    };
+    let (dir, stem) = (p.parent()?, p.file_stem().map(|s| s.to_string_lossy().into_owned())?);
     let prefix = format!("{stem}.");
-    let Ok(rd) = crate::iomon::fs::read_dir_sync(Cat::FsProbe, cache_dir(dir)) else {
-        return false;
-    };
-    for entry in rd.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with(&prefix)
-            && (name.ends_with(".state") || name.ends_with(".sq0.part") || name.ends_with(".part"))
-        {
-            return true;
+    for cache in cache_dir_candidates(dir) {
+        let Ok(rd) = crate::iomon::fs::read_dir_sync(Cat::FsProbe, &cache) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&prefix)
+                && (name.ends_with(".state")
+                    || name.ends_with(".sq0.part")
+                    || name.ends_with(".part"))
+            {
+                return Some(cache);
+            }
         }
     }
-    false
+    None
+}
+
+/// True if a recording's working dir still holds SABR resume state — see
+/// [`sabr_state_dir`].
+fn sabr_state_exists(output_path: &str) -> bool {
+    sabr_state_dir(output_path).is_some()
 }
 
 /// Build the yt-dlp SABR capture args, shared by [`build_plan`]'s SABR branch and
@@ -5228,7 +5271,12 @@ impl Supervisor {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let capture = cache_dir(&out_dir).join(format!("{stem}.mkv"));
+        // Resume in whichever working dir actually holds the surviving
+        // `.state`/`.part` files — a pre-rename capture lives in the legacy
+        // `.cache\`, and yt-dlp's `-o` must match the original exactly.
+        let capture = sabr_state_dir(&rec.output_path)
+            .unwrap_or_else(|| cache_dir(&out_dir))
+            .join(format!("{stem}.mkv"));
 
         // Resolve auth + args exactly as a fresh capture would, so the command — and
         // thus the SABR resume — matches the original (`-o` is identical).
@@ -5445,36 +5493,40 @@ impl Supervisor {
         let dirs = self.store.all_output_dirs().unwrap_or_default();
         let now = std::time::SystemTime::now();
         for d in dirs {
-            let cache = cache_dir(Path::new(&d));
-            let Ok(mut rd) = crate::iomon::fs::read_dir(Cat::CacheSweep, &cache).await else {
-                continue;
-            };
-            let mut removed = 0u32;
-            while let Ok(Some(entry)) = rd.next_entry().await {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if skip_stems
-                    .iter()
-                    .any(|s| name.starts_with(&format!("{s}.")))
-                {
-                    continue; // belongs to a recording being resumed
-                }
-                let Ok(meta) = entry.metadata().await else {
+            // Both the current working dir and the legacy `.cache\` — the
+            // legacy one only drains (nothing writes there anymore) and its
+            // empty husk is removed below, ending backup-tool churn on it.
+            for cache in cache_dir_candidates(Path::new(&d)) {
+                let Ok(mut rd) = crate::iomon::fs::read_dir(Cat::CacheSweep, &cache).await else {
                     continue;
                 };
-                let stale = meta
-                    .modified()
-                    .ok()
-                    .and_then(|m| now.duration_since(m).ok())
-                    .map(|age| age.as_secs() >= CACHE_MAX_AGE_SECS)
-                    .unwrap_or(false);
-                if stale && meta.is_file() && crate::iomon::fs::remove_file(Cat::CacheSweep, entry.path()).await.is_ok() {
-                    removed += 1;
+                let mut removed = 0u32;
+                while let Ok(Some(entry)) = rd.next_entry().await {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if skip_stems
+                        .iter()
+                        .any(|s| name.starts_with(&format!("{s}.")))
+                    {
+                        continue; // belongs to a recording being resumed
+                    }
+                    let Ok(meta) = entry.metadata().await else {
+                        continue;
+                    };
+                    let stale = meta
+                        .modified()
+                        .ok()
+                        .and_then(|m| now.duration_since(m).ok())
+                        .map(|age| age.as_secs() >= CACHE_MAX_AGE_SECS)
+                        .unwrap_or(false);
+                    if stale && meta.is_file() && crate::iomon::fs::remove_file(Cat::CacheSweep, entry.path()).await.is_ok() {
+                        removed += 1;
+                    }
                 }
+                if removed > 0 {
+                    info!("swept {removed} stale working file(s) from {}", cache.display());
+                }
+                let _ = crate::iomon::fs::remove_dir(Cat::CacheSweep, &cache).await; // only if now empty
             }
-            if removed > 0 {
-                info!("swept {removed} stale .cache file(s) from {d}");
-            }
-            let _ = crate::iomon::fs::remove_dir(Cat::CacheSweep, &cache).await; // only if now empty
         }
     }
 
@@ -6248,7 +6300,7 @@ impl Supervisor {
             .unwrap_or_else(|| PathBuf::from("."));
         let out_dir = if capture
             .parent()
-            .is_some_and(|d| d.file_name().is_some_and(|n| n == ".cache"))
+            .is_some_and(|d| d.file_name().is_some_and(is_cache_dir_name))
         {
             capture
                 .parent()
@@ -8572,48 +8624,51 @@ fn find_thumbnail_for(src: &Path) -> Option<PathBuf> {
 /// naming rules of the UI's active-capture split scan, but accepts only
 /// FINISHED parts (no `.part`/`.temp.`/`.ytdl`/`.state`/`.log`).
 ///
-/// `capture` may point into `.cache\` (a never-promoted take) or at the
-/// promoted location — the scan runs in the `.cache\` next to either.
+/// `capture` may point into a working dir (a never-promoted take) or at the
+/// promoted location — the scan runs in the working dir(s) next to either
+/// (current name and legacy `.cache\`; pre-rename parts live in the latter).
 pub fn find_split_media(capture: &Path) -> Vec<PathBuf> {
     let Some(dir) = capture.parent() else { return Vec::new() };
     let Some(stem) = capture.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
         return Vec::new();
     };
-    let cache = if dir.file_name().is_some_and(|n| n == ".cache") {
-        dir.to_path_buf()
+    let caches: Vec<PathBuf> = if dir.file_name().is_some_and(is_cache_dir_name) {
+        vec![dir.to_path_buf()]
     } else {
-        cache_dir(dir)
+        cache_dir_candidates(dir).into_iter().collect()
     };
     let prefix = format!("{stem}.");
-    let Ok(rd) = crate::iomon::fs::read_dir_sync(Cat::FsProbe, &cache) else {
-        return Vec::new();
-    };
     let is_fmt_seg = |s: &str| {
         s.strip_prefix('f')
             .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
     };
     let mut out = Vec::new();
-    for entry in rd.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(rest) = name.strip_prefix(&prefix) else { continue };
-        if rest.contains(".part")
-            || rest.contains(".temp.")
-            || rest.ends_with(".ytdl")
-            || rest.ends_with(".state")
-            || rest.ends_with(".log")
-        {
+    for cache in &caches {
+        let Ok(rd) = crate::iomon::fs::read_dir_sync(Cat::FsProbe, cache) else {
             continue;
-        }
-        let segs: Vec<&str> = rest.split('.').collect();
-        let Some(fpos) = segs.iter().position(|s| is_fmt_seg(s)) else { continue };
-        // Everything before the f<id> segment must be container decoration
-        // ("mkv.f140.mp4"), never title text — otherwise a sibling recording
-        // whose stem extends this one after a dot would leak in.
-        if !segs[..fpos].iter().all(|s| matches!(*s, "mkv" | "mp4" | "webm" | "m4a" | "ts")) {
-            continue;
-        }
-        if matches!(segs.last().copied(), Some("mp4" | "m4a" | "webm" | "mkv")) {
-            out.push(entry.path());
+        };
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(rest) = name.strip_prefix(&prefix) else { continue };
+            if rest.contains(".part")
+                || rest.contains(".temp.")
+                || rest.ends_with(".ytdl")
+                || rest.ends_with(".state")
+                || rest.ends_with(".log")
+            {
+                continue;
+            }
+            let segs: Vec<&str> = rest.split('.').collect();
+            let Some(fpos) = segs.iter().position(|s| is_fmt_seg(s)) else { continue };
+            // Everything before the f<id> segment must be container decoration
+            // ("mkv.f140.mp4"), never title text — otherwise a sibling recording
+            // whose stem extends this one after a dot would leak in.
+            if !segs[..fpos].iter().all(|s| matches!(*s, "mkv" | "mp4" | "webm" | "m4a" | "ts")) {
+                continue;
+            }
+            if matches!(segs.last().copied(), Some("mp4" | "m4a" | "webm" | "mkv")) {
+                out.push(entry.path());
+            }
         }
     }
     out.sort();
@@ -10976,7 +11031,7 @@ mod tests {
         // SABR writes the final MKV directly (no .ts intermediate, no remux), but
         // into the hidden .cache\ working dir; finalize promotes it to the output dir.
         assert!(plan.capture_path.to_string_lossy().ends_with(".mkv"));
-        assert!(plan.capture_path.parent().unwrap().ends_with(".cache"));
+        assert!(plan.capture_path.parent().unwrap().ends_with(CACHE_DIR_NAME));
         assert!(plan.final_path.to_string_lossy().ends_with(".mkv"));
         assert_eq!(plan.final_path.parent().unwrap(), std::path::Path::new("C:/rec"));
         assert_ne!(plan.capture_path, plan.final_path);
@@ -11141,7 +11196,7 @@ mod tests {
             0,
             &YtDlpBins::default(),
         );
-        assert!(plan.capture_path.parent().unwrap().ends_with(".cache"));
+        assert!(plan.capture_path.parent().unwrap().ends_with(CACHE_DIR_NAME));
         assert!(plan.capture_path.to_string_lossy().ends_with(".ts"));
         assert_eq!(plan.final_path.parent().unwrap(), std::path::Path::new("C:/rec"));
         assert!(plan.final_path.to_string_lossy().ends_with(".mkv"));
@@ -11158,7 +11213,7 @@ mod tests {
             None,
             &YtDlpBins::default(),
         );
-        assert!(vplan.capture_path.parent().unwrap().ends_with(".cache"));
+        assert!(vplan.capture_path.parent().unwrap().ends_with(CACHE_DIR_NAME));
         assert_eq!(vplan.final_path.parent().unwrap(), std::path::Path::new("C:/vids"));
     }
 
@@ -11471,6 +11526,39 @@ mod tests {
                 capture.display()
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_dir_rename_lookups_cover_both_names() {
+        // Producers use the new, backup-excludable name…
+        assert!(cache_dir(Path::new("C:/out")).ends_with(CACHE_DIR_NAME));
+        // …while name checks accept both generations.
+        assert!(is_cache_dir_name(std::ffi::OsStr::new(CACHE_DIR_NAME)));
+        assert!(is_cache_dir_name(std::ffi::OsStr::new(LEGACY_CACHE_DIR_NAME)));
+        assert!(!is_cache_dir_name(std::ffi::OsStr::new(".cachex")));
+        assert!(path_in_cache(r"A:\s\c\.sa-cache\x.ts"));
+        assert!(path_in_cache(r"A:\s\c\.cache\x.ts"));
+        assert!(!path_in_cache(r"A:\s\c\x.ts"));
+
+        // find_split_media scans the NEW dir from a final path too (the
+        // legacy dir is covered by find_split_media_accepts_bare_parts_only).
+        let dir = std::env::temp_dir().join(format!("sa-split-new-{}", std::process::id()));
+        let cache = dir.join(CACHE_DIR_NAME);
+        std::fs::create_dir_all(&cache).unwrap();
+        let stem = "Chan - 2026-07-11 01-02-03 - title [youtube xyz]";
+        std::fs::write(cache.join(format!("{stem}.mkv.f299.mp4")), b"v").unwrap();
+        std::fs::write(cache.join(format!("{stem}.mkv.f140.mp4")), b"a").unwrap();
+        let parts = find_split_media(&dir.join(format!("{stem}.mkv")));
+        assert_eq!(parts.len(), 2);
+
+        // …and live_capture_candidates probes both dirs, new name first.
+        let cands = live_capture_candidates(&dir.join(format!("{stem}.mkv")));
+        assert!(cands[0].to_string_lossy().contains(CACHE_DIR_NAME));
+        assert!(cands.iter().any(|c| {
+            let s = c.to_string_lossy().into_owned();
+            s.contains(LEGACY_CACHE_DIR_NAME) && !s.contains(CACHE_DIR_NAME)
+        }));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

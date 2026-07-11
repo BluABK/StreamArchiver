@@ -1020,7 +1020,7 @@ pub async fn run_recovery(
         finish_fail(format!("cannot create output dir: {e}"));
         return;
     }
-    let cache = out_dir.join(".cache");
+    let cache = crate::downloader::cache_dir(&out_dir);
     let _ = crate::iomon::fs::create_dir_all(Cat::Recovery, &cache).await;
     let temp_playlist = cache.join(format!("{base_stem}.m3u8"));
     if let Err(e) = crate::iomon::fs::write(Cat::Recovery, &temp_playlist, &recovered.text).await {
