@@ -357,9 +357,36 @@ impl AppCore {
         // in the Issues panel, recoverable from there). The sweep can't tell
         // that apart from genuine leftover garbage by file age alone.
         skip_stems.extend(self.store.stems_in_cache().unwrap_or_default());
+        // …and every orphan-repair candidate's stem: their `.cache\` capture may
+        // be the ONLY surviving copy (final file never written), and the repair
+        // pass below runs asynchronously — the sweep must not race it.
+        skip_stems.extend(
+            self.store
+                .orphan_repair_candidates()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(_, _, out)| {
+                    std::path::Path::new(&out)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                }),
+        );
         let sweep_sup = supervisor.clone();
         self.rt
             .spawn(async move { sweep_sup.sweep_caches(skip_stems).await });
+
+        // Disk-aware repair of takes whose row claims a final file that was never
+        // written (crash before/during the finalize remux): promote intact ones,
+        // retarget stranded `.cache\` captures into the Issues recovery sections.
+        let orphan_sup = supervisor.clone();
+        self.rt
+            .spawn(async move { orphan_sup.reconcile_orphan_outputs().await });
+
+        // Re-drive head backfills whose planned ('queued') state outlived the
+        // in-memory job that owned it — otherwise "Planned" persists forever.
+        let hb_sup = supervisor.clone();
+        self.rt
+            .spawn(async move { hb_sup.requeue_stale_head_backfills().await });
 
         // Repair pass for post-stream VOD archives: replay completed downloads
         // whose recording-side finalize never ran, and demote 'archived' rows

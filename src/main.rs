@@ -563,7 +563,6 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
 fn run_headless(secs: u64) -> Result<()> {
     let store = Store::open(&app_paths::db_path()).context("opening data store")?;
     let _ = store.mark_orphaned_recordings(models::now_unix());
-    let _ = store.promote_intact_orphans();
     let _ = store.mark_orphaned_videos(models::now_unix());
     let core = AppCore::new(Arc::new(store)).context("starting core runtime")?;
     core.start();

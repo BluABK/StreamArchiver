@@ -287,6 +287,10 @@ that window the take's row shows an **⏳ backfill queued** badge, switching to
 something visible from the moment the recording begins — not just once the
 job finishes its settle wait. The **Background** panel's *Planned* section
 lists every currently-queued take with an ETA for when it'll be checked.
+The planned state is persisted, but the job itself is in-memory — if a restart
+kills a job mid-wait, the next launch **re-drives it** (or clears the state
+when the row can no longer be backfilled), so a *Planned* entry can never
+survive as a permanent ghost across restarts.
 
 **Fetch new head backfill on new take.** A stream reconnect mid-broadcast (a
 new recording "take") loses footage the same way a missed intro does — and
@@ -575,6 +579,16 @@ analyzed after the fact even if the app died with it.
 The **⚠ Issues** button in the toolbar (turns amber with a count when issues exist) opens a panel listing recordings that need attention:
 
 - **Needs re-remux** — a recording whose capture finished as `.ts` but was never successfully remuxed to MKV (e.g. after a crash, a detached process, or an automatic remux failure at finalization). The **🔄 Re-remux** button triggers a background ffmpeg remux; the status cell shows a live progress bar with fps / speed / position once ffmpeg is running. The source `.ts` is deleted only on success.
+
+  A startup **repair pass** feeds this section: any recording whose row claims
+  a final output file that isn't actually on disk (the app died before or
+  during the finalize remux) has its `.cache\` folder checked — if the capture
+  survived there, the row is retargeted to it (a `.ts` lands here; an
+  already-final container lands under *stuck in cache*) instead of being
+  mislabeled "gone", and its capture is protected from the 24 h cache sweep.
+  Only rows with nothing on disk at all are listed as missing. Intact files
+  whose status update was simply lost in a crash are promoted to *completed*
+  directly.
 - **Empty capture** — the capture file is 0 bytes (nothing to recover); Re-remux is disabled.
 - **Remux failed** — a previous re-remux attempt failed; hover the status cell for the ffmpeg error. The button is locked to avoid re-triggering a known-bad file.
 - **🧩 Unmerged split captures (recoverable)** — the download tool died before

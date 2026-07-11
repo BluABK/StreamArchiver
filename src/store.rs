@@ -3970,17 +3970,51 @@ impl Store {
     /// 'completed'. These are captures where the app crashed after the file was
     /// fully written but before the status column was updated — the content is
     /// intact, so 'orphaned' is a misnomer. Returns the count updated.
-    pub fn promote_intact_orphans(&self) -> Result<usize> {
+    /// Candidates for the disk-aware startup repair pass
+    /// ([`crate::downloader::Supervisor::reconcile_orphan_outputs`]): rows whose
+    /// `output_path` claims a promoted final file but whose on-disk truth is
+    /// unverified — fresh crash orphans, plus rows an older (DB-only) promotion
+    /// already flipped to 'completed' with `bytes = 0` and no file behind them.
+    /// Returns `(id, status, output_path)`.
+    pub fn orphan_repair_candidates(&self) -> Result<Vec<(i64, String, String)>> {
         let conn = self.db();
-        let n = conn.execute(
-            "UPDATE recording SET status='completed'
-             WHERE status='orphaned'
-               AND output_path != ''
+        let mut stmt = conn.prepare(
+            "SELECT id, status, output_path FROM recording
+             WHERE output_path != ''
                AND output_path NOT LIKE '%.ts'
-               AND output_path NOT LIKE '%.cache%'",
-            [],
+               AND output_path NOT LIKE '%.cache%'
+               AND (status = 'orphaned'
+                    OR (status IN ('completed', 'ended', 'stopped', 'failed') AND bytes = 0))",
         )?;
-        Ok(n)
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Promote a repair candidate to 'completed' with its verified on-disk size
+    /// (the disk-aware replacement for the old blind orphan promotion).
+    pub fn promote_orphan_completed(&self, id: i64, bytes: i64) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE recording SET status='completed', bytes=?2 WHERE id=?1",
+            params![id, bytes],
+        )?;
+        Ok(())
+    }
+
+    /// Recordings whose head backfill was marked planned (`head_backfill_state
+    /// = 'queued'`) but whose in-memory job died with a previous session — the
+    /// startup requeue re-drives (or clears) these so "Planned" can't persist
+    /// across restarts forever.
+    pub fn recordings_head_backfill_queued(&self) -> Result<Vec<i64>> {
+        let conn = self.db();
+        let mut stmt =
+            conn.prepare("SELECT id FROM recording WHERE head_backfill_state = 'queued'")?;
+        let rows = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Mark any recordings still flagged 'recording' (i.e. left over from a
@@ -5436,6 +5470,83 @@ mod tests {
         assert!(stems.contains(&"tsstuck".to_string()));
         assert!(stems.contains(&"active".to_string()));
         assert!(!stems.contains(&"fine".to_string()));
+    }
+
+    #[test]
+    fn orphan_repair_candidates_and_promotion() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+        let rec = |path: &str, start: i64| {
+            store
+                .insert_recording(mid, start, path, Some(start), false, Some("s1"), None, "", "")
+                .unwrap()
+        };
+
+        // Fresh crash orphan pointing at a final-shaped path → candidate.
+        let orphan = rec("C:/rec/orphan.mkv", 1_000);
+        store.mark_recording_orphaned(orphan).unwrap();
+        // A row a blind promotion already flipped: completed, bytes=0 → candidate.
+        let damaged = rec("C:/rec/damaged.mkv", 2_000);
+        store.finish_recording(damaged, 3_000, 0, None, "completed", "C:/rec/damaged.mkv", "").unwrap();
+        // Healthy completed row (bytes > 0) → not a candidate.
+        let healthy = rec("C:/rec/healthy.mkv", 4_000);
+        store.finish_recording(healthy, 5_000, 500, Some(0), "completed", "C:/rec/healthy.mkv", "").unwrap();
+        // Already retargeted into .cache (ts awaiting re-remux) → not a candidate.
+        let ts = rec("C:/rec/.cache/kept.ts", 6_000);
+        store.mark_recording_orphaned(ts).unwrap();
+        // Still recording → never touched.
+        let _active = rec("C:/rec/active.mkv", 7_000);
+
+        let ids: Vec<i64> = store
+            .orphan_repair_candidates()
+            .unwrap()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        assert!(ids.contains(&orphan));
+        assert!(ids.contains(&damaged));
+        assert!(!ids.contains(&healthy));
+        assert!(!ids.contains(&ts));
+        assert_eq!(ids.len(), 2);
+
+        // Promotion records the verified size and removes the row from the pool.
+        store.promote_orphan_completed(orphan, 12_345).unwrap();
+        let r = store.get_recording(orphan).unwrap().unwrap();
+        assert_eq!(r.status, "completed");
+        assert_eq!(r.bytes, 12_345);
+        let ids: Vec<i64> = store
+            .orphan_repair_candidates()
+            .unwrap()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        assert_eq!(ids, vec![damaged]);
+    }
+
+    #[test]
+    fn head_backfill_queued_listing() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+        let r1 = store
+            .insert_recording(mid, 1_000, "C:/rec/a.mkv", Some(1_000), false, Some("s1"), None, "", "")
+            .unwrap();
+        let r2 = store
+            .insert_recording(mid, 2_000, "C:/rec/b.mkv", Some(2_000), false, Some("s2"), None, "", "")
+            .unwrap();
+
+        store.set_head_backfill_state(r1, "queued").unwrap();
+        store.set_head_backfill_state(r2, "mismatch").unwrap();
+        assert_eq!(store.recordings_head_backfill_queued().unwrap(), vec![r1]);
+
+        // Clearing the flag (what the job does at every exit) empties the pool.
+        store.set_head_backfill_state(r1, "").unwrap();
+        assert!(store.recordings_head_backfill_queued().unwrap().is_empty());
     }
 
     #[test]

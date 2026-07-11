@@ -4305,15 +4305,128 @@ impl Supervisor {
             info!(monitor_id = m.id, rec_id = rec.id, "resuming interrupted SABR capture");
             to_resume.push((rec, row));
         }
-        // Promote orphaned recordings that now have an intact non-TS output file
-        // to 'completed'. These are captures where the app crashed after writing
-        // finished but before the status column was updated — the content is fine.
-        match self.store.promote_intact_orphans() {
-            Ok(n) if n > 0 => info!("promoted {n} intact orphaned recording(s) to 'completed'"),
-            Ok(_) => {}
-            Err(e) => warn!("promote_intact_orphans failed: {e:#}"),
-        }
+        // Orphans whose output file survived intact are promoted (and ones whose
+        // capture is stranded in `.cache\` retargeted) by the disk-aware
+        // `reconcile_orphan_outputs` pass, spawned by the caller — verifying the
+        // files can spin up the recordings drive, so it must not run here
+        // synchronously.
         to_resume
+    }
+
+    /// Disk-aware startup repair for takes whose DB row claims a final output
+    /// file (crash orphans, plus rows a pre-2026-07-11 blind promotion already
+    /// flipped to 'completed' with nothing on disk):
+    ///
+    /// - final file exists non-empty → promote to 'completed' with its real size
+    ///   (the app died after the promote move but before the status update);
+    /// - final file missing but the capture survived in `.cache\` (the app died
+    ///   before/during the finalize remux) → retarget `output_path` to the
+    ///   capture, so the row lands in the Issues panel's existing recovery
+    ///   sections ("needs re-remux" for a `.ts`, "stuck in cache" for an
+    ///   already-final container) instead of reading as a misleading "gone";
+    /// - neither on disk → leave the row alone (genuinely gone; Issues says so).
+    ///
+    /// Never touches rows that are 'recording' (adopted or being finalized).
+    pub async fn reconcile_orphan_outputs(&self) {
+        let candidates = match self.store.orphan_repair_candidates() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("orphan repair: failed to load candidates: {e:#}");
+                return;
+            }
+        };
+        let mut promoted = 0usize;
+        let mut retargeted = 0usize;
+        for (rec_id, status, out) in candidates {
+            let final_path = PathBuf::from(&out);
+            let final_len = crate::iomon::fs::metadata(Cat::Startup, &final_path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if final_len > 0 {
+                if let Err(e) = self.store.promote_orphan_completed(rec_id, final_len as i64) {
+                    warn!(rec_id, "orphan repair: promote failed: {e:#}");
+                } else {
+                    promoted += 1;
+                    info!(rec_id, bytes = final_len, "orphan repair: output file intact, promoted to 'completed'");
+                }
+                continue;
+            }
+            let mut found = None;
+            for c in live_capture_candidates(&final_path) {
+                let len = crate::iomon::fs::metadata(Cat::Startup, &c)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                if len > 0 {
+                    found = Some((c, len));
+                    break;
+                }
+            }
+            let Some((capture, cap_len)) = found else {
+                continue; // nothing on disk — Issues lists it as missing
+            };
+            let cap_s = capture.to_string_lossy();
+            if let Err(e) = self.store.update_recording_output_path(rec_id, &cap_s) {
+                warn!(rec_id, "orphan repair: retarget failed: {e:#}");
+                continue;
+            }
+            let is_ts = capture.extension().is_some_and(|e| e.eq_ignore_ascii_case("ts"));
+            if is_ts {
+                // A `.ts` in `.cache\` is exactly what the Issues panel's
+                // "needs re-remux" section (and its Re-remux action) handles.
+                info!(
+                    rec_id, prior_status = %status, bytes = cap_len,
+                    "orphan repair: final file missing but capture survived in .cache — \
+                     retargeted; fix via Issues → Re-remux: {cap_s}"
+                );
+            } else {
+                // Already-final container (e.g. a SABR `.mkv`) merely stuck in
+                // `.cache\` — promote so the "stuck in cache" recovery applies.
+                let _ = self.store.promote_orphan_completed(rec_id, cap_len as i64);
+                info!(
+                    rec_id, prior_status = %status, bytes = cap_len,
+                    "orphan repair: capture stuck in .cache — retargeted; fix via Issues → Recover: {cap_s}"
+                );
+            }
+            retargeted += 1;
+        }
+        if promoted + retargeted > 0 {
+            info!(promoted, retargeted, "orphan repair: pass complete");
+        }
+    }
+
+    /// Re-drive head backfills whose planned state (`head_backfill_state =
+    /// 'queued'`) outlived the in-memory job that owned it — the job dies with
+    /// the process (restart/crash mid-settle), and without this the Background
+    /// panel shows a "Planned" row forever. Rows that can't be re-driven get
+    /// the flag cleared instead of dangling.
+    pub async fn requeue_stale_head_backfills(&self) {
+        let ids = match self.store.recordings_head_backfill_queued() {
+            Ok(ids) => ids,
+            Err(e) => {
+                warn!("head backfill requeue: failed to load queued rows: {e:#}");
+                return;
+            }
+        };
+        for rec_id in ids {
+            let redrivable = self
+                .store
+                .get_recording(rec_id)
+                .ok()
+                .flatten()
+                .filter(|rec| rec.stream_id.is_some() && rec.went_live_at.is_some())
+                .and_then(|rec| self.store.get_monitor_with_channel(rec.monitor_id).ok().flatten())
+                .is_some_and(|mw| mw.monitor.platform() == Platform::Twitch);
+            if !redrivable {
+                warn!(rec_id, "head backfill requeue: row can no longer be re-driven, clearing its planned state");
+                let _ = self.store.set_head_backfill_state(rec_id, "");
+                continue;
+            }
+            info!(rec_id, "head backfill requeue: re-driving job interrupted by a restart");
+            let this = self.clone();
+            tokio::spawn(async move { this.manual_head_backfill(rec_id, None).await });
+        }
     }
 
     /// Reconcile the persistent detached-process registry at startup (synchronously,
