@@ -19432,15 +19432,23 @@ impl StreamArchiverApp {
                 }
             });
             if !set_dir.is_empty() {
+                let mut last_err: Option<String> = None;
+                let mut updated = 0usize;
                 for (mid, dir) in &set_dir {
                     if let Err(e) = self.core.store.set_monitor_output_dir(*mid, dir) {
-                        self.files_status = format!("Failed to set folder: {e:#}");
+                        last_err = Some(format!("{e:#}"));
                     } else {
                         self.files_edit.insert(*mid, dir.clone());
+                        updated += 1;
                     }
                 }
-                self.files_status =
-                    format!("Updated output folder on {} instance(s).", set_dir.len());
+                self.files_status = match last_err {
+                    None => format!("Updated output folder on {updated} instance(s)."),
+                    Some(e) => format!(
+                        "Updated {updated} of {} instance(s) — last error: {e}",
+                        set_dir.len()
+                    ),
+                };
                 refresh_iomon_roots(&self.core.store, &self.settings.default_output_dir);
                 rescan = true;
             }
