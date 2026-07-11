@@ -536,7 +536,7 @@ The **⚠ Issues** button in the toolbar (turns amber with a count when issues e
 - **Empty capture** — the capture file is 0 bytes (nothing to recover); Re-remux is disabled.
 - **Remux failed** — a previous re-remux attempt failed; hover the status cell for the ffmpeg error. The button is locked to avoid re-triggering a known-bad file.
 
-The Issues panel refreshes every 5 s while open and every 5 min while closed (each sweep stats every recording on disk, so the closed-panel badge is kept deliberately lazy). **⟳ Refresh** forces an immediate rescan.
+The Issues panel refreshes every 5 s while open and every 5 min while closed — shortened to 15 s after something changed (a recording finalized, a re-attach, …), but never once-per-event: each sweep stats every recording on disk and holds the DB briefly, so an event storm must not stack sweeps. **⟳ Refresh** forces an immediate rescan.
 
 **In-tree badges.** The recording tree also surfaces the same issue as a **⚠ needs remux** badge at the take row, rolling up to the stream, instance, and channel rows, so you can see there is a problem without opening the panel.
 
