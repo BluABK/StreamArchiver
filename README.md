@@ -471,6 +471,15 @@ usable data) and are remuxed losslessly to **`.mkv`** on clean stop. MKV is the
 default; pick TS per channel if you prefer. **MP4 is never produced** (poor for
 interrupted writes).
 
+**Quality upgrade (Twitch, default on).** A capture that joins seconds after
+go-live often sees only transcodes — Twitch lists the **source** rendition
+late — so a `best`-quality capture can lock onto e.g. 720p60 while the stream
+is really 1080p60. The watcher re-probes the rendition list a few minutes in
+and, if something better appeared, restarts the take **once** at the better
+quality (a ⬆ notification announces it). The new take's head backfill covers
+the seam and — being source quality on both sides — joins into a complete
+`full.mkv` at the better quality. Settings → Recording to disable.
+
 **Disk-load management.** All bulk post-processing on the recordings drive is
 deliberately bounded so it can never starve (or physically knock out — USB
 enclosures *do* drop off the bus under sustained mixed load) the drive the live
@@ -555,6 +564,22 @@ The **⚠ Issues** button in the toolbar (turns amber with a count when issues e
 - **Needs re-remux** — a recording whose capture finished as `.ts` but was never successfully remuxed to MKV (e.g. after a crash, a detached process, or an automatic remux failure at finalization). The **🔄 Re-remux** button triggers a background ffmpeg remux; the status cell shows a live progress bar with fps / speed / position once ffmpeg is running. The source `.ts` is deleted only on success.
 - **Empty capture** — the capture file is 0 bytes (nothing to recover); Re-remux is disabled.
 - **Remux failed** — a previous re-remux attempt failed; hover the status cell for the ffmpeg error. The button is locked to avoid re-triggering a known-bad file.
+- **🧩 Unmerged split captures (recoverable)** — the download tool died before
+  merging its per-format files (SABR/DASH write video and audio separately and
+  merge at the very end), so the final file was never written and the take
+  finalized as 0 bytes — but the media survived as parts in `.cache\`. Never
+  listed as plain "gone": the **Merge into MKV** button losslessly muxes the
+  parts into the final file (gated + throttled like any finalize pass),
+  promotes it, and marks the recording completed.
+- **🔗 Head backfill can't join the live capture** — the head and the live
+  capture carry different stream parameters, so the lossless `full.mkv` concat
+  is impossible. The row shows the actual probed params (e.g. *head 1080p60 vs
+  live 720p60* — the capture joined before Twitch listed the source
+  rendition). Fixes: **re-fetch the head at the live capture's rendition** (so
+  the join succeeds), **download the published VOD at source quality** (the
+  full stream at the better resolution), or dismiss and keep both parts as
+  separate playable files. The *quality upgrade* watcher (see Streams)
+  prevents new cases at the root.
 
 The Issues panel refreshes every 5 s while open and every 5 min while closed — shortened to 15 s after something changed (a recording finalized, a re-attach, …), but never once-per-event: each sweep stats every recording on disk and holds the DB briefly, so an event storm must not stack sweeps. **⟳ Refresh** forces an immediate rescan.
 
