@@ -4,14 +4,39 @@ use std::path::PathBuf;
 
 use directories::{ProjectDirs, UserDirs};
 
-/// `create_dir_all` with manual I/O-monitor accounting instead of the
-/// `iomon::fs` facade: `iomon::classify` resolves the data dir through these
-/// very helpers, so routing them through the facade (which classifies) would
-/// re-enter that lazy initialization.
+/// `create_dir_all` once per distinct path per session. These helpers are
+/// called from hot paths (asset-path construction runs tens of times a
+/// second while rendering), and unconditionally re-creating the same four
+/// base dirs was ~30 create syscalls/second forever — invisible until the
+/// I/O monitor counted ~11k of them in minutes. Deleting a base dir
+/// mid-session now requires a restart to recreate it, which is fine: the
+/// DB/logs live there, so that state is already unrecoverable in-session.
+///
+/// Manual I/O-monitor accounting instead of the `iomon::fs` facade:
+/// `iomon::classify` resolves the data dir through these very helpers, so
+/// routing them through the facade (which classifies) would re-enter that
+/// lazy initialization.
 #[allow(clippy::disallowed_methods)]
 fn ensure_dir(dir: &std::path::Path) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static CREATED: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+    if CREATED
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashSet::new)
+        .contains(dir)
+    {
+        return;
+    }
     let start = std::time::Instant::now();
-    let _ = std::fs::create_dir_all(dir);
+    if std::fs::create_dir_all(dir).is_ok() {
+        CREATED
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashSet::new)
+            .insert(dir.to_path_buf());
+    }
     crate::iomon::record_region(
         crate::iomon::Cat::Startup,
         crate::iomon::Region::AppData,

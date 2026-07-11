@@ -849,12 +849,17 @@ fn sampler_loop() {
             if alive == 0 {
                 continue; // whole tree gone — folded next tick via `seen`
             }
-            let entry = seen
-                .entry(pid)
-                .or_insert_with(|| SeenProc { last: crate::platform::ProcIo::default() });
-            let read_bps = now.read_bytes.saturating_sub(entry.last.read_bytes);
-            let write_bps = now.write_bytes.saturating_sub(entry.last.write_bytes);
-            entry.last = now;
+            // First sight of a pid seeds the baseline and reports ZERO rate —
+            // its counters are cumulative since the process started, so
+            // delta-from-nothing would report e.g. a re-attached capture's
+            // whole 12 GB as one second's throughput (a 37 GB/s graph spike).
+            let (read_bps, write_bps) = match seen.insert(pid, SeenProc { last: now }) {
+                Some(prev) => (
+                    now.read_bytes.saturating_sub(prev.last.read_bytes),
+                    now.write_bytes.saturating_sub(prev.last.write_bytes),
+                ),
+                None => (0, 0),
+            };
             child_read_bps += read_bps;
             child_write_bps += write_bps;
             procs.push(ProcSample {
