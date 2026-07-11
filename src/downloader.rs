@@ -603,6 +603,12 @@ pub fn build_chat_plan(
     args.push("--skip-download".into());
     args.push("--sub-langs=live_chat".into());
     args.push("--write-subs".into());
+    // Stock yt-dlp finds ZERO formats on YouTube *live* streams these days
+    // (its web clients are SABR-only there, and it drops SABR formats as
+    // unsupported) and then aborts the whole extraction — killing this leg
+    // ~3s after spawn even though it only wants the live_chat "subtitle",
+    // which comes from the page data and needs no media format at all.
+    args.push("--ignore-no-formats-error".into());
     args.push("-o".into());
     args.push(capture_path.to_string_lossy().into_owned());
     let url = if row.monitor.platform() == Platform::YouTube {
