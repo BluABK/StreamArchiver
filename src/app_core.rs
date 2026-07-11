@@ -143,6 +143,17 @@ impl AppCore {
 
     /// Spawn background services (poll scheduler + download supervisor).
     pub fn start(&self) {
+        // Central capture-cache location (empty = per-output-dir layout) —
+        // applied here, before the startup reconcile/resume derive any capture
+        // paths, and covering headless runs too. Live-updated on settings save.
+        crate::downloader::set_cache_root(
+            &self
+                .store
+                .get_setting(crate::downloader::K_CACHE_ROOT)
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+        );
         // I/O monitor: register the recordings roots for region classification,
         // apply the persisted sample-log toggle, and start the 1 s process/disk
         // sampler (here rather than the GUI path so headless runs sample too).

@@ -702,24 +702,132 @@ pub const CACHE_DIR_NAME: &str = ".sa-cache";
 /// sweep removes them.
 pub const LEGACY_CACHE_DIR_NAME: &str = ".cache";
 
-/// The hidden working directory for in-progress captures, a subfolder of the
-/// output dir (same volume, so promotion to the parent is a fast rename). The
-/// `.`-prefix hides it on Unix; [`crate::platform::set_hidden`] adds the Windows
-/// hidden attribute when the dir is created.
+/// Settings key for the central capture-cache location (empty = per-output-dir
+/// `.sa-cache\` subfolders, the pre-setting behavior).
+pub const K_CACHE_ROOT: &str = "capture_cache_root";
+
+/// The configured central cache root (normalized to end in [`CACHE_DIR_NAME`]).
+/// `None` = per-output-dir layout.
+static CACHE_ROOT: parking_lot::RwLock<Option<PathBuf>> = parking_lot::RwLock::new(None);
+
+/// Apply the central cache-root setting (startup + live on settings save).
+/// The value is normalized to end in a `.sa-cache` component — that name is
+/// what every cache-membership check (string `contains`, SQL `LIKE`) keys on,
+/// and it's the single folder to exclude in backup tools.
+pub fn set_cache_root(raw: &str) {
+    let trimmed = raw.trim().trim_end_matches(['\\', '/']);
+    let root = if trimmed.is_empty() {
+        None
+    } else {
+        let p = PathBuf::from(trimmed);
+        if p.file_name().is_some_and(is_cache_dir_name) {
+            Some(p)
+        } else {
+            Some(p.join(CACHE_DIR_NAME))
+        }
+    };
+    if let Some(r) = &root {
+        info!("capture cache root: {}", r.display());
+    }
+    *CACHE_ROOT.write() = root;
+}
+
+/// Drive letter of a path's prefix component (e.g. 'A' for `A:\x`), uppercased.
+fn drive_of(path: &Path) -> Option<char> {
+    match path.components().next()? {
+        std::path::Component::Prefix(p) => match p.kind() {
+            std::path::Prefix::Disk(d) | std::path::Prefix::VerbatimDisk(d) => {
+                Some((d as char).to_ascii_uppercase())
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The hidden working directory for in-progress captures. Default layout: a
+/// `.sa-cache\` subfolder of the output dir. With a central cache root
+/// configured (`K_CACHE_ROOT`, e.g. `A:\streams\.sa-cache`), the layout is
+/// `{root}\{output-dir leaf}\` instead — one excludable subtree per drive for
+/// backup tools whose exclusions are path-based (no wildcards). The central
+/// root only applies to output dirs on the SAME drive (promotion must stay a
+/// same-volume rename, never a multi-GB cross-drive copy); others fall back
+/// to the per-dir layout. The `.`-prefix hides it on Unix;
+/// [`crate::platform::set_hidden`] adds the Windows hidden attribute when the
+/// dir is created.
 pub(crate) fn cache_dir(output_dir: &Path) -> PathBuf {
+    if let Some(root) = CACHE_ROOT.read().as_ref()
+        && drive_of(root).is_some()
+        && drive_of(root) == drive_of(output_dir)
+        && let Some(leaf) = output_dir.file_name()
+        // An output dir that IS the root's parent (or the root itself) would
+        // recurse the cache into itself — keep those on the per-dir layout.
+        && !output_dir.starts_with(root)
+    {
+        return root.join(leaf);
+    }
     output_dir.join(CACHE_DIR_NAME)
 }
 
-/// Both possible working dirs next to an output dir — the current name first,
-/// then the legacy one. Lookups of files that may PRE-DATE the rename go
-/// through this; producers of new files use [`cache_dir`] directly.
-fn cache_dir_candidates(output_dir: &Path) -> [PathBuf; 2] {
-    [output_dir.join(CACHE_DIR_NAME), output_dir.join(LEGACY_CACHE_DIR_NAME)]
+/// Every working dir a recording's files might live in, current layout first:
+/// the configured layout ([`cache_dir`]), the per-dir `.sa-cache\`, and the
+/// legacy per-dir `.cache\`. Lookups of files that may PRE-DATE the central
+/// root or the rename go through this; producers of new files use
+/// [`cache_dir`] directly.
+pub(crate) fn cache_dir_candidates(output_dir: &Path) -> Vec<PathBuf> {
+    let mut v = vec![
+        cache_dir(output_dir),
+        output_dir.join(CACHE_DIR_NAME),
+        output_dir.join(LEGACY_CACHE_DIR_NAME),
+    ];
+    v.dedup();
+    v
 }
 
 /// True if `name` is a capture working-dir name (current or legacy).
 pub fn is_cache_dir_name(name: &std::ffi::OsStr) -> bool {
     name == CACHE_DIR_NAME || name == LEGACY_CACHE_DIR_NAME
+}
+
+/// Where a cache-resident file belongs once promoted: the same path with the
+/// `.sa-cache`/`.cache` component removed. Works for every layout —
+/// `A:\s\ch\.sa-cache\x.ts` → `A:\s\ch\x.ts` (per-dir),
+/// `A:\s\.sa-cache\ch\x.ts` → `A:\s\ch\x.ts` (central root). `None` when the
+/// path has no cache component (already promoted).
+pub fn strip_cache_component(path: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    let mut found = false;
+    for c in path.components() {
+        if !found
+            && let std::path::Component::Normal(n) = c
+            && is_cache_dir_name(n)
+        {
+            found = true;
+            continue;
+        }
+        out.push(c.as_os_str());
+    }
+    found.then_some(out)
+}
+
+/// Mark the working dir hidden on Windows — the `.sa-cache`/`.cache` ANCESTOR
+/// component, not the leaf (under a central root, `{root}\{channel}` is a
+/// plain subfolder; hiding the root hides the whole subtree).
+fn set_cache_hidden(cache: &Path) {
+    let mut p = cache;
+    loop {
+        if p.file_name().is_some_and(is_cache_dir_name) {
+            crate::platform::set_hidden(p);
+            return;
+        }
+        match p.parent() {
+            Some(parent) => p = parent,
+            None => {
+                crate::platform::set_hidden(cache);
+                return;
+            }
+        }
+    }
 }
 
 /// True if a stored path string points into a capture working dir (current or
@@ -3287,7 +3395,7 @@ impl Supervisor {
         );
         if let Some(parent) = plan.capture_path.parent() {
             let _ = crate::iomon::fs::create_dir_all(Cat::DirSetup, parent).await;
-            crate::platform::set_hidden(parent); // mark the .cache\ working dir hidden
+            set_cache_hidden(parent); // mark the working dir (or its central root) hidden
         }
         if let Some(out_dir) = plan.final_path.parent() {
             let _ = crate::iomon::fs::create_dir_all(Cat::DirSetup, out_dir).await;
@@ -3620,7 +3728,7 @@ impl Supervisor {
         let plan = build_plan(&row, started_at, &auth, &ytdlp_global_args, stream_id.as_deref(), stream_title.as_deref().unwrap_or(""), pre_media.as_ref(), went_live_at.unwrap_or(0), &ytdlp_bins);
         if let Some(parent) = plan.capture_path.parent() {
             let _ = crate::iomon::fs::create_dir_all(Cat::DirSetup, parent).await;
-            crate::platform::set_hidden(parent); // mark the .cache\ working dir hidden
+            set_cache_hidden(parent); // mark the working dir (or its central root) hidden
         }
         // Also ensure the output dir exists (the final file is promoted there).
         if let Some(out_dir) = plan.final_path.parent() {
@@ -4200,7 +4308,7 @@ impl Supervisor {
     ) {
         if let Some(parent) = plan.capture_path.parent() {
             let _ = crate::iomon::fs::create_dir_all(Cat::DirSetup, parent).await;
-            crate::platform::set_hidden(parent);
+            set_cache_hidden(parent);
         }
         if let Some(out_dir) = plan.final_path.parent() {
             let _ = crate::iomon::fs::create_dir_all(Cat::DirSetup, out_dir).await;
@@ -5332,7 +5440,7 @@ impl Supervisor {
         }
         if let Some(parent) = plan.capture_path.parent() {
             let _ = crate::iomon::fs::create_dir_all(Cat::DirSetup, parent).await;
-            crate::platform::set_hidden(parent);
+            set_cache_hidden(parent);
         }
         let _ = self
             .store
@@ -6058,7 +6166,7 @@ impl Supervisor {
         };
         let cache = cache_dir(&out_dir);
         let _ = crate::iomon::fs::create_dir_all(Cat::Recovery, &cache).await;
-        crate::platform::set_hidden(&cache);
+        set_cache_hidden(&cache);
         let pl_path = cache.join(format!("{stem}.head.m3u8"));
         if let Err(e) = crate::iomon::fs::write(Cat::Recovery, &pl_path, &playlist.text).await {
             warn!(rec_id, "head backfill: cannot write playlist: {e:#}");
@@ -6292,24 +6400,19 @@ impl Supervisor {
             let _ = self.events.send(AppEvent::BackgroundTaskFinished { id: task_id, outcome });
         };
 
-        // A never-promoted take's output_path points into `.cache\`; the
-        // merged file belongs in the real output dir above it.
+        // A never-promoted take's output_path points into a working dir; the
+        // merged file belongs at its promoted location (the same path with the
+        // cache component removed — handles the per-dir AND central layouts).
         let cache = parts[0]
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        let out_dir = if capture
+        let out_dir = strip_cache_component(&capture)
+            .as_deref()
+            .unwrap_or(&capture)
             .parent()
-            .is_some_and(|d| d.file_name().is_some_and(is_cache_dir_name))
-        {
-            capture
-                .parent()
-                .and_then(Path::parent)
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| cache.clone())
-        } else {
-            capture.parent().map(Path::to_path_buf).unwrap_or_else(|| cache.clone())
-        };
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| cache.clone());
         let Some(orig_stem) = capture.file_stem().map(|s| s.to_string_lossy().into_owned())
         else {
             finish(crate::events::TaskOutcome::Failed("bad capture path".into()));
@@ -8632,10 +8735,10 @@ pub fn find_split_media(capture: &Path) -> Vec<PathBuf> {
     let Some(stem) = capture.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
         return Vec::new();
     };
-    let caches: Vec<PathBuf> = if dir.file_name().is_some_and(is_cache_dir_name) {
-        vec![dir.to_path_buf()]
+    let caches: Vec<PathBuf> = if strip_cache_component(capture).is_some() {
+        vec![dir.to_path_buf()] // already inside a working dir — scan right there
     } else {
-        cache_dir_candidates(dir).into_iter().collect()
+        cache_dir_candidates(dir)
     };
     let prefix = format!("{stem}.");
     let is_fmt_seg = |s: &str| {
@@ -11527,6 +11630,58 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn central_cache_root_layout_and_reverse_mapping() {
+        // Reverse mapping: the promoted location is the path minus its cache
+        // component, for every layout generation.
+        assert_eq!(
+            strip_cache_component(Path::new(r"A:\s\ch\.sa-cache\x.ts")),
+            Some(PathBuf::from(r"A:\s\ch\x.ts"))
+        );
+        assert_eq!(
+            strip_cache_component(Path::new(r"A:\s\.sa-cache\ch\x.ts")),
+            Some(PathBuf::from(r"A:\s\ch\x.ts"))
+        );
+        assert_eq!(
+            strip_cache_component(Path::new(r"A:\s\ch\.cache\x.ts")),
+            Some(PathBuf::from(r"A:\s\ch\x.ts"))
+        );
+        assert_eq!(strip_cache_component(Path::new(r"A:\s\ch\x.ts")), None);
+
+        // Use a drive letter no other test touches — CACHE_ROOT is process-global.
+        set_cache_root(r"Q:\streams"); // normalized to Q:\streams\.sa-cache
+        // Same drive → central layout, one subfolder per output-dir leaf.
+        assert_eq!(
+            cache_dir(Path::new(r"Q:\streams\Chan")),
+            PathBuf::from(r"Q:\streams\.sa-cache\Chan")
+        );
+        // Different drive → per-dir fallback (promotion must stay a rename).
+        assert_eq!(
+            cache_dir(Path::new(r"R:\out\Chan")),
+            PathBuf::from(r"R:\out\Chan\.sa-cache")
+        );
+        // An output dir inside the root itself must not recurse the cache.
+        assert_eq!(
+            cache_dir(Path::new(r"Q:\streams\.sa-cache\Chan")),
+            PathBuf::from(r"Q:\streams\.sa-cache\Chan\.sa-cache")
+        );
+        // Lookups cover all three layouts, current first.
+        assert_eq!(
+            cache_dir_candidates(Path::new(r"Q:\streams\Chan")),
+            vec![
+                PathBuf::from(r"Q:\streams\.sa-cache\Chan"),
+                PathBuf::from(r"Q:\streams\Chan\.sa-cache"),
+                PathBuf::from(r"Q:\streams\Chan\.cache"),
+            ]
+        );
+        set_cache_root("");
+        assert_eq!(
+            cache_dir(Path::new(r"Q:\streams\Chan")),
+            PathBuf::from(r"Q:\streams\Chan\.sa-cache")
+        );
     }
 
     #[test]

@@ -1612,14 +1612,23 @@ Both SABR paths are **mpv-only**; other players get the DASH companion's `.ts`
   files share the recording's stem: `{stem}.vod.mkv` (downloaded published VOD),
   `{stem}.head.mkv` (backfilled missed start), `{stem}.full.mkv` (head + live
   joined), and a recovered VOD from CDN recovery.
-- In-progress captures live in a hidden **`.sa-cache\`** working folder inside
-  each output dir and are promoted up on finish. The name is deliberately
-  app-unique so backup tools that only support global folder-name exclusions
-  (e.g. Backblaze) can exclude exactly it — add **`.sa-cache`** to your backup
-  exclusions to keep multi-GB transient capture files out of backups and off
-  the spindle during recording. (Pre-rename `.cache\` folders are still read
-  from — stranded captures, split parts, SABR resume state — and drain away:
-  nothing new is written there and the startup sweep removes them once empty.)
+- In-progress captures live in a hidden **`.sa-cache\`** working folder and
+  are promoted (same-volume rename) to the output folder on finish. Layout:
+  - Default: a `.sa-cache\` subfolder inside each output folder.
+  - **Capture cache location** (Settings → Recording): a central folder — e.g.
+    `A:\streams\.sa-cache` — holding one subfolder per channel
+    (`…\.sa-cache\{channel}\…`). This gives backup tools **one excludable
+    subtree per drive**, for tools like Backblaze whose exclusions are
+    path-based with no wildcard support (a per-channel dot-folder can't be
+    excluded there). It only applies to output folders on the *same drive*
+    (promotion must stay a rename, never a multi-GB cross-drive copy); output
+    folders on other drives keep the per-folder layout. Changing the setting
+    is safe at any time: files are *found* under all layouts (central,
+    per-folder, legacy `.cache\`), takes started before the change finish
+    under their original layout, and drained working folders are removed by
+    the startup sweep.
+  Exclude the `.sa-cache` folder(s) from backups to keep multi-GB transient
+  capture files out of backups and off the spindle during recording.
 - App logs: `%APPDATA%\StreamArchiver\data\logs\` (daily-rotated, 7-day
   retention). Per-download tool output (`streamlink`/`yt-dlp`/`ffmpeg`
   stdout+stderr) lands in `logs\captures\` on the same drive — *not* next to

@@ -570,6 +570,7 @@ struct SettingsForm {
     /// VOD/video download rate limit (yt-dlp `--limit-rate` syntax, e.g. `4M`);
     /// empty = unlimited (the default). Never applied to live captures.
     download_rate_limit: String,
+    capture_cache_root: String,
     /// yt-dlp `--postprocessor-args` specs (`;;`-separated); empty = none.
     /// Throttles yt-dlp's internal ffmpeg passes (e.g. the SABR merge).
     ytdlp_ppa: String,
@@ -1298,6 +1299,7 @@ impl StreamArchiverApp {
                 .flatten()
                 .unwrap_or_else(|| "3".into()),
             download_rate_limit: setting_or_empty(&core, crate::io_gate::K_DOWNLOAD_RATE_LIMIT),
+            capture_cache_root: setting_or_empty(&core, crate::downloader::K_CACHE_ROOT),
             ytdlp_ppa: setting_or_empty(&core, crate::io_gate::K_YTDLP_PPA),
             download_auth_method: core
                 .store
@@ -2561,6 +2563,7 @@ impl StreamArchiverApp {
             (K_DEFAULT_OUT, s.default_output_dir.trim()),
             (K_MAX_CONCURRENT, s.max_concurrent_downloads.trim()),
             (crate::io_gate::K_DOWNLOAD_RATE_LIMIT, s.download_rate_limit.trim()),
+            (crate::downloader::K_CACHE_ROOT, s.capture_cache_root.trim()),
             (crate::io_gate::K_YTDLP_PPA, s.ytdlp_ppa.trim()),
             (K_DOWNLOAD_AUTH, s.download_auth_method.trim()),
             (K_COOKIES_BROWSER, cookies_value.as_str()),
@@ -2667,6 +2670,7 @@ impl StreamArchiverApp {
         crate::io_gate::set_readrate(self.settings.postproc_readrate);
         // Apply the download rate limit to downloads started from now on.
         crate::io_gate::set_download_rate_limit(&self.settings.download_rate_limit);
+        crate::downloader::set_cache_root(&self.settings.capture_cache_root);
         crate::io_gate::set_ytdlp_ppa(&self.settings.ytdlp_ppa);
         // I/O monitor: apply the sample-log toggle and re-register the
         // recordings roots (the default output dir may have changed).
@@ -17941,6 +17945,24 @@ impl StreamArchiverApp {
                          (needs ffmpeg 5.0+). Empty = unthrottled.",
                     );
                     ui.end_row();
+                    ui.horizontal(|ui| {
+                        ui.label("Capture cache location:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings.capture_cache_root)
+                                .hint_text(r"A:\streams\.sa-cache")
+                                .desired_width(240.0),
+                        );
+                    });
+                    ui.label(
+                        "Central folder for ALL in-progress capture files, one subfolder \
+                         per channel — a single subtree backup tools can exclude by path \
+                         (Backblaze has no wildcard rules). Only applies to output folders \
+                         on the SAME drive (finalizing must stay a same-volume rename); \
+                         others keep a per-folder .sa-cache. Empty = a .sa-cache subfolder \
+                         inside each output folder. Existing files are found either way; \
+                         takes started before a change finish under the old layout.",
+                    );
+                    ui.end_row();
                     ui.checkbox(&mut self.settings.iomon_sample_log, "I/O sample log");
                     ui.label(
                         "Write the I/O monitor's 1s samples to a JSONL under the appdata \
@@ -21043,14 +21065,12 @@ impl StreamArchiverApp {
         }
         if let Some(Act::Remux(i)) = act {
             if let Some(rec) = self.issues_recs.get(i) {
-                let dest = std::path::Path::new(&rec.output_path)
-                    .parent()
-                    .and_then(|p| p.parent())
-                    .and_then(|d| {
-                        std::path::Path::new(&rec.output_path)
-                            .file_stem()
-                            .map(|s| d.join(format!("{}.mkv", s.to_string_lossy())))
-                    });
+                // The promoted location = the capture path minus its cache
+                // component (handles per-dir AND central-root layouts).
+                let dest = crate::downloader::strip_cache_component(std::path::Path::new(
+                    &rec.output_path,
+                ))
+                .map(|p| p.with_extension("mkv"));
                 if let Some(dest) = dest {
                     self.core.manual(crate::events::ManualCommand::ReRemux {
                         rec_id: rec.id,
@@ -21065,9 +21085,11 @@ impl StreamArchiverApp {
             && let Some(rec) = self.issues_stuck.get(k)
         {
             let capture = std::path::PathBuf::from(&rec.output_path);
-            // output_path is "<output_dir>\.cache\<stem>.<ext>" — the grandparent
-            // of the .cache file is the actual output dir it should move to.
-            let output_dir = capture.parent().and_then(|p| p.parent()).map(Path::to_path_buf);
+            // The promoted location = the capture path minus its cache
+            // component (handles per-dir AND central-root layouts); its parent
+            // is the output dir the file should move to.
+            let output_dir = crate::downloader::strip_cache_component(&capture)
+                .and_then(|p| p.parent().map(Path::to_path_buf));
             if let Some(output_dir) = output_dir {
                 self.core.manual(crate::events::ManualCommand::RecoverStuckCapture {
                     rec_id: rec.id,
@@ -25532,13 +25554,10 @@ fn live_file_len(p: &std::path::Path) -> Option<u64> {
 fn stream_target_for_active(output_path: &str) -> Option<StreamTarget> {
     let final_path = std::path::Path::new(output_path);
     let stem = final_path.file_stem()?.to_string_lossy().into_owned();
-    // Current working-dir name first, legacy `.cache\` second — takes started
-    // under an older build (incl. re-attached ones) still write to the latter.
-    let parent = final_path.parent()?;
-    let cache_dirs = [
-        parent.join(crate::downloader::CACHE_DIR_NAME),
-        parent.join(crate::downloader::LEGACY_CACHE_DIR_NAME),
-    ];
+    // Current layout first (central root when configured), then the per-dir
+    // and legacy dirs — takes started under an older build (incl. re-attached
+    // ones) still write to those.
+    let cache_dirs = crate::downloader::cache_dir_candidates(final_path.parent()?);
     for cache_dir in &cache_dirs {
         for ext in [".ts", ".mkv", ".mkv.mp4"] {
             let candidate = cache_dir.join(format!("{stem}{ext}"));
