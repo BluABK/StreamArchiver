@@ -349,6 +349,27 @@ fn swap_quality(chunked_url: &str, quality: &str) -> String {
     chunked_url.replacen("/chunked/", &format!("/{quality}/"), 1)
 }
 
+/// Re-point a found (source/`chunked`) playlist URL at `requested` quality,
+/// verified against the renditions that actually exist on the CDN. An empty
+/// request returns the found URL unchanged; an unavailable one falls back to
+/// the best available (see [`resolve_quality`]). Used by the head backfill's
+/// match-the-live-capture re-fetch — a head at source resolution can't be
+/// `-c copy`-concatenated with a live capture that joined before the source
+/// rendition appeared in Twitch's playlist.
+pub async fn playlist_at_quality(
+    client: &reqwest::Client,
+    found: &FoundPlaylist,
+    requested: &str,
+    max_conc: usize,
+) -> String {
+    if requested.trim().is_empty() {
+        return found.url.clone();
+    }
+    let quals = enumerate_qualities(client, found, max_conc).await;
+    let chosen = resolve_quality(requested, &quals);
+    swap_quality(&found.url, &chosen)
+}
+
 /// HEAD-probe which quality variants of a found playlist exist, source-first.
 pub async fn enumerate_qualities(
     client: &reqwest::Client,

@@ -1712,7 +1712,19 @@ impl Supervisor {
                     ManualCommand::BackfillHeadNow(rec_id) => {
                         let this = self.clone();
                         tokio::spawn(async move {
-                            this.manual_head_backfill(rec_id).await;
+                            this.manual_head_backfill(rec_id, None).await;
+                        });
+                    }
+                    ManualCommand::BackfillHeadMatchLive(rec_id) => {
+                        let this = self.clone();
+                        tokio::spawn(async move {
+                            this.refetch_head_matching_live(rec_id).await;
+                        });
+                    }
+                    ManualCommand::MergeSplitCapture(rec_id) => {
+                        let this = self.clone();
+                        tokio::spawn(async move {
+                            this.merge_split_capture(rec_id).await;
                         });
                     }
                     ManualCommand::RefreshCdnHosts => {
@@ -3522,7 +3534,7 @@ impl Supervisor {
             tokio::spawn(async move {
                 this.head_backfill_job(
                     monitor_id, channel_id, rec_id, capture, final_p, url, channel, sid, wl,
-                    approximate, started_at, None, false, lead_secs,
+                    approximate, started_at, None, false, lead_secs, None,
                 )
                 .await;
             });
@@ -5441,6 +5453,11 @@ impl Supervisor {
         // stream's true go-live"), for a mid-broadcast trigger start. `None` =
         // today's behavior, unchanged.
         lead_secs: Option<i64>,
+        // `Some("720p60")` = fetch the head at this Twitch rendition instead of
+        // source — the match-the-live-capture re-fetch for a head/live codec
+        // mismatch (live joined before the source rendition was listed).
+        // `None` = source (today's behavior).
+        quality: Option<String>,
     ) {
         // Let the CDN folder appear and streamlink's own rewind (if any) settle
         // — this is a fixed grace period, not proportional to how late the
@@ -5596,9 +5613,15 @@ impl Supervisor {
         // offset instead of being read from position zero.
         let head_secs = missed as f64;
         let skip_secs = lead_secs.map(|lead| (started_at - went_live_at - lead).max(0) as f64);
+        // Source quality unless a specific rendition was requested (the
+        // match-the-live-capture re-fetch), verified against what exists.
+        let playlist_url = match &quality {
+            Some(q) => crate::recovery::playlist_at_quality(&client, &found, q, max_conc).await,
+            None => found.url.clone(),
+        };
         let playlist = match crate::recovery::build_playlist(
             &client,
-            &found.url,
+            &playlist_url,
             max_conc,
             false,
             Some(head_secs + 4.0),
@@ -5728,7 +5751,7 @@ impl Supervisor {
     /// -finished one (uses the promoted final file — its own duration never
     /// changes again, so `missed` is computed against its fixed `ended_at`
     /// rather than a live `now_unix()`, see `head_backfill_job`).
-    pub async fn manual_head_backfill(&self, rec_id: i64) {
+    pub async fn manual_head_backfill(&self, rec_id: i64, quality: Option<String>) {
         let Ok(Some(rec)) = self.store.get_recording(rec_id) else {
             warn!(rec_id, "backfill head: recording not found");
             return;
@@ -5777,8 +5800,200 @@ impl Supervisor {
             missed_reference,
             true, // force — user-initiated
             None, // manual re-trigger always backfills from the true go-live
+            quality,
         )
         .await;
+    }
+
+    /// Re-fetch a mismatched head at the LIVE capture's own rendition (the
+    /// Issues-panel fix for `head_backfill_state == "mismatch"`): probe the
+    /// live file, derive its Twitch rendition name (`{height}p{fps}`), clear
+    /// the mismatch state, and re-run the head backfill at that quality so
+    /// the lossless concat can succeed. The superseded source-quality head is
+    /// replaced by the job's normal supersede path.
+    pub async fn refetch_head_matching_live(&self, rec_id: i64) {
+        let Ok(Some(rec)) = self.store.get_recording(rec_id) else {
+            warn!(rec_id, "match-live head re-fetch: recording not found");
+            return;
+        };
+        let live = probe_media(&rec.output_path).await;
+        let Some(live) = live else {
+            warn!(rec_id, "match-live head re-fetch: live capture won't probe");
+            let _ = self.events.send(AppEvent::BackgroundTaskFinished {
+                id: crate::events::next_task_id(),
+                outcome: crate::events::TaskOutcome::Failed(
+                    "live capture won't probe — cannot derive its rendition".into(),
+                ),
+            });
+            return;
+        };
+        // Twitch rendition names are `{height}p{fps}` with integer fps
+        // (e.g. 720p60); fps strings like "59.94" round to the advertised 60.
+        let fps: f64 = live.fps.parse().unwrap_or(0.0);
+        let quality = format!("{}p{}", live.height, fps.round() as i64);
+        info!(rec_id, quality, "re-fetching head at the live capture's rendition");
+        let _ = self.store.set_head_backfill_state(rec_id, "");
+        self.manual_head_backfill(rec_id, Some(quality)).await;
+    }
+
+    /// Merge a stranded split capture — the Issues fix for a take whose
+    /// download tool died before running its own format merge: the predicted
+    /// capture file never existed (finalize recorded 0 bytes, the take reads
+    /// as "gone") but the media survived as bare per-format files in
+    /// `.cache\` (see [`find_split_media`]). Losslessly muxes the parts into
+    /// the final MKV, promotes it + any companions, and marks the recording
+    /// completed. The parts are deleted only on success.
+    pub async fn merge_split_capture(&self, rec_id: i64) {
+        let Ok(Some(rec)) = self.store.get_recording(rec_id) else {
+            warn!(rec_id, "merge split capture: recording not found");
+            return;
+        };
+        let capture = PathBuf::from(&rec.output_path);
+        let parts = find_split_media(&capture);
+        if parts.is_empty() {
+            warn!(rec_id, "merge split capture: no split parts found");
+            return;
+        }
+        let task_id = crate::events::next_task_id();
+        let name = capture
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let _ = self.events.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
+            id: task_id,
+            kind: crate::events::BackgroundTaskKind::Remux,
+            label: name,
+            detail: format!("merging {} split part(s)", parts.len()),
+            started_at: now_unix(),
+            progress: None,
+            progress_info: None,
+        }));
+        let finish = |outcome: crate::events::TaskOutcome| {
+            let _ = self.events.send(AppEvent::BackgroundTaskFinished { id: task_id, outcome });
+        };
+
+        // A never-promoted take's output_path points into `.cache\`; the
+        // merged file belongs in the real output dir above it.
+        let cache = parts[0]
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let out_dir = if capture
+            .parent()
+            .is_some_and(|d| d.file_name().is_some_and(|n| n == ".cache"))
+        {
+            capture
+                .parent()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| cache.clone())
+        } else {
+            capture.parent().map(Path::to_path_buf).unwrap_or_else(|| cache.clone())
+        };
+        let Some(orig_stem) = capture.file_stem().map(|s| s.to_string_lossy().into_owned())
+        else {
+            finish(crate::events::TaskOutcome::Failed("bad capture path".into()));
+            return;
+        };
+        let stem = unique_stem(&out_dir, &orig_stem, "mkv", None);
+        let final_path = path_with_safe_stem(&out_dir.join(format!("{stem}.mkv")));
+        let tmp = cache.join(format!("{orig_stem}.merged.tmp.mkv"));
+
+        // One local full-file pass at a time (see io_gate) + readrate throttle.
+        let gate = crate::io_gate::local_pass("merge-split").await;
+        let out = loop {
+            let readrate = crate::io_gate::readrate();
+            let mut cmd = Command::new("ffmpeg");
+            cmd.arg("-y");
+            if let Some(rate) = readrate {
+                cmd.arg("-readrate").arg(format!("{rate}"));
+            }
+            for p in &parts {
+                cmd.arg("-i").arg(p);
+            }
+            for i in 0..parts.len() {
+                cmd.arg("-map").arg(format!("{i}"));
+            }
+            cmd.arg("-c")
+                .arg("copy")
+                .arg(&tmp)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            #[cfg(windows)]
+            cmd.creation_flags(CREATE_NO_WINDOW);
+            // spawn + wait_with_output (≡ output()) so the PID is sampleable.
+            let out = match cmd.spawn() {
+                Ok(child) => {
+                    let _io_guard = crate::iomon::track_tool(
+                        child.id(),
+                        "ffmpeg",
+                        "merge split capture",
+                        &final_path,
+                    );
+                    child.wait_with_output().await
+                }
+                Err(e) => Err(e),
+            };
+            if let Ok(o) = &out
+                && !o.status.success()
+                && readrate.is_some()
+                && crate::io_gate::is_readrate_error(&String::from_utf8_lossy(&o.stderr))
+            {
+                crate::io_gate::mark_readrate_unsupported();
+                continue; // retry once without the throttle
+            }
+            break out;
+        };
+        drop(gate);
+        match out {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let msg = stderr.trim().lines().last().unwrap_or("").to_string();
+                let _ = crate::iomon::fs::remove_file(Cat::CacheSweep, &tmp).await;
+                warn!(rec_id, "merge split capture failed: {msg}");
+                finish(crate::events::TaskOutcome::Failed(format!("ffmpeg merge: {msg}")));
+                return;
+            }
+            Err(e) => {
+                finish(crate::events::TaskOutcome::Failed(format!("spawn ffmpeg: {e}")));
+                return;
+            }
+        }
+        if let Err(e) = crate::iomon::fs::rename(Cat::Promote, &tmp, &final_path).await {
+            warn!(rec_id, "merge split capture: promote failed: {e:#}");
+            finish(crate::events::TaskOutcome::Failed(format!("promote: {e}")));
+            return;
+        }
+        // Bring any surviving companions (thumbnail, sidecars) up too.
+        move_companions(&cache, &out_dir, &orig_stem).await;
+        let bytes = crate::iomon::fs::metadata(Cat::Promote, &final_path)
+            .await
+            .map(|m| m.len() as i64)
+            .unwrap_or(0);
+        let _ = self.store.finish_recording(
+            rec_id,
+            rec.ended_at.unwrap_or_else(now_unix),
+            bytes,
+            rec.exit_code,
+            "completed",
+            &final_path.to_string_lossy(),
+            &rec.log_excerpt,
+        );
+        for p in &parts {
+            let _ = crate::iomon::fs::remove_file(Cat::CacheSweep, p).await;
+        }
+        let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
+        info!(
+            rec_id,
+            bytes,
+            "merged {} split part(s) -> {}",
+            parts.len(),
+            final_path.display()
+        );
+        finish(crate::events::TaskOutcome::Completed);
     }
 
     /// Join a backfilled head with the finished live capture into one seamless
@@ -5800,6 +6015,22 @@ impl Supervisor {
             return;
         }
         let Some(head) = backfill else { return };
+        // A previously-diagnosed parameter mismatch is permanent for these two
+        // files — don't re-probe (and re-warn) on every completion-path
+        // trigger. The Issues panel explains it and offers the fixes
+        // (re-fetch the head at the live resolution / grab the published
+        // VOD); a re-fetch clears the state.
+        if self
+            .store
+            .get_recording(rec_id)
+            .ok()
+            .flatten()
+            // "mismatch" (listed in Issues) or "mismatch_ack" (dismissed) —
+            // both mean these exact files can't join; only a re-fetch resets.
+            .is_some_and(|r| r.head_backfill_state.starts_with("mismatch"))
+        {
+            return;
+        }
         let head_p = PathBuf::from(&head);
         let live_p = PathBuf::from(&live_path);
         if !live_path.to_ascii_lowercase().ends_with(".mkv")
@@ -5830,10 +6061,26 @@ impl Supervisor {
             _ => false,
         };
         if !compatible {
+            let fmt = |m: &Option<MediaInfo>| {
+                m.as_ref()
+                    .map(|i| {
+                        format!(
+                            "{}x{}@{} {}/{}",
+                            i.width, i.height, i.fps, i.vcodec, i.acodec
+                        )
+                    })
+                    .unwrap_or_else(|| "unprobeable".into())
+            };
             warn!(
                 rec_id,
-                "head concat: codec parameters differ between head and live capture — keeping parts unjoined"
+                head = fmt(&head_info),
+                live = fmt(&live_info),
+                "head concat: codec parameters differ between head and live capture — keeping parts unjoined (listed under Issues)"
             );
+            // Persisted so the join isn't re-attempted every trigger and so
+            // the Issues panel can list it with fixes.
+            let _ = self.store.set_head_backfill_state(rec_id, "mismatch");
+            let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
             return;
         }
 
@@ -7776,6 +8023,62 @@ fn find_thumbnail_for(src: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Bare per-format media files (`{stem}.….fN.….{mp4,m4a,webm,mkv}`) left in
+/// `.cache\` for a recording — the SABR/DASH downloader writes per-format
+/// files and merges them at the very end; if it dies first, the media
+/// survives as finished parts while the predicted capture path never exists
+/// (so finalize records 0 bytes and the take reads as "gone"). Mirrors the
+/// naming rules of the UI's active-capture split scan, but accepts only
+/// FINISHED parts (no `.part`/`.temp.`/`.ytdl`/`.state`/`.log`).
+///
+/// `capture` may point into `.cache\` (a never-promoted take) or at the
+/// promoted location — the scan runs in the `.cache\` next to either.
+pub fn find_split_media(capture: &Path) -> Vec<PathBuf> {
+    let Some(dir) = capture.parent() else { return Vec::new() };
+    let Some(stem) = capture.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+        return Vec::new();
+    };
+    let cache = if dir.file_name().is_some_and(|n| n == ".cache") {
+        dir.to_path_buf()
+    } else {
+        cache_dir(dir)
+    };
+    let prefix = format!("{stem}.");
+    let Ok(rd) = crate::iomon::fs::read_dir_sync(Cat::FsProbe, &cache) else {
+        return Vec::new();
+    };
+    let is_fmt_seg = |s: &str| {
+        s.strip_prefix('f')
+            .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let mut out = Vec::new();
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix(&prefix) else { continue };
+        if rest.contains(".part")
+            || rest.contains(".temp.")
+            || rest.ends_with(".ytdl")
+            || rest.ends_with(".state")
+            || rest.ends_with(".log")
+        {
+            continue;
+        }
+        let segs: Vec<&str> = rest.split('.').collect();
+        let Some(fpos) = segs.iter().position(|s| is_fmt_seg(s)) else { continue };
+        // Everything before the f<id> segment must be container decoration
+        // ("mkv.f140.mp4"), never title text — otherwise a sibling recording
+        // whose stem extends this one after a dot would leak in.
+        if !segs[..fpos].iter().all(|s| matches!(*s, "mkv" | "mp4" | "webm" | "m4a" | "ts")) {
+            continue;
+        }
+        if matches!(segs.last().copied(), Some("mp4" | "m4a" | "webm" | "mkv")) {
+            out.push(entry.path());
+        }
+    }
+    out.sort();
+    out
 }
 
 /// Collect subtitle sidecar files adjacent to `src` (e.g. `{stem}.en.srt`,
@@ -10579,6 +10882,46 @@ mod tests {
         assert!(plan.remux_to_mkv);
         // No live-only retry flags for a VOD.
         assert!(!plan.args.iter().any(|a| a == "--retry-streams"));
+    }
+
+    #[test]
+    fn find_split_media_accepts_bare_parts_only() {
+        let dir = std::env::temp_dir().join(format!("sa-split-{}", std::process::id()));
+        let cache = dir.join(".cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let stem = "Chan - 2026-07-08 23-05-21 - title [youtube abc]";
+        // Finished parts (video + audio) — accepted.
+        std::fs::write(cache.join(format!("{stem}.mkv.f299.mp4")), b"v").unwrap();
+        std::fs::write(cache.join(format!("{stem}.mkv.f140.mp4")), b"a").unwrap();
+        // In-flight / working files — rejected.
+        std::fs::write(cache.join(format!("{stem}.mkv.f299.mp4.sq0.part")), b"x").unwrap();
+        std::fs::write(cache.join(format!("{stem}.mkv.temp.mp4")), b"x").unwrap();
+        std::fs::write(cache.join(format!("{stem}.log")), b"x").unwrap();
+        std::fs::write(cache.join(format!("{stem}.thumbnail.jpg")), b"x").unwrap();
+        // A sibling recording whose stem extends this one — rejected.
+        std::fs::write(cache.join(format!("{stem}. Part 2.f303.mp4")), b"x").unwrap();
+
+        // Works from both the never-promoted (.cache) path and the final path.
+        for capture in [
+            cache.join(format!("{stem}.mkv")),
+            dir.join(format!("{stem}.mkv")),
+        ] {
+            let parts = find_split_media(&capture);
+            let names: Vec<String> = parts
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(
+                names,
+                vec![
+                    format!("{stem}.mkv.f140.mp4"),
+                    format!("{stem}.mkv.f299.mp4"),
+                ],
+                "capture={}",
+                capture.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -394,4 +394,14 @@ pub enum ManualCommand {
     /// unless the owning channel is currently live (the CDN's growing live
     /// playlist this depends on stops being pre-mute-safe once the stream ends).
     BackfillHeadNow(i64),
+    /// Re-fetch a mismatched head backfill at the LIVE capture's own rendition
+    /// (the Issues fix for `head_backfill_state == "mismatch"`): the live take
+    /// joined before Twitch listed the source rendition, so the source-quality
+    /// head can't be losslessly concatenated with it.
+    BackfillHeadMatchLive(i64),
+    /// Merge a stranded split capture (bare per-format `.fN.*` files left in
+    /// `.cache\` when the tool died before its own merge) into the final MKV
+    /// and promote it — the Issues fix for a take that finalized 0-byte while
+    /// its media survived as parts.
+    MergeSplitCapture(i64),
 }

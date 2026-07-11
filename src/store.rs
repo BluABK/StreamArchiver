@@ -4267,6 +4267,24 @@ impl Store {
         Ok(row)
     }
 
+    /// Recordings whose head backfill exists but can't be losslessly joined
+    /// with the live capture (differing codec parameters — typically the live
+    /// take joined before Twitch listed the source rendition, so it captured
+    /// a transcode while the head fetched at source). Surfaced in Issues with
+    /// the fixes. Listed newest-first.
+    pub fn recordings_with_head_mismatch(&self) -> Result<Vec<crate::models::Recording>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM recording WHERE head_backfill_state = 'mismatch'
+             ORDER BY started_at DESC",
+            Self::RECORDING_FULL_COLUMNS
+        ))?;
+        let rows = stmt
+            .query_map([], Self::map_recording_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Recordings whose output path is still a `.ts` file inside a `.cache`
     /// directory — these finished capturing but were never successfully remuxed
     /// to the final MKV container. Listed newest-first.

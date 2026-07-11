@@ -821,19 +821,20 @@ pub struct StreamArchiverApp {
     /// Recordings whose published VOD came back DMCA-muted (post-stream archive) —
     /// un-muted via recovery, awaiting acknowledgement.
     issues_muted_vod: Vec<crate::models::MutedVodIssue>,
-    /// In-flight background Issues scan: (missing-output-file recordings,
-    /// error recordings whose file still exists, error recordings whose file is
-    /// gone). Every `path.exists()` the Issues panel needs runs on this thread —
-    /// against the recordings drive a single stat can block for seconds, so the
-    /// UI thread must never do one (see `FsProbes`).
-    #[allow(clippy::type_complexity)]
-    issues_missing_load: Option<
-        std::sync::mpsc::Receiver<(
-            Vec<crate::models::Recording>,
-            Vec<crate::models::Recording>,
-            Vec<crate::models::Recording>,
-        )>,
-    >,
+    /// Takes that finalized 0-byte / file-gone but whose media SURVIVED as
+    /// split per-format files in `.cache\` (the tool died before its own
+    /// merge) — recoverable, so never shown as plain "gone". Each entry
+    /// carries the discovered part files.
+    issues_unmerged: Vec<(crate::models::Recording, Vec<std::path::PathBuf>)>,
+    /// Head backfills that can't be losslessly joined with their live capture
+    /// (codec/resolution mismatch), with display strings: (rec, head params,
+    /// live params).
+    issues_head_mismatch: Vec<(crate::models::Recording, String, String)>,
+    /// In-flight background Issues scan (see [`IssuesScan`]). Every
+    /// `path.exists()`/ffprobe the Issues panel needs runs on this thread —
+    /// against the recordings drive a single stat can block for seconds, so
+    /// the UI thread must never do one (see `FsProbes`).
+    issues_missing_load: Option<std::sync::mpsc::Receiver<IssuesScan>>,
     issues_refreshed: Option<std::time::Instant>,
     /// A dirty-marking app event landed since the last issues sweep — shortens
     /// the closed-panel refresh interval instead of forcing an immediate one.
@@ -1553,6 +1554,8 @@ impl StreamArchiverApp {
             issues_missing: Vec::new(),
             issues_errors: Vec::new(),
             issues_errors_no_file: Vec::new(),
+            issues_unmerged: Vec::new(),
+            issues_head_mismatch: Vec::new(),
             issues_stuck: Vec::new(),
             issues_muted_vod: Vec::new(),
             issues_missing_load: None,
@@ -5020,6 +5023,63 @@ fn fmt_viewers(n: i64) -> String {
 }
 
 /// Human-readable byte size (B / KB / MB / GB).
+/// Everything the background Issues scan computes off the UI thread — every
+/// `path.exists()`/`read_dir`/ffprobe in here can block for seconds against
+/// the recordings drive under load.
+struct IssuesScan {
+    /// Output file genuinely gone from disk (and no recoverable parts).
+    missing: Vec<crate::models::Recording>,
+    /// Failed/aborted recordings whose file still exists.
+    errors_with_file: Vec<crate::models::Recording>,
+    /// Failed/aborted recordings whose file is gone.
+    errors_no_file: Vec<crate::models::Recording>,
+    /// File-gone takes whose media survived as split per-format parts in
+    /// `.cache\` — recoverable via merge.
+    unmerged: Vec<(crate::models::Recording, Vec<std::path::PathBuf>)>,
+    /// Head/live join blocked by codec parameters: (rec, head, live) with
+    /// human-readable stream params.
+    head_mismatch: Vec<(crate::models::Recording, String, String)>,
+}
+
+/// Compact `1920x1080@60 h264` of a file's first video stream, for the Issues
+/// mismatch explainer. Blocking ffprobe — background threads only.
+fn probe_dims_sync(path: &str) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+    let mut cmd = std::process::Command::new("ffprobe");
+    cmd.args([
+        "-v", "error", "-select_streams", "v:0", "-show_entries",
+        "stream=codec_name,width,height,r_frame_rate", "-of", "csv=p=0", path,
+    ]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let Ok(out) = cmd.output() else { return String::new() };
+    // csv=p=0 → "h264,1280,720,60/1"
+    let line = String::from_utf8_lossy(&out.stdout);
+    let mut it = line.trim().split(',');
+    let (codec, w, h, rate) = (
+        it.next().unwrap_or(""),
+        it.next().unwrap_or(""),
+        it.next().unwrap_or(""),
+        it.next().unwrap_or(""),
+    );
+    if codec.is_empty() || w.is_empty() {
+        return String::new();
+    }
+    let fps = match rate.split_once('/') {
+        Some((n, d)) => {
+            let (n, d) = (n.parse::<f64>().unwrap_or(0.0), d.parse::<f64>().unwrap_or(1.0));
+            if d > 0.0 { (n / d).round() as i64 } else { 0 }
+        }
+        None => rate.parse::<f64>().unwrap_or(0.0).round() as i64,
+    };
+    format!("{w}x{h}@{fps} {codec}")
+}
+
 /// Plain-text dump of the I/O monitor state for the "Copy summary" button.
 fn io_summary_text(
     snap: &crate::iomon::CountersSnapshot,
@@ -7386,6 +7446,7 @@ impl eframe::App for StreamArchiverApp {
                             let n = self.issues_recs.len() + self.issues_missing.len()
                                 + self.issues_errors.len() + self.issues_errors_no_file.len()
                                 + self.issues_stuck.len() + self.issues_muted_vod.len()
+                                + self.issues_unmerged.len() + self.issues_head_mismatch.len()
                                 + quota_warnings.len();
                             let label = if n > 0 {
                                 format!("⚠ Issues ({})", n)
@@ -19890,6 +19951,7 @@ impl StreamArchiverApp {
 
     /// Issues panel: lists all recordings whose output path is still a `.ts`
     /// file inside a `.cache` directory, and lets the user re-remux them to MKV.
+    /// See [`IssuesScan`] for the parts computed off-thread.
     #[allow(deprecated)]
     // The per-column `match ISSUES_COLUMNS[ci].id { "actions" => { if ... } }`
     // arms below are single-`if` bodies by nature of the column-dispatch
@@ -19904,10 +19966,12 @@ impl StreamArchiverApp {
         // count stays current even when the panel is hidden.
         if let Some(rx) = &self.issues_missing_load {
             match rx.try_recv() {
-                Ok((missing, errors_with_file, errors_no_file)) => {
-                    self.issues_missing = missing;
-                    self.issues_errors = errors_with_file;
-                    self.issues_errors_no_file = errors_no_file;
+                Ok(scan) => {
+                    self.issues_missing = scan.missing;
+                    self.issues_errors = scan.errors_with_file;
+                    self.issues_errors_no_file = scan.errors_no_file;
+                    self.issues_unmerged = scan.unmerged;
+                    self.issues_head_mismatch = scan.head_mismatch;
                     self.issues_missing_load = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -19952,10 +20016,23 @@ impl StreamArchiverApp {
                 .name("issues-missing-check".into())
                 .spawn(move || {
                     let candidates = core.store.recordings_with_final_path().unwrap_or_default();
-                    let missing: Vec<_> = candidates
+                    let gone: Vec<_> = candidates
                         .into_iter()
                         .filter(|r| !crate::iomon::fs::exists_sync(crate::iomon::Cat::FsProbe, &r.output_path))
                         .collect();
+                    // A "gone" take whose media survived as split per-format
+                    // parts in `.cache\` (tool died before its own merge) is
+                    // NOT lost — list it as recoverable, never as missing.
+                    let (unmerged, missing): (Vec<_>, Vec<_>) = gone
+                        .into_iter()
+                        .map(|r| {
+                            let parts = crate::downloader::find_split_media(
+                                std::path::Path::new(&r.output_path),
+                            );
+                            (r, parts)
+                        })
+                        .partition(|(_, parts)| !parts.is_empty());
+                    let missing: Vec<_> = missing.into_iter().map(|(r, _)| r).collect();
                     // Partition errors: file gone → treated as missing.
                     let all_errors = core.store.recordings_with_errors().unwrap_or_default();
                     let (with_file, no_file): (Vec<_>, Vec<_>) =
@@ -19963,7 +20040,30 @@ impl StreamArchiverApp {
                             r.output_path.is_empty()
                                 || crate::iomon::fs::exists_sync(crate::iomon::Cat::FsProbe, &r.output_path)
                         });
-                    let _ = tx.send((missing, with_file, no_file));
+                    // Head/live joins blocked by codec parameters, with the
+                    // actual stream params probed for the explainer.
+                    let head_mismatch: Vec<_> = core
+                        .store
+                        .recordings_with_head_mismatch()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|r| {
+                            let head = r
+                                .backfill_path
+                                .as_deref()
+                                .map(probe_dims_sync)
+                                .unwrap_or_default();
+                            let live = probe_dims_sync(&r.output_path);
+                            (r, head, live)
+                        })
+                        .collect();
+                    let _ = tx.send(IssuesScan {
+                        missing,
+                        errors_with_file: with_file,
+                        errors_no_file: no_file,
+                        unmerged,
+                        head_mismatch,
+                    });
                 })
                 .ok();
             self.issues_missing_load = Some(rx);
@@ -20028,6 +20128,10 @@ impl StreamArchiverApp {
             OpenMutedRecovered(usize),
             RerunMuted(usize),
             DismissMuted(usize),
+            MergeSplit(usize),
+            RefetchHeadMatchLive(usize),
+            FetchVodForMismatch(usize),
+            DismissMismatch(usize),
         }
         let mut act: Option<Act> = None;
         // Persisted column order/visibility, taken as a local copy (mutated by
@@ -20130,8 +20234,121 @@ impl StreamArchiverApp {
                         }
                         ui.separator();
                     }
+                    // ── Unmerged split captures (recoverable, NOT lost) ─────────
+                    if !self.issues_unmerged.is_empty() {
+                        ui.label(
+                            egui::RichText::new("🧩 Unmerged split captures (recoverable)").strong(),
+                        );
+                        ui.weak(
+                            "The download tool died before merging its per-format files — the \
+                             final file was never written (the take reads as 0 bytes / gone), \
+                             but the video and audio survived as parts in `.cache\\`. Merge is \
+                             lossless and runs throttled like any finalize pass.",
+                        );
+                        for (i, (rec, parts)) in self.issues_unmerged.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                let name = std::path::Path::new(&rec.output_path)
+                                    .file_stem()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| rec.output_path.clone());
+                                let total: u64 = parts
+                                    .iter()
+                                    .map(|p| self.fs_probes.len(p))
+                                    .sum();
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(220, 160, 30),
+                                    format!("{name} — {} part(s), {}", parts.len(), fmt_bytes(total as i64)),
+                                );
+                                if ui
+                                    .add_enabled(!has_active_remux, egui::Button::new("🧩 Merge into MKV"))
+                                    .on_hover_text(
+                                        "Losslessly mux the parts into the final MKV, promote it, \
+                                         and mark the recording completed. Parts are deleted only \
+                                         on success.",
+                                    )
+                                    .on_disabled_hover_text("Wait for the running remux/merge to finish.")
+                                    .clicked()
+                                {
+                                    act = Some(Act::MergeSplit(i));
+                                }
+                            });
+                        }
+                        ui.separator();
+                    }
+                    // ── Head/live join mismatches ───────────────────────────────
+                    if !self.issues_head_mismatch.is_empty() {
+                        ui.label(
+                            egui::RichText::new("🔗 Head backfill can't join the live capture").strong(),
+                        );
+                        ui.weak(
+                            "The backfilled head and the live capture carry different stream \
+                             parameters, so a lossless join is impossible. Usual cause: the \
+                             capture joined seconds after go-live, before Twitch listed the \
+                             source rendition — the take recorded a transcode while the head \
+                             fetched at source. Both files are kept and playable; pick a fix:",
+                        );
+                        for (i, (rec, head, live)) in self.issues_head_mismatch.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                let name = std::path::Path::new(&rec.output_path)
+                                    .file_stem()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| rec.output_path.clone());
+                                let (head_d, live_d) = (
+                                    if head.is_empty() { "?" } else { head.as_str() },
+                                    if live.is_empty() { "?" } else { live.as_str() },
+                                );
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(220, 160, 30),
+                                    format!("{name} — head {head_d} vs live {live_d}"),
+                                );
+                                if ui
+                                    .button("🧩 Re-fetch head @ live quality")
+                                    .on_hover_text(
+                                        "Fetch the head again at the live capture's own rendition \
+                                         so the lossless join can succeed. Full quality is then \
+                                         available via the VOD instead. (Post-stream: any \
+                                         DMCA-muted section fetches muted.)",
+                                    )
+                                    .clicked()
+                                {
+                                    act = Some(Act::RefetchHeadMatchLive(i));
+                                }
+                                if ui
+                                    .button("📼 Download VOD (source quality)")
+                                    .on_hover_text(
+                                        "Grab the published VOD at source quality instead — the \
+                                         full stream, including the head, at the better \
+                                         resolution the live capture missed.",
+                                    )
+                                    .clicked()
+                                {
+                                    act = Some(Act::FetchVodForMismatch(i));
+                                }
+                                if ui
+                                    .button("✓ Keep parts / dismiss")
+                                    .on_hover_text(
+                                        "Acknowledge — keep the head and live capture as separate \
+                                         playable files.",
+                                    )
+                                    .clicked()
+                                {
+                                    act = Some(Act::DismissMismatch(i));
+                                }
+                            });
+                        }
+                        ui.separator();
+                    }
                     ui.horizontal(|ui| {
-                        ui.label(format!("{} recording(s) need attention", self.issues_recs.len() + n_missing + n_errors + n_stuck + self.issues_muted_vod.len()));
+                        ui.label(format!(
+                            "{} recording(s) need attention",
+                            self.issues_recs.len()
+                                + n_missing
+                                + n_errors
+                                + n_stuck
+                                + self.issues_muted_vod.len()
+                                + self.issues_unmerged.len()
+                                + self.issues_head_mismatch.len()
+                        ));
                         if ui.button("⟳ Refresh").clicked() {
                             self.issues_refreshed = None;
                         }
@@ -20189,8 +20406,15 @@ impl StreamArchiverApp {
                         }
                     });
                     ui.separator();
-                    if self.issues_recs.is_empty() && n_missing == 0 && n_errors == 0 && n_missing_errors == 0 && n_stuck == 0 {
-                        ui.weak("No recording issues found — all recordings are in their final format.");
+                    if self.issues_recs.is_empty()
+                        && n_missing == 0
+                        && n_errors == 0
+                        && n_missing_errors == 0
+                        && n_stuck == 0
+                    {
+                        if self.issues_unmerged.is_empty() && self.issues_head_mismatch.is_empty() {
+                            ui.weak("No recording issues found — all recordings are in their final format.");
+                        }
                         return;
                     }
                     let mut tb = TableBuilder::new(ui)
@@ -20797,6 +21021,36 @@ impl StreamArchiverApp {
         {
             let _ = self.core.store.recording_vod_dl_acknowledge(rec_id);
             self.issues_refreshed = None; // force the list to refresh
+        }
+        if let Some(Act::MergeSplit(i)) = act
+            && let Some((rec, _)) = self.issues_unmerged.get(i)
+        {
+            self.core
+                .manual(crate::events::ManualCommand::MergeSplitCapture(rec.id));
+            self.status = format!("Merging split capture for recording {}…", rec.id);
+        }
+        if let Some(Act::RefetchHeadMatchLive(i)) = act
+            && let Some((rec, _, _)) = self.issues_head_mismatch.get(i)
+        {
+            self.core
+                .manual(crate::events::ManualCommand::BackfillHeadMatchLive(rec.id));
+            self.status = format!("Re-fetching head at the live quality for recording {}…", rec.id);
+            self.issues_refreshed = None;
+        }
+        if let Some(Act::FetchVodForMismatch(i)) = act
+            && let Some((rec, _, _)) = self.issues_head_mismatch.get(i)
+        {
+            self.core
+                .manual(crate::events::ManualCommand::ArchiveVodNow(rec.id));
+            self.status = format!("Downloading the published VOD for recording {}…", rec.id);
+        }
+        if let Some(Act::DismissMismatch(i)) = act
+            && let Some((rec, _, _)) = self.issues_head_mismatch.get(i)
+        {
+            // "mismatch_ack": still skips join re-attempts (any "mismatch*"
+            // state does) but no longer lists in Issues.
+            let _ = self.core.store.set_head_backfill_state(rec.id, "mismatch_ack");
+            self.issues_refreshed = None;
         }
         if let Some(Act::RemuxError(k)) = act {
             if let Some(rec) = self.issues_errors.get(k) {
