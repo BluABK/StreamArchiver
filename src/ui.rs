@@ -570,6 +570,9 @@ struct SettingsForm {
     /// VOD/video download rate limit (yt-dlp `--limit-rate` syntax, e.g. `4M`);
     /// empty = unlimited (the default). Never applied to live captures.
     download_rate_limit: String,
+    /// yt-dlp `--postprocessor-args` specs (`;;`-separated); empty = none.
+    /// Throttles yt-dlp's internal ffmpeg passes (e.g. the SABR merge).
+    ytdlp_ppa: String,
     /// Global download-auth default: "none" or "cookies".
     download_auth_method: String,
     /// Browser to read cookies from (yt-dlp `--cookies-from-browser`).
@@ -1291,6 +1294,7 @@ impl StreamArchiverApp {
                 .flatten()
                 .unwrap_or_else(|| "3".into()),
             download_rate_limit: setting_or_empty(&core, crate::io_gate::K_DOWNLOAD_RATE_LIMIT),
+            ytdlp_ppa: setting_or_empty(&core, crate::io_gate::K_YTDLP_PPA),
             download_auth_method: core
                 .store
                 .get_setting(K_DOWNLOAD_AUTH)
@@ -2544,6 +2548,7 @@ impl StreamArchiverApp {
             (K_DEFAULT_OUT, s.default_output_dir.trim()),
             (K_MAX_CONCURRENT, s.max_concurrent_downloads.trim()),
             (crate::io_gate::K_DOWNLOAD_RATE_LIMIT, s.download_rate_limit.trim()),
+            (crate::io_gate::K_YTDLP_PPA, s.ytdlp_ppa.trim()),
             (K_DOWNLOAD_AUTH, s.download_auth_method.trim()),
             (K_COOKIES_BROWSER, cookies_value.as_str()),
             (K_WEBSUB_URL, s.websub_vps_url.trim()),
@@ -2648,6 +2653,7 @@ impl StreamArchiverApp {
         crate::io_gate::set_readrate(self.settings.postproc_readrate);
         // Apply the download rate limit to downloads started from now on.
         crate::io_gate::set_download_rate_limit(&self.settings.download_rate_limit);
+        crate::io_gate::set_ytdlp_ppa(&self.settings.ytdlp_ppa);
         // I/O monitor: apply the sample-log toggle and re-register the
         // recordings roots (the default output dir may have changed).
         crate::iomon::set_sample_logging(self.settings.iomon_sample_log);
@@ -17784,6 +17790,23 @@ impl StreamArchiverApp {
                          (silently unthrottled on older builds).",
                     );
                     ui.end_row();
+                    ui.horizontal(|ui| {
+                        ui.label("yt-dlp ffmpeg throttle:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings.ytdlp_ppa)
+                                .hint_text("Merger+ffmpeg_i:-readrate 30")
+                                .desired_width(240.0),
+                        );
+                    });
+                    ui.label(
+                        "yt-dlp --postprocessor-args specs (separate several with ;;). \
+                         The disk throttle above can't reach ffmpeg passes yt-dlp runs \
+                         INTERNALLY — e.g. the post-stream SABR format merge reads + \
+                         writes the whole multi-GB capture at full disk speed. \
+                         \"Merger+ffmpeg_i:-readrate 30\" caps merges at 30× realtime \
+                         (needs ffmpeg 5.0+). Empty = unthrottled.",
+                    );
+                    ui.end_row();
                     ui.checkbox(&mut self.settings.iomon_sample_log, "I/O sample log");
                     ui.label(
                         "Write the I/O monitor's 1s samples to a JSONL under the appdata \
@@ -18440,7 +18463,24 @@ impl StreamArchiverApp {
                             ui.label(running)
                                 .on_hover_text(format!("registered as: {}", p.tool));
                             ui.label(p.pid.to_string());
-                            ui.label(&p.purpose);
+                            // The job's step, live: when a tool-internal ffmpeg
+                            // appears under a downloader, the job has moved from
+                            // downloading to an ffmpeg stage (post-stream format
+                            // merge, HLS remux) — exactly the full-disk-speed
+                            // phase worth spotting.
+                            let ffmpeg_child =
+                                p.tree.split(" + ").skip(1).any(|n| n == "ffmpeg");
+                            if ffmpeg_child {
+                                ui.label(format!("{} · ffmpeg pass", p.purpose)).on_hover_text(
+                                    "A tool-internal ffmpeg is running under this job right \
+                                     now — the post-stream format merge, or the tool's own \
+                                     HLS/remux stage. These run at full disk speed unless \
+                                     throttled via Settings → Recording → \"yt-dlp ffmpeg \
+                                     throttle\".",
+                                );
+                            } else {
+                                ui.label(&p.purpose);
+                            }
                             ui.label(p.region.label());
                             ui.label(bps(p.read_bps));
                             ui.label(bps(p.write_bps));

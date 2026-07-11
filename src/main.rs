@@ -144,6 +144,14 @@ fn main() -> Result<()> {
             .flatten()
             .unwrap_or_default(),
     );
+    // yt-dlp postprocessor args (throttle for its internal ffmpeg passes).
+    io_gate::set_ytdlp_ppa(
+        &store
+            .get_setting(io_gate::K_YTDLP_PPA)
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+    );
 
     // Crash recovery for on-demand downloads: any left mid-flight is stale.
     // (In-flight live recordings are handled in `core.start()` →

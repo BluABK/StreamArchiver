@@ -125,6 +125,27 @@ pub fn download_rate_limit() -> String {
     DOWNLOAD_RATE_LIMIT.read().clone()
 }
 
+/// Settings key for yt-dlp postprocessor args (`--postprocessor-args` specs,
+/// `;;`-separated; empty = none, the default). The escape hatch for
+/// throttling yt-dlp's INTERNAL ffmpeg passes — e.g. the post-stream SABR
+/// format merge reads+writes the whole multi-GB capture at full disk speed,
+/// and none of the app-side gates can reach inside the tool. Example:
+/// `Merger+ffmpeg_i:-readrate 30` caps merges at 30× realtime.
+pub const K_YTDLP_PPA: &str = "ytdlp_postprocessor_args";
+
+static YTDLP_PPA: RwLock<String> = RwLock::new(String::new());
+
+/// Set the yt-dlp postprocessor args (startup + settings save). Applies to
+/// tools *started* afterwards.
+pub fn set_ytdlp_ppa(v: &str) {
+    *YTDLP_PPA.write() = v.trim().to_string();
+}
+
+/// The configured `--postprocessor-args` specs (`;;`-separated), or empty.
+pub fn ytdlp_ppa() -> String {
+    YTDLP_PPA.read().clone()
+}
+
 /// Does this ffmpeg stderr indicate the `-readrate` flag itself was rejected
 /// (as opposed to the pass genuinely failing)?
 pub fn is_readrate_error(stderr: &str) -> bool {

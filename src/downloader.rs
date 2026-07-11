@@ -557,6 +557,24 @@ pub(crate) fn youtube_live_url(url: &str) -> String {
     }
 }
 
+/// Append the Settings-level yt-dlp postprocessor args (`--postprocessor-args`
+/// specs, `;;`-separated) to a yt-dlp invocation. This is how the user
+/// throttles yt-dlp's INTERNAL ffmpeg passes — the post-stream SABR format
+/// merge reads+writes the whole multi-GB capture at full disk speed on the
+/// recordings drive, and the app's own gates/`-readrate` can't reach inside
+/// the tool (e.g. `Merger+ffmpeg_i:-readrate 30`). Pushed BEFORE the global
+/// default args so a per-target spec there can override it.
+fn push_ppa_args(args: &mut Vec<String>) {
+    let specs = crate::io_gate::ytdlp_ppa();
+    for spec in specs.split(";;") {
+        let spec = spec.trim();
+        if !spec.is_empty() {
+            args.push("--postprocessor-args".into());
+            args.push(spec.to_string());
+        }
+    }
+}
+
 /// Build a yt-dlp chat-only plan: `--skip-download --sub-langs=live_chat
 /// --write-subs` with the same output path as the video so the `.live_chat.json`
 /// sidecar lands next to it. Auth and global defaults are forwarded as-is so the
@@ -645,6 +663,7 @@ fn build_dash_companion_plan(
         }
         _ => {}
     }
+    push_ppa_args(&mut args);
     args.extend_from_slice(ytdlp_global_args);
     if !pot_args.is_empty() {
         args.push("--extractor-args".into());
@@ -768,7 +787,9 @@ fn sabr_capture_args(
         }
         _ => {}
     }
-    // Global Settings args (e.g. --js-runtimes node) still apply.
+    // Postprocessor throttle first, then global Settings args (e.g.
+    // --js-runtimes node) — later --postprocessor-args for the same target win.
+    push_ppa_args(&mut args);
     args.extend_from_slice(ytdlp_global_args);
     // PO-token provider args (e.g. bgutil) — a separate --extractor-args entry,
     // applied regardless of the preset/raw choice below.
@@ -992,8 +1013,10 @@ pub fn build_plan(
                 }
                 _ => {}
             }
-            // Global defaults from Settings → yt-dlp default arguments.
-            // Per-monitor extra_args extend after and can override these.
+            // Postprocessor throttle, then the global defaults from Settings →
+            // yt-dlp default arguments. Per-monitor extra_args extend after
+            // and can override both.
+            push_ppa_args(&mut args);
             args.extend_from_slice(ytdlp_global_args);
             // PO-token provider (bgutil HTTP) — YouTube requires a proof-of-origin
             // token for video formats regardless of whether SABR is in use.
@@ -1156,7 +1179,10 @@ pub fn build_video_plan(
                 args.push("--extractor-args".into());
                 args.push("youtube:player_client=mweb".into());
             }
-            // Global defaults from Settings → yt-dlp default arguments.
+            // Postprocessor throttle (the VOD download's remux/merge is a
+            // full-file ffmpeg pass inside yt-dlp), then the global defaults
+            // from Settings → yt-dlp default arguments.
+            push_ppa_args(&mut args);
             args.extend_from_slice(ytdlp_global_args);
             // PO-token provider (bgutil HTTP) — YouTube 403s googlevideo media
             // URLs fetched without a proof-of-origin token, so VOD downloads
@@ -4212,7 +4238,11 @@ impl Supervisor {
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_default(),
                     tool: "re-attached".to_string(),
-                    purpose: format!("{} (re-attached)", row.kind.as_str()),
+                    purpose: match row.kind {
+                        DetachedKind::Video => "video download (re-attached)".to_string(),
+                        DetachedKind::Chat => "chat capture (re-attached)".to_string(),
+                        _ => "live capture (re-attached)".to_string(),
+                    },
                     region: crate::iomon::classify(Path::new(&row.capture_path)),
                     proc_start: row.proc_start,
                 },

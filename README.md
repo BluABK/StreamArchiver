@@ -498,6 +498,14 @@ captures are writing to:
   the same drive the remaining live captures are writing to — on a busy night
   it's typically the single largest writer. Never applied to live captures
   (throttling the live edge loses data).
+- **yt-dlp ffmpeg throttle** (Settings → Recording → Remux, default **off**):
+  `--postprocessor-args` specs (several separated by `;;`) forwarded to every
+  yt-dlp invocation. The disk throttle above only reaches ffmpeg passes the
+  *app* runs — a SABR capture's post-stream **format merge** happens *inside*
+  yt-dlp and reads + writes the whole multi-GB take at full disk speed.
+  `Merger+ffmpeg_i:-readrate 30` caps those merges at 30× realtime (ffmpeg
+  5.0+). In the I/O tab, a job in that phase shows `yt-dlp + ffmpeg` in its
+  tool column and `· ffmpeg pass` on its purpose.
 
 ### I/O monitor (the **I/O** tab)
 
