@@ -136,6 +136,14 @@ fn main() -> Result<()> {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(io_gate::DEFAULT_READRATE),
     );
+    // VOD/video download rate limit (yt-dlp --limit-rate); empty = off.
+    io_gate::set_download_rate_limit(
+        &store
+            .get_setting(io_gate::K_DOWNLOAD_RATE_LIMIT)
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+    );
 
     // Crash recovery for on-demand downloads: any left mid-flight is stale.
     // (In-flight live recordings are handled in `core.start()` →

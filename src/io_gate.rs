@@ -34,6 +34,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
+use parking_lot::RwLock;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::info;
 
@@ -100,6 +101,28 @@ pub fn mark_readrate_unsupported() {
     if !READRATE_UNSUPPORTED.swap(true, Ordering::Relaxed) {
         info!("ffmpeg does not support -readrate (needs ffmpeg >= 5.0) — post-processing throttle disabled");
     }
+}
+
+/// Settings key for the VOD/video download rate limit (yt-dlp `--limit-rate`
+/// syntax, e.g. `4M` or `500K`; empty = unlimited, the default).
+pub const K_DOWNLOAD_RATE_LIMIT: &str = "download_rate_limit";
+
+/// Configured `--limit-rate` value for non-live yt-dlp downloads (VOD-archive
+/// grabs + Videos-tab downloads). Empty = off. Live captures are never
+/// limited — a capture that can't keep up with the live edge loses data.
+static DOWNLOAD_RATE_LIMIT: RwLock<String> = RwLock::new(String::new());
+
+/// Set the download rate limit (startup from the persisted setting + settings
+/// save). Applies to downloads *started* afterwards; in-flight ones keep
+/// their launch args.
+pub fn set_download_rate_limit(v: &str) {
+    *DOWNLOAD_RATE_LIMIT.write() = v.trim().to_string();
+}
+
+/// The `--limit-rate` value for non-live yt-dlp downloads, or an empty string
+/// when unlimited.
+pub fn download_rate_limit() -> String {
+    DOWNLOAD_RATE_LIMIT.read().clone()
 }
 
 /// Does this ffmpeg stderr indicate the `-readrate` flag itself was rejected

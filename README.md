@@ -492,6 +492,12 @@ captures are writing to:
   bandwidth. `0` disables the cap.
 - Tool logs, chat sidecar writes, and the UI's file probes are batched, cached,
   or kept off the recordings drive entirely (see *Data & locations*).
+- **Download rate limit** (Settings → Defaults, default **off**): a yt-dlp
+  `--limit-rate` value (e.g. `4M`) applied to VOD-archive grabs and Videos-tab
+  downloads. A post-stream VOD download otherwise runs at full CDN speed onto
+  the same drive the remaining live captures are writing to — on a busy night
+  it's typically the single largest writer. Never applied to live captures
+  (throttling the live edge loses data).
 
 ### I/O monitor (the **I/O** tab)
 
@@ -506,13 +512,19 @@ rather than reconstructed after a crash:
   impossible for new code to bypass the layer unnoticed.
 - **Tool processes** (streamlink / yt-dlp / ffmpeg — including the ffmpeg a
   yt-dlp launcher spawns) are sampled once a second via per-PID Windows I/O
-  counters, each labeled with what it's doing and which file it works on. Note
-  the *read* side of a capture tool is mostly CDN network traffic; the *write*
-  side is the disk-relevant number.
+  counters, each labeled with what it's doing and which file it works on. The
+  tool column shows the **live process tree** (e.g. `yt-dlp + ffmpeg` while a
+  finished SABR capture runs its format merge), so a sudden burst is
+  attributable at a glance. Note the *read* side of a capture tool is mostly
+  CDN network traffic; the *write* side is the disk-relevant number.
 - **Physical-disk counters** report true bytes/sec and **queue depth** per
   drive (whole spindle, all processes — catches OS write-cache flushes too).
   Sustained queue depth on a USB enclosure is the early-warning signal before
-  it drops off the bus; the tab flags depth ≥ 4 in red.
+  it drops off the bus; the tab flags depth ≥ 4 in red. Alongside the live
+  value the tab keeps **session stats** so pressure doesn't have to be caught
+  in the act: average depth, the session max with how long it sat there, and
+  (on hover) the **top 5 pressure episodes** — each elevated run (queue ≥ 2)
+  with its peak, duration, and when it ended.
 
 The **I/O** tab shows live totals, a 30-minute rate graph (write/read/queue
 series per drive, hover for values), per-region and per-category tables

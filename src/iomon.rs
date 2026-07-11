@@ -651,6 +651,11 @@ pub struct ProcSample {
     pub total_write: u64,
     /// Live descendant processes rolled into this row (yt-dlp → ffmpeg).
     pub descendants: u32,
+    /// Executable names of the live tree, root first (e.g. "yt-dlp + ffmpeg")
+    /// — shows what a tool is *actually* doing right now (a capture whose
+    /// launcher is running its post-stream merge, a recovery's ffmpeg, …).
+    #[serde(default)]
+    pub tree: String,
 }
 
 /// A physical-disk reading (filled in by `platform::disk_performance`).
@@ -802,10 +807,10 @@ fn sampler_loop() {
         });
 
         // One Toolhelp snapshot per tick, shared by every tree walk.
-        let pairs = if registered.is_empty() {
+        let snap = if registered.is_empty() {
             Vec::new()
         } else {
-            crate::platform::process_children_snapshot()
+            crate::platform::process_tree_snapshot()
         };
         let mut procs: Vec<ProcSample> = Vec::with_capacity(registered.len());
         let (mut child_read_bps, mut child_write_bps) = (0u64, 0u64);
@@ -828,15 +833,17 @@ fn sampler_loop() {
             let mut i = 0;
             while i < tree.len() {
                 let cur = tree[i];
-                for &(p, parent) in &pairs {
-                    if parent == cur && !tree.contains(&p) {
-                        tree.push(p);
+                for p in &snap {
+                    if p.ppid == cur && !tree.contains(&p.pid) {
+                        tree.push(p.pid);
                     }
                 }
                 i += 1;
             }
             let mut now = crate::platform::ProcIo::default();
             let mut alive = 0u32;
+            // Exe names of the live tree, root first, deduped in BFS order.
+            let mut tree_names: Vec<&str> = Vec::new();
             for &p in &tree {
                 if let Some(io) = crate::platform::process_io_counters(p) {
                     now.read_bytes += io.read_bytes;
@@ -844,8 +851,15 @@ fn sampler_loop() {
                     now.read_ops += io.read_ops;
                     now.write_ops += io.write_ops;
                     alive += 1;
+                    if let Some(e) = snap.iter().find(|e| e.pid == p)
+                        && !e.name.is_empty()
+                        && !tree_names.contains(&e.name.as_str())
+                    {
+                        tree_names.push(&e.name);
+                    }
                 }
             }
+            let tree_label = tree_names.join(" + ");
             if alive == 0 {
                 continue; // whole tree gone — folded next tick via `seen`
             }
@@ -873,6 +887,7 @@ fn sampler_loop() {
                 total_read: now.read_bytes,
                 total_write: now.write_bytes,
                 descendants: alive.saturating_sub(1),
+                tree: tree_label,
             });
         }
         procs.sort_by_key(|p| std::cmp::Reverse(p.write_bps + p.read_bps));
@@ -923,6 +938,92 @@ fn sampler_loop() {
     }
 }
 
+/// A run of consecutive samples with elevated queue depth on one disk.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct QueueEpisode {
+    /// Highest depth seen during the run.
+    pub peak: u32,
+    /// How many seconds the run lasted (1 s samples).
+    pub secs: u32,
+    /// Wall-clock ms when the run ended (or the snapshot time while ongoing).
+    pub ended_at_ms: i64,
+    /// Still in progress at snapshot time.
+    pub ongoing: bool,
+}
+
+/// Session-long queue-depth statistics for one physical disk, so a pressure
+/// episode doesn't have to be caught in the act on the live graph.
+#[derive(Clone, Debug, Default)]
+pub struct DiskQueueStats {
+    pub samples: u64,
+    pub depth_sum: u64,
+    /// Highest depth seen this session.
+    pub max_depth: u32,
+    /// Seconds observed AT `max_depth` (resets when a new max is set).
+    pub max_secs: u64,
+    /// Top elevated runs (depth ≥ [`QUEUE_EPISODE_MIN`]) by (peak, length).
+    pub top: Vec<QueueEpisode>,
+    /// In-flight elevated run: (peak, secs so far).
+    cur: Option<(u32, u32)>,
+}
+
+impl DiskQueueStats {
+    pub fn avg(&self) -> f64 {
+        self.depth_sum as f64 / self.samples.max(1) as f64
+    }
+}
+
+/// Queue depth that counts as "elevated" (starts/extends an episode).
+/// 1 in flight is normal writing; sustained ≥ 2 means requests are waiting.
+const QUEUE_EPISODE_MIN: u32 = 2;
+/// How many top episodes are kept per disk.
+const QUEUE_TOP_LEN: usize = 5;
+
+static DISK_QUEUE: Mutex<Option<HashMap<char, DiskQueueStats>>> = Mutex::new(None);
+
+fn note_queue_depth(letter: char, depth: u32, at_ms: i64) {
+    let mut g = DISK_QUEUE.lock();
+    let st = g.get_or_insert_with(HashMap::new).entry(letter).or_default();
+    st.samples += 1;
+    st.depth_sum += u64::from(depth);
+    if depth > st.max_depth {
+        st.max_depth = depth;
+        st.max_secs = 1;
+    } else if depth > 0 && depth == st.max_depth {
+        st.max_secs += 1;
+    }
+    if depth >= QUEUE_EPISODE_MIN {
+        let (peak, secs) = st.cur.unwrap_or((0, 0));
+        st.cur = Some((peak.max(depth), secs + 1));
+    } else if let Some((peak, secs)) = st.cur.take() {
+        st.top.push(QueueEpisode { peak, secs, ended_at_ms: at_ms, ongoing: false });
+        st.top.sort_by_key(|e| std::cmp::Reverse((e.peak, e.secs)));
+        st.top.truncate(QUEUE_TOP_LEN);
+    }
+}
+
+/// Per-disk session queue stats. An in-flight elevated run is folded into the
+/// returned copy's `top` (marked `ongoing`) so it's visible before it ends.
+pub fn disk_queue_stats() -> Vec<(char, DiskQueueStats)> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let g = DISK_QUEUE.lock();
+    let Some(map) = g.as_ref() else { return Vec::new() };
+    let mut out: Vec<(char, DiskQueueStats)> = map
+        .iter()
+        .map(|(l, st)| {
+            let mut st = st.clone();
+            if let Some((peak, secs)) = st.cur.take() {
+                st.top.push(QueueEpisode { peak, secs, ended_at_ms: now_ms, ongoing: true });
+                st.top.sort_by_key(|e| std::cmp::Reverse((e.peak, e.secs)));
+                st.top.truncate(QUEUE_TOP_LEN);
+            }
+            (*l, st)
+        })
+        .collect();
+    out.sort_by_key(|(l, _)| *l);
+    out
+}
+
 /// Physical-disk readings for the recordings drive(s) + the appdata drive.
 /// Cumulative counters → B/s via `prev`; drives whose disk-performance query
 /// fails (no diskperf filter, USB oddities) are simply absent — the UI shows
@@ -935,8 +1036,10 @@ fn sample_disks(prev: &mut HashMap<char, (u64, u64)>, interval_secs: f64) -> Vec
         letters.push(l);
     }
     let mut out = Vec::with_capacity(letters.len());
+    let at_ms = chrono::Utc::now().timestamp_millis();
     for letter in letters {
         let Some(perf) = crate::platform::disk_performance(letter) else { continue };
+        note_queue_depth(letter, perf.queue_depth, at_ms);
         let (pr, pw) = prev
             .insert(letter, (perf.bytes_read, perf.bytes_written))
             .unwrap_or((perf.bytes_read, perf.bytes_written));
@@ -1318,6 +1421,27 @@ mod tests {
     }
 
     #[test]
+    fn queue_stats_track_avg_max_and_top_episodes() {
+        // Use an unlikely letter so parallel tests / the sampler can't collide.
+        let l = 'Q';
+        // depth series: 0,3,5,3,0, 2,2,0, 6 (ongoing)
+        for (i, d) in [0u32, 3, 5, 3, 0, 2, 2, 0, 6].into_iter().enumerate() {
+            note_queue_depth(l, d, 1000 + i as i64);
+        }
+        let stats = disk_queue_stats();
+        let (_, st) = stats.iter().find(|(letter, _)| *letter == l).expect("stats for Q");
+        assert_eq!(st.samples, 9);
+        assert_eq!(st.max_depth, 6);
+        assert_eq!(st.max_secs, 1);
+        assert!((st.avg() - (3 + 5 + 3 + 2 + 2 + 6) as f64 / 9.0).abs() < 1e-9);
+        // Episodes: closed [peak 5, 3s], closed [peak 2, 2s], ongoing [peak 6, 1s].
+        assert_eq!(st.top.len(), 3);
+        assert_eq!((st.top[0].peak, st.top[0].secs, st.top[0].ongoing), (6, 1, true));
+        assert_eq!((st.top[1].peak, st.top[1].secs, st.top[1].ongoing), (5, 3, false));
+        assert_eq!((st.top[2].peak, st.top[2].secs, st.top[2].ongoing), (2, 2, false));
+    }
+
+    #[test]
     fn sample_jsonl_roundtrip() {
         let s = Sample {
             at_ms: 1_752_000_000_000,
@@ -1338,6 +1462,7 @@ mod tests {
                 total_read: 13,
                 total_write: 14,
                 descendants: 1,
+                tree: "streamlink".into(),
             }],
             unattributed_bps: 15,
             db_bytes: 16,

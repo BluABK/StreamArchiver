@@ -274,11 +274,22 @@ pub fn wait_pid(_pid: u32, _shutdown: &std::sync::atomic::AtomicBool) -> Option<
     None
 }
 
-/// Snapshot `(pid, parent_pid)` for every process on the system (Toolhelp).
-/// Shared by [`kill_process_tree`] and the I/O monitor's child sampler (both
-/// need to find the grandchildren a launcher like yt-dlp spawned).
+/// One process from a Toolhelp snapshot: pid, parent pid, and executable
+/// name (lowercased, `.exe` stripped — for display).
+#[derive(Clone, Debug)]
+pub struct SnapProc {
+    pub pid: u32,
+    pub ppid: u32,
+    pub name: String,
+}
+
+/// Snapshot every process on the system (Toolhelp). Shared by
+/// [`kill_process_tree`] and the I/O monitor's child sampler (both need to
+/// find the grandchildren a launcher like yt-dlp spawned; the sampler also
+/// shows the exe names so "what is this tree doing right now" is visible —
+/// e.g. a finished SABR capture whose yt-dlp is running its ffmpeg merge).
 #[cfg(windows)]
-pub fn process_children_snapshot() -> Vec<(u32, u32)> {
+pub fn process_tree_snapshot() -> Vec<SnapProc> {
     use std::mem::size_of;
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -286,10 +297,10 @@ pub fn process_children_snapshot() -> Vec<(u32, u32)> {
         TH32CS_SNAPPROCESS,
     };
 
-    let mut pairs: Vec<(u32, u32)> = Vec::new();
+    let mut procs: Vec<SnapProc> = Vec::new();
     unsafe {
         let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
-            return pairs;
+            return procs;
         };
         let mut entry = PROCESSENTRY32W {
             dwSize: size_of::<PROCESSENTRY32W>() as u32,
@@ -297,7 +308,20 @@ pub fn process_children_snapshot() -> Vec<(u32, u32)> {
         };
         if Process32FirstW(snap, &mut entry).is_ok() {
             loop {
-                pairs.push((entry.th32ProcessID, entry.th32ParentProcessID));
+                let len = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let mut name = String::from_utf16_lossy(&entry.szExeFile[..len]).to_lowercase();
+                if let Some(stripped) = name.strip_suffix(".exe") {
+                    name.truncate(stripped.len());
+                }
+                procs.push(SnapProc {
+                    pid: entry.th32ProcessID,
+                    ppid: entry.th32ParentProcessID,
+                    name,
+                });
                 if Process32NextW(snap, &mut entry).is_err() {
                     break;
                 }
@@ -305,11 +329,11 @@ pub fn process_children_snapshot() -> Vec<(u32, u32)> {
         }
         let _ = CloseHandle(snap);
     }
-    pairs
+    procs
 }
 
 #[cfg(not(windows))]
-pub fn process_children_snapshot() -> Vec<(u32, u32)> {
+pub fn process_tree_snapshot() -> Vec<SnapProc> {
     Vec::new()
 }
 
@@ -492,16 +516,16 @@ pub fn kill_process_tree(pid: u32) {
         return;
     }
     // Snapshot (pid, parent_pid) for all processes.
-    let pairs = process_children_snapshot();
+    let procs = process_tree_snapshot();
 
     // BFS to collect the target and all descendants.
     let mut tree = vec![pid];
     let mut i = 0;
     while i < tree.len() {
         let cur = tree[i];
-        for &(p, parent) in &pairs {
-            if parent == cur && !tree.contains(&p) {
-                tree.push(p);
+        for p in &procs {
+            if p.ppid == cur && !tree.contains(&p.pid) {
+                tree.push(p.pid);
             }
         }
         i += 1;
@@ -646,9 +670,11 @@ mod tests {
     }
 
     #[test]
-    fn children_snapshot_contains_self() {
-        let pairs = process_children_snapshot();
+    fn tree_snapshot_contains_self_with_name() {
+        let procs = process_tree_snapshot();
         let me = std::process::id();
-        assert!(pairs.iter().any(|&(p, _)| p == me));
+        let mine = procs.iter().find(|p| p.pid == me).expect("own pid in snapshot");
+        assert!(!mine.name.is_empty());
+        assert!(!mine.name.ends_with(".exe"));
     }
 }

@@ -1106,6 +1106,18 @@ pub fn build_video_plan(
                 "-o".into(),
                 out_tmpl,
             ];
+            // Global VOD/video download rate limit (Settings → Downloads;
+            // default off). yt-dlp-syntax value, placed before the global
+            // defaults + per-video extra args so either can override it.
+            // Deliberately never applied to live captures — throttling a
+            // live-edge download just makes it fall behind and lose data —
+            // and the other tools have no equivalent flag (streamlink has no
+            // rate limiter; ffmpeg pulls are readrate-gated elsewhere).
+            let rate = crate::io_gate::download_rate_limit();
+            if !rate.is_empty() {
+                args.push("--limit-rate".into());
+                args.push(rate);
+            }
             // `quality` is a full escape hatch (a user can type any yt-dlp format
             // string there) and always wins if set; audio-track selection only
             // synthesizes its own `-f` when `quality` is left at the default, since
@@ -5580,6 +5592,7 @@ impl Supervisor {
             &tmp_head,
             Some((self.events.clone(), task_id)),
             Some(head_secs),
+            "head backfill",
         )
         .await
         {

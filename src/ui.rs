@@ -567,6 +567,9 @@ struct SettingsForm {
     kick_client_secret: String,
     default_output_dir: String,
     max_concurrent_downloads: String,
+    /// VOD/video download rate limit (yt-dlp `--limit-rate` syntax, e.g. `4M`);
+    /// empty = unlimited (the default). Never applied to live captures.
+    download_rate_limit: String,
     /// Global download-auth default: "none" or "cookies".
     download_auth_method: String,
     /// Browser to read cookies from (yt-dlp `--cookies-from-browser`).
@@ -1287,6 +1290,7 @@ impl StreamArchiverApp {
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| "3".into()),
+            download_rate_limit: setting_or_empty(&core, crate::io_gate::K_DOWNLOAD_RATE_LIMIT),
             download_auth_method: core
                 .store
                 .get_setting(K_DOWNLOAD_AUTH)
@@ -2539,6 +2543,7 @@ impl StreamArchiverApp {
             (K_KICK_SECRET, s.kick_client_secret.trim()),
             (K_DEFAULT_OUT, s.default_output_dir.trim()),
             (K_MAX_CONCURRENT, s.max_concurrent_downloads.trim()),
+            (crate::io_gate::K_DOWNLOAD_RATE_LIMIT, s.download_rate_limit.trim()),
             (K_DOWNLOAD_AUTH, s.download_auth_method.trim()),
             (K_COOKIES_BROWSER, cookies_value.as_str()),
             (K_WEBSUB_URL, s.websub_vps_url.trim()),
@@ -2641,6 +2646,8 @@ impl StreamArchiverApp {
         set_short_ts_pattern(&self.settings.short_ts_fmt);
         // Apply the post-processing disk throttle to in-flight and future passes.
         crate::io_gate::set_readrate(self.settings.postproc_readrate);
+        // Apply the download rate limit to downloads started from now on.
+        crate::io_gate::set_download_rate_limit(&self.settings.download_rate_limit);
         // I/O monitor: apply the sample-log toggle and re-register the
         // recordings roots (the default output dir may have changed).
         crate::iomon::set_sample_logging(self.settings.iomon_sample_log);
@@ -16999,6 +17006,15 @@ impl StreamArchiverApp {
                     ui.label("Max concurrent downloads");
                     ui.text_edit_singleline(&mut self.settings.max_concurrent_downloads);
                     ui.end_row();
+                    ui.label("Download rate limit").on_hover_text(
+                        "yt-dlp --limit-rate for VOD-archive grabs and Videos-tab \
+                         downloads (e.g. 4M, 500K). Empty = unlimited. Never applied \
+                         to live captures — throttling the live edge loses data. \
+                         Useful when post-stream VOD downloads write to the same \
+                         drive as active recordings.",
+                    );
+                    ui.text_edit_singleline(&mut self.settings.download_rate_limit);
+                    ui.end_row();
                     ui.label("Filename media info")
                         .on_hover_text(
                             "How the {resolution}/{height}/{width}/{fps}/{vcodec} filename \
@@ -18328,13 +18344,19 @@ impl StreamArchiverApp {
                     }
                 });
                 cols[1].strong("Physical disks (whole spindle, all processes)");
+                let qstats = iomon::disk_queue_stats();
                 match latest.as_ref().filter(|s| !s.disks.is_empty()) {
                     Some(s) => {
                         egui::Grid::new("io_disks").striped(true).min_col_width(60.0).show(&mut cols[1], |ui| {
                             ui.weak("disk");
                             ui.weak("read");
                             ui.weak("write");
-                            ui.weak("queue depth");
+                            ui.weak("queue");
+                            ui.weak("avg");
+                            ui.weak("max").on_hover_text(
+                                "Session peak queue depth and how long it sat there. \
+                                 Hover a value for the top pressure episodes.",
+                            );
                             ui.end_row();
                             for d in &s.disks {
                                 ui.label(format!("{}:", d.letter));
@@ -18344,6 +18366,41 @@ impl StreamArchiverApp {
                                     ui.colored_label(ui.visuals().error_fg_color, d.queue_depth.to_string());
                                 } else {
                                     ui.label(d.queue_depth.to_string());
+                                }
+                                match qstats.iter().find(|(l, _)| *l == d.letter) {
+                                    Some((_, st)) => {
+                                        ui.label(format!("{:.2}", st.avg()));
+                                        let max_label = format!("{} ({}s)", st.max_depth, st.max_secs);
+                                        let resp = if st.max_depth >= 4 {
+                                            ui.colored_label(ui.visuals().warn_fg_color, max_label)
+                                        } else {
+                                            ui.label(max_label)
+                                        };
+                                        if !st.top.is_empty() {
+                                            let lines: Vec<String> = st
+                                                .top
+                                                .iter()
+                                                .map(|e| {
+                                                    let when = chrono::DateTime::from_timestamp_millis(e.ended_at_ms)
+                                                        .map(|t| t.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
+                                                        .unwrap_or_default();
+                                                    if e.ongoing {
+                                                        format!("depth {} for {}s — ongoing", e.peak, e.secs)
+                                                    } else {
+                                                        format!("depth {} for {}s — ended {when}", e.peak, e.secs)
+                                                    }
+                                                })
+                                                .collect();
+                                            resp.on_hover_text(format!(
+                                                "Top pressure episodes (queue ≥ 2) this session:\n{}",
+                                                lines.join("\n")
+                                            ));
+                                        }
+                                    }
+                                    None => {
+                                        ui.label("-");
+                                        ui.label("-");
+                                    }
                                 }
                                 ui.end_row();
                             }
@@ -18375,7 +18432,13 @@ impl StreamArchiverApp {
                         ui.end_row();
                         for p in &s.procs {
                             ui.label(&p.label);
-                            ui.label(&p.tool);
+                            // What the tree is ACTUALLY running right now (a
+                            // capture's yt-dlp switches to "yt-dlp + ffmpeg"
+                            // during its post-stream merge); the registered
+                            // tool stays in the hover.
+                            let running = if p.tree.is_empty() { p.tool.as_str() } else { p.tree.as_str() };
+                            ui.label(running)
+                                .on_hover_text(format!("registered as: {}", p.tool));
                             ui.label(p.pid.to_string());
                             ui.label(&p.purpose);
                             ui.label(p.region.label());

@@ -673,6 +673,9 @@ pub async fn mux_playlist_to_mkv(
     dst: &Path,
     progress_tx: Option<(EventTx, u64)>,
     max_secs: Option<f64>,
+    // What this mux is for ("head backfill" / "VOD recovery") — shown as the
+    // purpose in the I/O monitor's per-process table.
+    purpose: &str,
 ) -> anyhow::Result<()> {
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -717,7 +720,7 @@ pub async fn mux_playlist_to_mkv(
     cmd.creation_flags(CREATE_NO_WINDOW);
 
     let mut child = cmd.spawn()?;
-    let _io_guard = crate::iomon::track_tool(child.id(), "ffmpeg", "cdn-mux", dst);
+    let _io_guard = crate::iomon::track_tool(child.id(), "ffmpeg", purpose, dst);
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
 
@@ -1007,7 +1010,14 @@ pub async fn run_recovery(
     let final_stem = crate::downloader::unique_stem(&out_dir, &base_stem, "mkv", None);
     let dst = out_dir.join(format!("{final_stem}.mkv"));
 
-    let mux = mux_playlist_to_mkv(&temp_playlist, &dst, Some((events.clone(), task_id)), None).await;
+    let mux = mux_playlist_to_mkv(
+        &temp_playlist,
+        &dst,
+        Some((events.clone(), task_id)),
+        None,
+        "VOD recovery",
+    )
+    .await;
     let _ = crate::iomon::fs::remove_file(Cat::Recovery, &temp_playlist).await;
 
     match mux {
