@@ -4004,6 +4004,118 @@ impl Store {
         Ok(())
     }
 
+    /// Every recording's stored output path with its DB size — the raw feed
+    /// for anything that must see PAST recording locations too (an instance
+    /// moved from A: to D: leaves its old takes on A:): the I/O monitor's
+    /// drive set, the startup cache sweep, and the Files view's per-location
+    /// stats.
+    pub fn recording_paths_with_bytes(&self) -> Result<Vec<(String, i64)>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT output_path, bytes FROM recording WHERE output_path != ''",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Per-monitor recording stats: `(monitor_id, count, total bytes)`.
+    pub fn recording_stats_by_monitor(&self) -> Result<Vec<(i64, i64, i64)>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT monitor_id, COUNT(*), COALESCE(SUM(bytes), 0)
+             FROM recording GROUP BY monitor_id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Change one monitor's output folder (Files view inline edit). Future
+    /// recordings land there; existing rows keep their absolute paths.
+    pub fn set_monitor_output_dir(&self, id: i64, dir: &str) -> Result<()> {
+        let conn = self.db();
+        conn.execute("UPDATE monitor SET output_dir=?2 WHERE id=?1", params![id, dir])?;
+        Ok(())
+    }
+
+    /// How many recording rows / video rows / monitors have a stored path
+    /// starting with `from` — the preview for [`Self::replace_path_prefix`].
+    pub fn count_path_prefix_matches(&self, from: &str) -> Result<(i64, i64, i64)> {
+        let conn = self.db();
+        let m = |col: &str| format!("substr(COALESCE({col}, ''), 1, length(?1)) = ?1");
+        let recs: i64 = conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM recording WHERE {} OR {} OR {} OR {} OR {}",
+                m("output_path"),
+                m("backfill_path"),
+                m("full_path"),
+                m("recovered_path"),
+                m("vod_dl_path"),
+            ),
+            params![from],
+            |r| r.get(0),
+        )?;
+        let vids: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM video WHERE {} OR {}", m("output_path"), m("output_dir")),
+            params![from],
+            |r| r.get(0),
+        )?;
+        let mons: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM monitor WHERE {}", m("output_dir")),
+            params![from],
+            |r| r.get(0),
+        )?;
+        Ok((recs, vids, mons))
+    }
+
+    /// Rewrite the leading `from` prefix to `to` in every stored path column
+    /// (recordings: output/backfill/full/recovered/vod-download paths; videos:
+    /// output path + dir; optionally monitor output dirs). This is a
+    /// DB-side remap for files the user physically moved (e.g. a drive
+    /// migration A:\ → D:\) — no files are touched. Returns
+    /// `(recording cols updated, video cols updated, monitors updated)`.
+    pub fn replace_path_prefix(
+        &self,
+        from: &str,
+        to: &str,
+        include_monitor_dirs: bool,
+    ) -> Result<(usize, usize, usize)> {
+        let conn = self.db();
+        let mut recs = 0usize;
+        for col in ["output_path", "backfill_path", "full_path", "recovered_path", "vod_dl_path"] {
+            recs += conn.execute(
+                &format!(
+                    "UPDATE recording SET {col} = ?2 || substr({col}, length(?1) + 1)
+                     WHERE substr(COALESCE({col}, ''), 1, length(?1)) = ?1"
+                ),
+                params![from, to],
+            )?;
+        }
+        let mut vids = 0usize;
+        for col in ["output_path", "output_dir"] {
+            vids += conn.execute(
+                &format!(
+                    "UPDATE video SET {col} = ?2 || substr({col}, length(?1) + 1)
+                     WHERE substr(COALESCE({col}, ''), 1, length(?1)) = ?1"
+                ),
+                params![from, to],
+            )?;
+        }
+        let mons = if include_monitor_dirs {
+            conn.execute(
+                "UPDATE monitor SET output_dir = ?2 || substr(output_dir, length(?1) + 1)
+                 WHERE substr(output_dir, 1, length(?1)) = ?1",
+                params![from, to],
+            )?
+        } else {
+            0
+        };
+        Ok((recs, vids, mons))
+    }
+
     /// Recordings whose head backfill was marked planned (`head_backfill_state
     /// = 'queued'`) but whose in-memory job died with a previous session — the
     /// startup requeue re-drives (or clears) these so "Planned" can't persist
@@ -5528,6 +5640,49 @@ mod tests {
             .map(|(id, _, _)| id)
             .collect();
         assert_eq!(ids, vec![damaged]);
+    }
+
+    #[test]
+    fn path_prefix_relocation_counts_and_rewrites() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+        store.set_monitor_output_dir(mid, r"A:\streams\Chan").unwrap();
+
+        let moved = store
+            .insert_recording(mid, 1_000, r"A:\streams\Chan\a.mkv", Some(1_000), false, None, None, "", "")
+            .unwrap();
+        store
+            .finish_recording(moved, 2_000, 5, Some(0), "completed", r"A:\streams\Chan\a.mkv", "")
+            .unwrap();
+        let stays = store
+            .insert_recording(mid, 3_000, r"G:\other\Chan\b.mkv", Some(3_000), false, None, None, "", "")
+            .unwrap();
+        store
+            .finish_recording(stays, 4_000, 5, Some(0), "completed", r"G:\other\Chan\b.mkv", "")
+            .unwrap();
+
+        let (r, v, mons) = store.count_path_prefix_matches(r"A:\streams").unwrap();
+        assert_eq!((r, v, mons), (1, 0, 1));
+
+        let (r, v, mons) = store.replace_path_prefix(r"A:\streams", r"D:\streams", true).unwrap();
+        assert_eq!((r, v, mons), (1, 0, 1));
+        assert_eq!(
+            store.get_recording(moved).unwrap().unwrap().output_path,
+            r"D:\streams\Chan\a.mkv"
+        );
+        assert_eq!(
+            store.get_recording(stays).unwrap().unwrap().output_path,
+            r"G:\other\Chan\b.mkv"
+        );
+        assert_eq!(
+            store.get_monitor_with_channel(mid).unwrap().unwrap().monitor.output_dir,
+            r"D:\streams\Chan"
+        );
+        // Nothing left matching the old prefix.
+        assert_eq!(store.count_path_prefix_matches(r"A:\streams").unwrap(), (0, 0, 0));
     }
 
     #[test]

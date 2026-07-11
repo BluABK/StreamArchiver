@@ -174,6 +174,10 @@ impl AppCore {
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(crate::app_paths::default_output_dir),
             );
+            // …plus every dir PAST recordings live in: an instance retargeted
+            // from A:\ to D:\ leaves its old takes on A:, and that drive must
+            // stay classified/sampled as a recordings drive too.
+            roots.extend(crate::downloader::historical_recording_dirs(&self.store));
             crate::iomon::set_recordings_roots(roots);
             crate::iomon::set_sample_logging(
                 self.store

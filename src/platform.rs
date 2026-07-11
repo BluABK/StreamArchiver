@@ -501,6 +501,34 @@ pub fn disk_performance(_letter: char) -> Option<DiskPerf> {
     None
 }
 
+/// Free / total bytes of a drive (e.g. 'A'), or `None` when the drive is
+/// offline or unmapped — the Files view degrades to "offline".
+#[cfg(windows)]
+pub fn disk_space(letter: char) -> Option<(u64, u64)> {
+    use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    if !letter.is_ascii_alphabetic() {
+        return None;
+    }
+    let wide = to_wide(&format!("{}:\\", letter.to_ascii_uppercase()));
+    let mut free = 0u64;
+    let mut total = 0u64;
+    unsafe {
+        GetDiskFreeSpaceExW(
+            windows::core::PCWSTR(wide.as_ptr()),
+            Some(&mut free),
+            Some(&mut total),
+            None,
+        )
+        .ok()?;
+    }
+    Some((free, total))
+}
+
+#[cfg(not(windows))]
+pub fn disk_space(_letter: char) -> Option<(u64, u64)> {
+    None
+}
+
 /// Forcefully kill a process and its entire child tree by PID.
 ///
 /// Uses a Toolhelp snapshot to find descendants (by parent PID) and terminates

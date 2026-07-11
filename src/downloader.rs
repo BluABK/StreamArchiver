@@ -706,30 +706,43 @@ pub const LEGACY_CACHE_DIR_NAME: &str = ".cache";
 /// `.sa-cache\` subfolders, the pre-setting behavior).
 pub const K_CACHE_ROOT: &str = "capture_cache_root";
 
-/// The configured central cache root (normalized to end in [`CACHE_DIR_NAME`]).
-/// `None` = per-output-dir layout.
-static CACHE_ROOT: parking_lot::RwLock<Option<PathBuf>> = parking_lot::RwLock::new(None);
+/// The configured central cache roots (each normalized to end in
+/// [`CACHE_DIR_NAME`]), at most one per drive letter — output dirs pick the
+/// root on THEIR drive. Empty = per-output-dir layout everywhere.
+static CACHE_ROOTS: parking_lot::RwLock<Vec<PathBuf>> = parking_lot::RwLock::new(Vec::new());
 
 /// Apply the central cache-root setting (startup + live on settings save).
-/// The value is normalized to end in a `.sa-cache` component — that name is
-/// what every cache-membership check (string `contains`, SQL `LIKE`) keys on,
-/// and it's the single folder to exclude in backup tools.
+/// Accepts SEVERAL roots separated by `;` (or newlines) — recordings can span
+/// drives (`A:\streams\…` and `G:\streams\…` instances), and each drive needs
+/// its own root since promotion must stay a same-volume rename. Each value is
+/// normalized to end in a `.sa-cache` component — that name is what every
+/// cache-membership check (string `contains`, SQL `LIKE`) keys on, and it's
+/// the folder to exclude in backup tools. The first root listed for a drive
+/// wins.
 pub fn set_cache_root(raw: &str) {
-    let trimmed = raw.trim().trim_end_matches(['\\', '/']);
-    let root = if trimmed.is_empty() {
-        None
-    } else {
-        let p = PathBuf::from(trimmed);
-        if p.file_name().is_some_and(is_cache_dir_name) {
-            Some(p)
-        } else {
-            Some(p.join(CACHE_DIR_NAME))
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for part in raw.split([';', '\n']) {
+        let trimmed = part.trim().trim_end_matches(['\\', '/']);
+        if trimmed.is_empty() {
+            continue;
         }
-    };
-    if let Some(r) = &root {
+        let p = PathBuf::from(trimmed);
+        let p = if p.file_name().is_some_and(is_cache_dir_name) {
+            p
+        } else {
+            p.join(CACHE_DIR_NAME)
+        };
+        // One root per drive — a second root on the same letter is ignored.
+        if drive_of(&p).is_some_and(|d| roots.iter().any(|r| drive_of(r) == Some(d))) {
+            warn!("capture cache root ignored (drive already has one): {}", p.display());
+            continue;
+        }
+        roots.push(p);
+    }
+    for r in &roots {
         info!("capture cache root: {}", r.display());
     }
-    *CACHE_ROOT.write() = root;
+    *CACHE_ROOTS.write() = roots;
 }
 
 /// Drive letter of a path's prefix component (e.g. 'A' for `A:\x`), uppercased.
@@ -756,12 +769,14 @@ fn drive_of(path: &Path) -> Option<char> {
 /// [`crate::platform::set_hidden`] adds the Windows hidden attribute when the
 /// dir is created.
 pub(crate) fn cache_dir(output_dir: &Path) -> PathBuf {
-    if let Some(root) = CACHE_ROOT.read().as_ref()
-        && drive_of(root).is_some()
-        && drive_of(root) == drive_of(output_dir)
+    if let Some(out_drive) = drive_of(output_dir)
+        && let Some(root) = CACHE_ROOTS
+            .read()
+            .iter()
+            .find(|r| drive_of(r) == Some(out_drive))
         && let Some(leaf) = output_dir.file_name()
-        // An output dir that IS the root's parent (or the root itself) would
-        // recurse the cache into itself — keep those on the per-dir layout.
+        // An output dir inside the root itself would recurse the cache into
+        // itself — keep those on the per-dir layout.
         && !output_dir.starts_with(root)
     {
         return root.join(leaf);
@@ -808,6 +823,29 @@ pub fn strip_cache_component(path: &Path) -> Option<PathBuf> {
         out.push(c.as_os_str());
     }
     found.then_some(out)
+}
+
+/// Distinct directories PAST recordings live in, derived from every stored
+/// recording path (cache-resident ones mapped to their promoted parent). An
+/// instance retargeted to another drive leaves its history behind — these
+/// dirs keep old drives visible to the I/O monitor, the startup cache sweep,
+/// and the Files view, even when no current instance points there.
+pub fn historical_recording_dirs(store: &crate::store::Store) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = store
+        .recording_paths_with_bytes()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(p, _)| {
+            let path = PathBuf::from(&p);
+            strip_cache_component(&path)
+                .unwrap_or(path)
+                .parent()
+                .map(Path::to_path_buf)
+        })
+        .collect();
+    dirs.sort_unstable();
+    dirs.dedup();
+    dirs
 }
 
 /// Mark the working dir hidden on Windows — the `.sa-cache`/`.cache` ANCESTOR
@@ -5598,7 +5636,17 @@ impl Supervisor {
     /// [`CACHE_MAX_AGE_SECS`]), skipping any stem currently being resumed. Removes a
     /// `.cache\` dir that ends up empty. Best-effort; runs once at startup.
     pub async fn sweep_caches(&self, skip_stems: std::collections::HashSet<String>) {
-        let dirs = self.store.all_output_dirs().unwrap_or_default();
+        // Current instance output dirs PLUS every dir past recordings live in
+        // — retargeting an instance to another drive must not strand stale
+        // working files (or empty legacy dirs) on the old one forever.
+        let mut dirs = self.store.all_output_dirs().unwrap_or_default();
+        dirs.extend(
+            historical_recording_dirs(&self.store)
+                .into_iter()
+                .map(|p| p.to_string_lossy().into_owned()),
+        );
+        dirs.sort_unstable();
+        dirs.dedup();
         let now = std::time::SystemTime::now();
         for d in dirs {
             // Both the current working dir and the legacy `.cache\` — the
@@ -11676,6 +11724,21 @@ mod tests {
                 PathBuf::from(r"Q:\streams\Chan\.sa-cache"),
                 PathBuf::from(r"Q:\streams\Chan\.cache"),
             ]
+        );
+        // Multiple roots (;-separated), one per drive — each output dir picks
+        // the root on ITS drive.
+        set_cache_root(r"Q:\streams ; S:\rec\.sa-cache");
+        assert_eq!(
+            cache_dir(Path::new(r"Q:\streams\Chan")),
+            PathBuf::from(r"Q:\streams\.sa-cache\Chan")
+        );
+        assert_eq!(
+            cache_dir(Path::new(r"S:\rec\Chan")),
+            PathBuf::from(r"S:\rec\.sa-cache\Chan")
+        );
+        assert_eq!(
+            cache_dir(Path::new(r"R:\out\Chan")),
+            PathBuf::from(r"R:\out\Chan\.sa-cache")
         );
         set_cache_root("");
         assert_eq!(

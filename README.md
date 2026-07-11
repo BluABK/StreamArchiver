@@ -578,6 +578,35 @@ appended to a JSONL under `logs\iomon\` on the system drive (~2–5 MB/day,
 pruned after 14 days), so an overnight stall or a drive disconnect can be
 analyzed after the fact even if the app died with it.
 
+### File management (the **Files** tab)
+
+An overview of what is mapped to which path, across every drive recordings
+have ever landed on:
+
+- **Drives** — each drive letter in use (online/offline, free/total space, and
+  how much recorded material the database places there). Low free space is
+  flagged: retarget instances to another drive and the old recordings stay
+  where they are, fully tracked.
+- **Instances** — every instance with its **output folder**, editable inline
+  (💾 applies; affects future takes only) and in **batch**: select rows and
+  apply one folder to all of them (`{channel}` expands per instance). The
+  resolved cache dir for the current cache layout is shown per row.
+- **Recording locations** — every folder recordings actually sit in per the
+  database, including *history-only* folders no instance points at anymore
+  (e.g. the old drive after a move), with existence checks and per-folder
+  totals.
+- **Relocate recorded paths** — for after you physically move files (drive
+  swap, folder rename): rewrites the leading path prefix in the database —
+  recordings incl. head/full/recovered/VOD companion paths, video downloads,
+  and optionally instance output folders. Preview first, then apply; no files
+  are touched.
+
+Instances moving between drives is a first-class case throughout: recordings
+store absolute paths, so playback, Issues recovery, chat sidecars, and the
+I/O monitor keep working for material on drives no instance currently records
+to (those drives stay classified and disk-sampled, and their leftover working
+dirs are still swept).
+
 ### Issues panel & re-remux
 
 ![Issues panel listing a recording that needs a re-remux](doc/screenshots/issues-panel.png)
@@ -1615,14 +1644,15 @@ Both SABR paths are **mpv-only**; other players get the DASH companion's `.ts`
 - In-progress captures live in a hidden **`.sa-cache\`** working folder and
   are promoted (same-volume rename) to the output folder on finish. Layout:
   - Default: a `.sa-cache\` subfolder inside each output folder.
-  - **Capture cache location** (Settings → Recording): a central folder — e.g.
-    `A:\streams\.sa-cache` — holding one subfolder per channel
-    (`…\.sa-cache\{channel}\…`). This gives backup tools **one excludable
-    subtree per drive**, for tools like Backblaze whose exclusions are
-    path-based with no wildcard support (a per-channel dot-folder can't be
-    excluded there). It only applies to output folders on the *same drive*
-    (promotion must stay a rename, never a multi-GB cross-drive copy); output
-    folders on other drives keep the per-folder layout. Changing the setting
+  - **Capture cache location(s)** (Settings → Recording): central folder(s) —
+    e.g. `A:\streams\.sa-cache; G:\streams\.sa-cache` — each holding one
+    subfolder per channel (`…\.sa-cache\{channel}\…`). This gives backup tools
+    **one excludable subtree per drive**, for tools like Backblaze whose
+    exclusions are path-based with no wildcard support (a per-channel
+    dot-folder can't be excluded there). Recordings can span drives: list one
+    location per drive, separated by `;` — each only applies to output folders
+    on *its* drive (promotion must stay a rename, never a multi-GB cross-drive
+    copy); drives without one keep the per-folder layout. Changing the setting
     is safe at any time: files are *found* under all layouts (central,
     per-folder, legacy `.cache\`), takes started before the change finish
     under their original layout, and drained working folders are removed by
