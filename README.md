@@ -513,9 +513,11 @@ captures are writing to:
   needs ffmpeg 5.0+; silently unthrottled on older builds). At 30× a 5-hour
   stream finalizes in ~10 minutes while using a fraction of the drive's
   bandwidth. `0` disables the cap. `-readrate` paces against the input's own
-  timestamps, which ad-break cuts can break (ffmpeg then *crawls* below
-  realtime, wedging the queue for hours) — a pacing watchdog detects a remux
-  falling hopelessly behind and retries that one file unthrottled.
+  timestamps, which ad-break cuts (or the non-zero start timestamps of
+  live-DVR DASH parts) can break — ffmpeg then *crawls* below realtime,
+  wedging the queue for hours. A pacing watchdog on both the finalize remux
+  and the split-capture merge detects a pass falling hopelessly behind and
+  retries that one file unthrottled.
 - Tool logs, chat sidecar writes, and the UI's file probes are batched, cached,
   or kept off the recordings drive entirely (see *Data & locations*).
 - **Download rate limit** (Settings → Defaults, default **off**): a yt-dlp
@@ -558,7 +560,11 @@ rather than reconstructed after a crash:
   value the tab keeps **session stats** so pressure doesn't have to be caught
   in the act: average depth, the session max with how long it sat there, and
   (on hover) the **top 5 pressure episodes** — each elevated run (queue ≥ 2)
-  with its peak, duration, and when it ended.
+  with its peak, duration, and when it ended. An **"other"** column shows the
+  spindle traffic *not* accounted for by this app or its tools — a backup
+  client, antivirus scan, or search indexer hammering the recordings drive
+  shows up here (highlighted when it dominates), instead of the queue-depth
+  spike being blamed on a capture or remux.
 
 The **I/O** tab shows live totals, a 30-minute rate graph (write/read/queue
 series per drive, hover for values), per-region and per-category tables
@@ -596,8 +602,9 @@ The **⚠ Issues** button in the toolbar (turns amber with a count when issues e
   merge at the very end), so the final file was never written and the take
   finalized as 0 bytes — but the media survived as parts in `.cache\`. Never
   listed as plain "gone": the **Merge into MKV** button losslessly muxes the
-  parts into the final file (gated + throttled like any finalize pass),
-  promotes it, and marks the recording completed.
+  parts into the final file (gated + throttled like any finalize pass, with a
+  live progress bar in Background jobs and the same pacing watchdog as the
+  finalize remux), promotes it, and marks the recording completed.
 - **🔗 Head backfill can't join the live capture** — the head and the live
   capture carry different stream parameters, so the lossless `full.mkv` concat
   is impossible. The row shows the actual probed params (e.g. *head 1080p60 vs

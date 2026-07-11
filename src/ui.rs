@@ -18517,10 +18517,47 @@ impl StreamArchiverApp {
                 let qstats = iomon::disk_queue_stats();
                 match latest.as_ref().filter(|s| !s.disks.is_empty()) {
                     Some(s) => {
+                        // Whole-spindle rate minus everything this app and its
+                        // tools account for on that drive = other programs
+                        // (backup clients, antivirus, indexers) — the mystery
+                        // load that queue-depth spikes otherwise get blamed on.
+                        let rec_letters = iomon::recordings_drive_letters();
+                        let data_letter = iomon::data_drive_letter();
+                        let attributed = |letter: char| -> u64 {
+                            let region_on_disk = |reg: iomon::Region| {
+                                if rec_letters.contains(&letter) {
+                                    reg == iomon::Region::Recordings
+                                } else if Some(letter) == data_letter {
+                                    matches!(reg, iomon::Region::AppData | iomon::Region::Temp)
+                                } else {
+                                    false
+                                }
+                            };
+                            let mut total = 0u64;
+                            for reg in iomon::Region::ALL {
+                                if region_on_disk(reg) {
+                                    let (r, w) = s.per_region[reg as usize];
+                                    total += r + w;
+                                }
+                            }
+                            for p in &s.procs {
+                                if region_on_disk(p.region) {
+                                    total += p.read_bps + p.write_bps;
+                                }
+                            }
+                            total
+                        };
                         egui::Grid::new("io_disks").striped(true).min_col_width(60.0).show(&mut cols[1], |ui| {
                             ui.weak("disk");
                             ui.weak("read");
                             ui.weak("write");
+                            ui.weak("other").on_hover_text(
+                                "Spindle traffic NOT accounted for by this app or its tool \
+                                 processes — other programs hitting the same drive (backup \
+                                 clients, antivirus scans, search indexers). Approximate: \
+                                 tool 'read' rates include their network transfer, and \
+                                 in-app rates count file bytes, not sector overhead.",
+                            );
                             ui.weak("queue");
                             ui.weak("avg");
                             ui.weak("max").on_hover_text(
@@ -18532,6 +18569,19 @@ impl StreamArchiverApp {
                                 ui.label(format!("{}:", d.letter));
                                 ui.label(bps(d.read_bps));
                                 ui.label(bps(d.write_bps));
+                                let spindle = d.read_bps + d.write_bps;
+                                let other = spindle.saturating_sub(attributed(d.letter));
+                                // Only alarming when foreign load dominates a busy disk.
+                                if other > 1024 * 1024 && other * 2 > spindle {
+                                    ui.colored_label(ui.visuals().warn_fg_color, bps(other))
+                                        .on_hover_text(
+                                            "Most of this drive's traffic right now is from \
+                                             OTHER programs — check backup/antivirus/indexer \
+                                             activity before blaming a capture or remux.",
+                                        );
+                                } else {
+                                    ui.label(bps(other));
+                                }
                                 if d.queue_depth >= 4 {
                                     ui.colored_label(ui.visuals().error_fg_color, d.queue_depth.to_string());
                                 } else {

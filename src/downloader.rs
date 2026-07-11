@@ -6267,10 +6267,15 @@ impl Supervisor {
         let final_path = path_with_safe_stem(&out_dir.join(format!("{stem}.mkv")));
         let tmp = cache.join(format!("{orig_stem}.merged.tmp.mkv"));
 
+        use tokio::io::{AsyncBufReadExt, BufReader};
         // One local full-file pass at a time (see io_gate) + readrate throttle.
         let gate = crate::io_gate::local_pass("merge-split").await;
-        let out = loop {
-            let readrate = crate::io_gate::readrate();
+        // Total duration for the progress fraction (the video part spans the
+        // whole take; the audio part matches it).
+        let total_us: Option<i64> = media_duration_secs(&parts[0]).await.map(|s| s * 1_000_000);
+        let mut allow_readrate = true;
+        let out: std::io::Result<(std::process::ExitStatus, String)> = loop {
+            let readrate = if allow_readrate { crate::io_gate::readrate() } else { None };
             let mut cmd = Command::new("ffmpeg");
             cmd.arg("-y");
             if let Some(rate) = readrate {
@@ -6284,42 +6289,114 @@ impl Supervisor {
             }
             cmd.arg("-c")
                 .arg("copy")
+                .arg("-progress")
+                .arg("pipe:1")
+                .arg("-nostats")
                 .arg(&tmp)
                 .stdin(Stdio::null())
-                .stdout(Stdio::null())
+                .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
             #[cfg(windows)]
             cmd.creation_flags(CREATE_NO_WINDOW);
-            // spawn + wait_with_output (≡ output()) so the PID is sampleable.
-            let out = match cmd.spawn() {
-                Ok(child) => {
-                    let _io_guard = crate::iomon::track_tool(
-                        child.id(),
-                        "ffmpeg",
-                        "merge split capture",
-                        &final_path,
-                    );
-                    child.wait_with_output().await
-                }
-                Err(e) => Err(e),
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => break Err(e),
             };
-            if let Ok(o) = &out
-                && !o.status.success()
+            let _io_guard = crate::iomon::track_tool(
+                child.id(),
+                "ffmpeg",
+                "merge split capture",
+                &final_path,
+            );
+            let stdout = child.stdout.take().expect("stdout piped");
+            let stderr = child.stderr.take().expect("stderr piped");
+            let stderr_task = tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr).lines();
+                let mut lines: Vec<String> = Vec::new();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    lines.push(line);
+                }
+                lines
+            });
+            // Same pacing watchdog as remux_ts_to_mkv: `-readrate` paces
+            // against the input's own timestamps, and live-DVR DASH parts
+            // start at a large non-zero timestamp (hours into the broadcast),
+            // which can make ffmpeg believe it's far ahead of schedule and
+            // sleep — crawling at sub-realtime while holding the 1-permit
+            // gate. Media position under 2× wall clock after 3 minutes ⇒
+            // kill and retry this merge without the throttle.
+            let pace_started = std::time::Instant::now();
+            let mut pacing_broken = false;
+            {
+                let mut reader = BufReader::new(stdout).lines();
+                let mut blk_speed = String::new();
+                let mut blk_pos = String::new();
+                let mut blk_us: Option<i64> = None;
+                while let Ok(Some(line)) = reader.next_line().await {
+                    if let Some((k, v)) = line.split_once('=') {
+                        let (k, v) = (k.trim(), v.trim());
+                        match k {
+                            "speed" => blk_speed = v.to_string(),
+                            "out_time" => blk_pos = v.to_string(),
+                            "out_time_ms" => blk_us = v.parse::<i64>().ok(),
+                            "progress" => {
+                                let progress = blk_us.and_then(|us| {
+                                    total_us
+                                        .filter(|&t| t > 0)
+                                        .map(|t| (us as f64 / t as f64).clamp(0.0, 1.0) as f32)
+                                });
+                                let pos_short = blk_pos.split('.').next().unwrap_or(&blk_pos);
+                                let _ = self.events.send(AppEvent::BackgroundTaskProgress {
+                                    id: task_id,
+                                    progress,
+                                    info: format!("speed={blk_speed} pos={pos_short}"),
+                                });
+                                if readrate.is_some() && !pacing_broken {
+                                    let elapsed = pace_started.elapsed().as_secs_f64();
+                                    let media_s = blk_us.unwrap_or(0) as f64 / 1e6;
+                                    if elapsed > 180.0 && media_s < elapsed * 2.0 {
+                                        pacing_broken = true;
+                                        let _ = child.start_kill();
+                                    }
+                                }
+                                blk_speed.clear();
+                                blk_pos.clear();
+                                blk_us = None;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            let status = match child.wait().await {
+                Ok(s) => s,
+                Err(e) => break Err(e),
+            };
+            let stderr_text = stderr_task.await.unwrap_or_default().join("\n");
+            if pacing_broken {
+                warn!(
+                    rec_id,
+                    "merge split capture: -readrate pacing collapsed (live DASH parts \
+                     start at a non-zero timestamp); retrying without the throttle"
+                );
+                allow_readrate = false;
+                continue;
+            }
+            if !status.success()
                 && readrate.is_some()
-                && crate::io_gate::is_readrate_error(&String::from_utf8_lossy(&o.stderr))
+                && crate::io_gate::is_readrate_error(&stderr_text)
             {
                 crate::io_gate::mark_readrate_unsupported();
                 continue; // retry once without the throttle
             }
-            break out;
+            break Ok((status, stderr_text));
         };
         drop(gate);
         match out {
-            Ok(o) if o.status.success() => {}
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                let msg = stderr.trim().lines().last().unwrap_or("").to_string();
+            Ok((status, _)) if status.success() => {}
+            Ok((_, stderr_text)) => {
+                let msg = stderr_text.trim().lines().last().unwrap_or("").to_string();
                 let _ = crate::iomon::fs::remove_file(Cat::CacheSweep, &tmp).await;
                 warn!(rec_id, "merge split capture failed: {msg}");
                 finish(crate::events::TaskOutcome::Failed(format!("ffmpeg merge: {msg}")));

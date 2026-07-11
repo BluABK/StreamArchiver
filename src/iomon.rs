@@ -276,6 +276,18 @@ pub fn set_recordings_roots(roots: Vec<PathBuf>) {
     *RECORDINGS_ROOTS.write() = roots;
 }
 
+/// Drive letters of the configured recordings roots — lets the UI map a
+/// physical disk back to the Recordings region when splitting whole-spindle
+/// rates into "this app + its tools" vs "other programs".
+pub fn recordings_drive_letters() -> Vec<char> {
+    RECORDINGS_DRIVES.read().clone()
+}
+
+/// Drive letter of the app-data dir (DB, logs, asset cache).
+pub fn data_drive_letter() -> Option<char> {
+    drive_letter(data_dir_cached())
+}
+
 fn data_dir_cached() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(crate::app_paths::data_dir)
