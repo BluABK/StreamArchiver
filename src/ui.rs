@@ -829,6 +829,9 @@ pub struct StreamArchiverApp {
         )>,
     >,
     issues_refreshed: Option<std::time::Instant>,
+    /// A dirty-marking app event landed since the last issues sweep — shortens
+    /// the closed-panel refresh interval instead of forcing an immediate one.
+    issues_dirty: bool,
     issues_confirm_clear: bool,
     /// The notifications feed window: whether it's open, its last-loaded rows,
     /// the throttle timestamp, an off-thread load, the cached unread count (the
@@ -1546,6 +1549,7 @@ impl StreamArchiverApp {
             issues_muted_vod: Vec::new(),
             issues_missing_load: None,
             issues_refreshed: None,
+            issues_dirty: false,
             issues_confirm_clear: false,
             show_notifications: false,
             notifications: Vec::new(),
@@ -2165,8 +2169,13 @@ impl StreamArchiverApp {
                 self.spawn_reload_schedule();
             }
             // Any event that marks the UI dirty may affect recording statuses —
-            // force a refresh of the issues panel on the next frame it is open.
-            self.issues_refreshed = None;
+            // note it so the issues panel refreshes soon. Deliberately NOT an
+            // immediate invalidation: during an event storm (startup re-attach
+            // + first poll sweep of ~100 monitors) that re-ran the off-thread
+            // missing-file sweep back-to-back — each pass holds the DB lock
+            // for a 500-row query (convoying every poller with 50-250ms lock
+            // waits) and stats up to 500 paths on the recordings drive.
+            self.issues_dirty = true;
         }
     }
 
@@ -19814,6 +19823,10 @@ impl StreamArchiverApp {
         // recordings drive (real head seeks while captures are writing).
         let interval = if self.show_issues {
             Duration::from_secs(5)
+        } else if self.issues_dirty {
+            // Something changed recently — bring the badge up to date soon,
+            // but never sweep-per-event (see pump_messages).
+            Duration::from_secs(15)
         } else {
             Duration::from_secs(300)
         };
@@ -19822,6 +19835,7 @@ impl StreamArchiverApp {
             .map(|t| t.elapsed() >= interval)
             .unwrap_or(true);
         if stale && self.issues_missing_load.is_none() {
+            self.issues_dirty = false;
             // DB-only queries (fast, system drive) stay synchronous.
             self.issues_recs = self.core.store.recordings_needing_remux().unwrap_or_default();
             self.issues_stuck = self.core.store.recordings_stuck_in_cache().unwrap_or_default();

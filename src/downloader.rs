@@ -6130,8 +6130,6 @@ async fn tail_log(
     done: Arc<AtomicBool>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
-    // Where the log lives, classified once for the per-read accounting below.
-    let log_region = crate::iomon::classify(&path);
     // The log is created before the spawn, but tolerate a brief absence.
     let mut file = loop {
         match crate::iomon::fs::open(crate::iomon::Cat::LogRead, &path).await {
@@ -6167,9 +6165,12 @@ async fn tail_log(
     loop {
         let read_start = std::time::Instant::now();
         let n = file.read(&mut buf).await.unwrap_or(0);
-        crate::iomon::record_region(
+        // record() (not record_region) so a slow read / the ops ring can name
+        // WHICH log — re-attached pre-relocation rows still tail from `.cache\`
+        // on the recordings drive, and those are exactly the slow ones.
+        crate::iomon::record(
             crate::iomon::Cat::LogRead,
-            log_region,
+            &path,
             crate::iomon::OpKind::Read,
             n as u64,
             read_start.elapsed(),

@@ -372,6 +372,16 @@ fn record_inner(
     let slow = dur.as_millis() as u64 >= SLOW_OP_MS;
     if slow {
         cell.slow_ops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // DB guard drops fire hundreds of times a second under load and carry no
+    // path — counters only. The store logs slow lock holds itself, with the
+    // acquiring call site (file:line), which this pathless warn can't match.
+    if matches!(cat, Cat::Db) {
+        return;
+    }
+
+    if slow {
         let now_ms = epoch().elapsed().as_millis() as i64;
         let last = &LAST_SLOW_WARN[cat as usize];
         let prev = last.load(Ordering::Relaxed);
@@ -389,12 +399,6 @@ fn record_inner(
                 path.map(|p| p.display().to_string()).unwrap_or_default()
             );
         }
-    }
-
-    // DB guard drops fire hundreds of times a second under load and carry no
-    // path — counters only, unless slow (a slow DB hold is worth surfacing).
-    if matches!(cat, Cat::Db) && !slow {
-        return;
     }
     // Ring push: try_lock so no hot path (or panic path) ever blocks here.
     // A contended push is dropped — the atomic counters above never miss.
