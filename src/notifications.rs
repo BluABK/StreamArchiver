@@ -198,6 +198,27 @@ fn handle(store: &Store, ev: AppEvent) {
             };
             (content, meta)
         }
+        AppEvent::TriggerBlocked { monitor_id, desc, matched, went_live_at } => {
+            let Some(row) = store.get_monitor_with_channel(monitor_id).ok().flatten() else {
+                return;
+            };
+            let heading = format!("🚫 {} — blacklist blocked recording", row.channel.name);
+            let mut content = content_for(&row, heading, "Watch stream");
+            content.lines = vec![
+                format!("\u{201c}{matched}\u{201d}"),
+                format!("{desc} — automatic recording suppressed (manual ▶ Start still records)"),
+            ];
+            let meta = NotifMeta {
+                kind: NotificationKind::TriggerBlocked,
+                severity: "info",
+                monitor_id: Some(monitor_id),
+                channel: row.channel.name.clone(),
+                recording_id: None,
+                // One feed row per stream even if the veto re-fires.
+                ref_key: format!("trigger_block:{monitor_id}:{went_live_at}"),
+            };
+            (content, meta)
+        }
         AppEvent::RecordingFinished {
             recording_id,
             channel,

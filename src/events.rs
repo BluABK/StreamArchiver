@@ -184,6 +184,18 @@ pub enum AppEvent {
         /// True when Auto-record was off and only the trigger started this.
         forced_start: bool,
     },
+    /// A blacklist trigger matched a live stream's title/game and vetoed the
+    /// automatic recording (manual ▶ Start still records). Sent once per
+    /// broadcast, not per poll.
+    TriggerBlocked {
+        monitor_id: i64,
+        /// Human description of the match, e.g. `title ~ "rerun"`.
+        desc: String,
+        /// The full field value that matched (the title/game text).
+        matched: String,
+        /// Go-live time — part of the notification dedupe key (one per stream).
+        went_live_at: i64,
+    },
     RecordingStarted {
         monitor_id: i64,
         recording_id: i64,

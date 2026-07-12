@@ -33,6 +33,7 @@ impl Supervisor {
             stopping_videos: Arc::new(Mutex::new(HashSet::new())),
             stopping_monitors: Arc::new(Mutex::new(HashSet::new())),
             stall_killed: Arc::new(Mutex::new(HashSet::new())),
+            blocked_notified: Arc::new(Mutex::new(HashMap::new())),
             active_chats,
             stopping_chats: Arc::new(Mutex::new(HashSet::new())),
             shutdown,
@@ -1183,28 +1184,43 @@ progress_info: None,
         // master dormancy switch is handled upstream (scheduler skips dormant
         // monitors, so this path isn't reached for them).
         let auto_off = !row.channel.enabled || !row.monitor.enabled;
+        // Blacklist rules resolve up front: they veto any automatic start
+        // below, and a metadata-less push signal must fetch the title/game
+        // before starting whenever any exist.
+        let block_rules = if forced {
+            Vec::new()
+        } else {
+            crate::triggers::effective_block_rules(&self.store, row.channel.id, monitor_id)
+        };
         let mut trigger_hit: Option<crate::triggers::TriggerHit> = None;
         {
             let rules =
                 crate::triggers::effective_rules(&self.store, row.channel.id, monitor_id);
-            if !rules.is_empty() {
-                if stream_title.is_some() || stream_game.is_some() {
-                    trigger_hit = crate::triggers::first_match(
-                        &rules,
-                        stream_title.as_deref(),
-                        stream_game.as_deref(),
-                    );
-                } else if !forced && auto_off {
-                    // The signal carried no title/game (EventSub push) but this
-                    // Auto-off monitor has trigger rules — re-detect to fetch
-                    // them, then re-enter with the metadata filled in (the
-                    // is_some() guard above prevents a second re-check loop).
-                    self.active.lock().unwrap().remove(&monitor_id);
-                    let this = self.clone();
-                    let row_bg = row.clone();
-                    tokio::spawn(async move {
-                        let o = this.check_one(&row_bg).await;
-                        if o.live && (o.stream_title.is_some() || o.stream_game.is_some()) {
+            let has_meta = stream_title.is_some() || stream_game.is_some();
+            if !rules.is_empty() && has_meta {
+                trigger_hit = crate::triggers::first_match(
+                    &rules,
+                    stream_title.as_deref(),
+                    stream_game.as_deref(),
+                );
+            }
+            // The signal carried no title/game (EventSub push) but rules need
+            // them: whitelist triggers on an Auto-off monitor (a match is the
+            // only thing that could start it), or ANY blacklist rule (a match
+            // must veto the start). Re-detect to fetch the metadata, then
+            // re-enter with it filled in (the has_meta guard above prevents a
+            // second re-check loop).
+            let need_meta_for_trigger = !rules.is_empty() && auto_off;
+            let need_meta_for_block = !block_rules.is_empty();
+            if !has_meta && !forced && (need_meta_for_trigger || need_meta_for_block) {
+                self.active.lock().unwrap().remove(&monitor_id);
+                let this = self.clone();
+                let row_bg = row.clone();
+                tokio::spawn(async move {
+                    let o = this.check_one(&row_bg).await;
+                    if o.live {
+                        let got_meta = o.stream_title.is_some() || o.stream_game.is_some();
+                        if got_meta {
                             this.try_begin(
                                 monitor_id,
                                 o.went_live_at.or(went_live_at),
@@ -1217,23 +1233,97 @@ progress_info: None,
                                 bypass_backoff,
                                 forced,
                             );
+                        } else if !need_meta_for_trigger {
+                            // Only the blacklist needed the metadata and none
+                            // could be fetched: fail OPEN (record) — an
+                            // archiver errs on capturing. Some("") marks the
+                            // metadata as checked so this can't loop.
+                            this.try_begin(
+                                monitor_id,
+                                o.went_live_at.or(went_live_at),
+                                o.went_live_at.is_none() && approximate,
+                                o.stream_id.or(stream_id),
+                                o.thumbnail_url.or(thumbnail_url),
+                                o.broadcaster_id.or(broadcaster_id),
+                                Some(String::new()),
+                                None,
+                                bypass_backoff,
+                                forced,
+                            );
                         }
-                    });
-                    let _ = self.store.set_monitor_check_result(monitor_id, "live", now_unix());
-                    // Title/game aren't known yet here (that's why the re-check
-                    // above was spawned) but the go-live time is, so at least
-                    // Went Live/Started On/Duration have data instead of sitting
-                    // blank until the re-check (or the next poll) fills the rest in.
-                    let (live_since, live_since_approx) = match went_live_at {
-                        Some(t) => (Some(t), approximate),
-                        None => (Some(now_unix()), true),
-                    };
-                    let _ = self.store.set_monitor_live_meta(
-                        monitor_id, "", "", "", -1, live_since, live_since_approx,
-                    );
-                    return false;
-                }
+                    }
+                });
+                let _ = self.store.set_monitor_check_result(monitor_id, "live", now_unix());
+                // Title/game aren't known yet here (that's why the re-check
+                // above was spawned) but the go-live time is, so at least
+                // Went Live/Started On/Duration have data instead of sitting
+                // blank until the re-check (or the next poll) fills the rest in.
+                let (live_since, live_since_approx) = match went_live_at {
+                    Some(t) => (Some(t), approximate),
+                    None => (Some(now_unix()), true),
+                };
+                let _ = self.store.set_monitor_live_meta(
+                    monitor_id, "", "", "", -1, live_since, live_since_approx,
+                );
+                return false;
             }
+        }
+        // Blacklist triggers: the inverse of trigger words — a title/game
+        // match VETOES any automatic start (Auto-record or a trigger-word
+        // match alike); only an explicit user ▶ Start records. An explicit
+        // "don't record this" beats "record this", so a blacklist hit wins
+        // over a whitelist trigger hit.
+        if !forced
+            && let Some(block) = crate::triggers::first_match(
+                &block_rules,
+                stream_title.as_deref(),
+                stream_game.as_deref(),
+            )
+        {
+            self.active.lock().unwrap().remove(&monitor_id);
+            // Keep the UI's live state fresh exactly like the Auto-off path
+            // below — the channel IS live, it's just not being recorded.
+            let _ = self.store.set_monitor_check_result(monitor_id, "live", now_unix());
+            let (live_since, live_since_approx) = match went_live_at {
+                Some(t) => (Some(t), approximate),
+                None => (Some(now_unix()), true),
+            };
+            let _ = self.store.set_monitor_live_meta(
+                monitor_id,
+                stream_title.as_deref().unwrap_or(""),
+                stream_game.as_deref().unwrap_or(""),
+                thumbnail_url.as_deref().unwrap_or(""),
+                -1,
+                live_since,
+                live_since_approx,
+            );
+            // Log + notify once per broadcast — try_begin re-runs on every
+            // poll while the stream stays live.
+            let key = stream_id
+                .clone()
+                .unwrap_or_else(|| went_live_at.unwrap_or(0).to_string());
+            let fresh = self
+                .blocked_notified
+                .lock()
+                .unwrap()
+                .insert(monitor_id, key.clone())
+                != Some(key);
+            if fresh {
+                let desc = block.describe();
+                info!(
+                    monitor_id,
+                    channel = row.channel.name.as_str(),
+                    hit = desc.as_str(),
+                    "blacklist trigger matched — automatic recording suppressed"
+                );
+                let _ = self.events.send(AppEvent::TriggerBlocked {
+                    monitor_id,
+                    desc,
+                    matched: block.matched.clone(),
+                    went_live_at: went_live_at.unwrap_or(0),
+                });
+            }
+            return false;
         }
         if !forced && auto_off && trigger_hit.is_none() {
             // Auto-record is off for this channel/instance: detection keeps the

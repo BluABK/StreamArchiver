@@ -198,6 +198,10 @@ pub struct Supervisor {
     /// secondary finalize's `contains`) could leave a permanent tombstone that
     /// silently skipped the channel's next take.
     stall_killed: Arc<Mutex<HashSet<(DetachedKind, i64)>>>,
+    /// monitor_id -> broadcast key of the last blacklist-veto notification, so
+    /// the "recording suppressed" event fires once per broadcast rather than on
+    /// every poll while the stream stays live.
+    blocked_notified: Arc<Mutex<HashMap<i64, String>>>,
     /// monitor_id -> child PID of in-flight live-chat sidecar downloads.
     /// Shared with AppCore so the UI can show the chat-active indicator.
     pub active_chats: Arc<Mutex<HashMap<i64, u32>>>,

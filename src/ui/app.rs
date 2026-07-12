@@ -200,6 +200,7 @@ impl StreamArchiverApp {
                 .flatten()
                 .is_none_or(|v| v != "0"),
             trigger_rules: crate::triggers::load_global_rules(&core.store),
+            trigger_block_rules: crate::triggers::load_global_block_rules(&core.store),
             custom_tools: crate::downloader::load_custom_tools(&core.store),
         };
         // Apply the loaded date format + short-timestamp pattern before the first render.
@@ -417,6 +418,8 @@ impl StreamArchiverApp {
             instance_scope_drafts: HashMap::new(),
             channel_trigger_drafts: HashMap::new(),
             instance_trigger_drafts: HashMap::new(),
+            channel_block_drafts: HashMap::new(),
+            instance_block_drafts: HashMap::new(),
             edit_schedule: None,
             schedule_selected: HashSet::new(),
             merge_preview: None,
@@ -1423,6 +1426,13 @@ impl StreamArchiverApp {
             crate::triggers::save_global_rules(&self.core.store, &self.settings.trigger_rules)
         {
             self.status = format!("Error saving trigger rules: {e}");
+            return;
+        }
+        if let Err(e) = crate::triggers::save_global_block_rules(
+            &self.core.store,
+            &self.settings.trigger_block_rules,
+        ) {
+            self.status = format!("Error saving blacklist triggers: {e}");
             return;
         }
         // Custom tools serialize to JSON too.

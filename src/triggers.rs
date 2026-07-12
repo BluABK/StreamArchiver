@@ -16,6 +16,13 @@
 //! Matching happens in the downloader's `try_begin` gate on every live poll
 //! (the scheduler keeps polling Auto-off monitors), so both go-live titles and
 //! mid-stream title/category flips are seen.
+//!
+//! **Blacklist triggers** are the exact inverse: a title/game match VETOES any
+//! automatic start (Auto-record and trigger-word matches alike) — only an
+//! explicit user ▶ Start records. They reuse the same rule/scope structures
+//! and three-level resolution under their own settings keys; the per-rule
+//! action overrides (`capture_from_start`, `stop_on_unmatch`, `lead_secs`,
+//! `end_delay_secs`) are meaningless for a veto and ignored.
 
 use std::collections::HashMap;
 
@@ -31,6 +38,12 @@ pub const K_TRIGGER_RULES: &str = "trigger_rules";
 pub const K_CHANNEL_TRIGGER_SCOPE: &str = "channel_trigger_scope";
 /// Per-monitor scope map (`{monitor_id -> TriggerScope}`).
 pub const K_MONITOR_TRIGGER_SCOPE: &str = "monitor_trigger_scope";
+/// Global blacklist rule list (JSON `Vec<TriggerRule>`).
+pub const K_BLOCK_RULES: &str = "trigger_block_rules";
+/// Per-channel blacklist scope map (`{channel_id -> TriggerScope}`).
+pub const K_CHANNEL_BLOCK_SCOPE: &str = "channel_trigger_block_scope";
+/// Per-monitor blacklist scope map (`{monitor_id -> TriggerScope}`).
+pub const K_MONITOR_BLOCK_SCOPE: &str = "monitor_trigger_block_scope";
 
 // ---------- rule model ----------
 
@@ -228,6 +241,52 @@ pub fn save_monitor_trigger_scope(
     save_scope(store, K_MONITOR_TRIGGER_SCOPE, monitor_id, cfg)
 }
 
+// ---------- blacklist persistence (same shapes, own keys) ----------
+
+/// The global blacklist rule list.
+pub fn load_global_block_rules(store: &Store) -> Vec<TriggerRule> {
+    store
+        .get_setting(K_BLOCK_RULES)
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_global_block_rules(store: &Store, rules: &[TriggerRule]) -> anyhow::Result<()> {
+    store.set_setting(K_BLOCK_RULES, &serde_json::to_string(rules)?)?;
+    Ok(())
+}
+
+pub fn load_channel_block_scope(store: &Store, channel_id: i64) -> TriggerScope {
+    load_scope_map(store, K_CHANNEL_BLOCK_SCOPE)
+        .remove(&channel_id.to_string())
+        .unwrap_or_default()
+}
+
+pub fn save_channel_block_scope(
+    store: &Store,
+    channel_id: i64,
+    cfg: &TriggerScope,
+) -> anyhow::Result<()> {
+    save_scope(store, K_CHANNEL_BLOCK_SCOPE, channel_id, cfg)
+}
+
+pub fn load_monitor_block_scope(store: &Store, monitor_id: i64) -> TriggerScope {
+    load_scope_map(store, K_MONITOR_BLOCK_SCOPE)
+        .remove(&monitor_id.to_string())
+        .unwrap_or_default()
+}
+
+pub fn save_monitor_block_scope(
+    store: &Store,
+    monitor_id: i64,
+    cfg: &TriggerScope,
+) -> anyhow::Result<()> {
+    save_scope(store, K_MONITOR_BLOCK_SCOPE, monitor_id, cfg)
+}
+
 // ---------- resolution ----------
 
 /// Pure resolver: global → channel scope → monitor scope, then drop disabled /
@@ -250,6 +309,16 @@ pub fn effective_rules(store: &Store, channel_id: i64, monitor_id: i64) -> Vec<T
         load_global_rules(store),
         &load_channel_trigger_scope(store, channel_id),
         &load_monitor_trigger_scope(store, monitor_id),
+    )
+}
+
+/// Store-hitting BLACKLIST resolver for one channel+monitor pair — the same
+/// three-level resolution over the blacklist keys.
+pub fn effective_block_rules(store: &Store, channel_id: i64, monitor_id: i64) -> Vec<TriggerRule> {
+    effective_rules_from(
+        load_global_block_rules(store),
+        &load_channel_block_scope(store, channel_id),
+        &load_monitor_block_scope(store, monitor_id),
     )
 }
 
@@ -460,6 +529,23 @@ mod tests {
         blank.pattern = "   ".into();
         let r = effective_rules_from(vec![blank], &inherit, &inherit);
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn blacklist_rules_persist_under_their_own_keys() {
+        let store = Store::open_in_memory().unwrap();
+        let block = vec![rule(TriggerField::Title, false, "rerun")];
+        save_global_block_rules(&store, &block).unwrap();
+        // Blacklist storage is fully separate from the whitelist…
+        assert!(load_global_rules(&store).is_empty());
+        assert_eq!(load_global_block_rules(&store), block);
+        // …and resolves through the same three-level scopes on its own keys.
+        save_channel_block_scope(&store, 7, &TriggerScope { mode: TriggerMode::Off, rules: vec![] })
+            .unwrap();
+        assert!(effective_block_rules(&store, 7, 1).is_empty());
+        assert_eq!(effective_block_rules(&store, 8, 1), block);
+        // The whitelist channel scope is untouched by the blacklist save.
+        assert!(load_channel_trigger_scope(&store, 7).is_inherit());
     }
 
     #[test]

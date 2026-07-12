@@ -567,6 +567,9 @@ struct SettingsForm {
     /// Global trigger-word rules (start recording on title/game match even with
     /// Auto off). Channel/instance Properties can extend/replace/disable them.
     trigger_rules: Vec<crate::triggers::TriggerRule>,
+    /// Global blacklist trigger rules (PREVENT automatic recording on title/game
+    /// match; manual Start still records). Same scope inheritance as above.
+    trigger_block_rules: Vec<crate::triggers::TriggerRule>,
     /// User-defined alternate yt-dlp-compatible binaries (alias + path),
     /// selectable alongside the system yt-dlp / SABR build in the Videos-tab
     /// download form.
@@ -795,6 +798,10 @@ pub struct StreamArchiverApp {
     channel_trigger_drafts: HashMap<i64, crate::triggers::TriggerScope>,
     /// Per-open instance-Properties trigger-word scope drafts (saved on change).
     instance_trigger_drafts: HashMap<i64, crate::triggers::TriggerScope>,
+    /// Per-open channel-Properties BLACKLIST-trigger scope drafts (saved on change).
+    channel_block_drafts: HashMap<i64, crate::triggers::TriggerScope>,
+    /// Per-open instance-Properties BLACKLIST-trigger scope drafts (saved on change).
+    instance_block_drafts: HashMap<i64, crate::triggers::TriggerScope>,
     /// Draft for the "Edit schedule item" dialog (None = closed). Saving converts
     /// the row to a protected `"manual"` source so refreshes don't overwrite it.
     edit_schedule: Option<EditScheduleDraft>,

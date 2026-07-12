@@ -33,6 +33,7 @@ impl StreamArchiverApp {
             for mid in closed {
                 self.instance_scope_drafts.remove(&mid);
                 self.instance_trigger_drafts.remove(&mid);
+                self.instance_block_drafts.remove(&mid);
                 // Free the shared per-channel asset caches when this was the
                 // last Properties window (channel or instance) showing them.
                 let cid = self.rows.iter().find(|r| r.monitor.id == mid).map(|r| r.channel.id);
@@ -100,9 +101,13 @@ impl StreamArchiverApp {
         self.instance_trigger_drafts
             .entry(m.id)
             .or_insert_with(|| crate::triggers::load_monitor_trigger_scope(&self.core.store, m.id));
+        self.instance_block_drafts
+            .entry(m.id)
+            .or_insert_with(|| crate::triggers::load_monitor_block_scope(&self.core.store, m.id));
         let global_order = load_source_order(&self.core.store);
         let mut scope_dirty = false;
         let mut trigger_dirty = false;
+        let mut block_dirty = false;
 
         let mut open = true;
         ctx.show_viewport_immediate(
@@ -144,7 +149,7 @@ impl StreamArchiverApp {
                 }
 
                 // ── Trigger words (this instance) ────────────────────────
-                self.instance_props_triggers_section(ui, mid, &mut trigger_dirty);
+                self.instance_props_triggers_section(ui, mid, &mut trigger_dirty, &mut block_dirty);
 
                 // ── Schedule sources (this instance) ─────────────────────
                 self.instance_props_sched_section(ui, mid, &global_order, &mut scope_dirty);
@@ -162,6 +167,7 @@ impl StreamArchiverApp {
             &inst_account,
             scope_dirty,
             trigger_dirty,
+            block_dirty,
             refetch,
             open_emote_viewer,
             open_asset_history,
@@ -558,6 +564,7 @@ impl StreamArchiverApp {
         ui: &mut egui::Ui,
         mid: i64,
         trigger_dirty: &mut bool,
+        block_dirty: &mut bool,
     ) {
         egui::CollapsingHeader::new(egui::RichText::new("Trigger words").strong())
             .id_salt("inst_props_sec_triggers")
@@ -573,9 +580,29 @@ impl StreamArchiverApp {
                 .weak(),
             );
             if let Some(scope) = self.instance_trigger_drafts.get_mut(&mid)
-                && trigger_scope_editor(ui, scope, "inst_triggers")
+                && trigger_scope_editor(ui, scope, "inst_triggers", true)
             {
                 *trigger_dirty = true;
+            }
+            });
+        egui::CollapsingHeader::new(egui::RichText::new("Blacklist triggers").strong())
+            .id_salt("inst_props_sec_block_triggers")
+            .default_open(false)
+            .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "PREVENT automatic recording while the live title/game matches — \
+                     manual ▶ Start still records. Inherits the channel's blacklist, \
+                     which inherits the global one (Settings → Downloads → Blacklist \
+                     triggers).",
+                )
+                .small()
+                .weak(),
+            );
+            if let Some(scope) = self.instance_block_drafts.get_mut(&mid)
+                && trigger_scope_editor(ui, scope, "inst_block_triggers", false)
+            {
+                *block_dirty = true;
             }
             });
     }
@@ -624,6 +651,7 @@ impl StreamArchiverApp {
         inst_account: &Option<AssetAccount>,
         scope_dirty: bool,
         trigger_dirty: bool,
+        block_dirty: bool,
         refetch: bool,
         open_emote_viewer: Option<(EmoteProvider, AssetAccount)>,
         open_asset_history: bool,
@@ -643,6 +671,12 @@ impl StreamArchiverApp {
             && let Err(e) = crate::triggers::save_monitor_trigger_scope(&self.core.store, mid, scope)
         {
             self.status = format!("Error saving trigger words: {e}");
+        }
+        if block_dirty
+            && let Some(scope) = self.instance_block_drafts.get(&mid)
+            && let Err(e) = crate::triggers::save_monitor_block_scope(&self.core.store, mid, scope)
+        {
+            self.status = format!("Error saving blacklist triggers: {e}");
         }
 
         // ⟳ Refetch dispatches outside the viewport closure (same cache-drop set
@@ -889,6 +923,7 @@ impl StreamArchiverApp {
             self.channel_cfg_drafts.remove(&cid);
             self.channel_scope_drafts.remove(&cid);
             self.channel_trigger_drafts.remove(&cid);
+            self.channel_block_drafts.remove(&cid);
             // Free the full-resolution thumbnail textures; they reload from disk
             // on the next open. Kept while an instance-Properties window of this
             // channel is still open — those share the same caches.
@@ -958,10 +993,14 @@ impl StreamArchiverApp {
         self.channel_trigger_drafts
             .entry(ch.id)
             .or_insert_with(|| crate::triggers::load_channel_trigger_scope(&self.core.store, ch.id));
+        self.channel_block_drafts
+            .entry(ch.id)
+            .or_insert_with(|| crate::triggers::load_channel_block_scope(&self.core.store, ch.id));
         let global_order = self.props_source_order.clone();
         let mut cfg_dirty = false;
         let mut scope_dirty = false;
         let mut trigger_dirty = false;
+        let mut block_dirty = false;
 
         // The first-open asset loads are done; everything from here is the sub-window
         // build + paint. Stamp that distinctly so a freeze here is attributed to the
@@ -1012,7 +1051,7 @@ impl StreamArchiverApp {
                 Self::channel_props_channel_section(ui, &ch);
 
                 // ── Trigger words (per-channel) ──────────────────────────
-                self.channel_props_triggers_section(ui, cid, &mut trigger_dirty);
+                self.channel_props_triggers_section(ui, cid, &mut trigger_dirty, &mut block_dirty);
 
                 // ── Schedule sources (per-channel) ───────────────────────
                 self.channel_props_sched_section(
@@ -1043,6 +1082,7 @@ impl StreamArchiverApp {
             cfg_dirty,
             scope_dirty,
             trigger_dirty,
+            block_dirty,
         );
 
         // Draft/texture cleanup for a closed window happens in the caller
@@ -1549,6 +1589,7 @@ impl StreamArchiverApp {
         ui: &mut egui::Ui,
         cid: i64,
         trigger_dirty: &mut bool,
+        block_dirty: &mut bool,
     ) {
         egui::CollapsingHeader::new(egui::RichText::new("Trigger words").strong())
             .id_salt("ch_props_sec_triggers")
@@ -1564,9 +1605,29 @@ impl StreamArchiverApp {
                 .weak(),
             );
             if let Some(scope) = self.channel_trigger_drafts.get_mut(&cid)
-                && trigger_scope_editor(ui, scope, "ch_triggers")
+                && trigger_scope_editor(ui, scope, "ch_triggers", true)
             {
                 *trigger_dirty = true;
+            }
+            });
+        egui::CollapsingHeader::new(egui::RichText::new("Blacklist triggers").strong())
+            .id_salt("ch_props_sec_block_triggers")
+            .default_open(false)
+            .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "PREVENT automatic recording while the live title/game matches — for \
+                     every instance in this channel; manual ▶ Start still records. \
+                     Inherits the global blacklist (Settings → Downloads → Blacklist \
+                     triggers); instances can override again.",
+                )
+                .small()
+                .weak(),
+            );
+            if let Some(scope) = self.channel_block_drafts.get_mut(&cid)
+                && trigger_scope_editor(ui, scope, "ch_block_triggers", false)
+            {
+                *block_dirty = true;
             }
             });
     }
@@ -1746,6 +1807,7 @@ impl StreamArchiverApp {
         cfg_dirty: bool,
         scope_dirty: bool,
         trigger_dirty: bool,
+        block_dirty: bool,
     ) {
         // The Refetch buttons (header = every account, per-row = one account)
         // dispatch outside the viewport closure.
@@ -1822,6 +1884,12 @@ impl StreamArchiverApp {
             && let Err(e) = crate::triggers::save_channel_trigger_scope(&self.core.store, cid, scope)
         {
             self.status = format!("Error saving trigger words: {e}");
+        }
+        if block_dirty
+            && let Some(scope) = self.channel_block_drafts.get(&cid)
+            && let Err(e) = crate::triggers::save_channel_block_scope(&self.core.store, cid, scope)
+        {
+            self.status = format!("Error saving blacklist triggers: {e}");
         }
     }
 

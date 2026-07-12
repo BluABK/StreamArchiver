@@ -847,6 +847,33 @@ to the automatic recording and the match is recorded the same way.
 > the title; the quota-based *Data API* method does not — use scrape for
 > channels you want triggers on.
 
+### Blacklist triggers (prevent recording on title/game match) 🚫
+
+The exact inverse of trigger words: while the live title or game matches a
+blacklist rule, **automatic recording is suppressed** — for streams you never
+want archived, like "rerun", "24/7", a specific game, or sponsored segments.
+Rules use the same shape (field, Contains/Regex pattern, per-rule enable) and
+the same **global < per-channel < per-instance** Inherit/Extend/Replace/Off
+resolution; global rules live in **Settings → Downloads → Blacklist
+triggers**, overrides in the Properties windows ("Blacklist triggers"
+section). Semantics:
+
+- A blacklist match vetoes **both** Auto-record starts and trigger-word
+  starts — an explicit "don't record this" beats "record this".
+- A **manual ▶ Start always records** — the blacklist only gates automation.
+- Checked at go-live and on every poll. A recording that is **already
+  running** is *not* stopped by a mid-stream match (the veto gates starts
+  only) — but with the stream still matching, the take won't auto-restart
+  after a stop.
+- Detection/metadata keep running: the channel still shows **live** with
+  title/game/thumbnail in the Streams grid, it's just not recorded.
+- When a start is vetoed you get a one-per-broadcast **🚫 Blacklist blocked**
+  notification (which rule matched and the matching text).
+- Push signals without a title (Twitch EventSub) fetch the metadata via a
+  follow-up check before starting whenever blacklist rules exist. If the
+  metadata can't be fetched at all, the recording proceeds (fail-open — an
+  archiver errs on capturing).
+
 ### Scheduled recordings (force-record at a time or on a weekly repeat) 📅
 
 Trigger words fire on *content* (title/game); **scheduled recordings** fire on

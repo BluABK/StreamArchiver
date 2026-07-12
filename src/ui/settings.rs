@@ -126,10 +126,15 @@ pub(super) fn scope_override_editor(
 /// (validated live when regex), a per-rule "capture from start" override, and
 /// remove. Returns true when anything changed (detected by value comparison so
 /// combo selections and add/remove all count).
+///
+/// `with_actions: false` = blacklist mode: the per-rule start-action controls
+/// (From start / Lead / Only while matching) are hidden — a veto has no
+/// recording to act on, and the fields are ignored at match time.
 pub(super) fn trigger_rules_editor(
     ui: &mut egui::Ui,
     rules: &mut Vec<crate::triggers::TriggerRule>,
     salt: &str,
+    with_actions: bool,
 ) -> bool {
     use crate::triggers::{TriggerField, TriggerRule, pattern_error};
     let before = rules.clone();
@@ -175,15 +180,20 @@ pub(super) fn trigger_rules_editor(
                     });
                 }
             }
-            ui.label("From start:").on_hover_text(
-                "Force the 'capture from start' flag for the recording this rule starts \
-                 (unarchived streams usually warrant it). Inherit = the instance's own setting.",
-            );
-            tristate_combo(ui, &format!("{salt}_cfs_{i}"), &mut r.capture_from_start);
+            if with_actions {
+                ui.label("From start:").on_hover_text(
+                    "Force the 'capture from start' flag for the recording this rule starts \
+                     (unarchived streams usually warrant it). Inherit = the instance's own setting.",
+                );
+                tristate_combo(ui, &format!("{salt}_cfs_{i}"), &mut r.capture_from_start);
+            }
             if ui.small_button("🗑").on_hover_text("Remove this rule").clicked() {
                 remove = Some(i);
             }
         });
+        if !with_actions {
+            continue;
+        }
         ui.horizontal(|ui| {
             ui.add_space(24.0); // roughly align under the row above
             ui.label("Lead:");
@@ -305,6 +315,7 @@ pub(super) fn trigger_scope_editor(
     ui: &mut egui::Ui,
     scope: &mut crate::triggers::TriggerScope,
     salt: &str,
+    with_actions: bool,
 ) -> bool {
     use crate::triggers::TriggerMode;
     let before = scope.clone();
@@ -328,7 +339,7 @@ pub(super) fn trigger_scope_editor(
     });
     if matches!(scope.mode, TriggerMode::Extend | TriggerMode::Replace) {
         ui.add_space(2.0);
-        trigger_rules_editor(ui, &mut scope.rules, salt);
+        trigger_rules_editor(ui, &mut scope.rules, salt, with_actions);
     }
     *scope != before
 }
@@ -416,6 +427,7 @@ impl StreamArchiverApp {
             self.settings_vod_download_section(ui);
             self.settings_head_backfill_section(ui);
             self.settings_trigger_words_section(ui);
+            self.settings_blacklist_triggers_section(ui);
             self.settings_vod_recovery_section(ui);
             self.settings_maintenance_section(ui);
             self.settings_diagnostics_section(ui);
@@ -1985,7 +1997,7 @@ impl StreamArchiverApp {
                  rules; channel/instance Properties can extend, replace, or disable them.",
             );
             ui.add_space(6.0);
-            trigger_rules_editor(ui, &mut self.settings.trigger_rules, "settings_triggers");
+            trigger_rules_editor(ui, &mut self.settings.trigger_rules, "settings_triggers", true);
             ui.label(
                 egui::RichText::new(
                     "Note: EventSub-pushed go-lives fetch the title via a follow-up check; \
@@ -1994,6 +2006,24 @@ impl StreamArchiverApp {
                 .small()
                 .weak(),
             );
+            }
+    }
+
+    fn settings_blacklist_triggers_section(&mut self, ui: &mut egui::Ui) {
+            if self.section_shown(SettingsTab::Downloads, "Blacklist triggers", &["blacklist", "block", "trigger", "prevent", "skip", "rerun", "veto", "title", "game", "regex"]) {
+            ui.add_space(12.0);
+            ui.heading("Blacklist triggers 🚫");
+            ui.label(
+                "The inverse of trigger words: PREVENT automatic recording while the live \
+                 title or game matches a rule — e.g. \"rerun\", \"24/7\", or a game you never \
+                 want archived. A blacklist match vetoes both Auto-record and trigger-word \
+                 starts; a manual ▶ Start always records. Checked at go-live and on every \
+                 poll; a recording that is already running is NOT stopped by a mid-stream \
+                 match. These are the GLOBAL rules; channel/instance Properties can extend, \
+                 replace, or disable them.",
+            );
+            ui.add_space(6.0);
+            trigger_rules_editor(ui, &mut self.settings.trigger_block_rules, "settings_block_triggers", false);
 
             // ── Twitch VOD recovery ────────────────────────────────────────────
             }
