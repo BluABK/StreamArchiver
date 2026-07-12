@@ -31,7 +31,7 @@
 
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use parking_lot::RwLock;
@@ -179,12 +179,13 @@ fn gate_sem(map: &'static OnceLock<GateMap>, key: &str, want: usize) -> Arc<Sema
 }
 
 /// Live status of the local gates, for progress messages: every pass holding
-/// a permit right now (label + seconds held, longest first) and how many are
-/// queued across all drives.
+/// a permit right now (label + seconds held, longest first) and every pass
+/// queued (label + drive + seconds waiting, in arrival order).
 static LOCAL_HOLDERS: parking_lot::Mutex<Vec<(u64, String, Instant)>> =
     parking_lot::Mutex::new(Vec::new());
-static NEXT_HOLDER_TOKEN: AtomicU64 = AtomicU64::new(1);
-static LOCAL_WAITING: AtomicUsize = AtomicUsize::new(0);
+static LOCAL_WAITERS: parking_lot::Mutex<Vec<(u64, String, String, Instant)>> =
+    parking_lot::Mutex::new(Vec::new());
+static NEXT_GATE_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 /// `(holders (label, seconds held) longest-first, queue length)`.
 pub fn local_gate_status() -> (Vec<(String, u64)>, usize) {
@@ -194,7 +195,19 @@ pub fn local_gate_status() -> (Vec<(String, u64)>, usize) {
         .map(|(_, l, t)| (l.clone(), t.elapsed().as_secs()))
         .collect();
     holders.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
-    (holders, LOCAL_WAITING.load(Ordering::Relaxed))
+    (holders, LOCAL_WAITERS.lock().len())
+}
+
+/// Every pass currently queued on a local gate — `(label, drive key,
+/// seconds waiting)`, longest-waiting (= next in line per drive) first.
+pub fn local_gate_queue() -> Vec<(String, String, u64)> {
+    let mut v: Vec<(String, String, u64)> = LOCAL_WAITERS
+        .lock()
+        .iter()
+        .map(|(_, l, d, t)| (l.clone(), d.clone(), t.elapsed().as_secs()))
+        .collect();
+    v.sort_by_key(|(.., s)| std::cmp::Reverse(*s));
+    v
 }
 
 /// Held permit of a local gate; removes its holder entry on drop.
@@ -209,12 +222,12 @@ impl Drop for LocalPass {
     }
 }
 
-/// Decrements the waiting counter even when the acquiring future is dropped
+/// Removes the waiter entry even when the acquiring future is dropped
 /// mid-await (task aborted at shutdown).
-struct WaitingGuard;
+struct WaitingGuard(u64);
 impl Drop for WaitingGuard {
     fn drop(&mut self) {
-        LOCAL_WAITING.fetch_sub(1, Ordering::Relaxed);
+        LOCAL_WAITERS.lock().retain(|(t, ..)| *t != self.0);
     }
 }
 
@@ -225,8 +238,9 @@ pub async fn local_pass(label: &str, path: &std::path::Path) -> LocalPass {
     let key = drive_key(path);
     let want = limits_for(path).local_permits as usize;
     let sem = gate_sem(&LOCAL_GATES, &key, want);
-    LOCAL_WAITING.fetch_add(1, Ordering::Relaxed);
-    let _wg = WaitingGuard;
+    let token = NEXT_GATE_TOKEN.fetch_add(1, Ordering::Relaxed);
+    LOCAL_WAITERS.lock().push((token, label.to_string(), key.clone(), Instant::now()));
+    let _wg = WaitingGuard(token);
     let start = Instant::now();
     let permit = sem.acquire_owned().await.expect("io gate semaphore closed");
     let waited = start.elapsed();
@@ -236,7 +250,6 @@ pub async fn local_pass(label: &str, path: &std::path::Path) -> LocalPass {
             waited.as_secs()
         );
     }
-    let token = NEXT_HOLDER_TOKEN.fetch_add(1, Ordering::Relaxed);
     LOCAL_HOLDERS.lock().push((token, label.to_string(), Instant::now()));
     LocalPass { token, _permit: permit }
 }

@@ -498,6 +498,7 @@ impl StreamArchiverApp {
             videos_grid,
             bg_active_grid,
             bg_recent_grid,
+            bg_show_gate_queue: false,
             processes_grid,
             issues_grid,
             reorder_columns: None,

@@ -133,6 +133,11 @@ impl StreamArchiverApp {
                             }
                             if waiting > 0 {
                                 ui.weak(format!("· {waiting} queued"));
+                                let toggle =
+                                    if self.bg_show_gate_queue { "▼ Hide queue" } else { "▶ View queue" };
+                                if ui.small_button(toggle).clicked() {
+                                    self.bg_show_gate_queue = !self.bg_show_gate_queue;
+                                }
                             }
                         })
                         .response;
@@ -146,6 +151,23 @@ impl StreamArchiverApp {
                          Recording → Disk I/O limits). Queued passes list their wait in \
                          their own task row.\n\n{all}"
                     ));
+                    // The queue itself: every pass waiting for a gate, in line
+                    // order (per drive) — includes passes that have no task row
+                    // of their own (batch re-remux items, embeds, head joins).
+                    if self.bg_show_gate_queue && waiting > 0 {
+                        for (i, (label, drive, secs)) in
+                            crate::io_gate::local_gate_queue().into_iter().enumerate()
+                        {
+                            ui.horizontal(|ui| {
+                                ui.add_space(24.0);
+                                ui.weak(format!(
+                                    "{}. {label} [{drive}:] — waiting {}",
+                                    i + 1,
+                                    fmt_duration(secs as i64)
+                                ));
+                            });
+                        }
+                    }
                 }
             }
             ui.add_space(4.0);

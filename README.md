@@ -506,7 +506,10 @@ captures are writing to:
   finished take just sits as a playable `.ts` in `.sa-cache\` a few minutes
   longer. The same applies to the leftover finalizes an app restart picks up.
   The current gate holder and queue are shown live at the top of **Background
-  jobs**, and each queued pass reports its wait in its own task row.
+  jobs**; **▶ View queue** expands the full line-up (every waiting pass with
+  its file, drive, and wait time — including passes that have no task row of
+  their own, like batch re-remux items, embeds, and head joins), and each
+  queued pass with a task row also reports the wait there.
 - CDN-fed muxes (head backfills, VOD recoveries) are capped at **two at a
   time per disk** (default) — DMCA mutes tend to land for several channels
   minutes after a shared stream end, and each recovery writes a full stream to

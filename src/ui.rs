@@ -1002,6 +1002,9 @@ pub struct StreamArchiverApp {
     videos_grid: GridState,
     bg_active_grid: GridState,
     bg_recent_grid: GridState,
+    /// Background view: whether the disk-gate queue list is expanded
+    /// (session-only).
+    bg_show_gate_queue: bool,
     processes_grid: GridState,
     issues_grid: GridState,
     /// Backing state for the "⇕ Reorder columns…" window (`None` = closed) —
