@@ -126,24 +126,32 @@ fn main() -> Result<()> {
         .map(std::path::PathBuf::from);
     watchdog::set_dialog_icon(dialog_icon_path);
 
-    // Post-processing disk throttle (ffmpeg -readrate) from the persisted
-    // setting; updated live when the user changes it in Settings.
-    io_gate::set_readrate(
-        store
-            .get_setting(io_gate::K_POSTPROC_READRATE)
-            .ok()
-            .flatten()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(io_gate::DEFAULT_READRATE),
-    );
-    // VOD/video download rate limit (yt-dlp --limit-rate); empty = off.
-    io_gate::set_download_rate_limit(
-        &store
-            .get_setting(io_gate::K_DOWNLOAD_RATE_LIMIT)
-            .ok()
-            .flatten()
-            .unwrap_or_default(),
-    );
+    // Per-disk I/O limits (gate permits, ffmpeg -readrate, yt-dlp
+    // --limit-rate) from the persisted config; updated live on settings save.
+    // The legacy global keys seed the defaults when the per-disk config has
+    // never been saved.
+    let disk_cfg = store
+        .get_setting(io_gate::K_DISK_LIMITS)
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+        .and_then(|s| serde_json::from_str::<io_gate::DiskLimitsConfig>(&s).ok())
+        .unwrap_or_else(|| {
+            let mut c = io_gate::DiskLimitsConfig::default();
+            c.default.readrate = store
+                .get_setting(io_gate::K_POSTPROC_READRATE)
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(io_gate::DEFAULT_READRATE);
+            c.default.rate_limit = store
+                .get_setting(io_gate::K_DOWNLOAD_RATE_LIMIT)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            c
+        });
+    io_gate::set_disk_limits(disk_cfg);
     // yt-dlp postprocessor args (throttle for its internal ffmpeg passes).
     io_gate::set_ytdlp_ppa(
         &store

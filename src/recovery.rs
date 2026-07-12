@@ -712,7 +712,7 @@ pub async fn mux_playlist_to_mkv(
     // recoveries/head backfills triggering together (e.g. DMCA mutes landing
     // minutes after a shared stream end) must not stack on top of the live
     // captures and finalize passes already hitting the same disk (see io_gate).
-    let _gate = crate::io_gate::cdn_mux("cdn-mux").await;
+    let _gate = crate::io_gate::cdn_mux(&crate::io_gate::gate_label("cdn-mux", dst), dst).await;
 
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-y")

@@ -654,14 +654,15 @@ pub fn build_video_plan(
                 "-o".into(),
                 out_tmpl,
             ];
-            // Global VOD/video download rate limit (Settings → Downloads;
-            // default off). yt-dlp-syntax value, placed before the global
-            // defaults + per-video extra args so either can override it.
-            // Deliberately never applied to live captures — throttling a
-            // live-edge download just makes it fall behind and lose data —
-            // and the other tools have no equivalent flag (streamlink has no
-            // rate limiter; ffmpeg pulls are readrate-gated elsewhere).
-            let rate = crate::io_gate::download_rate_limit();
+            // VOD/video download rate limit for the target disk (Settings →
+            // Downloads / per-disk I/O limits; default off). yt-dlp-syntax
+            // value, placed before the global defaults + per-video extra args
+            // so either can override it. Deliberately never applied to live
+            // captures — throttling a live-edge download just makes it fall
+            // behind and lose data — and the other tools have no equivalent
+            // flag (streamlink has no rate limiter; ffmpeg pulls are
+            // readrate-gated elsewhere).
+            let rate = crate::io_gate::rate_limit_for(&cache);
             if !rate.is_empty() {
                 args.push("--limit-rate".into());
                 args.push(rate);

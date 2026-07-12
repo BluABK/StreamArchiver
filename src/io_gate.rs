@@ -31,10 +31,11 @@
 
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::info;
 
@@ -47,36 +48,164 @@ pub const K_POSTPROC_READRATE: &str = "postproc_readrate";
 /// leaving most of the drive's bandwidth to live captures.
 pub const DEFAULT_READRATE: f64 = 30.0;
 
-static LOCAL_PASS: OnceLock<Arc<Semaphore>> = OnceLock::new();
-static CDN_MUX: OnceLock<Arc<Semaphore>> = OnceLock::new();
+// ===== Per-disk limits =====
 
-/// Live status of the 1-permit local gate, for progress messages: what holds
-/// the permit right now (label + since when) and how many passes are queued.
-struct LocalGateState {
-    holder: Option<(String, Instant)>,
-    waiting: usize,
+fn d_local_permits() -> u32 {
+    1
 }
-static LOCAL_STATE: parking_lot::Mutex<LocalGateState> =
-    parking_lot::Mutex::new(LocalGateState { holder: None, waiting: 0 });
-
-/// `(current holder label + seconds held, queue length incl. the asker)` of
-/// the local gate — lets a queued pass report WHAT it is waiting behind.
-pub fn local_gate_status() -> (Option<(String, u64)>, usize) {
-    let st = LOCAL_STATE.lock();
-    (
-        st.holder.as_ref().map(|(l, t)| (l.clone(), t.elapsed().as_secs())),
-        st.waiting,
-    )
+fn d_cdn_permits() -> u32 {
+    2
+}
+fn d_readrate() -> f64 {
+    DEFAULT_READRATE
 }
 
-/// Held permit of the local gate; clears the holder label on drop.
+/// The tunable I/O limits for one disk (or the default for all disks).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DiskLimits {
+    /// Concurrent local full-file ffmpeg passes (remux/concat/embed/merge).
+    #[serde(default = "d_local_permits")]
+    pub local_permits: u32,
+    /// Concurrent CDN-fed muxes (head backfill, VOD recovery).
+    #[serde(default = "d_cdn_permits")]
+    pub cdn_permits: u32,
+    /// ffmpeg `-readrate` multiplier for local passes; 0 = unthrottled.
+    #[serde(default = "d_readrate")]
+    pub readrate: f64,
+    /// yt-dlp `--limit-rate` for non-live downloads landing on this disk
+    /// (e.g. `4M`, `500K`); empty = unlimited.
+    #[serde(default)]
+    pub rate_limit: String,
+}
+
+impl Default for DiskLimits {
+    fn default() -> Self {
+        DiskLimits {
+            local_permits: d_local_permits(),
+            cdn_permits: d_cdn_permits(),
+            readrate: d_readrate(),
+            rate_limit: String::new(),
+        }
+    }
+}
+
+/// The whole per-disk configuration: a default + per-drive-letter overrides.
+/// Persisted as JSON under [`K_DISK_LIMITS`].
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DiskLimitsConfig {
+    #[serde(default)]
+    pub default: DiskLimits,
+    /// Uppercase drive letter (e.g. `"A"`) → overrides for that disk.
+    #[serde(default)]
+    pub drives: std::collections::HashMap<String, DiskLimits>,
+}
+
+/// Settings key for [`DiskLimitsConfig`] (JSON).
+pub const K_DISK_LIMITS: &str = "disk_io_limits";
+
+static DISK_CFG: parking_lot::RwLock<Option<DiskLimitsConfig>> = parking_lot::RwLock::new(None);
+
+/// Install the per-disk limits (startup from the persisted setting + settings
+/// save). Gate permit counts adjust lazily on each gate's next acquisition.
+pub fn set_disk_limits(cfg: DiskLimitsConfig) {
+    *DISK_CFG.write() = Some(cfg);
+}
+
+/// The current config (for the Settings editor).
+pub fn disk_limits_config() -> DiskLimitsConfig {
+    DISK_CFG.read().clone().unwrap_or_default()
+}
+
+/// Uppercase drive-letter key for a path (`"A"`), or `"*"` for UNC/relative
+/// paths (they share one bucket).
+fn drive_key(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy();
+    let mut ch = s.chars();
+    match (ch.next(), ch.next()) {
+        (Some(l), Some(':')) if l.is_ascii_alphabetic() => l.to_ascii_uppercase().to_string(),
+        _ => "*".to_string(),
+    }
+}
+
+/// The effective limits for the disk `path` lives on.
+pub fn limits_for(path: &std::path::Path) -> DiskLimits {
+    let cfg = DISK_CFG.read();
+    let Some(cfg) = cfg.as_ref() else { return DiskLimits::default() };
+    cfg.drives.get(&drive_key(path)).cloned().unwrap_or_else(|| cfg.default.clone())
+}
+
+// ===== Gates (per drive) =====
+
+struct GateEntry {
+    sem: Arc<Semaphore>,
+    permits: usize,
+}
+
+type GateMap = parking_lot::Mutex<std::collections::HashMap<String, GateEntry>>;
+static LOCAL_GATES: OnceLock<GateMap> = OnceLock::new();
+static CDN_GATES: OnceLock<GateMap> = OnceLock::new();
+
+/// Get (or create) the semaphore for `key`, adjusting its permit count to the
+/// configured value: growth is immediate (`add_permits`); shrink acquires the
+/// excess permits in the background and forgets them, so it takes effect as
+/// running passes finish. Called on every acquisition — config changes apply
+/// lazily without any runtime plumbing.
+fn gate_sem(map: &'static OnceLock<GateMap>, key: &str, want: usize) -> Arc<Semaphore> {
+    let want = want.max(1);
+    let m = map.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let mut g = m.lock();
+    let e = g.entry(key.to_string()).or_insert_with(|| GateEntry {
+        sem: Arc::new(Semaphore::new(want)),
+        permits: want,
+    });
+    match want.cmp(&e.permits) {
+        std::cmp::Ordering::Greater => {
+            e.sem.add_permits(want - e.permits);
+            e.permits = want;
+        }
+        std::cmp::Ordering::Less => {
+            let take = (e.permits - want) as u32;
+            let sem = e.sem.clone();
+            e.permits = want;
+            tokio::spawn(async move {
+                if let Ok(p) = sem.acquire_many_owned(take).await {
+                    p.forget();
+                }
+            });
+        }
+        std::cmp::Ordering::Equal => {}
+    }
+    e.sem.clone()
+}
+
+/// Live status of the local gates, for progress messages: every pass holding
+/// a permit right now (label + seconds held, longest first) and how many are
+/// queued across all drives.
+static LOCAL_HOLDERS: parking_lot::Mutex<Vec<(u64, String, Instant)>> =
+    parking_lot::Mutex::new(Vec::new());
+static NEXT_HOLDER_TOKEN: AtomicU64 = AtomicU64::new(1);
+static LOCAL_WAITING: AtomicUsize = AtomicUsize::new(0);
+
+/// `(holders (label, seconds held) longest-first, queue length)`.
+pub fn local_gate_status() -> (Vec<(String, u64)>, usize) {
+    let mut holders: Vec<(String, u64)> = LOCAL_HOLDERS
+        .lock()
+        .iter()
+        .map(|(_, l, t)| (l.clone(), t.elapsed().as_secs()))
+        .collect();
+    holders.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
+    (holders, LOCAL_WAITING.load(Ordering::Relaxed))
+}
+
+/// Held permit of a local gate; removes its holder entry on drop.
 pub struct LocalPass {
+    token: u64,
     _permit: OwnedSemaphorePermit,
 }
 
 impl Drop for LocalPass {
     fn drop(&mut self) {
-        LOCAL_STATE.lock().holder = None;
+        LOCAL_HOLDERS.lock().retain(|(t, ..)| *t != self.token);
     }
 }
 
@@ -85,57 +214,50 @@ impl Drop for LocalPass {
 struct WaitingGuard;
 impl Drop for WaitingGuard {
     fn drop(&mut self) {
-        LOCAL_STATE.lock().waiting -= 1;
+        LOCAL_WAITING.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
-/// Configured readrate ×10 (fixed-point so it fits an atomic). 0 = off.
-static READRATE_X10: AtomicU32 = AtomicU32::new((DEFAULT_READRATE * 10.0) as u32);
-/// Set once if the installed ffmpeg rejects `-readrate` (pre-5.0).
-static READRATE_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
-
-async fn acquire(gate: &'static OnceLock<Arc<Semaphore>>, permits: usize, label: &str) -> OwnedSemaphorePermit {
-    let sem = gate.get_or_init(|| Arc::new(Semaphore::new(permits))).clone();
+/// Acquire the local-passes gate of the disk `path` lives on (permit count
+/// per Settings → per-disk I/O limits; default 1). Hold the returned guard
+/// for the duration of the ffmpeg run; drop to release.
+pub async fn local_pass(label: &str, path: &std::path::Path) -> LocalPass {
+    let key = drive_key(path);
+    let want = limits_for(path).local_permits as usize;
+    let sem = gate_sem(&LOCAL_GATES, &key, want);
+    LOCAL_WAITING.fetch_add(1, Ordering::Relaxed);
+    let _wg = WaitingGuard;
     let start = Instant::now();
     let permit = sem.acquire_owned().await.expect("io gate semaphore closed");
     let waited = start.elapsed();
     if waited.as_secs() >= 5 {
         info!(
-            "disk gate: {label} waited {}s for its turn (other bulk passes running)",
+            "disk gate [{key}]: {label} waited {}s for its turn (other bulk passes running)",
             waited.as_secs()
         );
     }
-    permit
+    let token = NEXT_HOLDER_TOKEN.fetch_add(1, Ordering::Relaxed);
+    LOCAL_HOLDERS.lock().push((token, label.to_string(), Instant::now()));
+    LocalPass { token, _permit: permit }
 }
 
-/// Acquire the single-permit gate for local full-file passes (remux, concat,
-/// embed). Hold the permit for the duration of the ffmpeg run; drop to release.
-pub async fn local_pass(label: &str) -> LocalPass {
-    let _wg = {
-        LOCAL_STATE.lock().waiting += 1;
-        WaitingGuard
-    };
-    let permit = acquire(&LOCAL_PASS, 1, label).await;
-    LOCAL_STATE.lock().holder = Some((label.to_string(), Instant::now()));
-    LocalPass { _permit: permit }
-}
-
-/// [`local_pass`], but invokes `on_wait(waited_secs, holder, queue_len)`
+/// [`local_pass`], but invokes `on_wait(waited_secs, holders, queue_len)`
 /// every 5 s while queued — callers surface it as task progress so a queued
 /// pass is visibly waiting (and on what) instead of looking stale.
 pub async fn local_pass_with_progress(
     label: &str,
-    mut on_wait: impl FnMut(u64, Option<(String, u64)>, usize),
+    path: &std::path::Path,
+    mut on_wait: impl FnMut(u64, Vec<(String, u64)>, usize),
 ) -> LocalPass {
-    let fut = local_pass(label);
+    let fut = local_pass(label, path);
     tokio::pin!(fut);
     let started = Instant::now();
     loop {
         tokio::select! {
             p = &mut fut => return p,
             _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-                let (holder, waiting) = local_gate_status();
-                on_wait(started.elapsed().as_secs(), holder, waiting);
+                let (holders, waiting) = local_gate_status();
+                on_wait(started.elapsed().as_secs(), holders, waiting);
             }
         }
     }
@@ -157,11 +279,16 @@ pub fn gate_label(kind: &str, path: &std::path::Path) -> String {
 }
 
 /// Standard human line for a queued pass's progress info, e.g.
-/// `⏳ queued for disk gate 45s — running now: remux (312s) · 3 in queue`.
-pub fn wait_info(waited_secs: u64, holder: Option<(String, u64)>, waiting: usize) -> String {
+/// `⏳ queued for disk gate 45s — running now: remux: Vienna… (312s) · 3 in queue`.
+pub fn wait_info(waited_secs: u64, holders: Vec<(String, u64)>, waiting: usize) -> String {
     let mut s = format!("⏳ queued for disk gate {waited_secs}s");
-    match holder {
-        Some((label, held)) => s.push_str(&format!(" — running now: {label} ({held}s)")),
+    match holders.first() {
+        Some((label, held)) => {
+            s.push_str(&format!(" — running now: {label} ({held}s)"));
+            if holders.len() > 1 {
+                s.push_str(&format!(" +{} more", holders.len() - 1));
+            }
+        }
         None => s.push_str(" — gate turning over"),
     }
     if waiting > 1 {
@@ -170,25 +297,38 @@ pub fn wait_info(waited_secs: u64, holder: Option<(String, u64)>, waiting: usize
     s
 }
 
-/// Acquire the 2-permit gate for CDN-fed muxes (head backfill, VOD recovery).
-pub async fn cdn_mux(label: &str) -> OwnedSemaphorePermit {
-    acquire(&CDN_MUX, 2, label).await
+/// Acquire the CDN-mux gate of the disk `path` lives on (permit count per
+/// Settings → per-disk I/O limits; default 2). Head backfills and VOD
+/// recoveries write at network speed — gentler than a local pass, but
+/// unbounded stacking still saturates a drive.
+pub async fn cdn_mux(label: &str, path: &std::path::Path) -> OwnedSemaphorePermit {
+    let key = drive_key(path);
+    let want = limits_for(path).cdn_permits as usize;
+    let sem = gate_sem(&CDN_GATES, &key, want);
+    let start = Instant::now();
+    let permit = sem.acquire_owned().await.expect("io gate semaphore closed");
+    let waited = start.elapsed();
+    if waited.as_secs() >= 5 {
+        info!(
+            "disk gate [{key}]: {label} waited {}s for its turn (other CDN muxes running)",
+            waited.as_secs()
+        );
+    }
+    permit
 }
 
-/// Set the post-processing readrate multiplier (0 disables the throttle).
-/// Called at startup from the persisted setting and again on settings save.
-pub fn set_readrate(mult: f64) {
-    READRATE_X10.store((mult.clamp(0.0, 1000.0) * 10.0).round() as u32, Ordering::Relaxed);
-}
+/// Set once if the installed ffmpeg rejects `-readrate` (pre-5.0).
+static READRATE_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
 
-/// The `-readrate` multiplier to pass to local post-processing ffmpeg runs,
-/// or `None` when disabled or known-unsupported by the installed ffmpeg.
-pub fn readrate() -> Option<f64> {
+/// The `-readrate` multiplier for a local post-processing ffmpeg pass writing
+/// to `path`'s disk, or `None` when disabled for that disk or known-unsupported
+/// by the installed ffmpeg.
+pub fn readrate_for(path: &std::path::Path) -> Option<f64> {
     if READRATE_UNSUPPORTED.load(Ordering::Relaxed) {
         return None;
     }
-    let x10 = READRATE_X10.load(Ordering::Relaxed);
-    (x10 > 0).then(|| f64::from(x10) / 10.0)
+    let r = limits_for(path).readrate;
+    (r > 0.0).then_some(r)
 }
 
 /// Remember (process-wide) that this ffmpeg build rejects `-readrate`.
@@ -198,26 +338,18 @@ pub fn mark_readrate_unsupported() {
     }
 }
 
-/// Settings key for the VOD/video download rate limit (yt-dlp `--limit-rate`
-/// syntax, e.g. `4M` or `500K`; empty = unlimited, the default).
+/// Settings key for the LEGACY global download rate limit (yt-dlp
+/// `--limit-rate` syntax). Still persisted; seeds [`DiskLimitsConfig`]'s
+/// default when the per-disk config has never been saved.
 pub const K_DOWNLOAD_RATE_LIMIT: &str = "download_rate_limit";
 
-/// Configured `--limit-rate` value for non-live yt-dlp downloads (VOD-archive
-/// grabs + Videos-tab downloads). Empty = off. Live captures are never
-/// limited — a capture that can't keep up with the live edge loses data.
-static DOWNLOAD_RATE_LIMIT: RwLock<String> = RwLock::new(String::new());
-
-/// Set the download rate limit (startup from the persisted setting + settings
-/// save). Applies to downloads *started* afterwards; in-flight ones keep
-/// their launch args.
-pub fn set_download_rate_limit(v: &str) {
-    *DOWNLOAD_RATE_LIMIT.write() = v.trim().to_string();
-}
-
-/// The `--limit-rate` value for non-live yt-dlp downloads, or an empty string
-/// when unlimited.
-pub fn download_rate_limit() -> String {
-    DOWNLOAD_RATE_LIMIT.read().clone()
+/// The `--limit-rate` value for a non-live yt-dlp download landing on
+/// `path`'s disk (VOD-archive grabs + Videos-tab downloads), or an empty
+/// string when unlimited. Live captures are never limited — a capture that
+/// can't keep up with the live edge loses data. Applies to downloads
+/// *started* after a settings change; in-flight ones keep their launch args.
+pub fn rate_limit_for(path: &std::path::Path) -> String {
+    limits_for(path).rate_limit.trim().to_string()
 }
 
 /// Settings key for yt-dlp postprocessor args (`--postprocessor-args` specs,
@@ -251,27 +383,89 @@ pub fn is_readrate_error(stderr: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[tokio::test]
-    async fn local_pass_serializes() {
-        let a = local_pass("a").await;
-        // Second acquisition must not be immediately available.
-        let sem = LOCAL_PASS.get().unwrap().clone();
+    async fn local_pass_serializes_per_drive() {
+        // Distinct test drive letters so other tests' config doesn't interfere.
+        let qa = Path::new(r"Q:\x\a.mkv");
+        let a = local_pass("a", qa).await;
+        // Same drive: second acquisition must not be immediately available…
+        let sem = gate_sem(&LOCAL_GATES, "Q", 1);
         assert!(sem.clone().try_acquire_owned().is_err());
+        // …but ANOTHER drive's gate is independent.
+        let b = local_pass("b", Path::new(r"R:\y\b.mkv")).await;
+        // Both show as holders. (No assertion on the waiting count or on
+        // total holders — the sibling tests share the global registries.)
+        let (holders, _waiting) = local_gate_status();
+        assert!(holders.iter().any(|(l, _)| l == "a"));
+        assert!(holders.iter().any(|(l, _)| l == "b"));
         drop(a);
+        drop(b);
         assert!(sem.try_acquire_owned().is_ok());
+        let (holders, _) = local_gate_status();
+        assert!(!holders.iter().any(|(l, _)| l == "a" || l == "b"));
+    }
+
+    #[tokio::test]
+    async fn per_drive_limits_and_permit_adjustment() {
+        let mut cfg = DiskLimitsConfig::default();
+        cfg.default.readrate = 30.0;
+        cfg.drives.insert(
+            "S".into(),
+            DiskLimits { local_permits: 2, cdn_permits: 1, readrate: 0.0, rate_limit: "4M".into() },
+        );
+        set_disk_limits(cfg);
+        let s = Path::new(r"S:\rec\file.ts");
+        let t = Path::new(r"T:\rec\file.ts");
+        // Per-drive resolution: S is unthrottled with a rate limit, T inherits.
+        // (Asserted via limits_for, not readrate_for — the sibling test latches
+        // the process-wide readrate-unsupported flag and tests run in parallel.)
+        assert_eq!(limits_for(s).readrate, 0.0);
+        assert_eq!(rate_limit_for(s), "4M");
+        assert_eq!(limits_for(t).readrate, 30.0);
+        assert_eq!(rate_limit_for(t), "");
+        // S's local gate has 2 permits: two concurrent passes, not three.
+        let p1 = local_pass("s1", s).await;
+        let p2 = local_pass("s2", s).await;
+        let sem = gate_sem(&LOCAL_GATES, "S", 2);
+        assert!(sem.try_acquire_owned().is_err());
+        drop(p1);
+        drop(p2);
+        // Shrink to 1: gate_sem spawns the reducer; next config read wants 1.
+        let mut cfg = disk_limits_config();
+        cfg.drives.get_mut("S").unwrap().local_permits = 1;
+        set_disk_limits(cfg);
+        let _p = local_pass("s3", s).await;
+        tokio::task::yield_now().await; // let the reducer task grab the excess
+        let sem = gate_sem(&LOCAL_GATES, "S", 1);
+        assert!(sem.try_acquire_owned().is_err());
+        // Restore defaults so other tests see a clean config.
+        set_disk_limits(DiskLimitsConfig::default());
     }
 
     #[test]
-    fn readrate_roundtrip_and_unsupported_latch() {
-        set_readrate(12.5);
-        assert_eq!(readrate(), Some(12.5));
-        set_readrate(0.0);
-        assert_eq!(readrate(), None);
-        set_readrate(30.0);
+    fn readrate_unsupported_latch() {
+        let p = Path::new(r"U:\x.ts");
         assert!(is_readrate_error("Unrecognized option 'readrate'."));
         assert!(!is_readrate_error("Invalid data found when processing input"));
         mark_readrate_unsupported();
-        assert_eq!(readrate(), None);
+        assert_eq!(readrate_for(p), None);
+    }
+
+    #[test]
+    fn drive_keys_and_serde() {
+        assert_eq!(drive_key(Path::new(r"A:\streams\x.ts")), "A");
+        assert_eq!(drive_key(Path::new(r"c:\x.ts")), "C");
+        assert_eq!(drive_key(Path::new(r"\\nas\share\x.ts")), "*");
+        assert_eq!(drive_key(Path::new("relative/x.ts")), "*");
+        // Minimal/old JSON deserializes with defaults filled in.
+        let cfg: DiskLimitsConfig =
+            serde_json::from_str(r#"{"drives":{"A":{"local_permits":2}}}"#).unwrap();
+        assert_eq!(cfg.default, DiskLimits::default());
+        let a = &cfg.drives["A"];
+        assert_eq!(a.local_permits, 2);
+        assert_eq!(a.cdn_permits, 2);
+        assert_eq!(a.readrate, DEFAULT_READRATE);
     }
 }

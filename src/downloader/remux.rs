@@ -187,9 +187,9 @@ pub(super) async fn concat_mkvs(
     crate::iomon::fs::write(Cat::ConcatList, &list_path, list).await?;
 
     // One full-file pass at a time on the recordings drive (see io_gate).
-    let _gate = crate::io_gate::local_pass(&crate::io_gate::gate_label("concat", dst)).await;
+    let _gate = crate::io_gate::local_pass(&crate::io_gate::gate_label("concat", dst), dst).await;
     let out = loop {
-        let readrate = crate::io_gate::readrate();
+        let readrate = crate::io_gate::readrate_for(dst);
         let mut cmd = Command::new("ffmpeg");
         cmd.arg("-y")
             .arg("-fflags")
@@ -285,16 +285,16 @@ pub(super) async fn remux_ts_to_mkv_impl(
     let gate = match &progress_tx {
         Some((tx, id)) => {
             let (tx, id) = (tx.clone(), *id);
-            crate::io_gate::local_pass_with_progress(&label, move |waited, holder, waiting| {
+            crate::io_gate::local_pass_with_progress(&label, dst, move |waited, holders, waiting| {
                 let _ = tx.send(AppEvent::BackgroundTaskProgress {
                     id,
                     progress: None,
-                    info: crate::io_gate::wait_info(waited, holder, waiting),
+                    info: crate::io_gate::wait_info(waited, holders, waiting),
                 });
             })
             .await
         }
-        None => crate::io_gate::local_pass(&label).await,
+        None => crate::io_gate::local_pass(&label, dst).await,
     };
     remux_ts_to_mkv_gated(src, dst, progress_tx, opts, allow_readrate, gate).await
 }
@@ -317,7 +317,7 @@ async fn remux_ts_to_mkv_gated(
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
-    let readrate = if allow_readrate { crate::io_gate::readrate() } else { None };
+    let readrate = if allow_readrate { crate::io_gate::readrate_for(dst) } else { None };
 
     // Get total duration so we can compute a percentage from ffmpeg's output.
     let total_us: Option<i64> = if progress_tx.is_some() {
@@ -728,9 +728,10 @@ pub async fn embed_thumbnail_into_mkv(mkv: &Path, thumb: &Path) -> anyhow::Resul
     };
     let cover_name = format!("cover.{ext}");
     // One full-file pass at a time on the recordings drive (see io_gate).
-    let _gate = crate::io_gate::local_pass("embed-thumbnail").await;
+    let _gate =
+        crate::io_gate::local_pass(&crate::io_gate::gate_label("embed-thumbnail", mkv), mkv).await;
     let out = loop {
-        let readrate = crate::io_gate::readrate();
+        let readrate = crate::io_gate::readrate_for(mkv);
         let mut cmd = Command::new("ffmpeg");
         cmd.arg("-y");
         if let Some(rate) = readrate {
@@ -788,9 +789,10 @@ pub async fn embed_subtitles_into_mkv(mkv: &Path) -> anyhow::Result<bool> {
     }
     let tmp = mkv.with_extension("tmp.mkv");
     // One full-file pass at a time on the recordings drive (see io_gate).
-    let _gate = crate::io_gate::local_pass("embed-subs").await;
+    let _gate =
+        crate::io_gate::local_pass(&crate::io_gate::gate_label("embed-subs", mkv), mkv).await;
     let out = loop {
-        let readrate = crate::io_gate::readrate();
+        let readrate = crate::io_gate::readrate_for(mkv);
         let mut cmd = Command::new("ffmpeg");
         cmd.arg("-y");
         if let Some(rate) = readrate {

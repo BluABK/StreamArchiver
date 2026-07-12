@@ -574,6 +574,13 @@ struct SettingsForm {
     /// selectable alongside the system yt-dlp / SABR build in the Videos-tab
     /// download form.
     custom_tools: Vec<crate::downloader::CustomTool>,
+    /// Default concurrent local full-file ffmpeg passes per disk (min 1).
+    disk_default_local: u32,
+    /// Default concurrent CDN-fed muxes per disk (min 1).
+    disk_default_cdn: u32,
+    /// Per-drive I/O limit overrides: (drive letter, limits). The default
+    /// readrate/rate-limit live in `postproc_readrate`/`download_rate_limit`.
+    disk_overrides: Vec<(String, crate::io_gate::DiskLimits)>,
 }
 /// Lazy cache of decoded post images, keyed by content hash: an egui texture +
 /// its pixel dimensions, or `None` when the decode failed.

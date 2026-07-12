@@ -202,6 +202,16 @@ impl StreamArchiverApp {
             trigger_rules: crate::triggers::load_global_rules(&core.store),
             trigger_block_rules: crate::triggers::load_global_block_rules(&core.store),
             custom_tools: crate::downloader::load_custom_tools(&core.store),
+            // Installed by main() before the UI starts, so this reflects the
+            // persisted per-disk config (or the legacy-seeded defaults).
+            disk_default_local: crate::io_gate::disk_limits_config().default.local_permits,
+            disk_default_cdn: crate::io_gate::disk_limits_config().default.cdn_permits,
+            disk_overrides: {
+                let mut v: Vec<_> =
+                    crate::io_gate::disk_limits_config().drives.into_iter().collect();
+                v.sort_by(|a, b| a.0.cmp(&b.0));
+                v
+            },
         };
         // Apply the loaded date format + short-timestamp pattern before the first render.
         set_active_date_fmt(settings.date_fmt);
@@ -1451,10 +1461,41 @@ impl StreamArchiverApp {
         // Apply the (possibly changed) date format + short-timestamp pattern to the live UI.
         set_active_date_fmt(self.settings.date_fmt);
         set_short_ts_pattern(&self.settings.short_ts_fmt);
-        // Apply the post-processing disk throttle to in-flight and future passes.
-        crate::io_gate::set_readrate(self.settings.postproc_readrate);
-        // Apply the download rate limit to downloads started from now on.
-        crate::io_gate::set_download_rate_limit(&self.settings.download_rate_limit);
+        // Per-disk I/O limits: the global throttle/rate-limit controls are the
+        // defaults; the per-drive overrides come from the table. Applied to
+        // passes/downloads started from now on (gate permits adjust on each
+        // gate's next acquisition).
+        let disk_cfg = crate::io_gate::DiskLimitsConfig {
+            default: crate::io_gate::DiskLimits {
+                local_permits: self.settings.disk_default_local.max(1),
+                cdn_permits: self.settings.disk_default_cdn.max(1),
+                readrate: self.settings.postproc_readrate,
+                rate_limit: self.settings.download_rate_limit.trim().to_string(),
+            },
+            drives: self
+                .settings
+                .disk_overrides
+                .iter()
+                .filter_map(|(letter, lim)| {
+                    let l = letter.trim().to_uppercase();
+                    (l.len() == 1 && l.chars().all(|c| c.is_ascii_alphabetic()))
+                        .then(|| (l, lim.clone()))
+                })
+                .collect(),
+        };
+        match serde_json::to_string(&disk_cfg) {
+            Ok(json) => {
+                if let Err(e) = self.core.store.set_setting(crate::io_gate::K_DISK_LIMITS, &json) {
+                    self.status = format!("Error saving disk I/O limits: {e}");
+                    return;
+                }
+            }
+            Err(e) => {
+                self.status = format!("Error saving disk I/O limits: {e}");
+                return;
+            }
+        }
+        crate::io_gate::set_disk_limits(disk_cfg);
         crate::downloader::set_cache_root(&self.settings.capture_cache_root);
         crate::io_gate::set_ytdlp_ppa(&self.settings.ytdlp_ppa);
         // I/O monitor: apply the sample-log toggle and re-register the

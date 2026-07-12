@@ -423,6 +423,7 @@ impl StreamArchiverApp {
             self.settings_notifications_section(ui);
             self.settings_shutdown_section(ui);
             self.settings_remux_section(ui);
+            self.settings_disk_io_section(ui);
             self.settings_file_management_section(ui);
             self.settings_vod_download_section(ui);
             self.settings_head_backfill_section(ui);
@@ -983,12 +984,13 @@ impl StreamArchiverApp {
                     ui.end_row();
                     ui.label("Download rate limit").on_hover_text(
                         "yt-dlp --limit-rate for VOD-archive grabs and Videos-tab \
-                         downloads (e.g. 4M, 500K). Empty = unlimited. Never applied \
-                         to live captures — throttling the live edge loses data. \
-                         Useful when post-stream VOD downloads write to the same \
-                         drive as active recordings.",
+                         downloads. Moved to Settings → Recording → \"Disk I/O \
+                         limits\" — configurable per target drive (default row = \
+                         the old global value).",
                     );
-                    ui.text_edit_singleline(&mut self.settings.download_rate_limit);
+                    ui.label(
+                        egui::RichText::new("see Recording → Disk I/O limits").weak(),
+                    );
                     ui.end_row();
                     ui.label("Filename media info")
                         .on_hover_text(
@@ -1765,21 +1767,11 @@ impl StreamArchiverApp {
                     ui.checkbox(&mut self.settings.remux_embed_subs, "Embed subtitle sidecars");
                     ui.label("Copy .srt/.ass/.vtt sidecar files as subtitle streams in the MKV.");
                     ui.end_row();
-                    ui.horizontal(|ui| {
-                        ui.label("Disk throttle:");
-                        ui.add(
-                            egui::DragValue::new(&mut self.settings.postproc_readrate)
-                                .range(0.0..=1000.0)
-                                .speed(1.0)
-                                .suffix("× realtime"),
-                        );
-                    });
+                    ui.label("Disk throttle");
                     setting_desc(
                         ui,
-                        "Caps how fast finalize remuxes/joins/embeds read + write, so they \
-                         can't starve live recordings on the same drive. 0 = unthrottled. \
-                         30× ≈ a 5h stream finalizing in ~10 min. Needs ffmpeg 5.0+ \
-                         (silently unthrottled on older builds).",
+                        "Moved to \"Disk I/O limits\" below — the read throttle is now \
+                         configurable per drive (default row = the old global value).",
                     );
                     ui.end_row();
                     ui.horizontal(|ui| {
@@ -2027,6 +2019,104 @@ impl StreamArchiverApp {
 
             // ── Twitch VOD recovery ────────────────────────────────────────────
             }
+    }
+
+    fn settings_disk_io_section(&mut self, ui: &mut egui::Ui) {
+        if self.section_shown(SettingsTab::Recording, "Disk I/O limits", &["disk", "io", "gate", "permit", "concurrent", "throttle", "readrate", "rate", "limit", "drive", "usb", "parallel"]) {
+        ui.add_space(12.0);
+        ui.heading("Disk I/O limits 🖴");
+        ui.label(
+            "How much of the app's own bulk I/O may hit each disk at once. Local passes \
+             = full-file ffmpeg runs (finalize remux, split merge, head concat, embeds); \
+             CDN muxes = network-fed writes (head backfills, VOD recoveries). The read \
+             throttle and download rate limit here are the DEFAULTS (the same values as \
+             the Remux disk throttle and the download rate limit); per-drive rows \
+             override all four for recordings living on that drive. Permit changes \
+             apply to the next pass; a reduction takes effect as running passes finish.",
+        );
+        ui.add_space(6.0);
+        let mut remove: Option<usize> = None;
+        egui::Grid::new("disk_io_grid")
+            .num_columns(6)
+            .striped(true)
+            .spacing([14.0, 6.0])
+            .show(ui, |ui| {
+                ui.strong("Drive");
+                ui.strong("Local passes").on_hover_text("Concurrent full-file ffmpeg passes on this disk (1 = one at a time).");
+                ui.strong("CDN muxes").on_hover_text("Concurrent network-fed muxes writing to this disk.");
+                ui.strong("Read throttle").on_hover_text("ffmpeg -readrate multiplier for local passes; 0 = unthrottled.");
+                ui.strong("Download limit").on_hover_text("yt-dlp --limit-rate for VOD/video downloads landing on this disk (e.g. 4M, 500K); empty = unlimited. Never applied to live captures.");
+                ui.label("");
+                ui.end_row();
+
+                // Default row (all drives without an override).
+                ui.label("Default").on_hover_text("Applies to every drive without its own row below.");
+                ui.add(egui::DragValue::new(&mut self.settings.disk_default_local).range(1..=8));
+                ui.add(egui::DragValue::new(&mut self.settings.disk_default_cdn).range(1..=8));
+                ui.add(
+                    egui::DragValue::new(&mut self.settings.postproc_readrate)
+                        .range(0.0..=1000.0)
+                        .speed(1.0)
+                        .suffix("×"),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.settings.download_rate_limit)
+                        .hint_text("off")
+                        .desired_width(70.0),
+                );
+                ui.label("");
+                ui.end_row();
+
+                for i in 0..self.settings.disk_overrides.len() {
+                    let (letter, lim) = &mut self.settings.disk_overrides[i];
+                    ui.add(
+                        egui::TextEdit::singleline(letter)
+                            .hint_text("A")
+                            .desired_width(24.0)
+                            .char_limit(1),
+                    )
+                    .on_hover_text("Drive letter this override applies to.");
+                    ui.add(egui::DragValue::new(&mut lim.local_permits).range(1..=8));
+                    ui.add(egui::DragValue::new(&mut lim.cdn_permits).range(1..=8));
+                    ui.add(
+                        egui::DragValue::new(&mut lim.readrate)
+                            .range(0.0..=1000.0)
+                            .speed(1.0)
+                            .suffix("×"),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut lim.rate_limit)
+                            .hint_text("off")
+                            .desired_width(70.0),
+                    );
+                    if ui.small_button("🗑").on_hover_text("Remove this drive's override").clicked() {
+                        remove = Some(i);
+                    }
+                    ui.end_row();
+                }
+            });
+        if let Some(i) = remove {
+            self.settings.disk_overrides.remove(i);
+        }
+        if ui.button("➕ Add drive override").clicked() {
+            self.settings.disk_overrides.push((
+                String::new(),
+                crate::io_gate::DiskLimits {
+                    readrate: self.settings.postproc_readrate,
+                    rate_limit: self.settings.download_rate_limit.clone(),
+                    ..Default::default()
+                },
+            ));
+        }
+        ui.label(
+            egui::RichText::new(
+                "Live capture writes are never gated or throttled — these limits only \
+                 bound the app's own post-processing and downloads.",
+            )
+            .small()
+            .weak(),
+        );
+        }
     }
 
     fn settings_vod_recovery_section(&mut self, ui: &mut egui::Ui) {

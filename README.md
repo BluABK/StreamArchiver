@@ -499,16 +499,28 @@ deliberately bounded so it can never starve (or physically knock out — USB
 enclosures *do* drop off the bus under sustained mixed load) the drive the live
 captures are writing to:
 
-- Full-file ffmpeg passes — the finalize TS→MKV remux, head+live joins,
-  thumbnail/subtitle embeds — run **one at a time**, app-wide. When five takes
-  finish together (a raid ends, a shared event closes), their remuxes queue
-  instead of hammering the disk simultaneously; a finished take just sits as a
-  playable `.ts` in `.sa-cache\` a few minutes longer. The same applies to the
-  leftover finalizes an app restart picks up.
+- Full-file ffmpeg passes — the finalize TS→MKV remux, split merges, head+live
+  joins, thumbnail/subtitle embeds — run **one at a time per disk** (default;
+  see below). When five takes finish together (a raid ends, a shared event
+  closes), their remuxes queue instead of hammering the disk simultaneously; a
+  finished take just sits as a playable `.ts` in `.sa-cache\` a few minutes
+  longer. The same applies to the leftover finalizes an app restart picks up.
+  The current gate holder and queue are shown live at the top of **Background
+  jobs**, and each queued pass reports its wait in its own task row.
 - CDN-fed muxes (head backfills, VOD recoveries) are capped at **two at a
-  time** — DMCA mutes tend to land for several channels minutes after a shared
-  stream end, and each recovery writes a full stream to the drive.
-- **Disk throttle** (Settings → Recording → Remux, default **30× realtime**)
+  time per disk** (default) — DMCA mutes tend to land for several channels
+  minutes after a shared stream end, and each recovery writes a full stream to
+  the drive.
+- **Per-disk I/O limits** (Settings → Recording → Disk I/O limits): all four
+  knobs — local-pass permits, CDN-mux permits, the read throttle, and the
+  download rate limit — are configurable as a **default plus per-drive-letter
+  overrides**. Recordings split across a fast NVMe and a fragile USB HDD can
+  then run several parallel passes on the SSD while keeping the HDD strictly
+  serialized and throttled. Gates are keyed by the target file's drive, so a
+  saturated disk never queues work bound for an idle one. Permit changes apply
+  to the next pass (reductions as running passes finish).
+- **Disk throttle** (the default row of the Disk I/O limits table, default
+  **30× realtime**)
   additionally caps how fast each pass reads + writes (ffmpeg `-readrate`,
   needs ffmpeg 5.0+; silently unthrottled on older builds). At 30× a 5-hour
   stream finalizes in ~10 minutes while using a fraction of the drive's
@@ -520,9 +532,10 @@ captures are writing to:
   retries that one file unthrottled.
 - Tool logs, chat sidecar writes, and the UI's file probes are batched, cached,
   or kept off the recordings drive entirely (see *Data & locations*).
-- **Download rate limit** (Settings → Defaults, default **off**): a yt-dlp
+- **Download rate limit** (the default row of the Disk I/O limits table,
+  default **off**): a yt-dlp
   `--limit-rate` value (e.g. `4M`) applied to VOD-archive grabs and Videos-tab
-  downloads. A post-stream VOD download otherwise runs at full CDN speed onto
+  downloads, per target disk. A post-stream VOD download otherwise runs at full CDN speed onto
   the same drive the remaining live captures are writing to — on a busy night
   it's typically the single largest writer. Never applied to live captures
   (throttling the live edge loses data).

@@ -112,31 +112,40 @@ impl StreamArchiverApp {
             // authoritative "what is actually running right now, and how many
             // are queued behind it" line for those jobs.
             {
-                let (holder, waiting) = crate::io_gate::local_gate_status();
-                if holder.is_some() || waiting > 0 {
-                    ui.horizontal(|ui| {
-                        ui.label("🖴 Disk gate:");
-                        match holder {
-                            Some((label, held)) => {
-                                ui.colored_label(
-                                    egui::Color32::from_rgb(80, 160, 220),
-                                    format!("{label} — running {}", fmt_duration(held as i64)),
-                                );
+                let (holders, waiting) = crate::io_gate::local_gate_status();
+                if !holders.is_empty() || waiting > 0 {
+                    let resp = ui
+                        .horizontal(|ui| {
+                            ui.label("🖴 Disk gate:");
+                            match holders.first() {
+                                Some((label, held)) => {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(80, 160, 220),
+                                        format!("{label} — running {}", fmt_duration(*held as i64)),
+                                    );
+                                    if holders.len() > 1 {
+                                        ui.weak(format!("(+{} more)", holders.len() - 1));
+                                    }
+                                }
+                                None => {
+                                    ui.weak("turning over…");
+                                }
                             }
-                            None => {
-                                ui.weak("turning over…");
+                            if waiting > 0 {
+                                ui.weak(format!("· {waiting} queued"));
                             }
-                        }
-                        if waiting > 0 {
-                            ui.weak(format!("· {waiting} queued"));
-                        }
-                    })
-                    .response
-                    .on_hover_text(
-                        "One full-file pass at a time on the recordings drive (plus up to \
-                         two CDN-fed muxes) — see Settings → Recording → Remux for the \
-                         throttle. Queued passes list their wait in their own task row.",
-                    );
+                        })
+                        .response;
+                    let all: String = holders
+                        .iter()
+                        .map(|(l, h)| format!("{l} — running {}", fmt_duration(*h as i64)))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    resp.on_hover_text(format!(
+                        "Bulk local passes take turns per disk (permits per Settings → \
+                         Recording → Disk I/O limits). Queued passes list their wait in \
+                         their own task row.\n\n{all}"
+                    ));
                 }
             }
             ui.add_space(4.0);

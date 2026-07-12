@@ -537,11 +537,11 @@ impl Supervisor {
         let gate = {
             let tx = self.events.clone();
             let label = crate::io_gate::gate_label("merge-split", &final_path);
-            crate::io_gate::local_pass_with_progress(&label, move |waited, holder, waiting| {
+            crate::io_gate::local_pass_with_progress(&label, &final_path, move |waited, holders, waiting| {
                 let _ = tx.send(AppEvent::BackgroundTaskProgress {
                     id: task_id,
                     progress: None,
-                    info: crate::io_gate::wait_info(waited, holder, waiting),
+                    info: crate::io_gate::wait_info(waited, holders, waiting),
                 });
             })
             .await
@@ -551,7 +551,8 @@ impl Supervisor {
         let total_us: Option<i64> = media_duration_secs(&parts[0]).await.map(|s| s * 1_000_000);
         let mut allow_readrate = true;
         let out: std::io::Result<(std::process::ExitStatus, String)> = loop {
-            let readrate = if allow_readrate { crate::io_gate::readrate() } else { None };
+            let readrate =
+                if allow_readrate { crate::io_gate::readrate_for(&final_path) } else { None };
             let mut cmd = Command::new("ffmpeg");
             cmd.arg("-y");
             if let Some(rate) = readrate {
