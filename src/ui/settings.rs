@@ -393,6 +393,38 @@ impl StreamArchiverApp {
         // active tab's sections render (or search matches). Inner code keeps its
         // original indentation to avoid a whole-file reflow.
         egui::ScrollArea::vertical().show(ui, |ui| {
+            self.settings_detection_credentials_section(ui);
+            self.settings_youtube_data_api_section(ui);
+            self.settings_discord_import_section(ui);
+            self.settings_schedule_sources_section(ui);
+            self.settings_twitch_account_section(ui);
+            self.settings_google_account_section(ui);
+            self.settings_websub_section(ui);
+            self.settings_defaults_section(ui);
+            self.settings_display_section(ui);
+            self.settings_table_columns_section(ui);
+            self.settings_download_auth_section(ui);
+            self.settings_ytdlp_args_section(ui);
+            self.settings_sabr_section(ui);
+            self.settings_custom_tools_section(ui);
+            self.settings_monitor_defaults_section(ui);
+            self.settings_startup_section(ui);
+            self.settings_notifications_section(ui);
+            self.settings_shutdown_section(ui);
+            self.settings_remux_section(ui);
+            self.settings_file_management_section(ui);
+            self.settings_vod_download_section(ui);
+            self.settings_head_backfill_section(ui);
+            self.settings_trigger_words_section(ui);
+            self.settings_vod_recovery_section(ui);
+            self.settings_maintenance_section(ui);
+            self.settings_diagnostics_section(ui);
+
+            ui.add_space(16.0);
+        });
+    }
+
+    fn settings_detection_credentials_section(&mut self, ui: &mut egui::Ui) {
             if self.section_shown(SettingsTab::Accounts, "Detection credentials", &["twitch", "youtube", "kick", "client id", "secret", "api key", "credentials", "detection"]) {
             ui.add_space(8.0);
             ui.heading("Detection credentials (optional)");
@@ -428,7 +460,9 @@ impl StreamArchiverApp {
                 });
 
             }
+    }
 
+    fn settings_youtube_data_api_section(&mut self, ui: &mut egui::Ui) {
             if self.section_shown(SettingsTab::Accounts, "YouTube Data API usage", &["youtube", "data api", "quota", "search"]) {
             ui.add_space(12.0);
             ui.heading("YouTube Data API usage");
@@ -507,7 +541,9 @@ impl StreamArchiverApp {
             });
 
             }
+    }
 
+    fn settings_discord_import_section(&mut self, ui: &mut egui::Ui) {
             if self.section_shown(SettingsTab::Schedule, "Discord schedule import", &["discord", "schedule", "import", "token", "events"]) {
             ui.add_space(12.0);
             ui.heading("Discord schedule import");
@@ -550,7 +586,9 @@ impl StreamArchiverApp {
             });
 
             }
+    }
 
+    fn settings_schedule_sources_section(&mut self, ui: &mut egui::Ui) {
             if self.section_shown(SettingsTab::Schedule, "Schedule sources", &["schedule", "sources", "ocr", "banner", "twitter", "priority"]) {
             ui.add_space(12.0);
             ui.heading("Schedule sources");
@@ -710,7 +748,9 @@ impl StreamArchiverApp {
                 });
 
             }
+    }
 
+    fn settings_twitch_account_section(&mut self, ui: &mut egui::Ui) {
             if self.section_shown(SettingsTab::Accounts, "Twitch account (OAuth)", &["twitch", "account", "oauth", "connect", "login", "sub", "turbo"]) {
             ui.add_space(12.0);
             ui.heading("Twitch account (OAuth)");
@@ -771,7 +811,9 @@ impl StreamArchiverApp {
             }
 
             }
+    }
 
+    fn settings_google_account_section(&mut self, ui: &mut egui::Ui) {
             if self.section_shown(SettingsTab::Accounts, "YouTube account (Google OAuth)", &["youtube", "google", "oauth", "account", "connect", "subscriptions"]) {
             ui.add_space(12.0);
             ui.heading("YouTube account (Google OAuth)");
@@ -846,7 +888,9 @@ impl StreamArchiverApp {
             }
 
             }
+    }
 
+    fn settings_websub_section(&mut self, ui: &mut egui::Ui) {
             if self.section_shown(SettingsTab::Accounts, "YouTube WebSub (push via VPS)", &["youtube", "websub", "vps", "push", "relay", "pubsubhubbub"]) {
             ui.add_space(12.0);
             ui.heading("YouTube WebSub (push via VPS)");
@@ -879,7 +923,9 @@ impl StreamArchiverApp {
                 });
 
             }
+    }
 
+    fn settings_defaults_section(&mut self, ui: &mut egui::Ui) {
             if self.section_shown(SettingsTab::Recording, "Defaults", &["default", "output", "folder", "media player", "concurrent", "filename", "date", "timestamp"]) {
             ui.add_space(12.0);
             ui.heading("Defaults");
@@ -974,7 +1020,9 @@ impl StreamArchiverApp {
                 });
 
             }
+    }
 
+    fn settings_display_section(&mut self, ui: &mut egui::Ui) {
             if self.section_shown(SettingsTab::Interface, "Display", &["display", "actions", "emotes", "animate", "columns", "theme"]) {
             ui.add_space(12.0);
             ui.heading("Display");
@@ -1034,7 +1082,9 @@ impl StreamArchiverApp {
             );
 
             }
+    }
 
+    fn settings_table_columns_section(&mut self, ui: &mut egui::Ui) {
             if self.section_shown(SettingsTab::Interface, "Table columns", &["table", "columns", "reset", "grid", "sort"]) {
             ui.add_space(12.0);
             ui.heading("Table columns");
@@ -1088,7 +1138,9 @@ impl StreamArchiverApp {
             });
 
             }
+    }
 
+    fn settings_download_auth_section(&mut self, ui: &mut egui::Ui) {
             if self.section_shown(SettingsTab::Downloads, "Download authentication", &["download", "auth", "cookies", "browser", "token", "profile", "login"]) {
             ui.add_space(12.0);
             ui.heading("Download authentication");
@@ -1145,7 +1197,9 @@ impl StreamArchiverApp {
                 });
 
             }
+    }
 
+    fn settings_ytdlp_args_section(&mut self, ui: &mut egui::Ui) {
             if self.section_shown(SettingsTab::Downloads, "yt-dlp default arguments", &["yt-dlp", "ytdlp", "arguments", "args", "binary", "path"]) {
             ui.add_space(12.0);
             ui.heading("yt-dlp default arguments");
@@ -1170,7 +1224,9 @@ impl StreamArchiverApp {
                 });
 
             }
+    }
 
+    fn settings_sabr_section(&mut self, ui: &mut egui::Ui) {
             if self.section_shown(SettingsTab::Downloads, "YouTube SABR (live-from-start)", &["youtube", "sabr", "live-from-start", "po token", "dash", "codec", "capture from start"]) {
             ui.add_space(12.0);
             ui.heading("YouTube SABR (live-from-start)");
@@ -1325,7 +1381,9 @@ impl StreamArchiverApp {
                 });
 
             }
+    }
 
+    fn settings_custom_tools_section(&mut self, ui: &mut egui::Ui) {
             if self.section_shown(SettingsTab::Downloads, "Custom download tools", &["custom", "tool", "binary", "alias", "yt-dlp", "fork"]) {
             ui.add_space(12.0);
             ui.heading("Custom download tools 🔧");
@@ -1339,7 +1397,9 @@ impl StreamArchiverApp {
             custom_tools_editor(ui, &mut self.settings.custom_tools, &mut self.pending_browse);
 
             }
+    }
 
+    fn settings_monitor_defaults_section(&mut self, ui: &mut egui::Ui) {
             if self.section_shown(SettingsTab::Recording, "Stream monitor defaults", &["monitor", "defaults", "platform", "quality", "tool", "container", "detection"]) {
             ui.add_space(12.0);
             ui.heading("Stream monitor defaults");
@@ -1574,7 +1634,9 @@ impl StreamArchiverApp {
             }
 
             }
+    }
 
+    fn settings_startup_section(&mut self, ui: &mut egui::Ui) {
             if self.section_shown(SettingsTab::System, "Startup", &["startup", "start at login", "autostart", "boot"]) {
             ui.add_space(12.0);
             ui.heading("Startup");
@@ -1597,7 +1659,9 @@ impl StreamArchiverApp {
             }
 
             }
+    }
 
+    fn settings_notifications_section(&mut self, ui: &mut egui::Ui) {
             if self.section_shown(SettingsTab::Interface, "Notifications", &["notifications", "desktop", "toast", "alerts"]) {
             ui.add_space(12.0);
             ui.heading("Notifications");
@@ -1627,7 +1691,9 @@ impl StreamArchiverApp {
             }
 
             }
+    }
 
+    fn settings_shutdown_section(&mut self, ui: &mut egui::Ui) {
             if self.section_shown(SettingsTab::System, "Shutdown", &["shutdown", "quit", "close", "keep downloads", "exit"]) {
             ui.add_space(12.0);
             ui.heading("Shutdown");
@@ -1659,7 +1725,9 @@ impl StreamArchiverApp {
             ui.add_space(12.0);
             // ── Remux ──────────────────────────────────────────────────────────
             }
+    }
 
+    fn settings_remux_section(&mut self, ui: &mut egui::Ui) {
             if self.section_shown(SettingsTab::Recording, "Remux", &["remux", "mkv", "thumbnail", "title", "subtitles", "embed", "cover", "throttle", "readrate", "disk", "speed"]) {
             ui.add_space(12.0);
             ui.heading("Remux");
@@ -1778,7 +1846,9 @@ impl StreamArchiverApp {
 
             // ── File Management ────────────────────────────────────────────────
             }
+    }
 
+    fn settings_file_management_section(&mut self, ui: &mut egui::Ui) {
             if self.section_shown(SettingsTab::Recording, "File Management", &["file", "management", "subdirectories", "organize", "split", "folders"]) {
             ui.add_space(12.0);
             ui.heading("File Management");
@@ -1811,7 +1881,9 @@ impl StreamArchiverApp {
 
             // ── Post-stream VOD download ────────────────────────────────────────
             }
+    }
 
+    fn settings_vod_download_section(&mut self, ui: &mut egui::Ui) {
             if self.section_shown(SettingsTab::Downloads, "Post-stream VOD download", &["vod", "download", "archive", "replace", "post-stream", "published"]) {
             ui.add_space(12.0);
             ui.heading("Post-stream VOD download 📼");
@@ -1838,7 +1910,9 @@ impl StreamArchiverApp {
 
             // ── Post-stream VOD download ────────────────────────────────────────
             }
+    }
 
+    fn settings_head_backfill_section(&mut self, ui: &mut egui::Ui) {
             if self.section_shown(SettingsTab::Downloads, "Head backfill on new takes", &["head", "backfill", "take", "retake", "reconnect", "capture from start"]) {
             ui.add_space(12.0);
             ui.heading("Head backfill on new takes 🧩");
@@ -1896,7 +1970,9 @@ impl StreamArchiverApp {
 
             // ── Trigger words ──────────────────────────────────────────────────
             }
+    }
 
+    fn settings_trigger_words_section(&mut self, ui: &mut egui::Ui) {
             if self.section_shown(SettingsTab::Downloads, "Trigger words", &["trigger", "word", "karaoke", "unarchived", "force", "auto", "title", "game", "regex"]) {
             ui.add_space(12.0);
             ui.heading("Trigger words ⚡");
@@ -1921,7 +1997,9 @@ impl StreamArchiverApp {
 
             // ── Twitch VOD recovery ────────────────────────────────────────────
             }
+    }
 
+    fn settings_vod_recovery_section(&mut self, ui: &mut egui::Ui) {
             if self.section_shown(SettingsTab::Downloads, "Twitch VOD recovery", &["vod", "recovery", "muted", "deleted", "cdn", "recover", "unmute"]) {
             ui.add_space(12.0);
             ui.heading("Twitch VOD recovery 🛟");
@@ -2012,7 +2090,9 @@ impl StreamArchiverApp {
 
             // ── Maintenance ────────────────────────────────────────────────────
             }
+    }
 
+    fn settings_maintenance_section(&mut self, ui: &mut egui::Ui) {
             if self.section_shown(SettingsTab::Maintenance, "Maintenance", &["maintenance", "re-remux", "remux all", "thumbnails", "reorganize", "batch", "preset"]) {
             ui.add_space(12.0);
             ui.heading("Maintenance 🔧");
@@ -2108,7 +2188,9 @@ impl StreamArchiverApp {
             }
 
             }
+    }
 
+    fn settings_diagnostics_section(&mut self, ui: &mut egui::Ui) {
             if self.section_shown(SettingsTab::System, "Diagnostics", &["diagnostics", "crash", "freeze", "dialog", "icon", "logs"]) {
             ui.add_space(12.0);
 
@@ -2148,8 +2230,5 @@ impl StreamArchiverApp {
                     ui.end_row();
                 });
             } // end Diagnostics section guard
-
-            ui.add_space(16.0);
-        });
     }
 }
