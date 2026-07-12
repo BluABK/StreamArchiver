@@ -86,49 +86,8 @@ impl StreamArchiverApp {
             return false; // still loading — placeholder is on screen
         }
 
-        let thumbs = if inst_account.is_some() {
-            self.channel_asset_thumbs
-                .entry(cid)
-                .or_insert_with(|| load_channel_asset_thumbs(ch, &accounts, ctx))
-                .clone()
-        } else {
-            Vec::new()
-        };
-        let emote_counts = if inst_account.is_some() {
-            self.channel_emote_counts
-                .entry(cid)
-                .or_insert_with(|| emote_provider_counts(&ch.name, &accounts))
-                .clone()
-        } else {
-            Vec::new()
-        };
-        let asset_status = if inst_account.is_some() {
-            self.channel_asset_status
-                .entry(cid)
-                .or_insert_with(|| build_platform_asset_status(&ch.name, &accounts))
-                .clone()
-        } else {
-            Vec::new()
-        };
-
-        // Header icon: this instance's own account avatar when fetched; the
-        // channel-level icon as the fallback (nothing fetched yet / Generic).
-        let icon_tex = inst_account
-            .as_ref()
-            .and_then(|acc| {
-                thumbs
-                    .iter()
-                    .find(|t| {
-                        t.kind == "icon" && t.platform == acc.platform && t.account == acc.account
-                    })
-                    .map(|t| t.tex.clone())
-            })
-            .or_else(|| {
-                self.channel_icons
-                    .entry(cid)
-                    .or_insert_with(|| resolve_channel_icon(ch, &accounts, ctx))
-                    .clone()
-            });
+        let (thumbs, emote_counts, asset_status, icon_tex) =
+            self.instance_props_cached_assets(cid, ch, &accounts, &inst_account, ctx);
 
         let mut refetch = false;
         let mut open_emote_viewer: Option<(EmoteProvider, AssetAccount)> = None;
@@ -157,346 +116,38 @@ impl StreamArchiverApp {
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
                 // ── Header ──────────────────────────────────────────────
-                ui.horizontal(|ui| {
-                    if let Some(tex) = &icon_tex {
-                        let resp = ui.add(
-                            egui::Image::from_texture(tex)
-                                .max_size(egui::vec2(96.0, 96.0))
-                                .corner_radius(egui::CornerRadius::same(8)),
-                        );
-                        queue_alt_image_preview(ui.ctx(), &resp, tex);
-                    } else {
-                        let (rect, _) = ui.allocate_exact_size(
-                            egui::vec2(96.0, 96.0),
-                            egui::Sense::hover(),
-                        );
-                        ui.painter().rect_filled(
-                            rect,
-                            8.0,
-                            ui.visuals().weak_text_color(),
-                        );
-                    }
-                    ui.add_space(8.0);
-                    ui.vertical(|ui| {
-                        ui.add_space(4.0);
-                        ui.heading(&ch.name);
-                        // This instance's platform + source URL (not the
-                        // channel-wide platform list — that's channel Properties).
-                        ui.horizontal(|ui| {
-                            let ptex = self
-                                .platform_tex
-                                .get_or_insert_with(|| PlatformTextures::load(ui.ctx()));
-                            if let Some(t) = ptex.get(m.platform()) {
-                                ui.add(
-                                    egui::Image::from_texture(t)
-                                        .max_size(egui::vec2(14.0, 14.0)),
-                                );
-                            }
-                            if ui.link(instance_label(&m.url)).on_hover_text(&m.url).clicked()
-                            {
-                                ui.ctx().open_url(egui::OpenUrl::new_tab(m.url.clone()));
-                            }
-                        });
-                    });
-                });
+                self.instance_props_header(ui, ch, m, &icon_tex);
 
                 ui.separator();
 
                 egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
 
                 // ── Monitor (instance) ───────────────────────────────────
-                egui::CollapsingHeader::new(egui::RichText::new("Monitor (instance)").strong())
-                    .id_salt("inst_props_sec_monitor")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                egui::Grid::new("props_mon")
-                    .num_columns(2)
-                    .spacing([12.0, 4.0])
-                    .show(ui, |ui| {
-                        ui.label("DB monitor ID");
-                        ui.label(m.id.to_string());
-                        ui.end_row();
-                        ui.label("Detection");
-                        ui.label(m.detection_method.as_str());
-                        ui.end_row();
-                        ui.label("Tool");
-                        ui.label(format!("{:?}", m.tool));
-                        ui.end_row();
-                        ui.label("Poll interval");
-                        ui.label(format!("{}s", m.poll_interval_secs));
-                        ui.end_row();
-                        ui.label("Quality");
-                        ui.label(&m.quality);
-                        ui.end_row();
-                        ui.label("Max concurrent");
-                        ui.label(m.max_concurrent.to_string());
-                        ui.end_row();
-                        ui.label("Last state");
-                        ui.label(&m.last_state);
-                        ui.end_row();
-                        ui.label("Recordings");
-                        ui.label(row.recording_count.to_string());
-                        ui.end_row();
-                        ui.label("Output dir");
-                        ui.horizontal(|ui| {
-                            ui.label(prop_truncate_path(&m.output_dir, 28));
-                            if ui
-                                .small_button("📂")
-                                .on_hover_text("Open folder")
-                                .clicked()
-                            {
-                                crate::platform::open_path(
-                                    std::path::Path::new(&m.output_dir),
-                                );
-                            }
-                        });
-                        ui.end_row();
-                        ui.label("Fetch thumbnail");
-                        ui.label(prop_bool(m.fetch_thumbnail));
-                        ui.end_row();
-                        ui.label("Fetch assets");
-                        ui.label(prop_bool(m.fetch_chat_assets));
-                        ui.end_row();
-                    });
-                    });
+                Self::instance_props_monitor_section(ui, m, row.recording_count);
 
                 // ── Assets (this instance's account) ─────────────────────
                 // The same data the channel Properties window shows, filtered
                 // to the account this instance's URL resolves to.
                 if let Some(acc) = &inst_account {
-                    egui::CollapsingHeader::new(
-                        egui::RichText::new("Assets (this account)").strong(),
-                    )
-                    .id_salt("inst_props_sec_assets")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        if ui
-                            .button("⟳ Refetch")
-                            .on_hover_text(format!(
-                                "Fetch icon / banner / badges / emotes for {} now — \
-                                 ignores the 24h cache.",
-                                acc.label,
-                            ))
-                            .clicked()
-                        {
-                            refetch = true;
-                        }
-                        if ui
-                            .button("📂")
-                            .on_hover_text(
-                                "Open this account's asset folder (icons, banners, and the \
-                                 history/ archive of older versions).",
-                            )
-                            .clicked()
-                        {
-                            let dir = channel_asset_dir(&ch.name, acc.platform, &acc.account);
-                            let target = if crate::iomon::fs::is_dir_sync(crate::iomon::Cat::AssetCache, &dir) {
-                                dir
-                            } else {
-                                // Nothing fetched yet — fall back to the channel root.
-                                crate::app_paths::asset_cache_dir()
-                                    .join("channel_assets")
-                                    .join(crate::downloader::sanitize_filename(&ch.name))
-                            };
-                            crate::platform::open_path(&target);
-                        }
-                        if ui
-                            .button("🕑 History")
-                            .on_hover_text(
-                                "Show recorded asset changes over time (added / removed \
-                                 emotes, icon / banner / name-colour replacements) for \
-                                 this account only.",
-                            )
-                            .clicked()
-                        {
-                            open_asset_history = true;
-                        }
-                        if ui
-                            .button("ℹ About")
-                            .on_hover_text(
-                                "Show this account's archived About page — description, \
-                                 panels, links — with a version picker. Captured with \
-                                 each asset fetch; a new version is stored only when the \
-                                 content actually changed.",
-                            )
-                            .clicked()
-                        {
-                            open_about = true;
-                        }
-                    });
-
-                    // Thumbnails: this account's original icon/banner. Hover for
-                    // size, Alt to preview full-res, click to open the file.
-                    let own_thumbs: Vec<&AssetThumb> = thumbs
-                        .iter()
-                        .filter(|t| t.platform == acc.platform && t.account == acc.account)
-                        .collect();
-                    if !own_thumbs.is_empty() {
-                        ui.add_space(3.0);
-                        const THUMB_H: f32 = 56.0;
-                        ui.horizontal_wrapped(|ui| {
-                            for t in own_thumbs {
-                                let (w, h) = t.dims;
-                                let aspect = if h > 0 { w as f32 / h as f32 } else { 1.0 };
-                                let width = (THUMB_H * aspect).min(THUMB_H * 4.0);
-                                let resp = ui
-                                    .add(
-                                        egui::Image::from_texture(&t.tex)
-                                            .fit_to_exact_size(egui::vec2(width, THUMB_H))
-                                            .corner_radius(egui::CornerRadius::same(4))
-                                            .sense(egui::Sense::click()),
-                                    )
-                                    .on_hover_text(format!(
-                                        "{} — {w}×{h} px\nAlt: preview full size · click: open file",
-                                        t.label,
-                                    ));
-                                queue_alt_image_preview(ui.ctx(), &resp, &t.tex);
-                                if resp.clicked() {
-                                    crate::platform::open_path(&t.path);
-                                }
-                            }
-                        });
-                    }
-
-                    // Status row (same columns as the channel window, minus the
-                    // per-row ⟳ — the header Refetch covers this one account).
-                    ui.add_space(4.0);
-                    egui::Grid::new("inst_props_assets")
-                        .num_columns(6)
-                        .spacing([12.0, 4.0])
-                        .striped(true)
-                        .show(ui, |ui| {
-                            ui.strong("Source");
-                            ui.strong("Icon");
-                            ui.strong("Banner");
-                            ui.strong("Badges");
-                            ui.strong("Emotes");
-                            ui.strong("Updated");
-                            ui.end_row();
-                            for st in asset_status.iter().filter(|st| {
-                                st.account.platform == acc.platform
-                                    && st.account.account == acc.account
-                            }) {
-                                ui.horizontal(|ui| {
-                                    let ptex = self.platform_tex.get_or_insert_with(|| {
-                                        PlatformTextures::load(ui.ctx())
-                                    });
-                                    if let Some(t) = ptex.get(st.account.platform) {
-                                        ui.add(
-                                            egui::Image::from_texture(t)
-                                                .max_size(egui::vec2(13.0, 13.0)),
-                                        );
-                                    }
-                                    ui.label(&st.account.label);
-                                });
-                                asset_status_cell(ui, st.icon_present, st.icon_variants);
-                                asset_status_cell(ui, st.banner_present, st.banner_variants);
-                                ui.label(if st.badges > 0 {
-                                    st.badges.to_string()
-                                } else {
-                                    "—".into()
-                                });
-                                ui.label(if st.emotes > 0 {
-                                    st.emotes.to_string()
-                                } else {
-                                    "—".into()
-                                });
-                                ui.label(&st.stamp);
-                                ui.end_row();
-                            }
-                        });
-
-                    // Emote viewer launchers for this account only.
-                    if let Some((eacc, counts)) = emote_counts
-                        .iter()
-                        .find(|(a, _)| a.platform == acc.platform && a.account == acc.account)
-                        && counts.iter().any(|(_, n)| *n > 0)
-                    {
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                                ui.strong("View emotes:");
-                                let ptex = self
-                                    .provider_tex
-                                    .get_or_insert_with(|| ProviderTextures::load(ui.ctx()))
-                                    .clone();
-                                for &(provider, count) in counts {
-                                    if count == 0 {
-                                        continue;
-                                    }
-                                    let resp = match provider {
-                                        EmoteProvider::SevenTv => ui.add(egui::ImageButton::new(
-                                            egui::Image::from_texture(&ptex.seventv)
-                                                .fit_to_exact_size(egui::vec2(18.0, 18.0)),
-                                        )),
-                                        EmoteProvider::Bttv => ui.add(egui::ImageButton::new(
-                                            egui::Image::from_texture(&ptex.bttv)
-                                                .fit_to_exact_size(egui::vec2(18.0, 18.0)),
-                                        )),
-                                        EmoteProvider::Twitch => ui.button("😀"),
-                                        EmoteProvider::Ffz => ui.button("FFZ"),
-                                    };
-                                    if resp
-                                        .on_hover_text(format!(
-                                            "View {} {} emote{} for {}",
-                                            count,
-                                            provider.label(),
-                                            if count == 1 { "" } else { "s" },
-                                            eacc.label,
-                                        ))
-                                        .clicked()
-                                    {
-                                        open_emote_viewer = Some((provider, eacc.clone()));
-                                    }
-                                }
-                            });
-                    }
-                    });
+                    self.instance_props_assets_section(
+                        ui,
+                        ch,
+                        acc,
+                        &thumbs,
+                        &emote_counts,
+                        &asset_status,
+                        &mut refetch,
+                        &mut open_emote_viewer,
+                        &mut open_asset_history,
+                        &mut open_about,
+                    );
                 }
 
                 // ── Trigger words (this instance) ────────────────────────
-                egui::CollapsingHeader::new(egui::RichText::new("Trigger words").strong())
-                    .id_salt("inst_props_sec_triggers")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(
-                            "Start recording when the live title/game matches — even with Auto \
-                             off. Inherits the channel's rules, which inherit the global ones \
-                             (Settings → Downloads → Trigger words).",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                    if let Some(scope) = self.instance_trigger_drafts.get_mut(&m.id)
-                        && trigger_scope_editor(ui, scope, "inst_triggers")
-                    {
-                        trigger_dirty = true;
-                    }
-                    });
+                self.instance_props_triggers_section(ui, mid, &mut trigger_dirty);
 
                 // ── Schedule sources (this instance) ─────────────────────
-                egui::CollapsingHeader::new(
-                    egui::RichText::new("Schedule sources (this instance)").strong(),
-                )
-                .id_salt("inst_props_sec_sched")
-                .default_open(false)
-                .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "Overrides the global order/title-fill for this one instance, taking \
-                         precedence over the channel's setting. Changes apply on the next \
-                         schedule refresh.",
-                    )
-                    .small()
-                    .weak(),
-                );
-                if let Some(scope) = self.instance_scope_drafts.get_mut(&m.id) {
-                    if scope_override_editor(ui, scope, &global_order) {
-                        scope_dirty = true;
-                    }
-                }
-                });
+                self.instance_props_sched_section(ui, mid, &global_order, &mut scope_dirty);
 
                 }); // ScrollArea
                 });
@@ -504,6 +155,480 @@ impl StreamArchiverApp {
             },
         );
 
+        self.instance_props_apply_actions(
+            mid,
+            cid,
+            ch,
+            &inst_account,
+            scope_dirty,
+            trigger_dirty,
+            refetch,
+            open_emote_viewer,
+            open_asset_history,
+            open_about,
+        );
+
+        !open
+    }
+
+    /// Cached per-channel asset data filtered for the instance window (all
+    /// empty when the instance has no asset account), plus the header icon.
+    #[allow(clippy::type_complexity)]
+    fn instance_props_cached_assets(
+        &mut self,
+        cid: i64,
+        ch: &Channel,
+        accounts: &[AssetAccount],
+        inst_account: &Option<AssetAccount>,
+        ctx: &egui::Context,
+    ) -> (
+        Vec<AssetThumb>,
+        Vec<(AssetAccount, [(EmoteProvider, usize); 4])>,
+        Vec<PlatformAssetStatus>,
+        Option<egui::TextureHandle>,
+    ) {
+        let thumbs = if inst_account.is_some() {
+            self.channel_asset_thumbs
+                .entry(cid)
+                .or_insert_with(|| load_channel_asset_thumbs(ch, accounts, ctx))
+                .clone()
+        } else {
+            Vec::new()
+        };
+        let emote_counts = if inst_account.is_some() {
+            self.channel_emote_counts
+                .entry(cid)
+                .or_insert_with(|| emote_provider_counts(&ch.name, accounts))
+                .clone()
+        } else {
+            Vec::new()
+        };
+        let asset_status = if inst_account.is_some() {
+            self.channel_asset_status
+                .entry(cid)
+                .or_insert_with(|| build_platform_asset_status(&ch.name, accounts))
+                .clone()
+        } else {
+            Vec::new()
+        };
+
+        // Header icon: this instance's own account avatar when fetched; the
+        // channel-level icon as the fallback (nothing fetched yet / Generic).
+        let icon_tex = inst_account
+            .as_ref()
+            .and_then(|acc| {
+                thumbs
+                    .iter()
+                    .find(|t| {
+                        t.kind == "icon" && t.platform == acc.platform && t.account == acc.account
+                    })
+                    .map(|t| t.tex.clone())
+            })
+            .or_else(|| {
+                self.channel_icons
+                    .entry(cid)
+                    .or_insert_with(|| resolve_channel_icon(ch, accounts, ctx))
+                    .clone()
+            });
+
+        (thumbs, emote_counts, asset_status, icon_tex)
+    }
+
+    /// Header row: account avatar (or placeholder), channel name, and this
+    /// instance's platform icon + source-URL link.
+    fn instance_props_header(
+        &mut self,
+        ui: &mut egui::Ui,
+        ch: &Channel,
+        m: &Monitor,
+        icon_tex: &Option<egui::TextureHandle>,
+    ) {
+        ui.horizontal(|ui| {
+            if let Some(tex) = icon_tex {
+                let resp = ui.add(
+                    egui::Image::from_texture(tex)
+                        .max_size(egui::vec2(96.0, 96.0))
+                        .corner_radius(egui::CornerRadius::same(8)),
+                );
+                queue_alt_image_preview(ui.ctx(), &resp, tex);
+            } else {
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(96.0, 96.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter().rect_filled(
+                    rect,
+                    8.0,
+                    ui.visuals().weak_text_color(),
+                );
+            }
+            ui.add_space(8.0);
+            ui.vertical(|ui| {
+                ui.add_space(4.0);
+                ui.heading(&ch.name);
+                // This instance's platform + source URL (not the
+                // channel-wide platform list — that's channel Properties).
+                ui.horizontal(|ui| {
+                    let ptex = self
+                        .platform_tex
+                        .get_or_insert_with(|| PlatformTextures::load(ui.ctx()));
+                    if let Some(t) = ptex.get(m.platform()) {
+                        ui.add(
+                            egui::Image::from_texture(t)
+                                .max_size(egui::vec2(14.0, 14.0)),
+                        );
+                    }
+                    if ui.link(instance_label(&m.url)).on_hover_text(&m.url).clicked()
+                    {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(m.url.clone()));
+                    }
+                });
+            });
+        });
+    }
+
+    /// "Monitor (instance)" section — the read-only monitor-config grid.
+    fn instance_props_monitor_section(ui: &mut egui::Ui, m: &Monitor, recording_count: i64) {
+        egui::CollapsingHeader::new(egui::RichText::new("Monitor (instance)").strong())
+            .id_salt("inst_props_sec_monitor")
+            .default_open(true)
+            .show(ui, |ui| {
+        egui::Grid::new("props_mon")
+            .num_columns(2)
+            .spacing([12.0, 4.0])
+            .show(ui, |ui| {
+                ui.label("DB monitor ID");
+                ui.label(m.id.to_string());
+                ui.end_row();
+                ui.label("Detection");
+                ui.label(m.detection_method.as_str());
+                ui.end_row();
+                ui.label("Tool");
+                ui.label(format!("{:?}", m.tool));
+                ui.end_row();
+                ui.label("Poll interval");
+                ui.label(format!("{}s", m.poll_interval_secs));
+                ui.end_row();
+                ui.label("Quality");
+                ui.label(&m.quality);
+                ui.end_row();
+                ui.label("Max concurrent");
+                ui.label(m.max_concurrent.to_string());
+                ui.end_row();
+                ui.label("Last state");
+                ui.label(&m.last_state);
+                ui.end_row();
+                ui.label("Recordings");
+                ui.label(recording_count.to_string());
+                ui.end_row();
+                ui.label("Output dir");
+                ui.horizontal(|ui| {
+                    ui.label(prop_truncate_path(&m.output_dir, 28));
+                    if ui
+                        .small_button("📂")
+                        .on_hover_text("Open folder")
+                        .clicked()
+                    {
+                        crate::platform::open_path(
+                            std::path::Path::new(&m.output_dir),
+                        );
+                    }
+                });
+                ui.end_row();
+                ui.label("Fetch thumbnail");
+                ui.label(prop_bool(m.fetch_thumbnail));
+                ui.end_row();
+                ui.label("Fetch assets");
+                ui.label(prop_bool(m.fetch_chat_assets));
+                ui.end_row();
+            });
+            });
+    }
+
+    /// "Assets (this account)" section — refetch/folder/history/about buttons,
+    /// this account's thumbnails, its status row and emote-viewer launchers.
+    #[allow(deprecated)] // egui::ImageButton in the emote launchers
+    #[allow(clippy::too_many_arguments)]
+    fn instance_props_assets_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        ch: &Channel,
+        acc: &AssetAccount,
+        thumbs: &[AssetThumb],
+        emote_counts: &[(AssetAccount, [(EmoteProvider, usize); 4])],
+        asset_status: &[PlatformAssetStatus],
+        refetch: &mut bool,
+        open_emote_viewer: &mut Option<(EmoteProvider, AssetAccount)>,
+        open_asset_history: &mut bool,
+        open_about: &mut bool,
+    ) {
+        egui::CollapsingHeader::new(
+            egui::RichText::new("Assets (this account)").strong(),
+        )
+        .id_salt("inst_props_sec_assets")
+        .default_open(true)
+        .show(ui, |ui| {
+        ui.horizontal(|ui| {
+            if ui
+                .button("⟳ Refetch")
+                .on_hover_text(format!(
+                    "Fetch icon / banner / badges / emotes for {} now — \
+                     ignores the 24h cache.",
+                    acc.label,
+                ))
+                .clicked()
+            {
+                *refetch = true;
+            }
+            if ui
+                .button("📂")
+                .on_hover_text(
+                    "Open this account's asset folder (icons, banners, and the \
+                     history/ archive of older versions).",
+                )
+                .clicked()
+            {
+                let dir = channel_asset_dir(&ch.name, acc.platform, &acc.account);
+                let target = if crate::iomon::fs::is_dir_sync(crate::iomon::Cat::AssetCache, &dir) {
+                    dir
+                } else {
+                    // Nothing fetched yet — fall back to the channel root.
+                    crate::app_paths::asset_cache_dir()
+                        .join("channel_assets")
+                        .join(crate::downloader::sanitize_filename(&ch.name))
+                };
+                crate::platform::open_path(&target);
+            }
+            if ui
+                .button("🕑 History")
+                .on_hover_text(
+                    "Show recorded asset changes over time (added / removed \
+                     emotes, icon / banner / name-colour replacements) for \
+                     this account only.",
+                )
+                .clicked()
+            {
+                *open_asset_history = true;
+            }
+            if ui
+                .button("ℹ About")
+                .on_hover_text(
+                    "Show this account's archived About page — description, \
+                     panels, links — with a version picker. Captured with \
+                     each asset fetch; a new version is stored only when the \
+                     content actually changed.",
+                )
+                .clicked()
+            {
+                *open_about = true;
+            }
+        });
+
+        // Thumbnails: this account's original icon/banner. Hover for
+        // size, Alt to preview full-res, click to open the file.
+        let own_thumbs: Vec<&AssetThumb> = thumbs
+            .iter()
+            .filter(|t| t.platform == acc.platform && t.account == acc.account)
+            .collect();
+        if !own_thumbs.is_empty() {
+            ui.add_space(3.0);
+            const THUMB_H: f32 = 56.0;
+            ui.horizontal_wrapped(|ui| {
+                for t in own_thumbs {
+                    let (w, h) = t.dims;
+                    let aspect = if h > 0 { w as f32 / h as f32 } else { 1.0 };
+                    let width = (THUMB_H * aspect).min(THUMB_H * 4.0);
+                    let resp = ui
+                        .add(
+                            egui::Image::from_texture(&t.tex)
+                                .fit_to_exact_size(egui::vec2(width, THUMB_H))
+                                .corner_radius(egui::CornerRadius::same(4))
+                                .sense(egui::Sense::click()),
+                        )
+                        .on_hover_text(format!(
+                            "{} — {w}×{h} px\nAlt: preview full size · click: open file",
+                            t.label,
+                        ));
+                    queue_alt_image_preview(ui.ctx(), &resp, &t.tex);
+                    if resp.clicked() {
+                        crate::platform::open_path(&t.path);
+                    }
+                }
+            });
+        }
+
+        // Status row (same columns as the channel window, minus the
+        // per-row ⟳ — the header Refetch covers this one account).
+        ui.add_space(4.0);
+        egui::Grid::new("inst_props_assets")
+            .num_columns(6)
+            .spacing([12.0, 4.0])
+            .striped(true)
+            .show(ui, |ui| {
+                ui.strong("Source");
+                ui.strong("Icon");
+                ui.strong("Banner");
+                ui.strong("Badges");
+                ui.strong("Emotes");
+                ui.strong("Updated");
+                ui.end_row();
+                for st in asset_status.iter().filter(|st| {
+                    st.account.platform == acc.platform
+                        && st.account.account == acc.account
+                }) {
+                    ui.horizontal(|ui| {
+                        let ptex = self.platform_tex.get_or_insert_with(|| {
+                            PlatformTextures::load(ui.ctx())
+                        });
+                        if let Some(t) = ptex.get(st.account.platform) {
+                            ui.add(
+                                egui::Image::from_texture(t)
+                                    .max_size(egui::vec2(13.0, 13.0)),
+                            );
+                        }
+                        ui.label(&st.account.label);
+                    });
+                    asset_status_cell(ui, st.icon_present, st.icon_variants);
+                    asset_status_cell(ui, st.banner_present, st.banner_variants);
+                    ui.label(if st.badges > 0 {
+                        st.badges.to_string()
+                    } else {
+                        "—".into()
+                    });
+                    ui.label(if st.emotes > 0 {
+                        st.emotes.to_string()
+                    } else {
+                        "—".into()
+                    });
+                    ui.label(&st.stamp);
+                    ui.end_row();
+                }
+            });
+
+        // Emote viewer launchers for this account only.
+        if let Some((eacc, counts)) = emote_counts
+            .iter()
+            .find(|(a, _)| a.platform == acc.platform && a.account == acc.account)
+            && counts.iter().any(|(_, n)| *n > 0)
+        {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                    ui.strong("View emotes:");
+                    let ptex = self
+                        .provider_tex
+                        .get_or_insert_with(|| ProviderTextures::load(ui.ctx()))
+                        .clone();
+                    for &(provider, count) in counts {
+                        if count == 0 {
+                            continue;
+                        }
+                        let resp = match provider {
+                            EmoteProvider::SevenTv => ui.add(egui::ImageButton::new(
+                                egui::Image::from_texture(&ptex.seventv)
+                                    .fit_to_exact_size(egui::vec2(18.0, 18.0)),
+                            )),
+                            EmoteProvider::Bttv => ui.add(egui::ImageButton::new(
+                                egui::Image::from_texture(&ptex.bttv)
+                                    .fit_to_exact_size(egui::vec2(18.0, 18.0)),
+                            )),
+                            EmoteProvider::Twitch => ui.button("😀"),
+                            EmoteProvider::Ffz => ui.button("FFZ"),
+                        };
+                        if resp
+                            .on_hover_text(format!(
+                                "View {} {} emote{} for {}",
+                                count,
+                                provider.label(),
+                                if count == 1 { "" } else { "s" },
+                                eacc.label,
+                            ))
+                            .clicked()
+                        {
+                            *open_emote_viewer = Some((provider, eacc.clone()));
+                        }
+                    }
+                });
+        }
+        });
+    }
+
+    /// "Trigger words" section — this instance's trigger-scope editor.
+    fn instance_props_triggers_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        mid: i64,
+        trigger_dirty: &mut bool,
+    ) {
+        egui::CollapsingHeader::new(egui::RichText::new("Trigger words").strong())
+            .id_salt("inst_props_sec_triggers")
+            .default_open(true)
+            .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "Start recording when the live title/game matches — even with Auto \
+                     off. Inherits the channel's rules, which inherit the global ones \
+                     (Settings → Downloads → Trigger words).",
+                )
+                .small()
+                .weak(),
+            );
+            if let Some(scope) = self.instance_trigger_drafts.get_mut(&mid)
+                && trigger_scope_editor(ui, scope, "inst_triggers")
+            {
+                *trigger_dirty = true;
+            }
+            });
+    }
+
+    /// "Schedule sources (this instance)" section — the per-monitor scope
+    /// override editor.
+    fn instance_props_sched_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        mid: i64,
+        global_order: &[SourceEntry],
+        scope_dirty: &mut bool,
+    ) {
+        egui::CollapsingHeader::new(
+            egui::RichText::new("Schedule sources (this instance)").strong(),
+        )
+        .id_salt("inst_props_sec_sched")
+        .default_open(false)
+        .show(ui, |ui| {
+        ui.label(
+            egui::RichText::new(
+                "Overrides the global order/title-fill for this one instance, taking \
+                 precedence over the channel's setting. Changes apply on the next \
+                 schedule refresh.",
+            )
+            .small()
+            .weak(),
+        );
+        if let Some(scope) = self.instance_scope_drafts.get_mut(&mid) {
+            if scope_override_editor(ui, scope, global_order) {
+                *scope_dirty = true;
+            }
+        }
+        });
+    }
+
+    /// Post-render actions for the instance window: persist dirty scope/trigger
+    /// drafts, dispatch ⟳ Refetch (outside the viewport closure) and open the
+    /// emote-viewer / asset-history / About windows requested by button clicks.
+    #[allow(clippy::too_many_arguments)]
+    fn instance_props_apply_actions(
+        &mut self,
+        mid: i64,
+        cid: i64,
+        ch: &Channel,
+        inst_account: &Option<AssetAccount>,
+        scope_dirty: bool,
+        trigger_dirty: bool,
+        refetch: bool,
+        open_emote_viewer: Option<(EmoteProvider, AssetAccount)>,
+        open_asset_history: bool,
+        open_about: bool,
+    ) {
         if scope_dirty {
             if let Some(scope) = self.instance_scope_drafts.get(&mid) {
                 if let Err(e) = save_monitor_scope(&self.core.store, mid, scope) {
@@ -523,7 +648,7 @@ impl StreamArchiverApp {
         // ⟳ Refetch dispatches outside the viewport closure (same cache-drop set
         // as the channel window; channel_icons_small stays for the same
         // viewport-race reason — it refreshes on AssetFetch completion).
-        if refetch && let Some(acc) = &inst_account {
+        if refetch && let Some(acc) = inst_account {
             self.core.manual(ManualCommand::RefetchAssets(mid));
             self.channel_icons.remove(&cid);
             self.channel_twitch_colors.remove(&cid);
@@ -550,7 +675,7 @@ impl StreamArchiverApp {
             }
         }
         // 🕑 History — the asset-history popup scoped to this account only.
-        if open_asset_history && let Some(acc) = &inst_account {
+        if open_asset_history && let Some(acc) = inst_account {
             let fresh = AssetHistoryView::new(ch.name.clone(), std::slice::from_ref(acc));
             match self
                 .asset_histories
@@ -562,11 +687,9 @@ impl StreamArchiverApp {
             }
         }
         // ℹ About — the archived About-page viewer for this account.
-        if open_about && let Some(acc) = &inst_account {
+        if open_about && let Some(acc) = inst_account {
             self.open_about_view(cid, &ch.name, acc);
         }
-
-        !open
     }
 
     /// Drive the off-UI-thread load of the channel Properties window's per-open data,
@@ -812,45 +935,8 @@ impl StreamArchiverApp {
             return false; // still loading — placeholder is on screen
         }
 
-        let icon_tex = self
-            .channel_icons
-            .entry(ch.id)
-            .or_insert_with(|| resolve_channel_icon(&ch, &accounts, ctx))
-            .clone();
-
-        // Mainpage asset thumbnails (icon + banner per account). Loaded full-res
-        // once per open; the clone is cheap (Arc-backed texture handles).
-        let thumbs = self
-            .channel_asset_thumbs
-            .entry(ch.id)
-            .or_insert_with(|| load_channel_asset_thumbs(&ch, &accounts, ctx))
-            .clone();
-        // Viewable emote counts per account+provider — enumerated once per open
-        // (one stat per emote) and cached, since this runs every frame.
-        let emote_counts = self
-            .channel_emote_counts
-            .entry(ch.id)
-            .or_insert_with(|| emote_provider_counts(&ch.name, &accounts))
-            .clone();
-        // Per-platform asset-status rows — built once per open from blocking filesystem
-        // I/O (read_dir + per-file metadata + full JSON manifest parse) and cached, so the
-        // status grid (rebuilt every frame the window is open) reads from memory instead of
-        // re-running dozens of syscalls per repaint (which can stall the UI thread on slow
-        // or AV-scanned storage). The clone is cheap (a handful of small rows).
-        let asset_status = self
-            .channel_asset_status
-            .entry(ch.id)
-            .or_insert_with(|| build_platform_asset_status(&ch.name, &accounts))
-            .clone();
-        // Latest About snapshot + version count per account — small indexed
-        // rows, loaded once per open (or with the props bundle) and cached.
-        let about_latest = self
-            .channel_about_latest
-            .entry(ch.id)
-            .or_insert_with(|| {
-                self.core.store.about_latest_per_account(ch.id).unwrap_or_default()
-            })
-            .clone();
+        let (icon_tex, thumbs, emote_counts, asset_status, about_latest) =
+            self.channel_props_cached_assets(&ch, &accounts, ctx);
 
         let mut pref_change: Option<Option<crate::models::PreferredAssetSource>> = None;
         let mut open_emote_viewer: Option<(EmoteProvider, AssetAccount)> = None;
@@ -895,51 +981,7 @@ impl StreamArchiverApp {
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
                 // ── Header ──────────────────────────────────────────────
-                ui.horizontal(|ui| {
-                    if let Some(tex) = &icon_tex {
-                        let resp = ui.add(
-                            egui::Image::from_texture(tex)
-                                .max_size(egui::vec2(96.0, 96.0))
-                                .corner_radius(egui::CornerRadius::same(8)),
-                        );
-                        queue_alt_image_preview(ui.ctx(), &resp, tex);
-                    } else {
-                        let (rect, _) = ui.allocate_exact_size(
-                            egui::vec2(96.0, 96.0),
-                            egui::Sense::hover(),
-                        );
-                        ui.painter().rect_filled(
-                            rect,
-                            8.0,
-                            ui.visuals().weak_text_color(),
-                        );
-                    }
-                    ui.add_space(8.0);
-                    ui.vertical(|ui| {
-                        ui.add_space(4.0);
-                        ui.heading(&ch.name);
-                        ui.horizontal(|ui| {
-                            let ptex = self
-                                .platform_tex
-                                .get_or_insert_with(|| PlatformTextures::load(ui.ctx()));
-                            for &p in &platforms {
-                                if let Some(t) = ptex.get(p) {
-                                    ui.add(
-                                        egui::Image::from_texture(t)
-                                            .max_size(egui::vec2(14.0, 14.0)),
-                                    );
-                                }
-                            }
-                            let names: Vec<&str> =
-                                platforms.iter().map(|p| p.label()).collect();
-                            ui.label(if names.is_empty() {
-                                "—".to_string()
-                            } else {
-                                names.join(" · ")
-                            });
-                        });
-                    });
-                });
+                self.channel_props_header(ui, &ch, &platforms, &icon_tex);
 
                 ui.separator();
 
@@ -951,476 +993,760 @@ impl StreamArchiverApp {
                 // click to open the file), then the refetch/history controls,
                 // icon-source picker, per-account status grid and emote-viewer
                 // launchers.
-                egui::CollapsingHeader::new(egui::RichText::new("Assets").strong())
-                    .id_salt("ch_props_sec_assets")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                if !thumbs.is_empty() {
-                    ui.add_space(2.0);
-                    const THUMB_H: f32 = 56.0;
-                    ui.horizontal_wrapped(|ui| {
-                        for t in &thumbs {
-                            let (w, h) = t.dims;
-                            let aspect = if h > 0 { w as f32 / h as f32 } else { 1.0 };
-                            // Clamp very wide banners so one asset can't dominate.
-                            let width = (THUMB_H * aspect).min(THUMB_H * 4.0);
-                            let resp = ui
-                                .add(
-                                    egui::Image::from_texture(&t.tex)
-                                        .fit_to_exact_size(egui::vec2(width, THUMB_H))
-                                        .corner_radius(egui::CornerRadius::same(4))
-                                        .sense(egui::Sense::click()),
-                                )
-                                .on_hover_text(format!(
-                                    "{} — {w}×{h} px\nAlt: preview full size · click: open file",
-                                    t.label,
-                                ));
-                            queue_alt_image_preview(ui.ctx(), &resp, &t.tex);
-                            if resp.clicked() {
-                                crate::platform::open_path(&t.path);
-                            }
-                        }
-                    });
-                }
-
-                {
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if !accounts.is_empty()
-                            && ui
-                                .button("⟳ Refetch")
-                                .on_hover_text(
-                                    "Fetch icon / banner / badges / emotes for EVERY account of \
-                                     this channel now — ignores the 24h cache.",
-                                )
-                                .clicked()
-                        {
-                            refetch_monitor_ids.extend(accounts.iter().map(|a| a.monitor_id));
-                        }
-                        if ui
-                            .button("📂")
-                            .on_hover_text(
-                                "Open the channel's asset folder (per-platform icons, banners, \
-                                 and the history/ archive of older versions).",
-                            )
-                            .clicked()
-                        {
-                            let root = crate::app_paths::asset_cache_dir()
-                                .join("channel_assets")
-                                .join(crate::downloader::sanitize_filename(&ch.name));
-                            crate::platform::open_path(&root);
-                        }
-                        if ui
-                            .button("🕑 History")
-                            .on_hover_text(
-                                "Show this channel's recorded asset changes over time \
-                                 (added / removed emotes, icon / banner / name-colour \
-                                 replacements) across all its platforms.",
-                            )
-                            .clicked()
-                        {
-                            open_asset_history = true;
-                        }
-                    });
-
-                    // About pages — one row per asset account, each opening the
-                    // archived About-page viewer (version picker + rendered
-                    // description/panels/links). Captured with every asset fetch.
-                    if !accounts.is_empty() {
-                        ui.add_space(6.0);
-                        ui.label(egui::RichText::new("About pages").strong());
-                        for acc in &accounts {
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .button(format!("ℹ {}", acc.label))
-                                    .on_hover_text(
-                                        "Show this account's archived About page with a \
-                                         version picker. A new version is stored only \
-                                         when the content actually changed.",
-                                    )
-                                    .clicked()
-                                {
-                                    open_about_account = Some(acc.clone());
-                                }
-                                match about_latest.iter().find(|(s, _)| {
-                                    s.platform == acc.platform.as_str() && s.account == acc.account
-                                }) {
-                                    Some((s, n)) => ui.weak(format!(
-                                        "{n} version(s) · captured {} · checked {}",
-                                        fmt_datetime_short(s.fetched_at),
-                                        fmt_datetime_short(s.last_checked_at),
-                                    )),
-                                    None => ui.weak("never captured"),
-                                };
-                            });
-                        }
-                    }
-
-                    // Icon source picker — one entry per asset ACCOUNT (a channel
-                    // can hold a main + alt on one platform).
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.label("Icon source:");
-                        let cur = ch.preferred_asset.clone();
-                        // A legacy bare-platform preference matches that platform's
-                        // FIRST account row.
-                        let selected_idx = cur.as_ref().and_then(|p| {
-                            accounts.iter().position(|a| {
-                                a.platform == p.platform
-                                    && p.account.as_deref().is_none_or(|acc| acc == a.account)
-                            })
-                        });
-                        egui::ComboBox::from_id_salt("pref_plat_cb")
-                            .selected_text(match selected_idx {
-                                Some(i) => accounts[i].label.clone(),
-                                None => "Auto (first available)".to_string(),
-                            })
-                            .show_ui(ui, |ui| {
-                                if ui
-                                    .selectable_label(cur.is_none(), "Auto (first available)")
-                                    .clicked()
-                                {
-                                    pref_change = Some(None);
-                                }
-                                for (i, a) in accounts.iter().enumerate() {
-                                    if ui
-                                        .selectable_label(selected_idx == Some(i), &a.label)
-                                        .clicked()
-                                    {
-                                        pref_change =
-                                            Some(Some(crate::models::PreferredAssetSource {
-                                                platform: a.platform,
-                                                account: Some(a.account.clone()),
-                                            }));
-                                    }
-                                }
-                            })
-                            .response
-                            .on_hover_text(
-                                "Which account's profile pic represents this channel. \
-                                 Auto uses the first account that has a fetched icon.",
-                            );
-                    });
-
-                    // Per-account asset status (one row per platform ACCOUNT —
-                    // a main + alt on one platform get separate rows).
-                    ui.add_space(4.0);
-                    egui::Grid::new("props_assets")
-                        .num_columns(7)
-                        .spacing([12.0, 4.0])
-                        .striped(true)
-                        .show(ui, |ui| {
-                            ui.strong("Source");
-                            ui.strong("Icon");
-                            ui.strong("Banner");
-                            ui.strong("Badges");
-                            ui.strong("Emotes");
-                            ui.strong("Updated");
-                            ui.strong("");
-                            ui.end_row();
-                            // Reads from the per-open `asset_status` cache — NO filesystem
-                            // I/O here (it would otherwise be dozens of syscalls per frame;
-                            // see `PlatformAssetStatus`).
-                            for st in &asset_status {
-                                ui.horizontal(|ui| {
-                                    let ptex = self.platform_tex.get_or_insert_with(|| {
-                                        PlatformTextures::load(ui.ctx())
-                                    });
-                                    if let Some(t) = ptex.get(st.account.platform) {
-                                        ui.add(
-                                            egui::Image::from_texture(t)
-                                                .max_size(egui::vec2(13.0, 13.0)),
-                                        );
-                                    }
-                                    ui.label(&st.account.label);
-                                });
-                                asset_status_cell(ui, st.icon_present, st.icon_variants);
-                                asset_status_cell(ui, st.banner_present, st.banner_variants);
-                                ui.label(if st.badges > 0 {
-                                    st.badges.to_string()
-                                } else {
-                                    "—".into()
-                                });
-                                ui.label(if st.emotes > 0 {
-                                    st.emotes.to_string()
-                                } else {
-                                    "—".into()
-                                });
-                                ui.label(&st.stamp);
-                                if ui
-                                    .small_button("⟳")
-                                    .on_hover_text(format!(
-                                        "Refetch assets for {} only (ignores the 24h cache).",
-                                        st.account.label,
-                                    ))
-                                    .clicked()
-                                {
-                                    refetch_monitor_ids.push(st.account.monitor_id);
-                                }
-                                ui.end_row();
-                            }
-                        });
-
-                    // Emote viewers: one launcher per (account, provider) that has
-                    // emotes. Twitch (first-party) uses a generic emote glyph; the
-                    // third parties use their brand logo (7TV/BTTV) or a text badge
-                    // (FFZ). Sibling accounts each get their own labelled row.
-                    if emote_counts.iter().any(|(_, counts)| counts.iter().any(|(_, n)| *n > 0)) {
-                        ui.add_space(6.0);
-                        for (acc, counts) in &emote_counts {
-                            if !counts.iter().any(|(_, n)| *n > 0) {
-                                continue;
-                            }
-                            ui.horizontal(|ui| {
-                                if acc.has_siblings {
-                                    ui.strong(format!("View emotes ({}):", acc.account));
-                                } else {
-                                    ui.strong("View emotes:");
-                                }
-                                let ptex = self
-                                    .provider_tex
-                                    .get_or_insert_with(|| ProviderTextures::load(ui.ctx()))
-                                    .clone();
-                                for &(provider, count) in counts {
-                                    if count == 0 {
-                                        continue;
-                                    }
-                                    let resp = match provider {
-                                        EmoteProvider::SevenTv => ui.add(egui::ImageButton::new(
-                                            egui::Image::from_texture(&ptex.seventv)
-                                                .fit_to_exact_size(egui::vec2(18.0, 18.0)),
-                                        )),
-                                        EmoteProvider::Bttv => ui.add(egui::ImageButton::new(
-                                            egui::Image::from_texture(&ptex.bttv)
-                                                .fit_to_exact_size(egui::vec2(18.0, 18.0)),
-                                        )),
-                                        EmoteProvider::Twitch => ui.button("😀"),
-                                        EmoteProvider::Ffz => ui.button("FFZ"),
-                                    };
-                                    if resp
-                                        .on_hover_text(format!(
-                                            "View {} {} emote{} for {}",
-                                            count,
-                                            provider.label(),
-                                            if count == 1 { "" } else { "s" },
-                                            acc.label,
-                                        ))
-                                        .clicked()
-                                    {
-                                        open_emote_viewer = Some((provider, acc.clone()));
-                                    }
-                                }
-                            });
-                        }
-                    }
-                }
-                    });
+                self.channel_props_assets_section(
+                    ui,
+                    &ch,
+                    &accounts,
+                    &thumbs,
+                    &emote_counts,
+                    &asset_status,
+                    &about_latest,
+                    &mut pref_change,
+                    &mut open_emote_viewer,
+                    &mut open_asset_history,
+                    &mut open_about_account,
+                    &mut refetch_monitor_ids,
+                );
 
                 // ── Channel ─────────────────────────────────────────────
-                egui::CollapsingHeader::new(egui::RichText::new("Channel").strong())
-                    .id_salt("ch_props_sec_channel")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                egui::Grid::new("props_ch")
-                    .num_columns(2)
-                    .spacing([12.0, 4.0])
-                    .show(ui, |ui| {
-                        ui.label("DB channel ID");
-                        ui.label(ch.id.to_string());
-                        ui.end_row();
-
-                        ui.label("URL");
-                        if ui.link(&ch.url).clicked() {
-                            ui.ctx().open_url(egui::OpenUrl::new_tab(ch.url.clone()));
-                        }
-                        ui.end_row();
-
-                        if ch.platform == Platform::YouTube {
-                            let yt_id = extract_yt_channel_id(&ch.url)
-                                .unwrap_or_else(|| "— (handle URL, ID not in URL)".into());
-                            ui.label("Channel ID");
-                            ui.horizontal(|ui| {
-                                ui.label(&yt_id);
-                                if !yt_id.starts_with('—')
-                                    && ui.small_button("⧉").on_hover_text("Copy").clicked()
-                                {
-                                    ui.ctx().copy_text(yt_id.clone());
-                                }
-                            });
-                            ui.end_row();
-                        }
-                    });
-                    });
+                Self::channel_props_channel_section(ui, &ch);
 
                 // ── Trigger words (per-channel) ──────────────────────────
-                egui::CollapsingHeader::new(egui::RichText::new("Trigger words").strong())
-                    .id_salt("ch_props_sec_triggers")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(
-                            "Start recording when the live title/game matches — even with Auto \
-                             off — for every instance in this channel. Inherits the global rules \
-                             (Settings → Downloads → Trigger words); instances can override again.",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                    if let Some(scope) = self.channel_trigger_drafts.get_mut(&ch.id)
-                        && trigger_scope_editor(ui, scope, "ch_triggers")
-                    {
-                        trigger_dirty = true;
-                    }
-                    });
+                self.channel_props_triggers_section(ui, cid, &mut trigger_dirty);
 
                 // ── Schedule sources (per-channel) ───────────────────────
-                if let Some(cfg) = self.channel_cfg_drafts.get_mut(&ch.id) {
-                    egui::CollapsingHeader::new(
-                        egui::RichText::new("Schedule sources (this channel)").strong(),
-                    )
-                    .id_salt("ch_props_sec_sched")
-                    .default_open(false)
-                    .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(
-                            "Used by the image/scrape sources you enable in Settings → Schedule \
-                             sources. Changes apply on the next schedule refresh (or click ⟳ in \
-                             the Schedule tab).",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                    egui::Grid::new("props_sched_src")
-                        .num_columns(2)
-                        .spacing([12.0, 4.0])
-                        .show(ui, |ui| {
-                            ui.label("Twitter/X handle");
-                            if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut cfg.twitter_handle)
-                                        .hint_text("without @")
-                                        .desired_width(240.0),
-                                )
-                                .on_hover_text(
-                                    "Used by the 'Twitter/X pinned' source to read the schedule \
-                                     off the pinned tweet's image.",
-                                )
-                                .changed()
-                            {
-                                cfg_dirty = true;
-                            }
-                            ui.end_row();
-
-                            ui.label("Other image (path/URL)");
-                            if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut cfg.other_image)
-                                        .hint_text("local path or https://…")
-                                        .desired_width(240.0),
-                                )
-                                .on_hover_text(
-                                    "Used by the 'Other image (OCR)' source — point it at any \
-                                     schedule image (a saved screenshot or a direct image URL).",
-                                )
-                                .changed()
-                            {
-                                cfg_dirty = true;
-                            }
-                            ui.end_row();
-
-                            ui.label("OCR model override");
-                            if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut cfg.ocr_model)
-                                        .hint_text("(global default)")
-                                        .desired_width(240.0),
-                                )
-                                .changed()
-                            {
-                                cfg_dirty = true;
-                            }
-                            ui.end_row();
-
-                            ui.label("OCR primary timezone");
-                            if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut cfg.ocr_timezone)
-                                        .hint_text("(global default)")
-                                        .desired_width(240.0),
-                                )
-                                .on_hover_text(
-                                    "Primary IANA timezone this channel's schedule images are \
-                                     written in (e.g. America/Los_Angeles). Anchors the date when \
-                                     an image lists multiple timezones for one stream.",
-                                )
-                                .changed()
-                            {
-                                cfg_dirty = true;
-                            }
-                            ui.end_row();
-
-                            ui.label("OCR UTC offset override");
-                            if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut cfg.ocr_offset)
-                                        .hint_text("(global default, e.g. +02:00)")
-                                        .desired_width(240.0),
-                                )
-                                .changed()
-                            {
-                                cfg_dirty = true;
-                            }
-                            ui.end_row();
-
-                            ui.label("YouTube community backlog");
-                            if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut cfg.max_community_posts)
-                                        .hint_text("(global default)")
-                                        .desired_width(80.0),
-                                )
-                                .on_hover_text(
-                                    "How many recent YouTube community posts to scan for this \
-                                     channel's schedule image. Empty = use the global setting. \
-                                     Clamped to 1–20.",
-                                )
-                                .changed()
-                            {
-                                cfg_dirty = true;
-                            }
-                            ui.end_row();
-                        });
-
-                    // Per-channel source-order + title-fill override.
-                    ui.add_space(6.0);
-                    if let Some(scope) = self.channel_scope_drafts.get_mut(&ch.id) {
-                        if scope_override_editor(ui, scope, &global_order) {
-                            scope_dirty = true;
-                        }
-                    }
-                    });
-                }
+                self.channel_props_sched_section(
+                    ui,
+                    cid,
+                    &global_order,
+                    &mut cfg_dirty,
+                    &mut scope_dirty,
+                );
 
                 }); // ScrollArea
 
                 // Apply an icon-source change picked in the combo above.
-                if let Some(newp) = pref_change.take() {
-                    if let Err(e) =
-                        self.core.store.set_channel_preferred_asset(ch.id, newp.as_ref())
-                    {
-                        self.status = format!("Error: {e}");
-                    } else {
-                        self.channel_icons.remove(&ch.id);
-                        // channel_icons_small intentionally omitted — same viewport-race
-                        // reason as the Refetch button above. Refreshes on next AssetFetch.
-                        self.reload_rows();
-                    }
-                }
+                self.channel_props_apply_pref_change(&ch, &mut pref_change);
                 });
                 draw_alt_image_preview(ctx);
             },
         );
 
+        self.channel_props_apply_actions(
+            cid,
+            &ch,
+            &accounts,
+            refetch_monitor_ids,
+            open_emote_viewer,
+            open_asset_history,
+            open_about_account,
+            cfg_dirty,
+            scope_dirty,
+            trigger_dirty,
+        );
+
+        // Draft/texture cleanup for a closed window happens in the caller
+        // (channel_properties_windows), which also drops it from the open list.
+        !open
+    }
+
+    /// Per-open cached data for the channel window: header icon, asset
+    /// thumbnails, emote counts, per-account status rows and About snapshots.
+    #[allow(clippy::type_complexity)]
+    fn channel_props_cached_assets(
+        &mut self,
+        ch: &Channel,
+        accounts: &[AssetAccount],
+        ctx: &egui::Context,
+    ) -> (
+        Option<egui::TextureHandle>,
+        Vec<AssetThumb>,
+        Vec<(AssetAccount, [(EmoteProvider, usize); 4])>,
+        Vec<PlatformAssetStatus>,
+        Vec<(crate::store::AboutSnapshotRow, i64)>,
+    ) {
+        let icon_tex = self
+            .channel_icons
+            .entry(ch.id)
+            .or_insert_with(|| resolve_channel_icon(ch, accounts, ctx))
+            .clone();
+
+        // Mainpage asset thumbnails (icon + banner per account). Loaded full-res
+        // once per open; the clone is cheap (Arc-backed texture handles).
+        let thumbs = self
+            .channel_asset_thumbs
+            .entry(ch.id)
+            .or_insert_with(|| load_channel_asset_thumbs(ch, accounts, ctx))
+            .clone();
+        // Viewable emote counts per account+provider — enumerated once per open
+        // (one stat per emote) and cached, since this runs every frame.
+        let emote_counts = self
+            .channel_emote_counts
+            .entry(ch.id)
+            .or_insert_with(|| emote_provider_counts(&ch.name, accounts))
+            .clone();
+        // Per-platform asset-status rows — built once per open from blocking filesystem
+        // I/O (read_dir + per-file metadata + full JSON manifest parse) and cached, so the
+        // status grid (rebuilt every frame the window is open) reads from memory instead of
+        // re-running dozens of syscalls per repaint (which can stall the UI thread on slow
+        // or AV-scanned storage). The clone is cheap (a handful of small rows).
+        let asset_status = self
+            .channel_asset_status
+            .entry(ch.id)
+            .or_insert_with(|| build_platform_asset_status(&ch.name, accounts))
+            .clone();
+        // Latest About snapshot + version count per account — small indexed
+        // rows, loaded once per open (or with the props bundle) and cached.
+        let about_latest = self
+            .channel_about_latest
+            .entry(ch.id)
+            .or_insert_with(|| {
+                self.core.store.about_latest_per_account(ch.id).unwrap_or_default()
+            })
+            .clone();
+
+        (icon_tex, thumbs, emote_counts, asset_status, about_latest)
+    }
+
+    /// Header row: channel icon (or placeholder), name, and the platform
+    /// icon + label list across the channel's instances.
+    fn channel_props_header(
+        &mut self,
+        ui: &mut egui::Ui,
+        ch: &Channel,
+        platforms: &[Platform],
+        icon_tex: &Option<egui::TextureHandle>,
+    ) {
+        ui.horizontal(|ui| {
+            if let Some(tex) = icon_tex {
+                let resp = ui.add(
+                    egui::Image::from_texture(tex)
+                        .max_size(egui::vec2(96.0, 96.0))
+                        .corner_radius(egui::CornerRadius::same(8)),
+                );
+                queue_alt_image_preview(ui.ctx(), &resp, tex);
+            } else {
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(96.0, 96.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter().rect_filled(
+                    rect,
+                    8.0,
+                    ui.visuals().weak_text_color(),
+                );
+            }
+            ui.add_space(8.0);
+            ui.vertical(|ui| {
+                ui.add_space(4.0);
+                ui.heading(&ch.name);
+                ui.horizontal(|ui| {
+                    let ptex = self
+                        .platform_tex
+                        .get_or_insert_with(|| PlatformTextures::load(ui.ctx()));
+                    for &p in platforms {
+                        if let Some(t) = ptex.get(p) {
+                            ui.add(
+                                egui::Image::from_texture(t)
+                                    .max_size(egui::vec2(14.0, 14.0)),
+                            );
+                        }
+                    }
+                    let names: Vec<&str> =
+                        platforms.iter().map(|p| p.label()).collect();
+                    ui.label(if names.is_empty() {
+                        "—".to_string()
+                    } else {
+                        names.join(" · ")
+                    });
+                });
+            });
+        });
+    }
+
+    /// "Assets" section — thumbnail strip, refetch/history controls, About-page
+    /// rows, icon-source picker, per-account status grid and emote-viewer
+    /// launchers.
+    #[allow(clippy::too_many_arguments)]
+    fn channel_props_assets_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        ch: &Channel,
+        accounts: &[AssetAccount],
+        thumbs: &[AssetThumb],
+        emote_counts: &[(AssetAccount, [(EmoteProvider, usize); 4])],
+        asset_status: &[PlatformAssetStatus],
+        about_latest: &[(crate::store::AboutSnapshotRow, i64)],
+        pref_change: &mut Option<Option<crate::models::PreferredAssetSource>>,
+        open_emote_viewer: &mut Option<(EmoteProvider, AssetAccount)>,
+        open_asset_history: &mut bool,
+        open_about_account: &mut Option<AssetAccount>,
+        refetch_monitor_ids: &mut Vec<i64>,
+    ) {
+        egui::CollapsingHeader::new(egui::RichText::new("Assets").strong())
+            .id_salt("ch_props_sec_assets")
+            .default_open(true)
+            .show(ui, |ui| {
+        Self::channel_props_asset_thumbs(ui, thumbs);
+
+        {
+            Self::channel_props_asset_actions(
+                ui,
+                ch,
+                accounts,
+                about_latest,
+                open_asset_history,
+                open_about_account,
+                refetch_monitor_ids,
+            );
+
+            Self::channel_props_icon_source_picker(ui, ch, accounts, pref_change);
+
+            self.channel_props_asset_status_grid(ui, asset_status, refetch_monitor_ids);
+
+            self.channel_props_emote_launchers(ui, emote_counts, open_emote_viewer);
+        }
+            });
+    }
+
+    /// Thumbnail overview of every original icon/banner across the channel's
+    /// accounts (hover for size, Alt to preview full-res, click to open).
+    fn channel_props_asset_thumbs(ui: &mut egui::Ui, thumbs: &[AssetThumb]) {
+        if !thumbs.is_empty() {
+            ui.add_space(2.0);
+            const THUMB_H: f32 = 56.0;
+            ui.horizontal_wrapped(|ui| {
+                for t in thumbs {
+                    let (w, h) = t.dims;
+                    let aspect = if h > 0 { w as f32 / h as f32 } else { 1.0 };
+                    // Clamp very wide banners so one asset can't dominate.
+                    let width = (THUMB_H * aspect).min(THUMB_H * 4.0);
+                    let resp = ui
+                        .add(
+                            egui::Image::from_texture(&t.tex)
+                                .fit_to_exact_size(egui::vec2(width, THUMB_H))
+                                .corner_radius(egui::CornerRadius::same(4))
+                                .sense(egui::Sense::click()),
+                        )
+                        .on_hover_text(format!(
+                            "{} — {w}×{h} px\nAlt: preview full size · click: open file",
+                            t.label,
+                        ));
+                    queue_alt_image_preview(ui.ctx(), &resp, &t.tex);
+                    if resp.clicked() {
+                        crate::platform::open_path(&t.path);
+                    }
+                }
+            });
+        }
+    }
+
+    /// Refetch / open-folder / history button row plus the per-account
+    /// About-page rows.
+    fn channel_props_asset_actions(
+        ui: &mut egui::Ui,
+        ch: &Channel,
+        accounts: &[AssetAccount],
+        about_latest: &[(crate::store::AboutSnapshotRow, i64)],
+        open_asset_history: &mut bool,
+        open_about_account: &mut Option<AssetAccount>,
+        refetch_monitor_ids: &mut Vec<i64>,
+    ) {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if !accounts.is_empty()
+                && ui
+                    .button("⟳ Refetch")
+                    .on_hover_text(
+                        "Fetch icon / banner / badges / emotes for EVERY account of \
+                         this channel now — ignores the 24h cache.",
+                    )
+                    .clicked()
+            {
+                refetch_monitor_ids.extend(accounts.iter().map(|a| a.monitor_id));
+            }
+            if ui
+                .button("📂")
+                .on_hover_text(
+                    "Open the channel's asset folder (per-platform icons, banners, \
+                     and the history/ archive of older versions).",
+                )
+                .clicked()
+            {
+                let root = crate::app_paths::asset_cache_dir()
+                    .join("channel_assets")
+                    .join(crate::downloader::sanitize_filename(&ch.name));
+                crate::platform::open_path(&root);
+            }
+            if ui
+                .button("🕑 History")
+                .on_hover_text(
+                    "Show this channel's recorded asset changes over time \
+                     (added / removed emotes, icon / banner / name-colour \
+                     replacements) across all its platforms.",
+                )
+                .clicked()
+            {
+                *open_asset_history = true;
+            }
+        });
+
+        // About pages — one row per asset account, each opening the
+        // archived About-page viewer (version picker + rendered
+        // description/panels/links). Captured with every asset fetch.
+        if !accounts.is_empty() {
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("About pages").strong());
+            for acc in accounts {
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(format!("ℹ {}", acc.label))
+                        .on_hover_text(
+                            "Show this account's archived About page with a \
+                             version picker. A new version is stored only \
+                             when the content actually changed.",
+                        )
+                        .clicked()
+                    {
+                        *open_about_account = Some(acc.clone());
+                    }
+                    match about_latest.iter().find(|(s, _)| {
+                        s.platform == acc.platform.as_str() && s.account == acc.account
+                    }) {
+                        Some((s, n)) => ui.weak(format!(
+                            "{n} version(s) · captured {} · checked {}",
+                            fmt_datetime_short(s.fetched_at),
+                            fmt_datetime_short(s.last_checked_at),
+                        )),
+                        None => ui.weak("never captured"),
+                    };
+                });
+            }
+        }
+    }
+
+    /// Icon source picker — one entry per asset ACCOUNT (a channel can hold a
+    /// main + alt on one platform).
+    fn channel_props_icon_source_picker(
+        ui: &mut egui::Ui,
+        ch: &Channel,
+        accounts: &[AssetAccount],
+        pref_change: &mut Option<Option<crate::models::PreferredAssetSource>>,
+    ) {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("Icon source:");
+            let cur = ch.preferred_asset.clone();
+            // A legacy bare-platform preference matches that platform's
+            // FIRST account row.
+            let selected_idx = cur.as_ref().and_then(|p| {
+                accounts.iter().position(|a| {
+                    a.platform == p.platform
+                        && p.account.as_deref().is_none_or(|acc| acc == a.account)
+                })
+            });
+            egui::ComboBox::from_id_salt("pref_plat_cb")
+                .selected_text(match selected_idx {
+                    Some(i) => accounts[i].label.clone(),
+                    None => "Auto (first available)".to_string(),
+                })
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(cur.is_none(), "Auto (first available)")
+                        .clicked()
+                    {
+                        *pref_change = Some(None);
+                    }
+                    for (i, a) in accounts.iter().enumerate() {
+                        if ui
+                            .selectable_label(selected_idx == Some(i), &a.label)
+                            .clicked()
+                        {
+                            *pref_change =
+                                Some(Some(crate::models::PreferredAssetSource {
+                                    platform: a.platform,
+                                    account: Some(a.account.clone()),
+                                }));
+                        }
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Which account's profile pic represents this channel. \
+                     Auto uses the first account that has a fetched icon.",
+                );
+        });
+    }
+
+    /// Per-account asset status grid (one row per platform ACCOUNT — a main +
+    /// alt on one platform get separate rows), each with its own ⟳ refetch.
+    fn channel_props_asset_status_grid(
+        &mut self,
+        ui: &mut egui::Ui,
+        asset_status: &[PlatformAssetStatus],
+        refetch_monitor_ids: &mut Vec<i64>,
+    ) {
+        ui.add_space(4.0);
+        egui::Grid::new("props_assets")
+            .num_columns(7)
+            .spacing([12.0, 4.0])
+            .striped(true)
+            .show(ui, |ui| {
+                ui.strong("Source");
+                ui.strong("Icon");
+                ui.strong("Banner");
+                ui.strong("Badges");
+                ui.strong("Emotes");
+                ui.strong("Updated");
+                ui.strong("");
+                ui.end_row();
+                // Reads from the per-open `asset_status` cache — NO filesystem
+                // I/O here (it would otherwise be dozens of syscalls per frame;
+                // see `PlatformAssetStatus`).
+                for st in asset_status {
+                    ui.horizontal(|ui| {
+                        let ptex = self.platform_tex.get_or_insert_with(|| {
+                            PlatformTextures::load(ui.ctx())
+                        });
+                        if let Some(t) = ptex.get(st.account.platform) {
+                            ui.add(
+                                egui::Image::from_texture(t)
+                                    .max_size(egui::vec2(13.0, 13.0)),
+                            );
+                        }
+                        ui.label(&st.account.label);
+                    });
+                    asset_status_cell(ui, st.icon_present, st.icon_variants);
+                    asset_status_cell(ui, st.banner_present, st.banner_variants);
+                    ui.label(if st.badges > 0 {
+                        st.badges.to_string()
+                    } else {
+                        "—".into()
+                    });
+                    ui.label(if st.emotes > 0 {
+                        st.emotes.to_string()
+                    } else {
+                        "—".into()
+                    });
+                    ui.label(&st.stamp);
+                    if ui
+                        .small_button("⟳")
+                        .on_hover_text(format!(
+                            "Refetch assets for {} only (ignores the 24h cache).",
+                            st.account.label,
+                        ))
+                        .clicked()
+                    {
+                        refetch_monitor_ids.push(st.account.monitor_id);
+                    }
+                    ui.end_row();
+                }
+            });
+    }
+
+    /// Emote viewers: one launcher per (account, provider) that has emotes.
+    /// Twitch (first-party) uses a generic emote glyph; the third parties use
+    /// their brand logo (7TV/BTTV) or a text badge (FFZ). Sibling accounts
+    /// each get their own labelled row.
+    #[allow(deprecated)] // egui::ImageButton
+    fn channel_props_emote_launchers(
+        &mut self,
+        ui: &mut egui::Ui,
+        emote_counts: &[(AssetAccount, [(EmoteProvider, usize); 4])],
+        open_emote_viewer: &mut Option<(EmoteProvider, AssetAccount)>,
+    ) {
+        if emote_counts.iter().any(|(_, counts)| counts.iter().any(|(_, n)| *n > 0)) {
+            ui.add_space(6.0);
+            for (acc, counts) in emote_counts {
+                if !counts.iter().any(|(_, n)| *n > 0) {
+                    continue;
+                }
+                ui.horizontal(|ui| {
+                    if acc.has_siblings {
+                        ui.strong(format!("View emotes ({}):", acc.account));
+                    } else {
+                        ui.strong("View emotes:");
+                    }
+                    let ptex = self
+                        .provider_tex
+                        .get_or_insert_with(|| ProviderTextures::load(ui.ctx()))
+                        .clone();
+                    for &(provider, count) in counts {
+                        if count == 0 {
+                            continue;
+                        }
+                        let resp = match provider {
+                            EmoteProvider::SevenTv => ui.add(egui::ImageButton::new(
+                                egui::Image::from_texture(&ptex.seventv)
+                                    .fit_to_exact_size(egui::vec2(18.0, 18.0)),
+                            )),
+                            EmoteProvider::Bttv => ui.add(egui::ImageButton::new(
+                                egui::Image::from_texture(&ptex.bttv)
+                                    .fit_to_exact_size(egui::vec2(18.0, 18.0)),
+                            )),
+                            EmoteProvider::Twitch => ui.button("😀"),
+                            EmoteProvider::Ffz => ui.button("FFZ"),
+                        };
+                        if resp
+                            .on_hover_text(format!(
+                                "View {} {} emote{} for {}",
+                                count,
+                                provider.label(),
+                                if count == 1 { "" } else { "s" },
+                                acc.label,
+                            ))
+                            .clicked()
+                        {
+                            *open_emote_viewer = Some((provider, acc.clone()));
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    /// "Channel" section — the read-only channel-identity grid.
+    fn channel_props_channel_section(ui: &mut egui::Ui, ch: &Channel) {
+        egui::CollapsingHeader::new(egui::RichText::new("Channel").strong())
+            .id_salt("ch_props_sec_channel")
+            .default_open(true)
+            .show(ui, |ui| {
+        egui::Grid::new("props_ch")
+            .num_columns(2)
+            .spacing([12.0, 4.0])
+            .show(ui, |ui| {
+                ui.label("DB channel ID");
+                ui.label(ch.id.to_string());
+                ui.end_row();
+
+                ui.label("URL");
+                if ui.link(&ch.url).clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(ch.url.clone()));
+                }
+                ui.end_row();
+
+                if ch.platform == Platform::YouTube {
+                    let yt_id = extract_yt_channel_id(&ch.url)
+                        .unwrap_or_else(|| "— (handle URL, ID not in URL)".into());
+                    ui.label("Channel ID");
+                    ui.horizontal(|ui| {
+                        ui.label(&yt_id);
+                        if !yt_id.starts_with('—')
+                            && ui.small_button("⧉").on_hover_text("Copy").clicked()
+                        {
+                            ui.ctx().copy_text(yt_id.clone());
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+            });
+    }
+
+    /// "Trigger words" section — the per-channel trigger-scope editor.
+    fn channel_props_triggers_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        cid: i64,
+        trigger_dirty: &mut bool,
+    ) {
+        egui::CollapsingHeader::new(egui::RichText::new("Trigger words").strong())
+            .id_salt("ch_props_sec_triggers")
+            .default_open(true)
+            .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "Start recording when the live title/game matches — even with Auto \
+                     off — for every instance in this channel. Inherits the global rules \
+                     (Settings → Downloads → Trigger words); instances can override again.",
+                )
+                .small()
+                .weak(),
+            );
+            if let Some(scope) = self.channel_trigger_drafts.get_mut(&cid)
+                && trigger_scope_editor(ui, scope, "ch_triggers")
+            {
+                *trigger_dirty = true;
+            }
+            });
+    }
+
+    /// "Schedule sources (this channel)" section — per-channel source config
+    /// (Twitter handle, OCR overrides, …) plus the scope-override editor.
+    fn channel_props_sched_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        cid: i64,
+        global_order: &[SourceEntry],
+        cfg_dirty: &mut bool,
+        scope_dirty: &mut bool,
+    ) {
+        if let Some(cfg) = self.channel_cfg_drafts.get_mut(&cid) {
+            egui::CollapsingHeader::new(
+                egui::RichText::new("Schedule sources (this channel)").strong(),
+            )
+            .id_salt("ch_props_sec_sched")
+            .default_open(false)
+            .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "Used by the image/scrape sources you enable in Settings → Schedule \
+                     sources. Changes apply on the next schedule refresh (or click ⟳ in \
+                     the Schedule tab).",
+                )
+                .small()
+                .weak(),
+            );
+            egui::Grid::new("props_sched_src")
+                .num_columns(2)
+                .spacing([12.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label("Twitter/X handle");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut cfg.twitter_handle)
+                                .hint_text("without @")
+                                .desired_width(240.0),
+                        )
+                        .on_hover_text(
+                            "Used by the 'Twitter/X pinned' source to read the schedule \
+                             off the pinned tweet's image.",
+                        )
+                        .changed()
+                    {
+                        *cfg_dirty = true;
+                    }
+                    ui.end_row();
+
+                    ui.label("Other image (path/URL)");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut cfg.other_image)
+                                .hint_text("local path or https://…")
+                                .desired_width(240.0),
+                        )
+                        .on_hover_text(
+                            "Used by the 'Other image (OCR)' source — point it at any \
+                             schedule image (a saved screenshot or a direct image URL).",
+                        )
+                        .changed()
+                    {
+                        *cfg_dirty = true;
+                    }
+                    ui.end_row();
+
+                    ui.label("OCR model override");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut cfg.ocr_model)
+                                .hint_text("(global default)")
+                                .desired_width(240.0),
+                        )
+                        .changed()
+                    {
+                        *cfg_dirty = true;
+                    }
+                    ui.end_row();
+
+                    ui.label("OCR primary timezone");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut cfg.ocr_timezone)
+                                .hint_text("(global default)")
+                                .desired_width(240.0),
+                        )
+                        .on_hover_text(
+                            "Primary IANA timezone this channel's schedule images are \
+                             written in (e.g. America/Los_Angeles). Anchors the date when \
+                             an image lists multiple timezones for one stream.",
+                        )
+                        .changed()
+                    {
+                        *cfg_dirty = true;
+                    }
+                    ui.end_row();
+
+                    ui.label("OCR UTC offset override");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut cfg.ocr_offset)
+                                .hint_text("(global default, e.g. +02:00)")
+                                .desired_width(240.0),
+                        )
+                        .changed()
+                    {
+                        *cfg_dirty = true;
+                    }
+                    ui.end_row();
+
+                    ui.label("YouTube community backlog");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut cfg.max_community_posts)
+                                .hint_text("(global default)")
+                                .desired_width(80.0),
+                        )
+                        .on_hover_text(
+                            "How many recent YouTube community posts to scan for this \
+                             channel's schedule image. Empty = use the global setting. \
+                             Clamped to 1–20.",
+                        )
+                        .changed()
+                    {
+                        *cfg_dirty = true;
+                    }
+                    ui.end_row();
+                });
+
+            // Per-channel source-order + title-fill override.
+            ui.add_space(6.0);
+            if let Some(scope) = self.channel_scope_drafts.get_mut(&cid) {
+                if scope_override_editor(ui, scope, global_order) {
+                    *scope_dirty = true;
+                }
+            }
+            });
+        }
+    }
+
+    /// Apply an icon-source change picked in the picker combo.
+    fn channel_props_apply_pref_change(
+        &mut self,
+        ch: &Channel,
+        pref_change: &mut Option<Option<crate::models::PreferredAssetSource>>,
+    ) {
+        if let Some(newp) = pref_change.take() {
+            if let Err(e) =
+                self.core.store.set_channel_preferred_asset(ch.id, newp.as_ref())
+            {
+                self.status = format!("Error: {e}");
+            } else {
+                self.channel_icons.remove(&ch.id);
+                // channel_icons_small intentionally omitted — same viewport-race
+                // reason as the Refetch button above. Refreshes on next AssetFetch.
+                self.reload_rows();
+            }
+        }
+    }
+
+    /// Post-render actions for the channel window: dispatch the collected
+    /// Refetch requests (outside the viewport closure), open the emote-viewer /
+    /// asset-history / About windows requested by button clicks, and persist
+    /// dirty config/scope/trigger drafts.
+    #[allow(clippy::too_many_arguments)]
+    fn channel_props_apply_actions(
+        &mut self,
+        cid: i64,
+        ch: &Channel,
+        accounts: &[AssetAccount],
+        mut refetch_monitor_ids: Vec<i64>,
+        open_emote_viewer: Option<(EmoteProvider, AssetAccount)>,
+        open_asset_history: bool,
+        open_about_account: Option<AssetAccount>,
+        cfg_dirty: bool,
+        scope_dirty: bool,
+        trigger_dirty: bool,
+    ) {
         // The Refetch buttons (header = every account, per-row = one account)
         // dispatch outside the viewport closure.
         if !refetch_monitor_ids.is_empty() {
@@ -1460,7 +1786,7 @@ impl StreamArchiverApp {
         }
         // The "🕑 History" button was clicked — load and open the asset-history popup.
         if open_asset_history {
-            let fresh = AssetHistoryView::new(ch.name.clone(), &accounts);
+            let fresh = AssetHistoryView::new(ch.name.clone(), accounts);
             match self
                 .asset_histories
                 .iter_mut()
@@ -1497,10 +1823,6 @@ impl StreamArchiverApp {
         {
             self.status = format!("Error saving trigger words: {e}");
         }
-
-        // Draft/texture cleanup for a closed window happens in the caller
-        // (channel_properties_windows), which also drops it from the open list.
-        !open
     }
 
     /// Render every open emote-viewer window (one per channel+provider) — a
