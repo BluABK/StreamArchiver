@@ -69,660 +69,726 @@ impl Supervisor {
                 Some(monitor_id) = offline_rx.recv() => {
                     self.handle_offline_signal(monitor_id);
                 }
-                Some(cmd) = manual_rx.recv() => match cmd {
-                    ManualCommand::Start { id, user_initiated } => {
-                        let this = self.clone();
-                        tokio::spawn(async move { this.manual_start(id, user_initiated).await });
-                    }
-                    ManualCommand::Stop(id) => self.manual_stop(id),
-                    ManualCommand::StopHoldFor { monitor_id, hours } => {
-                        self.manual_stop_hold(monitor_id, hours)
-                    }
-                    ManualCommand::StartVideo(id) => {
-                        if !self.shutdown.load(Ordering::SeqCst) {
-                            let this = self.clone();
-                            tokio::spawn(async move { this.start_video(id).await });
-                        }
-                    }
-                    ManualCommand::StopVideo(id) => self.stop_video(id),
-                    ManualCommand::StopChat(id) => self.stop_chat_download(id),
-                    ManualCommand::RefetchAssets(id) => {
-                        if let Ok(Some(row)) = self.store.get_monitor_with_channel(id) {
-                            // Manual: bypass the 24h stamp + the fetch_chat_assets
-                            // toggle, and resolve the platform id from the URL.
-                            self.fetch_channel_assets(&row, None, true);
-                        }
-                    }
-                    ManualCommand::ReRemux { rec_id, capture, final_ } => {
-                        let store = self.store.clone();
-                        let tx = self.events.clone();
-                        let task_id = rec_id as u64;
-                        let src_name = capture
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        let dst_name = final_
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        let _ = tx.send(AppEvent::BackgroundTaskStarted(
-                            crate::events::BackgroundTask {
-                                id: task_id,
-                                kind: crate::events::BackgroundTaskKind::Remux,
-                                label: src_name,
-                                detail: format!("→ {dst_name}"),
-                                started_at: now_unix(),
-                                progress: None,
-                progress_info: None,
-                            },
-                        ));
-                        let tx2 = tx.clone();
-                        tokio::spawn(async move {
-                            info!("re-remux start: {}", capture.display());
-                            // ffmpeg writes the destination directly, so shorten
-                            // proactively — this also covers a Re-remux retry after
-                            // the FIRST attempt failed because this exact name was
-                            // too long (see path_with_safe_stem).
-                            let final_ = path_with_safe_stem(&final_);
-                            match remux_ts_to_mkv(&capture, &final_, Some((tx2, task_id)), &Default::default()).await {
-                                Ok(()) => {
-                                    let _ = crate::iomon::fs::remove_file(Cat::CacheSweep, &capture).await;
-                                    let path_s = final_.to_string_lossy();
-                                    if let Err(e) = store.update_recording_output_path(rec_id, &path_s) {
-                                        warn!("re-remux: DB update failed for rec_id={rec_id}: {e:#}");
-                                    }
-                                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
-                                        id: task_id,
-                                        outcome: crate::events::TaskOutcome::Completed,
-                                    });
-                                    let _ = tx.send(AppEvent::RecordingUpdated { recording_id: rec_id });
-                                    info!("re-remux done: {}", final_.display());
-                                }
-                                Err(e) => {
-                                    warn!("re-remux failed for rec_id={rec_id}: {e:#}");
-                                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
-                                        id: task_id,
-                                        outcome: crate::events::TaskOutcome::Failed(e.to_string()),
-                                    });
-                                    let _ = tx.send(AppEvent::RecordingUpdated { recording_id: rec_id });
-                                }
-                            }
-                        });
-                    }
-                    ManualCommand::ReRemuxAll => {
-                        let store = self.store.clone();
-                        let tx = self.events.clone();
-                        tokio::spawn(async move {
-                            let task_id = crate::events::next_task_id();
-                            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
-                                id: task_id,
-                                kind: crate::events::BackgroundTaskKind::ReRemuxAll,
-                                label: "Re-remux all".into(),
-                                detail: String::new(),
-                                started_at: now_unix(),
-                                progress: Some(0.0),
-                                progress_info: None,
-                            }));
-                            let recs = match store.list_recordings_with_mkv() {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
-                                        id: task_id,
-                                        outcome: crate::events::TaskOutcome::Failed(e.to_string()),
-                                    });
-                                    return;
-                                }
-                            };
-                            let total = recs.len();
-                            let mut done = 0usize;
-                            let opts = store.remux_opts();
-                            for (rec_id, output_path) in &recs {
-                                let planned_mkv = PathBuf::from(output_path);
-                                // The sibling .ts (the actual source to remux) lives
-                                // under the ORIGINAL stem — only the destination we're
-                                // about to write gets proactively shortened.
-                                let ts = planned_mkv.with_extension("ts");
-                                if !crate::iomon::fs::exists_sync(Cat::FsProbe, &ts) {
-                                    done += 1;
-                                    continue;
-                                }
-                                let mkv = path_with_safe_stem(&planned_mkv);
-                                let _ = tx.send(AppEvent::BackgroundTaskProgress {
-                                    id: task_id,
-                                    progress: Some(done as f32 / total as f32),
-                                    info: format!("{}/{total}: {}", done + 1, mkv.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()),
-                                });
-                                match remux_ts_to_mkv(&ts, &mkv, None, &opts).await {
-                                    Ok(()) => {
-                                        let _ = crate::iomon::fs::remove_file(Cat::CacheSweep, &ts).await;
-                                        if mkv != planned_mkv {
-                                            let _ = store.update_recording_output_path(*rec_id, &mkv.to_string_lossy());
-                                        }
-                                        let _ = tx.send(AppEvent::RecordingUpdated { recording_id: *rec_id });
-                                    }
-                                    Err(e) => warn!("re-remux-all failed for rec_id={rec_id}: {e:#}"),
-                                }
-                                done += 1;
-                            }
-                            let _ = tx.send(AppEvent::BackgroundTaskFinished {
-                                id: task_id,
-                                outcome: crate::events::TaskOutcome::CompletedWithNote(format!("{total} checked")),
-                            });
-                        });
-                    }
-                    ManualCommand::RecoverVod { inputs, quality, sink, probe_all } => {
-                        let store = self.store.clone();
-                        let tx = self.events.clone();
-                        let client = self.ctx.http_client();
-                        tokio::spawn(async move {
-                            let task_id = crate::events::next_task_id();
-                            crate::recovery::run_recovery(
-                                client, store, tx, inputs, quality, sink, probe_all, task_id,
-                            )
-                            .await;
-                        });
-                    }
-                    ManualCommand::ScanRecoverableVods { window_days, quality } => {
-                        let store = self.store.clone();
-                        let tx = self.events.clone();
-                        let client = self.ctx.http_client();
-                        tokio::spawn(async move {
-                            let task_id = crate::events::next_task_id();
-                            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
-                                id: task_id,
-                                kind: crate::events::BackgroundTaskKind::RecoverVodScan,
-                                label: "VOD recovery scan".into(),
-                                detail: String::new(),
-                                started_at: now_unix(),
-                                progress: Some(0.0),
-                                progress_info: None,
-                            }));
-                            let within = window_days.max(1) * 86_400;
-                            let takes = store
-                                .recordings_recoverable(within, now_unix())
-                                .unwrap_or_default();
-                            let total = takes.len();
-                            // Bound concurrent recoveries; each keeps its own inner
-                            // segment-HEAD semaphore, so total load stays sane.
-                            let sem = Arc::new(Semaphore::new(2));
-                            let mut set: JoinSet<()> = JoinSet::new();
-                            for take in takes {
-                                let Some(login) = crate::detectors::twitch_login(&take.monitor_url)
-                                else {
-                                    continue;
-                                };
-                                let (client, sem, store, tx, quality) = (
-                                    client.clone(),
-                                    sem.clone(),
-                                    store.clone(),
-                                    tx.clone(),
-                                    quality.clone(),
-                                );
-                                set.spawn(async move {
-                                    let _permit = sem.acquire().await.expect("semaphore");
-                                    // Re-check under the permit: the take may
-                                    // have queued for a long time and been
-                                    // recovered meanwhile by the auto-recovery
-                                    // hook (avoids a duplicate multi-GB pull).
-                                    let state = store
-                                        .recording_recovery_state(take.rec_id)
-                                        .ok()
-                                        .flatten();
-                                    if !matches!(state.as_deref(), None | Some("failed")) {
-                                        return;
-                                    }
-                                    let sub = crate::events::next_task_id();
-                                    let inputs = crate::recovery::RecoveryInputs {
-                                        login,
-                                        broadcast_id: take.stream_id,
-                                        start_epoch: take.start_epoch,
-                                        went_live_approx: take.went_live_approx,
-                                        vod_id: take.vod_id,
-                                    };
-                                    crate::recovery::run_recovery(
-                                        client,
-                                        store,
-                                        tx,
-                                        inputs,
-                                        quality,
-                                        crate::recovery::RecoverySink::Recording(take.rec_id),
-                                        take.deleted,
-                                        sub,
-                                    )
-                                    .await;
-                                });
-                            }
-                            while set.join_next().await.is_some() {}
-                            let _ = tx.send(AppEvent::BackgroundTaskFinished {
-                                id: task_id,
-                                outcome: crate::events::TaskOutcome::CompletedWithNote(format!(
-                                    "{total} recording(s) processed"
-                                )),
-                            });
-                        });
-                    }
-                    ManualCommand::ArchiveVodNow(rec_id) => {
-                        let store = self.store.clone();
-                        let manual_tx = self.manual_tx.clone();
-                        let ctx = self.ctx.clone();
-                        tokio::spawn(async move {
-                            let Ok(Some((murl, vod_id, stream_id, went_live))) =
-                                store.recording_archive_now(rec_id)
-                            else {
-                                return;
-                            };
-                            let url = match Platform::detect(&murl) {
-                                Platform::Twitch => vod_id
-                                    .filter(|v| !v.is_empty())
-                                    .map(|v| crate::vod_archive::twitch_vod_url(&v)),
-                                Platform::YouTube => stream_id
-                                    .filter(|s| !s.is_empty())
-                                    .map(|s| crate::vod_archive::youtube_vod_url(&s)),
-                                Platform::Kick => match crate::vod_archive::kick_slug(&murl) {
-                                    Some(slug) => {
-                                        crate::vod_archive::resolve_kick_vod(
-                                            &ctx.http_client(),
-                                            &slug,
-                                            went_live,
-                                        )
-                                        .await
-                                    }
-                                    None => None,
-                                },
-                                _ => None,
-                            };
-                            match url {
-                                Some(u) => {
-                                    enqueue_vod_archive(&store, &manual_tx, rec_id, &u);
-                                }
-                                None => {
-                                    let _ = store.set_recording_vod_dl(rec_id, "failed", None);
-                                }
-                            }
-                        });
-                    }
-                    ManualCommand::BackfillHeadNow(rec_id) => {
-                        let this = self.clone();
-                        tokio::spawn(async move {
-                            this.manual_head_backfill(rec_id, None).await;
-                        });
-                    }
-                    ManualCommand::BackfillHeadMatchLive(rec_id) => {
-                        let this = self.clone();
-                        tokio::spawn(async move {
-                            this.refetch_head_matching_live(rec_id).await;
-                        });
-                    }
-                    ManualCommand::MergeSplitCapture(rec_id) => {
-                        let this = self.clone();
-                        tokio::spawn(async move {
-                            this.merge_split_capture(rec_id).await;
-                        });
-                    }
-                    ManualCommand::RefreshCdnHosts => {
-                        let store = self.store.clone();
-                        let tx = self.events.clone();
-                        let client = self.ctx.http_client();
-                        tokio::spawn(async move {
-                            let task_id = crate::events::next_task_id();
-                            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
-                                id: task_id,
-                                kind: crate::events::BackgroundTaskKind::RefreshCdnHosts,
-                                label: "Refresh CDN hosts".into(),
-                                detail: String::new(),
-                                started_at: now_unix(),
-                                progress: Some(0.0),
-                                progress_info: None,
-                            }));
-                            let vod_ids = store.published_vod_ids(300).unwrap_or_default();
-                            let (learned, checked) =
-                                crate::recovery::harvest_hosts(&store, &client, &vod_ids).await;
-                            let total = crate::recovery::load_hosts(&store).len();
-                            let _ = tx.send(AppEvent::BackgroundTaskFinished {
-                                id: task_id,
-                                outcome: crate::events::TaskOutcome::CompletedWithNote(format!(
-                                    "{learned} new host(s) from {checked} VOD(s) · {total} known"
-                                )),
-                            });
-                        });
-                    }
-                    ManualCommand::RecoverStuckCapture { rec_id, capture, output_dir } => {
-                        let store = self.store.clone();
-                        let tx = self.events.clone();
-                        tokio::spawn(async move {
-                            let Some(stem) =
-                                capture.file_stem().map(|s| s.to_string_lossy().into_owned())
-                            else {
-                                warn!(rec_id, "recover stuck capture: no file stem for {}", capture.display());
-                                return;
-                            };
-                            let ext = capture
-                                .extension()
-                                .map(|e| e.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            let _ = crate::iomon::fs::create_dir_all(Cat::DirSetup, &output_dir).await;
-                            match rename_or_shorten(&capture, &output_dir, &stem, &ext).await {
-                                Ok(actual) => {
-                                    if let Err(e) = store
-                                        .update_recording_output_path(rec_id, &actual.to_string_lossy())
-                                    {
-                                        warn!(rec_id, "recover stuck capture: DB update failed: {e:#}");
-                                    }
-                                    info!(rec_id, "recovered stuck capture -> {}", actual.display());
-                                    let _ = tx.send(AppEvent::RecordingUpdated { recording_id: rec_id });
-                                }
-                                Err(e) => warn!(rec_id, "recover stuck capture failed: {e:#}"),
-                            }
-                        });
-                    }
-                    ManualCommand::EmbedMissingThumbnails => {
-                        let store = self.store.clone();
-                        let tx = self.events.clone();
-                        tokio::spawn(async move {
-                            let task_id = crate::events::next_task_id();
-                            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
-                                id: task_id,
-                                kind: crate::events::BackgroundTaskKind::EmbedMissingThumbnails,
-                                label: "Embed missing thumbnails".into(),
-                                detail: String::new(),
-                                started_at: now_unix(),
-                                progress: Some(0.0),
-                                progress_info: None,
-                            }));
-                            let recs = match store.list_recordings_with_mkv() {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
-                                        id: task_id,
-                                        outcome: crate::events::TaskOutcome::Failed(e.to_string()),
-                                    });
-                                    return;
-                                }
-                            };
-                            let total = recs.len();
-                            let mut embedded = 0usize;
-                            for (i, (rec_id, output_path)) in recs.iter().enumerate() {
-                                let mkv = PathBuf::from(output_path);
-                                if !crate::iomon::fs::exists_sync(Cat::Thumbnail, &mkv) { continue; }
-                                let _ = tx.send(AppEvent::BackgroundTaskProgress {
-                                    id: task_id,
-                                    progress: Some(i as f32 / total as f32),
-                                    info: format!("{}/{total}: {}", i + 1, mkv.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()),
-                                });
-                                let mkv2 = mkv.clone();
-                                let has = tokio::task::spawn_blocking(move || mkv_has_thumbnail(&mkv2)).await.unwrap_or(false);
-                                if has { continue; }
-                                if let Some(thumb) = find_thumbnail_for(&mkv) {
-                                    match embed_thumbnail_into_mkv(&mkv, &thumb).await {
-                                        Ok(()) => {
-                                            embedded += 1;
-                                            let _ = tx.send(AppEvent::RecordingUpdated { recording_id: *rec_id });
-                                        }
-                                        Err(e) => warn!("embed-thumbnail failed for rec_id={rec_id}: {e:#}"),
-                                    }
-                                }
-                            }
-                            let _ = tx.send(AppEvent::BackgroundTaskFinished {
-                                id: task_id,
-                                outcome: crate::events::TaskOutcome::CompletedWithNote(format!("{embedded} embedded")),
-                            });
-                        });
-                    }
-                    ManualCommand::FetchMissingThumbnails { embed } => {
-                        let store = self.store.clone();
-                        let tx = self.events.clone();
-                        tokio::spawn(async move {
-                            let task_id = crate::events::next_task_id();
-                            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
-                                id: task_id,
-                                kind: crate::events::BackgroundTaskKind::FetchMissingThumbnails,
-                                label: "Fetch missing thumbnails".into(),
-                                detail: String::new(),
-                                started_at: now_unix(),
-                                progress: Some(0.0),
-                                progress_info: None,
-                            }));
-                            let recs = match store.list_recordings_with_stream_id() {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
-                                        id: task_id,
-                                        outcome: crate::events::TaskOutcome::Failed(e.to_string()),
-                                    });
-                                    return;
-                                }
-                            };
-                            let total = recs.len();
-                            let mut fetched = 0usize;
-                            for (i, (rec_id, output_path, _stream_id)) in recs.iter().enumerate() {
-                                let output = PathBuf::from(output_path);
-                                if !crate::iomon::fs::exists_sync(Cat::Thumbnail, &output) { continue; }
-                                // Skip if a thumbnail sidecar already exists.
-                                if find_thumbnail_for(&output).is_some() { continue; }
-                                let _ = tx.send(AppEvent::BackgroundTaskProgress {
-                                    id: task_id,
-                                    progress: Some(i as f32 / total as f32),
-                                    info: format!("{}/{total}: {}", i + 1, output.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()),
-                                });
-                                // We don't have a standalone thumbnail-fetch API here;
-                                // log a note for now — actual YouTube thumbnail fetching
-                                // requires the YT API helpers which live in detectors.rs.
-                                info!("fetch-missing-thumbnails: rec_id={rec_id} has no thumbnail sidecar (manual implementation required per-platform)");
-                                if embed {
-                                    if let Some(thumb) = find_thumbnail_for(&output) {
-                                        if let Err(e) = embed_thumbnail_into_mkv(&output, &thumb).await {
-                                            warn!("embed after fetch failed rec_id={rec_id}: {e:#}");
-                                        } else {
-                                            fetched += 1;
-                                            let _ = tx.send(AppEvent::RecordingUpdated { recording_id: *rec_id });
-                                        }
-                                    }
-                                }
-                            }
-                            let _ = tx.send(AppEvent::BackgroundTaskFinished {
-                                id: task_id,
-                                outcome: crate::events::TaskOutcome::CompletedWithNote(format!("{fetched} processed")),
-                            });
-                        });
-                    }
-                    ManualCommand::ReorganizeAll => {
-                        let store = self.store.clone();
-                        let tx = self.events.clone();
-                        tokio::spawn(async move {
-                            let task_id = crate::events::next_task_id();
-                            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
-                                id: task_id,
-                                kind: crate::events::BackgroundTaskKind::ReorganizeAll,
-                                label: "Re-organize all".into(),
-                                detail: String::new(),
-                                started_at: now_unix(),
-                                progress: Some(0.0),
-                                progress_info: None,
-                            }));
-                            let cfg = store.subdir_config();
-                            let ids = match store.list_all_recording_ids() {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
-                                        id: task_id,
-                                        outcome: crate::events::TaskOutcome::Failed(e.to_string()),
-                                    });
-                                    return;
-                                }
-                            };
-                            let total = ids.len();
-                            for (i, rec_id) in ids.iter().enumerate() {
-                                let _ = tx.send(AppEvent::BackgroundTaskProgress {
-                                    id: task_id,
-                                    progress: Some(i as f32 / total.max(1) as f32),
-                                    info: format!("{}/{total}", i + 1),
-                                });
-                                let reverse = !cfg.enabled;
-                                match reorganize_recording_files(*rec_id, &store, &cfg, reverse).await {
-                                    Ok(Some(_)) => { let _ = tx.send(AppEvent::RecordingUpdated { recording_id: *rec_id }); }
-                                    Ok(None) => {}
-                                    Err(e) => warn!("reorganize-all rec_id={rec_id}: {e:#}"),
-                                }
-                            }
-                            // Second pass: sweep every monitor output directory for companion
-                            // files that aren't linked to any recording (e.g. chat logs from
-                            // recordings that failed before an output_path was set).
-                            if cfg.enabled {
-                                if let Ok(dirs) = store.list_monitor_output_dirs() {
-                                    for dir in dirs {
-                                        sweep_companion_files(std::path::Path::new(&dir), &cfg).await;
-                                    }
-                                }
-                            }
-                            let _ = tx.send(AppEvent::BackgroundTaskFinished {
-                                id: task_id,
-                                outcome: crate::events::TaskOutcome::CompletedWithNote(format!("{total} checked")),
-                            });
-                        });
-                    }
-                    ManualCommand::ReorganizeTake(rec_id) => {
-                        let store = self.store.clone();
-                        let tx = self.events.clone();
-                        tokio::spawn(async move {
-                            let task_id = crate::events::next_task_id();
-                            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
-                                id: task_id,
-                                kind: crate::events::BackgroundTaskKind::ReorganizeTake(rec_id),
-                                label: format!("Re-organize recording #{rec_id}"),
-                                detail: String::new(),
-                                started_at: now_unix(),
-                                progress: None,
-                                progress_info: None,
-                            }));
-                            let cfg = store.subdir_config();
-                            let reverse = !cfg.enabled;
-                            match reorganize_recording_files(rec_id, &store, &cfg, reverse).await {
-                                Ok(_) => {
-                                    let _ = tx.send(AppEvent::RecordingUpdated { recording_id: rec_id });
-                                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
-                                        id: task_id,
-                                        outcome: crate::events::TaskOutcome::Completed,
-                                    });
-                                }
-                                Err(e) => {
-                                    warn!("reorganize take {rec_id}: {e:#}");
-                                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
-                                        id: task_id,
-                                        outcome: crate::events::TaskOutcome::Failed(e.to_string()),
-                                    });
-                                }
-                            }
-                        });
-                    }
-                    ManualCommand::ReorganizeMonitor(mid) => {
-                        let store = self.store.clone();
-                        let tx = self.events.clone();
-                        tokio::spawn(async move {
-                            let task_id = crate::events::next_task_id();
-                            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
-                                id: task_id,
-                                kind: crate::events::BackgroundTaskKind::ReorganizeMonitor(mid),
-                                label: format!("Re-organize monitor #{mid}"),
-                                detail: String::new(),
-                                started_at: now_unix(),
-                                progress: Some(0.0),
-                                progress_info: None,
-                            }));
-                            let cfg = store.subdir_config();
-                            let ids = match store.list_recording_ids_for_monitor(mid) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
-                                        id: task_id,
-                                        outcome: crate::events::TaskOutcome::Failed(e.to_string()),
-                                    });
-                                    return;
-                                }
-                            };
-                            let total = ids.len();
-                            let reverse = !cfg.enabled;
-                            for (i, rec_id) in ids.iter().enumerate() {
-                                let _ = tx.send(AppEvent::BackgroundTaskProgress {
-                                    id: task_id, progress: Some(i as f32 / total.max(1) as f32), info: format!("{}/{total}", i+1),
-                                });
-                                match reorganize_recording_files(*rec_id, &store, &cfg, reverse).await {
-                                    Ok(Some(_)) => { let _ = tx.send(AppEvent::RecordingUpdated { recording_id: *rec_id }); }
-                                    Err(e) => warn!("reorganize monitor {mid} rec_id={rec_id}: {e:#}"),
-                                    _ => {}
-                                }
-                            }
-                            let _ = tx.send(AppEvent::BackgroundTaskFinished {
-                                id: task_id,
-                                outcome: crate::events::TaskOutcome::CompletedWithNote(format!("{total} checked")),
-                            });
-                        });
-                    }
-                    ManualCommand::ReorganizeChannel(channel_id) => {
-                        let store = self.store.clone();
-                        let tx = self.events.clone();
-                        tokio::spawn(async move {
-                            let task_id = crate::events::next_task_id();
-                            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
-                                id: task_id,
-                                kind: crate::events::BackgroundTaskKind::ReorganizeChannel(channel_id),
-                                label: format!("Re-organize channel #{channel_id}"),
-                                detail: String::new(),
-                                started_at: now_unix(),
-                                progress: Some(0.0),
-                                progress_info: None,
-                            }));
-                            let cfg = store.subdir_config();
-                            let ids = match store.list_recording_ids_for_channel(channel_id) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
-                                        id: task_id,
-                                        outcome: crate::events::TaskOutcome::Failed(e.to_string()),
-                                    });
-                                    return;
-                                }
-                            };
-                            let total = ids.len();
-                            let reverse = !cfg.enabled;
-                            for (i, rec_id) in ids.iter().enumerate() {
-                                let _ = tx.send(AppEvent::BackgroundTaskProgress {
-                                    id: task_id, progress: Some(i as f32 / total.max(1) as f32), info: format!("{}/{total}", i+1),
-                                });
-                                match reorganize_recording_files(*rec_id, &store, &cfg, reverse).await {
-                                    Ok(Some(_)) => { let _ = tx.send(AppEvent::RecordingUpdated { recording_id: *rec_id }); }
-                                    Err(e) => warn!("reorganize channel {channel_id} rec_id={rec_id}: {e:#}"),
-                                    _ => {}
-                                }
-                            }
-                            let _ = tx.send(AppEvent::BackgroundTaskFinished {
-                                id: task_id,
-                                outcome: crate::events::TaskOutcome::CompletedWithNote(format!("{total} checked")),
-                            });
-                        });
-                    }
-                    ManualCommand::RenameRecording { rec_id, new_stem } => {
-                        let store = self.store.clone();
-                        let tx = self.events.clone();
-                        tokio::spawn(async move {
-                            match rename_recording_files(rec_id, &store, &new_stem).await {
-                                Ok(Some(_)) => {
-                                    let _ = tx.send(AppEvent::RecordingUpdated { recording_id: rec_id });
-                                }
-                                Ok(None) => {}
-                                Err(e) => {
-                                    warn!("rename rec_id={rec_id}: {e:#}");
-                                    let _ = tx.send(AppEvent::Error {
-                                        context: format!("Rename recording #{rec_id}"),
-                                        message: e.to_string(),
-                                    });
-                                }
-                            }
-                        });
-                    }
-                },
+                Some(cmd) = manual_rx.recv() => self.handle_manual_command(cmd),
                 else => break,
             }
         }
+    }
+
+    /// Dispatch one manual command from the UI / scheduler (the body of
+    /// [`Self::run`]'s manual-command select arm).
+    fn handle_manual_command(&self, cmd: ManualCommand) {
+        match cmd {
+            ManualCommand::Start { id, user_initiated } => {
+                let this = self.clone();
+                tokio::spawn(async move { this.manual_start(id, user_initiated).await });
+            }
+            ManualCommand::Stop(id) => self.manual_stop(id),
+            ManualCommand::StopHoldFor { monitor_id, hours } => {
+                self.manual_stop_hold(monitor_id, hours)
+            }
+            ManualCommand::StartVideo(id) => {
+                if !self.shutdown.load(Ordering::SeqCst) {
+                    let this = self.clone();
+                    tokio::spawn(async move { this.start_video(id).await });
+                }
+            }
+            ManualCommand::StopVideo(id) => self.stop_video(id),
+            ManualCommand::StopChat(id) => self.stop_chat_download(id),
+            ManualCommand::RefetchAssets(id) => {
+                if let Ok(Some(row)) = self.store.get_monitor_with_channel(id) {
+                    // Manual: bypass the 24h stamp + the fetch_chat_assets
+                    // toggle, and resolve the platform id from the URL.
+                    self.fetch_channel_assets(&row, None, true);
+                }
+            }
+            ManualCommand::ReRemux { rec_id, capture, final_ } => {
+                self.cmd_re_remux(rec_id, capture, final_)
+            }
+            ManualCommand::ReRemuxAll => self.cmd_re_remux_all(),
+            ManualCommand::RecoverVod { inputs, quality, sink, probe_all } => {
+                let store = self.store.clone();
+                let tx = self.events.clone();
+                let client = self.ctx.http_client();
+                tokio::spawn(async move {
+                    let task_id = crate::events::next_task_id();
+                    crate::recovery::run_recovery(
+                        client, store, tx, inputs, quality, sink, probe_all, task_id,
+                    )
+                    .await;
+                });
+            }
+            ManualCommand::ScanRecoverableVods { window_days, quality } => {
+                self.cmd_scan_recoverable_vods(window_days, quality)
+            }
+            ManualCommand::ArchiveVodNow(rec_id) => self.cmd_archive_vod_now(rec_id),
+            ManualCommand::BackfillHeadNow(rec_id) => {
+                let this = self.clone();
+                tokio::spawn(async move {
+                    this.manual_head_backfill(rec_id, None).await;
+                });
+            }
+            ManualCommand::BackfillHeadMatchLive(rec_id) => {
+                let this = self.clone();
+                tokio::spawn(async move {
+                    this.refetch_head_matching_live(rec_id).await;
+                });
+            }
+            ManualCommand::MergeSplitCapture(rec_id) => {
+                let this = self.clone();
+                tokio::spawn(async move {
+                    this.merge_split_capture(rec_id).await;
+                });
+            }
+            ManualCommand::RefreshCdnHosts => self.cmd_refresh_cdn_hosts(),
+            ManualCommand::RecoverStuckCapture { rec_id, capture, output_dir } => {
+                self.cmd_recover_stuck_capture(rec_id, capture, output_dir)
+            }
+            ManualCommand::EmbedMissingThumbnails => self.cmd_embed_missing_thumbnails(),
+            ManualCommand::FetchMissingThumbnails { embed } => {
+                self.cmd_fetch_missing_thumbnails(embed)
+            }
+            ManualCommand::ReorganizeAll => self.cmd_reorganize_all(),
+            ManualCommand::ReorganizeTake(rec_id) => self.cmd_reorganize_take(rec_id),
+            ManualCommand::ReorganizeMonitor(mid) => self.cmd_reorganize_monitor(mid),
+            ManualCommand::ReorganizeChannel(channel_id) => {
+                self.cmd_reorganize_channel(channel_id)
+            }
+            ManualCommand::RenameRecording { rec_id, new_stem } => {
+                self.cmd_rename_recording(rec_id, new_stem)
+            }
+        }
+    }
+
+    /// [`ManualCommand::ReRemux`]: re-remux one captured `.ts` to MKV in the
+    /// background and update the recording row on success.
+    fn cmd_re_remux(&self, rec_id: i64, capture: PathBuf, final_: PathBuf) {
+        let store = self.store.clone();
+        let tx = self.events.clone();
+        let task_id = rec_id as u64;
+        let src_name = capture
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let dst_name = final_
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let _ = tx.send(AppEvent::BackgroundTaskStarted(
+            crate::events::BackgroundTask {
+                id: task_id,
+                kind: crate::events::BackgroundTaskKind::Remux,
+                label: src_name,
+                detail: format!("→ {dst_name}"),
+                started_at: now_unix(),
+                progress: None,
+progress_info: None,
+            },
+        ));
+        let tx2 = tx.clone();
+        tokio::spawn(async move {
+            info!("re-remux start: {}", capture.display());
+            // ffmpeg writes the destination directly, so shorten
+            // proactively — this also covers a Re-remux retry after
+            // the FIRST attempt failed because this exact name was
+            // too long (see path_with_safe_stem).
+            let final_ = path_with_safe_stem(&final_);
+            match remux_ts_to_mkv(&capture, &final_, Some((tx2, task_id)), &Default::default()).await {
+                Ok(()) => {
+                    let _ = crate::iomon::fs::remove_file(Cat::CacheSweep, &capture).await;
+                    let path_s = final_.to_string_lossy();
+                    if let Err(e) = store.update_recording_output_path(rec_id, &path_s) {
+                        warn!("re-remux: DB update failed for rec_id={rec_id}: {e:#}");
+                    }
+                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                        id: task_id,
+                        outcome: crate::events::TaskOutcome::Completed,
+                    });
+                    let _ = tx.send(AppEvent::RecordingUpdated { recording_id: rec_id });
+                    info!("re-remux done: {}", final_.display());
+                }
+                Err(e) => {
+                    warn!("re-remux failed for rec_id={rec_id}: {e:#}");
+                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                        id: task_id,
+                        outcome: crate::events::TaskOutcome::Failed(e.to_string()),
+                    });
+                    let _ = tx.send(AppEvent::RecordingUpdated { recording_id: rec_id });
+                }
+            }
+        });
+    }
+
+    /// [`ManualCommand::ReRemuxAll`]: re-remux every recording that still has
+    /// a `.ts` source next to its planned MKV.
+    fn cmd_re_remux_all(&self) {
+        let store = self.store.clone();
+        let tx = self.events.clone();
+        tokio::spawn(async move {
+            let task_id = crate::events::next_task_id();
+            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
+                id: task_id,
+                kind: crate::events::BackgroundTaskKind::ReRemuxAll,
+                label: "Re-remux all".into(),
+                detail: String::new(),
+                started_at: now_unix(),
+                progress: Some(0.0),
+                progress_info: None,
+            }));
+            let recs = match store.list_recordings_with_mkv() {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                        id: task_id,
+                        outcome: crate::events::TaskOutcome::Failed(e.to_string()),
+                    });
+                    return;
+                }
+            };
+            let total = recs.len();
+            let mut done = 0usize;
+            let opts = store.remux_opts();
+            for (rec_id, output_path) in &recs {
+                let planned_mkv = PathBuf::from(output_path);
+                // The sibling .ts (the actual source to remux) lives
+                // under the ORIGINAL stem — only the destination we're
+                // about to write gets proactively shortened.
+                let ts = planned_mkv.with_extension("ts");
+                if !crate::iomon::fs::exists_sync(Cat::FsProbe, &ts) {
+                    done += 1;
+                    continue;
+                }
+                let mkv = path_with_safe_stem(&planned_mkv);
+                let _ = tx.send(AppEvent::BackgroundTaskProgress {
+                    id: task_id,
+                    progress: Some(done as f32 / total as f32),
+                    info: format!("{}/{total}: {}", done + 1, mkv.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()),
+                });
+                match remux_ts_to_mkv(&ts, &mkv, None, &opts).await {
+                    Ok(()) => {
+                        let _ = crate::iomon::fs::remove_file(Cat::CacheSweep, &ts).await;
+                        if mkv != planned_mkv {
+                            let _ = store.update_recording_output_path(*rec_id, &mkv.to_string_lossy());
+                        }
+                        let _ = tx.send(AppEvent::RecordingUpdated { recording_id: *rec_id });
+                    }
+                    Err(e) => warn!("re-remux-all failed for rec_id={rec_id}: {e:#}"),
+                }
+                done += 1;
+            }
+            let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                id: task_id,
+                outcome: crate::events::TaskOutcome::CompletedWithNote(format!("{total} checked")),
+            });
+        });
+    }
+
+    /// [`ManualCommand::ScanRecoverableVods`]: sweep deleted/muted recordings
+    /// within the CDN window and recover each (bounded concurrency).
+    fn cmd_scan_recoverable_vods(&self, window_days: i64, quality: String) {
+        let store = self.store.clone();
+        let tx = self.events.clone();
+        let client = self.ctx.http_client();
+        tokio::spawn(async move {
+            let task_id = crate::events::next_task_id();
+            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
+                id: task_id,
+                kind: crate::events::BackgroundTaskKind::RecoverVodScan,
+                label: "VOD recovery scan".into(),
+                detail: String::new(),
+                started_at: now_unix(),
+                progress: Some(0.0),
+                progress_info: None,
+            }));
+            let within = window_days.max(1) * 86_400;
+            let takes = store
+                .recordings_recoverable(within, now_unix())
+                .unwrap_or_default();
+            let total = takes.len();
+            // Bound concurrent recoveries; each keeps its own inner
+            // segment-HEAD semaphore, so total load stays sane.
+            let sem = Arc::new(Semaphore::new(2));
+            let mut set: JoinSet<()> = JoinSet::new();
+            for take in takes {
+                let Some(login) = crate::detectors::twitch_login(&take.monitor_url)
+                else {
+                    continue;
+                };
+                let (client, sem, store, tx, quality) = (
+                    client.clone(),
+                    sem.clone(),
+                    store.clone(),
+                    tx.clone(),
+                    quality.clone(),
+                );
+                set.spawn(async move {
+                    let _permit = sem.acquire().await.expect("semaphore");
+                    // Re-check under the permit: the take may
+                    // have queued for a long time and been
+                    // recovered meanwhile by the auto-recovery
+                    // hook (avoids a duplicate multi-GB pull).
+                    let state = store
+                        .recording_recovery_state(take.rec_id)
+                        .ok()
+                        .flatten();
+                    if !matches!(state.as_deref(), None | Some("failed")) {
+                        return;
+                    }
+                    let sub = crate::events::next_task_id();
+                    let inputs = crate::recovery::RecoveryInputs {
+                        login,
+                        broadcast_id: take.stream_id,
+                        start_epoch: take.start_epoch,
+                        went_live_approx: take.went_live_approx,
+                        vod_id: take.vod_id,
+                    };
+                    crate::recovery::run_recovery(
+                        client,
+                        store,
+                        tx,
+                        inputs,
+                        quality,
+                        crate::recovery::RecoverySink::Recording(take.rec_id),
+                        take.deleted,
+                        sub,
+                    )
+                    .await;
+                });
+            }
+            while set.join_next().await.is_some() {}
+            let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                id: task_id,
+                outcome: crate::events::TaskOutcome::CompletedWithNote(format!(
+                    "{total} recording(s) processed"
+                )),
+            });
+        });
+    }
+
+    /// [`ManualCommand::ArchiveVodNow`]: resolve the published VOD URL for a
+    /// recording and enqueue its download.
+    fn cmd_archive_vod_now(&self, rec_id: i64) {
+        let store = self.store.clone();
+        let manual_tx = self.manual_tx.clone();
+        let ctx = self.ctx.clone();
+        tokio::spawn(async move {
+            let Ok(Some((murl, vod_id, stream_id, went_live))) =
+                store.recording_archive_now(rec_id)
+            else {
+                return;
+            };
+            let url = match Platform::detect(&murl) {
+                Platform::Twitch => vod_id
+                    .filter(|v| !v.is_empty())
+                    .map(|v| crate::vod_archive::twitch_vod_url(&v)),
+                Platform::YouTube => stream_id
+                    .filter(|s| !s.is_empty())
+                    .map(|s| crate::vod_archive::youtube_vod_url(&s)),
+                Platform::Kick => match crate::vod_archive::kick_slug(&murl) {
+                    Some(slug) => {
+                        crate::vod_archive::resolve_kick_vod(
+                            &ctx.http_client(),
+                            &slug,
+                            went_live,
+                        )
+                        .await
+                    }
+                    None => None,
+                },
+                _ => None,
+            };
+            match url {
+                Some(u) => {
+                    enqueue_vod_archive(&store, &manual_tx, rec_id, &u);
+                }
+                None => {
+                    let _ = store.set_recording_vod_dl(rec_id, "failed", None);
+                }
+            }
+        });
+    }
+
+    /// [`ManualCommand::RefreshCdnHosts`]: harvest current Twitch CDN hosts
+    /// from published VODs.
+    fn cmd_refresh_cdn_hosts(&self) {
+        let store = self.store.clone();
+        let tx = self.events.clone();
+        let client = self.ctx.http_client();
+        tokio::spawn(async move {
+            let task_id = crate::events::next_task_id();
+            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
+                id: task_id,
+                kind: crate::events::BackgroundTaskKind::RefreshCdnHosts,
+                label: "Refresh CDN hosts".into(),
+                detail: String::new(),
+                started_at: now_unix(),
+                progress: Some(0.0),
+                progress_info: None,
+            }));
+            let vod_ids = store.published_vod_ids(300).unwrap_or_default();
+            let (learned, checked) =
+                crate::recovery::harvest_hosts(&store, &client, &vod_ids).await;
+            let total = crate::recovery::load_hosts(&store).len();
+            let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                id: task_id,
+                outcome: crate::events::TaskOutcome::CompletedWithNote(format!(
+                    "{learned} new host(s) from {checked} VOD(s) · {total} known"
+                )),
+            });
+        });
+    }
+
+    /// [`ManualCommand::RecoverStuckCapture`]: move a capture whose promote
+    /// step failed out of `.cache\` to its output directory.
+    fn cmd_recover_stuck_capture(&self, rec_id: i64, capture: PathBuf, output_dir: PathBuf) {
+        let store = self.store.clone();
+        let tx = self.events.clone();
+        tokio::spawn(async move {
+            let Some(stem) =
+                capture.file_stem().map(|s| s.to_string_lossy().into_owned())
+            else {
+                warn!(rec_id, "recover stuck capture: no file stem for {}", capture.display());
+                return;
+            };
+            let ext = capture
+                .extension()
+                .map(|e| e.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let _ = crate::iomon::fs::create_dir_all(Cat::DirSetup, &output_dir).await;
+            match rename_or_shorten(&capture, &output_dir, &stem, &ext).await {
+                Ok(actual) => {
+                    if let Err(e) = store
+                        .update_recording_output_path(rec_id, &actual.to_string_lossy())
+                    {
+                        warn!(rec_id, "recover stuck capture: DB update failed: {e:#}");
+                    }
+                    info!(rec_id, "recovered stuck capture -> {}", actual.display());
+                    let _ = tx.send(AppEvent::RecordingUpdated { recording_id: rec_id });
+                }
+                Err(e) => warn!(rec_id, "recover stuck capture failed: {e:#}"),
+            }
+        });
+    }
+
+    /// [`ManualCommand::EmbedMissingThumbnails`]: embed the thumbnail sidecar
+    /// into all MKVs that don't already carry one.
+    fn cmd_embed_missing_thumbnails(&self) {
+        let store = self.store.clone();
+        let tx = self.events.clone();
+        tokio::spawn(async move {
+            let task_id = crate::events::next_task_id();
+            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
+                id: task_id,
+                kind: crate::events::BackgroundTaskKind::EmbedMissingThumbnails,
+                label: "Embed missing thumbnails".into(),
+                detail: String::new(),
+                started_at: now_unix(),
+                progress: Some(0.0),
+                progress_info: None,
+            }));
+            let recs = match store.list_recordings_with_mkv() {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                        id: task_id,
+                        outcome: crate::events::TaskOutcome::Failed(e.to_string()),
+                    });
+                    return;
+                }
+            };
+            let total = recs.len();
+            let mut embedded = 0usize;
+            for (i, (rec_id, output_path)) in recs.iter().enumerate() {
+                let mkv = PathBuf::from(output_path);
+                if !crate::iomon::fs::exists_sync(Cat::Thumbnail, &mkv) { continue; }
+                let _ = tx.send(AppEvent::BackgroundTaskProgress {
+                    id: task_id,
+                    progress: Some(i as f32 / total as f32),
+                    info: format!("{}/{total}: {}", i + 1, mkv.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()),
+                });
+                let mkv2 = mkv.clone();
+                let has = tokio::task::spawn_blocking(move || mkv_has_thumbnail(&mkv2)).await.unwrap_or(false);
+                if has { continue; }
+                if let Some(thumb) = find_thumbnail_for(&mkv) {
+                    match embed_thumbnail_into_mkv(&mkv, &thumb).await {
+                        Ok(()) => {
+                            embedded += 1;
+                            let _ = tx.send(AppEvent::RecordingUpdated { recording_id: *rec_id });
+                        }
+                        Err(e) => warn!("embed-thumbnail failed for rec_id={rec_id}: {e:#}"),
+                    }
+                }
+            }
+            let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                id: task_id,
+                outcome: crate::events::TaskOutcome::CompletedWithNote(format!("{embedded} embedded")),
+            });
+        });
+    }
+
+    /// [`ManualCommand::FetchMissingThumbnails`]: fetch (and optionally embed)
+    /// thumbnails for recordings without a sidecar.
+    fn cmd_fetch_missing_thumbnails(&self, embed: bool) {
+        let store = self.store.clone();
+        let tx = self.events.clone();
+        tokio::spawn(async move {
+            let task_id = crate::events::next_task_id();
+            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
+                id: task_id,
+                kind: crate::events::BackgroundTaskKind::FetchMissingThumbnails,
+                label: "Fetch missing thumbnails".into(),
+                detail: String::new(),
+                started_at: now_unix(),
+                progress: Some(0.0),
+                progress_info: None,
+            }));
+            let recs = match store.list_recordings_with_stream_id() {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                        id: task_id,
+                        outcome: crate::events::TaskOutcome::Failed(e.to_string()),
+                    });
+                    return;
+                }
+            };
+            let total = recs.len();
+            let mut fetched = 0usize;
+            for (i, (rec_id, output_path, _stream_id)) in recs.iter().enumerate() {
+                let output = PathBuf::from(output_path);
+                if !crate::iomon::fs::exists_sync(Cat::Thumbnail, &output) { continue; }
+                // Skip if a thumbnail sidecar already exists.
+                if find_thumbnail_for(&output).is_some() { continue; }
+                let _ = tx.send(AppEvent::BackgroundTaskProgress {
+                    id: task_id,
+                    progress: Some(i as f32 / total as f32),
+                    info: format!("{}/{total}: {}", i + 1, output.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()),
+                });
+                // We don't have a standalone thumbnail-fetch API here;
+                // log a note for now — actual YouTube thumbnail fetching
+                // requires the YT API helpers which live in detectors.rs.
+                info!("fetch-missing-thumbnails: rec_id={rec_id} has no thumbnail sidecar (manual implementation required per-platform)");
+                if embed {
+                    if let Some(thumb) = find_thumbnail_for(&output) {
+                        if let Err(e) = embed_thumbnail_into_mkv(&output, &thumb).await {
+                            warn!("embed after fetch failed rec_id={rec_id}: {e:#}");
+                        } else {
+                            fetched += 1;
+                            let _ = tx.send(AppEvent::RecordingUpdated { recording_id: *rec_id });
+                        }
+                    }
+                }
+            }
+            let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                id: task_id,
+                outcome: crate::events::TaskOutcome::CompletedWithNote(format!("{fetched} processed")),
+            });
+        });
+    }
+
+    /// [`ManualCommand::ReorganizeAll`]: apply the current subdir config to
+    /// every recording, then sweep unlinked companion files.
+    fn cmd_reorganize_all(&self) {
+        let store = self.store.clone();
+        let tx = self.events.clone();
+        tokio::spawn(async move {
+            let task_id = crate::events::next_task_id();
+            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
+                id: task_id,
+                kind: crate::events::BackgroundTaskKind::ReorganizeAll,
+                label: "Re-organize all".into(),
+                detail: String::new(),
+                started_at: now_unix(),
+                progress: Some(0.0),
+                progress_info: None,
+            }));
+            let cfg = store.subdir_config();
+            let ids = match store.list_all_recording_ids() {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                        id: task_id,
+                        outcome: crate::events::TaskOutcome::Failed(e.to_string()),
+                    });
+                    return;
+                }
+            };
+            let total = ids.len();
+            for (i, rec_id) in ids.iter().enumerate() {
+                let _ = tx.send(AppEvent::BackgroundTaskProgress {
+                    id: task_id,
+                    progress: Some(i as f32 / total.max(1) as f32),
+                    info: format!("{}/{total}", i + 1),
+                });
+                let reverse = !cfg.enabled;
+                match reorganize_recording_files(*rec_id, &store, &cfg, reverse).await {
+                    Ok(Some(_)) => { let _ = tx.send(AppEvent::RecordingUpdated { recording_id: *rec_id }); }
+                    Ok(None) => {}
+                    Err(e) => warn!("reorganize-all rec_id={rec_id}: {e:#}"),
+                }
+            }
+            // Second pass: sweep every monitor output directory for companion
+            // files that aren't linked to any recording (e.g. chat logs from
+            // recordings that failed before an output_path was set).
+            if cfg.enabled {
+                if let Ok(dirs) = store.list_monitor_output_dirs() {
+                    for dir in dirs {
+                        sweep_companion_files(std::path::Path::new(&dir), &cfg).await;
+                    }
+                }
+            }
+            let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                id: task_id,
+                outcome: crate::events::TaskOutcome::CompletedWithNote(format!("{total} checked")),
+            });
+        });
+    }
+
+    /// [`ManualCommand::ReorganizeTake`]: re-organize one recording.
+    fn cmd_reorganize_take(&self, rec_id: i64) {
+        let store = self.store.clone();
+        let tx = self.events.clone();
+        tokio::spawn(async move {
+            let task_id = crate::events::next_task_id();
+            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
+                id: task_id,
+                kind: crate::events::BackgroundTaskKind::ReorganizeTake(rec_id),
+                label: format!("Re-organize recording #{rec_id}"),
+                detail: String::new(),
+                started_at: now_unix(),
+                progress: None,
+                progress_info: None,
+            }));
+            let cfg = store.subdir_config();
+            let reverse = !cfg.enabled;
+            match reorganize_recording_files(rec_id, &store, &cfg, reverse).await {
+                Ok(_) => {
+                    let _ = tx.send(AppEvent::RecordingUpdated { recording_id: rec_id });
+                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                        id: task_id,
+                        outcome: crate::events::TaskOutcome::Completed,
+                    });
+                }
+                Err(e) => {
+                    warn!("reorganize take {rec_id}: {e:#}");
+                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                        id: task_id,
+                        outcome: crate::events::TaskOutcome::Failed(e.to_string()),
+                    });
+                }
+            }
+        });
+    }
+
+    /// [`ManualCommand::ReorganizeMonitor`]: re-organize a monitor's recordings.
+    fn cmd_reorganize_monitor(&self, mid: i64) {
+        let store = self.store.clone();
+        let tx = self.events.clone();
+        tokio::spawn(async move {
+            let task_id = crate::events::next_task_id();
+            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
+                id: task_id,
+                kind: crate::events::BackgroundTaskKind::ReorganizeMonitor(mid),
+                label: format!("Re-organize monitor #{mid}"),
+                detail: String::new(),
+                started_at: now_unix(),
+                progress: Some(0.0),
+                progress_info: None,
+            }));
+            let cfg = store.subdir_config();
+            let ids = match store.list_recording_ids_for_monitor(mid) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                        id: task_id,
+                        outcome: crate::events::TaskOutcome::Failed(e.to_string()),
+                    });
+                    return;
+                }
+            };
+            let total = ids.len();
+            let reverse = !cfg.enabled;
+            for (i, rec_id) in ids.iter().enumerate() {
+                let _ = tx.send(AppEvent::BackgroundTaskProgress {
+                    id: task_id, progress: Some(i as f32 / total.max(1) as f32), info: format!("{}/{total}", i+1),
+                });
+                match reorganize_recording_files(*rec_id, &store, &cfg, reverse).await {
+                    Ok(Some(_)) => { let _ = tx.send(AppEvent::RecordingUpdated { recording_id: *rec_id }); }
+                    Err(e) => warn!("reorganize monitor {mid} rec_id={rec_id}: {e:#}"),
+                    _ => {}
+                }
+            }
+            let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                id: task_id,
+                outcome: crate::events::TaskOutcome::CompletedWithNote(format!("{total} checked")),
+            });
+        });
+    }
+
+    /// [`ManualCommand::ReorganizeChannel`]: re-organize a channel's recordings.
+    fn cmd_reorganize_channel(&self, channel_id: i64) {
+        let store = self.store.clone();
+        let tx = self.events.clone();
+        tokio::spawn(async move {
+            let task_id = crate::events::next_task_id();
+            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
+                id: task_id,
+                kind: crate::events::BackgroundTaskKind::ReorganizeChannel(channel_id),
+                label: format!("Re-organize channel #{channel_id}"),
+                detail: String::new(),
+                started_at: now_unix(),
+                progress: Some(0.0),
+                progress_info: None,
+            }));
+            let cfg = store.subdir_config();
+            let ids = match store.list_recording_ids_for_channel(channel_id) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                        id: task_id,
+                        outcome: crate::events::TaskOutcome::Failed(e.to_string()),
+                    });
+                    return;
+                }
+            };
+            let total = ids.len();
+            let reverse = !cfg.enabled;
+            for (i, rec_id) in ids.iter().enumerate() {
+                let _ = tx.send(AppEvent::BackgroundTaskProgress {
+                    id: task_id, progress: Some(i as f32 / total.max(1) as f32), info: format!("{}/{total}", i+1),
+                });
+                match reorganize_recording_files(*rec_id, &store, &cfg, reverse).await {
+                    Ok(Some(_)) => { let _ = tx.send(AppEvent::RecordingUpdated { recording_id: *rec_id }); }
+                    Err(e) => warn!("reorganize channel {channel_id} rec_id={rec_id}: {e:#}"),
+                    _ => {}
+                }
+            }
+            let _ = tx.send(AppEvent::BackgroundTaskFinished {
+                id: task_id,
+                outcome: crate::events::TaskOutcome::CompletedWithNote(format!("{total} checked")),
+            });
+        });
+    }
+
+    /// [`ManualCommand::RenameRecording`]: rename a recording's files to a new stem.
+    fn cmd_rename_recording(&self, rec_id: i64, new_stem: String) {
+        let store = self.store.clone();
+        let tx = self.events.clone();
+        tokio::spawn(async move {
+            match rename_recording_files(rec_id, &store, &new_stem).await {
+                Ok(Some(_)) => {
+                    let _ = tx.send(AppEvent::RecordingUpdated { recording_id: rec_id });
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("rename rec_id={rec_id}: {e:#}");
+                    let _ = tx.send(AppEvent::Error {
+                        context: format!("Rename recording #{rec_id}"),
+                        message: e.to_string(),
+                    });
+                }
+            }
+        });
     }
 
     /// Fetch a monitor's channel assets (icon/banner/badges/emotes) as a background
@@ -2112,6 +2178,170 @@ impl Supervisor {
             row.monitor.capture_from_start = false;
             info!(monitor_id, "SABR from-start unavailable; capturing live edge");
         }
+        let (auth, media_mode, want_media, pre_media) =
+            self.resolve_auth_and_preprobe(&row).await;
+
+        let _permit = self.sem.acquire().await.expect("semaphore");
+        // The probe + permit wait may have spanned a shutdown; don't start new work.
+        if self.shutdown.load(Ordering::SeqCst) {
+            self.active.lock().unwrap().remove(&monitor_id);
+            return;
+        }
+        let (ytdlp_global_args, ytdlp_bins, started_at, plan) = self
+            .build_record_plan(&row, &auth, &stream_id, &stream_title, &pre_media, went_live_at)
+            .await;
+
+        let (take_group, rec_id) = self.insert_recording_row(
+            &row,
+            monitor_id,
+            started_at,
+            &plan,
+            went_live_at,
+            approximate,
+            &stream_id,
+            &trigger_info,
+            &trigger_rule_json,
+        );
+
+        self.spawn_dash_companion(
+            &row,
+            &plan,
+            &auth,
+            &ytdlp_global_args,
+            &ytdlp_bins,
+            monitor_id,
+            take_group.clone(),
+            &stream_id,
+            went_live_at,
+            approximate,
+            trigger_info,
+            trigger_rule_json,
+        );
+        self.spawn_asset_fetches(&row, &plan, monitor_id, thumbnail_url, broadcaster_id);
+
+        info!(monitor_id, program = %plan.program, "starting recording -> {}", plan.capture_path.display());
+        {
+            let redacted: Vec<String> = plan.args.iter().map(|a| {
+                if a.contains("Authorization=OAuth ") {
+                    let prefix = &a[..a.find("OAuth ").map(|i| i + 6).unwrap_or(a.len())];
+                    format!("{prefix}<redacted>")
+                } else {
+                    a.clone()
+                }
+            }).collect();
+            info!(monitor_id, "args: {}", redacted.join(" "));
+        }
+
+        let (from_start, resolve_lost, watcher_done, watcher) =
+            self.spawn_catch_up_watcher(&row, &plan, monitor_id, rec_id, went_live_at);
+        self.spawn_head_backfill(
+            &row,
+            &plan,
+            &trigger_rule,
+            monitor_id,
+            rec_id,
+            &stream_id,
+            went_live_at,
+            approximate,
+            started_at,
+        );
+        let ad_sink = self.make_ad_sink(
+            &row,
+            &plan,
+            monitor_id,
+            rec_id,
+            started_at,
+            went_live_at,
+            from_start,
+        );
+        let (meta_done, meta_task) =
+            self.spawn_meta_watcher(&row, &trigger_rule, monitor_id, rec_id, started_at);
+        self.spawn_quality_upgrade_watcher(&row, &plan, monitor_id, &stream_id);
+        let (chat_done, chat_task) =
+            self.spawn_chat_loggers(&row, &plan, &auth, &ytdlp_global_args, &ytdlp_bins, monitor_id);
+
+        // If a manual stop arrived while we were setting up (pid was 0 so kill
+        // couldn't fire yet), honour it now: skip spawning the process entirely.
+        let outcome = if self.stopping_monitors.lock().unwrap().contains(&monitor_id) {
+            ProcessOutcome { exit_code: None, log: String::new() }
+        } else {
+            self.run_process(
+                &self.active,
+                monitor_id,
+                &plan,
+                None,
+                None,
+                ad_sink,
+                DetachReg {
+                    kind: DetachedKind::Recording,
+                    ref_id: rec_id,
+                    monitor_id: Some(monitor_id),
+                    take_group: Some(take_group.clone()),
+                    started_at,
+                    secondary: false,
+                    stream_id: stream_id.clone(),
+                    went_live_at,
+                },
+            )
+            .await
+        };
+
+        self.stop_record_watchers(watcher_done, watcher, meta_done, meta_task, chat_done, chat_task)
+            .await;
+        // Broadcast end ~= when the tool exited; snapshot it before remux so the
+        // span (and thus lost-time) isn't inflated by remux duration.
+        let ended = now_unix();
+
+        let final_path = self
+            .promote_and_rename(
+                &row, &plan, monitor_id, rec_id, started_at, &stream_id, went_live_at,
+                want_media, media_mode, &pre_media,
+            )
+            .await;
+
+        let bytes = file_len(&final_path).await as i64;
+
+        self.maybe_clear_lost_time(resolve_lost, went_live_at, &final_path, ended, rec_id)
+            .await;
+
+        let duration = now_unix() - started_at;
+        let ok = bytes > 0;
+        let manually_stopped = self.stopping_monitors.lock().unwrap().remove(&monitor_id);
+        let shutting_down = self.shutdown.load(Ordering::SeqCst);
+        let sabr_stall =
+            self.note_sabr_stall(sabr_key, monitor_id, ok, manually_stopped, shutting_down, &outcome);
+        self.finalize_recording(
+            &row,
+            monitor_id,
+            rec_id,
+            &outcome,
+            &final_path,
+            bytes,
+            ok,
+            manually_stopped,
+            shutting_down,
+            sabr_stall,
+            went_live_at,
+            approximate,
+        );
+
+        // A manual stop already installed its own 120s cooldown (see `manual_stop`);
+        // don't let the subprocess's exit clobber it — a 0-byte stopped capture would
+        // otherwise reset the wait to 30s, and a captured one would clear it entirely,
+        // either way re-triggering the moment the next LIVE signal arrives.
+        if !manually_stopped {
+            self.note_result(monitor_id, duration, ok);
+        }
+        self.active.lock().unwrap().remove(&monitor_id);
+        self.ad_active.lock().unwrap().remove(&monitor_id);
+    }
+
+    /// Resolve the effective auth source and, when the filename template wants
+    /// media variables in a pre-probe mode, probe the stream before capture.
+    async fn resolve_auth_and_preprobe(
+        &self,
+        row: &MonitorWithChannel,
+    ) -> (AuthSource, MediaInfoMode, bool, Option<MediaInfo>) {
         let global_method = self
             .store
             .get_setting("download_auth_method")
@@ -2124,7 +2354,7 @@ impl Supervisor {
             .ok()
             .flatten()
             .unwrap_or_default();
-        let auth = resolve_auth(&row, &global_method, &global_browser);
+        let auth = resolve_auth(row, &global_method, &global_browser);
         // Filename media-info ({resolution}/{fps}/…): pre-probe the stream if the
         // template uses it and the mode asks for it. Do this BEFORE taking the
         // concurrency permit (so a slow probe can't block other recordings) and
@@ -2137,13 +2367,20 @@ impl Supervisor {
         } else {
             None
         };
+        (auth, media_mode, want_media, pre_media)
+    }
 
-        let _permit = self.sem.acquire().await.expect("semaphore");
-        // The probe + permit wait may have spanned a shutdown; don't start new work.
-        if self.shutdown.load(Ordering::SeqCst) {
-            self.active.lock().unwrap().remove(&monitor_id);
-            return;
-        }
+    /// Build the download plan for a new take and ensure its working (`.cache\`)
+    /// and output directories exist.
+    async fn build_record_plan(
+        &self,
+        row: &MonitorWithChannel,
+        auth: &AuthSource,
+        stream_id: &Option<String>,
+        stream_title: &Option<String>,
+        pre_media: &Option<MediaInfo>,
+        went_live_at: Option<i64>,
+    ) -> (Vec<String>, YtDlpBins, i64, DownloadPlan) {
         let ytdlp_global_raw = self
             .store
             .get_setting("ytdlp_default_args")
@@ -2153,7 +2390,7 @@ impl Supervisor {
         let ytdlp_global_args = split_args(&ytdlp_global_raw);
         let ytdlp_bins = load_ytdlp_bins(&self.store);
         let started_at = now_unix();
-        let plan = build_plan(&row, started_at, &auth, &ytdlp_global_args, stream_id.as_deref(), stream_title.as_deref().unwrap_or(""), pre_media.as_ref(), went_live_at.unwrap_or(0), &ytdlp_bins);
+        let plan = build_plan(row, started_at, auth, &ytdlp_global_args, stream_id.as_deref(), stream_title.as_deref().unwrap_or(""), pre_media.as_ref(), went_live_at.unwrap_or(0), &ytdlp_bins);
         if let Some(parent) = plan.capture_path.parent() {
             let _ = crate::iomon::fs::create_dir_all(Cat::DirSetup, parent).await;
             set_cache_hidden(parent); // mark the working dir (or its central root) hidden
@@ -2162,7 +2399,24 @@ impl Supervisor {
         if let Some(out_dir) = plan.final_path.parent() {
             let _ = crate::iomon::fs::create_dir_all(Cat::DirSetup, out_dir).await;
         }
+        (ytdlp_global_args, ytdlp_bins, started_at, plan)
+    }
 
+    /// Insert the recording row and emit the recording-started events.
+    /// Returns `(take_group, rec_id)`.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_recording_row(
+        &self,
+        row: &MonitorWithChannel,
+        monitor_id: i64,
+        started_at: i64,
+        plan: &DownloadPlan,
+        went_live_at: Option<i64>,
+        approximate: bool,
+        stream_id: &Option<String>,
+        trigger_info: &str,
+        trigger_rule_json: &str,
+    ) -> (String, i64) {
         // A take key links the recordings of this capture attempt: the primary
         // and, in dual capture, the DASH companion share it (they're one "take").
         let take_group = format!("{monitor_id}:{started_at}");
@@ -2176,8 +2430,8 @@ impl Supervisor {
                 approximate,
                 stream_id.as_deref(),
                 Some(&take_group),
-                &trigger_info,
-                &trigger_rule_json,
+                trigger_info,
+                trigger_rule_json,
             )
             .unwrap_or(0);
         let _ = self
@@ -2197,7 +2451,26 @@ impl Supervisor {
             channel: row.channel.name.clone(),
             thumbnail_path: toast_thumbnail,
         });
+        (take_group, rec_id)
+    }
 
+    /// Spawn the DASH companion capture when dual capture applies to this take.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_dash_companion(
+        &self,
+        row: &MonitorWithChannel,
+        plan: &DownloadPlan,
+        auth: &AuthSource,
+        ytdlp_global_args: &[String],
+        ytdlp_bins: &YtDlpBins,
+        monitor_id: i64,
+        take_group: String,
+        stream_id: &Option<String>,
+        went_live_at: Option<i64>,
+        approximate: bool,
+        trigger_info: String,
+        trigger_rule_json: String,
+    ) {
         // Dual capture: also run a DASH companion via the system yt-dlp for formats
         // that only DASH carries. It captures from the live edge (SABR owns
         // from-start), writes a sibling `{stem}.dash.mkv`, and finalizes as its own
@@ -2209,9 +2482,9 @@ impl Supervisor {
         {
             let dash_plan = build_dash_companion_plan(
                 &plan.final_path,
-                &row,
-                &auth,
-                &ytdlp_global_args,
+                row,
+                auth,
+                ytdlp_global_args,
                 &ytdlp_bins.system_program(),
                 &load_dash_format(&self.store),
                 &ytdlp_bins.sabr.pot_args,
@@ -2230,6 +2503,18 @@ impl Supervisor {
                 .await;
             });
         }
+    }
+
+    /// Fire-and-forget asset fetches for a new take (stream thumbnail over HTTP
+    /// when the tool doesn't write its own, plus channel assets).
+    fn spawn_asset_fetches(
+        &self,
+        row: &MonitorWithChannel,
+        plan: &DownloadPlan,
+        monitor_id: i64,
+        thumbnail_url: Option<String>,
+        broadcaster_id: Option<String>,
+    ) {
         // Asset fetching — fire-and-forget tasks that don't block the recording.
         // Normal yt-dlp writes its own thumbnail inline (`--write-thumbnail`); for
         // streamlink and SABR captures (which don't) we fetch it over HTTP instead.
@@ -2267,22 +2552,20 @@ impl Supervisor {
             }
         }
         if row.monitor.fetch_chat_assets {
-            self.fetch_channel_assets(&row, broadcaster_id.clone(), false);
+            self.fetch_channel_assets(row, broadcaster_id.clone(), false);
         }
+    }
 
-        info!(monitor_id, program = %plan.program, "starting recording -> {}", plan.capture_path.display());
-        {
-            let redacted: Vec<String> = plan.args.iter().map(|a| {
-                if a.contains("Authorization=OAuth ") {
-                    let prefix = &a[..a.find("OAuth ").map(|i| i + 6).unwrap_or(a.len())];
-                    format!("{prefix}<redacted>")
-                } else {
-                    a.clone()
-                }
-            }).collect();
-            info!(monitor_id, "args: {}", redacted.join(" "));
-        }
-
+    /// Spawn the DVR catch-up watcher for capture-from-start takes.
+    /// Returns `(from_start, resolve_lost, watcher_done, watcher)`.
+    fn spawn_catch_up_watcher(
+        &self,
+        row: &MonitorWithChannel,
+        plan: &DownloadPlan,
+        monitor_id: i64,
+        rec_id: i64,
+        went_live_at: Option<i64>,
+    ) -> (bool, bool, Arc<AtomicBool>, Option<tokio::task::JoinHandle<()>>) {
         // When capturing from the start of the broadcast (live-from-start /
         // hls-live-restart), the early footage isn't lost — it's pulled from the
         // DVR. Watch the growing capture and zero out "lost time" once it catches
@@ -2303,7 +2586,24 @@ impl Supervisor {
                 watcher_done.clone(),
             ))
         });
+        (from_start, resolve_lost, watcher_done, watcher)
+    }
 
+    /// Spawn the Twitch head-backfill job when this take rewinds to the
+    /// broadcast start (or a trigger leadtime asks for a short lead-in).
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_head_backfill(
+        &self,
+        row: &MonitorWithChannel,
+        plan: &DownloadPlan,
+        trigger_rule: &Option<crate::triggers::TriggerRule>,
+        monitor_id: i64,
+        rec_id: i64,
+        stream_id: &Option<String>,
+        went_live_at: Option<i64>,
+        approximate: bool,
+        started_at: i64,
+    ) {
         // Trigger-configured backfill leadtime (0/absent = off) — a fixed,
         // short lead-in buffer before this take started, for a mid-broadcast
         // trigger start (e.g. one GDQ segment) rather than the whole missed
@@ -2346,12 +2646,25 @@ impl Supervisor {
                 .await;
             });
         }
+    }
 
+    /// Build the ad-break sink for Twitch+streamlink takes (None otherwise).
+    #[allow(clippy::too_many_arguments)]
+    fn make_ad_sink(
+        &self,
+        row: &MonitorWithChannel,
+        plan: &DownloadPlan,
+        monitor_id: i64,
+        rec_id: i64,
+        started_at: i64,
+        went_live_at: Option<i64>,
+        from_start: bool,
+    ) -> Option<AdSink> {
         // Twitch+streamlink filters ads into hard cuts and logs each break; record
         // them so the UI can show ad count/time and the cut timestamps. Skip when
         // the recording row failed to insert (rec_id 0) — an ad break with a 0
         // recording_id would violate the FK and be dropped anyway.
-        let ad_sink = (rec_id != 0
+        (rec_id != 0
             && row.monitor.tool == Tool::Streamlink
             && row.monitor.platform() == Platform::Twitch)
             .then(|| AdSink {
@@ -2364,8 +2677,19 @@ impl Supervisor {
                 from_start,
                 capture_path: plan.capture_path.clone(),
                 ad_active: self.ad_active.clone(),
-            });
+            })
+    }
 
+    /// Spawn the title/game metadata watcher for the take.
+    /// Returns `(meta_done, meta_task)`.
+    fn spawn_meta_watcher(
+        &self,
+        row: &MonitorWithChannel,
+        trigger_rule: &Option<crate::triggers::TriggerRule>,
+        monitor_id: i64,
+        rec_id: i64,
+        started_at: i64,
+    ) -> (Arc<AtomicBool>, Option<tokio::task::JoinHandle<()>>) {
         // Log title / game-category changes during the take (the scheduler pauses
         // normal polling while recording, so poll the source directly). Supported
         // for Twitch (Helix), Kick (v2 JSON), and YouTube (/live scrape); no-ops
@@ -2392,7 +2716,17 @@ impl Supervisor {
                 stop_rule,
             ))
         });
+        (meta_done, meta_task)
+    }
 
+    /// Spawn the restart-at-better-quality watcher when it applies to this take.
+    fn spawn_quality_upgrade_watcher(
+        &self,
+        row: &MonitorWithChannel,
+        plan: &DownloadPlan,
+        monitor_id: i64,
+        stream_id: &Option<String>,
+    ) {
         // Restart-at-better-quality watcher: a Twitch capture that joins
         // seconds after go-live often sees only transcodes (the source
         // rendition is listed late) and locks onto e.g. 720p60 while the
@@ -2419,7 +2753,19 @@ impl Supervisor {
                 this.quality_upgrade_watcher(monitor_id, key, url, capture, channel).await;
             });
         }
+    }
 
+    /// Spawn the chat loggers for the take (native Twitch IRC logger and/or the
+    /// yt-dlp live-chat sidecar). Returns `(chat_done, chat_task)`.
+    fn spawn_chat_loggers(
+        &self,
+        row: &MonitorWithChannel,
+        plan: &DownloadPlan,
+        auth: &AuthSource,
+        ytdlp_global_args: &[String],
+        ytdlp_bins: &YtDlpBins,
+        monitor_id: i64,
+    ) -> (Arc<AtomicBool>, Option<tokio::task::JoinHandle<()>>) {
         // Twitch chat -> a native anonymous IRC-over-WebSocket logger, written as
         // a `.chat.jsonl` sidecar in the OUTPUT dir (next to the final file, not in
         // .cache\) so it isn't promoted/purged from under a still-writing logger; it
@@ -2447,38 +2793,24 @@ impl Supervisor {
             // Base the YouTube chat sidecar on the final (output-dir) path, not the
             // .cache\ capture: this process outlives the video, so its
             // `.live_chat.json` must not be promoted/purged mid-write.
-            let chat_plan = build_chat_plan(&row, &plan.final_path, &auth, &ytdlp_global_args, &ytdlp_bins.system_program());
+            let chat_plan = build_chat_plan(row, &plan.final_path, auth, ytdlp_global_args, &ytdlp_bins.system_program());
             let this = self.clone();
             let mid = monitor_id;
             tokio::spawn(async move { this.run_chat_download(mid, chat_plan).await });
         }
+        (chat_done, chat_task)
+    }
 
-        // If a manual stop arrived while we were setting up (pid was 0 so kill
-        // couldn't fire yet), honour it now: skip spawning the process entirely.
-        let outcome = if self.stopping_monitors.lock().unwrap().contains(&monitor_id) {
-            ProcessOutcome { exit_code: None, log: String::new() }
-        } else {
-            self.run_process(
-                &self.active,
-                monitor_id,
-                &plan,
-                None,
-                None,
-                ad_sink,
-                DetachReg {
-                    kind: DetachedKind::Recording,
-                    ref_id: rec_id,
-                    monitor_id: Some(monitor_id),
-                    take_group: Some(take_group.clone()),
-                    started_at,
-                    secondary: false,
-                    stream_id: stream_id.clone(),
-                    went_live_at,
-                },
-            )
-            .await
-        };
-
+    /// Stop the per-take watchers once the capture process has exited.
+    async fn stop_record_watchers(
+        &self,
+        watcher_done: Arc<AtomicBool>,
+        watcher: Option<tokio::task::JoinHandle<()>>,
+        meta_done: Arc<AtomicBool>,
+        meta_task: Option<tokio::task::JoinHandle<()>>,
+        chat_done: Arc<AtomicBool>,
+        chat_task: Option<tokio::task::JoinHandle<()>>,
+    ) {
         // Stop the catch-up watcher before we touch the capture file (so it can't
         // race finalize's authoritative lost-time write). Abort rather than wait:
         // the watcher only checks its done flag at the start of each sleep tick, so
@@ -2505,14 +2837,29 @@ impl Supervisor {
         if let Some(t) = chat_task {
             let _ = t.await;
         }
-        // Broadcast end ~= when the tool exited; snapshot it before remux so the
-        // span (and thus lost-time) isn't inflated by remux duration.
-        let ended = now_unix();
+    }
 
+    /// Promote the finished capture out of `.cache\`, apply the post-capture
+    /// rename (media vars / games / title), and purge working leftovers.
+    /// Returns the final path.
+    #[allow(clippy::too_many_arguments)]
+    async fn promote_and_rename(
+        &self,
+        row: &MonitorWithChannel,
+        plan: &DownloadPlan,
+        monitor_id: i64,
+        rec_id: i64,
+        started_at: i64,
+        stream_id: &Option<String>,
+        went_live_at: Option<i64>,
+        want_media: bool,
+        media_mode: MediaInfoMode,
+        pre_media: &Option<MediaInfo>,
+    ) -> PathBuf {
         // Promote the finished capture from the hidden `.cache\` up to the output
         // dir (remux .ts→.mkv, or move an already-final container); a failed/0-byte
         // capture is left in `.cache\` for the startup sweep.
-        let mut final_path = promote_capture(&plan, &self.store.remux_opts()).await;
+        let mut final_path = promote_capture(plan, &self.store.remux_opts()).await;
         let promoted = final_path != plan.capture_path;
         let cache = plan.capture_path.parent().map(Path::to_path_buf);
         // The capture stem (== final stem before any post-rename) used to match this
@@ -2580,9 +2927,18 @@ impl Supervisor {
                 purge_cache(cache, &capstem).await;
             }
         }
+        final_path
+    }
 
-        let bytes = file_len(&final_path).await as i64;
-
+    /// Zero out "lost time" when the finished capture spans the whole broadcast.
+    async fn maybe_clear_lost_time(
+        &self,
+        resolve_lost: bool,
+        went_live_at: Option<i64>,
+        final_path: &Path,
+        ended: i64,
+        rec_id: i64,
+    ) {
         // Conclude "no footage missed" only when the capture actually spans the
         // whole broadcast (reached the live edge with the head intact). If it
         // ended before catching up (stopped/crashed/stream ended early), the gap
@@ -2591,7 +2947,7 @@ impl Supervisor {
         // provisional `started - went_live` estimate.
         if resolve_lost {
             if let (Some(wl), Some(captured)) =
-                (went_live_at, media_duration_secs(&final_path).await)
+                (went_live_at, media_duration_secs(final_path).await)
             {
                 let span = (ended - wl).max(0);
                 if captured + CATCHUP_TOLERANCE_SECS >= span {
@@ -2599,11 +2955,19 @@ impl Supervisor {
                 }
             }
         }
+    }
 
-        let duration = now_unix() - started_at;
-        let ok = bytes > 0;
-        let manually_stopped = self.stopping_monitors.lock().unwrap().remove(&monitor_id);
-        let shutting_down = self.shutdown.load(Ordering::SeqCst);
+    /// Track SABR from-start stalls (and the live-edge fallback flag) for this
+    /// take's outcome. Returns whether this outcome was a SABR from-start stall.
+    fn note_sabr_stall(
+        &self,
+        sabr_key: (i64, Option<String>),
+        monitor_id: i64,
+        ok: bool,
+        manually_stopped: bool,
+        shutting_down: bool,
+        outcome: &ProcessOutcome,
+    ) -> bool {
         // SABR from-start stall ("not near live head"): YouTube only serves the
         // last ~4 hours of a live stream via SABR, so once a stream is older than
         // its DVR window each from-start attempt downloads the opening segments
@@ -2647,6 +3011,27 @@ impl Supervisor {
                 self.sabr_dvr_exceeded.lock().unwrap().remove(&sabr_key);
             }
         }
+        sabr_stall
+    }
+
+    /// Classify the outcome, finish the recording row, emit events, and kick
+    /// off the post-take follow-ups (VOD check/archive, backfill concat).
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_recording(
+        &self,
+        row: &MonitorWithChannel,
+        monitor_id: i64,
+        rec_id: i64,
+        outcome: &ProcessOutcome,
+        final_path: &Path,
+        bytes: i64,
+        ok: bool,
+        manually_stopped: bool,
+        shutting_down: bool,
+        sabr_stall: bool,
+        went_live_at: Option<i64>,
+        approximate: bool,
+    ) {
         // A 0-byte capture isn't always a failure: a livestream that had already
         // ended (or hadn't started, or exposed no live video formats) leaves
         // nothing to capture but isn't an error. Classify those as `ended` so they
@@ -2693,7 +3078,7 @@ impl Supervisor {
             status: status.into(),
         });
         self.schedule_vod_check(rec_id, row.monitor.platform(), status, &row.monitor.url, went_live_at, approximate);
-        self.schedule_vod_archive(rec_id, &row, went_live_at, status);
+        self.schedule_vod_archive(rec_id, row, went_live_at, status);
         // Join a backfilled head with the finished capture (no-op without one).
         {
             let this = self.clone();
@@ -2703,16 +3088,6 @@ impl Supervisor {
         if status == "failed" && !outcome.log.is_empty() {
             warn!(monitor_id, "recording stderr:\n{}", outcome.log);
         }
-
-        // A manual stop already installed its own 120s cooldown (see `manual_stop`);
-        // don't let the subprocess's exit clobber it — a 0-byte stopped capture would
-        // otherwise reset the wait to 30s, and a captured one would clear it entirely,
-        // either way re-triggering the moment the next LIVE signal arrives.
-        if !manually_stopped {
-            self.note_result(monitor_id, duration, ok);
-        }
-        self.active.lock().unwrap().remove(&monitor_id);
-        self.ad_active.lock().unwrap().remove(&monitor_id);
     }
 
     /// Run the DASH companion capture (dual capture): a self-contained second
