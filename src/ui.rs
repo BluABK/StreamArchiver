@@ -2742,6 +2742,16 @@ impl StreamArchiverApp {
     }
 }
 
+/// A wrapping description label for settings grids. Grid cells hand labels
+/// unbounded width, so a long help text stretches the whole window sideways
+/// instead of wrapping — cap the cell and wrap inside it.
+fn setting_desc(ui: &mut egui::Ui, text: &str) {
+    ui.scope(|ui| {
+        ui.set_max_width(620.0);
+        ui.add(egui::Label::new(text).wrap());
+    });
+}
+
 /// Re-register the I/O monitor's recordings roots: current instance output
 /// dirs + the default output dir + every dir PAST recordings live in (a drive
 /// an instance moved away from must stay classified and disk-sampled).
@@ -17991,7 +18001,8 @@ impl StreamArchiverApp {
                                 .suffix("× realtime"),
                         );
                     });
-                    ui.label(
+                    setting_desc(
+                        ui,
                         "Caps how fast finalize remuxes/joins/embeds read + write, so they \
                          can't starve live recordings on the same drive. 0 = unthrottled. \
                          30× ≈ a 5h stream finalizing in ~10 min. Needs ffmpeg 5.0+ \
@@ -18006,7 +18017,8 @@ impl StreamArchiverApp {
                                 .desired_width(240.0),
                         );
                     });
-                    ui.label(
+                    setting_desc(
+                        ui,
                         "yt-dlp --postprocessor-args specs (separate several with ;;). \
                          The disk throttle above can't reach ffmpeg passes yt-dlp runs \
                          INTERNALLY — e.g. the post-stream SABR format merge reads + \
@@ -18022,8 +18034,34 @@ impl StreamArchiverApp {
                                 .hint_text(r"A:\streams\.sa-cache; G:\streams\.sa-cache")
                                 .desired_width(240.0),
                         );
+                        if ui
+                            .button("Browse…")
+                            .on_hover_text(
+                                "Pick a folder — appended to the list (one location per \
+                                 drive, ';'-separated).",
+                            )
+                            .clicked()
+                        {
+                            let first = self
+                                .settings
+                                .capture_cache_root
+                                .split(';')
+                                .next()
+                                .unwrap_or("")
+                                .trim()
+                                .to_string();
+                            self.pending_browse = Some(spawn_browse_folder(&first, |app, p| {
+                                let s = &mut app.settings.capture_cache_root;
+                                if s.trim().is_empty() {
+                                    *s = p;
+                                } else {
+                                    *s = format!("{}; {}", s.trim().trim_end_matches(';'), p);
+                                }
+                            }));
+                        }
                     });
-                    ui.label(
+                    setting_desc(
+                        ui,
                         "Central folder(s) for ALL in-progress capture files, one subfolder \
                          per channel — a single subtree per drive that backup tools can \
                          exclude by path (Backblaze has no wildcard rules). Recordings can \
@@ -18036,7 +18074,8 @@ impl StreamArchiverApp {
                     );
                     ui.end_row();
                     ui.checkbox(&mut self.settings.iomon_sample_log, "I/O sample log");
-                    ui.label(
+                    setting_desc(
+                        ui,
                         "Write the I/O monitor's 1s samples to a JSONL under the appdata \
                          logs folder (system drive) so drive stalls and disconnects can be \
                          analyzed after the fact. ~2-5 MB/day, pruned after 14 days.",
