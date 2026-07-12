@@ -109,7 +109,22 @@ impl AppCore {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
-            .thread_name("streamarchiver-core")
+            // Name the async workers apart from the on-demand blocking pool
+            // (tokio names both from the same hook; the 2 workers spawn
+            // eagerly inside build(), so the first 2 names are theirs). The
+            // distinction makes iomon's slow-op warnings diagnosable: a slow
+            // fs op on a `-blocking-` thread is tokio::fs doing its job, one
+            // on a `-core-` worker stalls every async task scheduled there.
+            .thread_name_fn(|| {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static N: AtomicUsize = AtomicUsize::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed);
+                if n < 2 {
+                    format!("streamarchiver-core-{n}")
+                } else {
+                    format!("streamarchiver-blocking-{}", n - 2)
+                }
+            })
             .build()?;
         let rt_handle = rt.handle().clone();
         let (events, _rx) = bus();
