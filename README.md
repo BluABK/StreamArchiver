@@ -1745,6 +1745,27 @@ tray ── open/quit ──► core (tokio): store · scheduler · detectors ·
 egui window (on demand) ◄── events ──┘
 ```
 
+### Source layout
+
+The three biggest modules are split into directories; each keeps a small facade
+file (`src/store.rs`, `src/downloader.rs`, `src/ui.rs`) holding the core
+type(s) and re-exports, with the implementation spread over
+`src/<module>/*.rs` submodules (`impl` blocks continue across files):
+
+- `src/store/` — SQLite persistence: `migrations`, plus per-domain query
+  clusters (`recordings`, `monitors`, `scheduled`, `vod`, `posts`, `videos`).
+- `src/downloader/` — capture pipeline: `cache` (`.sa-cache` layout),
+  `tools`, `plan`, `supervisor`, `process`, `backfill`, `vod`, `remux`,
+  `naming`, `finalize`.
+- `src/ui/` — egui app: `app` (pump/persistence), one module per view
+  (`streams`, `videos`, `schedule`, `settings`, `files`, `io_view`, `posts`,
+  `background`, `issues`, `debug`), window clusters (`dialogs`, `properties`,
+  `chat`), and shared helpers (`grid`, `calendar`, `format`, `player`,
+  `assets_helpers`).
+
+Unit tests live in a `#[cfg(test)] mod tests` inside the submodule whose code
+they cover (they exercise private items and compile out of release builds).
+
 ## Roadmap
 
 - Installer + AppUserModelID (for branded Windows toast notifications).
