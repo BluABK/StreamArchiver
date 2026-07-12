@@ -487,7 +487,6 @@ impl StreamArchiverApp {
     /// The Schedule tab: a month/week/day calendar of all upcoming scheduled
     /// streams, with a left sidebar to filter channels and a collision highlight.
     pub(super) fn schedule_view(&mut self, ui: &mut egui::Ui) {
-        use chrono::Datelike;
 
         // Lazy load on first view + initialize the focused date to today.
         if !self.schedule_loaded {
@@ -529,41 +528,157 @@ impl StreamArchiverApp {
             .clone();
 
         // Channel avatars for the week-view header's "recording scheduled" row
-        // (schema v51) — same small-icon cache/pattern as the Streams grid,
-        // built here (mutable) so `schedule_week_grid` (immutable) can just
-        // look them up by channel id.
-        let mut sched_rec_avatars: HashMap<i64, egui::TextureHandle> = HashMap::new();
-        {
-            let mut channel_ids: Vec<i64> = self
-                .scheduled_recordings
-                .iter()
-                .filter(|r| r.rec.enabled)
-                .filter_map(|r| self.rows.iter().find(|row| row.monitor.id == r.rec.monitor_id))
-                .map(|row| row.channel.id)
-                .collect();
-            channel_ids.sort_unstable();
-            channel_ids.dedup();
-            for cid in channel_ids {
-                let Some(channel) = self.rows.iter().find(|r| r.channel.id == cid).map(|r| r.channel.clone())
-                else {
-                    continue;
-                };
-                let mons: Vec<&MonitorWithChannel> =
-                    self.rows.iter().filter(|r| r.channel.id == cid).collect();
-                let accounts = channel_asset_accounts(&mons);
-                let tex = self
-                    .channel_icons_small
-                    .entry(cid)
-                    .or_insert_with(|| resolve_channel_icon_small(&channel, &accounts, ui.ctx()))
-                    .clone();
-                if let Some(t) = tex {
-                    sched_rec_avatars.insert(cid, t);
-                }
-            }
-        }
+        // (schema v51) — built by `schedule_rec_avatars` (mutable) so
+        // `schedule_week_grid` (immutable) can just look them up by channel id.
+        let sched_rec_avatars = self.schedule_rec_avatars(ui);
 
         // Precompute (immutable reads of `self`) what the closures need: collisions
         // and the per-day buckets of visible streams (indices into `schedule_all`).
+        let (collide, by_day, all_day_events) = self.schedule_visible_buckets();
+
+        // Actions collected during rendering, applied after the borrowing closures.
+        let mut open_day: Option<chrono::NaiveDate> = None;
+        let mut nav_anchor: Option<chrono::NaiveDate> = None;
+        let mut set_mode: Option<ScheduleMode> = None;
+        let mut do_refresh = false;
+        let mut open_sources = false;
+        let mut clear_hidden = false;
+        let mut hide_all = false;
+        let mut toggle_channel: Option<i64> = None;
+        let mut set_collisions: Option<bool> = None;
+        let mut set_show_hidden: Option<bool> = None;
+
+        // ── Left sidebar: per-channel filter + collision toggle. ──
+        self.schedule_sidebar(
+            ui,
+            &ptex,
+            &mut clear_hidden,
+            &mut hide_all,
+            &mut toggle_channel,
+            &mut set_show_hidden,
+        );
+
+        // Visible date range + header title for the current mode.
+        let mode = self.schedule_mode;
+        let today = chrono::Local::now().date_naive();
+        let (title, prev_date, next_date, collisions_in_view) =
+            self.schedule_nav_dates(mode, anchor, &collide);
+
+        // ── Center: the calendar for the selected mode. ──
+        egui::CentralPanel::default().show_inside(ui, |ui| {
+            // Header: view mode + navigation + title + collision controls.
+            self.schedule_toolbar(
+                ui,
+                mode,
+                &title,
+                today,
+                prev_date,
+                next_date,
+                collisions_in_view,
+                &mut set_mode,
+                &mut nav_anchor,
+                &mut do_refresh,
+                &mut open_sources,
+                &mut set_collisions,
+            );
+
+            self.schedule_selection_bar(ui);
+
+            // Zoom the calendar body only: scale every relative text size
+            // (`.strong()`/`.weak()`/`.small()`/monospace/etc. all resolve
+            // through `TextStyle`, so this one override covers virtually all
+            // text drawn below without touching each call site). Applied to
+            // this `ui` only, after the header/selection-bar above already
+            // rendered at normal size, so the toolbar/sidebar are unaffected.
+            if (self.schedule_zoom - 1.0).abs() > f32::EPSILON {
+                let zoom = self.schedule_zoom;
+                for font_id in ui.style_mut().text_styles.values_mut() {
+                    font_id.size *= zoom;
+                }
+            }
+
+            match mode {
+                ScheduleMode::Month => {
+                    self.schedule_month_grid(ui, anchor, today, &by_day, &collide, &ptex, &mut open_day)
+                }
+                ScheduleMode::Week => {
+                    self.schedule_week_grid(
+                        ui, anchor, today, &by_day, &collide, &ptex, &mut open_day,
+                        &sched_rec_avatars, &all_day_events,
+                    )
+                }
+                ScheduleMode::Day => {
+                    self.schedule_day_grid(ui, anchor, today, &by_day, &collide, &mut open_day)
+                }
+                ScheduleMode::Agenda => {
+                    self.schedule_agenda_view(ui, anchor, &by_day, &collide, &ptex, &mut open_day)
+                }
+            }
+        });
+
+        // ── Apply collected actions. ──
+        self.schedule_apply_actions(
+            ui,
+            set_mode,
+            nav_anchor,
+            clear_hidden,
+            hide_all,
+            toggle_channel,
+            set_collisions,
+            open_day,
+            do_refresh,
+            open_sources,
+            set_show_hidden,
+        );
+    }
+
+    /// Channel avatars for the week-view header's "recording scheduled" row
+    /// (schema v51) — same small-icon cache/pattern as the Streams grid,
+    /// built here (mutable) so `schedule_week_grid` (immutable) can just
+    /// look them up by channel id.
+    fn schedule_rec_avatars(&mut self, ui: &egui::Ui) -> HashMap<i64, egui::TextureHandle> {
+        let mut sched_rec_avatars: HashMap<i64, egui::TextureHandle> = HashMap::new();
+        let mut channel_ids: Vec<i64> = self
+            .scheduled_recordings
+            .iter()
+            .filter(|r| r.rec.enabled)
+            .filter_map(|r| self.rows.iter().find(|row| row.monitor.id == r.rec.monitor_id))
+            .map(|row| row.channel.id)
+            .collect();
+        channel_ids.sort_unstable();
+        channel_ids.dedup();
+        for cid in channel_ids {
+            let Some(channel) = self.rows.iter().find(|r| r.channel.id == cid).map(|r| r.channel.clone())
+            else {
+                continue;
+            };
+            let mons: Vec<&MonitorWithChannel> =
+                self.rows.iter().filter(|r| r.channel.id == cid).collect();
+            let accounts = channel_asset_accounts(&mons);
+            let tex = self
+                .channel_icons_small
+                .entry(cid)
+                .or_insert_with(|| resolve_channel_icon_small(&channel, &accounts, ui.ctx()))
+                .clone();
+            if let Some(t) = tex {
+                sched_rec_avatars.insert(cid, t);
+            }
+        }
+        sched_rec_avatars
+    }
+
+    /// Precompute (immutable reads of `self`) what the calendar closures
+    /// need: the collision set and the per-day buckets of visible streams
+    /// (indices into `schedule_all`), plus the "all-day" events for the week
+    /// view's bar strip.
+    #[allow(clippy::type_complexity)]
+    fn schedule_visible_buckets(
+        &self,
+    ) -> (
+        HashSet<usize>,
+        HashMap<chrono::NaiveDate, Vec<usize>>,
+        Vec<usize>,
+    ) {
         let collide: HashSet<usize> = if self.schedule_collisions {
             schedule_collisions(&self.schedule_all, &self.schedule_hidden)
         } else {
@@ -596,20 +711,19 @@ impl StreamArchiverApp {
             }
         }
         // `schedule_all` is sorted by start_time, so each day's list is time-sorted.
+        (collide, by_day, all_day_events)
+    }
 
-        // Actions collected during rendering, applied after the borrowing closures.
-        let mut open_day: Option<chrono::NaiveDate> = None;
-        let mut nav_anchor: Option<chrono::NaiveDate> = None;
-        let mut set_mode: Option<ScheduleMode> = None;
-        let mut do_refresh = false;
-        let mut open_sources = false;
-        let mut clear_hidden = false;
-        let mut hide_all = false;
-        let mut toggle_channel: Option<i64> = None;
-        let mut set_collisions: Option<bool> = None;
-        let mut set_show_hidden: Option<bool> = None;
-
-        // ── Left sidebar: per-channel filter + collision toggle. ──
+    /// ── Left sidebar: per-channel filter + collision toggle. ──
+    fn schedule_sidebar(
+        &self,
+        ui: &mut egui::Ui,
+        ptex: &PlatformTextures,
+        clear_hidden: &mut bool,
+        hide_all: &mut bool,
+        toggle_channel: &mut Option<i64>,
+        set_show_hidden: &mut Option<bool>,
+    ) {
         egui::Panel::left("schedule_sidebar")
             .resizable(true)
             .default_size(210.0)
@@ -636,9 +750,9 @@ impl StreamArchiverApp {
                     .changed()
                 {
                     if all {
-                        clear_hidden = true;
+                        *clear_hidden = true;
                     } else {
-                        hide_all = true;
+                        *hide_all = true;
                     }
                 }
                 ui.separator();
@@ -663,10 +777,10 @@ impl StreamArchiverApp {
                             let row = ui.horizontal(|ui| {
                                 let mut vis = !ch_is_hidden;
                                 if ui.checkbox(&mut vis, "").changed() {
-                                    toggle_channel = Some(cid);
+                                    *toggle_channel = Some(cid);
                                 }
                                 for &p in &plats {
-                                    platform_icon(ui, &ptex, p).on_hover_text(p.label());
+                                    platform_icon(ui, ptex, p).on_hover_text(p.label());
                                 }
                                 ui.add(
                                     egui::Label::new(format!("{name}  ({count})")).truncate(),
@@ -718,15 +832,22 @@ impl StreamArchiverApp {
                                 })
                                 .clicked()
                             {
-                                set_show_hidden = Some(!show_hidden);
+                                *set_show_hidden = Some(!show_hidden);
                             }
                         }
                     });
             });
+    }
 
-        // Visible date range + header title for the current mode.
-        let mode = self.schedule_mode;
-        let today = chrono::Local::now().date_naive();
+    /// Visible date range + header title for the current mode, plus the
+    /// prev/next navigation targets and the number of collisions in view.
+    fn schedule_nav_dates(
+        &self,
+        mode: ScheduleMode,
+        anchor: chrono::NaiveDate,
+        collide: &HashSet<usize>,
+    ) -> (String, chrono::NaiveDate, chrono::NaiveDate, usize) {
+        use chrono::Datelike;
         let (range_start, range_end, title) = match mode {
             ScheduleMode::Month => {
                 let first = chrono::NaiveDate::from_ymd_opt(anchor.year(), anchor.month(), 1)
@@ -774,186 +895,192 @@ impl StreamArchiverApp {
                     .is_some_and(|d| d >= range_start && d < range_end)
             })
             .count();
+        (title, prev_date, next_date, collisions_in_view)
+    }
 
-        // ── Center: the calendar for the selected mode. ──
-        egui::CentralPanel::default().show_inside(ui, |ui| {
-            // Header: view mode + navigation + title + collision controls.
-            ui.horizontal(|ui| {
-                let mut m = mode;
-                ui.selectable_value(&mut m, ScheduleMode::Month, "Month");
-                ui.selectable_value(&mut m, ScheduleMode::Week, "Week");
-                ui.selectable_value(&mut m, ScheduleMode::Day, "Day");
-                ui.selectable_value(&mut m, ScheduleMode::Agenda, "Agenda");
-                if m != mode {
-                    set_mode = Some(m);
+    /// Header: view mode switcher + navigation + title + zoom + collision
+    /// controls.
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_toolbar(
+        &mut self,
+        ui: &mut egui::Ui,
+        mode: ScheduleMode,
+        title: &str,
+        today: chrono::NaiveDate,
+        prev_date: chrono::NaiveDate,
+        next_date: chrono::NaiveDate,
+        collisions_in_view: usize,
+        set_mode: &mut Option<ScheduleMode>,
+        nav_anchor: &mut Option<chrono::NaiveDate>,
+        do_refresh: &mut bool,
+        open_sources: &mut bool,
+        set_collisions: &mut Option<bool>,
+    ) {
+        ui.horizontal(|ui| {
+            let mut m = mode;
+            ui.selectable_value(&mut m, ScheduleMode::Month, "Month");
+            ui.selectable_value(&mut m, ScheduleMode::Week, "Week");
+            ui.selectable_value(&mut m, ScheduleMode::Day, "Day");
+            ui.selectable_value(&mut m, ScheduleMode::Agenda, "Agenda");
+            if m != mode {
+                *set_mode = Some(m);
+            }
+            ui.separator();
+            if ui.button("◀").on_hover_text("Previous").clicked() {
+                *nav_anchor = Some(prev_date);
+            }
+            if ui.button("Today").clicked() {
+                *nav_anchor = Some(today);
+            }
+            if ui.button("▶").on_hover_text("Next").clicked() {
+                *nav_anchor = Some(next_date);
+            }
+            ui.add_space(8.0);
+            ui.heading(title);
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Calendar-body zoom (font + element size) — buttons mirror
+                // the Ctrl+Plus/Minus/0 shortcuts. Toolbar/sidebar are
+                // unaffected; only the grid rendered below this header scales.
+                if ui
+                    .add(egui::Button::new("🔍+").small())
+                    .on_hover_text("Zoom in (Ctrl+Plus)")
+                    .clicked()
+                {
+                    self.schedule_zoom = (self.schedule_zoom + SCHEDULE_ZOOM_STEP).min(SCHEDULE_ZOOM_MAX);
+                }
+                if ui
+                    .add(egui::Button::new(format!("{:.0}%", self.schedule_zoom * 100.0)).small())
+                    .on_hover_text("Reset zoom (Ctrl+0)")
+                    .clicked()
+                {
+                    self.schedule_zoom = 1.0;
+                }
+                if ui
+                    .add(egui::Button::new("🔍−").small())
+                    .on_hover_text("Zoom out (Ctrl+Minus)")
+                    .clicked()
+                {
+                    self.schedule_zoom = (self.schedule_zoom - SCHEDULE_ZOOM_STEP).max(SCHEDULE_ZOOM_MIN);
                 }
                 ui.separator();
-                if ui.button("◀").on_hover_text("Previous").clicked() {
-                    nav_anchor = Some(prev_date);
+                if ui
+                    .button("⟳")
+                    .on_hover_text("Fetch the latest schedules now (F5)")
+                    .clicked()
+                {
+                    *do_refresh = true;
                 }
-                if ui.button("Today").clicked() {
-                    nav_anchor = Some(today);
+                if ui
+                    .button("⛭ Sources")
+                    .on_hover_text(
+                        "Choose which schedule sources to use and their priority order",
+                    )
+                    .clicked()
+                {
+                    *open_sources = true;
                 }
-                if ui.button("▶").on_hover_text("Next").clicked() {
-                    nav_anchor = Some(next_date);
+                let mut hc = self.schedule_collisions;
+                if ui
+                    .checkbox(&mut hc, "Highlight collisions")
+                    .on_hover_text("Flag streams whose scheduled times overlap")
+                    .changed()
+                {
+                    *set_collisions = Some(hc);
                 }
-                ui.add_space(8.0);
-                ui.heading(title);
+                if self.schedule_collisions && collisions_in_view > 0 {
+                    ui.colored_label(HL_COLLISION, format!("⚠ {collisions_in_view}"))
+                        .on_hover_text("Overlapping streams in view");
+                }
+            });
+        });
+        ui.separator();
+    }
 
+    /// ── Selection action bar (shown when any events are selected). ──
+    fn schedule_selection_bar(&mut self, ui: &mut egui::Ui) {
+        let n_sel = self.schedule_selected.len();
+        if n_sel > 0 {
+            let accent = ui.visuals().selection.bg_fill;
+            ui.horizontal(|ui| {
+                ui.colored_label(accent, format!("{n_sel} selected"));
+                ui.separator();
+                // Merge: only valid when ≥2 events from the same channel are selected
+                let can_merge = n_sel >= 2 && {
+                    let ch_ids: HashSet<i64> = self
+                        .schedule_selected
+                        .iter()
+                        .filter_map(|&sid| {
+                            self.schedule_all.iter().find(|s| s.segment_id == sid)
+                        })
+                        .map(|s| s.channel_id)
+                        .collect();
+                    ch_ids.len() == 1
+                };
+                if ui
+                    .add_enabled(can_merge, egui::Button::new("🔀 Merge"))
+                    .on_hover_text("Merge selected events into one calendar entry")
+                    .on_disabled_hover_text(
+                        if n_sel < 2 {
+                            "Select 2+ events to merge"
+                        } else {
+                            "Can only merge events from the same channel"
+                        },
+                    )
+                    .clicked()
+                {
+                    let mut segs: Vec<UpcomingStream> = self
+                        .schedule_selected
+                        .iter()
+                        .filter_map(|&sid| {
+                            self.schedule_all.iter().find(|s| s.segment_id == sid).cloned()
+                        })
+                        .collect();
+                    // Sort highest priority first (YouTube first) so index 0 is the default primary.
+                    segs.sort_by_key(|s| merge_source_priority(&s.source));
+                    self.merge_preview = Some(MergePreviewDraft {
+                        segments: segs,
+                        primary_idx: 0,
+                        error: String::new(),
+                    });
+                }
+                if ui
+                    .button("🗑 Delete")
+                    .on_hover_text("Delete all selected events")
+                    .clicked()
+                {
+                    self.confirm_delete_segments =
+                        Some(self.schedule_selected.iter().copied().collect());
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Calendar-body zoom (font + element size) — buttons mirror
-                    // the Ctrl+Plus/Minus/0 shortcuts. Toolbar/sidebar are
-                    // unaffected; only the grid rendered below this header scales.
-                    if ui
-                        .add(egui::Button::new("🔍+").small())
-                        .on_hover_text("Zoom in (Ctrl+Plus)")
-                        .clicked()
-                    {
-                        self.schedule_zoom = (self.schedule_zoom + SCHEDULE_ZOOM_STEP).min(SCHEDULE_ZOOM_MAX);
-                    }
-                    if ui
-                        .add(egui::Button::new(format!("{:.0}%", self.schedule_zoom * 100.0)).small())
-                        .on_hover_text("Reset zoom (Ctrl+0)")
-                        .clicked()
-                    {
-                        self.schedule_zoom = 1.0;
-                    }
-                    if ui
-                        .add(egui::Button::new("🔍−").small())
-                        .on_hover_text("Zoom out (Ctrl+Minus)")
-                        .clicked()
-                    {
-                        self.schedule_zoom = (self.schedule_zoom - SCHEDULE_ZOOM_STEP).max(SCHEDULE_ZOOM_MIN);
-                    }
-                    ui.separator();
-                    if ui
-                        .button("⟳")
-                        .on_hover_text("Fetch the latest schedules now (F5)")
-                        .clicked()
-                    {
-                        do_refresh = true;
-                    }
-                    if ui
-                        .button("⛭ Sources")
-                        .on_hover_text(
-                            "Choose which schedule sources to use and their priority order",
-                        )
-                        .clicked()
-                    {
-                        open_sources = true;
-                    }
-                    let mut hc = self.schedule_collisions;
-                    if ui
-                        .checkbox(&mut hc, "Highlight collisions")
-                        .on_hover_text("Flag streams whose scheduled times overlap")
-                        .changed()
-                    {
-                        set_collisions = Some(hc);
-                    }
-                    if self.schedule_collisions && collisions_in_view > 0 {
-                        ui.colored_label(HL_COLLISION, format!("⚠ {collisions_in_view}"))
-                            .on_hover_text("Overlapping streams in view");
+                    if ui.button("✕ Clear").on_hover_text("Clear selection").clicked() {
+                        self.schedule_selected.clear();
                     }
                 });
             });
             ui.separator();
+        }
+    }
 
-            // ── Selection action bar (shown when any events are selected). ──
-            let n_sel = self.schedule_selected.len();
-            if n_sel > 0 {
-                let accent = ui.visuals().selection.bg_fill;
-                ui.horizontal(|ui| {
-                    ui.colored_label(accent, format!("{n_sel} selected"));
-                    ui.separator();
-                    // Merge: only valid when ≥2 events from the same channel are selected
-                    let can_merge = n_sel >= 2 && {
-                        let ch_ids: HashSet<i64> = self
-                            .schedule_selected
-                            .iter()
-                            .filter_map(|&sid| {
-                                self.schedule_all.iter().find(|s| s.segment_id == sid)
-                            })
-                            .map(|s| s.channel_id)
-                            .collect();
-                        ch_ids.len() == 1
-                    };
-                    if ui
-                        .add_enabled(can_merge, egui::Button::new("🔀 Merge"))
-                        .on_hover_text("Merge selected events into one calendar entry")
-                        .on_disabled_hover_text(
-                            if n_sel < 2 {
-                                "Select 2+ events to merge"
-                            } else {
-                                "Can only merge events from the same channel"
-                            },
-                        )
-                        .clicked()
-                    {
-                        let mut segs: Vec<UpcomingStream> = self
-                            .schedule_selected
-                            .iter()
-                            .filter_map(|&sid| {
-                                self.schedule_all.iter().find(|s| s.segment_id == sid).cloned()
-                            })
-                            .collect();
-                        // Sort highest priority first (YouTube first) so index 0 is the default primary.
-                        segs.sort_by_key(|s| merge_source_priority(&s.source));
-                        self.merge_preview = Some(MergePreviewDraft {
-                            segments: segs,
-                            primary_idx: 0,
-                            error: String::new(),
-                        });
-                    }
-                    if ui
-                        .button("🗑 Delete")
-                        .on_hover_text("Delete all selected events")
-                        .clicked()
-                    {
-                        self.confirm_delete_segments =
-                            Some(self.schedule_selected.iter().copied().collect());
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("✕ Clear").on_hover_text("Clear selection").clicked() {
-                            self.schedule_selected.clear();
-                        }
-                    });
-                });
-                ui.separator();
-            }
-
-            // Zoom the calendar body only: scale every relative text size
-            // (`.strong()`/`.weak()`/`.small()`/monospace/etc. all resolve
-            // through `TextStyle`, so this one override covers virtually all
-            // text drawn below without touching each call site). Applied to
-            // this `ui` only, after the header/selection-bar above already
-            // rendered at normal size, so the toolbar/sidebar are unaffected.
-            if (self.schedule_zoom - 1.0).abs() > f32::EPSILON {
-                let zoom = self.schedule_zoom;
-                for font_id in ui.style_mut().text_styles.values_mut() {
-                    font_id.size *= zoom;
-                }
-            }
-
-            match mode {
-                ScheduleMode::Month => {
-                    self.schedule_month_grid(ui, anchor, today, &by_day, &collide, &ptex, &mut open_day)
-                }
-                ScheduleMode::Week => {
-                    self.schedule_week_grid(
-                        ui, anchor, today, &by_day, &collide, &ptex, &mut open_day,
-                        &sched_rec_avatars, &all_day_events,
-                    )
-                }
-                ScheduleMode::Day => {
-                    self.schedule_day_grid(ui, anchor, today, &by_day, &collide, &mut open_day)
-                }
-                ScheduleMode::Agenda => {
-                    self.schedule_agenda_view(ui, anchor, &by_day, &collide, &ptex, &mut open_day)
-                }
-            }
-        });
-
-        // ── Apply collected actions. ──
+    /// ── Apply collected actions ── runs after the panel closures have
+    /// released their borrows of `self`; the temp-storage reads pick up
+    /// context-menu / selection actions written by closures that can't
+    /// borrow `self` directly.
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_apply_actions(
+        &mut self,
+        ui: &egui::Ui,
+        set_mode: Option<ScheduleMode>,
+        nav_anchor: Option<chrono::NaiveDate>,
+        clear_hidden: bool,
+        hide_all: bool,
+        toggle_channel: Option<i64>,
+        set_collisions: Option<bool>,
+        open_day: Option<chrono::NaiveDate>,
+        do_refresh: bool,
+        open_sources: bool,
+        set_show_hidden: Option<bool>,
+    ) {
         if let Some(m) = set_mode {
             self.schedule_mode = m;
         }
