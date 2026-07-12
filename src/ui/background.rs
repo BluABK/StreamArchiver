@@ -107,6 +107,38 @@ impl StreamArchiverApp {
 
             // ── Active tasks ─────────────────────────────────────────────
             ui.strong("Active");
+            // Live disk-gate status: bulk passes (remux/merge/concat/embed)
+            // run one at a time against the recordings drive — this is the
+            // authoritative "what is actually running right now, and how many
+            // are queued behind it" line for those jobs.
+            {
+                let (holder, waiting) = crate::io_gate::local_gate_status();
+                if holder.is_some() || waiting > 0 {
+                    ui.horizontal(|ui| {
+                        ui.label("🖴 Disk gate:");
+                        match holder {
+                            Some((label, held)) => {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(80, 160, 220),
+                                    format!("{label} — running {}", fmt_duration(held as i64)),
+                                );
+                            }
+                            None => {
+                                ui.weak("turning over…");
+                            }
+                        }
+                        if waiting > 0 {
+                            ui.weak(format!("· {waiting} queued"));
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "One full-file pass at a time on the recordings drive (plus up to \
+                         two CDN-fed muxes) — see Settings → Recording → Remux for the \
+                         throttle. Queued passes list their wait in their own task row.",
+                    );
+                }
+            }
             ui.add_space(4.0);
 
             if self.background_tasks.is_empty() {

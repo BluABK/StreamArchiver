@@ -187,7 +187,7 @@ pub(super) async fn concat_mkvs(
     crate::iomon::fs::write(Cat::ConcatList, &list_path, list).await?;
 
     // One full-file pass at a time on the recordings drive (see io_gate).
-    let _gate = crate::io_gate::local_pass("concat").await;
+    let _gate = crate::io_gate::local_pass(&crate::io_gate::gate_label("concat", dst)).await;
     let out = loop {
         let readrate = crate::io_gate::readrate();
         let mut cmd = Command::new("ffmpeg");
@@ -281,10 +281,11 @@ pub(super) async fn remux_ts_to_mkv_impl(
     // One full-file pass at a time on the recordings drive (see io_gate).
     // With a task attached, the queue wait is reported as live progress info
     // (what holds the gate + queue depth) so a queued remux never looks stale.
+    let label = crate::io_gate::gate_label("remux", dst);
     let gate = match &progress_tx {
         Some((tx, id)) => {
             let (tx, id) = (tx.clone(), *id);
-            crate::io_gate::local_pass_with_progress("remux", move |waited, holder, waiting| {
+            crate::io_gate::local_pass_with_progress(&label, move |waited, holder, waiting| {
                 let _ = tx.send(AppEvent::BackgroundTaskProgress {
                     id,
                     progress: None,
@@ -293,7 +294,7 @@ pub(super) async fn remux_ts_to_mkv_impl(
             })
             .await
         }
-        None => crate::io_gate::local_pass("remux").await,
+        None => crate::io_gate::local_pass(&label).await,
     };
     remux_ts_to_mkv_gated(src, dst, progress_tx, opts, allow_readrate, gate).await
 }
@@ -369,9 +370,9 @@ async fn remux_ts_to_mkv_gated(
 
     cmd.arg("-c").arg("copy");
 
-    // Title metadata tag.
-    if opts.embed_title && !opts.title_template.is_empty() {
-        cmd.arg("-metadata").arg(format!("title={}", opts.title_template));
+    // Title metadata tag (template expanded — never raw `{braces}`).
+    if opts.embed_title && !opts.title_template.trim().is_empty() {
+        cmd.arg("-metadata").arg(format!("title={}", expand_title_tag(opts, dst)));
     }
 
     if let Some(ref thumb) = thumbnail {
@@ -537,6 +538,44 @@ async fn remux_ts_to_mkv_gated(
             anyhow::bail!("ffmpeg remux failed (exit {}): {}", code, tail)
         }
     }
+}
+
+/// Expand the remux title-tag template. `{name}` is always the destination
+/// file stem; without recording context (`opts.title_vars` = None) `{title}`
+/// falls back to the stem too and the remaining tokens render empty — the
+/// literal template must never become the MKV title (which is exactly what
+/// happened until 2026-07-13: the raw `{channel}: {year}-…` string was
+/// embedded verbatim into every finalized MKV with the title tag enabled).
+pub(super) fn expand_title_tag(opts: &crate::models::RemuxOpts, dst: &Path) -> String {
+    let name = dst
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let v = opts.title_vars.clone().unwrap_or_default();
+    let title = if v.title.trim().is_empty() { name.clone() } else { v.title };
+    let (date, year, month, day) = if v.started_at > 0 {
+        // Same UTC civil time the filename templates use.
+        let (y, mo, d, ..) = civil_from_unix_utc(v.started_at);
+        (
+            format!("{y:04}-{mo:02}-{d:02}"),
+            format!("{y:04}"),
+            format!("{mo:02}"),
+            format!("{d:02}"),
+        )
+    } else {
+        Default::default()
+    };
+    opts.title_template
+        .replace("{name}", &name)
+        .replace("{title}", &title)
+        .replace("{channel}", &v.channel)
+        .replace("{games}", &v.games)
+        .replace("{date}", &date)
+        .replace("{year}", &year)
+        .replace("{month}", &month)
+        .replace("{day}", &day)
+        .trim()
+        .to_string()
 }
 
 pub(super) async fn file_len(path: &Path) -> u64 {
@@ -967,6 +1006,35 @@ mod tests {
     use crate::models::{Channel, Container, DetectionMethod, Monitor, Tool};
     #[allow(unused_imports)]
     use crate::downloader::test_util::*;
+
+    #[test]
+    fn title_tag_expands_tokens_and_never_leaks_braces() {
+        let dst = Path::new(r"A:\streams\Vienna\Vienna - 2026-07-11 - stream.mkv");
+        let mut opts = crate::models::RemuxOpts {
+            embed_title: true,
+            title_template: "{channel}: {year}-{month}-{day} - {title} ({games})".into(),
+            title_vars: Some(crate::models::TitleVars {
+                title: "cozy stream".into(),
+                channel: "Vienna".into(),
+                games: "Just Chatting".into(),
+                started_at: 1783811671, // 2026-07-11 UTC
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            expand_title_tag(&opts, dst),
+            "Vienna: 2026-07-11 - cozy stream (Just Chatting)"
+        );
+        // No recording context: {title}/{name} fall back to the file stem,
+        // everything else renders empty — never literal {braces}.
+        opts.title_vars = None;
+        let s = expand_title_tag(&opts, dst);
+        assert!(!s.contains('{'), "raw template leaked: {s}");
+        assert!(s.contains("Vienna - 2026-07-11 - stream"));
+        // Default "{title}" template + no vars = the stem.
+        opts.title_template = "{title}".into();
+        assert_eq!(expand_title_tag(&opts, dst), "Vienna - 2026-07-11 - stream");
+    }
 
     #[test]
     fn subtitle_lang_from_name_extracts_code() {

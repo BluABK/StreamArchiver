@@ -536,7 +536,8 @@ impl Supervisor {
         // visibly waiting (and on what) instead of looking stale.
         let gate = {
             let tx = self.events.clone();
-            crate::io_gate::local_pass_with_progress("merge-split", move |waited, holder, waiting| {
+            let label = crate::io_gate::gate_label("merge-split", &final_path);
+            crate::io_gate::local_pass_with_progress(&label, move |waited, holder, waiting| {
                 let _ = tx.send(AppEvent::BackgroundTaskProgress {
                     id: task_id,
                     progress: None,

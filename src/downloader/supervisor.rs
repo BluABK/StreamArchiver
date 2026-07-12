@@ -200,7 +200,10 @@ progress_info: None,
             // the FIRST attempt failed because this exact name was
             // too long (see path_with_safe_stem).
             let final_ = path_with_safe_stem(&final_);
-            match remux_ts_to_mkv(&capture, &final_, Some((tx2, task_id)), &Default::default()).await {
+            // The user's embed settings apply to manual re-remuxes too (a
+            // bare Default here silently skipped thumbnail/title/subs).
+            let opts = remux_opts_for_recording(&store, rec_id);
+            match remux_ts_to_mkv(&capture, &final_, Some((tx2, task_id)), &opts).await {
                 Ok(()) => {
                     let _ = crate::iomon::fs::remove_file(Cat::CacheSweep, &capture).await;
                     let path_s = final_.to_string_lossy();
@@ -254,8 +257,8 @@ progress_info: None,
             };
             let total = recs.len();
             let mut done = 0usize;
-            let opts = store.remux_opts();
             for (rec_id, output_path) in &recs {
+                let opts = remux_opts_for_recording(&store, *rec_id);
                 let planned_mkv = PathBuf::from(output_path);
                 // The sibling .ts (the actual source to remux) lives
                 // under the ORIGINAL stem — only the destination we're
@@ -2957,7 +2960,7 @@ progress_info: None,
         // capture is left in `.cache\` for the startup sweep.
         let mut final_path = promote_capture(
             plan,
-            &self.store.remux_opts(),
+            &remux_opts_for_recording(&self.store, rec_id),
             Some((self.events.clone(), rec_id as u64)),
         )
         .await;

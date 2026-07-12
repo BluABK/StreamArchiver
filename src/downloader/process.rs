@@ -959,7 +959,11 @@ impl Supervisor {
                     writes_own_thumbnail: false,
                     mode: String::new(),
                 },
-                &self.store.remux_opts(),
+                &if row.kind == DetachedKind::Recording {
+                    remux_opts_for_recording(&self.store, row.ref_id)
+                } else {
+                    self.store.remux_opts()
+                },
                 (row.kind == DetachedKind::Recording)
                     .then(|| (self.events.clone(), row.ref_id as u64)),
             )
@@ -1273,7 +1277,7 @@ impl Supervisor {
                     writes_own_thumbnail: false,
                     mode: String::new(),
                 },
-                &self.store.remux_opts(),
+                &remux_opts_for_recording(&self.store, rec_id),
                 Some((self.events.clone(), rec_id as u64)),
             )
             .await
@@ -1420,7 +1424,7 @@ impl Supervisor {
         // Finalize: promote .cache → output dir, move companions, post-rename, purge.
         let mut final_path = promote_capture(
             &plan,
-            &self.store.remux_opts(),
+            &remux_opts_for_recording(&self.store, rec_id),
             Some((self.events.clone(), rec_id as u64)),
         )
         .await;

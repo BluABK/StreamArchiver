@@ -1774,6 +1774,23 @@ pub struct OcrModelStats {
     pub cost_usd: f64,
 }
 
+/// Concrete values for the remux title-tag template tokens, filled by
+/// recording-aware callers (see `remux_opts_for_recording`). Without them the
+/// remux falls back to the destination file stem for `{title}`/`{name}` and
+/// empty strings for the rest — a raw template with literal `{braces}` must
+/// never end up as an MKV title tag.
+#[derive(Clone, Debug, Default)]
+pub struct TitleVars {
+    /// Stream/video title (empty = unknown → falls back to the file stem).
+    pub title: String,
+    /// Channel display name.
+    pub channel: String,
+    /// Games/categories summary (same formatting as the `{games}` filename var).
+    pub games: String,
+    /// Capture start (unix secs) for `{date}`/`{year}`/`{month}`/`{day}`; 0 = unknown.
+    pub started_at: i64,
+}
+
 /// Controls what gets embedded into the MKV container during a TS→MKV remux.
 #[derive(Clone, Debug)]
 pub struct RemuxOpts {
@@ -1781,11 +1798,14 @@ pub struct RemuxOpts {
     pub embed_thumbnail: bool,
     /// Write a `title` metadata tag. `title_template` must be non-empty.
     pub embed_title: bool,
-    /// Template string for the title tag; same token set as the capture filename template.
-    /// `"{title}"` is the recommended default.
+    /// Template for the title tag. Tokens: `{title}` `{channel}` `{games}`
+    /// `{date}` `{year}` `{month}` `{day}` `{name}`. `"{title}"` is the
+    /// recommended default.
     pub title_template: String,
     /// Copy subtitle sidecar files (`.srt`/`.ass`/`.vtt`) as subtitle streams.
     pub embed_subs: bool,
+    /// Values for the title-template tokens (see [`TitleVars`]).
+    pub title_vars: Option<TitleVars>,
 }
 
 impl Default for RemuxOpts {
@@ -1795,6 +1815,7 @@ impl Default for RemuxOpts {
             embed_title: false,
             title_template: "{title}".into(),
             embed_subs: false,
+            title_vars: None,
         }
     }
 }

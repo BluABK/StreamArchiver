@@ -135,6 +135,32 @@ pub(super) fn format_games(categories: &[String]) -> String {
 /// The `{games}` value for a finished recording: every distinct category logged
 /// to `stream_meta_change` for it (empty when none was logged — e.g. a generic
 /// URL, which has no metadata source).
+/// `store.remux_opts()` with the title-tag template vars filled from a
+/// recording (title/games from its meta changes, channel from its monitor,
+/// start time from the row). Recording finalize/re-remux paths should pass
+/// THIS to `promote_capture`/`remux_ts_to_mkv` so the embedded title tag
+/// carries real values instead of file-stem fallbacks.
+pub(super) fn remux_opts_for_recording(store: &Store, rec_id: i64) -> crate::models::RemuxOpts {
+    let mut opts = store.remux_opts();
+    if opts.embed_title
+        && let Ok(Some(rec)) = store.get_recording(rec_id)
+    {
+        let channel = store
+            .get_monitor_with_channel(rec.monitor_id)
+            .ok()
+            .flatten()
+            .map(|r| r.channel.name)
+            .unwrap_or_default();
+        opts.title_vars = Some(crate::models::TitleVars {
+            title: title_for_recording(store, rec_id),
+            channel,
+            games: games_for_recording(store, rec_id),
+            started_at: rec.started_at,
+        });
+    }
+    opts
+}
+
 pub(super) fn games_for_recording(store: &Store, rec_id: i64) -> String {
     let cats: Vec<String> = store
         .meta_changes_for_recording(rec_id)

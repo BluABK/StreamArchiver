@@ -141,6 +141,21 @@ pub async fn local_pass_with_progress(
     }
 }
 
+/// `"{kind}: {file stem}"` (stem truncated) — gate labels carry the file so
+/// "running now: remux: Vienna - 2026-07-11 …" answers WHAT holds the gate.
+pub fn gate_label(kind: &str, path: &std::path::Path) -> String {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if stem.is_empty() {
+        return kind.to_string();
+    }
+    let short: String = stem.chars().take(48).collect();
+    let ellipsis = if short.len() < stem.len() { "…" } else { "" };
+    format!("{kind}: {short}{ellipsis}")
+}
+
 /// Standard human line for a queued pass's progress info, e.g.
 /// `⏳ queued for disk gate 45s — running now: remux (312s) · 3 in queue`.
 pub fn wait_info(waited_secs: u64, holder: Option<(String, u64)>, waiting: usize) -> String {

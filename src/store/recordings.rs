@@ -1262,7 +1262,13 @@ impl Store {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "{title}".to_string());
         let embed_subs = bool_setting(crate::models::K_REMUX_EMBED_SUBS);
-        crate::models::RemuxOpts { embed_thumbnail, embed_title, title_template, embed_subs }
+        crate::models::RemuxOpts {
+            embed_thumbnail,
+            embed_title,
+            title_template,
+            embed_subs,
+            title_vars: None,
+        }
     }
 
     /// In-flight recordings (status `recording`) — crash/quit leftovers seen at

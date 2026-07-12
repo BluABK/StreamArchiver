@@ -1760,7 +1760,7 @@ impl StreamArchiverApp {
                                 .desired_width(200.0),
                         );
                     });
-                    ui.label("Template for the MKV title tag. Tokens: {title} {channel} {date} {name}");
+                    ui.label("Template for the MKV title tag. Tokens: {title} {channel} {games} {date} {year} {month} {day} {name}");
                     ui.end_row();
                     ui.checkbox(&mut self.settings.remux_embed_subs, "Embed subtitle sidecars");
                     ui.label("Copy .srt/.ass/.vtt sidecar files as subtitle streams in the MKV.");
