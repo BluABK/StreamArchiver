@@ -47,7 +47,17 @@ enum Act {
     RefetchHeadMatchLive(usize),
     FetchVodForMismatch(usize),
     DismissMismatch(usize),
+    /// Open the error-details window: (title, full text). Same text as the
+    /// status-column hover — the 🔍 button makes it readable/copyable.
+    ViewError(String, String),
 }
+
+/// Status-column explainer for stuck-in-cache rows (hover AND 🔍 window).
+const STUCK_IN_CACHE_DETAILS: &str =
+    "The recording finished successfully, but moving it out of the hidden \
+     working folder failed — most commonly because the filename was too long \
+     for the filesystem. The file is safe; it just isn't where it should be \
+     yet.";
 
 impl StreamArchiverApp {
     /// Returns the list of active (non-dismissed) quota warning keys.
@@ -384,6 +394,7 @@ impl StreamArchiverApp {
                         issues_reset,
                     );
                 });
+                self.issues_error_window(ctx);
             },
         );
         if issues_entries != self.issues_grid.entries {
@@ -1004,6 +1015,19 @@ impl StreamArchiverApp {
                                 {
                                     *act = Some(Act::Delete(i));
                                 }
+                                if ui.button("🔍")
+                                    .on_hover_text("View error details in a window.")
+                                    .clicked()
+                                {
+                                    let details = if empty {
+                                        "Capture wrote 0 bytes. Delete this file.".to_string()
+                                    } else if let Some(ref err) = remux_err {
+                                        err.clone()
+                                    } else {
+                                        rec.status.clone()
+                                    };
+                                    *act = Some(Act::ViewError(fname.clone(), details));
+                                }
                             }
                         }
                         _ => {}
@@ -1070,13 +1094,7 @@ impl StreamArchiverApp {
                             ui.colored_label(
                                 egui::Color32::from_rgb(200, 150, 60),
                                 "⚠ stuck in cache",
-                            ).on_hover_text(
-                                "The recording finished successfully, but moving it out \
-                                 of the hidden working folder failed — most \
-                                 commonly because the filename was too long for the \
-                                 filesystem. The file is safe; it just isn't where it \
-                                 should be yet.",
-                            );
+                            ).on_hover_text(STUCK_IN_CACHE_DETAILS);
                         }
                         "actions" => {
                             if ui
@@ -1085,6 +1103,18 @@ impl StreamArchiverApp {
                                 .clicked()
                             {
                                 *act = Some(Act::RecoverStuck(k));
+                            }
+                            if ui.button("🔍")
+                                .on_hover_text("View error details in a window.")
+                                .clicked()
+                            {
+                                *act = Some(Act::ViewError(
+                                    fname.clone(),
+                                    format!(
+                                        "{STUCK_IN_CACHE_DETAILS}\nPath: {}",
+                                        rec.output_path
+                                    ),
+                                ));
                             }
                         }
                         _ => {}
@@ -1118,6 +1148,10 @@ impl StreamArchiverApp {
                 .extension()
                 .map(|e| e.to_string_lossy().to_uppercase())
                 .unwrap_or_else(|| "?".into());
+            let details = format!(
+                "Output file was deleted from disk.\nDB status: {}\nPath: {}",
+                rec.status, rec.output_path
+            );
             body.row(22.0, |mut row| {
                 for &ci in issues_order {
                     row.col(|ui| match ISSUES_COLUMNS[ci].id {
@@ -1144,10 +1178,7 @@ impl StreamArchiverApp {
                             ui.colored_label(
                                 egui::Color32::from_rgb(200, 130, 30),
                                 "✗ file missing",
-                            ).on_hover_text(format!(
-                                "Output file was deleted from disk.\nDB status: {}\nPath: {}",
-                                rec.status, rec.output_path
-                            ));
+                            ).on_hover_text(&details);
                         }
                         "actions" => {
                             if ui.button("🔗 Clear path")
@@ -1155,6 +1186,12 @@ impl StreamArchiverApp {
                                 .clicked()
                             {
                                 *act = Some(Act::ClearPath(j));
+                            }
+                            if ui.button("🔍")
+                                .on_hover_text("View error details in a window.")
+                                .clicked()
+                            {
+                                *act = Some(Act::ViewError(fname.clone(), details.clone()));
                             }
                         }
                         _ => {}
@@ -1188,6 +1225,16 @@ impl StreamArchiverApp {
                 .extension()
                 .map(|e| e.to_string_lossy().to_uppercase())
                 .unwrap_or_else(|| "?".to_string());
+            let details = {
+                let mut parts = vec![
+                    format!("status: {}", rec.status),
+                    format!("path: {}", rec.output_path),
+                ];
+                if !rec.log_excerpt.is_empty() {
+                    parts.push(rec.log_excerpt.trim().to_string());
+                }
+                parts.join("\n")
+            };
             body.row(22.0, |mut row| {
                 for &ci in issues_order {
                     row.col(|ui| match ISSUES_COLUMNS[ci].id {
@@ -1214,16 +1261,7 @@ impl StreamArchiverApp {
                             ui.colored_label(
                                 egui::Color32::from_rgb(200, 80, 80),
                                 format!("✗ {}{} — file missing", rec.status, exit_str),
-                            ).on_hover_text({
-                                let mut parts = vec![
-                                    format!("status: {}", rec.status),
-                                    format!("path: {}", rec.output_path),
-                                ];
-                                if !rec.log_excerpt.is_empty() {
-                                    parts.push(rec.log_excerpt.trim().to_string());
-                                }
-                                parts.join("\n")
-                            });
+                            ).on_hover_text(&details);
                         }
                         "actions" => {
                             if ui.button("✕ Clear")
@@ -1231,6 +1269,12 @@ impl StreamArchiverApp {
                                 .clicked()
                             {
                                 *act = Some(Act::ClearMissingError(j2));
+                            }
+                            if ui.button("🔍")
+                                .on_hover_text("View error details in a window.")
+                                .clicked()
+                            {
+                                *act = Some(Act::ViewError(fname.clone(), details.clone()));
                             }
                         }
                         _ => {}
@@ -1352,6 +1396,12 @@ impl StreamArchiverApp {
                                 .clicked()
                             {
                                 *act = Some(Act::ClearError(k));
+                            }
+                            if ui.button("🔍")
+                                .on_hover_text("View error details in a window.")
+                                .clicked()
+                            {
+                                *act = Some(Act::ViewError(fname.clone(), hover.clone()));
                             }
                         }
                         _ => {}
@@ -1573,6 +1623,47 @@ impl StreamArchiverApp {
                 let _ = self.core.store.delete_recording(rec.id);
                 self.issues_errors_no_file.retain(|r| r.id != rec.id);
             }
+        }
+        if let Some(Act::ViewError(title, text)) = act {
+            self.issues_error_view = Some((title, text));
+        }
+    }
+
+    /// The error-details window (🔍 row button): the status-column hover text
+    /// in a selectable, copyable form. One window, re-targeted by each click.
+    fn issues_error_window(&mut self, ctx: &egui::Context) {
+        let Some((title, text)) = self.issues_error_view.clone() else {
+            return;
+        };
+        let mut open = true;
+        egui::Window::new(if title.is_empty() || title == "—" {
+            "Details".to_string()
+        } else {
+            format!("Details — {title}")
+        })
+        .id(egui::Id::new("issues_error_view"))
+        .open(&mut open)
+        .collapsible(false)
+        .default_size([640.0, 260.0])
+        .show(ctx, |ui| {
+            if ui.button("📋 Copy").clicked() {
+                ui.ctx().copy_text(text.clone());
+            }
+            ui.separator();
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    // Read-only but selectable.
+                    let mut s = text.as_str();
+                    ui.add(
+                        egui::TextEdit::multiline(&mut s)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+        });
+        if !open {
+            self.issues_error_view = None;
         }
     }
 }

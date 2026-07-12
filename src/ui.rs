@@ -635,6 +635,10 @@ pub struct StreamArchiverApp {
     /// the closed-panel refresh interval instead of forcing an immediate one.
     issues_dirty: bool,
     issues_confirm_clear: bool,
+    /// Error-details window inside the Issues viewport: (title, full text —
+    /// the same text the status-column hover shows), opened via the 🔍 row
+    /// button.
+    issues_error_view: Option<(String, String)>,
     /// The notifications feed window: whether it's open, its last-loaded rows,
     /// the throttle timestamp, an off-thread load, the cached unread count (the
     /// header badge), and the session-only category + text filters.

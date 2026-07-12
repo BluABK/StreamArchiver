@@ -337,6 +337,7 @@ impl StreamArchiverApp {
             issues_refreshed: None,
             issues_dirty: false,
             issues_confirm_clear: false,
+            issues_error_view: None,
             show_notifications: false,
             notifications: Vec::new(),
             notif_refreshed: None,

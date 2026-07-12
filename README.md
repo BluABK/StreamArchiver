@@ -645,6 +645,8 @@ The **⚠ Issues** button in the toolbar (turns amber with a count when issues e
   separate playable files. The *quality upgrade* watcher (see Streams)
   prevents new cases at the root.
 
+Every grid row carries a **🔍** action that opens the status-cell hover text (DB status, exit code, path, tool-log excerpt / ffmpeg error) in a details window — selectable, scrollable, with a **📋 Copy** button — so long errors don't have to be read from a transient tooltip.
+
 The Issues panel refreshes every 5 s while open and every 5 min while closed — shortened to 15 s after something changed (a recording finalized, a re-attach, …), but never once-per-event: each sweep stats every recording on disk and holds the DB briefly, so an event storm must not stack sweeps. **⟳ Refresh** forces an immediate rescan.
 
 **In-tree badges.** The recording tree also surfaces the same issue as a **⚠ needs remux** badge at the take row, rolling up to the stream, instance, and channel rows, so you can see there is a problem without opening the panel.
