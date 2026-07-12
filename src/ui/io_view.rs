@@ -2,6 +2,15 @@
 
 use super::*;
 
+/// The I/O monitor's sub-tabs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum IoTab {
+    /// Disk-load monitor (rates, tools, queue depth, recent ops).
+    Disks,
+    /// The DB connection lock: holder, waiter queue, recent contention.
+    Database,
+}
+
 /// Which series set the I/O tab's rate graph shows.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum IoPlotMetric {
@@ -119,6 +128,17 @@ impl StreamArchiverApp {
         use crate::iomon::{self, Cat, Region};
         // Live tab: tick once a second, refresh the cached copies at most 1×/s.
         ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+        // Sub-tabs: the disk-load monitor vs the DB connection-lock panel.
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.io_tab, IoTab::Disks, "Disks");
+            ui.selectable_value(&mut self.io_tab, IoTab::Database, "Database");
+        });
+        ui.separator();
+        if self.io_tab == IoTab::Database {
+            self.io_db_tab(ui);
+            return;
+        }
         let stale = self
             .io_refreshed
             .map(|t| t.elapsed().as_millis() >= 900)
@@ -600,6 +620,116 @@ impl StreamArchiverApp {
                         }
                     }
                 });
+            ui.add_space(16.0);
+        });
+    }
+
+    /// The Database sub-tab: the single SQLite connection's lock, live —
+    /// current holder (thread + store call site + held-for), the waiter
+    /// queue, cumulative counters, and the recent-contention log that the
+    /// "slow DB lock" warnings feed.
+    fn io_db_tab(&mut self, ui: &mut egui::Ui) {
+        use crate::iomon::{self, Cat};
+        // Lock states flip in milliseconds — tick faster than the Disks tab.
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        let snap = crate::store::db_lock::snapshot();
+        let db_cell = iomon::snapshot().cat_total(Cat::Db);
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.strong("Connection lock");
+            ui.label(
+                egui::RichText::new(
+                    "One SQLite connection behind a fair mutex — every store call \
+                     takes it in turn. A holder is only visible while a query runs, \
+                     so \"free\" most of the time is healthy.",
+                )
+                .small()
+                .weak(),
+            );
+            ui.add_space(4.0);
+            egui::Grid::new("io_db_lock_grid")
+                .num_columns(2)
+                .spacing([16.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label("Held by");
+                    match &snap.holder {
+                        Some((thread, site, secs)) => {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(80, 160, 220),
+                                format!("{site} on '{thread}' — held {:.3}s", secs),
+                            );
+                        }
+                        None => {
+                            ui.weak("free");
+                        }
+                    }
+                    ui.end_row();
+                    ui.label("Waiting");
+                    ui.label(format!("{}", snap.waiters.len()));
+                    ui.end_row();
+                    ui.label("Acquisitions (session)");
+                    ui.label(format!("{}", db_cell.meta_ops));
+                    ui.end_row();
+                    ui.label("Cumulative hold time");
+                    ui.label(format!("{:.1}s", db_cell.total_ns as f64 / 1e9));
+                    ui.end_row();
+                    ui.label("Slow waits (≥50 ms)");
+                    ui.label(format!("{}", snap.slow_waits));
+                    ui.end_row();
+                    ui.label("Long holds (≥200 ms)");
+                    ui.label(format!("{}", snap.long_holds));
+                    ui.end_row();
+                });
+
+            if !snap.waiters.is_empty() {
+                ui.add_space(8.0);
+                ui.strong("Waiter queue (in line order)");
+                for (i, (thread, site, secs)) in snap.waiters.iter().enumerate() {
+                    ui.label(format!("{}. {site} on '{thread}' — waiting {:.3}s", i + 1, secs));
+                }
+            }
+
+            ui.add_space(8.0);
+            ui.strong("Recent contention");
+            ui.label(
+                egui::RichText::new(
+                    "Waits ≥50 ms and holds ≥200 ms, newest first (the same incidents \
+                     the \"slow DB lock\" log warnings report). Waits name the holder \
+                     they were blocked behind.",
+                )
+                .small()
+                .weak(),
+            );
+            ui.add_space(4.0);
+            if snap.recent.is_empty() {
+                ui.weak("No contention this session.");
+            } else {
+                egui::Grid::new("io_db_recent_grid")
+                    .num_columns(5)
+                    .striped(true)
+                    .spacing([14.0, 3.0])
+                    .show(ui, |ui| {
+                        ui.strong("When");
+                        ui.strong("What");
+                        ui.strong("ms");
+                        ui.strong("Call site · thread");
+                        ui.strong("Blocked behind");
+                        ui.end_row();
+                        for ev in &snap.recent {
+                            ui.label(fmt_datetime_short(ev.at_unix));
+                            if ev.kind == "hold" {
+                                ui.colored_label(ui.visuals().warn_fg_color, "long hold");
+                            } else {
+                                ui.label("slow wait");
+                            }
+                            ui.label(format!("{}", ev.ms));
+                            ui.label(format!("{} · '{}'", ev.call_site, ev.thread));
+                            ui.label(ev.blocked_on.as_deref().unwrap_or("—"));
+                            ui.end_row();
+                        }
+                    });
+            }
             ui.add_space(16.0);
         });
     }

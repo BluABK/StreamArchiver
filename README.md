@@ -589,6 +589,15 @@ filterable recent-operations log — operations slower than 100 ms are
 highlighted, and the thread column exposes anything touching the disk from the
 UI thread. **📋 Copy summary** exports the state as text.
 
+**Database sub-tab.** The single SQLite connection sits behind a fair mutex
+that every store call takes in turn; this tab shows that lock live: the
+current **holder** (which thread, from which store call site, held for how
+long), the **waiter queue** in line order, session counters (acquisitions,
+cumulative hold time, slow waits ≥50 ms, long holds ≥200 ms), and a
+**recent-contention log** of the same incidents the `slow DB lock` warnings
+report — each wait naming the holder it was blocked behind, so "another
+thread held the connection" is never a dead end again.
+
 **Sample log** (Settings → Recording, default **on**): the 1 s samples are also
 appended to a JSONL under `logs\iomon\` on the system drive (~2–5 MB/day,
 pruned after 14 days), so an overnight stall or a drive disconnect can be

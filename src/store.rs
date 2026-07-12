@@ -260,6 +260,99 @@ pub struct RecInfo {
     pub output_path: String,
 }
 
+/// Live + recent diagnostics for the app-wide DB connection lock — feeds the
+/// "slow DB lock" warnings (naming the holder a waiter was blocked behind)
+/// and the I/O tab's Database panel. Global on purpose: the app has one
+/// on-disk Store. In-memory test stores report into the same slots, which
+/// only matters to tests that would assert on the shared state (none do).
+pub mod db_lock {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    /// One party at the lock: which thread, from which store call site, since when.
+    #[derive(Clone)]
+    pub(super) struct Entry {
+        pub(super) thread: String,
+        pub(super) file: &'static str,
+        pub(super) line: u32,
+        pub(super) since: Instant,
+    }
+
+    impl Entry {
+        pub(super) fn call_site(&self) -> String {
+            format!("{}:{}", self.file, self.line)
+        }
+    }
+
+    pub(super) static HOLDER: parking_lot::Mutex<Option<Entry>> = parking_lot::Mutex::new(None);
+    pub(super) static WAITERS: parking_lot::Mutex<Vec<(u64, Entry)>> =
+        parking_lot::Mutex::new(Vec::new());
+    pub(super) static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+    pub(super) static SLOW_WAITS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static LONG_HOLDS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static SLOW_EVENTS: parking_lot::Mutex<VecDeque<SlowEvent>> =
+        parking_lot::Mutex::new(VecDeque::new());
+    const SLOW_EVENTS_CAP: usize = 64;
+
+    /// One recent contention incident (a ≥50 ms wait or a ≥200 ms hold).
+    #[derive(Clone)]
+    pub struct SlowEvent {
+        pub at_unix: i64,
+        /// `"wait"` or `"hold"`.
+        pub kind: &'static str,
+        pub ms: u64,
+        pub thread: String,
+        pub call_site: String,
+        /// For waits: who held the lock when the wait started.
+        pub blocked_on: Option<String>,
+    }
+
+    /// Point-in-time picture for the I/O tab's Database panel.
+    #[derive(Clone, Default)]
+    pub struct Snap {
+        /// `(thread, call site, seconds held)` of the current holder.
+        pub holder: Option<(String, String, f64)>,
+        /// `(thread, call site, seconds waiting)` per waiter, queue order.
+        pub waiters: Vec<(String, String, f64)>,
+        pub slow_waits: u64,
+        pub long_holds: u64,
+        /// Recent contention incidents, newest first.
+        pub recent: Vec<SlowEvent>,
+    }
+
+    pub fn snapshot() -> Snap {
+        let holder = HOLDER
+            .lock()
+            .as_ref()
+            .map(|e| (e.thread.clone(), e.call_site(), e.since.elapsed().as_secs_f64()));
+        let waiters = WAITERS
+            .lock()
+            .iter()
+            .map(|(_, e)| (e.thread.clone(), e.call_site(), e.since.elapsed().as_secs_f64()))
+            .collect();
+        Snap {
+            holder,
+            waiters,
+            slow_waits: SLOW_WAITS.load(Ordering::Relaxed),
+            long_holds: LONG_HOLDS.load(Ordering::Relaxed),
+            recent: SLOW_EVENTS.lock().iter().rev().cloned().collect(),
+        }
+    }
+
+    pub(super) fn push_event(ev: SlowEvent) {
+        let mut q = SLOW_EVENTS.lock();
+        if q.len() >= SLOW_EVENTS_CAP {
+            q.pop_front();
+        }
+        q.push_back(ev);
+    }
+
+    pub(super) fn thread_name() -> String {
+        std::thread::current().name().unwrap_or("?").to_string()
+    }
+}
+
 /// RAII guard returned by [`Store::db`]. Logs a warning when the lock is held
 /// longer than 200 ms, showing the call-site that acquired it — useful for
 /// identifying which store method is the bottleneck.
@@ -290,14 +383,29 @@ impl Drop for DbGuard<'_> {
             0,
             self.acquired_at.elapsed(),
         );
+        // Clear the holder slot BEFORE the inner guard releases the mutex
+        // (field drop runs after this body), so the next holder never races
+        // an overwrite from us.
+        *db_lock::HOLDER.lock() = None;
         let ms = self.acquired_at.elapsed().as_millis();
         if ms >= 200 {
+            db_lock::LONG_HOLDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let thread = db_lock::thread_name();
             tracing::warn!(
                 hold_ms = ms,
+                thread = thread.as_str(),
                 file = self.caller.file(),
                 line = self.caller.line(),
                 "store: long DB lock hold"
             );
+            db_lock::push_event(db_lock::SlowEvent {
+                at_unix: crate::models::now_unix(),
+                kind: "hold",
+                ms: ms as u64,
+                thread,
+                call_site: format!("{}:{}", self.caller.file(), self.caller.line()),
+                blocked_on: None,
+            });
         } else if ms >= 50 {
             tracing::debug!(
                 hold_ms = ms,
@@ -325,23 +433,78 @@ impl Store {
     fn db(&self) -> DbGuard<'_> {
         let caller = std::panic::Location::caller();
         let t = std::time::Instant::now();
-        let g = self.conn.lock();
-        let wait_ms = t.elapsed().as_millis();
-        if wait_ms >= 50 {
-            tracing::warn!(
-                wait_ms,
-                file = caller.file(),
-                line = caller.line(),
-                "store: slow DB lock – another thread held the connection"
-            );
-        } else if wait_ms >= 5 {
-            tracing::debug!(
-                wait_ms,
-                file = caller.file(),
-                line = caller.line(),
-                "store: DB lock wait"
-            );
-        }
+        // Uncontended fast path (parking_lot's fair unlock hands the mutex
+        // directly to the next queued waiter, so try_lock can't barge).
+        let g = match self.conn.try_lock() {
+            Some(g) => g,
+            None => {
+                // Contended: remember who we're stuck behind (the holder at
+                // wait start — the one worth blaming) and join the visible
+                // waiter queue for the I/O tab.
+                let blocked_on = db_lock::HOLDER.lock().as_ref().map(|h| {
+                    format!(
+                        "{} at {} (held {}ms so far)",
+                        h.thread,
+                        h.call_site(),
+                        h.since.elapsed().as_millis()
+                    )
+                });
+                let token =
+                    db_lock::NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                db_lock::WAITERS.lock().push((
+                    token,
+                    db_lock::Entry {
+                        thread: db_lock::thread_name(),
+                        file: caller.file(),
+                        line: caller.line(),
+                        since: t,
+                    },
+                ));
+                // Leaves the queue on every exit path (incl. unwinds).
+                struct WaiterGuard(u64);
+                impl Drop for WaiterGuard {
+                    fn drop(&mut self) {
+                        db_lock::WAITERS.lock().retain(|(t, _)| *t != self.0);
+                    }
+                }
+                let _wg = WaiterGuard(token);
+                let g = self.conn.lock();
+                let wait_ms = t.elapsed().as_millis();
+                if wait_ms >= 50 {
+                    db_lock::SLOW_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let blame =
+                        blocked_on.clone().unwrap_or_else(|| "<holder unknown>".to_string());
+                    tracing::warn!(
+                        wait_ms,
+                        file = caller.file(),
+                        line = caller.line(),
+                        "store: slow DB lock – blocked behind {blame}"
+                    );
+                    db_lock::push_event(db_lock::SlowEvent {
+                        at_unix: crate::models::now_unix(),
+                        kind: "wait",
+                        ms: wait_ms as u64,
+                        thread: db_lock::thread_name(),
+                        call_site: format!("{}:{}", caller.file(), caller.line()),
+                        blocked_on,
+                    });
+                } else if wait_ms >= 5 {
+                    tracing::debug!(
+                        wait_ms,
+                        file = caller.file(),
+                        line = caller.line(),
+                        "store: DB lock wait"
+                    );
+                }
+                g
+            }
+        };
+        *db_lock::HOLDER.lock() = Some(db_lock::Entry {
+            thread: db_lock::thread_name(),
+            file: caller.file(),
+            line: caller.line(),
+            since: std::time::Instant::now(),
+        });
         DbGuard { inner: g, acquired_at: std::time::Instant::now(), caller }
     }
 

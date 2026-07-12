@@ -1036,6 +1036,8 @@ pub struct StreamArchiverApp {
     io_hist: Vec<crate::iomon::Sample>,
     io_snap: Option<crate::iomon::CountersSnapshot>,
     io_refreshed: Option<std::time::Instant>,
+    /// I/O tab: which sub-tab is shown (Disks / Database).
+    io_tab: IoTab,
     /// I/O tab: which series the rate graph shows.
     io_plot_metric: IoPlotMetric,
     /// I/O tab: recent-operations log filters.

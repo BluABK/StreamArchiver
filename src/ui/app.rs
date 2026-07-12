@@ -514,6 +514,7 @@ impl StreamArchiverApp {
             io_hist: Vec::new(),
             io_snap: None,
             io_refreshed: None,
+            io_tab: IoTab::Disks,
             io_plot_metric: IoPlotMetric::Write,
             io_ops_cat: None,
             io_ops_region: None,
