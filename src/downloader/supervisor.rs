@@ -2063,7 +2063,11 @@ progress_info: None,
                     match rename_or_shorten(&src, dest_dir, &dest_stem, &dest_ext).await {
                         Ok(actual) => final_path = actual,
                         Err(e) => {
-                            warn!(video = id, "promote move failed, keeping in cache: {e:#}");
+                            warn!(
+                                video = id,
+                                "promote move failed — the download is intact but stays in the \
+                                 on-disk capture cache instead of the output dir: {e:#}"
+                            );
                             final_path = src;
                         }
                     }

@@ -692,7 +692,7 @@ pub(super) fn spawn_live_preview(
         let Some(target) = target else {
             warn!(
                 %channel,
-                cache = %cache_listing(&tmp),
+                preview_temp_files = %cache_listing(&tmp),
                 tail = %log_tail(&tmp),
                 "live-preview: no playable stream within 2 minutes"
             );

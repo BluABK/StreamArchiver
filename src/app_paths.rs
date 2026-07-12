@@ -43,6 +43,7 @@ fn ensure_dir(dir: &std::path::Path) {
         crate::iomon::OpKind::Create,
         0,
         start.elapsed(),
+        true,
     );
 }
 

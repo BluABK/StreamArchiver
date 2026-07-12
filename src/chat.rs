@@ -104,6 +104,7 @@ impl ChatSink {
             crate::iomon::OpKind::Write,
             bytes,
             start.elapsed(),
+            false, // awaited tokio write — no thread sat blocked
         );
         res?;
         self.buf.clear();

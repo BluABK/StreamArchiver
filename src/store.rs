@@ -382,6 +382,7 @@ impl Drop for DbGuard<'_> {
             crate::iomon::OpKind::Meta,
             0,
             self.acquired_at.elapsed(),
+            true,
         );
         // Clear the holder slot BEFORE the inner guard releases the mutex
         // (field drop runs after this body), so the next holder never races

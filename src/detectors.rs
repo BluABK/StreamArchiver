@@ -1028,7 +1028,10 @@ impl DetectContext {
         let key = (monitor_id, source_id.to_string());
         if let Some((cached, segs)) = self.ocr_cache.lock().await.get(&key) {
             if *cached == hash {
-                debug!("OCR cache hit (monitor {monitor_id}, source {source_id})");
+                debug!(
+                    "OCR skipped — image unchanged, reusing in-memory cached result \
+                     (monitor {monitor_id}, source {source_id}; no API call, no files touched)"
+                );
                 record_ocr_cache_hit(self.store.as_ref());
                 return Some(segs.clone());
             }
@@ -1238,9 +1241,10 @@ impl DetectContext {
             if let Some((cached, segs)) = guard.get(&cache_key) {
                 if *cached == combined_hash {
                     debug!(
-                        "OCR community cache hit (monitor {}, {} posts unchanged)",
+                        "OCR skipped — {} community post image(s) unchanged, reusing in-memory \
+                         cached result (monitor {}; no API call, no files touched)",
+                        imgs.len(),
                         row.monitor.id,
-                        imgs.len()
                     );
                     record_ocr_cache_hit(self.store.as_ref());
                     return Some(segs.clone());

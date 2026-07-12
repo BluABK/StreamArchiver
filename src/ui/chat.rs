@@ -1141,6 +1141,7 @@ pub(super) fn parse_chat_chunk(
             crate::iomon::OpKind::Read,
             take as u64,
             read_start.elapsed(),
+            true,
         );
         read_res?;
         pos += take as u64;

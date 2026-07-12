@@ -291,7 +291,13 @@ impl Supervisor {
                     }
                 }
                 if removed > 0 {
-                    info!("swept {removed} stale working file(s) from {}", cache.display());
+                    info!(
+                        "capture-cache sweep: deleted {removed} leftover transient working \
+                         file(s) from the on-disk cache {} (abandoned mid-capture temp data \
+                         older than {}h; finished archives are never swept)",
+                        cache.display(),
+                        CACHE_MAX_AGE_SECS / 3600,
+                    );
                 }
                 let _ = crate::iomon::fs::remove_dir(Cat::CacheSweep, &cache).await; // only if now empty
             }

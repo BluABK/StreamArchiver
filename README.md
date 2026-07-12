@@ -589,6 +589,18 @@ filterable recent-operations log — operations slower than 100 ms are
 highlighted, and the thread column exposes anything touching the disk from the
 UI thread. **📋 Copy summary** exports the state as text.
 
+**Slow-op log levels.** A slow filesystem op only logs at **WARN** when it
+actually blocked work: a sync call on the UI thread (the UI froze for the
+duration — always a regression) or a sync call that stalled a tokio async
+worker for ≥ 1 s. Everything else — awaited async I/O (the named thread is
+just where the task resumed; nothing sat blocked) and sync ops on dedicated
+background or blocking-pool threads — logs at **DEBUG**, with the reason it's
+harmless spelled out in the message ("the disk was busy" seen from a thread
+nothing waits on). Chatty categories carry extra context: fs probes are
+metadata-only peeks refreshing in-memory state, cache sweeps scan the on-disk
+capture cache for leftover transient files (never finished archives), and
+chat appends buffer messages in memory while a slow write is in flight.
+
 **Database sub-tab.** The single SQLite connection sits behind a fair mutex
 that every store call takes in turn; this tab shows that lock live: the
 current **holder** (which thread, from which store call site, held for how

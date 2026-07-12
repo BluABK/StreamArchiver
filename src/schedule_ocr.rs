@@ -436,7 +436,7 @@ async fn run_cli(command: &str, model: &str, dir: &str, prompt: &str, opts: &Ocr
                 cost_usd: env.total_cost_usd,
             };
             info!(
-                "OCR: {model} → {} in / {} out / ${:.4} (cache r={} c={})",
+                "OCR: {model} → {} in / {} out / ${:.4} (API prompt-cache tokens: read={} created={})",
                 env.usage.input_tokens,
                 env.usage.output_tokens,
                 env.total_cost_usd,

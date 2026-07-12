@@ -33,16 +33,27 @@ use serde::{Deserialize, Serialize};
 
 /// How long a single filesystem op may take before it counts as *slow*:
 /// bumps the `slow_ops` counter, always enters the ops ring, and emits a
-/// rate-limited warning. 100ms is glacial for one syscall — on the recordings
-/// drive it means the disk is saturated (or the USB enclosure is wobbling).
+/// rate-limited log line — WARN when the op actually blocked work (sync I/O
+/// on the UI thread, or a ≥1s sync stall of a tokio worker), DEBUG otherwise
+/// (busy disk seen from a background thread or an awaited async op). 100ms is
+/// glacial for one syscall — on the recordings drive it means the disk is
+/// saturated (or the USB enclosure is wobbling).
 pub const SLOW_OP_MS: u64 = 100;
 
 /// Ops-ring capacity (recent-operations log in the I/O tab).
 const OPS_RING_CAP: usize = 512;
 
-/// Minimum gap between slow-op `warn!`s per category (the ring + counters
-/// still record every one; the log just shouldn't scroll).
+/// Minimum gap between slow-op log lines per category (the ring + counters
+/// still record every one; the log just shouldn't scroll). WARN and DEBUG
+/// lines are rate-limited independently so a flood of routine DEBUG entries
+/// can never swallow a real "this blocked work" WARN.
 const SLOW_WARN_GAP_MS: i64 = 5_000;
+
+/// A *sync* fs call on a tokio async-worker thread stalls the whole executor
+/// for its duration. Below this it's logged as routine (short stalls under
+/// disk load are expected from the few remaining sync probe call sites);
+/// at/above it the executor was meaningfully stalled and it's a WARN.
+const EXECUTOR_STALL_WARN_MS: u128 = 1_000;
 
 // ===== Categories & regions =====
 
@@ -238,8 +249,24 @@ static CELLS: [[Cell; REGION_COUNT]; CAT_COUNT] = [CELL_ROW_INIT; CAT_COUNT];
 
 #[allow(clippy::declare_interior_mutable_const)]
 const LAST_WARN_INIT: AtomicI64 = AtomicI64::new(i64::MIN);
-/// Per-category "last slow-op warn" timestamp (ms since process start).
+/// Per-category "last slow-op WARN" timestamp (ms since process start).
 static LAST_SLOW_WARN: [AtomicI64; CAT_COUNT] = [LAST_WARN_INIT; CAT_COUNT];
+/// Per-category "last slow-op DEBUG" timestamp — separate from the WARN
+/// limiter so routine busy-disk chatter can't suppress a real blocked-work
+/// warning that follows within the gap.
+static LAST_SLOW_DEBUG: [AtomicI64; CAT_COUNT] = [LAST_WARN_INIT; CAT_COUNT];
+
+/// One rate-limit slot check: true if this category may log now (and claims
+/// the slot). Lock-free; a lost CAS race simply skips the line.
+fn slow_log_slot(arr: &[AtomicI64; CAT_COUNT], cat: Cat) -> bool {
+    let now_ms = epoch().elapsed().as_millis() as i64;
+    let last = &arr[cat as usize];
+    let prev = last.load(Ordering::Relaxed);
+    now_ms.saturating_sub(prev) >= SLOW_WARN_GAP_MS
+        && last
+            .compare_exchange(prev, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+}
 
 fn epoch() -> Instant {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
@@ -344,15 +371,39 @@ static OPS_RING: Mutex<std::collections::VecDeque<OpRecord>> =
 
 // ===== Recording =====
 
-/// Record one filesystem operation, classifying `path` into a region.
+/// Record one *synchronous* filesystem operation (the calling thread sat
+/// blocked for `dur`), classifying `path` into a region.
 pub fn record(cat: Cat, path: &Path, kind: OpKind, bytes: u64, dur: Duration) {
-    record_inner(cat, classify(path), kind, bytes, dur, Some(path));
+    record_inner(cat, classify(path), kind, bytes, dur, Some(path), true);
 }
 
-/// Like [`record`] for call sites that classified their path once up front
-/// (e.g. the chat sink, which appends to the same file for a whole session).
-pub fn record_region(cat: Cat, region: Region, kind: OpKind, bytes: u64, dur: Duration) {
-    record_inner(cat, region, kind, bytes, dur, None);
+/// [`record`] with an explicit sync/async execution flag — the fs facade's
+/// entry point (its async wrappers await tokio, so no thread was blocked).
+fn record_with(cat: Cat, path: &Path, kind: OpKind, bytes: u64, dur: Duration, sync: bool) {
+    record_inner(cat, classify(path), kind, bytes, dur, Some(path), sync);
+}
+
+/// Like [`record`] for call sites that classified their path once up front.
+/// `sync` = whether the calling thread was blocked for the duration (a plain
+/// std::fs call) or merely awaited it (tokio offloads the wait — the thread
+/// kept doing other work).
+pub fn record_region(cat: Cat, region: Region, kind: OpKind, bytes: u64, dur: Duration, sync: bool) {
+    record_inner(cat, region, kind, bytes, dur, None, sync);
+}
+
+/// What a slow op in this category actually means — appended to slow-op log
+/// lines for the categories that show up often, so the log explains itself.
+fn slow_cat_context(cat: Cat) -> &'static str {
+    match cat {
+        Cat::FsProbe => " Fs probes are metadata-only peeks (existence/size/mtime) — no file \
+                         data is read or written; UI-side probes only refresh an in-memory \
+                         cache whose previous value keeps being served meanwhile.",
+        Cat::CacheSweep => " Cache sweeps scan the on-disk capture cache (.sa-cache) for leftover \
+                            transient working files; finished archives are never touched.",
+        Cat::ChatSidecar => " Chat messages buffer in memory while an append is in flight; none \
+                             are lost to a slow write.",
+        _ => "",
+    }
 }
 
 fn record_inner(
@@ -362,6 +413,7 @@ fn record_inner(
     bytes: u64,
     dur: Duration,
     path: Option<&Path>,
+    sync: bool,
 ) {
     let cell = &CELLS[cat as usize][region as usize];
     match kind {
@@ -394,27 +446,60 @@ fn record_inner(
     }
 
     if slow {
-        let now_ms = epoch().elapsed().as_millis() as i64;
-        let last = &LAST_SLOW_WARN[cat as usize];
-        let prev = last.load(Ordering::Relaxed);
-        if now_ms.saturating_sub(prev) >= SLOW_WARN_GAP_MS
-            && last
-                .compare_exchange(prev, now_ms, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        {
-            // The thread name decides how bad this is: "main" = the UI froze
-            // for the duration (a render-path I/O regression — see FsProbes);
-            // a worker (fs-probes, issues-missing-check, tokio…) just means
-            // the disk is busy and a cached value went stale.
-            tracing::warn!(
-                "slow {} op ({}ms) on thread '{}': {} [{}] {}",
-                kind.label(),
-                dur.as_millis(),
-                std::thread::current().name().unwrap_or("?"),
-                cat.label(),
-                region.label(),
-                path.map(|p| p.display().to_string()).unwrap_or_default()
-            );
+        // WARN is reserved for ops that actually blocked work: a sync call on
+        // the UI thread (the UI froze for the duration) or a long sync call on
+        // a tokio async worker (the executor stalled). Everything else — async
+        // ops (the "thread" is only where the task resumed; nothing sat
+        // blocked) and sync ops on dedicated background / blocking-pool
+        // threads — is routine busy-disk latency and logs at DEBUG with the
+        // reason it's harmless spelled out.
+        let ms = dur.as_millis();
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("?");
+        let what = format!(
+            "{} op took {}ms: {} [{}] {}",
+            kind.label(),
+            ms,
+            cat.label(),
+            region.label(),
+            path.map(|p| p.display().to_string()).unwrap_or_default()
+        );
+        let ctx = slow_cat_context(cat);
+        if sync && name == "main" {
+            if slow_log_slot(&LAST_SLOW_WARN, cat) {
+                tracing::warn!(
+                    "slow {what} — BLOCKED THE UI thread for the whole duration; render-path \
+                     disk I/O is a regression (route it through FsProbes or a worker).{ctx}"
+                );
+            }
+        } else if sync && name.starts_with("streamarchiver-core") && ms >= EXECUTOR_STALL_WARN_MS {
+            if slow_log_slot(&LAST_SLOW_WARN, cat) {
+                tracing::warn!(
+                    "slow {what} — sync fs call stalled async worker '{name}' for the whole \
+                     duration, delaying unrelated async tasks; this call site should use the \
+                     async iomon::fs variant or spawn_blocking.{ctx}"
+                );
+            }
+        } else if slow_log_slot(&LAST_SLOW_DEBUG, cat) {
+            let why = if !sync {
+                "async op awaited off-thread — no app thread sat blocked, the named thread is \
+                 just where the task resumed; the disk was busy"
+                    .to_string()
+            } else if name.starts_with("streamarchiver-blocking") {
+                "ran on the blocking-thread pool, which exists to absorb slow disk waits; \
+                 nothing else was held up"
+                    .to_string()
+            } else if name.starts_with("streamarchiver-core") {
+                "briefly held an async worker; sub-second stalls under disk load are expected \
+                 from the few sync probe call sites"
+                    .to_string()
+            } else {
+                format!(
+                    "ran on dedicated background thread '{name}' — the UI and the recording \
+                     pipeline don't wait on it; the disk was busy"
+                )
+            };
+            tracing::debug!("slow {what} on '{name}' — not blocking work: {why}.{ctx}");
         }
     }
     // Ring push: try_lock so no hot path (or panic path) ever blocks here.
@@ -1087,7 +1172,7 @@ fn flush_sample_log(path: &Path, buf: &mut Vec<String>) {
     }) {
         let bytes = text.len() as u64;
         let res = f.write_all(text.as_bytes());
-        record_region(Cat::IoMonLog, Region::AppData, OpKind::Write, bytes, start.elapsed());
+        record_region(Cat::IoMonLog, Region::AppData, OpKind::Write, bytes, start.elapsed(), true);
         if let Err(e) = res {
             tracing::warn!("iomon sample log write failed: {e}");
         }
@@ -1110,8 +1195,9 @@ pub mod fs {
     use std::path::Path;
     use std::time::Instant;
 
-    use super::{Cat, OpKind, record};
+    use super::{Cat, OpKind, record_with};
 
+    /// Finish an *async* op (the wait was awaited, not thread-blocking).
     fn done<T>(
         cat: Cat,
         path: &Path,
@@ -1120,7 +1206,20 @@ pub mod fs {
         bytes: u64,
         res: io::Result<T>,
     ) -> io::Result<T> {
-        record(cat, path, kind, bytes, start.elapsed());
+        record_with(cat, path, kind, bytes, start.elapsed(), false);
+        res
+    }
+
+    /// Finish a *sync* op (the calling thread sat blocked for the duration).
+    fn done_sync<T>(
+        cat: Cat,
+        path: &Path,
+        kind: OpKind,
+        start: Instant,
+        bytes: u64,
+        res: io::Result<T>,
+    ) -> io::Result<T> {
+        record_with(cat, path, kind, bytes, start.elapsed(), true);
         res
     }
 
@@ -1248,7 +1347,7 @@ pub mod fs {
         let (path, contents) = (path.as_ref(), contents.as_ref());
         let start = Instant::now();
         let res = std::fs::write(path, contents);
-        done(cat, path, OpKind::Write, start, contents.len() as u64, res)
+        done_sync(cat, path, OpKind::Write, start, contents.len() as u64, res)
     }
 
     pub fn read_sync(cat: Cat, path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
@@ -1256,7 +1355,7 @@ pub mod fs {
         let start = Instant::now();
         let res = std::fs::read(path);
         let bytes = res.as_ref().map(|b| b.len() as u64).unwrap_or(0);
-        done(cat, path, OpKind::Read, start, bytes, res)
+        done_sync(cat, path, OpKind::Read, start, bytes, res)
     }
 
     pub fn read_to_string_sync(cat: Cat, path: impl AsRef<Path>) -> io::Result<String> {
@@ -1264,7 +1363,7 @@ pub mod fs {
         let start = Instant::now();
         let res = std::fs::read_to_string(path);
         let bytes = res.as_ref().map(|s| s.len() as u64).unwrap_or(0);
-        done(cat, path, OpKind::Read, start, bytes, res)
+        done_sync(cat, path, OpKind::Read, start, bytes, res)
     }
 
     pub fn copy_sync(cat: Cat, from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<u64> {
@@ -1272,49 +1371,49 @@ pub mod fs {
         let start = Instant::now();
         let res = std::fs::copy(from, to);
         let bytes = *res.as_ref().unwrap_or(&0);
-        done(cat, to, OpKind::Write, start, bytes, res)
+        done_sync(cat, to, OpKind::Write, start, bytes, res)
     }
 
     pub fn rename_sync(cat: Cat, from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
         let (from, to) = (from.as_ref(), to.as_ref());
         let start = Instant::now();
         let res = std::fs::rename(from, to);
-        done(cat, to, OpKind::Rename, start, 0, res)
+        done_sync(cat, to, OpKind::Rename, start, 0, res)
     }
 
     pub fn remove_file_sync(cat: Cat, path: impl AsRef<Path>) -> io::Result<()> {
         let path = path.as_ref();
         let start = Instant::now();
         let res = std::fs::remove_file(path);
-        done(cat, path, OpKind::Delete, start, 0, res)
+        done_sync(cat, path, OpKind::Delete, start, 0, res)
     }
 
     pub fn remove_dir_sync(cat: Cat, path: impl AsRef<Path>) -> io::Result<()> {
         let path = path.as_ref();
         let start = Instant::now();
         let res = std::fs::remove_dir(path);
-        done(cat, path, OpKind::Delete, start, 0, res)
+        done_sync(cat, path, OpKind::Delete, start, 0, res)
     }
 
     pub fn remove_dir_all_sync(cat: Cat, path: impl AsRef<Path>) -> io::Result<()> {
         let path = path.as_ref();
         let start = Instant::now();
         let res = std::fs::remove_dir_all(path);
-        done(cat, path, OpKind::Delete, start, 0, res)
+        done_sync(cat, path, OpKind::Delete, start, 0, res)
     }
 
     pub fn create_dir_all_sync(cat: Cat, path: impl AsRef<Path>) -> io::Result<()> {
         let path = path.as_ref();
         let start = Instant::now();
         let res = std::fs::create_dir_all(path);
-        done(cat, path, OpKind::Create, start, 0, res)
+        done_sync(cat, path, OpKind::Create, start, 0, res)
     }
 
     pub fn metadata_sync(cat: Cat, path: impl AsRef<Path>) -> io::Result<std::fs::Metadata> {
         let path = path.as_ref();
         let start = Instant::now();
         let res = std::fs::metadata(path);
-        done(cat, path, OpKind::Meta, start, 0, res)
+        done_sync(cat, path, OpKind::Meta, start, 0, res)
     }
 
     /// `Path::exists` semantics (false on any error), counted as a meta op.
@@ -1336,21 +1435,21 @@ pub mod fs {
         let path = path.as_ref();
         let start = Instant::now();
         let res = std::fs::read_dir(path);
-        done(cat, path, OpKind::Meta, start, 0, res)
+        done_sync(cat, path, OpKind::Meta, start, 0, res)
     }
 
     pub fn open_sync(cat: Cat, path: impl AsRef<Path>) -> io::Result<std::fs::File> {
         let path = path.as_ref();
         let start = Instant::now();
         let res = std::fs::File::open(path);
-        done(cat, path, OpKind::Meta, start, 0, res)
+        done_sync(cat, path, OpKind::Meta, start, 0, res)
     }
 
     pub fn create_sync(cat: Cat, path: impl AsRef<Path>) -> io::Result<std::fs::File> {
         let path = path.as_ref();
         let start = Instant::now();
         let res = std::fs::File::create(path);
-        done(cat, path, OpKind::Create, start, 0, res)
+        done_sync(cat, path, OpKind::Create, start, 0, res)
     }
 
     /// Open with custom options (append, truncate, ...). The closure
@@ -1365,7 +1464,7 @@ pub mod fs {
         configure(&mut opts);
         let start = Instant::now();
         let res = opts.open(path);
-        done(cat, path, OpKind::Meta, start, 0, res)
+        done_sync(cat, path, OpKind::Meta, start, 0, res)
     }
 }
 
@@ -1400,9 +1499,9 @@ mod tests {
     #[test]
     fn counters_accumulate_per_cat_region() {
         let before = *snapshot().cell(Cat::Recovery, Region::Other);
-        record_region(Cat::Recovery, Region::Other, OpKind::Write, 1234, Duration::from_micros(50));
-        record_region(Cat::Recovery, Region::Other, OpKind::Read, 100, Duration::from_micros(50));
-        record_region(Cat::Recovery, Region::Other, OpKind::Meta, 0, Duration::from_micros(50));
+        record_region(Cat::Recovery, Region::Other, OpKind::Write, 1234, Duration::from_micros(50), true);
+        record_region(Cat::Recovery, Region::Other, OpKind::Read, 100, Duration::from_micros(50), true);
+        record_region(Cat::Recovery, Region::Other, OpKind::Meta, 0, Duration::from_micros(50), true);
         let after = *snapshot().cell(Cat::Recovery, Region::Other);
         let d = after.delta(&before);
         assert_eq!(d.write_ops, 1);
@@ -1422,6 +1521,7 @@ mod tests {
             OpKind::Read,
             1,
             Duration::from_millis(SLOW_OP_MS + 1),
+            true,
         );
         let after = snapshot().cell(Cat::Preview, Region::Other).slow_ops;
         assert_eq!(after, before + 1);
@@ -1430,7 +1530,7 @@ mod tests {
     #[test]
     fn ops_ring_is_bounded_at_cap() {
         for i in 0..(OPS_RING_CAP + 50) {
-            record_region(Cat::Other, Region::Other, OpKind::Meta, i as u64, Duration::ZERO);
+            record_region(Cat::Other, Region::Other, OpKind::Meta, i as u64, Duration::ZERO, true);
         }
         let ring = snapshot().ring;
         assert!(ring.len() <= OPS_RING_CAP);
