@@ -488,7 +488,9 @@ impl Supervisor {
             warn!(rec_id, "merge split capture: no split parts found");
             return;
         }
-        let task_id = crate::events::next_task_id();
+        // Keyed by the recording id (like re-remux/finalize tasks) so grid and
+        // Issues rows can match the running merge to their recording.
+        let task_id = rec_id as u64;
         let name = capture
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -530,7 +532,19 @@ impl Supervisor {
 
         use tokio::io::{AsyncBufReadExt, BufReader};
         // One local full-file pass at a time (see io_gate) + readrate throttle.
-        let gate = crate::io_gate::local_pass("merge-split").await;
+        // The queue wait is reported as live progress so a queued merge is
+        // visibly waiting (and on what) instead of looking stale.
+        let gate = {
+            let tx = self.events.clone();
+            crate::io_gate::local_pass_with_progress("merge-split", move |waited, holder, waiting| {
+                let _ = tx.send(AppEvent::BackgroundTaskProgress {
+                    id: task_id,
+                    progress: None,
+                    info: crate::io_gate::wait_info(waited, holder, waiting),
+                });
+            })
+            .await
+        };
         // Total duration for the progress fraction (the video part spans the
         // whole take; the audio part matches it).
         let total_us: Option<i64> = media_duration_secs(&parts[0]).await.map(|s| s * 1_000_000);

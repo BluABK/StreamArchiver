@@ -50,6 +50,45 @@ pub const DEFAULT_READRATE: f64 = 30.0;
 static LOCAL_PASS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static CDN_MUX: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
+/// Live status of the 1-permit local gate, for progress messages: what holds
+/// the permit right now (label + since when) and how many passes are queued.
+struct LocalGateState {
+    holder: Option<(String, Instant)>,
+    waiting: usize,
+}
+static LOCAL_STATE: parking_lot::Mutex<LocalGateState> =
+    parking_lot::Mutex::new(LocalGateState { holder: None, waiting: 0 });
+
+/// `(current holder label + seconds held, queue length incl. the asker)` of
+/// the local gate — lets a queued pass report WHAT it is waiting behind.
+pub fn local_gate_status() -> (Option<(String, u64)>, usize) {
+    let st = LOCAL_STATE.lock();
+    (
+        st.holder.as_ref().map(|(l, t)| (l.clone(), t.elapsed().as_secs())),
+        st.waiting,
+    )
+}
+
+/// Held permit of the local gate; clears the holder label on drop.
+pub struct LocalPass {
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for LocalPass {
+    fn drop(&mut self) {
+        LOCAL_STATE.lock().holder = None;
+    }
+}
+
+/// Decrements the waiting counter even when the acquiring future is dropped
+/// mid-await (task aborted at shutdown).
+struct WaitingGuard;
+impl Drop for WaitingGuard {
+    fn drop(&mut self) {
+        LOCAL_STATE.lock().waiting -= 1;
+    }
+}
+
 /// Configured readrate ×10 (fixed-point so it fits an atomic). 0 = off.
 static READRATE_X10: AtomicU32 = AtomicU32::new((DEFAULT_READRATE * 10.0) as u32);
 /// Set once if the installed ffmpeg rejects `-readrate` (pre-5.0).
@@ -71,8 +110,49 @@ async fn acquire(gate: &'static OnceLock<Arc<Semaphore>>, permits: usize, label:
 
 /// Acquire the single-permit gate for local full-file passes (remux, concat,
 /// embed). Hold the permit for the duration of the ffmpeg run; drop to release.
-pub async fn local_pass(label: &str) -> OwnedSemaphorePermit {
-    acquire(&LOCAL_PASS, 1, label).await
+pub async fn local_pass(label: &str) -> LocalPass {
+    let _wg = {
+        LOCAL_STATE.lock().waiting += 1;
+        WaitingGuard
+    };
+    let permit = acquire(&LOCAL_PASS, 1, label).await;
+    LOCAL_STATE.lock().holder = Some((label.to_string(), Instant::now()));
+    LocalPass { _permit: permit }
+}
+
+/// [`local_pass`], but invokes `on_wait(waited_secs, holder, queue_len)`
+/// every 5 s while queued — callers surface it as task progress so a queued
+/// pass is visibly waiting (and on what) instead of looking stale.
+pub async fn local_pass_with_progress(
+    label: &str,
+    mut on_wait: impl FnMut(u64, Option<(String, u64)>, usize),
+) -> LocalPass {
+    let fut = local_pass(label);
+    tokio::pin!(fut);
+    let started = Instant::now();
+    loop {
+        tokio::select! {
+            p = &mut fut => return p,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                let (holder, waiting) = local_gate_status();
+                on_wait(started.elapsed().as_secs(), holder, waiting);
+            }
+        }
+    }
+}
+
+/// Standard human line for a queued pass's progress info, e.g.
+/// `⏳ queued for disk gate 45s — running now: remux (312s) · 3 in queue`.
+pub fn wait_info(waited_secs: u64, holder: Option<(String, u64)>, waiting: usize) -> String {
+    let mut s = format!("⏳ queued for disk gate {waited_secs}s");
+    match holder {
+        Some((label, held)) => s.push_str(&format!(" — running now: {label} ({held}s)")),
+        None => s.push_str(" — gate turning over"),
+    }
+    if waiting > 1 {
+        s.push_str(&format!(" · {waiting} in queue"));
+    }
+    s
 }
 
 /// Acquire the 2-permit gate for CDN-fed muxes (head backfill, VOD recovery).

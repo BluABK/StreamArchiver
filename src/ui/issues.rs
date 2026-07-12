@@ -802,6 +802,7 @@ impl StreamArchiverApp {
                  Download VOD gets the whole broadcast if it's still published. \
                  Merge is lossless and runs throttled like any finalize pass.",
             );
+            let now = crate::models::now_unix();
             for (i, (rec, parts)) in self.issues_unmerged.iter().enumerate() {
                 ui.horizontal(|ui| {
                     let name = std::path::Path::new(&rec.output_path)
@@ -824,14 +825,45 @@ impl StreamArchiverApp {
                             if partial { " (interrupted)" } else { "" },
                         ),
                     );
-                    if ui
+                    // This take's own merge (running or queued for the disk
+                    // gate) — keyed by the recording id. Show its live state
+                    // instead of the button.
+                    let merge_task = self.background_tasks.iter().find(|bt| {
+                        bt.kind == crate::events::BackgroundTaskKind::Remux
+                            && bt.id == rec.id as u64
+                    });
+                    if let Some(bt) = merge_task {
+                        let elapsed = (now - bt.started_at).max(0);
+                        if let Some(p) = bt.progress {
+                            ui.add(
+                                egui::ProgressBar::new(p)
+                                    .show_percentage()
+                                    .desired_width(110.0),
+                            );
+                        }
+                        ui.colored_label(
+                            egui::Color32::from_rgb(80, 160, 220),
+                            bt.progress_info
+                                .clone()
+                                .unwrap_or_else(|| "⏳ merging…".into()),
+                        )
+                        .on_hover_text(format!(
+                            "Elapsed: {} — a queued merge shows what currently \
+                             holds the disk gate; speed/position appear once \
+                             its own ffmpeg starts.",
+                            fmt_duration(elapsed)
+                        ));
+                    } else if ui
                         .add_enabled(!has_active_remux, egui::Button::new("🧩 Merge into MKV"))
                         .on_hover_text(
                             "Losslessly mux the parts into the final MKV, promote it, \
                              and mark the recording completed. Parts are deleted only \
                              on success.",
                         )
-                        .on_disabled_hover_text("Wait for the running remux/merge to finish.")
+                        .on_disabled_hover_text(
+                            "Another remux/merge is running — this one starts after \
+                             it (see Background jobs for the live queue).",
+                        )
                         .clicked()
                     {
                         *act = Some(Act::MergeSplit(i));

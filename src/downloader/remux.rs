@@ -279,7 +279,22 @@ pub(super) async fn remux_ts_to_mkv_impl(
     allow_readrate: bool,
 ) -> anyhow::Result<()> {
     // One full-file pass at a time on the recordings drive (see io_gate).
-    let gate = crate::io_gate::local_pass("remux").await;
+    // With a task attached, the queue wait is reported as live progress info
+    // (what holds the gate + queue depth) so a queued remux never looks stale.
+    let gate = match &progress_tx {
+        Some((tx, id)) => {
+            let (tx, id) = (tx.clone(), *id);
+            crate::io_gate::local_pass_with_progress("remux", move |waited, holder, waiting| {
+                let _ = tx.send(AppEvent::BackgroundTaskProgress {
+                    id,
+                    progress: None,
+                    info: crate::io_gate::wait_info(waited, holder, waiting),
+                });
+            })
+            .await
+        }
+        None => crate::io_gate::local_pass("remux").await,
+    };
     remux_ts_to_mkv_gated(src, dst, progress_tx, opts, allow_readrate, gate).await
 }
 
@@ -297,7 +312,7 @@ async fn remux_ts_to_mkv_gated(
     progress_tx: Option<(EventTx, u64)>,
     opts: &crate::models::RemuxOpts,
     allow_readrate: bool,
-    gate: tokio::sync::OwnedSemaphorePermit,
+    gate: crate::io_gate::LocalPass,
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
