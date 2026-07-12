@@ -331,6 +331,7 @@ impl StreamArchiverApp {
             issues_errors_no_file: Vec::new(),
             issues_unmerged: Vec::new(),
             issues_head_mismatch: Vec::new(),
+            issues_stale_recording: Vec::new(),
             issues_stuck: Vec::new(),
             issues_muted_vod: Vec::new(),
             issues_missing_load: None,

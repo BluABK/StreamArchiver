@@ -374,6 +374,129 @@ pub fn find_split_media(capture: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Like [`find_split_media`], but for a take whose tool DIED mid-write: also
+/// accept the unfinished `.part` working files (`{stem}.f303.mkv.sq0.part`,
+/// `{stem}.mkv.f140.mp4.sq62.part` — both dev-build name orderings occur).
+/// SABR restarts can leave several `sq<N>` sequences of the SAME format;
+/// concatenating them would repeat or skip content, so only the LARGEST file
+/// per format id is returned. Only meaningful for dead takes — a live
+/// capture's parts are still growing.
+pub fn find_split_parts(capture: &Path) -> Vec<PathBuf> {
+    let Some(dir) = capture.parent() else { return Vec::new() };
+    let Some(stem) = capture.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+        return Vec::new();
+    };
+    let caches: Vec<PathBuf> = if strip_cache_component(capture).is_some() {
+        vec![dir.to_path_buf()]
+    } else {
+        cache_dir_candidates(dir)
+    };
+    let is_fmt_seg = |s: &str| {
+        s.strip_prefix('f')
+            .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let is_sq_seg = |s: &str| {
+        s.strip_prefix("sq")
+            .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let prefix = format!("{stem}.");
+    // format id -> (bytes, path): keep the largest sequence per format.
+    let mut best: std::collections::HashMap<String, (u64, PathBuf)> =
+        std::collections::HashMap::new();
+    for cache in &caches {
+        let Ok(rd) = crate::iomon::fs::read_dir_sync(Cat::FsProbe, cache) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(rest) = name.strip_prefix(&prefix) else { continue };
+            if rest.contains(".temp.") {
+                continue;
+            }
+            let segs: Vec<&str> = rest.split('.').collect();
+            // Shape: [container decoration…] f<id> <container> [sq<N>] part
+            if segs.last().copied() != Some("part") {
+                continue;
+            }
+            let Some(fpos) = segs.iter().position(|s| is_fmt_seg(s)) else { continue };
+            if !segs[..fpos].iter().all(|s| matches!(*s, "mkv" | "mp4" | "webm" | "m4a" | "ts")) {
+                continue;
+            }
+            let mid = &segs[fpos + 1..segs.len() - 1];
+            let ok = match mid {
+                [ext] => matches!(*ext, "mkv" | "mp4" | "webm" | "m4a" | "ts"),
+                [ext, sq] => {
+                    matches!(*ext, "mkv" | "mp4" | "webm" | "m4a" | "ts") && is_sq_seg(sq)
+                }
+                _ => false,
+            };
+            if !ok {
+                continue;
+            }
+            let bytes = crate::iomon::fs::metadata_sync(Cat::FsProbe, entry.path())
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if bytes == 0 {
+                continue;
+            }
+            let key = segs[fpos].to_string();
+            match best.get(&key) {
+                Some((b, _)) if *b >= bytes => {}
+                _ => {
+                    best.insert(key, (bytes, entry.path()));
+                }
+            }
+        }
+    }
+    let mut out: Vec<PathBuf> = best.into_values().map(|(_, p)| p).collect();
+    out.sort();
+    out
+}
+
+/// Newest handle-true mtime (unix secs) across a recording's output file and
+/// every capture-stem working file in its cache dir(s). Handle-based because
+/// NTFS directory entries can be stale for files that are open for writing —
+/// the file must be opened for the truth. Sync and it stats the recordings
+/// drive: call it off the UI thread only (the Issues scan thread).
+pub fn latest_capture_activity(output_path: &str) -> Option<i64> {
+    fn open_mtime(p: &Path) -> Option<i64> {
+        let md = crate::iomon::fs::open_sync(Cat::FsProbe, p).ok()?.metadata().ok()?;
+        if !md.is_file() {
+            return None;
+        }
+        md.modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+    }
+    let p = Path::new(output_path);
+    let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned())?;
+    let mut newest = open_mtime(p);
+    // Working dir(s): the file's own dir when it already points into a cache,
+    // otherwise every cache-layout candidate next to the output dir.
+    let dirs: Vec<PathBuf> = if strip_cache_component(p).is_some() {
+        p.parent().map(|d| vec![d.to_path_buf()]).unwrap_or_default()
+    } else {
+        p.parent().map(cache_dir_candidates).unwrap_or_default()
+    };
+    let prefix = format!("{stem}.");
+    for dir in &dirs {
+        let Ok(rd) = crate::iomon::fs::read_dir_sync(Cat::FsProbe, dir) else { continue };
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            if let Some(mt) = open_mtime(&entry.path())
+                && newest.is_none_or(|n| mt > n)
+            {
+                newest = Some(mt);
+            }
+        }
+    }
+    newest
+}
+
 /// Collect subtitle sidecar files adjacent to `src` (e.g. `{stem}.en.srt`,
 /// `{stem}.vtt`, `{stem}.ass`). Used by `remux_ts_to_mkv` when `embed_subs` is on.
 pub(super) fn collect_subtitle_sidecars(src: &Path) -> Vec<PathBuf> {
@@ -454,7 +577,17 @@ pub(super) fn capture_log_path(capture_path: &Path, suffix: &str) -> PathBuf {
 /// the remux branch's thumbnail/title/subtitle embedding (see [`crate::models::RemuxOpts`]) —
 /// callers should pass `store.remux_opts()`, not a default, or the user's Settings
 /// toggles silently do nothing for this (the automatic) path.
-pub(super) async fn promote_capture(plan: &DownloadPlan, opts: &crate::models::RemuxOpts) -> PathBuf {
+/// `task` = `(events, task_id)`: when set, the remux branch announces itself
+/// as a Background job (kind `Remux`) with live ffmpeg progress — pass the
+/// recording id as `task_id` for takes so grid rows can match it. Without it
+/// a finalize can sit invisibly for a long time waiting for its disk-gate
+/// turn while the row still reads "recording" (the rec-652 stuck-finalize
+/// incident, 2026-07-12). The quick move branch never announces.
+pub(super) async fn promote_capture(
+    plan: &DownloadPlan,
+    opts: &crate::models::RemuxOpts,
+    task: Option<(EventTx, u64)>,
+) -> PathBuf {
     // yt-dlp SABR dev-build sometimes appends a container extension to the
     // output path even when the template already specifies one — e.g. writing
     // `stem.mkv.mp4` instead of `stem.mkv` because the merged container is MP4.
@@ -476,7 +609,29 @@ pub(super) async fn promote_capture(plan: &DownloadPlan, opts: &crate::models::R
         // react to on a name-too-long failure, so shorten proactively before
         // the write instead of reactively after it (see path_with_safe_stem).
         let dest = path_with_safe_stem(&plan.final_path);
-        match remux_ts_to_mkv(&effective, &dest, None, opts).await {
+        if let Some((tx, id)) = &task {
+            let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
+                id: *id,
+                kind: crate::events::BackgroundTaskKind::Remux,
+                label: effective
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                detail: "finalize: remux to MKV (may wait for the disk gate)".into(),
+                started_at: now_unix(),
+                progress: None,
+                progress_info: None,
+            }));
+        }
+        let res = remux_ts_to_mkv(&effective, &dest, task.clone(), opts).await;
+        if let Some((tx, id)) = &task {
+            let outcome = match &res {
+                Ok(()) => crate::events::TaskOutcome::Completed,
+                Err(e) => crate::events::TaskOutcome::Failed(e.to_string()),
+            };
+            let _ = tx.send(AppEvent::BackgroundTaskFinished { id: *id, outcome });
+        }
+        match res {
             Ok(()) => {
                 let _ = crate::iomon::fs::remove_file(Cat::Promote, &effective).await;
                 dest
@@ -1129,6 +1284,43 @@ mod tests {
                 capture.display()
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn find_split_parts_picks_largest_per_format() {
+        let dir = std::env::temp_dir().join(format!("sa-split-parts-{}", std::process::id()));
+        let cache = dir.join(".sa-cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let stem = "Chan - 2026-07-12 00-03-31 - title [youtube abc]";
+        // Ordering A: {stem}.f<id>.mkv.sq<N>.part (format id before container).
+        std::fs::write(cache.join(format!("{stem}.f303.mkv.sq0.part")), vec![0u8; 10]).unwrap();
+        std::fs::write(cache.join(format!("{stem}.f140.mkv.sq0.part")), vec![0u8; 4]).unwrap();
+        // Ordering B: {stem}.mkv.f<id>.mp4.sq<N>.part — two sequences of the
+        // SAME format: only the largest is returned.
+        std::fs::write(cache.join(format!("{stem}.mkv.f299.mp4.sq1.part")), vec![0u8; 3]).unwrap();
+        std::fs::write(cache.join(format!("{stem}.mkv.f299.mp4.sq62.part")), vec![0u8; 20]).unwrap();
+        // Non-media / working files — rejected.
+        std::fs::write(cache.join(format!("{stem}.f303.mkv.state")), b"x").unwrap();
+        std::fs::write(cache.join(format!("{stem}.mkv.temp.mp4.sq0.part")), b"x").unwrap();
+        std::fs::write(cache.join(format!("{stem}.log")), b"x").unwrap();
+        // 0-byte part — rejected.
+        std::fs::write(cache.join(format!("{stem}.f251.mkv.sq0.part")), b"").unwrap();
+        // A sibling recording whose stem extends this one — rejected.
+        std::fs::write(cache.join(format!("{stem}. Part 2.f303.mkv.sq0.part")), b"x").unwrap();
+
+        let parts = find_split_parts(&cache.join(format!("{stem}.mkv")));
+        let names: Vec<String> = parts
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                format!("{stem}.f140.mkv.sq0.part"),
+                format!("{stem}.f303.mkv.sq0.part"),
+                format!("{stem}.mkv.f299.mp4.sq62.part"),
+            ]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]

@@ -960,6 +960,8 @@ impl Supervisor {
                     mode: String::new(),
                 },
                 &self.store.remux_opts(),
+                (row.kind == DetachedKind::Recording)
+                    .then(|| (self.events.clone(), row.ref_id as u64)),
             )
             .await
         } else {
@@ -1201,6 +1203,104 @@ impl Supervisor {
         }
     }
 
+    /// Manual rescue for a row stuck in `recording` with no live capture
+    /// process (Issues → "Finalize now"): promote whatever the capture left on
+    /// disk and settle the row. Mirrors the startup finalize but is driven from
+    /// the DB row alone — no detached-registry entry required (that's exactly
+    /// the zombie case: the process died without the app ever seeing it exit).
+    pub(super) async fn finalize_recording_now(&self, rec_id: i64) {
+        let Ok(Some(rec)) = self.store.get_recording(rec_id) else {
+            warn!(rec_id, "finalize now: recording not found");
+            return;
+        };
+        if rec.status != "recording" {
+            info!(rec_id, status = %rec.status, "finalize now: row is not 'recording' — nothing to do");
+            return;
+        }
+        // Belt and braces: never finalize under a genuinely-live capture.
+        let live = self.active.lock().unwrap().contains_key(&rec.monitor_id)
+            || self.active_secondary.lock().unwrap().contains_key(&rec.monitor_id);
+        if live {
+            info!(rec_id, "finalize now: monitor has an active capture — skipping");
+            return;
+        }
+        let out = PathBuf::from(&rec.output_path);
+        // Find the actual media: the final file itself, or the capture left in
+        // the working dir.
+        let mut src: Option<PathBuf> = None;
+        if file_len(&out).await > 0 {
+            src = Some(out.clone());
+        } else {
+            for c in live_capture_candidates(&out) {
+                if file_len(&c).await > 0 {
+                    src = Some(c);
+                    break;
+                }
+            }
+        }
+        let ended = now_unix();
+        let Some(src) = src else {
+            // Nothing on disk. Surviving split parts (if any) are the
+            // unmerged-recovery section's job; this row just has to stop
+            // pretending to record so the Issues lists can classify it.
+            let _ = self.store.finish_recording(
+                rec_id,
+                ended,
+                0,
+                None,
+                "failed",
+                &rec.output_path,
+                &rec.log_excerpt,
+            );
+            let _ = self.store.clear_detached(DetachedKind::Recording, rec_id);
+            let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
+            info!(rec_id, "finalize now: no capture on disk — marked failed");
+            return;
+        };
+        let is_ts = src.extension().is_some_and(|e| e.eq_ignore_ascii_case("ts"));
+        let in_cache = strip_cache_component(&src).is_some();
+        let final_path = if is_ts || in_cache {
+            let final_pred = strip_cache_component(&src)
+                .unwrap_or_else(|| src.clone())
+                .with_extension("mkv");
+            promote_capture(
+                &DownloadPlan {
+                    program: String::new(),
+                    args: Vec::new(),
+                    capture_path: src.clone(),
+                    final_path: final_pred,
+                    remux_to_mkv: is_ts,
+                    writes_own_thumbnail: false,
+                    mode: String::new(),
+                },
+                &self.store.remux_opts(),
+                Some((self.events.clone(), rec_id as u64)),
+            )
+            .await
+        } else {
+            src.clone()
+        };
+        let bytes = file_len(&final_path).await as i64;
+        let status = if bytes > 0 { "completed" } else { "failed" };
+        let _ = self.store.finish_recording(
+            rec_id,
+            ended,
+            bytes,
+            None,
+            status,
+            &final_path.to_string_lossy(),
+            &rec.log_excerpt,
+        );
+        let _ = self.store.clear_detached(DetachedKind::Recording, rec_id);
+        let _ = self.events.send(AppEvent::RecordingFinished {
+            recording_id: rec_id,
+            channel: String::new(),
+            status: status.into(),
+        });
+        let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
+        info!(rec_id, bytes, status, "finalize now: settled");
+    }
+
     /// Resume an interrupted SABR capture, reusing the orphaned recording's `rec_id`
     /// and `.cache\` stem so yt-dlp continues from the surviving `.state`/`.part`
     /// (re-invoked with the identical `-o`). Chat and the DASH companion are not
@@ -1318,7 +1418,12 @@ impl Supervisor {
         let ended = now_unix();
 
         // Finalize: promote .cache → output dir, move companions, post-rename, purge.
-        let mut final_path = promote_capture(&plan, &self.store.remux_opts()).await;
+        let mut final_path = promote_capture(
+            &plan,
+            &self.store.remux_opts(),
+            Some((self.events.clone(), rec_id as u64)),
+        )
+        .await;
         let promoted = final_path != plan.capture_path;
         let cache = plan.capture_path.parent().map(Path::to_path_buf);
         let capstem = plan

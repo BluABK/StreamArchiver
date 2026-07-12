@@ -141,6 +141,12 @@ impl Supervisor {
                 });
             }
             ManualCommand::RefreshCdnHosts => self.cmd_refresh_cdn_hosts(),
+            ManualCommand::FinalizeRecording(rec_id) => {
+                let this = self.clone();
+                tokio::spawn(async move {
+                    this.finalize_recording_now(rec_id).await;
+                });
+            }
             ManualCommand::RecoverStuckCapture { rec_id, capture, output_dir } => {
                 self.cmd_recover_stuck_capture(rec_id, capture, output_dir)
             }
@@ -1935,7 +1941,7 @@ progress_info: None,
             .unwrap_or_default();
         let mut final_path;
         if plan.remux_to_mkv {
-            final_path = promote_capture(&plan, &self.store.remux_opts()).await;
+            final_path = promote_capture(&plan, &self.store.remux_opts(), None).await;
         } else {
             let produced = if file_len(&plan.capture_path).await > 0 {
                 Some(plan.capture_path.clone())
@@ -2859,7 +2865,12 @@ progress_info: None,
         // Promote the finished capture from the hidden `.cache\` up to the output
         // dir (remux .ts→.mkv, or move an already-final container); a failed/0-byte
         // capture is left in `.cache\` for the startup sweep.
-        let mut final_path = promote_capture(plan, &self.store.remux_opts()).await;
+        let mut final_path = promote_capture(
+            plan,
+            &self.store.remux_opts(),
+            Some((self.events.clone(), rec_id as u64)),
+        )
+        .await;
         let promoted = final_path != plan.capture_path;
         let cache = plan.capture_path.parent().map(Path::to_path_buf);
         // The capture stem (== final stem before any post-rename) used to match this
@@ -3164,7 +3175,7 @@ progress_info: None,
 
         // Promote the companion out of .cache\ (remux .ts→.mkv) on success; a failed
         // one stays in .cache\ for the sweep.
-        let final_path = promote_capture(&plan, &self.store.remux_opts()).await;
+        let final_path = promote_capture(&plan, &self.store.remux_opts(), None).await;
         if final_path != plan.capture_path {
             if let Some(cache) = plan.capture_path.parent() {
                 let stem = plan

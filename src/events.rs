@@ -358,6 +358,10 @@ pub enum ManualCommand {
     /// output directory, shortening the name if that's what blocked it the
     /// first time (see `downloader::rename_or_shorten`). On success
     /// `recording.output_path` is updated to the new location.
+    /// Settle a row stuck in `recording` with no live capture process
+    /// (Issues → "Finalize now"): promote whatever the capture left on disk
+    /// and finish the row — the manual twin of the startup finalize.
+    FinalizeRecording(i64),
     RecoverStuckCapture {
         rec_id: i64,
         capture: std::path::PathBuf,

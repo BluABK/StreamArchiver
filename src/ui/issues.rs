@@ -19,6 +19,34 @@ pub(super) struct IssuesScan {
     /// Head/live join blocked by codec parameters: (rec, head, live) with
     /// human-readable stream params.
     pub(super) head_mismatch: Vec<(crate::models::Recording, String, String)>,
+    /// Rows still marked `recording` whose files have gone quiet: the capture
+    /// died unnoticed (power loss / sleep) or the finalize is still pending.
+    /// Paired with the seconds since the last write (`None` = nothing on disk).
+    pub(super) stale_recording: Vec<(crate::models::Recording, Option<i64>)>,
+}
+
+/// A `recording` row whose newest capture-file write is older than this is
+/// listed in Issues as stale (a live capture writes continuously).
+const STALE_RECORDING_SECS: i64 = 600;
+
+/// A human explanation when a capture/resume died on a network/DNS failure —
+/// matched against the tool's log tail.
+fn network_failure_hint(log: &str) -> Option<&'static str> {
+    let broken = [
+        "getaddrinfo failed",
+        "Failed to resolve",
+        "[Errno 11001]",
+        "Temporary failure in name resolution",
+        "Name or service not known",
+    ]
+    .iter()
+    .any(|m| log.contains(m));
+    broken.then_some(
+        "Likely cause: the network/DNS was unavailable when the download tool \
+         (re)started — e.g. the machine woke from sleep before the network came \
+         back up, or the connection dropped. The stream itself was fine; only \
+         this attempt could not reach the site.",
+    )
 }
 
 /// Deferred Issues-panel actions: collected while rendering inside the
@@ -44,6 +72,11 @@ enum Act {
     RerunMuted(usize),
     DismissMuted(usize),
     MergeSplit(usize),
+    /// Archive the published VOD for an unmerged-split take (covers the part
+    /// of the stream the interrupted capture missed).
+    DownloadVodUnmerged(usize),
+    /// Settle a stale 'recording' row (Issues → "Finalize now").
+    FinalizeStale(usize),
     RefetchHeadMatchLive(usize),
     FetchVodForMismatch(usize),
     DismissMismatch(usize),
@@ -359,6 +392,7 @@ impl StreamArchiverApp {
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
                     self.issues_quota_section(ui, &quota_warnings, &mut act);
+                    self.issues_stale_recording_section(ui, &mut act);
                     self.issues_muted_vod_section(ui, &mut act);
                     self.issues_unmerged_section(ui, has_active_remux, &mut act);
                     self.issues_head_mismatch_section(ui, &mut act);
@@ -378,7 +412,10 @@ impl StreamArchiverApp {
                         && n_missing_errors == 0
                         && n_stuck == 0
                     {
-                        if self.issues_unmerged.is_empty() && self.issues_head_mismatch.is_empty() {
+                        if self.issues_unmerged.is_empty()
+                            && self.issues_head_mismatch.is_empty()
+                            && self.issues_stale_recording.is_empty()
+                        {
                             ui.weak("No recording issues found — all recordings are in their final format.");
                         }
                         return;
@@ -420,6 +457,7 @@ impl StreamArchiverApp {
                     self.issues_errors_no_file = scan.errors_no_file;
                     self.issues_unmerged = scan.unmerged;
                     self.issues_head_mismatch = scan.head_mismatch;
+                    self.issues_stale_recording = scan.stale_recording;
                     self.issues_missing_load = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -480,9 +518,14 @@ impl StreamArchiverApp {
                     let (unmerged, missing): (Vec<_>, Vec<_>) = gone
                         .into_iter()
                         .map(|r| {
-                            let parts = crate::downloader::find_split_media(
-                                std::path::Path::new(&r.output_path),
-                            );
+                            let capture = std::path::Path::new(&r.output_path);
+                            let mut parts = crate::downloader::find_split_media(capture);
+                            if parts.is_empty() {
+                                // The tool died mid-write: the media may
+                                // survive only as unfinished `.part`
+                                // sequences (largest one per format).
+                                parts = crate::downloader::find_split_parts(capture);
+                            }
                             (r, parts)
                         })
                         .partition(|(_, parts)| !parts.is_empty());
@@ -494,6 +537,40 @@ impl StreamArchiverApp {
                             r.output_path.is_empty()
                                 || crate::iomon::fs::exists_sync(crate::iomon::Cat::FsProbe, &r.output_path)
                         });
+                    // A failed take whose media survives as split parts is
+                    // recoverable — list it ONLY under unmerged (with the
+                    // merge action), not as a plain dead "file missing" row.
+                    let unmerged_ids: std::collections::HashSet<i64> =
+                        unmerged.iter().map(|(r, _)| r.id).collect();
+                    let no_file: Vec<_> = no_file
+                        .into_iter()
+                        .filter(|r| !unmerged_ids.contains(&r.id))
+                        .collect();
+                    // Rows still marked 'recording' whose files have gone
+                    // quiet: capture died unnoticed, or finalize pending.
+                    let now = crate::models::now_unix();
+                    let stale_recording: Vec<_> = core
+                        .store
+                        .recordings_marked_recording()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|r| {
+                            // A capture in its first minutes may not have
+                            // files yet — never list those.
+                            if now - r.started_at < STALE_RECORDING_SECS {
+                                return None;
+                            }
+                            if r.output_path.is_empty() {
+                                return Some((r, None));
+                            }
+                            let age = crate::downloader::latest_capture_activity(&r.output_path)
+                                .map(|t| (now - t).max(0));
+                            match age {
+                                Some(a) if a < STALE_RECORDING_SECS => None,
+                                other => Some((r, other)),
+                            }
+                        })
+                        .collect();
                     // Head/live joins blocked by codec parameters, with the
                     // actual stream params probed for the explainer.
                     let head_mismatch: Vec<_> = core
@@ -517,6 +594,7 @@ impl StreamArchiverApp {
                         errors_no_file: no_file,
                         unmerged,
                         head_mismatch,
+                        stale_recording,
                     });
                 })
                 .ok();
@@ -613,6 +691,96 @@ impl StreamArchiverApp {
         }
     }
 
+    /// ── Rows stuck in 'recording' with no live capture ──
+    fn issues_stale_recording_section(&self, ui: &mut egui::Ui, act: &mut Option<Act>) {
+        if self.issues_stale_recording.is_empty() {
+            return;
+        }
+        ui.label(
+            egui::RichText::new("⏸ Marked 'recording' but not being written").strong(),
+        );
+        ui.weak(
+            "These takes claim to be recording, but their files have not been \
+             written for a while. Either the capture process died without the \
+             app noticing (power loss, sleep, forced kill), or the post-capture \
+             finalize is still waiting for its turn at the disk gate (then it \
+             shows a remux job here and under Background jobs). Finalize now \
+             promotes whatever was captured and settles the row.",
+        );
+        let now = crate::models::now_unix();
+        for (i, (rec, age)) in self.issues_stale_recording.iter().enumerate() {
+            ui.horizontal(|ui| {
+                let name = std::path::Path::new(&rec.output_path)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| format!("recording {}", rec.id));
+                let age_s = match age {
+                    Some(a) => format!("last write {} ago", fmt_duration(*a)),
+                    None => "no capture file found on disk".to_string(),
+                };
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 160, 30),
+                    format!("{name} — {age_s}"),
+                );
+                // An in-flight finalize/remux for this take (startup re-drive
+                // or a manual action) is a Remux background task keyed by the
+                // recording id.
+                let task = self.background_tasks.iter().find(|bt| {
+                    bt.kind == crate::events::BackgroundTaskKind::Remux
+                        && bt.id == rec.id as u64
+                });
+                if let Some(bt) = task {
+                    let elapsed = (now - bt.started_at).max(0);
+                    if let Some(p) = bt.progress {
+                        ui.add(
+                            egui::ProgressBar::new(p)
+                                .show_percentage()
+                                .desired_width(110.0),
+                        );
+                    }
+                    ui.colored_label(
+                        egui::Color32::from_rgb(80, 160, 220),
+                        format!("⏳ finalizing… {}", fmt_duration(elapsed)),
+                    )
+                    .on_hover_text(
+                        "The finalize is queued/running — remuxes take turns on \
+                         the recordings drive, so a backlog can hold this for a \
+                         while. Progress shows once ffmpeg starts.",
+                    );
+                } else if ui
+                    .button("🛠 Finalize now")
+                    .on_hover_text(
+                        "Promote whatever was captured (remux/move it out of \
+                         the working folder) and settle this row.",
+                    )
+                    .clicked()
+                {
+                    *act = Some(Act::FinalizeStale(i));
+                }
+                if ui.button("🔍")
+                    .on_hover_text("View details in a window.")
+                    .clicked()
+                {
+                    let mut text = format!(
+                        "Status: recording (stale)\n{age_s}\nStarted: {}\nPath: {}",
+                        fmt_datetime_short(rec.started_at),
+                        rec.output_path
+                    );
+                    if let Some(hint) = network_failure_hint(&rec.log_excerpt) {
+                        text.push_str("\n\n");
+                        text.push_str(hint);
+                    }
+                    if !rec.log_excerpt.is_empty() {
+                        text.push_str("\n\n");
+                        text.push_str(rec.log_excerpt.trim());
+                    }
+                    *act = Some(Act::ViewError(name.clone(), text));
+                }
+            });
+        }
+        ui.separator();
+    }
+
     /// ── Unmerged split captures (recoverable, NOT lost) ──
     fn issues_unmerged_section(
         &mut self,
@@ -627,8 +795,12 @@ impl StreamArchiverApp {
             ui.weak(
                 "The download tool died before merging its per-format files — the \
                  final file was never written (the take reads as 0 bytes / gone), \
-                 but the video and audio survived as parts in `.cache\\`. Merge is \
-                 lossless and runs throttled like any finalize pass.",
+                 but the video and audio survived as parts in `.cache\\`. Rows \
+                 marked (interrupted) recovered from unfinished working files: the \
+                 merged video is intact up to where the capture stopped, but its \
+                 very tail may be cut, and the stream continued past that point — \
+                 Download VOD gets the whole broadcast if it's still published. \
+                 Merge is lossless and runs throttled like any finalize pass.",
             );
             for (i, (rec, parts)) in self.issues_unmerged.iter().enumerate() {
                 ui.horizontal(|ui| {
@@ -640,9 +812,17 @@ impl StreamArchiverApp {
                         .iter()
                         .map(|p| self.fs_probes.len(p))
                         .sum();
+                    let partial = parts
+                        .iter()
+                        .any(|p| p.to_string_lossy().ends_with(".part"));
                     ui.colored_label(
                         egui::Color32::from_rgb(220, 160, 30),
-                        format!("{name} — {} part(s), {}", parts.len(), fmt_bytes(total as i64)),
+                        format!(
+                            "{name} — {} part(s), {}{}",
+                            parts.len(),
+                            fmt_bytes(total as i64),
+                            if partial { " (interrupted)" } else { "" },
+                        ),
                     );
                     if ui
                         .add_enabled(!has_active_remux, egui::Button::new("🧩 Merge into MKV"))
@@ -655,6 +835,42 @@ impl StreamArchiverApp {
                         .clicked()
                     {
                         *act = Some(Act::MergeSplit(i));
+                    }
+                    if ui
+                        .button("📼 Download VOD")
+                        .on_hover_text(
+                            "Archive the published VOD instead / as well — the only \
+                             way to get the part of the stream after the capture \
+                             died.",
+                        )
+                        .clicked()
+                    {
+                        *act = Some(Act::DownloadVodUnmerged(i));
+                    }
+                    if ui.button("🔍")
+                        .on_hover_text("View details in a window.")
+                        .clicked()
+                    {
+                        let mut text = format!(
+                            "Status: {}\nPath: {}\n\nSurviving parts:",
+                            rec.status, rec.output_path
+                        );
+                        for p in parts {
+                            text.push_str(&format!(
+                                "\n  {} ({})",
+                                p.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(),
+                                fmt_bytes(self.fs_probes.len(p) as i64),
+                            ));
+                        }
+                        if let Some(hint) = network_failure_hint(&rec.log_excerpt) {
+                            text.push_str("\n\n");
+                            text.push_str(hint);
+                        }
+                        if !rec.log_excerpt.is_empty() {
+                            text.push_str("\n\n");
+                            text.push_str(rec.log_excerpt.trim());
+                        }
+                        *act = Some(Act::ViewError(name.clone(), text));
                     }
                 });
             }
@@ -751,6 +967,7 @@ impl StreamArchiverApp {
                     + self.issues_muted_vod.len()
                     + self.issues_unmerged.len()
                     + self.issues_head_mismatch.len()
+                    + self.issues_stale_recording.len()
             ));
             if ui.button("⟳ Refresh").clicked() {
                 self.issues_refreshed = None;
@@ -1230,6 +1447,9 @@ impl StreamArchiverApp {
                     format!("status: {}", rec.status),
                     format!("path: {}", rec.output_path),
                 ];
+                if let Some(hint) = network_failure_hint(&rec.log_excerpt) {
+                    parts.push(format!("\n{hint}"));
+                }
                 if !rec.log_excerpt.is_empty() {
                     parts.push(rec.log_excerpt.trim().to_string());
                 }
@@ -1324,6 +1544,9 @@ impl StreamArchiverApp {
                 let mut parts = vec![format!("status: {}", rec.status)];
                 if !exit_str.is_empty() { parts.push(exit_str.clone()); }
                 if !rec.output_path.is_empty() { parts.push(format!("path: {}", rec.output_path)); }
+                if let Some(hint) = network_failure_hint(&rec.log_excerpt) {
+                    parts.push(format!("\n{hint}"));
+                }
                 if !rec.log_excerpt.is_empty() { parts.push(format!("\n{}", rec.log_excerpt.trim())); }
                 parts.join("\n")
             };
@@ -1538,6 +1761,21 @@ impl StreamArchiverApp {
                 .manual(crate::events::ManualCommand::MergeSplitCapture(rec.id));
             self.status = format!("Merging split capture for recording {}…", rec.id);
         }
+        if let Some(Act::DownloadVodUnmerged(i)) = act
+            && let Some((rec, _)) = self.issues_unmerged.get(i)
+        {
+            self.core
+                .manual(crate::events::ManualCommand::ArchiveVodNow(rec.id));
+            self.status = format!("Downloading the published VOD for recording {}…", rec.id);
+        }
+        if let Some(Act::FinalizeStale(i)) = act
+            && let Some((rec, _)) = self.issues_stale_recording.get(i)
+        {
+            self.core
+                .manual(crate::events::ManualCommand::FinalizeRecording(rec.id));
+            self.status = format!("Finalizing recording {}…", rec.id);
+            self.issues_refreshed = None;
+        }
         if let Some(Act::RefetchHeadMatchLive(i)) = act
             && let Some((rec, _, _)) = self.issues_head_mismatch.get(i)
         {
@@ -1665,5 +1903,25 @@ impl StreamArchiverApp {
         if !open {
             self.issues_error_view = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_hint_matches_dns_failures() {
+        // The exact shape of the Maid Mint / Anya failed-resume logs (2026-07-12).
+        assert!(network_failure_hint(
+            "WARNING: [youtube:tab] HTTPSConnection(host='www.youtube.com', port=443): \
+             Failed to resolve 'www.youtube.com' ([Errno 11001] getaddrinfo failed). \
+             Retrying (1/3)..."
+        )
+        .is_some());
+        assert!(network_failure_hint("Temporary failure in name resolution").is_some());
+        // Real tool errors must not be blamed on the network.
+        assert!(network_failure_hint("ERROR: This live event has ended.").is_none());
+        assert!(network_failure_hint("").is_none());
     }
 }

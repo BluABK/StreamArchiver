@@ -477,7 +477,13 @@ impl Supervisor {
             return;
         };
         let capture = PathBuf::from(&rec.output_path);
-        let parts = find_split_media(&capture);
+        // Finished per-format files first; for a take whose tool died mid-write
+        // fall back to the largest surviving `.part` per format — the media is
+        // intact up to where the capture stopped (the very tail may be cut).
+        let mut parts = find_split_media(&capture);
+        if parts.is_empty() {
+            parts = find_split_parts(&capture);
+        }
         if parts.is_empty() {
             warn!(rec_id, "merge split capture: no split parts found");
             return;

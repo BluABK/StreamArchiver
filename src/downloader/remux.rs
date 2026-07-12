@@ -278,10 +278,29 @@ pub(super) async fn remux_ts_to_mkv_impl(
     opts: &crate::models::RemuxOpts,
     allow_readrate: bool,
 ) -> anyhow::Result<()> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-
     // One full-file pass at a time on the recordings drive (see io_gate).
     let gate = crate::io_gate::local_pass("remux").await;
+    remux_ts_to_mkv_gated(src, dst, progress_tx, opts, allow_readrate, gate).await
+}
+
+/// The gated body of [`remux_ts_to_mkv_impl`]. The disk-gate permit is an
+/// argument so retries (pacing collapse, readrate-unsupported) KEEP this
+/// file's turn. Releasing and re-acquiring used to send every retry to the
+/// back of the queue — with a backlog of remuxes, each file burned a
+/// 3-minute throttled attempt per gate turn, got killed by the pacing
+/// watchdog, and rejoined the back: the whole queue carouseled for hours
+/// without a single file finishing (observed 2026-07-12, ~10 queued passes
+/// cycling across app restarts).
+async fn remux_ts_to_mkv_gated(
+    src: &Path,
+    dst: &Path,
+    progress_tx: Option<(EventTx, u64)>,
+    opts: &crate::models::RemuxOpts,
+    allow_readrate: bool,
+    gate: tokio::sync::OwnedSemaphorePermit,
+) -> anyhow::Result<()> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
     let readrate = if allow_readrate { crate::io_gate::readrate() } else { None };
 
     // Get total duration so we can compute a percentage from ffmpeg's output.
@@ -463,27 +482,25 @@ pub(super) async fn remux_ts_to_mkv_impl(
     let stderr_lines = stderr_task.await.unwrap_or_default();
 
     if pacing_broken {
-        // Release the gate first — the retry re-acquires it (1 permit).
-        drop(gate);
         warn!(
             "remux: -readrate pacing collapsed (media time far behind wall clock — \
-             timestamp discontinuities in the source, e.g. ad-break cuts); retrying \
-             without the throttle: {}",
+             disk contention or timestamp discontinuities in the source, e.g. \
+             ad-break cuts); retrying without the throttle, keeping this file's \
+             disk-gate turn: {}",
             src.display()
         );
-        return Box::pin(remux_ts_to_mkv_impl(src, dst, progress_tx, opts, false)).await;
+        return Box::pin(remux_ts_to_mkv_gated(src, dst, progress_tx, opts, false, gate)).await;
     }
 
     if status.success() {
         Ok(())
     } else {
         // Older ffmpeg (< 5.0) rejects -readrate outright: latch that
-        // process-wide and retry this pass once without the throttle.
-        // Release the gate first — the retry re-acquires it (1 permit).
+        // process-wide and retry this pass once without the throttle,
+        // keeping our disk-gate turn.
         if readrate.is_some() && crate::io_gate::is_readrate_error(&stderr_lines.join("\n")) {
             crate::io_gate::mark_readrate_unsupported();
-            drop(gate);
-            return Box::pin(remux_ts_to_mkv_impl(src, dst, progress_tx, opts, true)).await;
+            return Box::pin(remux_ts_to_mkv_gated(src, dst, progress_tx, opts, true, gate)).await;
         }
         let code = status.code().unwrap_or(-1);
         // Grab the last few non-empty lines of stderr — ffmpeg prints the

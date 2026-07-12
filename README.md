@@ -627,6 +627,15 @@ The **⚠ Issues** button in the toolbar (turns amber with a count when issues e
   directly.
 - **Empty capture** — the capture file is 0 bytes (nothing to recover); Re-remux is disabled.
 - **Remux failed** — a previous re-remux attempt failed; hover the status cell for the ffmpeg error. The button is locked to avoid re-triggering a known-bad file.
+- **⏸ Marked 'recording' but not being written** — a take still claims to be
+  recording, but none of its files (final output or `.sa-cache\` working
+  files, checked handle-true against NTFS's lazy metadata) have been written
+  for 10+ minutes. Either the capture process died without the app noticing
+  (power loss, sleep, forced kill) or the post-capture finalize is still
+  waiting for its turn at the disk gate — in the latter case the row shows
+  the live remux progress instead of an action. **🛠 Finalize now** promotes
+  whatever was captured (remux/move it out of the working folder) and settles
+  the row.
 - **🧩 Unmerged split captures (recoverable)** — the download tool died before
   merging its per-format files (SABR/DASH write video and audio separately and
   merge at the very end), so the final file was never written and the take
@@ -635,6 +644,15 @@ The **⚠ Issues** button in the toolbar (turns amber with a count when issues e
   parts into the final file (gated + throttled like any finalize pass, with a
   live progress bar in Background jobs and the same pacing watchdog as the
   finalize remux), promotes it, and marks the recording completed.
+
+  This also covers takes whose tool died **mid-write** (machine slept, power
+  loss): the unfinished `.part` sequences are recovered too — the largest
+  sequence per format is merged (marked *(interrupted)*; the very tail may be
+  cut). Since the stream usually continued past that point, each row also
+  offers **📼 Download VOD** to archive the whole published broadcast. When
+  the tool's log shows the failure was a network/DNS outage (e.g. the machine
+  woke from sleep before the network came up), the 🔍 details say so
+  explicitly instead of leaving a bare `getaddrinfo failed`.
 - **🔗 Head backfill can't join the live capture** — the head and the live
   capture carry different stream parameters, so the lossless `full.mkv` concat
   is impossible. The row shows the actual probed params (e.g. *head 1080p60 vs
@@ -646,6 +664,8 @@ The **⚠ Issues** button in the toolbar (turns amber with a count when issues e
   prevents new cases at the root.
 
 Every grid row carries a **🔍** action that opens the status-cell hover text (DB status, exit code, path, tool-log excerpt / ffmpeg error) in a details window — selectable, scrollable, with a **📋 Copy** button — so long errors don't have to be read from a transient tooltip.
+
+Every recording finalize (in-session, startup re-drive, resume, or manual) is announced as a **Background job** with live ffmpeg progress, so a take that is queued behind other remuxes on the disk gate is visibly *finalizing* instead of silently stuck. Remux passes whose `-readrate` pacing collapses retry unthrottled **while keeping their disk-gate turn** — previously a killed pass re-queued at the back, and a backlog of remuxes could carousel for hours without any file finishing.
 
 The Issues panel refreshes every 5 s while open and every 5 min while closed — shortened to 15 s after something changed (a recording finalized, a re-attach, …), but never once-per-event: each sweep stats every recording on disk and holds the DB briefly, so an event storm must not stack sweeps. **⟳ Refresh** forces an immediate rescan.
 

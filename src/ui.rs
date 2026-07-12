@@ -625,6 +625,10 @@ pub struct StreamArchiverApp {
     /// (codec/resolution mismatch), with display strings: (rec, head params,
     /// live params).
     issues_head_mismatch: Vec<(crate::models::Recording, String, String)>,
+    /// Rows still marked `recording` whose files have gone quiet (capture died
+    /// unnoticed, or the finalize is pending) + seconds since the last write
+    /// (`None` = nothing on disk).
+    issues_stale_recording: Vec<(crate::models::Recording, Option<i64>)>,
     /// In-flight background Issues scan (see [`IssuesScan`]). Every
     /// `path.exists()`/ffprobe the Issues panel needs runs on this thread —
     /// against the recordings drive a single stat can block for seconds, so
