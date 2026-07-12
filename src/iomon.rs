@@ -402,10 +402,15 @@ fn record_inner(
                 .compare_exchange(prev, now_ms, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
         {
+            // The thread name decides how bad this is: "main" = the UI froze
+            // for the duration (a render-path I/O regression — see FsProbes);
+            // a worker (fs-probes, issues-missing-check, tokio…) just means
+            // the disk is busy and a cached value went stale.
             tracing::warn!(
-                "slow {} op ({}ms): {} [{}] {}",
+                "slow {} op ({}ms) on thread '{}': {} [{}] {}",
                 kind.label(),
                 dur.as_millis(),
+                std::thread::current().name().unwrap_or("?"),
                 cat.label(),
                 region.label(),
                 path.map(|p| p.display().to_string()).unwrap_or_default()
