@@ -555,6 +555,12 @@ impl StreamArchiverApp {
         // Snapshot which monitors currently have an ad playing (for the row tint).
         let ad_active = self.core.ad_active.lock().unwrap().clone();
         let ad_running = |mid: i64| ad_active.get(&mid).is_some_and(|&end| now < end);
+        // Snapshot capture-ended-but-finalize-pending takes (monitor -> rec):
+        // these monitors are still in `active` while their remux waits at the
+        // disk gate, and must show "finalizing", not "recording".
+        let finalizing_mons: HashMap<i64, i64> = self.core.finalizing.lock().unwrap().clone();
+        let finalizing_ids: HashSet<i64> = finalizing_mons.keys().copied().collect();
+        let finalizing_recs: HashSet<i64> = finalizing_mons.values().copied().collect();
         // Snapshot which monitors have a live-chat download running (💬 badge on
         // instance rows, bubbled up to their channel row while active).
         let active_chat_ids: HashSet<i64> =
@@ -720,9 +726,9 @@ impl StreamArchiverApp {
                                 Self::channel_row(
                                     &mut tr, &chan_entries[ci], &self.rows, groups,
                                     channel_avatars, channel_name_colors, &ptex,
-                                    active_ids, &active_chat_ids, &ad_running,
-                                    &exp_channels, now, sel_color, status_bgcolor,
-                                    &col_order, &mut out,
+                                    active_ids, &finalizing_ids, &active_chat_ids,
+                                    &ad_running, &exp_channels, now, sel_color,
+                                    status_bgcolor, &col_order, &mut out,
                                 );
                             }
                             Vis::Instance { row: ri, depth } => {
@@ -730,17 +736,18 @@ impl StreamArchiverApp {
                                     &mut tr, &self.rows[ri], depth, groups,
                                     &mut self.fs_probes, &self.settings,
                                     &self.scheduled_recordings, &ptex, now, active_ids,
-                                    &active_chat_ids, selected_monitor, &exp_instances,
-                                    instance_avatars, &stop_holds_snapshot, &ad_running,
-                                    sel_color, status_bgcolor, &col_order, &mut out,
+                                    &finalizing_ids, &active_chat_ids, selected_monitor,
+                                    &exp_instances, instance_avatars,
+                                    &stop_holds_snapshot, &ad_running, sel_color,
+                                    status_bgcolor, &col_order, &mut out,
                                 );
                             }
                             Vis::Stream { mid, gi, depth } => {
                                 Self::stream_row(
                                     &mut tr, &groups[&mid][gi], mid, depth, &self.rows,
                                     &mut self.fs_probes, &self.settings,
-                                    &self.background_tasks, ad_breaks, meta_logs,
-                                    &exp_streams, now, &col_order, &mut out,
+                                    &self.background_tasks, &finalizing_recs, ad_breaks,
+                                    meta_logs, &exp_streams, now, &col_order, &mut out,
                                 );
                             }
                             Vis::Take { mid, gi, ti, depth } => {
@@ -748,7 +755,8 @@ impl StreamArchiverApp {
                                     &mut tr, &groups[&mid][gi], ti, depth, &self.rows,
                                     mid, &self.core, &mut self.status,
                                     &mut self.fs_probes, &self.settings,
-                                    &self.background_tasks, ad_breaks, meta_logs,
+                                    &self.background_tasks, &finalizing_recs, ad_breaks,
+                                    meta_logs,
                                     &mut self.rename_rec_id, &mut self.rename_draft,
                                     &mut self.rename_preview,
                                     &mut self.show_rename_dialog, now, &col_order,
@@ -1140,6 +1148,7 @@ impl StreamArchiverApp {
         channel_name_colors: &HashMap<i64, (egui::Color32, bool)>,
         ptex: &PlatformTextures,
         active_ids: &HashSet<i64>,
+        finalizing_ids: &HashSet<i64>,
         active_chat_ids: &HashSet<i64>,
         ad_running: &impl Fn(i64) -> bool,
         exp_channels: &HashSet<i64>,
@@ -1154,9 +1163,13 @@ impl StreamArchiverApp {
         let mons: Vec<&MonitorWithChannel> =
             e.rows.iter().map(|&ri| &rows[ri]).collect();
         let ninst = mons.len();
-        let any_rec = mons
+        let any_rec = mons.iter().any(|m| {
+            active_ids.contains(&m.monitor.id) && !finalizing_ids.contains(&m.monitor.id)
+        });
+        let fin_count = mons
             .iter()
-            .any(|m| active_ids.contains(&m.monitor.id));
+            .filter(|m| finalizing_ids.contains(&m.monitor.id))
+            .count();
         let live_count = channel_live_count(&mons, active_ids);
         let expanded = exp_channels.contains(&cid);
         let platforms = channel_platforms(&mons);
@@ -1332,6 +1345,14 @@ impl StreamArchiverApp {
                                 "recording".to_string()
                             };
                             ui.colored_label(color, label).on_hover_text(hover);
+                        } else if fin_count > 0 {
+                            let (icon, color) = state_icon("finalizing");
+                            let label = if fin_count > 1 {
+                                format!("{icon} {fin_count}")
+                            } else {
+                                icon.to_string()
+                            };
+                            ui.colored_label(color, label).on_hover_text(FINALIZING_HOVER);
                         } else if live_count > 0 {
                             let (icon, color) = state_icon("live");
                             let label = if live_count > 1 {
@@ -1555,6 +1576,7 @@ impl StreamArchiverApp {
         ptex: &PlatformTextures,
         now: i64,
         active_ids: &HashSet<i64>,
+        finalizing_ids: &HashSet<i64>,
         active_chat_ids: &HashSet<i64>,
         selected_monitor: Option<i64>,
         exp_instances: &HashSet<i64>,
@@ -1567,7 +1589,10 @@ impl StreamArchiverApp {
         out: &mut StreamsOut,
     ) {
         let mid = row.monitor.id;
-        let recording = active_ids.contains(&mid);
+        let finalizing = finalizing_ids.contains(&mid);
+        // "Recording" = a live capture process; a finalize-pending take still
+        // occupies `active` but its capture has ended.
+        let recording = active_ids.contains(&mid) && !finalizing;
         let chat_active = active_chat_ids.contains(&mid);
         let is_selected = selected_monitor == Some(mid);
         let has_hist = row.recording_count > 0;
@@ -1656,7 +1681,7 @@ impl StreamArchiverApp {
             }
         });
         if render_instance_row(
-            tr, row, ptex, now, recording, chat_active,
+            tr, row, ptex, now, recording, finalizing, chat_active,
             tint, output_dir_ok, depth, has_hist, expanded,
             inst_needs_remux,
             inst_stream_target.as_ref(), &media_player,
@@ -1682,6 +1707,7 @@ impl StreamArchiverApp {
         fs_probes: &mut FsProbes,
         settings: &SettingsForm,
         background_tasks: &[crate::events::BackgroundTask],
+        finalizing_recs: &HashSet<i64>,
         ad_breaks: &HashMap<i64, Vec<AdBreak>>,
         meta_logs: &HashMap<i64, Vec<StreamMetaChange>>,
         exp_streams: &HashSet<String>,
@@ -1821,9 +1847,14 @@ impl StreamArchiverApp {
                         }
                     }
                     "state" => {
-                        let (icon, color) = state_icon(g.status());
+                        let finalizing = g.status() == "recording"
+                            && g.takes.iter().any(|t| finalizing_recs.contains(&t.id));
+                        let shown = if finalizing { "finalizing" } else { g.status() };
+                        let (icon, color) = state_icon(shown);
                         let resp = ui.colored_label(color, icon);
-                        if g.status() == "failed" {
+                        if finalizing {
+                            resp.on_hover_text(FINALIZING_HOVER);
+                        } else if g.status() == "failed" {
                             let log = g
                                 .takes
                                 .last()
@@ -2124,6 +2155,7 @@ impl StreamArchiverApp {
         fs_probes: &mut FsProbes,
         settings: &SettingsForm,
         background_tasks: &[crate::events::BackgroundTask],
+        finalizing_recs: &HashSet<i64>,
         ad_breaks: &HashMap<i64, Vec<AdBreak>>,
         meta_logs: &HashMap<i64, Vec<StreamMetaChange>>,
         rename_rec_id: &mut Option<i64>,
@@ -2248,9 +2280,14 @@ impl StreamArchiverApp {
                         );
                     }
                     "state" => {
-                        let (icon, color) = state_icon(&t.status);
+                        let finalizing =
+                            t.status == "recording" && finalizing_recs.contains(&t.id);
+                        let shown = if finalizing { "finalizing" } else { t.status.as_str() };
+                        let (icon, color) = state_icon(shown);
                         let resp = ui.colored_label(color, icon);
-                        if t.status == "failed" {
+                        if finalizing {
+                            resp.on_hover_text(FINALIZING_HOVER);
+                        } else if t.status == "failed" {
                             let mut msg = fail_hover(&t.log_excerpt);
                             if let Some(code) = t.exit_code {
                                 msg = format!("{msg}\n(exit code {code})");

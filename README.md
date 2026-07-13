@@ -103,6 +103,14 @@ two tools on one URL.
    On/Duration/Title/Game/Viewers show whichever live instance went live
    **earliest**.
 
+   A take whose capture has **ended** but whose finalize (the remux/promote
+   into the output dir) is still running — or waiting in the disk-gate queue,
+   which can be hours behind after a restart recovers many interrupted takes —
+   shows **⌛ finalizing** instead of ⏺ recording, at the take, stream,
+   instance, and channel levels. The Background view shows the actual
+   remux progress and queue position. (Previously these kept showing
+   "recording" until the remux finished.)
+
    The instance and channel rows represent **present state only** — once an
    instance is neither recording nor live, its Went Live/Started On/Duration/
    Lost time cells go blank rather than showing a past recording's numbers

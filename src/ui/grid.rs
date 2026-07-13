@@ -1052,11 +1052,18 @@ pub(super) fn detection_icon(m: crate::models::DetectionMethod) -> &'static str 
     }
 }
 
+/// Hover text for the "finalizing" state (capture over, finalize pending).
+pub(super) const FINALIZING_HOVER: &str =
+    "Capture ended — finalizing: the remux/promote into the output dir is \
+     running or queued at the disk gate (large backlogs can take hours). \
+     Watch progress and the queue in the Background view.";
+
 /// Icon + color for the State column. Returns `(icon, text_color)`.
 pub(super) fn state_icon(state: &str) -> (&'static str, egui::Color32) {
     use egui::Color32;
     match state {
         "recording" => ("⏺", Color32::from_rgb(0x4d, 0x9b, 0xff)), // blue
+        "finalizing" => ("⌛", Color32::from_rgb(0xd8, 0xb4, 0x54)), // amber — capture over, remux pending
         "live" => ("●", SUCCESS_GREEN),                              // green (live not yet recording)
         "failed" => ("⚠", HL_ERROR_TEXT),                           // red
         "stopped" => ("⏹", Color32::from_gray(0xa0)),               // gray
@@ -1404,6 +1411,9 @@ pub(super) fn render_instance_row(
     ptex: &PlatformTextures,
     now: i64,
     recording: bool,
+    // Capture ended, finalize (remux/promote, possibly disk-gate-queued) still
+    // pending — overrides the "recording" state display.
+    finalizing: bool,
     chat_active: bool,
     tint: Option<egui::Color32>,
     // TTL-cached `output_dir` existence (menus re-run per frame while open).
@@ -1778,11 +1788,15 @@ pub(super) fn render_instance_row(
                         );
                         return;
                     }
-                    let (icon, color) = state_icon(&m.last_state);
+                    let shown_state = if finalizing { "finalizing" } else { &m.last_state };
+                    let (icon, color) = state_icon(shown_state);
                     let resp = ui.colored_label(color, icon);
-                    let is_failed = m.last_state == "failed"
-                        || row.last_recording_status.as_deref() == Some("failed");
-                    if is_failed {
+                    let is_failed = !finalizing
+                        && (m.last_state == "failed"
+                            || row.last_recording_status.as_deref() == Some("failed"));
+                    if finalizing {
+                        resp.on_hover_text(FINALIZING_HOVER);
+                    } else if is_failed {
                         resp.on_hover_text(fail_hover(&row.last_recording_log));
                     } else {
                         resp.on_hover_text(&m.last_state);

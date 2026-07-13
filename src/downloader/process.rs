@@ -953,6 +953,13 @@ impl Supervisor {
     /// `{resolution}` rename + lost-time accounting the in-session path does, finalize
     /// the recording/video row, drop the registry entry, and free the active-map slot.
     async fn finalize_reattached(&self, row: &DetachedRow, active: &ActiveSet) {
+        // The promote below can queue at the disk gate for hours while this
+        // monitor still occupies `active` — mark it "finalizing" for the UI.
+        if row.kind == DetachedKind::Recording
+            && let Some(mid) = row.monitor_id
+        {
+            self.finalizing.lock().unwrap().insert(mid, row.ref_id);
+        }
         let capture_path = PathBuf::from(&row.capture_path);
         let final_pred = PathBuf::from(&row.final_path);
         let mut final_path = if row.remux_to_mkv {
@@ -1212,6 +1219,13 @@ impl Supervisor {
                 purge_cache(cache, &stem).await;
             }
         }
+        // Recording kind only — a chat/video row for the same monitor must not
+        // clear a recording finalize still in flight.
+        if row.kind == DetachedKind::Recording
+            && let Some(mid) = row.monitor_id
+        {
+            self.finalizing.lock().unwrap().remove(&mid);
+        }
     }
 
     /// Manual rescue for a row stuck in `recording` with no live capture
@@ -1270,6 +1284,8 @@ impl Supervisor {
         };
         let is_ts = src.extension().is_some_and(|e| e.eq_ignore_ascii_case("ts"));
         let in_cache = strip_cache_component(&src).is_some();
+        // The promote below can queue at the disk gate; show "finalizing".
+        self.finalizing.lock().unwrap().insert(rec.monitor_id, rec_id);
         let final_path = if is_ts || in_cache {
             let final_pred = strip_cache_component(&src)
                 .unwrap_or_else(|| src.clone())
@@ -1309,6 +1325,7 @@ impl Supervisor {
             status: status.into(),
         });
         let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
+        self.finalizing.lock().unwrap().remove(&rec.monitor_id);
         info!(rec_id, bytes, status, "finalize now: settled");
     }
 
@@ -1435,6 +1452,9 @@ impl Supervisor {
             .await;
         let ended = now_unix();
 
+        // Capture over — the promote below may queue at the disk gate; show
+        // "finalizing" in the UI rather than a stale "recording".
+        self.finalizing.lock().unwrap().insert(monitor_id, rec_id);
         // Finalize: promote .cache → output dir, move companions, post-rename, purge.
         let mut final_path = promote_capture(
             &plan,
@@ -1552,6 +1572,7 @@ impl Supervisor {
             tokio::spawn(async move { this.maybe_concat_backfill(rec_id).await });
         }
         info!(monitor_id, rec_id, bytes, status, "resumed recording finished");
+        self.finalizing.lock().unwrap().remove(&monitor_id);
         self.active.lock().unwrap().remove(&monitor_id);
     }
     pub(super) async fn run_process(

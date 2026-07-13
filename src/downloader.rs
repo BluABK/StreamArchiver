@@ -74,6 +74,15 @@ pub type VideoSpeed = Arc<Mutex<HashMap<i64, f64>>>;
 /// naturally (now >= value) and are removed when the recording ends.
 pub type AdActive = Arc<Mutex<HashMap<i64, i64>>>;
 
+/// monitor_id -> rec_id of a take whose capture process has ENDED but whose
+/// finalize (remux/promote, possibly queued behind the disk gate for hours)
+/// hasn't completed yet. The monitor stays in [`ActiveSet`] for that whole
+/// span, so without this the UI would keep saying "recording" long after the
+/// stream ended (the Arielle/Bao/crelly report, 2026-07-13). Written by the
+/// in-session, re-attach, and SABR-resume finalize paths; read by the Streams
+/// grid to show "finalizing" instead.
+pub type Finalizing = Arc<Mutex<HashMap<i64, i64>>>;
+
 /// Key for the per-stream SABR stall maps: `(monitor_id, stream_id)`. Fully
 /// per-stream when a video ID is known; degrades to per-monitor otherwise.
 type SabrKey = (i64, Option<String>);
@@ -205,6 +214,9 @@ pub struct Supervisor {
     /// monitor_id -> child PID of in-flight live-chat sidecar downloads.
     /// Shared with AppCore so the UI can show the chat-active indicator.
     pub active_chats: Arc<Mutex<HashMap<i64, u32>>>,
+    /// Capture-ended-but-finalize-pending takes (see [`Finalizing`]).
+    /// Shared with AppCore so the UI shows "finalizing" instead of "recording".
+    finalizing: Finalizing,
     /// monitor_ids whose chat download was asked to stop.
     stopping_chats: Arc<Mutex<HashSet<i64>>>,
     shutdown: Arc<AtomicBool>,

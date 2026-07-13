@@ -79,6 +79,10 @@ pub struct AppCore {
     /// monitor_id -> stop-hold (user Stop suppressing automatic restarts).
     /// Written by the supervisor, read by the UI for the ✋ state badge.
     pub stop_holds: crate::downloader::StopHolds,
+    /// monitor_id -> rec_id of takes whose capture ended but whose finalize
+    /// (remux, possibly gate-queued for hours) is still pending. Read by the
+    /// Streams grid to show "finalizing" instead of a stale "recording".
+    pub finalizing: crate::downloader::Finalizing,
     /// Set during shutdown so the scheduler/supervisor stop starting new work.
     pub shutdown: Arc<AtomicBool>,
     /// Set by a "Quit & stop recordings" action so the exit path kills the tool
@@ -140,6 +144,7 @@ impl AppCore {
             video_speed: Arc::new(Mutex::new(HashMap::new())),
             ad_active: Arc::new(Mutex::new(HashMap::new())),
             stop_holds: Arc::new(Mutex::new(HashMap::new())),
+            finalizing: Arc::new(Mutex::new(HashMap::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             force_stop_on_quit: AtomicBool::new(false),
             manual_tx: Mutex::new(None),
@@ -317,6 +322,7 @@ impl AppCore {
             self.ad_active.clone(),
             max_concurrent,
             self.stop_holds.clone(),
+            self.finalizing.clone(),
         );
         // Crash/restart recovery, in two synchronous passes so reservations land
         // before detection can fire:

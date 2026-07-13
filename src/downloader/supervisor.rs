@@ -19,6 +19,7 @@ impl Supervisor {
         ad_active: AdActive,
         max_concurrent: usize,
         stop_holds: StopHolds,
+        finalizing: Finalizing,
     ) -> Supervisor {
         // Restore the persisted holds into the shared map (the UI reads it).
         *stop_holds.lock().unwrap() = load_stop_holds(&store);
@@ -48,6 +49,7 @@ impl Supervisor {
             running_concats: Arc::new(Mutex::new(HashSet::new())),
             quality_upgraded: Arc::new(Mutex::new(HashSet::new())),
             stop_holds,
+            finalizing,
         }
     }
 
@@ -2420,6 +2422,10 @@ progress_info: None,
 
         self.stop_record_watchers(watcher_done, watcher, meta_done, meta_task, chat_done, chat_task)
             .await;
+        // Capture over, finalize begins — the promote below can sit in the disk-
+        // gate queue for hours, so tell the UI this monitor is "finalizing", not
+        // still recording (it stays in `active` until the very end).
+        self.finalizing.lock().unwrap().insert(monitor_id, rec_id);
         // Broadcast end ~= when the tool exited; snapshot it before remux so the
         // span (and thus lost-time) isn't inflated by remux duration.
         let ended = now_unix();
@@ -2464,6 +2470,7 @@ progress_info: None,
         if !manually_stopped {
             self.note_result(monitor_id, duration, ok);
         }
+        self.finalizing.lock().unwrap().remove(&monitor_id);
         self.active.lock().unwrap().remove(&monitor_id);
         self.ad_active.lock().unwrap().remove(&monitor_id);
     }

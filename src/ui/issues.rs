@@ -547,13 +547,19 @@ impl StreamArchiverApp {
                         .filter(|r| !unmerged_ids.contains(&r.id))
                         .collect();
                     // Rows still marked 'recording' whose files have gone
-                    // quiet: capture died unnoticed, or finalize pending.
+                    // quiet: capture died unnoticed. Takes whose finalize is
+                    // already in flight (remux queued at the disk gate — the
+                    // Streams grid shows them "finalizing") are excluded:
+                    // offering "Finalize now" there would double-promote.
                     let now = crate::models::now_unix();
+                    let finalizing_recs: std::collections::HashSet<i64> =
+                        core.finalizing.lock().unwrap().values().copied().collect();
                     let stale_recording: Vec<_> = core
                         .store
                         .recordings_marked_recording()
                         .unwrap_or_default()
                         .into_iter()
+                        .filter(|r| !finalizing_recs.contains(&r.id))
                         .filter_map(|r| {
                             // A capture in its first minutes may not have
                             // files yet — never list those.
