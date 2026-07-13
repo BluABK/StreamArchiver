@@ -31,7 +31,7 @@ const STALE_RECORDING_SECS: i64 = 600;
 
 /// A human explanation when a capture/resume died on a network/DNS failure —
 /// matched against the tool's log tail.
-fn network_failure_hint(log: &str) -> Option<&'static str> {
+pub(super) fn network_failure_hint(log: &str) -> Option<&'static str> {
     let broken = [
         "getaddrinfo failed",
         "Failed to resolve",

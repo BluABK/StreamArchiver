@@ -496,12 +496,34 @@ pub(super) fn channel_platforms(monitors: &[&MonitorWithChannel]) -> Vec<Platfor
     out
 }
 
-/// Tooltip for a failed row: the captured reason (last stderr line), if any.
+/// Tooltip for a failed row: the most meaningful captured error line, plus a
+/// likely-cause hint for recognizable failures (network/DNS).
+///
+/// Tools print `ERROR: <the actual problem>` followed by a Python traceback
+/// whose frames (`File "...", line N, in ...`) say nothing useful — the old
+/// "last non-empty line" rule surfaced exactly such a frame (rec 653's DNS
+/// failure hovered as `File "yt_dlp\extractor\youtube\_tab.py", line 925…`).
 pub(super) fn fail_hover(log: &str) -> String {
-    match log.lines().map(str::trim).rev().find(|l| !l.is_empty()) {
-        Some(reason) => format!("Failed: {reason}"),
+    let lines: Vec<&str> = log.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let reason = lines
+        .iter()
+        .rev()
+        .find(|l| {
+            let low = l.to_ascii_lowercase();
+            low.starts_with("error") || low.contains(" error: ")
+        })
+        // No explicit error line: last line that isn't a traceback frame.
+        .or_else(|| lines.iter().rev().find(|l| !l.starts_with("File \"")))
+        .copied();
+    let mut out = match reason {
+        Some(r) => format!("Failed: {r}"),
         None => "Failed (no captured output).".to_string(),
+    };
+    if let Some(hint) = network_failure_hint(log) {
+        out.push_str("\n\n🌐 ");
+        out.push_str(hint);
     }
+    out
 }
 /// Version-picker entry: capture timestamp, `(current)` on the newest.
 pub(super) fn about_version_label(snaps: &[crate::store::AboutSnapshotRow], i: usize) -> String {
@@ -1204,6 +1226,24 @@ mod tests {
     use super::*;
     #[allow(unused_imports)]
     use std::path::PathBuf;
+
+    /// The rec-653 hover: the real `ERROR:` line must win over the traceback
+    /// frames that follow it, and a DNS failure gets the likely-cause hint.
+    #[test]
+    fn fail_hover_prefers_error_line_over_traceback_frames() {
+        let log = "\
+WARNING: [youtube:tab] Failed to resolve 'www.youtube.com' ([Errno 11001] getaddrinfo failed). Retrying (3/3)...
+ERROR: [youtube:tab] @AnyaNyabyss: Playlists that require authentication may not extract correctly without a successful webpage download.
+  File \"yt_dlp\\extractor\\common.py\", line 763, in extract
+  File \"yt_dlp\\extractor\\youtube\\_tab.py\", line 925, in _report_playlist_authcheck";
+        let hover = fail_hover(log);
+        assert!(hover.starts_with("Failed: ERROR: [youtube:tab]"), "{hover}");
+        assert!(!hover.contains("line 925"), "traceback frame leaked: {hover}");
+        assert!(hover.contains("🌐"), "DNS hint missing: {hover}");
+        // No error line at all → last non-frame line, no hint.
+        let plain = fail_hover("something odd\n  File \"x.py\", line 1, in y");
+        assert_eq!(plain, "Failed: something odd");
+    }
 
     #[test]
     fn alt_preview_big_viewport_shows_full_size_beside_cursor() {
