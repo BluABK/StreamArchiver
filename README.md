@@ -109,7 +109,10 @@ two tools on one URL.
    shows **⌛ finalizing** instead of ⏺ recording, at the take, stream,
    instance, and channel levels. The Background view shows the actual
    remux progress and queue position. (Previously these kept showing
-   "recording" until the remux finished.)
+   "recording" until the remux finished.) A finalizing take no longer blocks
+   the monitor either: polling resumes and a new take can start the moment
+   the capture process exits, so a stream that drops and comes back is
+   re-captured immediately even while the old take's remux is still queued.
 
    The instance and channel rows represent **present state only** — once an
    instance is neither recording nor live, its Went Live/Started On/Duration/

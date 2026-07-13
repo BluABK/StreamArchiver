@@ -2424,8 +2424,14 @@ progress_info: None,
             .await;
         // Capture over, finalize begins — the promote below can sit in the disk-
         // gate queue for hours, so tell the UI this monitor is "finalizing", not
-        // still recording (it stays in `active` until the very end).
+        // still recording. Crucially, FREE THE ACTIVE SLOT NOW: while a monitor
+        // is in `active`, the scheduler skips polling it and try_begin refuses
+        // new takes — holding it through a queued remux made a dropped-and-
+        // restarted stream invisible for the whole wait (DougDoug, 2026-07-14:
+        // his restart went uncaptured for 2+ h behind a 7 GB remux queue).
         self.finalizing.lock().unwrap().insert(monitor_id, rec_id);
+        self.active.lock().unwrap().remove(&monitor_id);
+        self.ad_active.lock().unwrap().remove(&monitor_id);
         // Broadcast end ~= when the tool exited; snapshot it before remux so the
         // span (and thus lost-time) isn't inflated by remux duration.
         let ended = now_unix();
@@ -2471,8 +2477,6 @@ progress_info: None,
             self.note_result(monitor_id, duration, ok);
         }
         self.finalizing.lock().unwrap().remove(&monitor_id);
-        self.active.lock().unwrap().remove(&monitor_id);
-        self.ad_active.lock().unwrap().remove(&monitor_id);
     }
 
     /// Resolve the effective auth source and, when the filename template wants
@@ -3215,9 +3219,14 @@ progress_info: None,
             &final_path.to_string_lossy(),
             &outcome.log,
         );
-        let _ = self
-            .store
-            .set_monitor_check_result(monitor_id, status, now_unix());
+        // The active slot was freed at capture exit (finalize may have queued
+        // for hours) — a NEW take can already be recording this monitor. Don't
+        // overwrite its live state with this old take's terminal status.
+        if !self.active.lock().unwrap().contains_key(&monitor_id) {
+            let _ = self
+                .store
+                .set_monitor_check_result(monitor_id, status, now_unix());
+        }
         let _ = self.events.send(AppEvent::RecordingFinished {
             recording_id: rec_id,
             channel: row.channel.name.clone(),

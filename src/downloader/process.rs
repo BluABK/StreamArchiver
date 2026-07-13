@@ -953,12 +953,15 @@ impl Supervisor {
     /// `{resolution}` rename + lost-time accounting the in-session path does, finalize
     /// the recording/video row, drop the registry entry, and free the active-map slot.
     async fn finalize_reattached(&self, row: &DetachedRow, active: &ActiveSet) {
-        // The promote below can queue at the disk gate for hours while this
-        // monitor still occupies `active` — mark it "finalizing" for the UI.
+        // The promote below can queue at the disk gate for hours — mark the
+        // monitor "finalizing" for the UI and FREE ITS ACTIVE SLOT now (an
+        // adopted capture held it through `wait_for_exit`), so polling resumes
+        // and a restarted stream can start a fresh take immediately.
         if row.kind == DetachedKind::Recording
             && let Some(mid) = row.monitor_id
         {
             self.finalizing.lock().unwrap().insert(mid, row.ref_id);
+            active.lock().unwrap().remove(&mid);
         }
         let capture_path = PathBuf::from(&row.capture_path);
         let final_pred = PathBuf::from(&row.final_path);
@@ -1130,7 +1133,8 @@ impl Supervisor {
                     &final_path.to_string_lossy(),
                     &log,
                 );
-                active.lock().unwrap().remove(&key);
+                // Slot already freed at fn entry; removing `key` here could
+                // now evict a NEWER take that started during the gate wait.
                 let vod_platform = mrow.as_ref().map(|r| r.monitor.platform());
                 let vod_url = mrow.as_ref().map(|r| r.monitor.url.clone()).unwrap_or_default();
                 // Post-stream VOD archive (YouTube/Kick) for takes that
@@ -1155,7 +1159,12 @@ impl Supervisor {
                     let rid = row.ref_id;
                     tokio::spawn(async move { this.maybe_concat_backfill(rid).await });
                 }
-                if let Some(mid) = row.monitor_id {
+                if let Some(mid) = row.monitor_id
+                    && !active.lock().unwrap().contains_key(&mid)
+                {
+                    // Skipped when a newer take is already recording — its
+                    // live state must not be flipped to "offline" by this old
+                    // take's late finalize.
                     let _ = self.events.send(AppEvent::MonitorState {
                         monitor_id: mid,
                         state: "offline".into(),
@@ -1453,8 +1462,11 @@ impl Supervisor {
         let ended = now_unix();
 
         // Capture over — the promote below may queue at the disk gate; show
-        // "finalizing" in the UI rather than a stale "recording".
+        // "finalizing" in the UI rather than a stale "recording", and free the
+        // active slot NOW so polling resumes and a restarted stream can start
+        // a fresh take instead of being blocked behind this remux.
         self.finalizing.lock().unwrap().insert(monitor_id, rec_id);
+        self.active.lock().unwrap().remove(&monitor_id);
         // Finalize: promote .cache → output dir, move companions, post-rename, purge.
         let mut final_path = promote_capture(
             &plan,
@@ -1558,9 +1570,12 @@ impl Supervisor {
             &final_path.to_string_lossy(),
             &outcome.log,
         );
-        let _ = self
-            .store
-            .set_monitor_check_result(monitor_id, status, now_unix());
+        // Slot freed at capture exit — don't stomp a newer take's live state.
+        if !self.active.lock().unwrap().contains_key(&monitor_id) {
+            let _ = self
+                .store
+                .set_monitor_check_result(monitor_id, status, now_unix());
+        }
         let _ = self.events.send(AppEvent::RecordingFinished {
             recording_id: rec_id,
             channel: row.channel.name.clone(),
@@ -1573,7 +1588,6 @@ impl Supervisor {
         }
         info!(monitor_id, rec_id, bytes, status, "resumed recording finished");
         self.finalizing.lock().unwrap().remove(&monitor_id);
-        self.active.lock().unwrap().remove(&monitor_id);
     }
     pub(super) async fn run_process(
         &self,
