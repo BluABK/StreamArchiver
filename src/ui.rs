@@ -783,6 +783,16 @@ pub struct StreamArchiverApp {
     /// Font/element zoom for the calendar body only (toolbar + sidebar stay
     /// normal size). 1.0 = 100%; Ctrl+0 resets. Session-only, like `schedule_mode`.
     schedule_zoom: f32,
+    /// Per-channel display colour for every Schedule surface (event blocks,
+    /// chips, stripes, sidebar legend) — the SAME resolution as the Streams
+    /// list (custom colour > fetched Twitch broadcaster colour > palette),
+    /// rebuilt each frame the Schedule view renders. Twitch colours are
+    /// darkened for white-on-block readability (`block_safe_color`).
+    schedule_chan_colors: HashMap<i64, egui::Color32>,
+    /// Compact calendar events: collapse each Week/Day event block to a
+    /// one-line chip at its start time (quick overview when many streams
+    /// overlap). Persisted under [`K_SCHEDULE_COMPACT`].
+    schedule_compact: bool,
     /// The day whose full stream list is shown in a popup (local date; None = closed).
     schedule_day_popup: Option<chrono::NaiveDate>,
     /// Whether the "Schedule sources" dialog is open.

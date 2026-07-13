@@ -98,6 +98,24 @@ pub(super) fn channel_event_color(channel_id: i64, color: &str) -> egui::Color32
     PALETTE[(channel_id.unsigned_abs() as usize) % PALETTE.len()]
 }
 
+/// Darken a (possibly bright — e.g. a fetched Twitch broadcaster) channel
+/// colour enough that the white text drawn on calendar event blocks stays
+/// readable. Colours already dark enough pass through unchanged, so the
+/// curated palette and most custom colours are unaffected.
+pub(super) fn block_safe_color(c: egui::Color32) -> egui::Color32 {
+    let lum = 0.2126 * c.r() as f32 + 0.7152 * c.g() as f32 + 0.0722 * c.b() as f32;
+    const MAX_LUM: f32 = 165.0;
+    if lum <= MAX_LUM {
+        return c;
+    }
+    let k = MAX_LUM / lum;
+    egui::Color32::from_rgb(
+        (c.r() as f32 * k) as u8,
+        (c.g() as f32 * k) as u8,
+        (c.b() as f32 * k) as u8,
+    )
+}
+
 /// Source-priority weight for auto-merge primary selection: lower = higher priority.
 /// YouTube sources beat platform (Twitch) sources because they're manually scheduled
 /// and have more accurate timing than the Twitch advance schedule.
@@ -375,8 +393,9 @@ pub(super) fn schedule_detail_row(
     hidden: bool,
     ptex: &PlatformTextures,
     merge_label: Option<&str>,
+    // The channel's shared Streams-list colour (`App::sched_color`).
+    color: egui::Color32,
 ) {
-    let color = channel_event_color(s.channel_id, &s.channel_color);
     let resp = ui
         .horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 5.0;
@@ -466,6 +485,10 @@ pub(super) fn secs_since_midnight(unix: i64) -> f32 {
 pub(super) fn layout_event_lanes(
     indices: &[usize],
     all: &[UpcomingStream],
+    // Compact mode: every event occupies exactly this many seconds of lane
+    // (its chip height), so lanes only split when *start times* land within
+    // the same chip — not for the whole real duration.
+    max_span_secs: Option<i64>,
 ) -> Vec<(usize, usize, usize)> {
     if indices.is_empty() {
         return vec![];
@@ -476,7 +499,10 @@ pub(super) fn layout_event_lanes(
 
     for &idx in indices {
         let s = &all[idx];
-        let end = effective_end(s);
+        let end = match max_span_secs {
+            Some(span) => s.start_time + span,
+            None => effective_end(s),
+        };
         // Find the first lane that is free at s.start_time.
         let lane = lane_end
             .iter()
@@ -511,6 +537,11 @@ pub(super) fn schedule_time_grid(
     hidden_segs: &HashSet<i64>,
     selected: &HashSet<i64>,
     merge_labels: &HashMap<i64, String>,
+    // Per-channel shared Streams-list colours (`App::schedule_chan_colors`);
+    // missing channels fall back to the custom/palette colour.
+    chan_colors: &HashMap<i64, egui::Color32>,
+    // Collapse every event to a one-line chip at its start time.
+    compact: bool,
 ) {
     use chrono::Timelike;
     let hour_px = SCHED_HOUR_PX * zoom;
@@ -518,6 +549,9 @@ pub(super) fn schedule_time_grid(
     let time_col_w = SCHED_TIME_COL_W * zoom;
     let col_gap = SCHED_COL_GAP * zoom;
     let min_block_h = SCHED_MIN_BLOCK_H * zoom;
+    // Seconds of grid one compact chip covers (its pixel height in time units)
+    // — the lane-collision window and the rendered height in compact mode.
+    let chip_span_secs = (min_block_h / hour_px * 3600.0).ceil();
 
     // Scroll to show the current local hour, but only the first time the view
     // appears so subsequent frames don't fight the user's manual scroll position.
@@ -620,12 +654,17 @@ pub(super) fn schedule_time_grid(
                 // duplicate (and grossly clipped) block in the time grid.
                 let indices: Vec<usize> =
                     day_indices.iter().copied().filter(|i| !exclude.contains(i)).collect();
-                let layout = layout_event_lanes(&indices, all);
+                let layout =
+                    layout_event_lanes(&indices, all, compact.then_some(chip_span_secs as i64));
 
                 for (stream_idx, lane, total_lanes) in layout {
                     let s = &all[stream_idx];
                     let start_secs = secs_since_midnight(s.start_time);
-                    let end_secs = secs_since_midnight(effective_end(s));
+                    let end_secs = if compact {
+                        start_secs + chip_span_secs
+                    } else {
+                        secs_since_midnight(effective_end(s))
+                    };
 
                     // Clip to day boundaries (midnight transitions handled by bucketing).
                     let end_secs = if end_secs <= start_secs {
@@ -653,7 +692,10 @@ pub(super) fn schedule_time_grid(
                     let evt_resp = ui.interact(block_rect, evt_id, egui::Sense::click());
                     let hovered = evt_resp.hovered();
 
-                    let color = channel_event_color(s.channel_id, &s.channel_color);
+                    let color = chan_colors
+                        .get(&s.channel_id)
+                        .copied()
+                        .unwrap_or_else(|| channel_event_color(s.channel_id, &s.channel_color));
                     let fill = if is_hidden {
                         // Soft-hidden: keep hue but drop alpha to ~35% so it reads as "ghost"
                         egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 85)
@@ -723,6 +765,28 @@ pub(super) fn schedule_time_grid(
                         let badge = source_badge(&s.source).0;
                         // Prepend 🔀 if this block is a merged primary
                         let merge_icon = if merge_label.is_some() { "🔀 " } else { "" };
+                        if compact {
+                            // One line, start time first: "HH:MM Channel — Title".
+                            let mut line = format!(
+                                "{}{}{} {} {}",
+                                if is_hidden { "⊘ " } else { "" },
+                                merge_icon,
+                                badge,
+                                fmt_time_short(s.start_time),
+                                s.channel_name,
+                            );
+                            if !s.title.is_empty() {
+                                line.push_str(" — ");
+                                line.push_str(&s.title);
+                            }
+                            text_painter.text(
+                                egui::pos2(text_rect.left(), block_rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                line,
+                                name_font,
+                                name_color,
+                            );
+                        } else {
                         let name_str = if is_hidden {
                             format!("⊘ {}{}{}", merge_icon, badge, s.channel_name)
                         } else {
@@ -753,6 +817,7 @@ pub(super) fn schedule_time_grid(
                                 title_color,
                             );
                         }
+                        }
                     }
 
                     let block_clicked = evt_resp.clicked();
@@ -781,5 +846,58 @@ pub(super) fn schedule_time_grid(
 
     if let Some(day) = clicked_day {
         *open_day = Some(day);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stream(id: i64, start: i64, end: Option<i64>) -> crate::models::UpcomingStream {
+        crate::models::UpcomingStream {
+            segment_id: id,
+            monitor_id: 1,
+            channel_id: 1,
+            channel_name: "ch".into(),
+            url: String::new(),
+            start_time: start,
+            end_time: end,
+            title: String::new(),
+            category: String::new(),
+            source: "platform".into(),
+            channel_color: String::new(),
+            merged_into: None,
+            auto_merge_excluded: false,
+        }
+    }
+
+    /// Compact mode: two long overlapping streams whose *starts* are far apart
+    /// share one lane (chips don't collide); two starts within the chip span
+    /// still split into side-by-side lanes.
+    #[test]
+    fn compact_lanes_split_only_when_starts_collide() {
+        // 3h-long streams starting 1h apart: overlap in real time, not as chips.
+        let all = vec![stream(1, 0, Some(3 * 3600)), stream(2, 3600, Some(4 * 3600))];
+        let full = layout_event_lanes(&[0, 1], &all, None);
+        assert_eq!(full.iter().map(|&(_, _, t)| t).max(), Some(2), "full mode overlaps");
+        let compact = layout_event_lanes(&[0, 1], &all, Some(660));
+        assert!(compact.iter().all(|&(_, _, t)| t == 1), "chips fit one lane");
+        // Starts 5 min apart with an 11-min chip span → chips collide → 2 lanes.
+        let close = vec![stream(1, 0, Some(3600)), stream(2, 300, Some(3600))];
+        let compact = layout_event_lanes(&[0, 1], &close, Some(660));
+        assert!(compact.iter().all(|&(_, _, t)| t == 2));
+    }
+
+    /// Bright colours (e.g. fetched Twitch spring green) darken for white block
+    /// text; already-dark palette colours pass through unchanged.
+    #[test]
+    fn block_safe_color_darkens_only_bright_colors() {
+        let bright = egui::Color32::from_rgb(0x00, 0xff, 0x7f); // Twitch spring green
+        let safe = block_safe_color(bright);
+        assert!(safe.g() < 0xff, "bright green must darken, got {safe:?}");
+        // Hue preserved: green still dominates.
+        assert!(safe.g() > safe.r() && safe.g() > safe.b());
+        let dark = egui::Color32::from_rgb(0x42, 0x88, 0xc4); // palette steel blue
+        assert_eq!(block_safe_color(dark), dark);
     }
 }

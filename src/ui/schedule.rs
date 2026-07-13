@@ -11,6 +11,10 @@ pub(super) enum ScheduleMode {
     Day,
     Agenda,
 }
+
+/// Setting key for the "Compact" calendar toggle (events collapse to a
+/// one-line chip at their start time in the Week/Day views).
+pub(super) const K_SCHEDULE_COMPACT: &str = "schedule_compact_events";
 /// Local timestamp in the active [`DateFmt`] (empty if unset). Used for the
 /// Polled / Went Live / Started On columns and the history tree.
 /// A clickable row in the "Schedule sources" dialog's Available column: the
@@ -532,6 +536,10 @@ impl StreamArchiverApp {
         // `schedule_week_grid` (immutable) can just look them up by channel id.
         let sched_rec_avatars = self.schedule_rec_avatars(ui);
 
+        // Shared Streams-list channel colours for every surface below
+        // (blocks, chips, stripes, sidebar legend).
+        self.rebuild_schedule_chan_colors();
+
         // Precompute (immutable reads of `self`) what the closures need: collisions
         // and the per-day buckets of visible streams (indices into `schedule_all`).
         let (collide, by_day, all_day_events) = self.schedule_visible_buckets();
@@ -630,6 +638,62 @@ impl StreamArchiverApp {
             open_sources,
             set_show_hidden,
         );
+    }
+
+    /// Rebuild the schedule's channel→colour map so every Schedule surface
+    /// (event blocks, chips, stripes, sidebar legend) uses the SAME colours
+    /// as the Streams list: a manual custom colour wins, else the streamer's
+    /// fetched Twitch broadcaster colour (darkened for white-on-block
+    /// readability), else the deterministic palette. Twitch colours load
+    /// once per channel per session via the same cache the Streams grid uses
+    /// (`channel_twitch_colors`).
+    fn rebuild_schedule_chan_colors(&mut self) {
+        // Collect what each channel needs first (no `self` borrows held), so
+        // the Twitch-colour cache below can be filled mutably.
+        let mut chans: Vec<(i64, String, String, Option<String>)> = Vec::new();
+        let mut seen: HashSet<i64> = HashSet::new();
+        for r in &self.rows {
+            let cid = r.channel.id;
+            if !seen.insert(cid) {
+                continue;
+            }
+            let mons: Vec<&MonitorWithChannel> =
+                self.rows.iter().filter(|x| x.channel.id == cid).collect();
+            let accounts = channel_asset_accounts(&mons);
+            let tw = preferred_account_index(&r.channel.preferred_asset, &accounts)
+                .filter(|&i| accounts[i].platform == Platform::Twitch)
+                .or_else(|| accounts.iter().position(|a| a.platform == Platform::Twitch))
+                .map(|i| accounts[i].account.clone());
+            chans.push((cid, r.channel.color.clone(), r.channel.name.clone(), tw));
+        }
+        self.schedule_chan_colors.clear();
+        for (cid, custom, name, tw) in chans {
+            let color = if !custom.is_empty() {
+                channel_event_color(cid, &custom)
+            } else if let Some(acct) = tw {
+                match *self
+                    .channel_twitch_colors
+                    .entry(cid)
+                    .or_insert_with(|| load_twitch_name_color(&name, &acct))
+                {
+                    Some(c) => block_safe_color(c),
+                    None => channel_event_color(cid, ""),
+                }
+            } else {
+                channel_event_color(cid, "")
+            };
+            self.schedule_chan_colors.insert(cid, color);
+        }
+    }
+
+    /// The display colour for a schedule entry — the shared Streams-list
+    /// colour when known, else the legacy custom/palette fallback (e.g. a
+    /// segment whose monitor was deleted after the schedule was fetched).
+    pub(super) fn sched_color(&self, s: &UpcomingStream) -> egui::Color32 {
+        self.schedule_chan_colors
+            .get(&s.channel_id)
+            .copied()
+            .unwrap_or_else(|| channel_event_color(s.channel_id, &s.channel_color))
     }
 
     /// Channel avatars for the week-view header's "recording scheduled" row
@@ -774,16 +838,38 @@ impl StreamArchiverApp {
                             }
                             // Pre-compute for context-menu closure (can't re-borrow self inside).
                             let ch_is_hidden = self.schedule_hidden.contains(&cid);
+                            // The channel's calendar colour — swatch + tinted
+                            // name make the sidebar double as the legend.
+                            let color = self
+                                .schedule_chan_colors
+                                .get(&cid)
+                                .copied()
+                                .unwrap_or_else(|| channel_event_color(cid, ""));
                             let row = ui.horizontal(|ui| {
                                 let mut vis = !ch_is_hidden;
                                 if ui.checkbox(&mut vis, "").changed() {
                                     *toggle_channel = Some(cid);
                                 }
+                                let (swatch, _) = ui.allocate_exact_size(
+                                    egui::vec2(10.0, 10.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().rect_filled(
+                                    swatch,
+                                    egui::CornerRadius::same(2),
+                                    color,
+                                );
                                 for &p in &plats {
                                     platform_icon(ui, ptex, p).on_hover_text(p.label());
                                 }
+                                let name_color =
+                                    readable_color(color, ui.visuals().panel_fill);
                                 ui.add(
-                                    egui::Label::new(format!("{name}  ({count})")).truncate(),
+                                    egui::Label::new(
+                                        egui::RichText::new(format!("{name}  ({count})"))
+                                            .color(name_color),
+                                    )
+                                    .truncate(),
                                 );
                             }).response;
                             // Context menu — captures only Copy values, uses temp data.
@@ -987,6 +1073,22 @@ impl StreamArchiverApp {
                     .changed()
                 {
                     *set_collisions = Some(hc);
+                }
+                let mut compact = self.schedule_compact;
+                if ui
+                    .checkbox(&mut compact, "Compact")
+                    .on_hover_text(
+                        "Collapse Week/Day events to a one-line chip at their start time — \
+                         a quick overview when many streams overlap. Hover a chip for the \
+                         full details.",
+                    )
+                    .changed()
+                {
+                    self.schedule_compact = compact;
+                    let _ = self
+                        .core
+                        .store
+                        .set_setting(K_SCHEDULE_COMPACT, if compact { "1" } else { "0" });
                 }
                 if self.schedule_collisions && collisions_in_view > 0 {
                     ui.colored_label(HL_COLLISION, format!("⚠ {collisions_in_view}"))
@@ -1271,7 +1373,7 @@ impl StreamArchiverApp {
         let is_hidden = self.schedule_hidden_segments.contains(&s.segment_id);
         let is_selected = self.schedule_selected.contains(&s.segment_id);
         let merge_label = self.schedule_merge_labels.get(&s.segment_id).map(String::as_str);
-        let color = channel_event_color(s.channel_id, &s.channel_color);
+        let color = self.sched_color(s);
         let stripe_color = if is_hidden {
             egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 85)
         } else {
@@ -1591,7 +1693,7 @@ impl StreamArchiverApp {
                 );
                 let evt_id = egui::Id::new("sched_allday").with(ws).with(*idx);
                 let evt_resp = ui.interact(rect, evt_id, egui::Sense::click());
-                let color = channel_event_color(s.channel_id, &s.channel_color);
+                let color = self.sched_color(s);
                 let fill = if evt_resp.hovered() {
                     color
                 } else {
@@ -1639,6 +1741,8 @@ impl StreamArchiverApp {
             &self.schedule_hidden_segments,
             &self.schedule_selected,
             &self.schedule_merge_labels,
+            &self.schedule_chan_colors,
+            self.schedule_compact,
         );
     }
 
@@ -1682,6 +1786,8 @@ impl StreamArchiverApp {
             &self.schedule_hidden_segments,
             &self.schedule_selected,
             &self.schedule_merge_labels,
+            &self.schedule_chan_colors,
+            self.schedule_compact,
         );
     }
 
@@ -1816,7 +1922,7 @@ impl StreamArchiverApp {
                         let s = &self.schedule_all[i];
                         let is_hidden = self.schedule_hidden_segments.contains(&s.segment_id);
                         let merge_label_agenda = self.schedule_merge_labels.get(&s.segment_id).map(String::as_str);
-                        let color = channel_event_color(s.channel_id, &s.channel_color);
+                        let color = self.sched_color(s);
                         let stripe_color = if is_hidden {
                             egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 85)
                         } else {
@@ -1951,7 +2057,7 @@ impl StreamArchiverApp {
                                 // surfaces ⚠ markers, so rows here are shown unmarked.
                                 let hidden = hidden_segs.contains(&s.segment_id);
                                 let ml = merge_labels.get(&s.segment_id).map(String::as_str);
-                                schedule_detail_row(ui, s, false, hidden, &ptex, ml);
+                                schedule_detail_row(ui, s, false, hidden, &ptex, ml, self.sched_color(s));
                                 // Action button strip — writes to the same temp-data keys
                                 // that schedule_view() drains each frame.
                                 ui.horizontal(|ui| {

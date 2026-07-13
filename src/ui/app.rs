@@ -31,6 +31,8 @@ impl StreamArchiverApp {
             .as_deref()
             != Some("0");
 
+        let schedule_compact = setting_or_empty(&core, K_SCHEDULE_COMPACT) == "1";
+
         let default_out = core
             .store
             .get_setting(K_DEFAULT_OUT)
@@ -419,6 +421,8 @@ impl StreamArchiverApp {
             schedule_show_hidden: false,
             schedule_collisions: true,
             schedule_zoom: 1.0,
+            schedule_chan_colors: HashMap::new(),
+            schedule_compact,
             schedule_day_popup: None,
             show_schedule_sources: false,
             schedule_sources_draft: Vec::new(),

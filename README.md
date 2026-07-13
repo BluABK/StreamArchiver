@@ -1191,12 +1191,26 @@ YouTube sources as the Next stream column) in a calendar, with **Month**, **Week
   day popup also has **Copy all**. Hover a stream for its full details.
 - **Left sidebar** filters which channels are shown: an **All channels** toggle
   plus a per-channel checkbox (with each channel's platform icon and upcoming
-  count). Newly-added channels default to visible.
+  count). Newly-added channels default to visible. Each row carries the
+  channel's **calendar color** as a swatch + tinted name, so the sidebar
+  doubles as the legend for the event blocks.
+- **Channel colors** are the *same* ones the Streams list uses: a manually
+  chosen custom color wins, else the streamer's own **Twitch name color**
+  (darkened just enough that white block text stays readable), else the
+  automatic palette. Every schedule surface — event blocks, month chips,
+  agenda stripes, day lists, the sidebar legend — resolves through this one
+  map, so an event is recognizable by color across views.
 - **Highlight collisions** (on by default) flags with a `⚠` any streams whose
   times overlap — handy for spotting clashes across channels. YouTube upcoming
   streams carry no end time, so they're treated as two hours long for the overlap
   check. The header shows how many overlapping streams are visible in the current
   view.
+- **Compact** (header checkbox, persisted): collapses every Week/Day event
+  block to a **one-line chip at its start time** (`HH:MM Channel — Title`)
+  instead of a duration-height block — a quick at-a-glance overview when many
+  overlapping streams would otherwise shred the columns into slivers. Chips
+  only split into side-by-side lanes when *start times* land within the same
+  chip, not for the whole real duration; hover any chip for the full details.
 
 Times respect the **date format** setting (12- vs 24-hour). `⟳` (or **F5** on the
 tab) **fetches the latest schedules from Twitch/YouTube right away** — it doesn't
