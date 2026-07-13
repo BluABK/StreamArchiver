@@ -37,6 +37,7 @@ pub(super) const MUTE_WATCH_INTERVAL_SECS: u64 = 180;
 /// then fast, then backed off — [`VOD_TOTAL_POLLS`] attempts). Marks the
 /// recording `not_published` if no matching VOD appears. When a clean VOD is
 /// found it keeps watching for a late DMCA mute (see [`watch_vod_mute`]).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn check_twitch_vod(
     ctx: Arc<DetectContext>,
     store: Arc<Store>,
@@ -44,6 +45,7 @@ pub(super) async fn check_twitch_vod(
     manual_tx: mpsc::UnboundedSender<ManualCommand>,
     rec_id: i64,
     login: String,
+    stream_id: Option<String>,
     went_live_at: Option<i64>,
 ) {
     let (client_id, token) = match ctx.twitch_helix_auth().await {
@@ -63,7 +65,16 @@ pub(super) async fn check_twitch_vod(
 
     for poll in 0..VOD_TOTAL_POLLS {
         tokio::time::sleep(Duration::from_secs(vod_poll_delay_secs(poll))).await;
-        match poll_twitch_vod(&ctx.http_client(), &client_id, &token, &user_id, went_live_at).await {
+        match poll_twitch_vod(
+            &ctx.http_client(),
+            &client_id,
+            &token,
+            &user_id,
+            stream_id.as_deref(),
+            went_live_at,
+        )
+        .await
+        {
             Ok(Some((vod_id, muted_secs))) => {
                 let _ = store.set_recording_vod_found(rec_id, &vod_id, muted_secs);
                 let _ = events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
@@ -260,15 +271,65 @@ pub(super) fn spawn_auto_recovery(ctx: &Arc<DetectContext>, store: &Arc<Store>, 
     });
 }
 
+/// Pick the recording's VOD out of a Helix `/videos` page (newest first).
+///
+/// When the recording knows its `stream_id`, only a video whose own
+/// `stream_id` matches is accepted — Helix archive videos carry the
+/// originating broadcast id, so this is exact. Crucially, a known-but-absent
+/// stream id returns `None` (VOD not published yet / deleted) instead of
+/// falling back to the window: rec 652 (2026-07-13) had the NEXT broadcast's
+/// VOD — published 1h57m after go-live, inside the 2 h window and sorted
+/// first — downloaded in place of the real one, which only the finalize
+/// sanity check caught. The `created_at` window remains as the fallback for
+/// recordings with no stream id (EventSub-less detections, old rows).
+pub(super) fn match_twitch_vod(
+    data: &[serde_json::Value],
+    stream_id: Option<&str>,
+    went_live_at: Option<i64>,
+) -> Option<(String, i64)> {
+    let entry = |item: &serde_json::Value| -> Option<(String, i64)> {
+        let vod_id = item["id"].as_str()?;
+        let muted_secs: i64 = item["muted_segments"]
+            .as_array()
+            .map(|segs| segs.iter().filter_map(|s| s["duration"].as_i64()).sum())
+            .unwrap_or(0);
+        Some((vod_id.to_string(), muted_secs))
+    };
+    if let Some(want) = stream_id.filter(|s| !s.is_empty()) {
+        return data
+            .iter()
+            .find(|item| item["stream_id"].as_str() == Some(want))
+            .and_then(entry);
+    }
+    for item in data {
+        let Some(created_at_str) = item["created_at"].as_str() else {
+            continue;
+        };
+        let Some(created_ts) = crate::detectors::parse_rfc3339(created_at_str) else {
+            continue;
+        };
+        let matches = match went_live_at {
+            Some(wl) => (created_ts - wl).abs() <= crate::vod_archive::VOD_MATCH_WINDOW_SECS,
+            None => true, // no anchor — accept the most recent archive
+        };
+        if matches {
+            return entry(item);
+        }
+    }
+    None
+}
+
 /// Query Helix `/helix/videos` for the streamer's most recent archive VODs and
-/// find one whose `created_at` is within [`crate::vod_archive::VOD_MATCH_WINDOW_SECS`]
-/// of `went_live_at`. Returns `Some((vod_id, muted_secs))` on match, `None` if
-/// no matching VOD exists yet, or an error on a transient API failure.
+/// find the recording's one (see [`match_twitch_vod`] — exact `stream_id`
+/// match when known, `created_at` window fallback otherwise). Returns
+/// `Some((vod_id, muted_secs))` on match, `None` if no matching VOD exists
+/// yet, or an error on a transient API failure.
 pub(super) async fn poll_twitch_vod(
     client: &reqwest::Client,
     client_id: &str,
     token: &str,
     user_id: &str,
+    stream_id: Option<&str>,
     went_live_at: Option<i64>,
 ) -> anyhow::Result<Option<(String, i64)>> {
     use anyhow::bail;
@@ -286,30 +347,24 @@ pub(super) async fn poll_twitch_vod(
     let Some(data) = v["data"].as_array() else {
         return Ok(None);
     };
-    for item in data {
-        let Some(vod_id) = item["id"].as_str() else {
-            continue;
-        };
-        let Some(created_at_str) = item["created_at"].as_str() else {
-            continue;
-        };
-        let Some(created_ts) = crate::detectors::parse_rfc3339(created_at_str) else {
-            continue;
-        };
-        let matches = match went_live_at {
-            Some(wl) => (created_ts - wl).abs() <= crate::vod_archive::VOD_MATCH_WINDOW_SECS,
-            None => true, // no anchor — accept the most recent archive
-        };
-        if !matches {
-            continue;
-        }
-        let muted_secs: i64 = item["muted_segments"]
-            .as_array()
-            .map(|segs| segs.iter().filter_map(|s| s["duration"].as_i64()).sum())
-            .unwrap_or(0);
-        return Ok(Some((vod_id.to_string(), muted_secs)));
-    }
-    Ok(None)
+    Ok(match_twitch_vod(data, stream_id, went_live_at))
+}
+
+/// One-shot exact VOD lookup for a recording whose broadcast id is known:
+/// auth → user id → Helix `/videos` → `stream_id` match (no window fallback).
+/// `None` on any failure — callers fall back to whatever they already have.
+pub(super) async fn resolve_twitch_vod_by_stream(
+    ctx: &Arc<DetectContext>,
+    monitor_url: &str,
+    stream_id: &str,
+) -> Option<(String, i64)> {
+    let login = crate::detectors::twitch_login(monitor_url)?;
+    let (client_id, token) = ctx.twitch_helix_auth().await.ok()?;
+    let user_id = ctx.twitch_user_id(&client_id, &token, &login).await?;
+    poll_twitch_vod(&ctx.http_client(), &client_id, &token, &user_id, Some(stream_id), None)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Keep re-checking a freshly-published, currently-clean VOD for a late DMCA
@@ -447,6 +502,14 @@ impl Supervisor {
             return;
         };
         let anchor = if went_live_approx { None } else { went_live_at };
+        // The broadcast id makes the Helix match exact (see match_twitch_vod).
+        let stream_id = self
+            .store
+            .monitor_id_for_recording(rec_id)
+            .ok()
+            .flatten()
+            .and_then(|(_, sid)| sid)
+            .filter(|s| !s.is_empty());
         let _ = self.store.set_recording_vod_pending(rec_id);
         tokio::spawn(check_twitch_vod(
             Arc::clone(&self.ctx),
@@ -455,6 +518,7 @@ impl Supervisor {
             self.manual_tx.clone(),
             rec_id,
             login,
+            stream_id,
             anchor,
         ));
     }
@@ -745,5 +809,41 @@ mod tests {
         assert_eq!(vod_poll_delay_secs(25), 300);
         let total: u64 = (0..VOD_TOTAL_POLLS).map(vod_poll_delay_secs).sum();
         assert!((3600..=3900).contains(&total), "total {total}");
+    }
+
+    /// The rec-652 incident: the NEXT broadcast's VOD (newer, first in the
+    /// Helix page, inside the 2 h created_at window) must not shadow the
+    /// recording's own VOD when the broadcast id is known — and a known id
+    /// with no matching VOD means "not published", never a window neighbor.
+    #[test]
+    fn twitch_vod_match_prefers_stream_id_over_window() {
+        // Newest-first Helix page, mirroring the real incident: REACTION VOD
+        // (stream 999) created 1h57m after the Mario stream (id 320421899867)
+        // went live at t=1783811671.
+        let data = vec![
+            serde_json::json!({
+                "id": "2817892940", "stream_id": "999",
+                "created_at": "2026-07-12T01:11:35Z", // ~went_live + 7024s
+                "muted_segments": null,
+            }),
+            serde_json::json!({
+                "id": "2817816829", "stream_id": "320421899867",
+                "created_at": "2026-07-11T23:14:35Z",
+                "muted_segments": [{"duration": 180}, {"duration": 30}],
+            }),
+        ];
+        // Known stream id → exact match (and muted segments summed), even
+        // though the wrong VOD sorts first and sits inside the window.
+        let wl = Some(crate::detectors::parse_rfc3339("2026-07-11T23:14:31Z").unwrap());
+        assert_eq!(
+            match_twitch_vod(&data, Some("320421899867"), wl),
+            Some(("2817816829".into(), 210))
+        );
+        // Known id, VOD not in the page → not published, no neighbor-grabbing.
+        assert_eq!(match_twitch_vod(&data, Some("111"), wl), None);
+        // No id (legacy row) → old window behavior: newest within the window.
+        assert_eq!(match_twitch_vod(&data, None, wl), Some(("2817892940".into(), 0)));
+        // No id and no anchor → most recent archive.
+        assert_eq!(match_twitch_vod(&data, None, None), Some(("2817892940".into(), 0)));
     }
 }

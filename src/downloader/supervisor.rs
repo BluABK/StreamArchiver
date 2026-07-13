@@ -388,9 +388,24 @@ progress_info: None,
                 return;
             };
             let url = match Platform::detect(&murl) {
-                Platform::Twitch => vod_id
-                    .filter(|v| !v.is_empty())
-                    .map(|v| crate::vod_archive::twitch_vod_url(&v)),
+                Platform::Twitch => {
+                    // Re-resolve by broadcast id when we can: a stored vod_id
+                    // may be a wrong-VOD match from the old window-only poll
+                    // (rec 652 downloaded the NEXT stream's VOD). Falls back
+                    // to the stored id when Helix is unavailable.
+                    let repolled = match stream_id.as_deref().filter(|s| !s.is_empty()) {
+                        Some(sid) => {
+                            resolve_twitch_vod_by_stream(&ctx, &murl, sid).await.map(|(v, muted)| {
+                                let _ = store.set_recording_vod_found(rec_id, &v, muted);
+                                v
+                            })
+                        }
+                        None => None,
+                    };
+                    repolled
+                        .or(vod_id.filter(|v| !v.is_empty()))
+                        .map(|v| crate::vod_archive::twitch_vod_url(&v))
+                }
                 Platform::YouTube => stream_id
                     .filter(|s| !s.is_empty())
                     .map(|s| crate::vod_archive::youtube_vod_url(&s)),

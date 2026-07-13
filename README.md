@@ -971,7 +971,13 @@ tri-state **Inherit / On / Off**:
 **How it works.** When a recording ends and the platform's VOD becomes available, a
 detached **yt-dlp** download is queued (it shows in the Videos tab with a progress bar,
 survives an app restart, and is stoppable) and lands next to the live file as
-`{stem}.vod.mkv`. If **Replace** is on and the download succeeds (and, for Twitch, the
+`{stem}.vod.mkv`. On Twitch the VOD is matched to the recording by its **broadcast
+(stream) id** — Helix archive videos carry the originating stream id, so back-to-back
+streams can never shadow each other's VODs; a publish-time window is only used for
+old recordings that never learned their stream id. A completed download must also pass
+a **sanity check** (ffprobe-readable, and at least 90% of the expected duration) before
+it's trusted as the archive — a failed check marks the download failed instead of
+silently archiving the wrong or truncated file. If **Replace** is on and the download succeeds (and, for Twitch, the
 VOD isn't DMCA-muted), the live capture is swapped out: the VOD is renamed to the live
 file's name — so the recording's chat/thumbnail sidecars stay matched — and the old file
 is deleted only *after* the VOD is confirmed good.
