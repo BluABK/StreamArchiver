@@ -154,6 +154,59 @@ mod tests {
         assert_eq!(out, b"xy");
     }
 
+    /// Capture writer for driving a real fmt subscriber in tests.
+    #[derive(Clone, Default)]
+    struct Cap(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl io::Write for Cap {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Cap {
+        type Writer = Cap;
+        fn make_writer(&'a self) -> Cap {
+            self.clone()
+        }
+    }
+
+    /// The regression from 2026-07-13: tracing-subscriber's default ANSI
+    /// sanitization rewrote our embedded colour escapes to literal "\x1b[38;…"
+    /// text in the terminal. With sanitization off, the raw ESC must survive
+    /// the fmt pipeline — and the file side must still strip it cleanly.
+    #[test]
+    fn embedded_ansi_survives_fmt_and_strips_for_file() {
+        const MSG: &str = "tag \x1b[38;2;145;70;255m[Twitch]\x1b[0m end";
+        // Terminal path: raw ESC preserved.
+        let cap = Cap::default();
+        let sub = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_ansi_sanitization(false)
+            .with_writer(cap.clone())
+            .finish();
+        tracing::subscriber::with_default(sub, || tracing::info!("{MSG}"));
+        let out = cap.0.lock().unwrap().clone();
+        assert!(out.contains(&0x1b), "raw ESC must reach the writer: {}", String::from_utf8_lossy(&out));
+        assert!(!String::from_utf8_lossy(&out).contains("\\x1b"), "must not be escaped to text");
+        // File path: same event through StripAnsiMake → no ESC, text intact.
+        let cap = Cap::default();
+        let sub = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_ansi_sanitization(false)
+            .with_writer(StripAnsiMake(cap.clone()))
+            .finish();
+        tracing::subscriber::with_default(sub, || tracing::info!("{MSG}"));
+        let out = cap.0.lock().unwrap().clone();
+        let text = String::from_utf8_lossy(&out);
+        assert!(!out.contains(&0x1b), "file log must carry no ESC: {text}");
+        assert!(text.contains("tag [Twitch] end"), "tag text survives: {text}");
+    }
+
     #[test]
     fn plat_tag_plain_when_color_off() {
         set_color_enabled(false);
