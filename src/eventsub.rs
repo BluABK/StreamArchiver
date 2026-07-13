@@ -231,7 +231,10 @@ fn handle_message(
                     if let Some(uid) = event["broadcaster_user_id"].as_str() {
                         if let Some(mons) = uid_to_monitors.get(uid) {
                             for &mid in mons {
-                                info!("eventsub: stream.online -> monitor {mid}");
+                                info!(
+                                    "eventsub {}: stream.online -> monitor {mid}",
+                                    crate::models::Platform::Twitch.tag()
+                                );
                                 let _ = live_tx.send(
                                     LiveSignal::new(mid, went_live, false)
                                         .with_stream_id(stream_id.clone()),
@@ -244,7 +247,10 @@ fn handle_message(
                     if let Some(uid) = event["broadcaster_user_id"].as_str() {
                         if let Some(mons) = uid_to_monitors.get(uid) {
                             for &mid in mons {
-                                info!("eventsub: stream.offline -> monitor {mid}");
+                                info!(
+                                    "eventsub {}: stream.offline -> monitor {mid}",
+                                    crate::models::Platform::Twitch.tag()
+                                );
                                 let _ = offline_tx.send(mid);
                             }
                         }

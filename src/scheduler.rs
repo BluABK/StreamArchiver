@@ -78,8 +78,9 @@ async fn tick(
     let mut youtube_api_items: Vec<DetectItem> = Vec::new();
     let mut kick_api_items: Vec<DetectItem> = Vec::new();
     let mut prev_state: HashMap<i64, String> = HashMap::new();
-    // monitor id -> (channel name, detection short label) for readable logs.
-    let mut meta: HashMap<i64, (String, &'static str)> = HashMap::new();
+    // monitor id -> (channel name, detection short label, platform) for
+    // readable logs.
+    let mut meta: HashMap<i64, (String, &'static str, crate::models::Platform)> = HashMap::new();
     // monitor id -> the currently-persisted (go-live time, is-approx) so a
     // continuing live session with no platform-reported go-live time keeps its
     // originally-stamped approximation instead of drifting forward every poll.
@@ -136,7 +137,7 @@ async fn tick(
         if now >= due_at {
             meta.insert(
                 m.id,
-                (row.channel.name.clone(), m.detection_method.short_label()),
+                (row.channel.name.clone(), m.detection_method.short_label(), m.platform()),
             );
             let item = DetectItem {
                 monitor_id: m.id,
@@ -269,10 +270,11 @@ async fn tick(
 
         // Readable per-poll logging: name [method] result (+ go-live / error
         // detail). A state change is INFO; a routine poll is DEBUG.
-        let (name, method) = meta
+        let (name, method, plat) = meta
             .get(&o.monitor_id)
-            .map(|(n, m)| (n.as_str(), *m))
-            .unwrap_or(("?", "?"));
+            .map(|(n, m, p)| (n.as_str(), *m, *p))
+            .unwrap_or(("?", "?", crate::models::Platform::Generic));
+        let tag = plat.tag();
         let extra = if o.error {
             format!(" — {}", o.detail)
         } else if o.live {
@@ -285,7 +287,7 @@ async fn tick(
         };
         if changed {
             info!(
-                "poll: {name} [{method}] {} -> {new_state}{extra}",
+                "poll: {tag} {name} [{method}] {} -> {new_state}{extra}",
                 old_state.unwrap_or("?")
             );
             let _ = events.send(AppEvent::MonitorState {
@@ -293,7 +295,7 @@ async fn tick(
                 state: new_state.to_string(),
             });
         } else {
-            debug!("poll: {name} [{method}] {new_state}{extra}");
+            debug!("poll: {tag} {name} [{method}] {new_state}{extra}");
         }
         // Signal the supervisor to (consider) starting a recording. Use the
         // platform-reported go-live time when available, else approximate it

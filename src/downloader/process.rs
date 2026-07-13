@@ -408,7 +408,12 @@ impl Supervisor {
                 }
                 active.insert(m.id, 0);
             }
-            info!(monitor_id = m.id, rec_id = rec.id, "resuming interrupted SABR capture");
+            info!(
+                monitor_id = m.id,
+                rec_id = rec.id,
+                "resuming interrupted SABR capture {}",
+                Platform::YouTube.tag()
+            );
             to_resume.push((rec, row));
         }
         // Orphans whose output file survived intact are promoted (and ones whose
@@ -525,7 +530,8 @@ impl Supervisor {
                     info!(
                         monitor_id = mid,
                         rec_id = row.ref_id,
-                        "resuming detached SABR capture"
+                        "resuming detached SABR capture {}",
+                        Platform::YouTube.tag()
                     );
                     items.push(ReattachItem {
                         row,
@@ -712,6 +718,7 @@ impl Supervisor {
                     self.store.clone(),
                     self.events.clone(),
                     row.monitor_id.unwrap_or(0),
+                    m.monitor.platform(),
                     row.ref_id,
                     PathBuf::from(&row.capture_path),
                     row.went_live_at.unwrap_or(0),
@@ -1397,7 +1404,14 @@ impl Supervisor {
             channel: row.channel.name.clone(),
             thumbnail_path: None,
         });
-        info!(monitor_id, rec_id, program = %plan.program, "resuming SABR capture -> {}", plan.final_path.display());
+        info!(
+            monitor_id,
+            rec_id,
+            program = %plan.program,
+            "resuming SABR capture {} -> {}",
+            Platform::YouTube.tag(),
+            plan.final_path.display()
+        );
 
         let outcome = self
             .run_process(

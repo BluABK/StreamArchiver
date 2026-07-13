@@ -1315,9 +1315,10 @@ progress_info: None,
                 let desc = block.describe();
                 info!(
                     monitor_id,
-                    channel = row.channel.name.as_str(),
                     hit = desc.as_str(),
-                    "blacklist trigger matched — automatic recording suppressed"
+                    "blacklist trigger matched for {} {} — automatic recording suppressed",
+                    row.monitor.platform().tag(),
+                    row.channel.name
                 );
                 let _ = self.events.send(AppEvent::TriggerBlocked {
                     monitor_id,
@@ -1711,10 +1712,11 @@ progress_info: None,
     /// only chat alongside the video recording. Registers its PID in
     /// `active_chats` (visible to the UI), and removes it when the process exits
     /// (either stream ended naturally, or the user called `stop_chat_download`).
-    async fn run_chat_download(&self, monitor_id: i64, plan: DownloadPlan) {
+    async fn run_chat_download(&self, monitor_id: i64, platform: Platform, plan: DownloadPlan) {
         if self.shutdown.load(Ordering::SeqCst) {
             return;
         }
+        let tag = platform.tag();
         // Detached like every other download: a named job without kill-on-close,
         // no kill_on_drop, and output to a log file so the sidecar survives an app
         // restart and a relaunch can re-attach. yt-dlp writes the `.live_chat.json`
@@ -1795,7 +1797,7 @@ progress_info: None,
                 },
             )
         });
-        info!(monitor_id, "chat download started");
+        info!(monitor_id, "chat download started {tag}");
         // Fire any event so the UI repaints and shows the chat-active indicator.
         let _ = self.events.send(AppEvent::MonitorState {
             monitor_id,
@@ -1813,12 +1815,12 @@ progress_info: None,
         // Surface any yt-dlp diagnostics (auth failure, format unavailable, …).
         let tail = read_log_tail(&log_path, 12).await;
         if !tail.trim().is_empty() {
-            warn!(monitor_id, "chat yt-dlp log tail:\n{tail}");
+            warn!(monitor_id, "chat yt-dlp log tail {tag}:\n{tail}");
         }
         if stopped {
-            info!(monitor_id, "chat download stopped by user");
+            info!(monitor_id, "chat download stopped by user {tag}");
         } else {
-            info!(monitor_id, "chat download ended");
+            info!(monitor_id, "chat download ended {tag}");
         }
         // Repaint so the indicator disappears.
         let _ = self.events.send(AppEvent::MonitorState {
@@ -2279,7 +2281,12 @@ progress_info: None,
             && self.sabr_dvr_exceeded.lock().unwrap().contains(&sabr_key)
         {
             row.monitor.capture_from_start = false;
-            info!(monitor_id, "SABR from-start unavailable; capturing live edge");
+            info!(
+                monitor_id,
+                "SABR from-start unavailable for {} {}; capturing live edge",
+                Platform::YouTube.tag(),
+                row.channel.name
+            );
         }
         let (auth, media_mode, want_media, pre_media) =
             self.resolve_auth_and_preprobe(&row).await;
@@ -2322,7 +2329,14 @@ progress_info: None,
         );
         self.spawn_asset_fetches(&row, &plan, monitor_id, thumbnail_url, broadcaster_id);
 
-        info!(monitor_id, program = %plan.program, "starting recording -> {}", plan.capture_path.display());
+        info!(
+            monitor_id,
+            program = %plan.program,
+            "starting recording: {} {} -> {}",
+            row.monitor.platform().tag(),
+            row.channel.name,
+            plan.capture_path.display()
+        );
         {
             let redacted: Vec<String> = plan.args.iter().map(|a| {
                 if a.contains("Authorization=OAuth ") {
@@ -2683,6 +2697,7 @@ progress_info: None,
                 self.store.clone(),
                 self.events.clone(),
                 monitor_id,
+                row.monitor.platform(),
                 rec_id,
                 plan.capture_path.clone(),
                 went_live_at.unwrap_or(0),
@@ -2899,7 +2914,8 @@ progress_info: None,
             let chat_plan = build_chat_plan(row, &plan.final_path, auth, ytdlp_global_args, &ytdlp_bins.system_program());
             let this = self.clone();
             let mid = monitor_id;
-            tokio::spawn(async move { this.run_chat_download(mid, chat_plan).await });
+            let chat_platform = row.monitor.platform();
+            tokio::spawn(async move { this.run_chat_download(mid, chat_platform, chat_plan).await });
         }
         (chat_done, chat_task)
     }
@@ -3192,9 +3208,22 @@ progress_info: None,
             let this = self.clone();
             tokio::spawn(async move { this.maybe_concat_backfill(rec_id).await });
         }
-        info!(monitor_id, bytes, status, "recording finished");
+        info!(
+            monitor_id,
+            bytes,
+            status,
+            "recording finished: {} {}",
+            row.monitor.platform().tag(),
+            row.channel.name
+        );
         if status == "failed" && !outcome.log.is_empty() {
-            warn!(monitor_id, "recording stderr:\n{}", outcome.log);
+            warn!(
+                monitor_id,
+                "recording stderr for {} {}:\n{}",
+                row.monitor.platform().tag(),
+                row.channel.name,
+                outcome.log
+            );
         }
     }
 

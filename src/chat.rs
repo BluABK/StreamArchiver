@@ -151,7 +151,11 @@ pub async fn log_twitch_chat(
     let Some(login) = crate::detectors::twitch_login(&url) else {
         return;
     };
-    info!("chat: logging {login} -> {}", path.display());
+    info!(
+        "chat: logging {} {login} -> {}",
+        crate::models::Platform::Twitch.tag(),
+        path.display()
+    );
     while !done.load(Ordering::SeqCst) && !shutdown.load(Ordering::SeqCst) {
         if let Err(e) = session(&login, &path, &done, &shutdown).await {
             debug!("chat ({login}): {e:#}; reconnecting");

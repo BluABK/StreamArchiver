@@ -23,6 +23,7 @@ mod imports;
 mod inspector;
 mod io_gate;
 mod iomon;
+mod logfmt;
 mod models;
 mod notifications;
 mod oauth;
@@ -679,12 +680,20 @@ fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
     prune_old_logs(&log_dir.join("iomon"), iomon::SAMPLE_LOG_KEEP_DAYS);
     let file_appender = tracing_appender::rolling::daily(&log_dir, "streamarchiver.log");
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+    // Strip ANSI escapes from message *text* too (colored platform tags) —
+    // with_ansi(false) only disables the layer's own coloring.
     let file_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .with_target(false)
-        .with_writer(non_blocking);
+        .with_writer(logfmt::StripAnsiMake(non_blocking));
 
     // ── stderr layer ─────────────────────────────────────────────────────────
+    // Colored platform tags in message text only when stderr is a real
+    // terminal (debug console runs); redirected stderr / release GUI = plain.
+    {
+        use std::io::IsTerminal;
+        logfmt::set_color_enabled(std::io::stderr().is_terminal());
+    }
     let stderr_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_writer(std::io::stderr);

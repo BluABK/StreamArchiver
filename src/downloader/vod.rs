@@ -67,7 +67,7 @@ pub(super) async fn check_twitch_vod(
             Ok(Some((vod_id, muted_secs))) => {
                 let _ = store.set_recording_vod_found(rec_id, &vod_id, muted_secs);
                 let _ = events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
-                info!(rec_id, vod_id, muted_secs, "Twitch VOD found");
+                info!(rec_id, vod_id, muted_secs, "{} VOD found", Platform::Twitch.tag());
                 let archive_on = archive_download_enabled(&store, rec_id);
                 if muted_secs > 0 {
                     // A muted VOD is silenced — never a plain download. Un-mute via
@@ -102,7 +102,7 @@ pub(super) async fn check_twitch_vod(
 
     let _ = store.set_recording_vod_not_published(rec_id);
     let _ = events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
-    info!(rec_id, login, "Twitch VOD not published after polling timeout");
+    info!(rec_id, login, "{} VOD not published after polling timeout", Platform::Twitch.tag());
     // Auto-recover a deleted VOD (no published archive) when enabled.
     if setting_true(&store, crate::recovery::K_AUTO_RECOVER_DELETED) {
         spawn_auto_recovery(&ctx, &store, &events, rec_id);
@@ -351,7 +351,13 @@ pub(super) async fn watch_vod_mute(
         if muted_secs <= 0 {
             continue;
         }
-        info!(rec_id, vod_id, muted_secs, "published VOD was muted after stream end");
+        info!(
+            rec_id,
+            vod_id,
+            muted_secs,
+            "published {} VOD was muted after stream end",
+            Platform::Twitch.tag()
+        );
         let _ = store.set_recording_vod_muted_secs(rec_id, muted_secs);
         let (state, dl_video_id) = store
             .recording_vod_dl(rec_id)

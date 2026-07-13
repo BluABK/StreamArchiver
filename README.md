@@ -601,6 +601,13 @@ metadata-only peeks refreshing in-memory state, cache sweeps scan the on-disk
 capture cache for leftover transient files (never finished archives), and
 chat appends buffer messages in memory while a slow write is in flight.
 
+**Platform tags in logs.** Lifecycle log messages (poll results, recording
+start/finish, chat capture, SABR resume, head backfill, VOD polling, push
+notifications) carry a `[Twitch]` / `[YouTube]` / `[Kick]` tag in the
+platform's brand color — purple, red, green — when stderr is a real terminal
+(debug console runs). The rolling log file gets the same tag in plain text:
+an ANSI-stripping writer removes the color escapes before they reach disk.
+
 **Database sub-tab.** The single SQLite connection sits behind a fair mutex
 that every store call takes in turn; this tab shows that lock live: the
 current **holder** (which thread, from which store call site, held for how

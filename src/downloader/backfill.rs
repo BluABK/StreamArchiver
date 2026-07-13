@@ -220,7 +220,7 @@ impl Supervisor {
         }
         let Some(found) = found else {
             // VODs disabled and folder absent — quiet failure, no error toast.
-            info!(rec_id, "head backfill: live playlist not found on the CDN");
+            info!(rec_id, "head backfill: {} live playlist not found on the CDN", Platform::Twitch.tag());
             finish(crate::events::TaskOutcome::Failed("live playlist not found".into()));
             return;
         };
@@ -297,7 +297,14 @@ impl Supervisor {
                     .store
                     .set_recording_backfill_path(rec_id, &dest.to_string_lossy());
                 let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
-                info!(rec_id, missed, muted_used, "head backfill: {} ready", dest.display());
+                info!(
+                    rec_id,
+                    missed,
+                    muted_used,
+                    "head backfill {}: {} ready",
+                    Platform::Twitch.tag(),
+                    dest.display()
+                );
                 let note = if muted_used > 0 {
                     format!("{missed}s backfilled ({muted_used} segments muted)")
                 } else {
@@ -876,7 +883,12 @@ impl Supervisor {
                     .store
                     .set_recording_full_path(rec_id, &dest.to_string_lossy());
                 let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
-                info!(rec_id, "head concat: full stream ready at {}", dest.display());
+                info!(
+                    rec_id,
+                    "head concat {}: full stream ready at {}",
+                    Platform::Twitch.tag(),
+                    dest.display()
+                );
                 finish(crate::events::TaskOutcome::CompletedWithNote(
                     "head + live joined (parts kept)".into(),
                 ));

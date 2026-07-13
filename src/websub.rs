@@ -212,8 +212,10 @@ pub async fn run(
                         if cooled_down {
                             if to_check.insert(mid) {
                                 info!(
-                                    "websub: {} (video {}) -> check monitor {mid}",
-                                    e.kind, e.video_id
+                                    "websub {}: {} (video {}) -> check monitor {mid}",
+                                    crate::models::Platform::YouTube.tag(),
+                                    e.kind,
+                                    e.video_id
                                 );
                             }
                             video_last_checked.insert(key, now);

@@ -795,6 +795,7 @@ pub(super) async fn catch_up_watcher(
     store: Arc<Store>,
     events: EventTx,
     monitor_id: i64,
+    platform: crate::models::Platform,
     rec_id: i64,
     capture_path: PathBuf,
     went_live: i64,
@@ -822,7 +823,11 @@ pub(super) async fn catch_up_watcher(
             let elapsed = now_unix() - went_live;
             if captured + CATCHUP_TOLERANCE_SECS >= elapsed {
                 let _ = store.set_recording_lost_secs(rec_id, 0);
-                info!(rec_id, "from-start capture caught up with live (lost time = 0)");
+                info!(
+                    rec_id,
+                    "from-start capture caught up with live {} (lost time = 0)",
+                    platform.tag()
+                );
                 // Wake the UI so an already-expanded history tree refreshes the
                 // Lost-time column from the new value.
                 let _ = events.send(AppEvent::MonitorState {
