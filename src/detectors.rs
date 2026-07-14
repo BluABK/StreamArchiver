@@ -22,7 +22,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::app_core::sleep_cancellable;
 use crate::browser_ua::{BrowserFingerprint, build_browser_fingerprint};
@@ -640,9 +640,25 @@ impl DetectContext {
                         break;
                     }
                     Err(e) => {
+                        // A transport-level failure (DNS/connect/TLS/timeout) hits
+                        // the WHOLE batched request, not one channel — and
+                        // reqwest's error Display embeds the full request URL
+                        // (every login in the chunk as a query param, easily a
+                        // few hundred bytes for a full batch). Log the real error
+                        // ONCE here; give each monitor a short detail instead, so
+                        // one network hiccup doesn't repeat a multi-KB line once
+                        // per channel in the scheduler's per-monitor state-change
+                        // log (100 channels -> the same error dozens of times).
+                        warn!(
+                            "Twitch Helix streams: batch request failed for {} channel(s): {e}",
+                            chunk.len()
+                        );
                         for l in chunk {
                             for mid in &login_to_mons[l] {
-                                outcomes.push(DetectOutcome::err(*mid, e.to_string()));
+                                outcomes.push(DetectOutcome::err(
+                                    *mid,
+                                    "Twitch Helix request failed (network/DNS) — see the warning above for detail",
+                                ));
                             }
                         }
                         break;
