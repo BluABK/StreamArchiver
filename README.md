@@ -1281,6 +1281,17 @@ hits, parse failures, tokens and cost per model) alongside **YouTube Data API**
 quota usage (units and search calls against the daily cutoff), so you can see
 what these features are actually costing you.
 
+**Detection / API requests** (same tab) tracks cumulative poll/detect request
+counts **per platform** (Twitch, YouTube, Kick, Generic) across every
+detection method — batched Twitch Helix polls, the WebSub/scrape fallback
+check, YouTube/Kick API probes, generic HTTP probes — with an error count,
+error rate, and the timestamp + detail of the most recent failure (hover the
+timestamp for the full message). This is meant to surface *instability* that
+would otherwise only show up by combing the log: a platform's error rate
+climbing, or a recent DNS/auth failure repeating. A platform never polled
+(e.g. no Kick channels configured) simply doesn't appear. **Reset** clears
+the counters; they otherwise persist across restarts.
+
 ![Stats tab — Claude OCR usage/cost and YouTube Data API quota](doc/screenshots/stats-ocr.png)
 
 ### Chat logs

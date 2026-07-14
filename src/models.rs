@@ -1665,6 +1665,9 @@ pub const K_OCR_TIMEOUT_SECS: &str = "ocr_timeout_secs";
 pub const K_OCR_EFFORT: &str = "ocr_effort";
 /// Cumulative OCR call stats (JSON blob).
 pub const K_OCR_STATS: &str = "ocr_stats";
+/// `app_settings` key — cumulative per-platform detection/poll request stats
+/// (JSON blob). See [`PollStats`].
+pub const K_POLL_STATS: &str = "poll_stats";
 /// Persistent OCR image-hash cache: JSON `{"<monitor_id>:<source_id>": <fnv64_hash>}`.
 /// Populated after every successful OCR run so a restart doesn't re-run OCR on
 /// an unchanged banner/community-post image.
@@ -1772,6 +1775,38 @@ pub struct OcrModelStats {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_usd: f64,
+}
+
+/// Cumulative detection/poll request counts for one platform, folded in by
+/// the scheduler across every detection method used for it (batched Twitch
+/// Helix polls, WebSub/scrape fallback checks, YouTube/Kick API probes,
+/// generic HTTP probes). Tracks request *health* — success vs error — so
+/// recurring instability (auth failures, DNS/network blips, rate limiting)
+/// shows up in the Stats view instead of only being visible by combing logs.
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PlatformPollStats {
+    /// Total poll/detect attempts (one per monitor-check — a single batched
+    /// Twitch Helix call counts once per channel it covers, mirroring what
+    /// the scheduler's per-monitor state-change log already does).
+    pub polls: u64,
+    /// Attempts that came back as an error (network/DNS, auth, rate-limit,
+    /// parse failure — anything `DetectOutcome` flags as an error).
+    pub errors: u64,
+    /// Unix timestamp of the most recent error.
+    pub last_error_at: Option<i64>,
+    /// Detail string from the most recent error (mirrors what the
+    /// scheduler's per-monitor state-change line logs for that outcome).
+    pub last_error: String,
+}
+
+/// Cumulative per-platform poll/detect stats (see [`PlatformPollStats`]),
+/// keyed by [`Platform::as_str`]. Persisted as one JSON blob under
+/// [`K_POLL_STATS`], accumulated once per scheduler tick rather than per
+/// monitor — keeps disk writes to about one per poll interval regardless of
+/// how many channels are configured.
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PollStats {
+    pub by_platform: std::collections::HashMap<String, PlatformPollStats>,
 }
 
 /// Concrete values for the remux title-tag template tokens, filled by

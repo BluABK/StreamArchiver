@@ -194,6 +194,27 @@ async fn tick(
     }
 
     let checked_at = now_unix();
+    // One read-modify-write per tick (not per monitor) — folds every outcome
+    // from this pass into the persisted per-platform counters so the Stats
+    // view can show request instability (error rates, most recent failure)
+    // without needing to comb the log.
+    if !outcomes.is_empty() {
+        let mut stats = load_poll_stats(&ctx.store);
+        for o in &outcomes {
+            let platform = meta
+                .get(&o.monitor_id)
+                .map(|(_, _, p)| *p)
+                .unwrap_or(crate::models::Platform::Generic);
+            let entry = stats.by_platform.entry(platform.as_str().to_string()).or_default();
+            entry.polls += 1;
+            if o.error {
+                entry.errors += 1;
+                entry.last_error_at = Some(checked_at);
+                entry.last_error = o.detail.clone();
+            }
+        }
+        save_poll_stats(&ctx.store, &stats);
+    }
     for o in &outcomes {
         // This tick's `recording` snapshot was taken before the (possibly slow,
         // batched) detection calls above ran — a recording can start for this
@@ -317,6 +338,24 @@ async fn tick(
     min_wait.clamp(1, MAX_SLEEP_SECS) as u64
 }
 
+/// Load the cumulative per-platform poll/detect stats from the settings
+/// store (see [`crate::models::PollStats`]). Used by the Stats view; the
+/// scheduler itself only needs the mutate-then-save half (below).
+pub fn load_poll_stats(store: &crate::store::Store) -> crate::models::PollStats {
+    store
+        .get_setting(crate::models::K_POLL_STATS)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_poll_stats(store: &crate::store::Store, stats: &crate::models::PollStats) {
+    if let Ok(json) = serde_json::to_string(stats) {
+        let _ = store.set_setting(crate::models::K_POLL_STATS, &json);
+    }
+}
+
 /// Local `HH:MM:SS` for a unix timestamp (log-friendly).
 fn fmt_log_time(t: i64) -> String {
     chrono::DateTime::from_timestamp(t, 0)
@@ -351,4 +390,53 @@ async fn run_per_item(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::disallowed_methods)]
+    use super::*;
+    use crate::models::Platform;
+    use crate::store::Store;
+
+    /// `load_poll_stats`/`save_poll_stats` round-trip through the settings
+    /// store, and folding several outcomes for the same platform accumulates
+    /// rather than overwrites (mirrors what `tick`'s per-tick block does).
+    #[test]
+    fn poll_stats_round_trip_and_accumulate() {
+        let store = Store::open_in_memory().unwrap();
+
+        // Empty store -> empty stats, not an error.
+        let stats = load_poll_stats(&store);
+        assert!(stats.by_platform.is_empty());
+
+        let mut stats = load_poll_stats(&store);
+        {
+            let e = stats.by_platform.entry(Platform::Twitch.as_str().to_string()).or_default();
+            e.polls += 1;
+        }
+        save_poll_stats(&store, &stats);
+
+        // A second tick's worth of outcomes folds onto the first, not replaces it.
+        let mut stats = load_poll_stats(&store);
+        {
+            let e = stats.by_platform.entry(Platform::Twitch.as_str().to_string()).or_default();
+            e.polls += 1;
+            e.errors += 1;
+            e.last_error_at = Some(12345);
+            e.last_error = "error sending request for url (...)".into();
+        }
+        save_poll_stats(&store, &stats);
+
+        let stats = load_poll_stats(&store);
+        let tw = &stats.by_platform[Platform::Twitch.as_str()];
+        assert_eq!(tw.polls, 2, "accumulates across ticks, doesn't overwrite");
+        assert_eq!(tw.errors, 1);
+        assert_eq!(tw.last_error_at, Some(12345));
+        assert!(tw.last_error.contains("error sending request"));
+        // A platform that was never polled has no entry at all (not a
+        // zeroed-out one) — the Stats view's "polls == 0 -> skip" check
+        // relies on this via `.get(...).unwrap_or_default()`.
+        assert!(!stats.by_platform.contains_key(Platform::YouTube.as_str()));
+    }
 }

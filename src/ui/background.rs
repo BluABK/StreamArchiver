@@ -362,11 +362,12 @@ impl StreamArchiverApp {
         if self.stats_snapshot.is_none() {
             let ocr = load_ocr_stats(self.core.store.as_ref());
             let global = self.core.store.global_stats().unwrap_or_default();
-            self.stats_snapshot = Some((ocr, global));
+            let poll = crate::scheduler::load_poll_stats(self.core.store.as_ref());
+            self.stats_snapshot = Some((ocr, global, poll));
         }
-        let (ocr, global) = match self.stats_snapshot.clone() {
+        let (ocr, global, poll) = match self.stats_snapshot.clone() {
             Some(s) => s,
-            None => (OcrStats::default(), GlobalStats::default()),
+            None => (OcrStats::default(), GlobalStats::default(), PollStats::default()),
         };
 
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -535,6 +536,78 @@ impl StreamArchiverApp {
                     egui::ProgressBar::new(search_frac)
                         .text(format!("{search_today} / 100 search queries")),
                 );
+            }
+
+            ui.add_space(16.0);
+
+            // ── Detection / API requests ────────────────────────────────────
+            // Per-platform poll/detect request health (all detection methods —
+            // Twitch Helix, WebSub/scrape fallback, YouTube/Kick API, generic
+            // probe) so recurring instability (auth failures, DNS/network
+            // blips, rate limiting) is visible here instead of only in the log.
+            ui.horizontal(|ui| {
+                ui.heading("Detection / API requests");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button("🗑  Reset")
+                        .on_hover_text("Clear all accumulated request stats")
+                        .clicked()
+                    {
+                        let _ = self.core.store.set_setting(crate::models::K_POLL_STATS, "{}");
+                        self.stats_snapshot = None;
+                    }
+                });
+            });
+            ui.separator();
+
+            egui::Grid::new("poll_stats_grid")
+                .num_columns(4)
+                .spacing([24.0, 4.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong("Platform");
+                    ui.strong("Polls");
+                    ui.strong("Errors");
+                    ui.strong("Last error");
+                    ui.end_row();
+
+                    for p in Platform::ALL {
+                        let s = poll.by_platform.get(p.as_str()).cloned().unwrap_or_default();
+                        if s.polls == 0 {
+                            continue; // never polled this platform — nothing to show
+                        }
+                        ui.label(p.label());
+                        ui.label(s.polls.to_string());
+                        let err_rate = if s.polls > 0 {
+                            100.0 * s.errors as f64 / s.polls as f64
+                        } else {
+                            0.0
+                        };
+                        let err_text = format!("{} ({err_rate:.1}%)", s.errors);
+                        if s.errors > 0 {
+                            ui.colored_label(HL_ERROR_TEXT, err_text);
+                        } else {
+                            ui.label(err_text);
+                        }
+                        match s.last_error_at {
+                            Some(t) => {
+                                use chrono::{Local, TimeZone};
+                                let when = Local
+                                    .timestamp_opt(t, 0)
+                                    .single()
+                                    .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                                    .unwrap_or_else(|| "—".into());
+                                ui.label(when).on_hover_text(&s.last_error);
+                            }
+                            None => {
+                                ui.weak("—");
+                            }
+                        }
+                        ui.end_row();
+                    }
+                });
+            if poll.by_platform.values().all(|s| s.polls == 0) {
+                ui.weak("No polls recorded yet.");
             }
 
             ui.add_space(16.0);

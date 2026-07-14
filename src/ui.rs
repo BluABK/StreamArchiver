@@ -26,7 +26,7 @@ use crate::models::{
     K_REMUX_EMBED_THUMBNAIL, K_REMUX_EMBED_TITLE, K_REMUX_TITLE_TEMPLATE, K_REMUX_EMBED_SUBS,
     K_FILE_SPLIT_ENABLED, K_FILE_SPLIT_VIDEOS, K_FILE_SPLIT_SUBS, K_FILE_SPLIT_CHAT,
     K_FILE_SPLIT_THUMBS, K_FILE_SPLIT_LOGS,
-    MediaInfoMode, Monitor, MonitorDefaults, MonitorWithChannel, OcrStats, Platform, RecurrenceKind,
+    MediaInfoMode, Monitor, MonitorDefaults, MonitorWithChannel, OcrStats, Platform, PollStats, RecurrenceKind,
     Recording, SabrCodecPref, ScheduleSegment, ScheduledRecording, ScheduledRecordingWithNames,
     StreamGroup, StreamMetaChange, Tool, UpcomingStream, Video, group_recordings, now_unix,
 };
@@ -1039,8 +1039,8 @@ pub struct StreamArchiverApp {
     format_designer: Option<FormatDesignerState>,
     /// Pending "Stop recordings & quit" confirmation (triggered by the tray item).
     confirm_quit_stop: bool,
-    /// Cached (ocr_stats, global_stats) for the Stats view; None = not yet loaded.
-    stats_snapshot: Option<(OcrStats, GlobalStats)>,
+    /// Cached (ocr_stats, global_stats, poll_stats) for the Stats view; None = not yet loaded.
+    stats_snapshot: Option<(OcrStats, GlobalStats, PollStats)>,
     /// I/O tab: cached sampler history + counters snapshot (refreshed ~1×/s
     /// while the tab is open — never cloned per frame).
     io_hist: Vec<crate::iomon::Sample>,
