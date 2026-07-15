@@ -531,8 +531,11 @@ captures are writing to:
   overrides**. Recordings split across a fast NVMe and a fragile USB HDD can
   then run several parallel passes on the SSD while keeping the HDD strictly
   serialized and throttled. Gates are keyed by the target file's drive, so a
-  saturated disk never queues work bound for an idle one. Permit changes apply
-  to the next pass (reductions as running passes finish).
+  saturated disk never queues work bound for an idle one. Permit changes take
+  effect **immediately on Save** — including for passes already queued behind
+  the old limit, so raising a limit to drain a stuck backlog doesn't require
+  waiting for some unrelated new pass to kick off first. A reduction still
+  lets any pass already *running* finish; it only holds back the next one.
 - **Disk throttle** (the default row of the Disk I/O limits table, default
   **30× realtime**)
   additionally caps how fast each pass reads + writes (ffmpeg `-readrate`,

@@ -106,9 +106,50 @@ pub const K_DISK_LIMITS: &str = "disk_io_limits";
 static DISK_CFG: parking_lot::RwLock<Option<DiskLimitsConfig>> = parking_lot::RwLock::new(None);
 
 /// Install the per-disk limits (startup from the persisted setting + settings
-/// save). Gate permit counts adjust lazily on each gate's next acquisition.
+/// save), and immediately resize every gate that already exists to match.
+///
+/// The permit-count sync itself lives inside [`gate_sem`], which normally
+/// only runs when a NEW pass starts — an already-queued pass just sits
+/// parked on `Semaphore::acquire`, so it never re-triggers that check.
+/// During exactly the scenario this setting is meant for (draining a large
+/// stuck backlog with nothing new queuing), that meant a raised limit could
+/// sit installed in [`DISK_CFG`] but never actually reach the semaphore the
+/// backlog is blocked on — the change looked like it did nothing. Walking
+/// the existing gate map here and re-running `gate_sem` for each key closes
+/// that gap: `add_permits` (the growth path) wakes already-queued waiters
+/// immediately, in FIFO order, same as any other permit release.
 pub fn set_disk_limits(cfg: DiskLimitsConfig) {
-    *DISK_CFG.write() = Some(cfg);
+    modify_disk_limits(|c| *c = cfg);
+}
+
+/// Atomically read-modify-write the disk limits config — `f` runs with the
+/// write lock held for the whole operation, unlike a [`disk_limits_config`]
+/// read followed by a separate [`set_disk_limits`] write (a caller that does
+/// the two as separate steps has a TOCTOU race window: a second concurrent
+/// modify-write in between gets silently discarded when the first one's
+/// write finally lands). Also resizes existing gates, same as
+/// `set_disk_limits` — see its doc comment for why.
+pub fn modify_disk_limits(f: impl FnOnce(&mut DiskLimitsConfig)) {
+    {
+        let mut guard = DISK_CFG.write();
+        let mut cfg = guard.take().unwrap_or_default();
+        f(&mut cfg);
+        *guard = Some(cfg);
+    }
+    resize_existing_gates(&LOCAL_GATES, |l| l.local_permits);
+    resize_existing_gates(&CDN_GATES, |l| l.cdn_permits);
+}
+
+/// Re-run the growth/shrink logic in [`gate_sem`] for every drive key that
+/// already has a gate, against the just-installed [`DISK_CFG`]. A no-op
+/// until the first pass on a given map ever runs (nothing to resize yet).
+fn resize_existing_gates(map: &'static OnceLock<GateMap>, want: impl Fn(&DiskLimits) -> u32) {
+    let Some(m) = map.get() else { return };
+    let keys: Vec<String> = m.lock().keys().cloned().collect();
+    for key in keys {
+        let limits = limits_for_key(&key);
+        gate_sem(map, &key, want(&limits) as usize);
+    }
 }
 
 /// The current config (for the Settings editor).
@@ -129,9 +170,17 @@ fn drive_key(path: &std::path::Path) -> String {
 
 /// The effective limits for the disk `path` lives on.
 pub fn limits_for(path: &std::path::Path) -> DiskLimits {
+    limits_for_key(&drive_key(path))
+}
+
+/// The effective limits for a drive-letter key (`"A"`, or `"*"` for
+/// UNC/relative paths) directly — used by [`limits_for`] and by the
+/// existing-gate resize on a settings save, which already has the key from
+/// the gate map and no path to re-derive it from.
+fn limits_for_key(key: &str) -> DiskLimits {
     let cfg = DISK_CFG.read();
     let Some(cfg) = cfg.as_ref() else { return DiskLimits::default() };
-    cfg.drives.get(&drive_key(path)).cloned().unwrap_or_else(|| cfg.default.clone())
+    cfg.drives.get(key).cloned().unwrap_or_else(|| cfg.default.clone())
 }
 
 // ===== Gates (per drive) =====
@@ -145,11 +194,30 @@ type GateMap = parking_lot::Mutex<std::collections::HashMap<String, GateEntry>>;
 static LOCAL_GATES: OnceLock<GateMap> = OnceLock::new();
 static CDN_GATES: OnceLock<GateMap> = OnceLock::new();
 
+/// The app's Tokio runtime handle, registered once by `AppCore::new` right
+/// after it builds the runtime. Lets the shrink path below spawn its permit-
+/// reclaim task from ANY calling thread — notably the egui/UI thread, which
+/// runs outside the runtime and would panic on a bare `tokio::spawn` (no
+/// reactor entered there). `local_pass`/`cdn_mux` themselves always run as
+/// spawned async tasks already inside the runtime, so this is only load-
+/// bearing for [`set_disk_limits`]'s existing-gate resize on a settings save.
+static RT_HANDLE: OnceLock<tokio::runtime::Handle> = OnceLock::new();
+
+/// Register the runtime handle (see [`RT_HANDLE`]). Call once, right after
+/// building the runtime and before the UI can reach a settings save.
+pub fn set_runtime_handle(handle: tokio::runtime::Handle) {
+    let _ = RT_HANDLE.set(handle);
+}
+
 /// Get (or create) the semaphore for `key`, adjusting its permit count to the
-/// configured value: growth is immediate (`add_permits`); shrink acquires the
-/// excess permits in the background and forgets them, so it takes effect as
-/// running passes finish. Called on every acquisition — config changes apply
-/// lazily without any runtime plumbing.
+/// configured value: growth is immediate (`add_permits`), waking any pass
+/// already parked in `Semaphore::acquire` in FIFO order — including one that
+/// entered the queue under an older, lower limit. Shrink acquires the excess
+/// permits in the background and forgets them, so it takes effect as running
+/// passes finish. Called on every new acquisition, AND on every settings
+/// save via [`set_disk_limits`]'s resize of already-existing gates — so a
+/// stuck backlog doesn't have to wait for some unrelated new pass to start
+/// before a raised limit reaches it.
 fn gate_sem(map: &'static OnceLock<GateMap>, key: &str, want: usize) -> Arc<Semaphore> {
     let want = want.max(1);
     let m = map.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
@@ -167,11 +235,19 @@ fn gate_sem(map: &'static OnceLock<GateMap>, key: &str, want: usize) -> Arc<Sema
             let take = (e.permits - want) as u32;
             let sem = e.sem.clone();
             e.permits = want;
-            tokio::spawn(async move {
+            let reclaim = async move {
                 if let Ok(p) = sem.acquire_many_owned(take).await {
                     p.forget();
                 }
-            });
+            };
+            match RT_HANDLE.get() {
+                Some(h) => {
+                    h.spawn(reclaim);
+                }
+                None => {
+                    tokio::spawn(reclaim);
+                }
+            }
         }
         std::cmp::Ordering::Equal => {}
     }
@@ -422,13 +498,21 @@ mod tests {
 
     #[tokio::test]
     async fn per_drive_limits_and_permit_adjustment() {
-        let mut cfg = DiskLimitsConfig::default();
-        cfg.default.readrate = 30.0;
-        cfg.drives.insert(
-            "S".into(),
-            DiskLimits { local_permits: 2, cdn_permits: 1, readrate: 0.0, rate_limit: "4M".into() },
-        );
-        set_disk_limits(cfg);
+        // `modify_disk_limits`, not a `disk_limits_config()` read followed by
+        // a separate `set_disk_limits()` write — `DISK_CFG` is one global
+        // shared with every other test in this file, running on independent
+        // OS threads truly in parallel, and that two-step pattern has a
+        // TOCTOU race: another concurrently-running test's write landing in
+        // between gets silently discarded once this one's write completes.
+        // Every test here uses its own drive letter, so an ATOMIC
+        // modify never conflicts with another test's.
+        modify_disk_limits(|cfg| {
+            cfg.default.readrate = 30.0;
+            cfg.drives.insert(
+                "S".into(),
+                DiskLimits { local_permits: 2, cdn_permits: 1, readrate: 0.0, rate_limit: "4M".into() },
+            );
+        });
         let s = Path::new(r"S:\rec\file.ts");
         let t = Path::new(r"T:\rec\file.ts");
         // Per-drive resolution: S is unthrottled with a rate limit, T inherits.
@@ -446,15 +530,55 @@ mod tests {
         drop(p1);
         drop(p2);
         // Shrink to 1: gate_sem spawns the reducer; next config read wants 1.
-        let mut cfg = disk_limits_config();
-        cfg.drives.get_mut("S").unwrap().local_permits = 1;
-        set_disk_limits(cfg);
+        modify_disk_limits(|cfg| cfg.drives.get_mut("S").unwrap().local_permits = 1);
         let _p = local_pass("s3", s).await;
         tokio::task::yield_now().await; // let the reducer task grab the excess
         let sem = gate_sem(&LOCAL_GATES, "S", 1);
         assert!(sem.try_acquire_owned().is_err());
-        // Restore defaults so other tests see a clean config.
-        set_disk_limits(DiskLimitsConfig::default());
+    }
+
+    /// The bug this session fixed: a pass already parked in `Semaphore::acquire`
+    /// (queued before a settings save, exactly what a stuck backlog looks like)
+    /// must be woken by `set_disk_limits` itself — NOT only by some unrelated
+    /// NEW pass starting afterward. Before the fix, raising the limit updated
+    /// `DISK_CFG` but never touched the live semaphore the backlog was blocked
+    /// on, so "I upped all the values but nothing changed" was literally true.
+    #[tokio::test]
+    async fn raising_limit_wakes_an_already_queued_pass_with_no_new_caller() {
+        let v = Path::new(r"V:\rec\file.ts");
+        // `modify_disk_limits` — see the comment in
+        // `per_drive_limits_and_permit_adjustment` above (same shared global).
+        modify_disk_limits(|cfg| {
+            cfg.drives.insert(
+                "V".into(),
+                DiskLimits { local_permits: 1, cdn_permits: 1, readrate: 0.0, rate_limit: String::new() },
+            );
+        });
+
+        // Hold the only permit — mirrors the long-running ffmpeg pass at the
+        // head of a stuck backlog.
+        let held = local_pass("holder", v).await;
+        // A second pass enters the queue under the OLD (1-permit) limit and
+        // parks on acquire — mirrors the rest of the backlog.
+        let queued = tokio::spawn(async move { local_pass("queued", v).await });
+        // Give it a few scheduler turns to actually reach `.acquire().await`
+        // (not just be spawned-but-unpolled).
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        // Raise the limit — the fix under test: this alone must resize the
+        // already-created semaphore, no new `local_pass` call involved.
+        modify_disk_limits(|cfg| cfg.drives.get_mut("V").unwrap().local_permits = 2);
+
+        // The queued pass must complete promptly now, without anything else
+        // ever calling local_pass("V", ...) again.
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), queued)
+            .await
+            .expect("queued pass must be woken by the settings save, not time out")
+            .expect("task panicked");
+        drop(got);
+        drop(held);
     }
 
     #[test]

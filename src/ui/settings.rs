@@ -2031,8 +2031,11 @@ impl StreamArchiverApp {
              CDN muxes = network-fed writes (head backfills, VOD recoveries). The read \
              throttle and download rate limit here are the DEFAULTS (the same values as \
              the Remux disk throttle and the download rate limit); per-drive rows \
-             override all four for recordings living on that drive. Permit changes \
-             apply to the next pass; a reduction takes effect as running passes finish.",
+             override all four for recordings living on that drive. Permit changes take \
+             effect immediately on Save — including for passes already queued behind the \
+             old limit (a stuck backlog doesn't need a new pass to start before a raised \
+             limit reaches it). A reduction still lets any pass already RUNNING finish \
+             first; it only holds back the next one.",
         );
         ui.add_space(6.0);
         let mut remove: Option<usize> = None;
