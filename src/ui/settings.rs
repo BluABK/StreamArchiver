@@ -344,6 +344,73 @@ pub(super) fn trigger_scope_editor(
     *scope != before
 }
 
+/// The "Live" cell for a dynamic-mode disk-override row: current/ceiling for
+/// both gate kinds, each a draggable value that pins a manual override on
+/// change (see `io_gate::pin_dynamic_permits`), plus a 🔓 to release any
+/// active pin back to the adjuster. `letter` is the row's (possibly still
+/// being typed) drive-letter field.
+fn dynamic_live_cell(ui: &mut egui::Ui, letter: &str, local_ceiling: u32, cdn_ceiling: u32) {
+    let key = letter.trim().to_uppercase();
+    if key.len() != 1 || !key.chars().all(|c| c.is_ascii_alphabetic()) {
+        ui.weak("(drive letter?)");
+        return;
+    }
+    let ch = key.chars().next().unwrap();
+    let (pin_local, pin_cdn) = crate::io_gate::dynamic_pin_for(&key);
+    let mut new_pin_local = pin_local;
+    let mut new_pin_cdn = pin_cdn;
+    ui.horizontal(|ui| {
+        match crate::io_gate::local_dyn_status(ch) {
+            Some(s) => {
+                let mut v = pin_local.unwrap_or(s.current);
+                let resp = ui
+                    .add(egui::DragValue::new(&mut v).range(1..=local_ceiling.max(1)).prefix("L "))
+                    .on_hover_text(format!(
+                        "Local passes: {}/{} in use, ceiling {}. Drag to pin a specific \
+                         number — overrides the adjuster until cleared.",
+                        s.in_use, s.current, s.ceiling
+                    ));
+                if resp.changed() {
+                    new_pin_local = Some(v);
+                }
+            }
+            None => {
+                ui.weak("L —").on_hover_text("Not active yet — no local pass has run on this drive.");
+            }
+        }
+        match crate::io_gate::cdn_dyn_status(ch) {
+            Some(s) => {
+                let mut v = pin_cdn.unwrap_or(s.current);
+                let resp = ui
+                    .add(egui::DragValue::new(&mut v).range(1..=cdn_ceiling.max(1)).prefix("C "))
+                    .on_hover_text(format!(
+                        "CDN muxes: {}/{} in use, ceiling {}. Drag to pin a specific number \
+                         — overrides the adjuster until cleared.",
+                        s.in_use, s.current, s.ceiling
+                    ));
+                if resp.changed() {
+                    new_pin_cdn = Some(v);
+                }
+            }
+            None => {
+                ui.weak("C —").on_hover_text("Not active yet — no CDN mux has run on this drive.");
+            }
+        }
+        if (pin_local.is_some() || pin_cdn.is_some())
+            && ui
+                .small_button("🔓")
+                .on_hover_text("Clear the manual override, resume auto-adjustment")
+                .clicked()
+        {
+            new_pin_local = None;
+            new_pin_cdn = None;
+        }
+    });
+    if new_pin_local != pin_local || new_pin_cdn != pin_cdn {
+        crate::io_gate::pin_dynamic_permits(&key, new_pin_local, new_pin_cdn);
+    }
+}
+
 impl StreamArchiverApp {
     /// Whether a settings section should render: when the search box is empty, only
     /// the selected category tab's sections show; when searching, any section whose
@@ -2037,22 +2104,35 @@ impl StreamArchiverApp {
              limit reaches it). A reduction still lets any pass already RUNNING finish \
              first; it only holds back the next one.",
         );
+        ui.label(
+            "Tick Dynamic on a drive to stop hand-tuning it: Local passes/CDN muxes become \
+             a CEILING, and the live count adapts to the disk's actual queue depth instead \
+             of holding a fixed number — grows slowly while the disk proves idle, backs off \
+             immediately at the first sign of real contention. The Live column shows the \
+             current count next to the ceiling (e.g. 2/4); pin a specific number there to \
+             override the adjuster for now (🔓 to release it back to auto). Read throttle \
+             and download rate limit are unaffected by Dynamic.",
+        );
         ui.add_space(6.0);
         let mut remove: Option<usize> = None;
         egui::Grid::new("disk_io_grid")
-            .num_columns(6)
+            .num_columns(7)
             .striped(true)
             .spacing([14.0, 6.0])
             .show(ui, |ui| {
                 ui.strong("Drive");
-                ui.strong("Local passes").on_hover_text("Concurrent full-file ffmpeg passes on this disk (1 = one at a time).");
-                ui.strong("CDN muxes").on_hover_text("Concurrent network-fed muxes writing to this disk.");
+                ui.strong("Local passes").on_hover_text("Concurrent full-file ffmpeg passes on this disk (1 = one at a time). The ceiling when Dynamic is on.");
+                ui.strong("CDN muxes").on_hover_text("Concurrent network-fed muxes writing to this disk. The ceiling when Dynamic is on.");
                 ui.strong("Read throttle").on_hover_text("ffmpeg -readrate multiplier for local passes; 0 = unthrottled.");
                 ui.strong("Download limit").on_hover_text("yt-dlp --limit-rate for VOD/video downloads landing on this disk (e.g. 4M, 500K); empty = unlimited. Never applied to live captures.");
+                ui.strong("Dynamic").on_hover_text("Adapt the live permit count to actual disk activity instead of holding it fixed. See the note above.");
                 ui.label("");
                 ui.end_row();
 
-                // Default row (all drives without an override).
+                // Default row (all drives without an override). No live/pin
+                // readout here — "Default" isn't one physical disk, it's the
+                // fallback for every un-overridden one, so there's no single
+                // queue depth to show.
                 ui.label("Default").on_hover_text("Applies to every drive without its own row below.");
                 ui.add(egui::DragValue::new(&mut self.settings.disk_default_local).range(1..=8));
                 ui.add(egui::DragValue::new(&mut self.settings.disk_default_cdn).range(1..=8));
@@ -2067,6 +2147,7 @@ impl StreamArchiverApp {
                         .hint_text("off")
                         .desired_width(70.0),
                 );
+                ui.checkbox(&mut self.settings.disk_default_dynamic, "");
                 ui.label("");
                 ui.end_row();
 
@@ -2092,6 +2173,12 @@ impl StreamArchiverApp {
                             .hint_text("off")
                             .desired_width(70.0),
                     );
+                    ui.vertical(|ui| {
+                        ui.checkbox(&mut lim.dynamic, "");
+                        if lim.dynamic {
+                            dynamic_live_cell(ui, letter, lim.local_permits, lim.cdn_permits);
+                        }
+                    });
                     if ui.small_button("🗑").on_hover_text("Remove this drive's override").clicked() {
                         remove = Some(i);
                     }

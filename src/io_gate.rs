@@ -64,18 +64,29 @@ fn d_readrate() -> f64 {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DiskLimits {
     /// Concurrent local full-file ffmpeg passes (remux/concat/embed/merge).
+    /// The CEILING the adjuster grows toward when `dynamic` is on; the fixed
+    /// value used directly otherwise.
     #[serde(default = "d_local_permits")]
     pub local_permits: u32,
-    /// Concurrent CDN-fed muxes (head backfill, VOD recovery).
+    /// Concurrent CDN-fed muxes (head backfill, VOD recovery). Same ceiling
+    /// semantics as `local_permits` when `dynamic` is on.
     #[serde(default = "d_cdn_permits")]
     pub cdn_permits: u32,
     /// ffmpeg `-readrate` multiplier for local passes; 0 = unthrottled.
+    /// Unaffected by `dynamic` — permit counts only.
     #[serde(default = "d_readrate")]
     pub readrate: f64,
     /// yt-dlp `--limit-rate` for non-live downloads landing on this disk
     /// (e.g. `4M`, `500K`); empty = unlimited.
     #[serde(default)]
     pub rate_limit: String,
+    /// When true, `local_permits`/`cdn_permits` above become ceilings and the
+    /// background adjuster (see `start_dynamic_adjuster`) grows/shrinks the
+    /// LIVE permit count toward them based on the disk's actual queue depth
+    /// — idle disk grows slowly toward the ceiling, real contention backs
+    /// off immediately. Default false preserves every existing config.
+    #[serde(default)]
+    pub dynamic: bool,
 }
 
 impl Default for DiskLimits {
@@ -85,6 +96,7 @@ impl Default for DiskLimits {
             cdn_permits: d_cdn_permits(),
             readrate: d_readrate(),
             rate_limit: String::new(),
+            dynamic: false,
         }
     }
 }
@@ -130,25 +142,54 @@ pub fn set_disk_limits(cfg: DiskLimitsConfig) {
 /// write finally lands). Also resizes existing gates, same as
 /// `set_disk_limits` — see its doc comment for why.
 pub fn modify_disk_limits(f: impl FnOnce(&mut DiskLimitsConfig)) {
-    {
+    let cfg = {
         let mut guard = DISK_CFG.write();
         let mut cfg = guard.take().unwrap_or_default();
         f(&mut cfg);
-        *guard = Some(cfg);
-    }
-    resize_existing_gates(&LOCAL_GATES, |l| l.local_permits);
-    resize_existing_gates(&CDN_GATES, |l| l.cdn_permits);
+        *guard = Some(cfg.clone());
+        cfg
+    };
+    // Resize using THIS call's own just-committed snapshot, not a fresh
+    // re-read per key — two `modify_disk_limits` calls from different
+    // threads (e.g. two tests, each touching a different drive) can each
+    // trigger a resize sweep that touches an innocent-bystander key neither
+    // of them actually changed (every sweep walks every gate, not just the
+    // key it cares about). `DISK_CFG`'s write lock strictly orders the two
+    // COMMITS, but a fresh `limits_for_key` re-read per key during the sweep
+    // is a separate, unlocked step — a later commit's sweep could still read
+    // a value, get preempted, and apply it AFTER an earlier commit's sweep
+    // already applied a newer one, resurrecting a stale permit count. Using
+    // one fixed snapshot for the whole sweep avoids that: since commits are
+    // ordered, this call's snapshot is always at least as fresh as anything
+    // already applied, so it can never regress a value another call set.
+    resize_existing_gates(&LOCAL_GATES, &cfg, |l| l.local_permits);
+    resize_existing_gates(&CDN_GATES, &cfg, |l| l.cdn_permits);
 }
 
 /// Re-run the growth/shrink logic in [`gate_sem`] for every drive key that
 /// already has a gate, against the just-installed [`DISK_CFG`]. A no-op
 /// until the first pass on a given map ever runs (nothing to resize yet).
-fn resize_existing_gates(map: &'static OnceLock<GateMap>, want: impl Fn(&DiskLimits) -> u32) {
+///
+/// Needs no special-casing for dynamic-mode drives: `gate_sem` itself is a
+/// no-op (resize-wise) on an entry already flagged dynamic, so a save that
+/// leaves a drive in dynamic mode can't fight the background adjuster for
+/// control of its live permit count. A save that flips a drive OUT of
+/// dynamic mode DOES resize it here, back to the static ceiling — handing
+/// control back — and any leftover manual pin for that drive is cleared so
+/// it doesn't silently reappear if dynamic mode is re-enabled later.
+fn resize_existing_gates(
+    map: &'static OnceLock<GateMap>,
+    cfg: &DiskLimitsConfig,
+    want: impl Fn(&DiskLimits) -> u32,
+) {
     let Some(m) = map.get() else { return };
     let keys: Vec<String> = m.lock().keys().cloned().collect();
     for key in keys {
-        let limits = limits_for_key(&key);
-        gate_sem(map, &key, want(&limits) as usize);
+        let limits = cfg.drives.get(&key).cloned().unwrap_or_else(|| cfg.default.clone());
+        gate_sem(map, &key, want(&limits) as usize, limits.dynamic);
+        if !limits.dynamic {
+            clear_dynamic_pin(&key);
+        }
     }
 }
 
@@ -188,6 +229,12 @@ fn limits_for_key(key: &str) -> DiskLimits {
 struct GateEntry {
     sem: Arc<Semaphore>,
     permits: usize,
+    /// Single source of truth for who owns this gate's live permit count:
+    /// the background adjuster (true) or the static config (false). Synced
+    /// from `DiskLimits.dynamic` on every `gate_sem` call — re-derived, not
+    /// cached stale, so it can't drift out of sync with the persisted
+    /// config's own flag.
+    dynamic: bool,
 }
 
 type GateMap = parking_lot::Mutex<std::collections::HashMap<String, GateEntry>>;
@@ -209,23 +256,12 @@ pub fn set_runtime_handle(handle: tokio::runtime::Handle) {
     let _ = RT_HANDLE.set(handle);
 }
 
-/// Get (or create) the semaphore for `key`, adjusting its permit count to the
-/// configured value: growth is immediate (`add_permits`), waking any pass
-/// already parked in `Semaphore::acquire` in FIFO order — including one that
-/// entered the queue under an older, lower limit. Shrink acquires the excess
-/// permits in the background and forgets them, so it takes effect as running
-/// passes finish. Called on every new acquisition, AND on every settings
-/// save via [`set_disk_limits`]'s resize of already-existing gates — so a
-/// stuck backlog doesn't have to wait for some unrelated new pass to start
-/// before a raised limit reaches it.
-fn gate_sem(map: &'static OnceLock<GateMap>, key: &str, want: usize) -> Arc<Semaphore> {
-    let want = want.max(1);
-    let m = map.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
-    let mut g = m.lock();
-    let e = g.entry(key.to_string()).or_insert_with(|| GateEntry {
-        sem: Arc::new(Semaphore::new(want)),
-        permits: want,
-    });
+/// Growth (immediate `add_permits`, waking any pass already parked in
+/// `Semaphore::acquire` in FIFO order) / shrink (background reclaim, takes
+/// effect as running passes finish) to `want` permits on an existing entry —
+/// the mutation core shared by the static config's resize path and the
+/// dynamic adjuster's [`set_dynamic_permits`].
+fn apply_target(e: &mut GateEntry, want: usize) {
     match want.cmp(&e.permits) {
         std::cmp::Ordering::Greater => {
             e.sem.add_permits(want - e.permits);
@@ -251,7 +287,247 @@ fn gate_sem(map: &'static OnceLock<GateMap>, key: &str, want: usize) -> Arc<Sema
         }
         std::cmp::Ordering::Equal => {}
     }
+}
+
+/// Get (or create) the semaphore for `key`. For a STATIC drive
+/// (`dynamic=false`), also adjusts its permit count to `want` via
+/// [`apply_target`] — called on every new acquisition, AND on every settings
+/// save via [`set_disk_limits`]'s resize of already-existing gates, so a
+/// stuck backlog doesn't have to wait for some unrelated new pass to start
+/// before a raised limit reaches it. For a DYNAMIC drive, `want` is ignored
+/// entirely and the live permit count is left untouched — it's owned by the
+/// background adjuster (see [`start_dynamic_adjuster`]/[`set_dynamic_permits`]),
+/// and letting a mere new acquisition reset it back to the static ceiling
+/// would silently undo whatever the adjuster had backed it off to.
+///
+/// `dynamic` is resynced from the caller's current read of `DiskLimits` on
+/// every call (never cached stale) — the single source of truth for which
+/// mode a gate is in lives on [`GateEntry`] itself, so the two behaviors
+/// above can never disagree about which one applies.
+fn gate_sem(map: &'static OnceLock<GateMap>, key: &str, want: usize, dynamic: bool) -> Arc<Semaphore> {
+    let want = want.max(1);
+    let m = map.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let mut g = m.lock();
+    let e = g.entry(key.to_string()).or_insert_with(|| GateEntry {
+        // Dynamic gates slow-start at 1 permit and let the adjuster prove
+        // it's safe to grow, rather than jumping straight to the ceiling.
+        sem: Arc::new(Semaphore::new(if dynamic { 1 } else { want })),
+        permits: if dynamic { 1 } else { want },
+        dynamic,
+    });
+    e.dynamic = dynamic;
+    if e.dynamic {
+        return e.sem.clone();
+    }
+    apply_target(e, want);
     e.sem.clone()
+}
+
+/// Directly set a DYNAMIC drive's live permit count to `target` — the
+/// adjuster's own entry point, bypassing `DISK_CFG` entirely (the computed
+/// value is live-only; the user's configured ceiling must stay untouched so
+/// Settings always shows the real configured max, not the adjuster's current
+/// guess). A no-op if the gate doesn't exist yet or isn't in dynamic mode
+/// (e.g. a settings save flipped it back to static in the same instant).
+fn set_dynamic_permits(map: &'static OnceLock<GateMap>, key: &str, target: usize) {
+    let Some(m) = map.get() else { return };
+    if let Some(e) = m.lock().get_mut(key)
+        && e.dynamic
+    {
+        apply_target(e, target.max(1));
+    }
+}
+
+/// Live picture of one drive's dynamic-mode gate, for the Settings UI's
+/// "actual vs configured" display.
+pub struct DynGateStatus {
+    /// Permits currently installed on the live semaphore — the adjuster's
+    /// (or, briefly during a mode transition, the static config's) current
+    /// target. This is the "actual" number.
+    pub current: u32,
+    /// Of those, how many are checked out (a pass is actively running) right now.
+    pub in_use: u32,
+    /// The user's configured ceiling (`local_permits`/`cdn_permits`) the
+    /// adjuster grows toward.
+    pub ceiling: u32,
+}
+
+fn dyn_status(
+    map: &'static OnceLock<GateMap>,
+    letter: char,
+    ceiling_of: impl Fn(&DiskLimits) -> u32,
+) -> Option<DynGateStatus> {
+    let m = map.get()?;
+    let key = letter.to_ascii_uppercase().to_string();
+    let (current, in_use) = {
+        let g = m.lock();
+        let e = g.get(&key)?;
+        let in_use = e.permits.saturating_sub(e.sem.available_permits());
+        (e.permits as u32, in_use as u32)
+    };
+    let ceiling = ceiling_of(&limits_for_key(&key));
+    Some(DynGateStatus { current, in_use, ceiling })
+}
+
+/// Live status of drive `letter`'s local-passes gate, or `None` if nothing
+/// has run there yet (no gate created — the UI should show "not active yet",
+/// not "0/0").
+pub fn local_dyn_status(letter: char) -> Option<DynGateStatus> {
+    dyn_status(&LOCAL_GATES, letter, |l| l.local_permits)
+}
+
+/// Live status of drive `letter`'s CDN-mux gate — see [`local_dyn_status`].
+pub fn cdn_dyn_status(letter: char) -> Option<DynGateStatus> {
+    dyn_status(&CDN_GATES, letter, |l| l.cdn_permits)
+}
+
+/// Session-only manual override of a drive's dynamic-mode permit counts —
+/// "in-flight" per the feature's own name, never persisted (a restart always
+/// resumes under the adjuster's own judgment). Keyed by uppercase drive
+/// letter; `(local pin, cdn pin)` — `None` in either slot means "let the
+/// adjuster decide" for that gate kind.
+type DynamicPinMap = parking_lot::Mutex<std::collections::HashMap<String, (Option<u32>, Option<u32>)>>;
+static DYNAMIC_PIN: OnceLock<DynamicPinMap> = OnceLock::new();
+fn dynamic_pin_map() -> &'static DynamicPinMap {
+    DYNAMIC_PIN.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Pin a manual override for one drive's dynamic permit counts (or clear one
+/// by passing `None`). Takes effect on the adjuster's next tick (within
+/// [`DYNAMIC_TICK_SECS`]). Passing `None` for both clears the whole entry.
+pub fn pin_dynamic_permits(letter: &str, local: Option<u32>, cdn: Option<u32>) {
+    let key = letter.trim().to_uppercase();
+    if key.is_empty() {
+        return;
+    }
+    if local.is_none() && cdn.is_none() {
+        dynamic_pin_map().lock().remove(&key);
+    } else {
+        dynamic_pin_map().lock().insert(key, (local, cdn));
+    }
+}
+
+/// The current manual pin for a drive, if any — `(local pin, cdn pin)`.
+pub fn dynamic_pin_for(letter: &str) -> (Option<u32>, Option<u32>) {
+    dynamic_pin_map().lock().get(&letter.trim().to_uppercase()).copied().unwrap_or((None, None))
+}
+
+/// Drop any manual pin for `key` (a drive-letter key, not a raw user string
+/// — see [`resize_existing_gates`], which calls this when a drive exits
+/// dynamic mode so a stale pin can't silently reappear if it's re-enabled).
+fn clear_dynamic_pin(key: &str) {
+    dynamic_pin_map().lock().remove(key);
+}
+
+// ===== Dynamic-mode background adjuster =====
+
+/// How often the dynamic adjuster re-evaluates each dynamic-mode drive.
+const DYNAMIC_TICK_SECS: u64 = 5;
+/// Consecutive low-queue ticks required before growing by 1 permit — slow
+/// enough that a single quiet second doesn't ramp concurrency straight back
+/// up on a drive that's only momentarily caught its breath.
+const DYNAMIC_GROW_STREAK: u32 = 2;
+/// `queue_depth` at/below this counts as "idle enough to grow".
+const DYNAMIC_LOW_QUEUE: u32 = 1;
+/// `queue_depth` at/above this triggers an immediate backoff. Between this
+/// and `DYNAMIC_LOW_QUEUE` is a dead zone: hold steady, don't grow off a
+/// borderline reading.
+const DYNAMIC_HIGH_QUEUE: u32 = 3;
+
+/// One adjustment step for a dynamic-mode gate. Additive growth (slow-start,
+/// +1 after `DYNAMIC_GROW_STREAK` consecutive idle ticks, mirrors `gate_sem`'s
+/// own grow semantics) toward `ceiling`; MULTIPLICATIVE backoff (halve
+/// toward the floor of 1) the instant the disk shows real contention —
+/// fast enough to matter for a drive that's already been knocked off the bus
+/// once (see the module doc's USB-enclosure incident); an additive-by-1
+/// backoff would take too long to help at a ceiling of 6-8. `queue_depth` is
+/// whole-spindle (any process, not just this app) and instantaneous — the
+/// same "is this disk actually busy" signal Task Manager's per-disk active
+/// time reflects.
+fn dynamic_step(current: u32, queue_depth: u32, low_streak: &mut u32, ceiling: u32) -> u32 {
+    let ceiling = ceiling.max(1);
+    if queue_depth <= DYNAMIC_LOW_QUEUE {
+        *low_streak += 1;
+        if *low_streak >= DYNAMIC_GROW_STREAK {
+            (current + 1).min(ceiling)
+        } else {
+            current
+        }
+    } else if queue_depth >= DYNAMIC_HIGH_QUEUE {
+        *low_streak = 0;
+        (current / 2).max(1)
+    } else {
+        *low_streak = 0; // dead zone
+        current
+    }
+}
+
+/// Per-drive-key consecutive-low-queue streak, for `dynamic_step`'s slow-
+/// start growth condition. One shared map across both gate kinds (keyed by
+/// `"{L or C}:{drive}"`) since local and CDN ramp independently.
+static LOW_STREAK: OnceLock<parking_lot::Mutex<std::collections::HashMap<String, u32>>> = OnceLock::new();
+fn low_streak_map() -> &'static parking_lot::Mutex<std::collections::HashMap<String, u32>> {
+    LOW_STREAK.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Start the dynamic-limits background adjuster (idempotent — safe to call
+/// more than once, only the first call spawns anything). A dedicated
+/// `std::thread`, not a Tokio task: `platform::disk_performance` is a cheap
+/// synchronous IOCTL, and this mirrors `iomon::start_sampler`'s own
+/// precedent for exactly this kind of periodic-disk-poll work — no tokio
+/// worker or `spawn_blocking` overhead for a couple of syscalls every few
+/// seconds. Deliberately independent of `iomon.rs`: polls the same cheap
+/// primitive directly, scoped only to drives that already have a gate (i.e.
+/// drives the app is actually doing bulk I/O on), so it never needs to know
+/// what iomon happens to be sampling. Fire-and-forget for the process
+/// lifetime, same as the sampler.
+pub fn start_dynamic_adjuster() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    if STARTED.set(()).is_err() {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("io-gate-dynamic".into()).spawn(|| loop {
+        std::thread::sleep(std::time::Duration::from_secs(DYNAMIC_TICK_SECS));
+        dynamic_tick_for(&LOCAL_GATES, "L", |l| l.local_permits, |p| p.0);
+        dynamic_tick_for(&CDN_GATES, "C", |l| l.cdn_permits, |p| p.1);
+    });
+}
+
+/// One adjuster pass over every dynamic-mode drive currently gated on `map`.
+fn dynamic_tick_for(
+    map: &'static OnceLock<GateMap>,
+    streak_prefix: &str,
+    ceiling_of: impl Fn(&DiskLimits) -> u32,
+    pin_of: impl Fn(&(Option<u32>, Option<u32>)) -> Option<u32>,
+) {
+    let Some(m) = map.get() else { return };
+    let keys: Vec<String> = m.lock().keys().cloned().collect();
+    for key in keys {
+        if key == "*" {
+            continue; // UNC/relative bucket — no physical disk to poll
+        }
+        let limits = limits_for_key(&key);
+        if !limits.dynamic {
+            continue;
+        }
+        let target = match pin_of(&dynamic_pin_for(&key)) {
+            Some(pinned) => pinned,
+            None => {
+                let queue_depth = key
+                    .chars()
+                    .next()
+                    .and_then(crate::platform::disk_performance)
+                    .map(|d| d.queue_depth)
+                    .unwrap_or(0);
+                let current = m.lock().get(&key).map(|e| e.permits as u32).unwrap_or(1);
+                let streak_key = format!("{streak_prefix}:{key}");
+                let mut streaks = low_streak_map().lock();
+                let streak = streaks.entry(streak_key).or_insert(0);
+                dynamic_step(current, queue_depth, streak, ceiling_of(&limits))
+            }
+        };
+        set_dynamic_permits(map, &key, target as usize);
+    }
 }
 
 /// Live status of the local gates, for progress messages: every pass holding
@@ -312,8 +588,8 @@ impl Drop for WaitingGuard {
 /// for the duration of the ffmpeg run; drop to release.
 pub async fn local_pass(label: &str, path: &std::path::Path) -> LocalPass {
     let key = drive_key(path);
-    let want = limits_for(path).local_permits as usize;
-    let sem = gate_sem(&LOCAL_GATES, &key, want);
+    let limits = limits_for(path);
+    let sem = gate_sem(&LOCAL_GATES, &key, limits.local_permits as usize, limits.dynamic);
     let token = NEXT_GATE_TOKEN.fetch_add(1, Ordering::Relaxed);
     LOCAL_WAITERS.lock().push((token, label.to_string(), key.clone(), Instant::now()));
     let _wg = WaitingGuard(token);
@@ -392,8 +668,8 @@ pub fn wait_info(waited_secs: u64, holders: Vec<(String, u64)>, waiting: usize) 
 /// unbounded stacking still saturates a drive.
 pub async fn cdn_mux(label: &str, path: &std::path::Path) -> OwnedSemaphorePermit {
     let key = drive_key(path);
-    let want = limits_for(path).cdn_permits as usize;
-    let sem = gate_sem(&CDN_GATES, &key, want);
+    let limits = limits_for(path);
+    let sem = gate_sem(&CDN_GATES, &key, limits.cdn_permits as usize, limits.dynamic);
     let start = Instant::now();
     let permit = sem.acquire_owned().await.expect("io gate semaphore closed");
     let waited = start.elapsed();
@@ -474,13 +750,36 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    /// Tests below share process-global state (`DISK_CFG`, `LOCAL_GATES`/
+    /// `CDN_GATES`, `DYNAMIC_PIN`). `resize_existing_gates` deliberately
+    /// sweeps EVERY existing gate on every `modify_disk_limits` call — that
+    /// IS the point (a raised limit must reach an already-stuck backlog
+    /// immediately, not just brand-new work) — which means one test's config
+    /// change can transiently touch another test's drive letter too, even
+    /// though each test uses its own. In production this never matters:
+    /// `modify_disk_limits` only ever has ONE caller at a time (the single-
+    /// threaded Settings-save handler, or the dynamic adjuster's own
+    /// narrower `set_dynamic_permits`, which bypasses `DISK_CFG` entirely).
+    /// But `cargo test` runs these on independent OS threads truly in
+    /// parallel, so distinct drive letters alone aren't enough to prevent
+    /// interleaving. Serialize just the tests that mutate this shared state
+    /// (acquire as the first line) — they still run in parallel with every
+    /// other file's tests, just not with each other. Safe to hold across
+    /// `.await`: `#[tokio::test]` defaults to a current-thread runtime, so
+    /// one test never migrates across OS threads mid-await.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn lock_shared_state() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[tokio::test]
     async fn local_pass_serializes_per_drive() {
+        let _guard = lock_shared_state();
         // Distinct test drive letters so other tests' config doesn't interfere.
         let qa = Path::new(r"Q:\x\a.mkv");
         let a = local_pass("a", qa).await;
         // Same drive: second acquisition must not be immediately available…
-        let sem = gate_sem(&LOCAL_GATES, "Q", 1);
+        let sem = gate_sem(&LOCAL_GATES, "Q", 1, false);
         assert!(sem.clone().try_acquire_owned().is_err());
         // …but ANOTHER drive's gate is independent.
         let b = local_pass("b", Path::new(r"R:\y\b.mkv")).await;
@@ -498,6 +797,7 @@ mod tests {
 
     #[tokio::test]
     async fn per_drive_limits_and_permit_adjustment() {
+        let _guard = lock_shared_state();
         // `modify_disk_limits`, not a `disk_limits_config()` read followed by
         // a separate `set_disk_limits()` write — `DISK_CFG` is one global
         // shared with every other test in this file, running on independent
@@ -510,7 +810,13 @@ mod tests {
             cfg.default.readrate = 30.0;
             cfg.drives.insert(
                 "S".into(),
-                DiskLimits { local_permits: 2, cdn_permits: 1, readrate: 0.0, rate_limit: "4M".into() },
+                DiskLimits {
+                    local_permits: 2,
+                    cdn_permits: 1,
+                    readrate: 0.0,
+                    rate_limit: "4M".into(),
+                    dynamic: false,
+                },
             );
         });
         let s = Path::new(r"S:\rec\file.ts");
@@ -525,7 +831,7 @@ mod tests {
         // S's local gate has 2 permits: two concurrent passes, not three.
         let p1 = local_pass("s1", s).await;
         let p2 = local_pass("s2", s).await;
-        let sem = gate_sem(&LOCAL_GATES, "S", 2);
+        let sem = gate_sem(&LOCAL_GATES, "S", 2, false);
         assert!(sem.try_acquire_owned().is_err());
         drop(p1);
         drop(p2);
@@ -533,7 +839,7 @@ mod tests {
         modify_disk_limits(|cfg| cfg.drives.get_mut("S").unwrap().local_permits = 1);
         let _p = local_pass("s3", s).await;
         tokio::task::yield_now().await; // let the reducer task grab the excess
-        let sem = gate_sem(&LOCAL_GATES, "S", 1);
+        let sem = gate_sem(&LOCAL_GATES, "S", 1, false);
         assert!(sem.try_acquire_owned().is_err());
     }
 
@@ -545,13 +851,20 @@ mod tests {
     /// on, so "I upped all the values but nothing changed" was literally true.
     #[tokio::test]
     async fn raising_limit_wakes_an_already_queued_pass_with_no_new_caller() {
+        let _guard = lock_shared_state();
         let v = Path::new(r"V:\rec\file.ts");
         // `modify_disk_limits` — see the comment in
         // `per_drive_limits_and_permit_adjustment` above (same shared global).
         modify_disk_limits(|cfg| {
             cfg.drives.insert(
                 "V".into(),
-                DiskLimits { local_permits: 1, cdn_permits: 1, readrate: 0.0, rate_limit: String::new() },
+                DiskLimits {
+                    local_permits: 1,
+                    cdn_permits: 1,
+                    readrate: 0.0,
+                    rate_limit: String::new(),
+                    dynamic: false,
+                },
             );
         });
 
@@ -604,5 +917,162 @@ mod tests {
         assert_eq!(a.local_permits, 2);
         assert_eq!(a.cdn_permits, 2);
         assert_eq!(a.readrate, DEFAULT_READRATE);
+        assert!(!a.dynamic);
+    }
+
+    // ── Dynamic mode ──────────────────────────────────────────────────
+
+    #[test]
+    fn dynamic_step_grows_slowly_and_backs_off_fast() {
+        let mut streak = 0u32;
+        let mut cur = 1u32;
+        // Tick 1, low queue: streak builds, not yet enough to grow (GROW_STREAK = 2).
+        cur = dynamic_step(cur, 0, &mut streak, 4);
+        assert_eq!((cur, streak), (1, 1));
+        // Tick 2, still low: streak hits the threshold, grows by 1.
+        cur = dynamic_step(cur, 0, &mut streak, 4);
+        assert_eq!((cur, streak), (2, 2));
+        // Tick 3, still low (queue_depth == LOW_QUEUE counts as low too): grows again.
+        cur = dynamic_step(cur, 1, &mut streak, 4);
+        assert_eq!((cur, streak), (3, 3));
+        // Tick 4: dead zone (queue_depth == 2) holds steady AND resets the streak.
+        cur = dynamic_step(cur, 2, &mut streak, 4);
+        assert_eq!((cur, streak), (3, 0));
+        // Tick 5: real contention backs off MULTIPLICATIVELY (halve), not by 1.
+        cur = dynamic_step(cur, 3, &mut streak, 4);
+        assert_eq!((cur, streak), (1, 0)); // 3 / 2 = 1
+        // Never below the floor of 1, however busy.
+        assert_eq!(dynamic_step(1, 9, &mut 0, 4), 1);
+        // Growth never exceeds the ceiling, however long the idle streak.
+        let mut maxed_streak = DYNAMIC_GROW_STREAK;
+        assert_eq!(dynamic_step(4, 0, &mut maxed_streak, 4), 4);
+    }
+
+    /// The core fix this feature depends on: a NEW acquisition-time call
+    /// must never undo the adjuster's current throttling on a dynamic gate
+    /// (unlike a static gate, which DOES resize on every acquisition).
+    ///
+    /// Registers "W" in `DISK_CFG` up front (not just a hardcoded
+    /// `dynamic=true` literal passed straight to `gate_sem`) — `resize_
+    /// existing_gates` derives `dynamic` from `DISK_CFG`, not from whatever
+    /// a caller happens to pass, so if this test's literal disagreed with
+    /// the (never-updated) config, a concurrently-running sibling test's own
+    /// `modify_disk_limits` call would sweep every key including this one,
+    /// see `dynamic=false` in the config, and fight this test for control of
+    /// "W" — exactly the split-brain the single-`GateEntry.dynamic`-flag
+    /// design is meant to prevent, except the discrepancy would be coming
+    /// from this test's setup, not production code (which always derives
+    /// `dynamic` from `limits_for`/`limits_for_key`, never a literal).
+    /// `#[tokio::test]`: `modify_disk_limits` can need a runtime to spawn a
+    /// shrink-reclaim task on this thread.
+    #[tokio::test]
+    async fn dynamic_gate_ignores_want_on_repeated_acquisition() {
+        let _guard = lock_shared_state();
+        modify_disk_limits(|cfg| {
+            cfg.drives.insert(
+                "W".into(),
+                DiskLimits {
+                    local_permits: 5,
+                    cdn_permits: 2,
+                    readrate: 0.0,
+                    rate_limit: String::new(),
+                    dynamic: true,
+                },
+            );
+        });
+        let sem1 = gate_sem(&LOCAL_GATES, "W", 4, true);
+        assert_eq!(sem1.available_permits(), 1, "dynamic gates slow-start at 1, not at `want`");
+        // A second "new pass" acquisition with a DIFFERENT `want` (as if the
+        // ceiling changed) must not resize an already-created dynamic gate.
+        let sem2 = gate_sem(&LOCAL_GATES, "W", 8, true);
+        assert_eq!(sem2.available_permits(), 1);
+        assert!(Arc::ptr_eq(&sem1, &sem2));
+        // Only the adjuster's own entry point may move it.
+        set_dynamic_permits(&LOCAL_GATES, "W", 3);
+        assert_eq!(sem1.available_permits(), 3);
+        // Flip to static via the config (the same path production uses) —
+        // local_permits stayed 5 throughout, so this is always a GROWTH
+        // (3 -> 5, synchronous `add_permits`, no spawned reclaim task to
+        // race against) regardless of whether this test's own resize sweep
+        // or a concurrent sibling's gets there first — both converge on 5.
+        modify_disk_limits(|cfg| cfg.drives.get_mut("W").unwrap().dynamic = false);
+        assert_eq!(local_dyn_status('W').map(|s| s.current), Some(5));
+    }
+
+    // `#[tokio::test]`, not plain `#[test]`: `modify_disk_limits` resizes
+    // EVERY key in the shared gate maps, not just this test's own — if a
+    // concurrently-running test's drive needs a shrink at that moment, the
+    // reclaim task's spawn needs a runtime on this thread (no RT_HANDLE is
+    // registered in test context, only in AppCore::new for the real app).
+    #[tokio::test]
+    async fn resize_existing_gates_skips_dynamic_and_clears_pin_on_exit() {
+        let _guard = lock_shared_state();
+        modify_disk_limits(|cfg| {
+            cfg.drives.insert(
+                "X".into(),
+                DiskLimits {
+                    local_permits: 4,
+                    cdn_permits: 2,
+                    readrate: 0.0,
+                    rate_limit: String::new(),
+                    dynamic: true,
+                },
+            );
+        });
+        let sem = gate_sem(&LOCAL_GATES, "X", 4, true);
+        assert_eq!(sem.available_permits(), 1);
+        pin_dynamic_permits("X", Some(3), None);
+        assert_eq!(dynamic_pin_for("X"), (Some(3), None));
+        // Simulate the adjuster having moved it away from the ceiling.
+        set_dynamic_permits(&LOCAL_GATES, "X", 2);
+        assert_eq!(sem.available_permits(), 2);
+        // A save that changes an unrelated field but LEAVES dynamic=true must
+        // not fight the adjuster — resize_existing_gates should no-op here.
+        modify_disk_limits(|cfg| cfg.drives.get_mut("X").unwrap().cdn_permits = 3);
+        assert_eq!(sem.available_permits(), 2, "still-dynamic drive must not be resized on save");
+        assert_eq!(dynamic_pin_for("X"), (Some(3), None), "pin survives while still dynamic");
+        // Flipping dynamic OFF: resize_existing_gates must resize back to the
+        // static ceiling (4) AND clear the now-stale pin.
+        modify_disk_limits(|cfg| cfg.drives.get_mut("X").unwrap().dynamic = false);
+        assert_eq!(sem.available_permits(), 4, "resized back to the static ceiling on exit");
+        assert_eq!(dynamic_pin_for("X"), (None, None), "pin cleared on exiting dynamic mode");
+    }
+
+    // `#[tokio::test]` — see the comment on the previous test for why.
+    #[tokio::test]
+    async fn dyn_status_none_before_gate_then_tracks_current_in_use_ceiling() {
+        let _guard = lock_shared_state();
+        assert!(local_dyn_status('Y').is_none());
+        modify_disk_limits(|cfg| {
+            cfg.drives.insert(
+                "Y".into(),
+                DiskLimits {
+                    local_permits: 5,
+                    cdn_permits: 2,
+                    readrate: 0.0,
+                    rate_limit: String::new(),
+                    dynamic: true,
+                },
+            );
+        });
+        assert!(local_dyn_status('Y').is_none(), "still None until a gate actually exists");
+        let sem = gate_sem(&LOCAL_GATES, "Y", 5, true);
+        let status = local_dyn_status('Y').unwrap();
+        assert_eq!((status.current, status.in_use, status.ceiling), (1, 0, 5));
+        let _permit = sem.clone().try_acquire_owned().unwrap();
+        let status = local_dyn_status('Y').unwrap();
+        assert_eq!((status.current, status.in_use, status.ceiling), (1, 1, 5));
+    }
+
+    #[test]
+    fn pin_dynamic_permits_round_trip() {
+        assert_eq!(dynamic_pin_for("Z"), (None, None));
+        pin_dynamic_permits("z", Some(2), Some(1)); // lowercase input normalizes
+        assert_eq!(dynamic_pin_for("Z"), (Some(2), Some(1)));
+        pin_dynamic_permits("Z", None, Some(3));
+        assert_eq!(dynamic_pin_for("Z"), (None, Some(3)));
+        // Clearing both removes the entry entirely, not just zeroes it.
+        pin_dynamic_permits("Z", None, None);
+        assert_eq!(dynamic_pin_for("Z"), (None, None));
     }
 }

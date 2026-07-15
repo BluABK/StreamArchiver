@@ -536,6 +536,23 @@ captures are writing to:
   the old limit, so raising a limit to drain a stuck backlog doesn't require
   waiting for some unrelated new pass to kick off first. A reduction still
   lets any pass already *running* finish; it only holds back the next one.
+- **Dynamic mode** (a **Dynamic** checkbox per drive, default off): instead of
+  hand-tuning a fixed permit count, the local-pass/CDN-mux numbers become a
+  **ceiling** and a background adjuster grows or shrinks the *live* count
+  toward it every few seconds based on the disk's actual queue depth (the
+  same "is this disk actually busy" signal Windows' own per-disk activity
+  graph reflects — whole-spindle, so other programs' I/O counts too, not just
+  this app's). Growth is gradual (a couple of idle checks before adding a
+  permit, so a momentarily-quiet disk doesn't snap straight back to the
+  ceiling); backing off is fast — the first sign of real contention roughly
+  halves the live count immediately, because the whole point is protecting a
+  drive that's already been driven off the bus once. The **Live** column on
+  each dynamic-mode override row shows the current count next to the ceiling
+  (e.g. `L 2/4 · C 1/2`); drag either number to **pin** it — the adjuster
+  leaves that gate alone until you hit **🔓** to release it back to auto. A
+  drive with dynamic mode on that hasn't run a pass yet shows "not active
+  yet" rather than a real number. Only the permit counts adapt — the read
+  throttle and download rate limit stay fixed at whatever's configured.
 - **Disk throttle** (the default row of the Disk I/O limits table, default
   **30× realtime**)
   additionally caps how fast each pass reads + writes (ffmpeg `-readrate`,

@@ -131,6 +131,13 @@ impl AppCore {
             })
             .build()?;
         let rt_handle = rt.handle().clone();
+        // Registered here (not the interactive-only main.rs GUI path) so
+        // EVERY entry point — GUI, `--run-for` headless, `--manual-test` —
+        // gets it before anything could reach a settings save or the
+        // dynamic disk-gate adjuster's shrink-reclaim spawn, both of which
+        // need it to spawn safely from a non-runtime thread (egui's UI
+        // thread, or the adjuster's own dedicated std::thread).
+        crate::io_gate::set_runtime_handle(rt_handle.clone());
         let (events, _rx) = bus();
         Ok(Arc::new(AppCore {
             store,
@@ -208,6 +215,11 @@ impl AppCore {
                     .unwrap_or(crate::iomon::SAMPLE_LOG_DEFAULT),
             );
             crate::iomon::start_sampler();
+            // Dynamic disk-gate limits: started here too (not just the GUI
+            // path) so headless/daemon runs also get unattended adaptation —
+            // arguably the case that needs it most, since nobody's watching
+            // to raise a static limit by hand.
+            crate::io_gate::start_dynamic_adjuster();
         }
 
         let (live_tx, live_rx) =

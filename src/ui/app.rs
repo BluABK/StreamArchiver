@@ -208,6 +208,7 @@ impl StreamArchiverApp {
             // persisted per-disk config (or the legacy-seeded defaults).
             disk_default_local: crate::io_gate::disk_limits_config().default.local_permits,
             disk_default_cdn: crate::io_gate::disk_limits_config().default.cdn_permits,
+            disk_default_dynamic: crate::io_gate::disk_limits_config().default.dynamic,
             disk_overrides: {
                 let mut v: Vec<_> =
                     crate::io_gate::disk_limits_config().drives.into_iter().collect();
@@ -1468,15 +1469,17 @@ impl StreamArchiverApp {
         set_active_date_fmt(self.settings.date_fmt);
         set_short_ts_pattern(&self.settings.short_ts_fmt);
         // Per-disk I/O limits: the global throttle/rate-limit controls are the
-        // defaults; the per-drive overrides come from the table. Applied to
-        // passes/downloads started from now on (gate permits adjust on each
-        // gate's next acquisition).
+        // defaults; the per-drive overrides come from the table. Permit
+        // changes take effect immediately on save, including for a dynamic-
+        // mode drive's ceiling (the live count itself stays under the
+        // adjuster's control — see io_gate::resize_existing_gates).
         let disk_cfg = crate::io_gate::DiskLimitsConfig {
             default: crate::io_gate::DiskLimits {
                 local_permits: self.settings.disk_default_local.max(1),
                 cdn_permits: self.settings.disk_default_cdn.max(1),
                 readrate: self.settings.postproc_readrate,
                 rate_limit: self.settings.download_rate_limit.trim().to_string(),
+                dynamic: self.settings.disk_default_dynamic,
             },
             drives: self
                 .settings

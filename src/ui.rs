@@ -575,9 +575,15 @@ struct SettingsForm {
     /// download form.
     custom_tools: Vec<crate::downloader::CustomTool>,
     /// Default concurrent local full-file ffmpeg passes per disk (min 1).
+    /// The ceiling when `disk_default_dynamic` is on, the fixed value otherwise.
     disk_default_local: u32,
-    /// Default concurrent CDN-fed muxes per disk (min 1).
+    /// Default concurrent CDN-fed muxes per disk (min 1). Same ceiling
+    /// semantics as `disk_default_local` when dynamic mode is on.
     disk_default_cdn: u32,
+    /// Default disk-gate dynamic mode: adapt permits to live disk activity
+    /// instead of holding a fixed count. Per-drive overrides carry their own
+    /// `dynamic` bit on `DiskLimits` directly.
+    disk_default_dynamic: bool,
     /// Per-drive I/O limit overrides: (drive letter, limits). The default
     /// readrate/rate-limit live in `postproc_readrate`/`download_rate_limit`.
     disk_overrides: Vec<(String, crate::io_gate::DiskLimits)>,

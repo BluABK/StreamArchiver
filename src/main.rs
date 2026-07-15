@@ -179,10 +179,9 @@ fn main() -> Result<()> {
         Err(e) => tracing::warn!("notification pruning failed: {e:#}"),
     }
     let core = AppCore::new(Arc::new(store)).context("starting core runtime")?;
-    // Before anything can reach a settings save: the disk-gate resize on a
-    // live config change needs a runtime handle to spawn its permit-reclaim
-    // task from the (non-runtime) UI thread — see io_gate::RT_HANDLE.
-    io_gate::set_runtime_handle(core.rt.clone());
+    // Runtime handle registration + the dynamic disk-gate adjuster both live
+    // in AppCore::new/start now, so every entry point gets them — see the
+    // comments there.
     core.start(); // launch the background scheduler + download supervisor
 
     // `--hidden` (used by the autostart entry) launches straight to the tray.
