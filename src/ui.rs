@@ -606,6 +606,17 @@ pub struct StreamArchiverApp {
     /// Show desktop notifications (toasts) on recording start/finish/error.
     /// Persisted as the `notifications_enabled` setting; default on.
     notifications_enabled: bool,
+    /// Do Not Disturb: manually suppress toasts right now. Persisted as
+    /// `dnd_enabled`; default off. See [`crate::notifications::dnd_active`].
+    dnd_enabled: bool,
+    /// Also suppress toasts automatically during `dnd_start`-`dnd_end` each
+    /// day. Persisted as `dnd_schedule_enabled`; default off.
+    dnd_schedule_enabled: bool,
+    /// `"HH:MM"` local time the scheduled DND window begins/ends (a start
+    /// later than the end spans midnight). Edited live in Settings; only
+    /// persisted once both parse as valid times.
+    dnd_start: String,
+    dnd_end: String,
     /// The process-manager dialog: whether it's open, its last snapshot, and when
     /// that snapshot was taken (throttles the per-row `pid_alive`/DB queries).
     show_processes: bool,

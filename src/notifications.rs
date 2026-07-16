@@ -29,6 +29,18 @@ const APP_NAME: &str = "StreamArchiver";
 /// (the default); `"0"` = the user disabled toasts in Settings.
 pub const K_NOTIFICATIONS: &str = "notifications_enabled";
 
+/// Do Not Disturb: `"1"` = suppress toasts right now, regardless of the
+/// schedule below. Absent/`"0"` = off (the default).
+pub const K_DND_ENABLED: &str = "dnd_enabled";
+/// `"1"` = also suppress toasts automatically during the `[K_DND_START,
+/// K_DND_END)` daily local-time window, independent of `K_DND_ENABLED`.
+pub const K_DND_SCHEDULE_ENABLED: &str = "dnd_schedule_enabled";
+/// `"HH:MM"` local time the scheduled DND window begins. `start > end` spans
+/// midnight (e.g. `22:00`–`08:00`).
+pub const K_DND_START: &str = "dnd_start";
+/// `"HH:MM"` local time the scheduled DND window ends (exclusive).
+pub const K_DND_END: &str = "dnd_end";
+
 /// The built-in PowerShell AppUserModelID — lets a Win32 app show toasts without
 /// registering its own AUMID + Start-Menu shortcut.
 #[cfg(windows)]
@@ -45,6 +57,47 @@ fn enabled(store: &Store) -> bool {
         .flatten()
         .as_deref()
         != Some("0")
+}
+
+/// Whether Do Not Disturb is suppressing toasts right now: either manually
+/// enabled, or the schedule is on and the local wall-clock time falls in its
+/// window. Only gates the OS toast — the in-app notifications feed row is
+/// still recorded either way, same as the master `enabled()` toggle. Read
+/// live (cheap, infrequent) so a Settings change takes effect immediately.
+fn dnd_active(store: &Store) -> bool {
+    let manual = store.get_setting(K_DND_ENABLED).ok().flatten().as_deref() == Some("1");
+    if manual {
+        return true;
+    }
+    let schedule_on =
+        store.get_setting(K_DND_SCHEDULE_ENABLED).ok().flatten().as_deref() == Some("1");
+    if !schedule_on {
+        return false;
+    }
+    let start = store.get_setting(K_DND_START).ok().flatten().unwrap_or_default();
+    let end = store.get_setting(K_DND_END).ok().flatten().unwrap_or_default();
+    match (parse_hhmm(&start), parse_hhmm(&end)) {
+        (Some(start), Some(end)) => in_time_range(chrono::Local::now().time(), start, end),
+        _ => false,
+    }
+}
+
+fn parse_hhmm(s: &str) -> Option<chrono::NaiveTime> {
+    chrono::NaiveTime::parse_from_str(s.trim(), "%H:%M").ok()
+}
+
+/// True when `now` falls in the half-open `[start, end)` window. `start >
+/// end` is treated as spanning midnight (e.g. `22:00`–`08:00` covers both
+/// 23:00 and 04:00). Equal bounds cover the whole day — there's no useful
+/// "zero-width" reading for a DND window.
+fn in_time_range(now: chrono::NaiveTime, start: chrono::NaiveTime, end: chrono::NaiveTime) -> bool {
+    if start == end {
+        true
+    } else if start < end {
+        now >= start && now < end
+    } else {
+        now >= start || now < end
+    }
 }
 
 /// A protocol-activation button: clicking it asks Windows to open `url` (e.g. the
@@ -357,7 +410,7 @@ fn handle(store: &Store, ev: AppEvent) {
     };
     let _ = store.insert_notification(&n);
 
-    if enabled(store) {
+    if enabled(store) && !dnd_active(store) {
         show_toast(content);
     }
 }
@@ -504,6 +557,53 @@ fn file_uri(p: &Path) -> String {
         }
     }
     format!("file:///{}", enc.trim_start_matches('/'))
+}
+
+#[cfg(test)]
+mod dnd_tests {
+    use super::{in_time_range, parse_hhmm};
+
+    fn t(hhmm: &str) -> chrono::NaiveTime {
+        parse_hhmm(hhmm).unwrap()
+    }
+
+    #[test]
+    fn same_day_window() {
+        // 09:00-17:00 "work hours": inside, at the start (inclusive), at the
+        // end (exclusive), and outside.
+        assert!(in_time_range(t("12:00"), t("09:00"), t("17:00")));
+        assert!(in_time_range(t("09:00"), t("09:00"), t("17:00")));
+        assert!(!in_time_range(t("17:00"), t("09:00"), t("17:00")));
+        assert!(!in_time_range(t("08:59"), t("09:00"), t("17:00")));
+        assert!(!in_time_range(t("20:00"), t("09:00"), t("17:00")));
+    }
+
+    #[test]
+    fn overnight_window_spans_midnight() {
+        // 22:00-08:00: covers late night and early morning, not the daytime gap.
+        assert!(in_time_range(t("23:30"), t("22:00"), t("08:00")));
+        assert!(in_time_range(t("04:00"), t("22:00"), t("08:00")));
+        assert!(in_time_range(t("22:00"), t("22:00"), t("08:00")));
+        assert!(in_time_range(t("07:59"), t("22:00"), t("08:00")), "still within the early-morning half");
+        assert!(!in_time_range(t("21:59"), t("22:00"), t("08:00")), "not yet reached the evening start");
+        assert!(!in_time_range(t("08:00"), t("22:00"), t("08:00")), "end is exclusive");
+        assert!(!in_time_range(t("12:00"), t("22:00"), t("08:00")));
+    }
+
+    #[test]
+    fn equal_bounds_cover_whole_day() {
+        assert!(in_time_range(t("00:00"), t("00:00"), t("00:00")));
+        assert!(in_time_range(t("13:37"), t("06:00"), t("06:00")));
+    }
+
+    #[test]
+    fn parse_hhmm_rejects_garbage() {
+        assert!(parse_hhmm("22:00").is_some());
+        assert!(parse_hhmm(" 8:05 ").is_some());
+        assert!(parse_hhmm("").is_none());
+        assert!(parse_hhmm("25:00").is_none());
+        assert!(parse_hhmm("not a time").is_none());
+    }
 }
 
 #[cfg(all(test, windows))]

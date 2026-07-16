@@ -30,6 +30,15 @@ impl StreamArchiverApp {
             .flatten()
             .as_deref()
             != Some("0");
+        // Do Not Disturb defaults off in both dimensions.
+        let dnd_enabled =
+            setting_or_empty(&core, crate::notifications::K_DND_ENABLED) == "1";
+        let dnd_schedule_enabled =
+            setting_or_empty(&core, crate::notifications::K_DND_SCHEDULE_ENABLED) == "1";
+        let dnd_start = setting_or_empty(&core, crate::notifications::K_DND_START);
+        let dnd_start = if dnd_start.is_empty() { "22:00".to_string() } else { dnd_start };
+        let dnd_end = setting_or_empty(&core, crate::notifications::K_DND_END);
+        let dnd_end = if dnd_end.is_empty() { "08:00".to_string() } else { dnd_end };
 
         let schedule_compact = setting_or_empty(&core, K_SCHEDULE_COMPACT) == "1";
 
@@ -334,6 +343,10 @@ impl StreamArchiverApp {
             autostart_on,
             keep_downloads_on_quit,
             notifications_enabled,
+            dnd_enabled,
+            dnd_schedule_enabled,
+            dnd_start,
+            dnd_end,
             show_processes: false,
             processes: Vec::new(),
             processes_refreshed: None,

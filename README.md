@@ -759,6 +759,14 @@ The Issues panel refreshes every 5 s while open and every 5 min while closed —
 
   ![Notifications window with a mixed feed of events](doc/screenshots/notifications-window.png)
   ![Desktop toast for a channel going live](doc/screenshots/live-toast-notification.png)
+- **Do Not Disturb** (Settings → Notifications) — suppresses desktop toasts
+  without touching anything else: the 🔔 feed, Background view, and recording
+  itself all keep working exactly as normal. Two independent switches: a
+  manual **Do Not Disturb** toggle for right now, and **Automatically during a
+  daily time range** (e.g. `22:00`–`08:00` overnight, or `09:00`–`17:00` for
+  work hours) that engages on its own every day — either one suppresses
+  toasts on its own, so leaving the manual toggle off doesn't disable the
+  schedule. A start later than the end spans midnight.
 - **Background** tab — lists every recurring background job (Live poll,
   Schedule refresh, Ad-free/sub refresh, YouTube WebSub poll, Channel asset
   refresh, YouTube posts refresh, Scheduled recordings) with its interval and

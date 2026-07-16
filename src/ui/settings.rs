@@ -1743,7 +1743,7 @@ impl StreamArchiverApp {
     }
 
     fn settings_notifications_section(&mut self, ui: &mut egui::Ui) {
-            if self.section_shown(SettingsTab::Interface, "Notifications", &["notifications", "desktop", "toast", "alerts"]) {
+            if self.section_shown(SettingsTab::Interface, "Notifications", &["notifications", "desktop", "toast", "alerts", "dnd", "do not disturb", "quiet hours", "work hours"]) {
             ui.add_space(12.0);
             ui.heading("Notifications");
             let mut notify_on = self.notifications_enabled;
@@ -1769,6 +1769,93 @@ impl StreamArchiverApp {
                 } else {
                     "Desktop notifications disabled.".into()
                 };
+            }
+
+            ui.add_space(8.0);
+            let mut dnd_on = self.dnd_enabled;
+            if ui
+                .checkbox(&mut dnd_on, "Do Not Disturb")
+                .on_hover_text(
+                    "Suppress desktop toasts right now (the in-app notifications feed and \
+                     Background view still update — only the pop-up is silenced). \
+                     Takes effect immediately.",
+                )
+                .changed()
+            {
+                self.dnd_enabled = dnd_on;
+                let _ = self.core.store.set_setting(
+                    crate::notifications::K_DND_ENABLED,
+                    if dnd_on { "1" } else { "0" },
+                );
+                self.status = if dnd_on {
+                    "Do Not Disturb enabled.".into()
+                } else {
+                    "Do Not Disturb disabled.".into()
+                };
+            }
+            let mut dnd_sched_on = self.dnd_schedule_enabled;
+            if ui
+                .checkbox(&mut dnd_sched_on, "Automatically during a daily time range")
+                .on_hover_text(
+                    "Also suppress toasts every day during the window below — e.g. work \
+                     hours, or overnight — independent of the toggle above.",
+                )
+                .changed()
+            {
+                self.dnd_schedule_enabled = dnd_sched_on;
+                let _ = self.core.store.set_setting(
+                    crate::notifications::K_DND_SCHEDULE_ENABLED,
+                    if dnd_sched_on { "1" } else { "0" },
+                );
+                self.status = if dnd_sched_on {
+                    "Do Not Disturb schedule enabled.".into()
+                } else {
+                    "Do Not Disturb schedule disabled.".into()
+                };
+            }
+            if self.dnd_schedule_enabled {
+                ui.indent("dnd_schedule_range", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("From");
+                        let r1 = ui.add(
+                            egui::TextEdit::singleline(&mut self.dnd_start)
+                                .desired_width(50.0)
+                                .hint_text("HH:MM"),
+                        );
+                        ui.label("to");
+                        let r2 = ui.add(
+                            egui::TextEdit::singleline(&mut self.dnd_end)
+                                .desired_width(50.0)
+                                .hint_text("HH:MM"),
+                        );
+                        ui.label("(a range like 22:00–08:00 spans midnight)");
+                        // Validated with the exact "%H:%M" format `dnd_active`
+                        // parses at runtime (not the looser `parse_time_of_day`,
+                        // which also accepts seconds) — a value that passes
+                        // here but fails there would silently never engage.
+                        let strict_hhmm = |s: &str| {
+                            chrono::NaiveTime::parse_from_str(s.trim(), "%H:%M").is_ok()
+                        };
+                        if r1.lost_focus() || r2.lost_focus() {
+                            match (strict_hhmm(&self.dnd_start), strict_hhmm(&self.dnd_end)) {
+                                (true, true) => {
+                                    let _ = self
+                                        .core
+                                        .store
+                                        .set_setting(crate::notifications::K_DND_START, &self.dnd_start);
+                                    let _ = self
+                                        .core
+                                        .store
+                                        .set_setting(crate::notifications::K_DND_END, &self.dnd_end);
+                                    self.status = "Do Not Disturb schedule updated.".into();
+                                }
+                                _ => {
+                                    self.status = "Time must be HH:MM.".into();
+                                }
+                            }
+                        }
+                    });
+                });
             }
 
             }
