@@ -434,10 +434,29 @@ impl Store {
     fn db(&self) -> DbGuard<'_> {
         let caller = std::panic::Location::caller();
         let t = std::time::Instant::now();
+        // Record ourselves as HOLDER right after actually acquiring the real
+        // mutex, before doing anything else. Slow-wait logging below (atomic
+        // counters, `tracing::warn!` formatting/dispatch, a locked VecDeque
+        // push) is not instant — a waiter whose own `try_lock()` fails while
+        // we're still in that logging, before HOLDER is updated, would
+        // otherwise blame "<holder unknown>" despite us clearly holding the
+        // lock (seen live: a wait logged unknown immediately after another
+        // thread's own contended acquisition).
+        let set_holder = || {
+            *db_lock::HOLDER.lock() = Some(db_lock::Entry {
+                thread: db_lock::thread_name(),
+                file: caller.file(),
+                line: caller.line(),
+                since: std::time::Instant::now(),
+            });
+        };
         // Uncontended fast path (parking_lot's fair unlock hands the mutex
         // directly to the next queued waiter, so try_lock can't barge).
         let g = match self.conn.try_lock() {
-            Some(g) => g,
+            Some(g) => {
+                set_holder();
+                g
+            }
             None => {
                 // Contended: remember who we're stuck behind (the holder at
                 // wait start — the one worth blaming) and join the visible
@@ -470,6 +489,7 @@ impl Store {
                 }
                 let _wg = WaiterGuard(token);
                 let g = self.conn.lock();
+                set_holder();
                 let wait_ms = t.elapsed().as_millis();
                 if wait_ms >= 50 {
                     db_lock::SLOW_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -500,12 +520,6 @@ impl Store {
                 g
             }
         };
-        *db_lock::HOLDER.lock() = Some(db_lock::Entry {
-            thread: db_lock::thread_name(),
-            file: caller.file(),
-            line: caller.line(),
-            since: std::time::Instant::now(),
-        });
         DbGuard { inner: g, acquired_at: std::time::Instant::now(), caller }
     }
 
