@@ -1073,6 +1073,30 @@ pub(super) fn sabr_dvr_window_exceeded(log: &str) -> bool {
     log.contains("not near live head")
 }
 
+/// True when a from-start SABR capture is worth retrying **in the same take**
+/// rather than finalizing as failed: it left resumable `.state`/`.part` files
+/// behind (so yt-dlp can pick up where it died) and the failure wasn't the
+/// stream itself ending or the DVR window closing — i.e. a transient local
+/// hiccup like antivirus/backup briefly locking the checkpoint file mid-write
+/// (2026-07-16: a 2h15m/1.75GB Maid Mint capture died this way to a Windows
+/// `PermissionError` renaming its SABR `.state` file, and nothing recovered it
+/// until the app was told about it). Mirrors the resumability gate
+/// `resume_inflight` already uses for crash recovery at app startup, so this
+/// is the same contract, just reachable immediately instead of only after a
+/// restart.
+pub(super) fn sabr_resumable_failure(
+    is_youtube_sabr_from_start: bool,
+    sabr_usable: bool,
+    state_exists: bool,
+    log: &str,
+) -> bool {
+    is_youtube_sabr_from_start
+        && sabr_usable
+        && state_exists
+        && !stream_ended_or_unavailable(log)
+        && !sabr_dvr_window_exceeded(log)
+}
+
 impl Supervisor {
     /// Disk-aware startup repair for takes whose DB row claims a final output
     /// file (crash orphans, plus rows a pre-2026-07-11 blind promotion already
@@ -1351,6 +1375,26 @@ mod tests {
             "ERROR: unable to download video data: HTTP Error 403: Forbidden"
         ));
         assert!(!stream_ended_or_unavailable(""));
+    }
+    #[test]
+    fn sabr_resumable_failure_gates_correctly() {
+        let permission_error = "PermissionError: [WinError 5] Access is denied: \
+             'A:\\streams\\.sa-cache\\Maid Mint\\tmpzyk9b7fo' -> '...state'";
+        // The Maid Mint incident: a from-start SABR take, usable binary, leftover
+        // `.state`, and a failure that's neither the stream ending nor the DVR
+        // window closing — should retry.
+        assert!(sabr_resumable_failure(true, true, true, permission_error));
+        assert!(!sabr_resumable_failure(false, true, true, permission_error), "not a YouTube SABR from-start take");
+        assert!(!sabr_resumable_failure(true, false, true, permission_error), "no usable SABR binary");
+        assert!(!sabr_resumable_failure(true, true, false, permission_error), "nothing resumable left behind");
+        assert!(
+            !sabr_resumable_failure(true, true, true, "Only images are available for download."),
+            "stream genuinely ended — retrying would just hit the same wall"
+        );
+        assert!(
+            !sabr_resumable_failure(true, true, true, "StreamStallError: not near live head"),
+            "DVR window exceeded has its own recovery (fall back to live edge), not a same-take retry"
+        );
     }
     #[test]
     fn plausible_media_output_rejects_working_files() {

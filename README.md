@@ -1764,7 +1764,18 @@ Mid-capture, a SABR recording on disk is **two separate growing files** — one
 per selected format (video + audio), each a progressively-appended fragmented
 MP4 or Matroska (`….f<id>….sq<N>.part`) — plus small `.state` resume sidecars.
 The single MKV only exists after the stream ends and the merge runs, so there
-is no one file to just "open". The player features handle this
+is no one file to just "open".
+
+**Resume on failure.** Those `.state`/`.part` files are also how a from-start
+SABR capture survives dying mid-download without losing what it already has.
+If yt-dlp exits abnormally — crashed, killed, or hit a transient local error
+like antivirus/backup briefly locking the `.state` file mid-write (Windows
+`PermissionError`/`Access is denied`) — and the failure wasn't the stream
+itself ending, the take retries in place up to 3 times (5 s apart) with the
+identical output path, so yt-dlp's own SABR resume continues from the
+surviving fragments instead of restarting from scratch. The same resumability
+check also runs at app startup for a capture still mid-flight when the app
+was closed or crashed, picking it back up on the next launch. The player features handle this
 (full behavior in [Watching in a media player](#watching-in-a-media-player)):
 
 - **⏵ Stream in player** finds the growing pair and merges it *in mpv*: the

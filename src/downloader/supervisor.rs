@@ -2399,25 +2399,80 @@ progress_info: None,
         let outcome = if self.stopping_monitors.lock().unwrap().contains(&monitor_id) {
             ProcessOutcome { exit_code: None, log: String::new() }
         } else {
-            self.run_process(
-                &self.active,
-                monitor_id,
-                &plan,
-                None,
-                None,
-                ad_sink,
-                DetachReg {
-                    kind: DetachedKind::Recording,
-                    ref_id: rec_id,
-                    monitor_id: Some(monitor_id),
-                    take_group: Some(take_group.clone()),
-                    started_at,
-                    secondary: false,
-                    stream_id: stream_id.clone(),
-                    went_live_at,
-                },
-            )
-            .await
+            let mut outcome = self
+                .run_process(
+                    &self.active,
+                    monitor_id,
+                    &plan,
+                    None,
+                    None,
+                    ad_sink,
+                    DetachReg {
+                        kind: DetachedKind::Recording,
+                        ref_id: rec_id,
+                        monitor_id: Some(monitor_id),
+                        take_group: Some(take_group.clone()),
+                        started_at,
+                        secondary: false,
+                        stream_id: stream_id.clone(),
+                        went_live_at,
+                    },
+                )
+                .await;
+            // A from-start SABR capture can die from a transient local hiccup
+            // (antivirus/backup briefly locking its `.state` checkpoint file —
+            // 2026-07-16: a 2h15m/1.75GB Maid Mint capture died exactly this way
+            // and nothing recovered it) without the stream itself ending. Retry
+            // the identical take a few times — same `-o`, same `plan`, so yt-dlp's
+            // own SABR resume continues from the surviving `.state` — before
+            // giving up and letting it finalize as failed. `ad_sink` is always
+            // `None` here (only Twitch+streamlink recordings get one), so it's
+            // safe to reuse `None` across retries without cloning.
+            const MAX_SABR_RETRIES: u32 = 3;
+            const SABR_RETRY_DELAY: Duration = Duration::from_secs(5);
+            let mut retries = 0;
+            while retries < MAX_SABR_RETRIES
+                && sabr_resumable_failure(
+                    row.monitor.platform() == Platform::YouTube
+                        && row.monitor.tool == Tool::YtDlp
+                        && row.monitor.capture_from_start,
+                    ytdlp_bins.sabr.usable(),
+                    sabr_state_exists(&plan.final_path.to_string_lossy()),
+                    &outcome.log,
+                )
+                && !self.stopping_monitors.lock().unwrap().contains(&monitor_id)
+                && !self.shutdown.load(Ordering::SeqCst)
+            {
+                retries += 1;
+                warn!(
+                    monitor_id,
+                    retries,
+                    "SABR capture died with resumable state left behind; retrying same take {}",
+                    Platform::YouTube.tag()
+                );
+                crate::app_core::sleep_cancellable(SABR_RETRY_DELAY, &self.shutdown).await;
+                outcome = self
+                    .run_process(
+                        &self.active,
+                        monitor_id,
+                        &plan,
+                        None,
+                        None,
+                        None,
+                        DetachReg {
+                            kind: DetachedKind::Recording,
+                            ref_id: rec_id,
+                            monitor_id: Some(monitor_id),
+                            take_group: Some(take_group.clone()),
+                            started_at,
+                            secondary: false,
+                            stream_id: stream_id.clone(),
+                            went_live_at,
+                        },
+                    )
+                    .await;
+            }
+            outcome
         };
 
         self.stop_record_watchers(watcher_done, watcher, meta_done, meta_task, chat_done, chat_task)
