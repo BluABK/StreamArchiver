@@ -67,7 +67,7 @@ impl Supervisor {
                     if self.shutdown.load(Ordering::SeqCst) {
                         continue; // draining: don't start new recordings
                     }
-                    self.try_begin(signal.monitor_id, signal.went_live_at, signal.approximate, signal.stream_id, signal.thumbnail_url, signal.broadcaster_id, signal.stream_title, signal.stream_game, false, false);
+                    self.try_begin(signal.monitor_id, signal.went_live_at, signal.approximate, signal.stream_id, signal.thumbnail_url, signal.broadcaster_id, signal.stream_title, signal.stream_game, signal.stream_viewers, false, false);
                 }
                 Some(monitor_id) = offline_rx.recv() => {
                     self.handle_offline_signal(monitor_id);
@@ -1112,7 +1112,7 @@ progress_info: None,
                     }
                     let occurrence_start = rule.next_run_at.unwrap_or(now);
                     if self.try_begin(
-                        rule.monitor_id, Some(now), true, None, None, None, None, None, true, true,
+                        rule.monitor_id, Some(now), true, None, None, None, None, None, None, true, true,
                     ) {
                         info!(
                             monitor_id = rule.monitor_id,
@@ -1163,6 +1163,7 @@ progress_info: None,
         broadcaster_id: Option<String>,
         stream_title: Option<String>,
         stream_game: Option<String>,
+        stream_viewers: Option<i64>,
         bypass_backoff: bool,
         forced: bool,
     ) -> bool {
@@ -1250,6 +1251,7 @@ progress_info: None,
                                 o.broadcaster_id.or(broadcaster_id),
                                 o.stream_title,
                                 o.stream_game,
+                                o.stream_viewers.or(stream_viewers),
                                 bypass_backoff,
                                 forced,
                             );
@@ -1267,6 +1269,7 @@ progress_info: None,
                                 o.broadcaster_id.or(broadcaster_id),
                                 Some(String::new()),
                                 None,
+                                o.stream_viewers.or(stream_viewers),
                                 bypass_backoff,
                                 forced,
                             );
@@ -1278,12 +1281,15 @@ progress_info: None,
                 // above was spawned) but the go-live time is, so at least
                 // Went Live/Started On/Duration have data instead of sitting
                 // blank until the re-check (or the next poll) fills the rest in.
+                // `stream_viewers` may still be known even without title/game
+                // (e.g. the caller's own poll had it) — preserve it rather
+                // than clobbering to unknown.
                 let (live_since, live_since_approx) = match went_live_at {
                     Some(t) => (Some(t), approximate),
                     None => (Some(now_unix()), true),
                 };
                 let _ = self.store.set_monitor_live_meta(
-                    monitor_id, "", "", "", -1, live_since, live_since_approx,
+                    monitor_id, "", "", "", stream_viewers.unwrap_or(-1), live_since, live_since_approx,
                 );
                 return false;
             }
@@ -1313,7 +1319,7 @@ progress_info: None,
                 stream_title.as_deref().unwrap_or(""),
                 stream_game.as_deref().unwrap_or(""),
                 thumbnail_url.as_deref().unwrap_or(""),
-                -1,
+                stream_viewers.unwrap_or(-1),
                 live_since,
                 live_since_approx,
             );
@@ -1350,9 +1356,14 @@ progress_info: None,
             // Auto-record is off for this channel/instance: detection keeps the
             // state fresh, but only an explicit user Start (or a trigger-word
             // match) records. Update last_state so the UI shows "live", and the
-            // live meta (title/game/thumbnail/go-live time) the same way the
-            // poll scheduler does, so Went Live/Started On/Duration aren't blank
-            // just because this channel was seen live via a push signal instead.
+            // live meta (title/game/thumbnail/viewers/go-live time) the same way
+            // the poll scheduler does, so Went Live/Started On/Duration/viewers
+            // aren't blank just because this channel was seen live via a push
+            // signal instead. `stream_viewers` was previously hardcoded to -1
+            // here, clobbering the correct value the scheduler's own poll had
+            // just written moments earlier in the same tick (every live poll
+            // sends a LiveSignal here regardless of Auto) — see `manual_start`'s
+            // parallel branch below, which already got this right.
             self.active.lock().unwrap().remove(&monitor_id);
             let _ = self.store.set_monitor_check_result(monitor_id, "live", now_unix());
             let (live_since, live_since_approx) = match went_live_at {
@@ -1364,7 +1375,7 @@ progress_info: None,
                 stream_title.as_deref().unwrap_or(""),
                 stream_game.as_deref().unwrap_or(""),
                 thumbnail_url.as_deref().unwrap_or(""),
-                -1,
+                stream_viewers.unwrap_or(-1),
                 live_since,
                 live_since_approx,
             );
@@ -1456,7 +1467,7 @@ progress_info: None,
         // check_one (which would just report "not live" and never proceed).
         if row.monitor.detection_method == DetectionMethod::Disabled {
             if user_initiated {
-                self.try_begin(monitor_id, Some(now_unix()), true, None, None, None, None, None, true, true);
+                self.try_begin(monitor_id, Some(now_unix()), true, None, None, None, None, None, None, true, true);
             }
             return;
         }
@@ -1469,7 +1480,7 @@ progress_info: None,
                     Some(t) => (Some(t), false),
                     None => (Some(now_unix()), true),
                 };
-                self.try_begin(monitor_id, went, approx, outcome.stream_id, outcome.thumbnail_url, outcome.broadcaster_id, outcome.stream_title, outcome.stream_game, true, user_initiated);
+                self.try_begin(monitor_id, went, approx, outcome.stream_id, outcome.thumbnail_url, outcome.broadcaster_id, outcome.stream_title, outcome.stream_game, outcome.stream_viewers, true, user_initiated);
             } else {
                 // Auto off + automatic trigger: just update the state + live
                 // meta (title/game/thumbnail/viewers/go-live time) so the UI

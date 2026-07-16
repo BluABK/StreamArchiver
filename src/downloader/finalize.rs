@@ -907,6 +907,11 @@ pub(super) async fn meta_watcher(
     let mut last_matched: Option<bool> = None;
     let mut unmatch_since: Option<i64> = None;
     let mut stop_sent = false;
+    // Whether the last fetch failed, so a run of failures during a take (e.g. a
+    // mid-take Twitch token expiring) logs once instead of once per poll for
+    // the rest of the recording — mirrors the batched-Helix-poll fix in
+    // `detect_twitch`. `None` until the first fetch settles (no baseline noise).
+    let mut fetch_failing: Option<bool> = None;
     loop {
         if done.load(Ordering::SeqCst) || shutdown.load(Ordering::SeqCst) {
             return;
@@ -917,6 +922,21 @@ pub(super) async fn meta_watcher(
             Platform::YouTube => ctx.youtube_stream_meta(&url).await,
             Platform::Generic => None,
         };
+        if platform != Platform::Generic {
+            let failing_now = fetched.is_none();
+            if failing_now && fetch_failing != Some(true) {
+                warn!(
+                    monitor_id, rec_id,
+                    "live title/game/viewer refresh started failing for {} — \
+                     title/game/viewer count will stay frozen until it recovers \
+                     (enable debug logging for the specific reason)",
+                    platform.tag()
+                );
+            } else if !failing_now && fetch_failing == Some(true) {
+                info!(monitor_id, rec_id, "live title/game/viewer refresh recovered for {}", platform.tag());
+            }
+            fetch_failing = Some(failing_now);
+        }
         if let Some(meta) = fetched {
             let at = (now_unix() - started_at).max(0);
             let mut changed = false;

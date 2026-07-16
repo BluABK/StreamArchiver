@@ -271,6 +271,8 @@ pub struct LiveSignal {
     pub stream_title: Option<String>,
     /// Game/category at go-live time, if the platform provided it at detection.
     pub stream_game: Option<String>,
+    /// Live viewer count at detection time, if the platform provided it.
+    pub stream_viewers: Option<i64>,
 }
 
 impl LiveSignal {
@@ -284,6 +286,7 @@ impl LiveSignal {
             broadcaster_id: None,
             stream_title: None,
             stream_game: None,
+            stream_viewers: None,
         }
     }
 
@@ -310,6 +313,11 @@ impl LiveSignal {
 
     pub fn with_stream_game(mut self, stream_game: Option<String>) -> LiveSignal {
         self.stream_game = stream_game;
+        self
+    }
+
+    pub fn with_stream_viewers(mut self, stream_viewers: Option<i64>) -> LiveSignal {
+        self.stream_viewers = stream_viewers;
         self
     }
 }

@@ -677,7 +677,16 @@ impl DetectContext {
     /// a connected user token if present, else the app token, with a one-shot
     /// app-token fallback on a 401.
     pub async fn twitch_stream_meta(&self, url: &str) -> Option<StreamMeta> {
-        let login = twitch_login(url)?;
+        // Silent `None` here used to be undiagnosable — a mid-take auth hiccup
+        // (e.g. a user token expiring) would just freeze viewer count/title/
+        // game for the rest of the recording with nothing in the log to explain
+        // why. Every early exit below logs its specific reason at DEBUG (the
+        // caller, `meta_watcher`, warns once at the point it notices repeated
+        // failures — this function itself has no per-take failure-streak state).
+        let Some(login) = twitch_login(url) else {
+            debug!("twitch_stream_meta: couldn't parse a login from {url}");
+            return None;
+        };
         let client_id = self
             .store
             .get_setting("twitch_client_id")
@@ -685,6 +694,7 @@ impl DetectContext {
             .flatten()
             .unwrap_or_default();
         if client_id.is_empty() {
+            debug!("twitch_stream_meta: no twitch_client_id configured");
             return None;
         }
         let user_token = {
@@ -694,7 +704,13 @@ impl DetectContext {
         let mut using_user_token = user_token.is_some();
         let mut token = match user_token {
             Some(t) => t,
-            None => self.twitch_app_token().await.ok()?,
+            None => match self.twitch_app_token().await {
+                Ok(t) => t,
+                Err(e) => {
+                    debug!("twitch_stream_meta: app-token fallback failed: {e:#}");
+                    return None;
+                }
+            },
         };
 
         #[derive(Deserialize)]
@@ -714,7 +730,7 @@ impl DetectContext {
         }
 
         loop {
-            let resp = self
+            let resp = match self
                 .http
                 .get("https://api.twitch.tv/helix/streams")
                 .header("Client-Id", &client_id)
@@ -722,11 +738,26 @@ impl DetectContext {
                 .query(&[("user_login", login.as_str())])
                 .send()
                 .await
-                .ok()?;
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    debug!("twitch_stream_meta: request for {login} failed: {e}");
+                    return None;
+                }
+            };
             match resp.status() {
                 s if s.is_success() => {
-                    let sr: Resp = resp.json().await.ok()?;
-                    let s = sr.data.into_iter().find(|s| s.kind == "live")?;
+                    let sr: Resp = match resp.json().await {
+                        Ok(sr) => sr,
+                        Err(e) => {
+                            debug!("twitch_stream_meta: response parse for {login} failed: {e}");
+                            return None;
+                        }
+                    };
+                    let Some(s) = sr.data.into_iter().find(|s| s.kind == "live") else {
+                        debug!("twitch_stream_meta: {login} not in the live response (ended?)");
+                        return None;
+                    };
                     return Some(StreamMeta {
                         title: s.title,
                         game: s.game_name,
@@ -734,11 +765,23 @@ impl DetectContext {
                     });
                 }
                 reqwest::StatusCode::UNAUTHORIZED if using_user_token => {
-                    token = self.twitch_app_token().await.ok()?;
+                    token = match self.twitch_app_token().await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            debug!(
+                                "twitch_stream_meta: user token rejected for {login} and \
+                                 app-token fallback failed: {e:#}"
+                            );
+                            return None;
+                        }
+                    };
                     using_user_token = false;
                     continue;
                 }
-                _ => return None,
+                s => {
+                    debug!("twitch_stream_meta: {login} got HTTP {s} from Helix");
+                    return None;
+                }
             }
         }
     }
