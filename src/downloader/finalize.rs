@@ -897,9 +897,19 @@ pub(super) async fn meta_watcher(
     shutdown: Arc<AtomicBool>,
     manual_tx: mpsc::UnboundedSender<ManualCommand>,
     stop_rule: Option<crate::triggers::TriggerRule>,
+    // Monitor-persisted title/game at take start — seeds the continuous,
+    // all-time `monitor_stream_change` ledger (see below) separately from
+    // `last_title`/`last_game`, which track this *take's* own baseline for
+    // the per-recording `stream_meta_change` popup. Without this split, every
+    // take start would log a spurious "changed from empty" event into the
+    // continuous history even when the title genuinely hadn't changed.
+    cont_title: String,
+    cont_game: String,
 ) {
     let mut last_title: Option<String> = None;
     let mut last_game: Option<String> = None;
+    let mut cont_title = cont_title;
+    let mut cont_game = cont_game;
     // Stop-on-unmatch state — see the doc comment above. `last_matched: None`
     // until the baseline poll; `unmatch_since: Some(t)` from the poll that
     // first observed a matching->non-matching transition, cleared the moment
@@ -940,6 +950,28 @@ pub(super) async fn meta_watcher(
         if let Some(meta) = fetched {
             let at = (now_unix() - started_at).max(0);
             let mut changed = false;
+            // Continuous, all-time history (spans recording and non-recording
+            // time alike — see `monitor_stream_change`): compared against the
+            // monitor's own persisted last-known value, not this take's
+            // baseline, so a take starting mid-broadcast (title already known
+            // from the live poll before recording began) doesn't log a false
+            // "changed from empty" event.
+            if meta.title != cont_title {
+                if let Err(e) = store.insert_monitor_stream_change(
+                    monitor_id, now_unix(), "title", &cont_title, &meta.title,
+                ) {
+                    warn!("insert monitor title change failed: {e:#}");
+                }
+                cont_title = meta.title.clone();
+            }
+            if meta.game != cont_game {
+                if let Err(e) = store.insert_monitor_stream_change(
+                    monitor_id, now_unix(), "category", &cont_game, &meta.game,
+                ) {
+                    warn!("insert monitor category change failed: {e:#}");
+                }
+                cont_game = meta.game.clone();
+            }
             // Title: log the initial non-empty value, then every transition.
             if last_title.as_deref() != Some(meta.title.as_str()) {
                 let baseline = last_title.is_none();

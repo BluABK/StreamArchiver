@@ -195,6 +195,26 @@ pub(super) fn meta_change_lines(changes: &[StreamMetaChange]) -> Vec<String> {
         })
         .collect()
 }
+/// One human-readable line per *actual* change in a monitor's all-time history
+/// (absolute date/time, not an offset — there's no single take to be relative
+/// to). Same "skip the baseline" rule as [`meta_change_lines`].
+pub(super) fn monitor_change_lines(changes: &[MonitorStreamChange]) -> Vec<String> {
+    changes
+        .iter()
+        .filter(|c| !c.old_value.is_empty())
+        .map(|c| {
+            let at = fmt_datetime_short(c.at_unix);
+            let kind = if c.kind == "category" { "Category" } else { "Title" };
+            let new = if c.new_value.is_empty() {
+                "(cleared)"
+            } else {
+                c.new_value.as_str()
+            };
+            format!("{at}  {kind}: {} → {new}", c.old_value)
+        })
+        .collect()
+}
+
 /// Merge a stream's takes into one chronological change list. Each take's offsets
 /// (`at_secs`, relative to that take's start) are rebased onto the whole stream's
 /// timeline (`take.started_at - stream_start + at_secs`); the rows are then sorted
@@ -2223,6 +2243,27 @@ mod tests {
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[0].contains("A → B"), "{:?}", lines[0]);
         assert!(lines[1].contains("B → C"), "{:?}", lines[1]);
+    }
+    #[test]
+    fn monitor_change_lines_skips_baseline_and_keeps_real_transitions() {
+        let mc = |id, at, kind: &str, old: &str, new: &str| MonitorStreamChange {
+            id,
+            monitor_id: 7,
+            at_unix: at,
+            kind: kind.into(),
+            old_value: old.into(),
+            new_value: new.into(),
+        };
+        let changes = vec![
+            mc(1, 1_700_000_000, "title", "", "Baseline title"),
+            mc(2, 1_700_000_300, "title", "Baseline title", "New title"),
+            mc(3, 1_700_000_600, "category", "", "Just Chatting"),
+            mc(4, 1_700_000_900, "category", "Just Chatting", "Games"),
+        ];
+        let lines = monitor_change_lines(&changes);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("Title: Baseline title → New title"), "{:?}", lines[0]);
+        assert!(lines[1].contains("Category: Just Chatting → Games"), "{:?}", lines[1]);
     }
     #[test]
     fn streams_col_min_width_shrinks_only_for_short_ts_datetime_cols() {

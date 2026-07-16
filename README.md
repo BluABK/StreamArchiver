@@ -1151,6 +1151,16 @@ recording, so this runs as a dedicated per-recording poller.)
 
 The categories played can also be folded into the filename — see `{games}` below.
 
+**All-time title/category history, independent of recording.** The change log
+above only exists for a take that's actually being recorded. Separately,
+StreamArchiver keeps a **continuous** title/category history per instance —
+fed by the normal live poll whenever a channel is live but not recording (Auto
+off, or Enabled-but-idle) and by the same in-recording poller while it is —
+so a channel's full history survives regardless of Auto/Enabled state. Open it
+from a stream row's right-click menu → **📝 Title/category history**: a
+scrollable, copyable, newest-first log with real dates/times (not
+take-relative offsets).
+
 ### Upcoming stream schedule
 
 The **Next stream** column shows when a channel's next stream is scheduled.

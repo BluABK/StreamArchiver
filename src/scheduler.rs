@@ -85,6 +85,11 @@ async fn tick(
     // continuing live session with no platform-reported go-live time keeps its
     // originally-stamped approximation instead of drifting forward every poll.
     let mut prev_live_since: HashMap<i64, (Option<i64>, bool)> = HashMap::new();
+    // monitor id -> the currently-persisted (title, game), captured before this
+    // tick's writes, so a change can be detected and archived to
+    // `monitor_stream_change` — the continuous history that spans live-not-
+    // recording time too (recording-time changes come from `meta_watcher`).
+    let mut prev_meta_values: HashMap<i64, (String, String)> = HashMap::new();
 
     let recording: std::collections::HashSet<i64> =
         active.lock().unwrap().keys().copied().collect();
@@ -92,6 +97,7 @@ async fn tick(
     for row in &rows {
         let m = &row.monitor;
         prev_state.insert(m.id, m.last_state.clone());
+        prev_meta_values.insert(m.id, (row.last_title.clone(), row.last_game.clone()));
         prev_live_since.insert(m.id, (m.last_live_since, m.last_live_since_approx));
         // Master "Enabled" switch off → fully dormant: no detection at all (nor
         // any recording/fetch elsewhere). The channel keeps its last state until
@@ -254,6 +260,25 @@ async fn tick(
         } else {
             ("", "", "", -1)
         };
+        // Archive a title/category change to the continuous per-monitor
+        // history the moment this poll observes it — independent of whether
+        // anything is being recorded. Only while genuinely live: an
+        // offline/errored tick's forced-empty title/game isn't a real
+        // transition worth logging (recording-time changes come from
+        // `meta_watcher` instead; the scheduler never polls an active
+        // recording, so there's no overlap/double-logging between the two).
+        if o.live && !o.error && let Some((prev_title, prev_game)) = prev_meta_values.get(&o.monitor_id) {
+            if title != prev_title {
+                let _ = ctx.store.insert_monitor_stream_change(
+                    o.monitor_id, checked_at, "title", prev_title, title,
+                );
+            }
+            if game != prev_game {
+                let _ = ctx.store.insert_monitor_stream_change(
+                    o.monitor_id, checked_at, "category", prev_game, game,
+                );
+            }
+        }
         let old_state = prev_state.get(&o.monitor_id).map(String::as_str);
         // Go-live time for the CURRENTLY live broadcast, independent of any
         // recording (so Went Live/Started On/Duration have data with Auto off).

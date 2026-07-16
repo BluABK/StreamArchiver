@@ -84,6 +84,9 @@ struct StreamsOut {
     open_ad_popup: Option<i64>,
     open_meta_popup: Option<MetaPopup>,
     open_schedule_popup: Option<i64>,
+    /// "Channel history" on a stream row: the owning monitor's all-time
+    /// title/category change ledger, independent of any recording.
+    open_history_popup: Option<i64>,
 }
 
 #[derive(Clone, Copy)]
@@ -826,6 +829,7 @@ impl StreamArchiverApp {
             open_ad_popup,
             open_meta_popup,
             open_schedule_popup,
+            open_history_popup,
         } = out;
         if let Some(rid) = open_ad_popup
             && !self.ad_popups.contains(&rid)
@@ -837,6 +841,11 @@ impl StreamArchiverApp {
             if !self.meta_popups.iter().any(|m| m.key() == key) {
                 self.meta_popups.push(p);
             }
+        }
+        if let Some(mid) = open_history_popup
+            && !self.history_popups.contains(&mid)
+        {
+            self.history_popups.push(mid);
         }
         if let Some(rec_id) = open_recover_take {
             self.open_recover_vod_from_seed(rec_id);
@@ -2131,6 +2140,18 @@ impl StreamArchiverApp {
                 {
                     out.copy_text =
                         dir.as_ref().map(|d| d.to_string_lossy().into_owned());
+                    ui.close();
+                }
+                ui.separator();
+                if ui
+                    .button("📝  Title/category history")
+                    .on_hover_text(
+                        "Every title/category change ever seen for this instance — \
+                         while recording or not.",
+                    )
+                    .clicked()
+                {
+                    out.open_history_popup = Some(mid);
                     ui.close();
                 }
             });

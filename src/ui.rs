@@ -26,9 +26,10 @@ use crate::models::{
     K_REMUX_EMBED_THUMBNAIL, K_REMUX_EMBED_TITLE, K_REMUX_TITLE_TEMPLATE, K_REMUX_EMBED_SUBS,
     K_FILE_SPLIT_ENABLED, K_FILE_SPLIT_VIDEOS, K_FILE_SPLIT_SUBS, K_FILE_SPLIT_CHAT,
     K_FILE_SPLIT_THUMBS, K_FILE_SPLIT_LOGS,
-    MediaInfoMode, Monitor, MonitorDefaults, MonitorWithChannel, OcrStats, Platform, PollStats, RecurrenceKind,
-    Recording, SabrCodecPref, ScheduleSegment, ScheduledRecording, ScheduledRecordingWithNames,
-    StreamGroup, StreamMetaChange, Tool, UpcomingStream, Video, group_recordings, now_unix,
+    MediaInfoMode, Monitor, MonitorDefaults, MonitorStreamChange, MonitorWithChannel, OcrStats, Platform,
+    PollStats, RecurrenceKind, Recording, SabrCodecPref, ScheduleSegment, ScheduledRecording,
+    ScheduledRecordingWithNames, StreamGroup, StreamMetaChange, Tool, UpcomingStream, Video,
+    group_recordings, now_unix,
 };
 use crate::google_oauth;
 use crate::grid_columns::{self, ColumnEntry, GridCol, GridState, GridTableId};
@@ -771,6 +772,12 @@ pub struct StreamArchiverApp {
     /// What the metadata-change popup shows (None = closed): a single take or a
     /// whole stream's aggregated takes.
     meta_popups: Vec<MetaPopup>,
+    /// Lazy per-monitor all-time title/category change ledger, keyed by
+    /// monitor id; cleared on reload. Independent of any recording — see
+    /// [`crate::models::MonitorStreamChange`].
+    history_change_cache: HashMap<i64, Vec<MonitorStreamChange>>,
+    /// Monitor id whose all-time change history is shown in a popup.
+    history_popups: Vec<i64>,
     /// Lazy per-monitor upcoming-schedule detail, keyed by monitor id; cleared on
     /// reload. Backs the Next stream popup.
     schedule_cache: HashMap<i64, Vec<ScheduleSegment>>,
@@ -1601,6 +1608,7 @@ impl eframe::App for StreamArchiverApp {
         self.recover_vod_window(ui.ctx());
         self.ad_popup_windows(ui.ctx());
         self.meta_popup_windows(ui.ctx());
+        self.history_popup_windows(ui.ctx());
         self.schedule_popup_windows(ui.ctx());
         self.schedule_sources_window(ui.ctx());
         self.schedule_day_window(ui.ctx());

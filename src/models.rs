@@ -1243,6 +1243,27 @@ pub struct StreamMetaChange {
     pub new_value: String,
 }
 
+/// One title or game/category change observed for a MONITOR, independent of
+/// any recording — the continuous, always-on counterpart to
+/// [`StreamMetaChange`]. `at_unix` is an absolute wall-clock timestamp (not an
+/// offset — there's no "take start" to be relative to when nothing may ever be
+/// recorded). Fed both by the scheduler's own live poll (while not recording)
+/// and by `meta_watcher` (while recording), so this is a single unbroken
+/// history regardless of Auto/Enabled state. As with `StreamMetaChange`, the
+/// first entry for each `kind` per "session" has an empty `old_value` and
+/// isn't a real transition — display code filters those out the same way.
+#[derive(Clone, Debug)]
+pub struct MonitorStreamChange {
+    #[allow(dead_code)]
+    pub id: i64,
+    #[allow(dead_code)]
+    pub monitor_id: i64,
+    pub at_unix: i64,
+    pub kind: String,
+    pub old_value: String,
+    pub new_value: String,
+}
+
 /// One upcoming scheduled stream for a monitor — a Twitch schedule segment or a
 /// YouTube upcoming livestream. Refreshed periodically and stored in
 /// `schedule_segment`; drives the Next stream column + popup. `start_time` is unix

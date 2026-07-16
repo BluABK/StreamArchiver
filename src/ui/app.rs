@@ -424,6 +424,8 @@ impl StreamArchiverApp {
             ad_popups: Vec::new(),
             meta_change_cache: HashMap::new(),
             meta_popups: Vec::new(),
+            history_change_cache: HashMap::new(),
+            history_popups: Vec::new(),
             schedule_cache: HashMap::new(),
             schedule_popups: Vec::new(),
             schedule_all: Vec::new(),

@@ -501,6 +501,47 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
+
+    /// Record a title or game/category change for a monitor, independent of
+    /// any recording — see [`MonitorStreamChange`].
+    pub fn insert_monitor_stream_change(
+        &self,
+        monitor_id: i64,
+        at_unix: i64,
+        kind: &str,
+        old_value: &str,
+        new_value: &str,
+    ) -> Result<i64> {
+        let conn = self.db();
+        conn.execute(
+            "INSERT INTO monitor_stream_change(monitor_id, at_unix, kind, old_value, new_value)
+             VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![monitor_id, at_unix, kind, old_value, new_value],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// All title/category history for a monitor, newest first.
+    pub fn monitor_stream_changes(&self, monitor_id: i64) -> Result<Vec<MonitorStreamChange>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id, monitor_id, at_unix, kind, old_value, new_value FROM monitor_stream_change
+             WHERE monitor_id = ?1 ORDER BY at_unix DESC, id DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![monitor_id], |r| {
+                Ok(MonitorStreamChange {
+                    id: r.get(0)?,
+                    monitor_id: r.get(1)?,
+                    at_unix: r.get(2)?,
+                    kind: r.get(3)?,
+                    old_value: r.get(4)?,
+                    new_value: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
 }
 
 #[cfg(test)]
@@ -565,6 +606,32 @@ mod tests {
 
         let breaks = store.ad_breaks_for_recording(rid).unwrap();
         assert_eq!(breaks.len(), 2);
+    }
+    #[test]
+    fn monitor_stream_change_roundtrip_and_ordering() {
+        // No recording involved at all — this ledger is independent of any take.
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        store.insert_monitor_stream_change(mid, 1_000, "title", "", "First title").unwrap();
+        store.insert_monitor_stream_change(mid, 2_000, "title", "First title", "Second title").unwrap();
+        store.insert_monitor_stream_change(mid, 1_500, "category", "", "Just Chatting").unwrap();
+
+        let changes = store.monitor_stream_changes(mid).unwrap();
+        assert_eq!(changes.len(), 3);
+        // Newest first.
+        assert_eq!(changes[0].at_unix, 2_000);
+        assert_eq!(changes[0].new_value, "Second title");
+        assert_eq!(changes[1].at_unix, 1_500);
+        assert_eq!(changes[2].at_unix, 1_000);
+        // A different monitor's history stays separate.
+        let mut m2 = sample_monitor(cid);
+        m2.channel_id = cid;
+        let mid2 = store.insert_monitor(&m2).unwrap();
+        assert!(store.monitor_stream_changes(mid2).unwrap().is_empty());
     }
     #[test]
     fn detached_registry_roundtrip() {

@@ -28,13 +28,13 @@ fn quota_date_today() -> String {
 
 use crate::models::{
     AdBreak, AuthKind, Channel, Container, DetachedKind, DetachedRow, DetectionMethod, GlobalStats,
-    Monitor, MonitorWithChannel, Platform, RecurrenceKind, SabrCodecPref, ScheduleSegment,
-    ScheduledRecording, ScheduledRecordingWithNames, StreamMetaChange, Tool, UpcomingStream, Video,
-    now_unix,
+    Monitor, MonitorStreamChange, MonitorWithChannel, Platform, RecurrenceKind, SabrCodecPref,
+    ScheduleSegment, ScheduledRecording, ScheduledRecordingWithNames, StreamMetaChange, Tool,
+    UpcomingStream, Video, now_unix,
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 54;
+const SCHEMA_VERSION: i64 = 55;
 
 pub struct Store {
     conn: FairMutex<Connection>,

@@ -1062,7 +1062,31 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 54)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 54);
+        if version < 55 {
+            // Title/category history for a MONITOR (not a recording): unlike
+            // `stream_meta_change` (v15, relative-second offsets scoped to one
+            // take, cleared/rebuilt per recording), this is a single continuous,
+            // wall-clock-timestamped ledger that keeps growing whether or not
+            // anything is being recorded — fed by the scheduler's own poll (live
+            // but not recording) and by `meta_watcher` (while recording), so a
+            // channel's title/game history is complete regardless of Auto/Enabled
+            // state. Cascades when the monitor is removed.
+            conn.execute_batch(
+                r#"
+                CREATE TABLE monitor_stream_change (
+                    id            INTEGER PRIMARY KEY,
+                    monitor_id    INTEGER NOT NULL REFERENCES monitor(id) ON DELETE CASCADE,
+                    at_unix       INTEGER NOT NULL,
+                    kind          TEXT NOT NULL,
+                    old_value     TEXT NOT NULL DEFAULT '',
+                    new_value     TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX idx_monitor_stream_change_monitor ON monitor_stream_change(monitor_id, at_unix);
+                "#,
+            )?;
+            conn.pragma_update(None, "user_version", 55)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 55);
         Ok(())
     }
 }

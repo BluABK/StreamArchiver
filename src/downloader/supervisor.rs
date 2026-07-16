@@ -2924,6 +2924,8 @@ progress_info: None,
                 self.shutdown.clone(),
                 self.manual_tx.clone(),
                 stop_rule,
+                row.last_title.clone(),
+                row.last_game.clone(),
             ))
         });
         (meta_done, meta_task)

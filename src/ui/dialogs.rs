@@ -487,6 +487,86 @@ impl StreamArchiverApp {
         }
     }
 
+    /// Load a monitor's all-time change-history rows into the cache if absent.
+    pub(super) fn ensure_history_cached(&mut self, monitor_id: i64) {
+        if !self.history_change_cache.contains_key(&monitor_id) {
+            let v = self
+                .core
+                .store
+                .monitor_stream_changes(monitor_id)
+                .unwrap_or_default();
+            self.history_change_cache.insert(monitor_id, v);
+        }
+    }
+
+    /// Render every open "channel history" window (one per monitor).
+    pub(super) fn history_popup_windows(&mut self, ctx: &egui::Context) {
+        let mut closed: Vec<i64> = Vec::new();
+        for i in 0..self.history_popups.len() {
+            let mid = self.history_popups[i];
+            if self.history_popup_window(ctx, mid) {
+                closed.push(mid);
+            }
+        }
+        if !closed.is_empty() {
+            self.history_popups.retain(|m| !closed.contains(m));
+        }
+    }
+
+    /// One "channel history" window (all-time title/category changes for a
+    /// monitor, independent of any recording); returns true on close.
+    #[allow(deprecated)]
+    pub(super) fn history_popup_window(&mut self, ctx: &egui::Context, monitor_id: i64) -> bool {
+        self.ensure_history_cached(monitor_id);
+        let changes = self.history_change_cache.get(&monitor_id).cloned().unwrap_or_default();
+        let channel_name = self
+            .core
+            .store
+            .get_monitor_with_channel(monitor_id)
+            .ok()
+            .flatten()
+            .map(|r| r.channel.name)
+            .unwrap_or_default();
+        let mut open = true;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of(("channel_history_vp", monitor_id)),
+            egui::ViewportBuilder::default()
+                .with_title(format!("{channel_name} — title & category history"))
+                .with_inner_size([480.0, 320.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let lines = monitor_change_lines(&changes);
+                    if lines.is_empty() {
+                        ui.label("No title or category changes recorded yet.");
+                        return;
+                    }
+                    ui.label(format!(
+                        "{} change(s), newest first — every title/category transition \
+                         ever observed for this instance, whether or not it was being \
+                         recorded.",
+                        lines.len(),
+                    ));
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for line in &lines {
+                                ui.label(egui::RichText::new(line).monospace());
+                            }
+                        });
+                    ui.add_space(6.0);
+                    if ui.button("📋  Copy").clicked() {
+                        ui.ctx().copy_text(lines.join("\n"));
+                    }
+                });
+            },
+        );
+        !open
+    }
+
     /// Render every open title/category-changes window (one per take/stream).
     pub(super) fn meta_popup_windows(&mut self, ctx: &egui::Context) {
         let mut closed: Vec<i64> = Vec::new();
