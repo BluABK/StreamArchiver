@@ -863,7 +863,8 @@ pub(super) const META_POLL_INTERVAL_SECS: i64 = 60;
 /// is logged as the baseline (empty `old_value`); later transitions record
 /// `old -> new` (including a change to empty, e.g. a cleared category). Stops
 /// when `done` (recording ended) or `shutdown` is set. No-ops gracefully when
-/// the source is unavailable (creds unset / offline / blocked -> `None`).
+/// the source answers offline or is unavailable (see [`MetaFetch`]
+/// (crate::detectors::MetaFetch) — only `Failed` counts as a broken refresh).
 ///
 /// Also refreshes `monitor.last_viewers` every cycle (Twitch/Kick only —
 /// YouTube's scrape has no viewer field). This is the ONLY place that field
@@ -926,14 +927,20 @@ pub(super) async fn meta_watcher(
         if done.load(Ordering::SeqCst) || shutdown.load(Ordering::SeqCst) {
             return;
         }
+        use crate::detectors::MetaFetch;
         let fetched = match platform {
             Platform::Twitch => ctx.twitch_stream_meta(&url).await,
             Platform::Kick => ctx.kick_stream_meta(&url).await,
             Platform::YouTube => ctx.youtube_stream_meta(&url).await,
-            Platform::Generic => None,
+            // No metadata source for generic monitors.
+            Platform::Generic => MetaFetch::Offline,
         };
         if platform != Platform::Generic {
-            let failing_now = fetched.is_none();
+            // Only a genuine fetch failure counts toward the warning streak:
+            // `Offline` is an authoritative answer (the stream ended while the
+            // capture drains its tail) — frozen fields are expected then, and
+            // warning would fire spuriously at every normal stream end.
+            let failing_now = matches!(fetched, MetaFetch::Failed);
             if failing_now && fetch_failing != Some(true) {
                 warn!(
                     monitor_id, rec_id,
@@ -947,7 +954,7 @@ pub(super) async fn meta_watcher(
             }
             fetch_failing = Some(failing_now);
         }
-        if let Some(meta) = fetched {
+        if let MetaFetch::Live(meta) = fetched {
             let at = (now_unix() - started_at).max(0);
             let mut changed = false;
             // Continuous, all-time history (spans recording and non-recording

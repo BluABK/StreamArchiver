@@ -203,6 +203,34 @@ pub struct StreamMeta {
     pub viewers: Option<i64>,
 }
 
+/// Outcome of one in-recording metadata fetch (`*_stream_meta`). The split
+/// between [`Offline`](MetaFetch::Offline) and [`Failed`](MetaFetch::Failed)
+/// matters to the caller's failure-streak warning (`meta_watcher`): a stream
+/// that simply ended while the capture drains its tail answers `Offline` —
+/// frozen title/game/viewer fields are *expected* then, not a defect — whereas
+/// `Failed` means the refresh itself is broken and worth warning about.
+#[derive(Clone, Debug)]
+pub enum MetaFetch {
+    /// Channel confirmed live; fresh metadata.
+    Live(StreamMeta),
+    /// The source answered authoritatively: not live right now.
+    Offline,
+    /// No answer: network/auth/HTTP/parse failure or missing configuration
+    /// (the specific reason is logged at DEBUG by the fetcher).
+    Failed,
+}
+
+#[cfg(test)]
+impl MetaFetch {
+    /// The metadata if live, else `None` (test convenience).
+    fn live(self) -> Option<StreamMeta> {
+        match self {
+            MetaFetch::Live(m) => Some(m),
+            _ => None,
+        }
+    }
+}
+
 pub struct DetectContext {
     http: Client,
     pub store: Arc<Store>,
@@ -672,11 +700,12 @@ impl DetectContext {
     /// Title + game/category of a currently-live Twitch channel, for the
     /// in-recording metadata change log (the scheduler pauses polling while a
     /// monitor records, so the [`Supervisor`](crate::downloader::Supervisor)
-    /// polls this directly). `None` when offline, on error, or when Twitch
-    /// credentials aren't configured. Mirrors `detect_twitch`'s token handling:
-    /// a connected user token if present, else the app token, with a one-shot
-    /// app-token fallback on a 401.
-    pub async fn twitch_stream_meta(&self, url: &str) -> Option<StreamMeta> {
+    /// polls this directly). [`MetaFetch::Offline`] when the channel isn't in
+    /// Helix's live response (ended); [`MetaFetch::Failed`] on error or when
+    /// Twitch credentials aren't configured. Mirrors `detect_twitch`'s token
+    /// handling: a connected user token if present, else the app token, with a
+    /// one-shot app-token fallback on a 401.
+    pub async fn twitch_stream_meta(&self, url: &str) -> MetaFetch {
         // Silent `None` here used to be undiagnosable — a mid-take auth hiccup
         // (e.g. a user token expiring) would just freeze viewer count/title/
         // game for the rest of the recording with nothing in the log to explain
@@ -685,7 +714,7 @@ impl DetectContext {
         // failures — this function itself has no per-take failure-streak state).
         let Some(login) = twitch_login(url) else {
             debug!("twitch_stream_meta: couldn't parse a login from {url}");
-            return None;
+            return MetaFetch::Failed;
         };
         let client_id = self
             .store
@@ -695,7 +724,7 @@ impl DetectContext {
             .unwrap_or_default();
         if client_id.is_empty() {
             debug!("twitch_stream_meta: no twitch_client_id configured");
-            return None;
+            return MetaFetch::Failed;
         }
         let user_token = {
             let _guard = self.twitch_refresh.lock().await;
@@ -708,7 +737,7 @@ impl DetectContext {
                 Ok(t) => t,
                 Err(e) => {
                     debug!("twitch_stream_meta: app-token fallback failed: {e:#}");
-                    return None;
+                    return MetaFetch::Failed;
                 }
             },
         };
@@ -742,7 +771,7 @@ impl DetectContext {
                 Ok(r) => r,
                 Err(e) => {
                     debug!("twitch_stream_meta: request for {login} failed: {e}");
-                    return None;
+                    return MetaFetch::Failed;
                 }
             };
             match resp.status() {
@@ -751,14 +780,14 @@ impl DetectContext {
                         Ok(sr) => sr,
                         Err(e) => {
                             debug!("twitch_stream_meta: response parse for {login} failed: {e}");
-                            return None;
+                            return MetaFetch::Failed;
                         }
                     };
                     let Some(s) = sr.data.into_iter().find(|s| s.kind == "live") else {
                         debug!("twitch_stream_meta: {login} not in the live response (ended?)");
-                        return None;
+                        return MetaFetch::Offline;
                     };
-                    return Some(StreamMeta {
+                    return MetaFetch::Live(StreamMeta {
                         title: s.title,
                         game: s.game_name,
                         viewers: Some(s.viewer_count),
@@ -772,7 +801,7 @@ impl DetectContext {
                                 "twitch_stream_meta: user token rejected for {login} and \
                                  app-token fallback failed: {e:#}"
                             );
-                            return None;
+                            return MetaFetch::Failed;
                         }
                     };
                     using_user_token = false;
@@ -780,7 +809,7 @@ impl DetectContext {
                 }
                 s => {
                     debug!("twitch_stream_meta: {login} got HTTP {s} from Helix");
-                    return None;
+                    return MetaFetch::Failed;
                 }
             }
         }
@@ -2404,19 +2433,46 @@ impl DetectContext {
     /// page has no live video details (offline) or on error. YouTube exposes no
     /// public "current game" field, so `game` carries the page's content category
     /// (e.g. "Gaming") — the closest stable signal.
-    pub async fn youtube_stream_meta(&self, url: &str) -> Option<StreamMeta> {
+    /// Title + category of a currently-live YouTube channel (scraping the
+    /// `/live` page). [`MetaFetch::Offline`] when the channel isn't live (the
+    /// page redirects to a browse page, or points at the just-ended VOD);
+    /// [`MetaFetch::Failed`] on network/HTTP errors or an unreadable page
+    /// (consent/bot interstitial, layout change) — each reason logged at
+    /// DEBUG, mirroring [`twitch_stream_meta`](Self::twitch_stream_meta).
+    pub async fn youtube_stream_meta(&self, url: &str) -> MetaFetch {
         let live_url = youtube_live_url(url);
         let rb = self
             .http
             .get(&live_url)
             .header("Accept-Language", "en-US,en;q=0.9")
             .header("Cookie", "CONSENT=YES+1; SOCS=CAI");
-        let resp = self.fingerprint.apply_yt_nav_headers(rb).send().await.ok()?;
-        if !resp.status().is_success() {
-            return None;
+        let resp = match self.fingerprint.apply_yt_nav_headers(rb).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                debug!("youtube_stream_meta: request for {live_url} failed: {e}");
+                return MetaFetch::Failed;
+            }
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            debug!("youtube_stream_meta: {live_url} got HTTP {status}");
+            return MetaFetch::Failed;
         }
-        let body = resp.text().await.ok()?;
-        parse_youtube_meta(&body)
+        let body = match resp.text().await {
+            Ok(b) => b,
+            Err(e) => {
+                debug!("youtube_stream_meta: reading the body for {live_url} failed: {e}");
+                return MetaFetch::Failed;
+            }
+        };
+        let out = parse_youtube_meta(&body);
+        if matches!(out, MetaFetch::Failed) {
+            debug!(
+                "youtube_stream_meta: {live_url} page had no readable live player data \
+                 (consent/bot interstitial or a layout change?)"
+            );
+        }
+        out
     }
 
     async fn scrape_kick(&self, item: &DetectItem) -> DetectOutcome {
@@ -2468,23 +2524,46 @@ impl DetectContext {
 
     /// Title + category of a currently-live Kick channel (the unofficial v2
     /// channel JSON; no credentials). For the in-recording metadata change log.
-    /// `None` when offline, on error, or behind a Cloudflare challenge. Always
-    /// uses the v2 endpoint (even when Kick API credentials are configured), so
+    /// [`MetaFetch::Offline`] when not live; [`MetaFetch::Failed`] on error or
+    /// behind a Cloudflare challenge (reasons logged at DEBUG). Always uses
+    /// the v2 endpoint (even when Kick API credentials are configured), so
     /// metadata may be unavailable if v2 is Cloudflare-blocked while detection
     /// runs on the official API — detection and recording are unaffected.
-    pub async fn kick_stream_meta(&self, url: &str) -> Option<StreamMeta> {
-        let slug = kick_slug(url)?;
+    pub async fn kick_stream_meta(&self, url: &str) -> MetaFetch {
+        let Some(slug) = kick_slug(url) else {
+            debug!("kick_stream_meta: couldn't parse a slug from {url}");
+            return MetaFetch::Failed;
+        };
         let api = format!("https://kick.com/api/v2/channels/{slug}");
         let rb = self
             .http
             .get(&api)
             .header("Accept", "application/json, text/plain, */*");
-        let resp = self.fingerprint.apply_kick_xhr_headers(rb).send().await.ok()?;
-        if !resp.status().is_success() {
-            return None;
+        let resp = match self.fingerprint.apply_kick_xhr_headers(rb).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                debug!("kick_stream_meta: request for {slug} failed: {e}");
+                return MetaFetch::Failed;
+            }
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            // 403 on the v2 endpoint usually means a Cloudflare bot challenge.
+            debug!("kick_stream_meta: {slug} got HTTP {status}");
+            return MetaFetch::Failed;
         }
-        let v: Value = resp.json().await.ok()?;
-        parse_kick_meta(&v)
+        let v: Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                debug!("kick_stream_meta: response parse for {slug} failed: {e}");
+                return MetaFetch::Failed;
+            }
+        };
+        let out = parse_kick_meta(&v);
+        if matches!(out, MetaFetch::Failed) {
+            debug!("kick_stream_meta: {slug} live but the response had no readable title (partial payload?)");
+        }
+        out
     }
 
     // ----- generic probe via streamlink -----
@@ -4283,47 +4362,55 @@ pub(crate) fn extract_json_after(body: &str, marker: &str) -> Option<Value> {
 }
 
 /// Extract a *live* YouTube stream's title + content category from a `/live`
-/// watch page body. `None` unless the page is a genuinely-live watch page — the
-/// `/live` URL can also resolve to the channel page, a finished VOD, or an
-/// upcoming premiere, all of which still embed a player response with a title, so
-/// we require `videoDetails.isLive == true`. The title comes from
-/// `videoDetails.title` (empty/absent ⇒ partial page ⇒ `None`, not a blank
-/// title); `game` carries the broad content category (YouTube has no public
-/// per-stream "game" field).
-fn parse_youtube_meta(body: &str) -> Option<StreamMeta> {
-    let pr = extract_json_after(body, "ytInitialPlayerResponse")?;
+/// watch page body. `Live` only for a genuinely-live watch page — the `/live`
+/// URL can also resolve to the channel page, a finished VOD, or an upcoming
+/// premiere, all of which still embed a player response with a title, so we
+/// require `videoDetails.isLive == true` (anything else on a recognizable
+/// YouTube page ⇒ `Offline`; an unrecognizable page ⇒ `Failed`). The title
+/// comes from `videoDetails.title` (empty/absent ⇒ partial page ⇒ `Failed`,
+/// not a blank title); `game` carries the broad content category (YouTube has
+/// no public per-stream "game" field).
+fn parse_youtube_meta(body: &str) -> MetaFetch {
+    let Some(pr) = extract_json_after(body, "ytInitialPlayerResponse") else {
+        // A channel with no active live serves a browse page from `/live`
+        // (`ytInitialData`, no player object) — that's a normal "not live"
+        // answer. A page with *neither* is a consent/bot interstitial, an
+        // error page, or a layout change: a real failure.
+        return if body.contains("ytInitialData") { MetaFetch::Offline } else { MetaFetch::Failed };
+    };
     let details = &pr["videoDetails"];
     if details["isLive"].as_bool() != Some(true) {
-        return None;
+        // `/live` keeps pointing at the just-ended VOD for a while after the
+        // stream concludes — a player page that isn't live means offline.
+        return MetaFetch::Offline;
     }
     // A live stream always has a non-empty title; an empty/absent one means a
-    // degraded page — skip rather than log a spurious empty-title change.
-    let title = details["title"]
-        .as_str()
-        .filter(|s| !s.is_empty())?
-        .to_string();
+    // degraded page — a failed read, not a real empty-title change.
+    let Some(title) = details["title"].as_str().filter(|s| !s.is_empty()) else {
+        return MetaFetch::Failed;
+    };
     let game = pr["microformat"]["playerMicroformatRenderer"]["category"]
         .as_str()
         .unwrap_or_default()
         .to_string();
-    Some(StreamMeta { title, game, viewers: None })
+    MetaFetch::Live(StreamMeta { title: title.to_string(), game, viewers: None })
 }
 
-/// Extract a live Kick stream's title + category from the v2 channel JSON. `None`
-/// when offline (no `livestream` object, or an explicit `is_live: false`) or when
-/// the title can't be read (empty/absent `session_title` ⇒ partial response ⇒
-/// skip, rather than logging a blank title).
-fn parse_kick_meta(v: &Value) -> Option<StreamMeta> {
+/// Extract a live Kick stream's title + category from the v2 channel JSON.
+/// `Offline` when not live (no `livestream` object, or an explicit
+/// `is_live: false`); `Failed` when live but the title can't be read.
+fn parse_kick_meta(v: &Value) -> MetaFetch {
     let ls = &v["livestream"];
     if !ls.is_object() || ls["is_live"].as_bool() == Some(false) {
-        return None;
+        return MetaFetch::Offline;
     }
-    let title = ls["session_title"]
-        .as_str()
-        .filter(|s| !s.is_empty())?
-        .to_string();
-    Some(StreamMeta {
-        title,
+    // Live but no readable title ⇒ partial response ⇒ a failed read, not a
+    // real blank title.
+    let Some(title) = ls["session_title"].as_str().filter(|s| !s.is_empty()) else {
+        return MetaFetch::Failed;
+    };
+    MetaFetch::Live(StreamMeta {
+        title: title.to_string(),
         // v2 exposes the category under `categories[0].name`.
         game: ls["categories"][0]["name"]
             .as_str()
@@ -4511,7 +4598,7 @@ mod tests {
         // `&` is a JSON unicode escape that serde must decode to `&`; the
         // trailing `var other = 1;` JS after the object must be ignored.
         let body = r#"<script nonce="x">var ytInitialPlayerResponse = {"videoDetails":{"title":"Dev & Chill","isLive":true},"microformat":{"playerMicroformatRenderer":{"category":"Gaming"}}};var other = 1;</script>"#;
-        let m = parse_youtube_meta(body).unwrap();
+        let m = parse_youtube_meta(body).live().unwrap();
         assert_eq!(m.title, "Dev & Chill");
         assert_eq!(m.game, "Gaming");
     }
@@ -4520,35 +4607,41 @@ mod tests {
     fn youtube_meta_handles_minified_and_missing() {
         // Minified `name={…}` form, and a missing category -> empty game.
         let body = r#"ytInitialPlayerResponse={"videoDetails":{"title":"Solo","isLive":true}};"#;
-        let m = parse_youtube_meta(body).unwrap();
+        let m = parse_youtube_meta(body).live().unwrap();
         assert_eq!(m.title, "Solo");
         assert_eq!(m.game, "");
-        // No player response at all -> None (treated as offline).
-        assert!(parse_youtube_meta("<html>nothing here</html>").is_none());
+        // No player response AND no ytInitialData -> not a recognizable
+        // YouTube page at all (consent/challenge/error) -> Failed.
+        assert!(matches!(parse_youtube_meta("<html>nothing here</html>"), MetaFetch::Failed));
+        // A browse page (`ytInitialData`, no player) is what /live serves when
+        // the channel isn't live -> an authoritative Offline, not a failure.
+        let browse = r#"<script>var ytInitialData = {"contents":{}};</script>"#;
+        assert!(matches!(parse_youtube_meta(browse), MetaFetch::Offline));
     }
 
     #[test]
     fn youtube_meta_requires_live_and_real_assignment() {
         // A finished VOD or upcoming premiere still embeds a player response with
-        // a title, but isn't live -> None.
+        // a title, but isn't live -> Offline (the stream-just-ended case).
         let vod = r#"var ytInitialPlayerResponse = {"videoDetails":{"title":"Old VOD","isLive":false}};"#;
-        assert!(parse_youtube_meta(vod).is_none());
+        assert!(matches!(parse_youtube_meta(vod), MetaFetch::Offline));
         let upcoming = r#"ytInitialPlayerResponse = {"videoDetails":{"title":"Premiere Soon"}};"#;
-        assert!(parse_youtube_meta(upcoming).is_none());
+        assert!(matches!(parse_youtube_meta(upcoming), MetaFetch::Offline));
 
         // A non-assignment mention (quoted key, then a stray `=` inside an href)
-        // must not be latched onto; with no real assignment present -> None.
+        // must not be latched onto; with no real assignment (and no
+        // ytInitialData) present -> Failed.
         let decoy = r#"x"ytInitialPlayerResponse" rel="x" href="a=b" {"videoDetails":{"title":"WRONG","isLive":true}}"#;
-        assert!(parse_youtube_meta(decoy).is_none());
+        assert!(matches!(parse_youtube_meta(decoy), MetaFetch::Failed));
 
         // A decoy mention *before* the real assignment -> the real object wins.
         let mixed = r#"if(window.ytInitialPlayerResponse){} var ytInitialPlayerResponse = {"videoDetails":{"title":"Real","isLive":true}};"#;
-        assert_eq!(parse_youtube_meta(mixed).unwrap().title, "Real");
+        assert_eq!(parse_youtube_meta(mixed).live().unwrap().title, "Real");
 
         // A longer identifier *ending* in the marker (`fooMARKER = {…}`) must not
         // be latched onto; the real standalone assignment after it wins.
         let suffixed = r#"var preloadytInitialPlayerResponse = {"videoDetails":{"title":"DECOY","isLive":true}}; var ytInitialPlayerResponse = {"videoDetails":{"title":"Real","isLive":true}};"#;
-        assert_eq!(parse_youtube_meta(suffixed).unwrap().title, "Real");
+        assert_eq!(parse_youtube_meta(suffixed).live().unwrap().title, "Real");
     }
 
     #[test]
@@ -4557,7 +4650,7 @@ mod tests {
             r#"{"livestream":{"is_live":true,"session_title":"first stream","categories":[{"name":"Just Chatting"}],"viewer_count":42}}"#,
         )
         .unwrap();
-        let m = parse_kick_meta(&v).unwrap();
+        let m = parse_kick_meta(&v).live().unwrap();
         assert_eq!(m.title, "first stream");
         assert_eq!(m.game, "Just Chatting");
         assert_eq!(m.viewers, Some(42));
@@ -4572,24 +4665,25 @@ mod tests {
             r#"{"livestream":{"is_live":true,"session_title":"x","viewers":7}}"#,
         )
         .unwrap();
-        assert_eq!(parse_kick_meta(&v).unwrap().viewers, Some(7));
+        assert_eq!(parse_kick_meta(&v).live().unwrap().viewers, Some(7));
 
         let neither: Value =
             serde_json::from_str(r#"{"livestream":{"is_live":true,"session_title":"x"}}"#).unwrap();
-        assert_eq!(parse_kick_meta(&neither).unwrap().viewers, None);
+        assert_eq!(parse_kick_meta(&neither).live().unwrap().viewers, None);
     }
 
     #[test]
-    fn kick_meta_none_when_offline() {
+    fn kick_meta_distinguishes_offline_from_partial() {
         let offline: Value = serde_json::from_str(r#"{"livestream":null}"#).unwrap();
-        assert!(parse_kick_meta(&offline).is_none());
+        assert!(matches!(parse_kick_meta(&offline), MetaFetch::Offline));
         let not_live: Value =
             serde_json::from_str(r#"{"livestream":{"is_live":false,"session_title":"x"}}"#).unwrap();
-        assert!(parse_kick_meta(&not_live).is_none());
-        // Live but no readable title -> None (partial response; don't log a blank).
+        assert!(matches!(parse_kick_meta(&not_live), MetaFetch::Offline));
+        // Live but no readable title -> a failed read (partial response),
+        // not an offline answer and not a blank-title change.
         let no_title: Value =
             serde_json::from_str(r#"{"livestream":{"is_live":true,"session_title":""}}"#).unwrap();
-        assert!(parse_kick_meta(&no_title).is_none());
+        assert!(matches!(parse_kick_meta(&no_title), MetaFetch::Failed));
     }
 
     #[test]
