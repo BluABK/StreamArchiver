@@ -204,6 +204,11 @@ struct MonitorForm {
     /// the channel/global default). Loaded from / saved to the monitor scope map.
     head_backfill_fetch: Option<bool>,
     head_backfill_replace: Option<bool>,
+    /// "Always show this instance's info on the channel row when it's live" —
+    /// the strongest tier of `crate::platform_pref` (beats both the channel
+    /// and global platform preference). Loaded from / saved to the monitor
+    /// pin map.
+    primary_pin: bool,
 }
 
 impl MonitorForm {
@@ -216,6 +221,7 @@ impl MonitorForm {
             monitor_id: None,
             channel_id: None,
             name: String::new(),
+            primary_pin: false,
             url: String::new(),
             tool: defaults.resolve_tool(p),
             detection_method: defaults.resolve_detection(p),
@@ -287,6 +293,7 @@ impl MonitorForm {
             vod_replace: None,
             head_backfill_fetch: None,
             head_backfill_replace: None,
+            primary_pin: false,
         }
     }
 
@@ -298,6 +305,7 @@ impl MonitorForm {
             monitor_id: None,
             channel_id: Some(channel.id),
             name: channel.name.clone(),
+            primary_pin: false,
             url: String::new(),
             tool: defaults.resolve_tool(p),
             detection_method: defaults.resolve_detection(p),
@@ -347,6 +355,21 @@ fn tristate_combo(ui: &mut egui::Ui, id: &str, value: &mut Option<bool>) -> egui
             ui.selectable_value(value, None, "Inherit");
             ui.selectable_value(value, Some(true), "On");
             ui.selectable_value(value, Some(false), "Off");
+        })
+        .response
+}
+
+/// An **Inherit / Twitch / YouTube / Kick** dropdown for an `Option<Platform>`
+/// override (`None` = inherit the level above). Returns the combo's response
+/// for hovers. See [`crate::platform_pref`].
+fn platform_pref_combo(ui: &mut egui::Ui, id: &str, value: &mut Option<Platform>) -> egui::Response {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(value.map(Platform::label).unwrap_or("Inherit"))
+        .show_ui(ui, |ui| {
+            ui.selectable_value(value, None, "Inherit");
+            ui.selectable_value(value, Some(Platform::Twitch), Platform::Twitch.label());
+            ui.selectable_value(value, Some(Platform::YouTube), Platform::YouTube.label());
+            ui.selectable_value(value, Some(Platform::Kick), Platform::Kick.label());
         })
         .response
 }
@@ -618,6 +641,11 @@ pub struct StreamArchiverApp {
     /// persisted once both parse as valid times.
     dnd_start: String,
     dnd_end: String,
+    /// Global default preferred platform when a channel has more than one
+    /// instance simultaneously live (`None` = earliest-live-wins, the prior
+    /// behavior). Persisted as `primary_platform_pref`; overridable per
+    /// channel/instance — see [`crate::platform_pref`].
+    primary_platform_pref: Option<Platform>,
     /// The process-manager dialog: whether it's open, its last snapshot, and when
     /// that snapshot was taken (throttles the per-row `pid_alive`/DB queries).
     show_processes: bool,
@@ -1486,6 +1514,7 @@ impl eframe::App for StreamArchiverApp {
                                     vod_replace: None,
                                     head_backfill_fetch: None,
                                     head_backfill_replace: None,
+                                    primary_platform_pref: None,
                                 });
                             }
                             if ui
@@ -1581,6 +1610,7 @@ impl eframe::App for StreamArchiverApp {
                 vod_replace: None,
                 head_backfill_fetch: None,
                 head_backfill_replace: None,
+                primary_platform_pref: None,
             });
         }
         if ctx_refresh_schedule {

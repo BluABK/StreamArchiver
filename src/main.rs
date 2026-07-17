@@ -28,6 +28,7 @@ mod models;
 mod notifications;
 mod oauth;
 mod platform;
+mod platform_pref;
 mod recovery;
 mod schedule_ocr;
 mod schedule_source;

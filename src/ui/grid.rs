@@ -658,6 +658,9 @@ pub(super) struct StreamsViewCache {
     pub(super) channel_name_colors: HashMap<i64, (egui::Color32, bool)>,
     pub(super) groups: HashMap<i64, Vec<StreamGroup>>,
     pub(super) model: Vec<Vec<Cell>>,
+    /// Snapshot of the preferred-platform-when-multiple-live config, loaded
+    /// once per rebuild rather than per channel row per frame.
+    pub(super) platform_pref: crate::platform_pref::PlatformPrefCtx,
 }
 
 pub(super) fn cmp_sort_key(a: &SortKey, b: &SortKey) -> std::cmp::Ordering {
@@ -1248,6 +1251,50 @@ pub(super) fn channel_primary<'a>(
         .or_else(|| monitors.iter().copied().max_by_key(|m| m.last_recording_started.unwrap_or(0)))
 }
 
+/// Like [`channel_primary`], but layers the platform-preference feature
+/// (`crate::platform_pref`) on top: prefer a currently-live PINNED instance
+/// (the instance-level tier — a stronger, more specific signal than a
+/// platform pick, since an instance already IS one platform) first, then a
+/// currently-live instance matching the resolved preferred platform (channel
+/// override, else global default — see `effective_primary_platform_from`),
+/// and only then fall back to `channel_primary`'s plain earliest-live-wins.
+/// Both preference tiers still resolve ties among their own qualifying
+/// instances via `channel_primary`'s own earliest-live logic — a preference
+/// narrows the candidate pool, it doesn't change how ties within that pool
+/// are broken. Pre-filtering to `live_monitors` before applying either tier
+/// matters: `channel_primary` has its own "nothing is live" fallback (most
+/// recent past recording), which must never surface a stale, currently-
+/// offline pinned/preferred instance while some OTHER instance is actually
+/// live right now.
+pub(super) fn channel_primary_preferred<'a>(
+    monitors: &[&'a MonitorWithChannel],
+    active: &HashSet<i64>,
+    now: i64,
+    pinned_ids: &HashSet<i64>,
+    preferred_platform: Option<Platform>,
+) -> Option<&'a MonitorWithChannel> {
+    let live_monitors: Vec<&'a MonitorWithChannel> = monitors
+        .iter()
+        .copied()
+        .filter(|m| active.contains(&m.monitor.id) || m.monitor.last_state == "live")
+        .collect();
+    if !pinned_ids.is_empty() {
+        let pinned: Vec<&'a MonitorWithChannel> =
+            live_monitors.iter().copied().filter(|m| pinned_ids.contains(&m.monitor.id)).collect();
+        if let Some(m) = channel_primary(&pinned, active, now) {
+            return Some(m);
+        }
+    }
+    if let Some(p) = preferred_platform {
+        let matching: Vec<&'a MonitorWithChannel> =
+            live_monitors.iter().copied().filter(|m| m.monitor.platform() == p).collect();
+        if let Some(m) = channel_primary(&matching, active, now) {
+            return Some(m);
+        }
+    }
+    channel_primary(monitors, active, now)
+}
+
 /// How many of the channel's instances are currently live (recording or not) —
 /// drives the container row's bubbled-up live-count badge.
 pub(super) fn channel_live_count(monitors: &[&MonitorWithChannel], active: &HashSet<i64>) -> usize {
@@ -1277,6 +1324,7 @@ pub(super) fn channel_cells(
     monitors: &[&MonitorWithChannel],
     active: &HashSet<i64>,
     now: i64,
+    platform_pref: &crate::platform_pref::PlatformPrefCtx,
 ) -> Vec<Cell> {
     if monitors.is_empty() {
         // Empty container: just the name + "added"; everything else blank. Index
@@ -1291,8 +1339,13 @@ pub(super) fn channel_cells(
     let any_recording = monitors.iter().any(|m| active.contains(&m.monitor.id));
     let live_count = channel_live_count(monitors, active);
     // The earliest-live (or, if none live, most recent past recording) instance
-    // drives the time columns.
-    let primary = channel_primary(monitors, active, now).unwrap_or(monitors[0]);
+    // drives the time columns — unless a pin/platform preference picks a
+    // different currently-live instance instead (must match `channel_row`'s
+    // own render exactly, or sorting and display would silently disagree).
+    let primary = channel_primary_preferred(
+        monitors, active, now, &platform_pref.pins, platform_pref.effective(channel.id),
+    )
+    .unwrap_or(monitors[0]);
     let rec = recording_cells(primary, now);
     let ninst = monitors.len();
     let tool = ninst.to_string();
@@ -2118,6 +2171,60 @@ mod tests {
     }
 
     #[test]
+    fn channel_primary_preferred_pin_beats_platform_beats_earliest_live() {
+        // Three live instances of the same channel: Twitch (earliest),
+        // YouTube (later), Kick (latest).
+        let twitch = test_row(1, "live", None, None, Some(1_000_000), false);
+        let mut youtube = test_row(2, "live", None, None, Some(1_000_100), false);
+        youtube.monitor.url = "https://www.youtube.com/@test".into();
+        let mut kick = test_row(3, "live", None, None, Some(1_000_200), false);
+        kick.monitor.url = "https://kick.com/test".into();
+        let monitors = vec![&twitch, &youtube, &kick];
+        let active = HashSet::new();
+        let now = 1_000_300;
+
+        // No preference configured: identical to plain channel_primary (earliest-live).
+        let none_pref = channel_primary_preferred(&monitors, &active, now, &HashSet::new(), None);
+        assert_eq!(none_pref.unwrap().monitor.id, 1);
+
+        // A platform preference overrides earliest-live.
+        let plat_pref =
+            channel_primary_preferred(&monitors, &active, now, &HashSet::new(), Some(Platform::YouTube));
+        assert_eq!(plat_pref.unwrap().monitor.id, 2);
+
+        // An instance pin beats both earliest-live AND the platform preference.
+        let mut pins = HashSet::new();
+        pins.insert(3);
+        let pinned =
+            channel_primary_preferred(&monitors, &active, now, &pins, Some(Platform::YouTube));
+        assert_eq!(pinned.unwrap().monitor.id, 3);
+
+        // A pin on an instance that ISN'T among the live set (offline, or not
+        // this channel's) falls through to the platform preference instead of
+        // resurrecting a stale/unrelated pick.
+        let mut dead_pin = HashSet::new();
+        dead_pin.insert(99);
+        let fallthrough =
+            channel_primary_preferred(&monitors, &active, now, &dead_pin, Some(Platform::Kick));
+        assert_eq!(fallthrough.unwrap().monitor.id, 3);
+    }
+
+    #[test]
+    fn channel_primary_preferred_falls_back_when_preferred_platform_absent() {
+        // Preferred platform is Kick, but this channel has no Kick instance at
+        // all — must fall back to earliest-live among what IS live, not None.
+        let twitch = test_row(1, "live", None, None, Some(1_000_000), false);
+        let mut youtube = test_row(2, "live", None, None, Some(1_000_100), false);
+        youtube.monitor.url = "https://www.youtube.com/@test".into();
+        let monitors = vec![&twitch, &youtube];
+        let active = HashSet::new();
+        let now = 1_000_300;
+        let primary =
+            channel_primary_preferred(&monitors, &active, now, &HashSet::new(), Some(Platform::Kick));
+        assert_eq!(primary.unwrap().monitor.id, 1, "no Kick instance -> falls back to earliest live");
+    }
+
+    #[test]
     fn channel_cells_state_sort_key_orders_recording_live_failed_offline() {
         // The state column must sort by significance (recording > live > failed
         // > offline/idle), not by `Cell::text`'s plain alphabetical key — which
@@ -2146,8 +2253,9 @@ mod tests {
         // erroring, which is exactly what happened here before this fix: the
         // "state" click was actually sorting by "next_stream").
         let state_idx = STREAM_COLUMNS.iter().position(|c| c.id == "state").unwrap();
+        let no_pref = crate::platform_pref::PlatformPrefCtx::default();
         let state_priority = |m: &MonitorWithChannel, active: &HashSet<i64>| {
-            let cells = channel_cells(&channel, &[m], active, now);
+            let cells = channel_cells(&channel, &[m], active, now, &no_pref);
             assert_eq!(cells.len(), STREAM_COLS, "channel_cells must have one entry per STREAM_COLUMNS");
             match cells[state_idx].key {
                 SortKey::Num(n) => n,

@@ -101,7 +101,15 @@ two tools on one URL.
    a live/recording indicator when **any** instance is live (with a count after
    the icon, e.g. `⏺ 2`, when more than one is), and its Went Live/Started
    On/Duration/Title/Game/Viewers show whichever live instance went live
-   **earliest**.
+   **earliest** — unless a **preferred platform** is configured (useful when
+   one platform's metadata is richer, e.g. Twitch's game/category vs.
+   YouTube's), in which case that platform's instance wins instead whenever
+   it's live. Three-level inheritance, same pattern as VOD-download/head-backfill
+   overrides: a per-**instance pin** ("Pin as preferred platform" in the
+   instance form) beats a per-**channel** override (channel form's "Preferred
+   platform when multiple live") beats the **global default** (Settings →
+   Interface → Display). None configured = the original earliest-live
+   behavior, unchanged.
 
    A take whose capture has **ended** but whose finalize (the remux/promote
    into the output dir) is still running — or waiting in the disk-gate queue,

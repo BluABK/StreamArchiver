@@ -15,6 +15,9 @@ pub(super) struct ChannelForm {
     /// Head-backfill-on-new-take overrides for this channel (`None` = inherit global).
     pub(super) head_backfill_fetch: Option<bool>,
     pub(super) head_backfill_replace: Option<bool>,
+    /// Preferred platform when this channel has multiple instances
+    /// simultaneously live (`None` = inherit the global default).
+    pub(super) primary_platform_pref: Option<Platform>,
 }
 /// Background load state of an import fetch (followed/subscriptions).
 pub(super) enum ImportLoadState {
@@ -212,6 +215,17 @@ impl StreamArchiverApp {
                                      follows the global default.",
                                 );
                             ui.end_row();
+
+                            ui.label("Preferred platform when multiple live");
+                            platform_pref_combo(ui, "chform_platform_pref", &mut f.primary_platform_pref)
+                                .on_hover_text(
+                                    "When this channel has more than one instance simultaneously \
+                                     live, show this platform's info on the channel row instead of \
+                                     whichever went live earliest. An instance-level pin (per \
+                                     instance) overrides this. Inherit follows the global default \
+                                     (Settings → Interface → Display).",
+                                );
+                            ui.end_row();
                         });
                     if !renaming {
                         ui.label(
@@ -243,6 +257,7 @@ impl StreamArchiverApp {
             } else {
                 let id_opt = f.id;
                 let color = f.color.trim().to_string();
+                let platform_pref = f.primary_platform_pref;
                 let vod_scope = crate::vod_archive::VodArchiveScope {
                     download: f.vod_download,
                     replace: f.vod_replace,
@@ -272,6 +287,16 @@ impl StreamArchiverApp {
                             cid,
                             &head_backfill_scope,
                         );
+                        let _ = crate::platform_pref::save_channel_primary_platform(
+                            &self.core.store,
+                            cid,
+                            platform_pref,
+                        );
+                        // The preference feeds the cached Streams-view rollup
+                        // (`StreamsViewCache::platform_pref`) — bump the rev so
+                        // it takes effect immediately instead of waiting for
+                        // the next unrelated cache invalidation.
+                        self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
                         self.status = "Saved.".into();
                         self.channel_form = None;
                         // A rename changes the asset-dir path these name-derived
@@ -509,13 +534,17 @@ impl StreamArchiverApp {
                 }
             }
 
+            // Preferred-platform-when-multiple-live config: loaded once per
+            // rebuild (not per channel row per frame — see `PlatformPrefCtx`).
+            let platform_pref = crate::platform_pref::PlatformPrefCtx::load(&self.core.store);
+
             // Channel-level sort/filter model (one entry per top-level channel row).
             let model: Vec<Vec<Cell>> = chan_entries
                 .iter()
                 .map(|e| {
                     let mons: Vec<&MonitorWithChannel> =
                         e.rows.iter().map(|&i| &self.rows[i]).collect();
-                    channel_cells(&e.channel, &mons, active_ids, now)
+                    channel_cells(&e.channel, &mons, active_ids, now, &platform_pref)
                 })
                 .collect();
 
@@ -527,6 +556,7 @@ impl StreamArchiverApp {
                 channel_name_colors,
                 groups,
                 model,
+                platform_pref,
             });
         }
     }
@@ -732,6 +762,7 @@ impl StreamArchiverApp {
                                     active_ids, &finalizing_ids, &active_chat_ids,
                                     &ad_running, &exp_channels, now, sel_color,
                                     status_bgcolor, &col_order, &mut out,
+                                    &cache.platform_pref,
                                 );
                             }
                             Vis::Instance { row: ri, depth } => {
@@ -900,6 +931,7 @@ impl StreamArchiverApp {
                 let hbsc = crate::head_backfill::load_monitor_head_backfill_scope(&self.core.store, r.monitor.id);
                 mf.head_backfill_fetch = hbsc.fetch;
                 mf.head_backfill_replace = hbsc.replace;
+                mf.primary_pin = crate::platform_pref::monitor_is_pinned(&self.core.store, r.monitor.id);
                 self.form = Some(mf);
             }
         }
@@ -964,6 +996,7 @@ impl StreamArchiverApp {
             if let Some(c) = self.channels.iter().find(|c| c.id == cid) {
                 let sc = crate::vod_archive::load_channel_vod_scope(&self.core.store, cid);
                 let hbsc = crate::head_backfill::load_channel_head_backfill_scope(&self.core.store, cid);
+                let platform_pref = crate::platform_pref::channel_primary_platform(&self.core.store, cid);
                 self.channel_form = Some(ChannelForm {
                     id: Some(cid),
                     name: c.name.clone(),
@@ -972,6 +1005,7 @@ impl StreamArchiverApp {
                     vod_replace: sc.replace,
                     head_backfill_fetch: hbsc.fetch,
                     head_backfill_replace: hbsc.replace,
+                    primary_platform_pref: platform_pref,
                 });
             }
         }
@@ -1166,6 +1200,7 @@ impl StreamArchiverApp {
         status_bgcolor: bool,
         col_order: &[usize],
         out: &mut StreamsOut,
+        platform_pref: &crate::platform_pref::PlatformPrefCtx,
     ) {
         let ch = &e.channel;
         let cid = ch.id;
@@ -1187,9 +1222,14 @@ impl StreamArchiverApp {
             .filter_map(|m| m.monitor.last_checked_at)
             .max()
             .unwrap_or(0);
-        // The earliest-live (or, if none live, most recent
-        // past recording) instance drives the time columns.
-        let primary = channel_primary(&mons, active_ids, now);
+        // The earliest-live (or, if none live, most recent past recording)
+        // instance drives the time columns — unless a pin/platform preference
+        // picks a different currently-live instance instead (must match
+        // `channel_cells`'s sort-model computation exactly, or display and
+        // sort order would silently disagree).
+        let primary = channel_primary_preferred(
+            &mons, active_ids, now, &platform_pref.pins, platform_pref.effective(cid),
+        );
         let rec = primary.map(|m| recording_cells(m, now));
         let ads = primary.map(|m| {
             (m.last_recording_ad_count, m.last_recording_ad_secs)

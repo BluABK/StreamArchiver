@@ -1667,6 +1667,15 @@ impl StreamArchiverApp {
                             );
                         ui.end_row();
 
+                        ui.label("Pin as preferred platform");
+                        ui.checkbox(&mut form.primary_pin, "").on_hover_text(
+                            "Always show THIS instance's info on the channel row while it's \
+                             live, even if a sibling instance (another platform) went live \
+                             earlier or the channel/global preference points elsewhere — the \
+                             strongest of the three preference tiers.",
+                        );
+                        ui.end_row();
+
                         ui.label("Enabled");
                         ui.checkbox(&mut form.automation_enabled, "")
                             .on_hover_text(

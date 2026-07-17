@@ -1162,6 +1162,38 @@ impl StreamArchiverApp {
                 .weak(),
             );
 
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label("Preferred platform when multiple instances are live:");
+                let cur = self.primary_platform_pref;
+                egui::ComboBox::from_id_salt("primary_platform_pref")
+                    .selected_text(cur.map(Platform::label).unwrap_or("Earliest live wins"))
+                    .show_ui(ui, |ui| {
+                        let mut pick = |ui: &mut egui::Ui, val: Option<Platform>, label: &str| {
+                            if ui.selectable_label(cur == val, label).clicked() && cur != val {
+                                self.primary_platform_pref = val;
+                                let _ = crate::platform_pref::set_global_primary_platform(
+                                    &self.core.store, val,
+                                );
+                                self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
+                            }
+                        };
+                        pick(ui, None, "Earliest live wins (default)");
+                        pick(ui, Some(Platform::Twitch), Platform::Twitch.label());
+                        pick(ui, Some(Platform::YouTube), Platform::YouTube.label());
+                        pick(ui, Some(Platform::Kick), Platform::Kick.label());
+                    });
+            })
+            .response
+            .on_hover_text(
+                "When a channel has more than one instance (e.g. Twitch + YouTube) live at \
+                 the same time, the channel row's Title/Game/Viewers/Went Live normally come \
+                 from whichever instance went live earliest. Set a preferred platform to show \
+                 that one's info instead whenever it's live — useful when one platform's \
+                 metadata is richer (e.g. Twitch's game/category). Can be overridden per \
+                 channel in Properties, or per instance with a pin (highest priority).",
+            );
+
             }
     }
 

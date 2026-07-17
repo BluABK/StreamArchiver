@@ -39,6 +39,7 @@ impl StreamArchiverApp {
         let dnd_start = if dnd_start.is_empty() { "22:00".to_string() } else { dnd_start };
         let dnd_end = setting_or_empty(&core, crate::notifications::K_DND_END);
         let dnd_end = if dnd_end.is_empty() { "08:00".to_string() } else { dnd_end };
+        let primary_platform_pref = crate::platform_pref::global_primary_platform(&core.store);
 
         let schedule_compact = setting_or_empty(&core, K_SCHEDULE_COMPACT) == "1";
 
@@ -347,6 +348,7 @@ impl StreamArchiverApp {
             dnd_schedule_enabled,
             dnd_start,
             dnd_end,
+            primary_platform_pref,
             show_processes: false,
             processes: Vec::new(),
             processes_refreshed: None,
@@ -1075,6 +1077,7 @@ impl StreamArchiverApp {
             fetch: form.head_backfill_fetch,
             replace: form.head_backfill_replace,
         };
+        let primary_pin = form.primary_pin;
 
         // Close the form immediately so the UI stays responsive while the DB
         // work runs. On a background-thread error the status bar shows the error;
@@ -1123,6 +1126,7 @@ impl StreamArchiverApp {
                         mid,
                         &head_backfill_scope,
                     );
+                    let _ = crate::platform_pref::save_monitor_pin(&store, mid, primary_pin);
                     let rows = store.list_monitors_with_channels().map_err(|e| e.to_string())?;
                     let next_streams =
                         store.next_scheduled_streams(now_unix()).map_err(|e| e.to_string())?;
@@ -1633,6 +1637,7 @@ impl StreamArchiverApp {
                         let hbsc = crate::head_backfill::load_monitor_head_backfill_scope(&self.core.store, self.rows[idx].monitor.id);
                         mf.head_backfill_fetch = hbsc.fetch;
                         mf.head_backfill_replace = hbsc.replace;
+                        mf.primary_pin = crate::platform_pref::monitor_is_pinned(&self.core.store, self.rows[idx].monitor.id);
                         self.form = Some(mf);
                     }
                 }
