@@ -6,11 +6,13 @@
 //! button that opens the channel URL (protocol activation — handled by Windows,
 //! no app callback needed). On other platforms we fall back to `notify_rust`.
 //!
-//! Toasts are shown under the built-in Windows PowerShell AppUserModelID so they
-//! appear without registering our own AUMID / Start-Menu shortcut; that's also
-//! why Windows attributes them to "Windows PowerShell". Proper branding and
-//! buttons that call *back* into the app would need a registered AUMID + COM
-//! activator (a separate, packaging-adjacent piece).
+//! Toasts are shown under our registered `BluABK.StreamArchiver` AUMID (see
+//! [`crate::toast_activation`]) so Windows attributes them to "StreamArchiver"
+//! with our icon, and clicking the toast *body* is a foreground activation
+//! delivered back into the app via the registered COM activator (focus the
+//! window, or open the 🔔 feed — the `launch` argument decides). If that
+//! registration failed this launch, toasts fall back to the borrowed
+//! PowerShell AUMID and keep working, just unbranded and without body clicks.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -40,12 +42,6 @@ pub const K_DND_SCHEDULE_ENABLED: &str = "dnd_schedule_enabled";
 pub const K_DND_START: &str = "dnd_start";
 /// `"HH:MM"` local time the scheduled DND window ends (exclusive).
 pub const K_DND_END: &str = "dnd_end";
-
-/// The built-in PowerShell AppUserModelID — lets a Win32 app show toasts without
-/// registering its own AUMID + Start-Menu shortcut.
-#[cfg(windows)]
-const POWERSHELL_AUMID: &str =
-    r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe";
 
 /// Whether desktop notifications are enabled. Read live so a Settings change
 /// takes effect immediately (events are infrequent, so a DB read per event is
@@ -118,6 +114,10 @@ struct ToastContent {
     /// Banner (shown as the hero image).
     hero: Option<PathBuf>,
     action: Option<ToastAction>,
+    /// Foreground-activation argument for a toast-*body* click, delivered to
+    /// the app's COM activator (`toast_activation::parse_activation_args`).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    launch: &'static str,
 }
 
 impl ToastContent {
@@ -129,6 +129,7 @@ impl ToastContent {
             logo: None,
             hero: None,
             action: None,
+            launch: "action=focus",
         }
     }
 }
@@ -162,6 +163,7 @@ pub fn send_test_toast(
         logo: find_toast_asset(channel_name, platform, &account, "icon."),
         hero: find_toast_asset(channel_name, platform, &account, "banner."),
         action,
+        launch: "action=focus",
     });
 }
 
@@ -329,13 +331,15 @@ fn handle(store: &Store, ev: AppEvent) {
         AppEvent::VodMuted { recording_id, channel, muted_secs } => {
             let mins = muted_secs / 60;
             let dur = if mins > 0 { format!("{mins} min") } else { format!("{muted_secs}s") };
-            let content = ToastContent::text(
+            let mut content = ToastContent::text(
                 "VOD is DMCA-muted".to_string(),
                 format!(
                     "{channel}'s published VOD has {dur} of muted content — recovering the audio; \
                      the live recording is kept."
                 ),
             );
+            // Land a body click on the 🔔 feed where the details live.
+            content.launch = "action=notifications";
             let mid = store
                 .monitor_id_for_recording(recording_id)
                 .ok()
@@ -352,10 +356,11 @@ fn handle(store: &Store, ev: AppEvent) {
             (content, meta)
         }
         AppEvent::Error { context, message } => {
-            let content = ToastContent::text(
+            let mut content = ToastContent::text(
                 "StreamArchiver error".to_string(),
                 format!("{context}: {message}"),
             );
+            content.launch = "action=notifications";
             let meta = NotifMeta {
                 kind: NotificationKind::Error,
                 severity: "error",
@@ -445,6 +450,7 @@ fn content_for_url(
         logo: find_toast_asset(&row.channel.name, platform, &account, "icon."),
         hero: find_toast_asset(&row.channel.name, platform, &account, "banner."),
         action,
+        launch: "action=focus",
     }
 }
 
@@ -505,16 +511,20 @@ fn show_toast(c: ToastContent) {
         ),
         None => String::new(),
     };
+    // The root `launch` argument reaches our COM activator on a body click
+    // (foreground activation) — a no-op under the fallback PowerShell AUMID.
     let xml = format!(
-        r#"<toast><visual><binding template="ToastGeneric">{texts}{images}</binding></visual>{actions}</toast>"#,
+        r#"<toast launch="{launch}" activationType="foreground"><visual><binding template="ToastGeneric">{texts}{images}</binding></visual>{actions}</toast>"#,
+        launch = xml_escape(c.launch),
     );
 
     let render = || -> windows::core::Result<()> {
         let doc = XmlDocument::new()?;
         doc.LoadXml(&HSTRING::from(xml.as_str()))?;
         let toast = ToastNotification::CreateToastNotification(&doc)?;
-        let notifier =
-            ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(POWERSHELL_AUMID))?;
+        let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(
+            crate::toast_activation::effective_aumid(),
+        ))?;
         notifier.Show(&toast)
     };
     if let Err(e) = render() {

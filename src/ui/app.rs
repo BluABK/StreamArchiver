@@ -859,6 +859,18 @@ impl StreamArchiverApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
+                UiCommand::ShowNotifications => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    // Mirror the 🔔 bell button: open, refresh, mark read.
+                    self.show_notifications = true;
+                    self.notif_refreshed = None;
+                    let _ = self
+                        .core
+                        .store
+                        .mark_notifications_read_before(crate::models::now_unix());
+                    self.notif_unread = 0;
+                }
                 UiCommand::Quit => {
                     self.quitting = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);

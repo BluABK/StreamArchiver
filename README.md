@@ -763,7 +763,15 @@ The Issues panel refreshes every 5 s while open and every 5 min while closed —
   completions, trigger matches, new community posts, and more, with a kind
   filter and text search; **Mark all read** clears the badge. The same events
   also raise a **desktop toast** (with a "Watch stream"/"Watch VOD" action
-  where relevant).
+  where relevant). On Windows the toasts are attributed to **StreamArchiver**
+  (own name + icon, registered at startup — no installer needed), and
+  clicking a toast's body calls back into the app: it focuses the window (or
+  relaunches the app to the tray and raises it if it wasn't running), and
+  error / DMCA-mute toasts open the 🔔 feed directly. The registration is
+  HKCU-only and refreshed on every launch; to remove it entirely, delete
+  `HKCU\Software\Classes\AppUserModelId\BluABK.StreamArchiver`,
+  `HKCU\Software\Classes\CLSID\{A4E2B7D1-5C3F-4B8E-9A61-0D2C47F3E9B2}`, and
+  `toast_icon.png` in the app data dir.
 
   ![Notifications window with a mixed feed of events](doc/screenshots/notifications-window.png)
   ![Desktop toast for a channel going live](doc/screenshots/live-toast-notification.png)
@@ -1960,7 +1968,8 @@ they cover (they exercise private items and compile out of release builds).
 
 ## Roadmap
 
-- Installer + AppUserModelID (for branded Windows toast notifications).
+- Installer / packaging (the AppUserModelID + branded toasts already work
+  installer-free via HKCU registration).
 - macOS/Linux polish (tray via `ksni`, process-group kill).
 - Re-remux survival across app restarts (register ffmpeg in the detached-process registry so an in-progress `.ts` → MKV re-remux triggered from the Issues panel is not lost when the app is restarted; the `.ts` source is always preserved on failure or interruption, so the re-remux can be re-triggered from the Issues panel).
 - Kick chat logging.

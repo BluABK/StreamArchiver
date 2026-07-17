@@ -334,6 +334,9 @@ pub type OfflineSignal = i64;
 pub enum UiCommand {
     /// Show and focus the main window.
     ShowWindow,
+    /// Show/focus the window and open the 🔔 notifications feed (a clicked
+    /// error / VOD-muted toast lands the user on the relevant list).
+    ShowNotifications,
     /// Begin application shutdown, leaving downloads running (the default).
     Quit,
     /// Begin shutdown and stop all active downloads (don't detach them).

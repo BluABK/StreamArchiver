@@ -35,6 +35,7 @@ mod schedule_source;
 mod scheduled_recordings;
 mod scheduler;
 mod store;
+mod toast_activation;
 mod triggers;
 mod ui;
 mod version;
@@ -43,7 +44,7 @@ mod watchdog;
 mod websub;
 
 use std::sync::Arc;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 
 use anyhow::{Context, Result};
 use eframe::egui;
@@ -111,6 +112,12 @@ fn main() -> Result<()> {
     // turn a process-killing panic into a visible native dialog before the runtime
     // aborts, so startup panics (store/core/tray/font setup) aren't silent crashes.
     watchdog::install_panic_dialog();
+
+    // Toast identity + COM activation: register our AUMID (branded toasts) and
+    // the toast-activator class factory. Before window/tray creation (the
+    // explicit process AUMID is also the taskbar identity) and before
+    // `core.start()` (the first toast needs the registration in place).
+    toast_activation::init();
 
     let store = Store::open(&app_paths::db_path()).context("opening data store")?;
 
@@ -186,7 +193,10 @@ fn main() -> Result<()> {
     core.start(); // launch the background scheduler + download supervisor
 
     // `--hidden` (used by the autostart entry) launches straight to the tray.
-    let start_hidden = std::env::args().any(|a| a == "--hidden");
+    // `-Embedding` is COM launching us to deliver a toast click while we
+    // weren't running — same deal: start to the tray; the delivered
+    // activation then shows/focuses the window.
+    let start_hidden = std::env::args().any(|a| a == "--hidden" || a == "-Embedding");
     info!(start_hidden, "core started; launching UI");
 
     let (rgba, w, h) = platform::app_icon_rgba();
@@ -233,8 +243,10 @@ fn main() -> Result<()> {
             // Add OS CJK/Unicode fallback fonts so non-Latin channel names (e.g.
             // Japanese VTuber names, fullwidth 【】) render instead of tofu boxes.
             fonts::install_unicode_fonts(&cc.egui_ctx);
-            let (tray, ui_rx) = build_tray(cc.egui_ctx.clone())
+            let (tray, ui_rx, ui_tx) = build_tray(cc.egui_ctx.clone())
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            // Toast clicks feed the same command channel as the tray menu.
+            toast_activation::set_ui_sink(ui_tx, cc.egui_ctx.clone());
             Ok(Box::new(ui::StreamArchiverApp::new(
                 core_for_app,
                 tray,
@@ -257,7 +269,9 @@ fn main() -> Result<()> {
 
 /// Create the system tray icon + menu and a background thread that forwards
 /// menu events to the UI (waking the reactive egui loop via `request_repaint`).
-fn build_tray(ctx: egui::Context) -> Result<(TrayIcon, Receiver<UiCommand>)> {
+/// Also hands back a `Sender` clone so other producers (toast activation) can
+/// feed the same command channel.
+fn build_tray(ctx: egui::Context) -> Result<(TrayIcon, Receiver<UiCommand>, Sender<UiCommand>)> {
     let menu = Menu::new();
     let open_item = MenuItem::new("Open StreamArchiver", true, None);
     // Default Quit detaches (downloads keep running); the second item force-stops.
@@ -281,6 +295,7 @@ fn build_tray(ctx: egui::Context) -> Result<(TrayIcon, Receiver<UiCommand>)> {
         .build()?;
 
     let (tx, rx) = std::sync::mpsc::channel::<UiCommand>();
+    let tx_out = tx.clone();
     let open_id = open_item.id().clone();
     let quit_id = quit_item.id().clone();
     let quit_stop_id = quit_stop_item.id().clone();
@@ -316,7 +331,7 @@ fn build_tray(ctx: egui::Context) -> Result<(TrayIcon, Receiver<UiCommand>)> {
     std::mem::forget(open_item);
     std::mem::forget(quit_item);
 
-    Ok((tray, rx))
+    Ok((tray, rx, tx_out))
 }
 
 /// One-shot detection for diagnostics. Uses scrape/probe (no credentials),
