@@ -376,6 +376,20 @@ pub fn local_dyn_status(letter: char) -> Option<DynGateStatus> {
     dyn_status(&LOCAL_GATES, letter, |l| l.local_permits)
 }
 
+/// Drive letters that currently have a gate of either kind — i.e. drives the
+/// app has actually done bulk I/O on since launch. Lets the Settings UI's
+/// Default row (which covers every drive without an override row) list a live
+/// readout per real disk instead of showing nothing.
+pub fn active_gate_letters() -> Vec<String> {
+    let mut set = std::collections::BTreeSet::new();
+    for map in [&LOCAL_GATES, &CDN_GATES] {
+        if let Some(m) = map.get() {
+            set.extend(m.lock().keys().cloned());
+        }
+    }
+    set.into_iter().collect()
+}
+
 /// Live status of drive `letter`'s CDN-mux gate — see [`local_dyn_status`].
 pub fn cdn_dyn_status(letter: char) -> Option<DynGateStatus> {
     dyn_status(&CDN_GATES, letter, |l| l.cdn_permits)

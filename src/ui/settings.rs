@@ -366,10 +366,14 @@ fn dynamic_live_cell(ui: &mut egui::Ui, letter: &str, local_ceiling: u32, cdn_ce
                 let resp = ui
                     .add(egui::DragValue::new(&mut v).range(1..=local_ceiling.max(1)).prefix("L "))
                     .on_hover_text(format!(
-                        "Local passes: {}/{} in use, ceiling {}. Drag to pin a specific \
-                         number — overrides the adjuster until cleared.",
+                        "Local passes: the adjuster's LIVE permit count (not a setting). \
+                         {} of {} in use, ceiling {}. Drag to pin a specific number — \
+                         overrides the adjuster until cleared.",
                         s.in_use, s.current, s.ceiling
                     ));
+                // Ceiling + busy count as visible text, not hover-only —
+                // this cell is the live readout, and it should read like one.
+                ui.weak(format!("/{} · {} busy", s.ceiling, s.in_use));
                 if resp.changed() {
                     new_pin_local = Some(v);
                 }
@@ -384,10 +388,12 @@ fn dynamic_live_cell(ui: &mut egui::Ui, letter: &str, local_ceiling: u32, cdn_ce
                 let resp = ui
                     .add(egui::DragValue::new(&mut v).range(1..=cdn_ceiling.max(1)).prefix("C "))
                     .on_hover_text(format!(
-                        "CDN muxes: {}/{} in use, ceiling {}. Drag to pin a specific number \
-                         — overrides the adjuster until cleared.",
+                        "CDN muxes: the adjuster's LIVE permit count (not a setting). \
+                         {} of {} in use, ceiling {}. Drag to pin a specific number — \
+                         overrides the adjuster until cleared.",
                         s.in_use, s.current, s.ceiling
                     ));
+                ui.weak(format!("/{} · {} busy", s.ceiling, s.in_use));
                 if resp.changed() {
                     new_pin_cdn = Some(v);
                 }
@@ -2227,10 +2233,12 @@ impl StreamArchiverApp {
             "Tick Dynamic on a drive to stop hand-tuning it: Local passes/CDN muxes become \
              a CEILING, and the live count adapts to the disk's actual queue depth instead \
              of holding a fixed number — grows slowly while the disk proves idle, backs off \
-             immediately at the first sign of real contention. The Live column shows the \
-             current count next to the ceiling (e.g. 2/4); pin a specific number there to \
-             override the adjuster for now (🔓 to release it back to auto). Read throttle \
-             and download rate limit are unaffected by Dynamic.",
+             immediately at the first sign of real contention. The ACTUAL live values appear \
+             under the ticked Dynamic checkbox once bulk I/O has run on the drive: \
+             \"L 2 /4 · 1 busy\" = 2 permits right now, ceiling 4, 1 in use (the Default \
+             row lists one such line per un-overridden drive). Drag the number to pin a \
+             manual override for now; 🔓 releases it back to auto. Read throttle and \
+             download rate limit are unaffected by Dynamic.",
         );
         ui.add_space(6.0);
         let mut remove: Option<usize> = None;
@@ -2266,7 +2274,40 @@ impl StreamArchiverApp {
                         .hint_text("off")
                         .desired_width(70.0),
                 );
-                ui.checkbox(&mut self.settings.disk_default_dynamic, "");
+                ui.vertical(|ui| {
+                    ui.checkbox(&mut self.settings.disk_default_dynamic, "");
+                    if self.settings.disk_default_dynamic {
+                        // "Default" spans every un-overridden drive, so the
+                        // live readout is one line per real disk that has
+                        // actually seen bulk I/O this session.
+                        let overridden: Vec<String> = self
+                            .settings
+                            .disk_overrides
+                            .iter()
+                            .map(|(l, _)| l.trim().to_uppercase())
+                            .collect();
+                        let mut any = false;
+                        for letter in crate::io_gate::active_gate_letters() {
+                            if overridden.contains(&letter) {
+                                continue;
+                            }
+                            any = true;
+                            ui.horizontal(|ui| {
+                                ui.weak(format!("{letter}:"));
+                                dynamic_live_cell(
+                                    ui,
+                                    &letter,
+                                    self.settings.disk_default_local,
+                                    self.settings.disk_default_cdn,
+                                );
+                            });
+                        }
+                        if !any {
+                            ui.weak("no bulk I/O yet")
+                                .on_hover_text("Appears once a remux/backfill/recovery runs on a drive without its own row.");
+                        }
+                    }
+                });
                 ui.label("");
                 ui.end_row();
 

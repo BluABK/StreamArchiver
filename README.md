@@ -554,12 +554,16 @@ captures are writing to:
   permit, so a momentarily-quiet disk doesn't snap straight back to the
   ceiling); backing off is fast — the first sign of real contention roughly
   halves the live count immediately, because the whole point is protecting a
-  drive that's already been driven off the bus once. The **Live** column on
-  each dynamic-mode override row shows the current count next to the ceiling
-  (e.g. `L 2/4 · C 1/2`); drag either number to **pin** it — the adjuster
-  leaves that gate alone until you hit **🔓** to release it back to auto. A
-  drive with dynamic mode on that hasn't run a pass yet shows "not active
-  yet" rather than a real number. Only the permit counts adapt — the read
+  drive that's already been driven off the bus once. The **actual live
+  values** appear directly under a ticked Dynamic checkbox once bulk I/O has
+  run on that drive: `L 2 /4 · 1 busy` means 2 permits right now, ceiling 4,
+  1 currently in use (and the same for `C`, the CDN-mux gate). On the
+  **Default** row — which covers every drive without its own override row —
+  one such line appears **per active drive**, labelled with its letter. Drag
+  the number to **pin** it — the adjuster leaves that gate alone until you
+  hit **🔓** to release it back to auto. A drive that hasn't run a pass yet
+  shows `L —` / `C —` rather than a real number. Only the permit counts
+  adapt — the read
   throttle and download rate limit stay fixed at whatever's configured.
 - **Disk throttle** (the default row of the Disk I/O limits table, default
   **30× realtime**)
