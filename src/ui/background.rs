@@ -124,7 +124,20 @@ impl StreamArchiverApp {
                                         format!("{label} — running {}", fmt_duration(*held as i64)),
                                     );
                                     if holders.len() > 1 {
-                                        ui.weak(format!("(+{} more)", holders.len() - 1));
+                                        let others: String = holders[1..]
+                                            .iter()
+                                            .map(|(l, h)| {
+                                                format!("{l} — running {}", fmt_duration(*h as i64))
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join("\n");
+                                        ui.weak(format!("(+{} more)", holders.len() - 1))
+                                            .on_hover_text(format!(
+                                                "Other passes ALSO running right now (each holds \
+                                                 its own disk-gate permit — another drive, or \
+                                                 this drive allows more than one). Only the \
+                                                 longest-running one is shown on the line.\n\n{others}"
+                                            ));
                                     }
                                 }
                                 None => {
