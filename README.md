@@ -192,7 +192,9 @@ URL's platform; edit any field to override it for that download. The
 **⚙ Per-platform defaults** panel to the right of the download form sets the
 default tool/quality/auth/output/filename/extra args for Twitch, YouTube, Kick,
 NRK, Nebula, and Generic (each collapsible) — saved automatically. **NRK**
-(`nrk.no` incl. `tv.nrk.no`) and **Nebula** (`nebula.tv`) are recognized as
+(`nrk.no` incl. `tv.nrk.no` and `radio.nrk.no` — TV, live channels, podcasts,
+radio theatre; audio-only downloads still land in MKV) and **Nebula**
+(`nebula.tv`) are recognized as
 their own platforms — own icon, defaults, and log tag — but ride yt-dlp's
 extractors (no platform-specific detection or channel-asset fetching; Nebula
 needs your subscription cookies via the Auth field). **Generic** covers every

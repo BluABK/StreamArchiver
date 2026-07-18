@@ -2390,6 +2390,12 @@ mod tests {
         // URL inference, including subdomains and the legacy Nebula domain.
         assert_eq!(Platform::detect("https://www.nrk.no/video/77b5f517"), Platform::Nrk);
         assert_eq!(Platform::detect("https://tv.nrk.no/direkte/nrk1"), Platform::Nrk);
+        // radio.nrk.no (podcasts / radio theatre / live radio) — yt-dlp's
+        // NRKRadioPodkast extractor; audio-only downloads still land in MKV.
+        assert_eq!(
+            Platform::detect("https://radio.nrk.no/podkast/oppdatert/l_5005d62a"),
+            Platform::Nrk
+        );
         assert_eq!(Platform::detect("https://nebula.tv/videos/some-video"), Platform::Nebula);
         assert_eq!(Platform::detect("https://watchnebula.com/foo"), Platform::Nebula);
         assert_eq!(Platform::detect("https://example.com/x"), Platform::Generic);
