@@ -191,7 +191,13 @@ list.
 URL's platform; edit any field to override it for that download. The
 **⚙ Per-platform defaults** panel to the right of the download form sets the
 default tool/quality/auth/output/filename/extra args for Twitch, YouTube, Kick,
-and Generic (each collapsible) — saved automatically. The form's **Auth** has a **Default
+and Generic (each collapsible) — saved automatically. **Generic** covers every
+URL that isn't Twitch/YouTube/Kick — any of yt-dlp's ~1800 supported sites
+(NRK, Vimeo, …) — and defaults to **yt-dlp** for exactly that reason:
+streamlink is a live-stream tool and fails on a plain video page with
+`error: No plugin can handle URL` (the form shows an inline ⚠ warning if you
+combine a generic URL with streamlink; defaults saved before this change are
+healed to yt-dlp once, automatically). The form's **Auth** has a **Default
 (per-platform)** option (selected by default, uses the platform default's auth)
 plus the explicit choices; **Inherit (global)** stays available and chains to the
 Settings → *Download authentication* default.

@@ -290,13 +290,31 @@ impl StreamArchiverApp {
             .map(|v| v != "0")
             .unwrap_or(true);
 
-        let download_defaults = core
+        let mut download_defaults = core
             .store
             .get_setting("download_defaults")
             .ok()
             .flatten()
             .and_then(|s| serde_json::from_str::<DownloadDefaults>(&s).ok())
             .unwrap_or_else(|| DownloadDefaults::seeded(&settings.default_output_dir));
+        // One-shot heal (marker-guarded, so re-choosing streamlink later
+        // sticks): defaults persisted under the old seed gave Generic
+        // downloads streamlink, which fails on plain video pages that yt-dlp
+        // handles fine (2026-07-18: an NRK URL in the Videos tab died with
+        // streamlink's "No plugin can handle URL").
+        const K_GENERIC_TOOL_HEALED: &str = "download_defaults_generic_ytdlp_healed";
+        if core.store.get_setting(K_GENERIC_TOOL_HEALED).ok().flatten().as_deref() != Some("1") {
+            if download_defaults.heal_legacy_generic_tool() {
+                tracing::info!(
+                    "download defaults: generic on-demand tool healed streamlink → yt-dlp \
+                     (streamlink can't download plain video pages)"
+                );
+                if let Ok(json) = serde_json::to_string(&download_defaults) {
+                    let _ = core.store.set_setting("download_defaults", &json);
+                }
+            }
+            let _ = core.store.set_setting(K_GENERIC_TOOL_HEALED, "1");
+        }
 
         let monitor_defaults = core
             .store

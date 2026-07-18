@@ -76,14 +76,29 @@ impl Platform {
         }
     }
 
-    /// Sensible default download tool for this platform (research-backed:
-    /// streamlink for Twitch incl. 2K, yt-dlp for YouTube).
+    /// Sensible default LIVE-capture tool for this platform (research-backed:
+    /// streamlink for Twitch incl. 2K, yt-dlp for YouTube). Generic gets
+    /// streamlink because a generic *live* URL is typically a raw HLS page or
+    /// one of streamlink's supported live sites.
     pub fn default_tool(self) -> Tool {
         match self {
             Platform::Twitch => Tool::Streamlink,
             Platform::YouTube => Tool::YtDlp,
             Platform::Kick => Tool::Streamlink,
             Platform::Generic => Tool::Streamlink,
+        }
+    }
+
+    /// Sensible default ON-DEMAND download tool (the Videos tab). Differs from
+    /// [`Platform::default_tool`] for Generic: an arbitrary video-page URL
+    /// (NRK, Vimeo, …) is almost always one of yt-dlp's ~1800 extractors,
+    /// while streamlink only handles live streams on its supported sites —
+    /// pasting a plain video page into a streamlink download just fails with
+    /// "error: No plugin can handle URL".
+    pub fn default_download_tool(self) -> Tool {
+        match self {
+            Platform::Generic => Tool::YtDlp,
+            other => other.default_tool(),
         }
     }
 
@@ -1445,7 +1460,7 @@ impl PlatformDownloadDefault {
     /// preferred tool, global auth, the app's default output folder).
     pub fn seeded(platform: Platform, default_output_dir: &str) -> PlatformDownloadDefault {
         PlatformDownloadDefault {
-            tool: platform.default_tool(),
+            tool: platform.default_download_tool(),
             quality: "best".into(),
             auth_kind: AuthKind::Inherit,
             auth_value: String::new(),
@@ -1492,6 +1507,23 @@ impl DownloadDefaults {
             Platform::YouTube => &mut self.youtube,
             Platform::Kick => &mut self.kick,
             Platform::Generic => &mut self.generic,
+        }
+    }
+
+    /// One-shot heal for defaults persisted before generic on-demand downloads
+    /// defaulted to yt-dlp: the old seed gave Generic streamlink, which cannot
+    /// download a plain video page (any non-Twitch/YouTube/Kick site — NRK,
+    /// Vimeo, … — failed with streamlink's "No plugin can handle URL" even
+    /// though yt-dlp handles them fine). Returns true when it changed
+    /// something; the caller persists the fix and sets a marker setting so a
+    /// user who later *deliberately* picks streamlink for generic downloads
+    /// isn't overridden again.
+    pub fn heal_legacy_generic_tool(&mut self) -> bool {
+        if self.generic.tool == Tool::Streamlink {
+            self.generic.tool = Tool::YtDlp;
+            true
+        } else {
+            false
         }
     }
 }
@@ -2251,6 +2283,38 @@ pub fn group_recordings(recordings: &[Recording]) -> Vec<StreamGroup> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generic_download_tool_is_ytdlp_but_live_stays_streamlink() {
+        // On-demand: an arbitrary video page (NRK, Vimeo, …) needs yt-dlp's
+        // extractors — streamlink dies with "No plugin can handle URL".
+        assert_eq!(Platform::Generic.default_download_tool(), Tool::YtDlp);
+        // Live capture keeps streamlink (raw HLS / streamlink's live sites).
+        assert_eq!(Platform::Generic.default_tool(), Tool::Streamlink);
+        // The known platforms agree between the two.
+        for p in [Platform::Twitch, Platform::YouTube, Platform::Kick] {
+            assert_eq!(p.default_download_tool(), p.default_tool());
+        }
+        // And the seeded Videos-tab default actually picks it up.
+        assert_eq!(
+            PlatformDownloadDefault::seeded(Platform::Generic, "out").tool,
+            Tool::YtDlp
+        );
+    }
+
+    #[test]
+    fn heal_legacy_generic_tool_flips_only_streamlink() {
+        let mut d = DownloadDefaults::seeded("out");
+        // Fresh seed is already yt-dlp — nothing to heal.
+        assert!(!d.heal_legacy_generic_tool());
+        // A legacy persisted config (old seed) gets flipped exactly once.
+        d.generic.tool = Tool::Streamlink;
+        assert!(d.heal_legacy_generic_tool());
+        assert_eq!(d.generic.tool, Tool::YtDlp);
+        assert!(!d.heal_legacy_generic_tool());
+        // Other platforms are never touched.
+        assert_eq!(d.twitch.tool, Tool::Streamlink);
+    }
 
     fn rec(id: i64, started: i64, ended: Option<i64>, stream_id: Option<&str>) -> Recording {
         Recording {

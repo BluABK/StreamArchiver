@@ -192,6 +192,26 @@ impl StreamArchiverApp {
                                 });
                             ui.end_row();
 
+                            if platform == Platform::Generic && d.tool == Tool::Streamlink {
+                                ui.label("");
+                                ui.label(
+                                    egui::RichText::new(
+                                        "⚠ streamlink can't download plain video pages — \
+                                         yt-dlp is the working default here",
+                                    )
+                                    .small()
+                                    .color(egui::Color32::from_rgb(0xd9, 0xa4, 0x06)),
+                                )
+                                .on_hover_text(
+                                    "Generic covers every site that isn't Twitch/YouTube/\
+                                     Kick. Streamlink only handles live streams on its \
+                                     supported sites; a regular video/VOD page fails with \
+                                     \"No plugin can handle URL\". yt-dlp's ~1800 \
+                                     extractors cover most sites (NRK, Vimeo, …).",
+                                );
+                                ui.end_row();
+                            }
+
                             ui.label("Quality");
                             if ui.text_edit_singleline(&mut d.quality).changed() {
                                 dirty = true;
@@ -862,6 +882,31 @@ impl StreamArchiverApp {
                             }
                         });
                     ui.end_row();
+
+                    // Streamlink can only grab LIVE streams from its supported
+                    // sites; pasting a plain video page from an arbitrary site
+                    // into it fails with "No plugin can handle URL", while
+                    // yt-dlp's ~1800 extractors handle most of them. Warn
+                    // in-place instead of letting the download die cryptically.
+                    if platform == Platform::Generic && vf.tool == Tool::Streamlink {
+                        ui.label("");
+                        ui.label(
+                            egui::RichText::new(
+                                "⚠ Streamlink only handles live streams on its supported \
+                                 sites — for a regular video page, pick yt-dlp",
+                            )
+                            .small()
+                            .color(egui::Color32::from_rgb(0xd9, 0xa4, 0x06)),
+                        )
+                        .on_hover_text(
+                            "This URL didn't match a known platform (Twitch/YouTube/Kick), \
+                             and streamlink is a live-stream tool: on a normal video/VOD \
+                             page it fails with \"error: No plugin can handle URL\". \
+                             yt-dlp supports ~1800 sites (NRK, Vimeo, …) and is the \
+                             default for generic downloads.",
+                        );
+                        ui.end_row();
+                    }
 
                     // Quality + Auth.
                     ui.label("Quality");
