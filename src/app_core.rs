@@ -222,6 +222,18 @@ impl AppCore {
             crate::io_gate::start_dynamic_adjuster();
         }
 
+        // Managed bgutil PO token server: adopt a still-running instance from a
+        // previous run, then keep it healthy for as long as the app lives.
+        // Here (not the GUI path) so headless runs get tokens too — SABR
+        // captures die without them.
+        crate::pot_server::init(&self.store);
+        crate::pot_server::start_watchdog(
+            self.store.clone(),
+            self.events.clone(),
+            self.shutdown.clone(),
+            &self.rt,
+        );
+
         let (live_tx, live_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::events::LiveSignal>();
         let (offline_tx, offline_rx) =
@@ -550,6 +562,10 @@ impl AppCore {
                 std::thread::sleep(Duration::from_millis(200));
             }
         }
+        // Stopping everything includes the managed PO token server (an external
+        // one is untouched); the detach path deliberately leaves it running —
+        // detached SABR captures still need tokens after the app exits.
+        crate::pot_server::kill_managed(&self.store);
         // Belt-and-suspenders: terminate any detached job tree by name (catches a
         // grandchild that escaped the PID-tree walk) and drop its registry row so the
         // next launch doesn't try to re-attach to a download we just stopped.

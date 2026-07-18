@@ -67,7 +67,8 @@ const K_SABR_EXTRACTOR_ARGS: &str = "ytdlp_sabr_extractor_args";
 const K_SABR_RAW_ARGS: &str = "ytdlp_sabr_raw_args";
 /// PO-token-provider `--extractor-args` (e.g. bgutil), a separate `--extractor-args`
 /// entry on the SABR command. Absent ⇒ bgutil default; explicit empty ⇒ disabled.
-const K_SABR_POT_ARGS: &str = "ytdlp_sabr_pot_args";
+/// `pub(crate)`: `pot_server` derives the managed server's base URL from it.
+pub(crate) const K_SABR_POT_ARGS: &str = "ytdlp_sabr_pot_args";
 /// Experimental: append `enable_live_deep_rewind=true` to the SABR extractor-args
 /// (rewinds past the normal DVR window; dev-build-only). Absent ⇒ off.
 const K_SABR_DEEP_REWIND: &str = "ytdlp_sabr_deep_rewind";
@@ -136,6 +137,7 @@ mod io_view;
 mod issues;
 mod player;
 mod posts;
+mod pot_log;
 mod properties;
 mod schedule;
 mod settings;
@@ -501,6 +503,12 @@ struct SettingsForm {
     sabr_codec_custom: String,
     /// DASH-companion format selector used by dual (SABR+DASH) capture.
     dash_format: String,
+    /// Managed bgutil GVS PO token server: auto-launch at startup, the built
+    /// server's directory (holds `main.js`), and the node binary to run it
+    /// with. Empty path fields fall back to the module defaults.
+    pot_server_autostart: bool,
+    pot_server_dir: String,
+    pot_server_node: String,
     /// Discord user token + whether to import stream schedules from Discord events
     /// (opt-in; automating a user token is against Discord's ToS).
     discord_token: String,
@@ -704,6 +712,11 @@ pub struct StreamArchiverApp {
     /// header badge), and the session-only category + text filters.
     show_notifications: bool,
     notifications: Vec<crate::store::NotificationRow>,
+    /// The GVS PO token server log window: whether it's open, plus the tail
+    /// text and its off-thread refresh state (reloaded ≤1/s while open).
+    show_pot_server_log: bool,
+    pot_log_text: String,
+    pot_log_refreshed: Option<std::time::Instant>,
     notif_refreshed: Option<std::time::Instant>,
     notif_unread: i64,
     notif_search: String,
@@ -1657,6 +1670,7 @@ impl eframe::App for StreamArchiverApp {
         self.confirm_delete_scheduled_recording_window(ui.ctx());
         self.issues_window(ui.ctx());
         self.notifications_window(ui.ctx());
+        self.pot_server_log_window(ui.ctx());
         self.posts_window(ui.ctx());
         self.format_designer_window(ui.ctx());
         self.confirm_quit_stop_window(ui.ctx());

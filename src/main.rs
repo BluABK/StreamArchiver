@@ -29,6 +29,7 @@ mod notifications;
 mod oauth;
 mod platform;
 mod platform_pref;
+mod pot_server;
 mod recovery;
 mod schedule_ocr;
 mod schedule_source;

@@ -1719,8 +1719,10 @@ together:
 3. **A GVS PO-token provider.** SABR refuses to serve media without a per-request PO
    token. The standard provider is
    [`bgutil-ytdlp-pot-provider`](https://github.com/Brainicism/bgutil-ytdlp-pot-provider):
-   run its token server (HTTP, default port **4416**) **and** install its yt-dlp
-   plugin *for the SABR binary*.
+   its token server (HTTP, default port **4416**) must be running **and** its yt-dlp
+   plugin installed *for the SABR binary*. The app launches and supervises the
+   server itself — see [Managed GVS PO token server](#managed-gvs-po-token-server)
+   below — so only the plugin install remains manual.
 
 #### Settings → "YouTube SABR (live-from-start)"
 
@@ -1753,8 +1755,12 @@ intermediate can't hold).
 bgutil has two parts — a **token server** and a **yt-dlp plugin** — and *both* must
 be reachable by the **SABR binary**:
 
-1. **Run the server** on `127.0.0.1:4416` (the Docker image, or the Node server from
-   the bgutil repo). The **PO token extractor-args** field already points here.
+1. **Have the server available.** Clone/build the bgutil repo's Node server once
+   (`server\build\main.js` after `npx tsc`); the app launches and supervises it
+   from then on ([Managed GVS PO token server](#managed-gvs-po-token-server)). The
+   **PO token extractor-args** field already points at its default
+   `127.0.0.1:4416`. (Running it yourself — e.g. the Docker image — still works;
+   the app detects an already-listening server and leaves it alone.)
 2. **Install the plugin for the SABR binary.** This is the easy step to get wrong:
 
 > ⚠ **A standalone/frozen `yt-dlp.exe` does NOT load plugins from Python
@@ -1788,6 +1794,50 @@ Once that lists formats, StreamArchiver will capture too.
 > A separate error — `n challenge solving failed … No video formats found` — is the
 > **n-sig (EJS) challenge solver**, not PO tokens: ensure a JS runtime + the
 > `yt_dlp_ejs` distribution are present (see yt-dlp's EJS wiki).
+
+#### Managed GVS PO token server
+
+A SABR capture whose token server is down doesn't fail politely — it downloads
+for a while, then dies mid-stream with `PoTokenError: This stream requires a
+GVS PO Token to continue` (`sps:ATTESTATION_REQUIRED`), and every retry against
+the dead server fails identically, burning a fresh take per backoff cycle. So
+the app manages the server itself instead of assuming it's running:
+
+- **Auto-launch at startup**: if nothing answers `GET /ping` on the configured
+  port, the app runs `node main.js -p <port>` from the server directory
+  (windowless). If a server is already listening — Docker, a manual shell,
+  whatever — it's detected as **external** and used as-is: never restarted,
+  never killed.
+- **Health watchdog**: pings every 30 s. A managed server that crashes is
+  restarted (exponential backoff 30 s → 5 min if it keeps dying), with **one**
+  🔔 notification per down-episode and the exit status + last log lines in the
+  app log.
+- **On-demand recovery**: when a capture dies with a PO-token error, the app
+  brings the server up *first* and then lets the in-flight SABR retry resume
+  the **same take** from its `.state` files — no orphaned fragments, no burned
+  take. Failures that aren't same-take-resumable still kick the watchdog so the
+  server is healthy before the monitor's ≥30 s backoff expires and the next
+  take succeeds. This on-demand start happens even with auto-launch off (the
+  capture proved the server is needed); an explicit **Stop** is always
+  respected.
+- **Port** comes from parsing `base_url=` out of the **PO token
+  extractor-args** setting, so the managed server and yt-dlp can't disagree.
+
+**Settings → Downloads → "GVS PO token server 🎫"** holds the config (
+**Auto-launch at startup**, **Server directory** — the folder containing
+`main.js`, **Node binary** — empty = `node` on `PATH`), a live status line
+(`running (managed) · pid … · v… · up …` / `external` / `starting` / `down` /
+`failed: …`), **▶ Start** / **⏹ Stop** buttons (Stop only applies to a managed
+server and holds for the session), **📜 View log** (a live-tailing window), and
+**📂 Open log file**. The **Background** view shows the same status one-liner
+with a log shortcut.
+
+The server's combined stdout+stderr goes to
+`%APPDATA%\StreamArchiver\data\logs\pot_server.log`, truncated at the first
+launch of each app run (restarts within a run append, so crash evidence
+survives). Quit behavior matches downloads: a normal quit **leaves the managed
+server running** (detached SABR captures still need tokens; the next app run
+re-adopts it by pid), while **Quit & stop recordings** kills it too.
 
 #### Dual capture (SABR + DASH)
 
@@ -1873,7 +1923,9 @@ Both SABR paths are **mpv-only**; other players get the DASH companion's `.ts`
   recordings disk; same 7-day retention (previously these were deleted at
   finalize, so surviving a week is a debugging upgrade). The I/O monitor's 1 s
   sample log (see *I/O monitor*) lands in `logs\iomon\session-*.jsonl`, 14-day
-  retention.
+  retention. The managed PO token server writes `logs\pot_server.log`
+  (truncated per app run, appended across in-run restarts — see *Managed GVS
+  PO token server*).
 - Asset cache: `%APPDATA%\StreamArchiver\data\asset-cache\` (see *Channel assets &
   change history*):
   - `channel_assets\{name}\{platform}\{account}\` — per channel + platform +

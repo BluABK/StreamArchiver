@@ -143,6 +143,11 @@ impl StreamArchiverApp {
                     v
                 }
             },
+            // Absent ⇒ on: the managed server should just work out of the box.
+            pot_server_autostart: setting_or_empty(&core, crate::pot_server::K_POT_SERVER_AUTOSTART)
+                != "0",
+            pot_server_dir: setting_or_empty(&core, crate::pot_server::K_POT_SERVER_DIR),
+            pot_server_node: setting_or_empty(&core, crate::pot_server::K_POT_SERVER_NODE),
             discord_token: setting_or_empty(&core, K_DISCORD_TOKEN),
             discord_schedule: setting_or_empty(&core, K_DISCORD_SCHEDULE) == "1",
             ocr_command: setting_or_empty(&core, K_OCR_COMMAND),
@@ -370,6 +375,9 @@ impl StreamArchiverApp {
             issues_error_view: None,
             show_notifications: false,
             notifications: Vec::new(),
+            show_pot_server_log: false,
+            pot_log_text: String::new(),
+            pot_log_refreshed: None,
             notif_refreshed: None,
             notif_unread: 0,
             notif_search: String::new(),
@@ -1415,6 +1423,12 @@ impl StreamArchiverApp {
             (K_SABR_CODEC_PREF, s.sabr_codec_pref.id()),
             (K_SABR_CODEC_CUSTOM, s.sabr_codec_custom.trim()),
             (K_DASH_FORMAT, s.dash_format.trim()),
+            (
+                crate::pot_server::K_POT_SERVER_AUTOSTART,
+                if s.pot_server_autostart { "1" } else { "0" },
+            ),
+            (crate::pot_server::K_POT_SERVER_DIR, s.pot_server_dir.trim()),
+            (crate::pot_server::K_POT_SERVER_NODE, s.pot_server_node.trim()),
             (K_DISCORD_TOKEN, s.discord_token.trim()),
             // Only persist the import as on when a token actually backs it, so the
             // consent flag can't be left latched with no token.
@@ -1538,6 +1552,9 @@ impl StreamArchiverApp {
         crate::io_gate::set_disk_limits(disk_cfg);
         crate::downloader::set_cache_root(&self.settings.capture_cache_root);
         crate::io_gate::set_ytdlp_ppa(&self.settings.ytdlp_ppa);
+        // PO token server: re-read path/autostart/base-url and wake the
+        // watchdog so a corrected config takes effect without a restart.
+        crate::pot_server::apply_settings(&self.core.store);
         // I/O monitor: apply the sample-log toggle and re-register the
         // recordings roots (the default output dir may have changed).
         crate::iomon::set_sample_logging(self.settings.iomon_sample_log);

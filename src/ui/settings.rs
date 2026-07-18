@@ -498,6 +498,7 @@ impl StreamArchiverApp {
             self.settings_download_auth_section(ui);
             self.settings_ytdlp_args_section(ui);
             self.settings_sabr_section(ui);
+            self.settings_pot_server_section(ui);
             self.settings_custom_tools_section(ui);
             self.settings_monitor_defaults_section(ui);
             self.settings_startup_section(ui);
@@ -1503,6 +1504,206 @@ impl StreamArchiverApp {
                     .on_hover_text(
                         "Format selector for the DASH companion process when a monitor has \
                          Dual capture (SABR + DASH) enabled. Uses the system yt-dlp.",
+                    );
+                    ui.end_row();
+                });
+
+            }
+    }
+
+    fn settings_pot_server_section(&mut self, ui: &mut egui::Ui) {
+            if self.section_shown(SettingsTab::Downloads, "GVS PO token server", &["pot", "po token", "gvs", "bgutil", "server", "node", "token"]) {
+            ui.add_space(12.0);
+            ui.heading("GVS PO token server 🎫");
+            ui.label(
+                "YouTube SABR captures die mid-stream without a GVS PO token, and the \
+                 tokens come from the bgutil provider's local HTTP server. This manages \
+                 that server so it's never silently missing: launched at startup, \
+                 health-checked every 30s, restarted if it crashes, and started on \
+                 demand when a capture fails for lack of a token. A server started \
+                 outside the app is detected and used as-is (never killed).",
+            );
+            ui.add_space(4.0);
+            // Live status + controls. Keep the section ticking while visible so
+            // the status line tracks the watchdog without user interaction.
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+            let st = crate::pot_server::status();
+            let ping_suffix = |p: &Option<crate::pot_server::PingInfo>| {
+                p.as_ref()
+                    .map(|p| {
+                        let s = p.uptime_secs as u64;
+                        format!(" · v{} · up {}:{:02}:{:02}", p.version, s / 3600, (s % 3600) / 60, s % 60)
+                    })
+                    .unwrap_or_default()
+            };
+            use crate::pot_server::PotMode;
+            let (text, color, hover) = match &st.mode {
+                PotMode::Managed { pid } => (
+                    format!("● running (managed) · pid {pid}{}", ping_suffix(&st.last_ping)),
+                    egui::Color32::from_rgb(0x39, 0xb0, 0x54),
+                    "The app spawned this server and supervises it: if it crashes, the \
+                     watchdog restarts it and posts a 🔔 notification. Uptime/version come \
+                     from the server's own /ping endpoint."
+                        .to_string(),
+                ),
+                PotMode::External => (
+                    format!("● running (external){}", ping_suffix(&st.last_ping)),
+                    egui::Color32::from_rgb(0x39, 0xb0, 0x54),
+                    "A server someone else started is answering on the configured port. \
+                     The app uses it but won't restart or stop it — Stop is disabled \
+                     because killing a process the app didn't spawn isn't safe."
+                        .to_string(),
+                ),
+                PotMode::Starting => (
+                    "◐ starting…".to_string(),
+                    egui::Color32::from_rgb(0xd9, 0xa4, 0x06),
+                    "Spawn issued; waiting up to 15s for the server's /ping to answer."
+                        .to_string(),
+                ),
+                PotMode::Down if st.desired == crate::pot_server::Desired::ForcedOff => (
+                    "○ stopped (by you)".to_string(),
+                    egui::Color32::GRAY,
+                    "You clicked Stop, so the watchdog won't restart it this session — \
+                     click Start to bring it back (or restart the app)."
+                        .to_string(),
+                ),
+                PotMode::Down => (
+                    "○ down".to_string(),
+                    egui::Color32::from_rgb(0xd9, 0x53, 0x4f),
+                    "Not currently reachable; the watchdog will start it on its next check \
+                     (within ~30s, sooner if a capture needs it)."
+                        .to_string(),
+                ),
+                PotMode::Disabled => (
+                    "○ not managed".to_string(),
+                    egui::Color32::GRAY,
+                    "Auto-launch is off and no server is being managed. SABR captures will \
+                     still try the configured base URL — if nothing listens there, they \
+                     fail with PO-token errors (a capture failure will still start the \
+                     server on demand unless you stopped it explicitly)."
+                        .to_string(),
+                ),
+                PotMode::Failed { reason } => (
+                    format!("✗ failed: {reason}"),
+                    egui::Color32::from_rgb(0xd9, 0x53, 0x4f),
+                    "The last launch attempt failed (details in the server log and the \
+                     app log). The watchdog retries with growing backoff; fix the \
+                     directory/node settings below if they're wrong."
+                        .to_string(),
+                ),
+            };
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(text).color(color)).on_hover_text(hover);
+                ui.weak(format!("({})", st.base_url)).on_hover_text(
+                    "The base URL the server is pinged/launched on — parsed from the \
+                     'PO token extractor-args' setting above so the managed server and \
+                     yt-dlp always agree on the port.",
+                );
+            });
+            ui.horizontal(|ui| {
+                let can_start = matches!(
+                    st.mode,
+                    PotMode::Down | PotMode::Disabled | PotMode::Failed { .. }
+                );
+                let can_stop = matches!(st.mode, PotMode::Managed { .. } | PotMode::Starting);
+                if ui
+                    .add_enabled(can_start, egui::Button::new("▶ Start"))
+                    .on_hover_text(
+                        "Start the server now and keep it running for this session, even \
+                         with Auto-launch off. Takes effect within a second or two.",
+                    )
+                    .clicked()
+                {
+                    crate::pot_server::request_start();
+                }
+                if ui
+                    .add_enabled(can_stop, egui::Button::new("⏹ Stop"))
+                    .on_hover_text(
+                        "Stop the managed server and keep it stopped for this session \
+                         (the watchdog won't restart it until Start is clicked or the \
+                         app restarts). Disabled for an external server — the app never \
+                         kills a process it didn't spawn.",
+                    )
+                    .clicked()
+                {
+                    crate::pot_server::request_stop();
+                }
+                if ui
+                    .button("📜 View log")
+                    .on_hover_text(
+                        "Open a live tail of the server's combined stdout+stderr — \
+                         startup lines, token generations, and crash reasons land here.",
+                    )
+                    .clicked()
+                {
+                    self.show_pot_server_log = true;
+                }
+                if ui
+                    .button("📂 Open log file")
+                    .on_hover_text(format!(
+                        "Open {} in the default viewer. Truncated at the first launch \
+                         of each app run; restarts within a run append.",
+                        crate::pot_server::log_path().display()
+                    ))
+                    .clicked()
+                {
+                    crate::platform::open_path(&crate::pot_server::log_path());
+                }
+            });
+            ui.add_space(4.0);
+            egui::Grid::new("pot_server_grid")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("Auto-launch at startup");
+                    ui.checkbox(&mut self.settings.pot_server_autostart, "").on_hover_text(
+                        "Launch the server when the app starts (skipped if one is already \
+                         answering on the port) and restart it whenever it goes down. \
+                         Off = only manual Start / on-demand starts triggered by a \
+                         capture failing for lack of a token.",
+                    );
+                    ui.end_row();
+
+                    ui.label("Server directory");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings.pot_server_dir)
+                                .hint_text(crate::pot_server::DEFAULT_SERVER_DIR)
+                                .desired_width(360.0),
+                        );
+                        if ui.button("Browse…").clicked() {
+                            self.pending_browse = Some(spawn_browse_folder(
+                                &self.settings.pot_server_dir,
+                                |app, p| app.settings.pot_server_dir = p,
+                            ));
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "The bgutil-ytdlp-pot-provider server's BUILD directory (the one \
+                         containing main.js — usually server\\build in the clone, after \
+                         `npx tsc`). Empty = the default path shown.",
+                    );
+                    ui.end_row();
+
+                    ui.label("Node binary");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings.pot_server_node)
+                                .hint_text("(empty = node on PATH)")
+                                .desired_width(360.0),
+                        );
+                        if ui.button("Browse…").clicked() {
+                            self.pending_browse = Some(spawn_browse_file(
+                                &self.settings.pot_server_node,
+                                |app, p| app.settings.pot_server_node = p,
+                            ));
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Node.js runs the server (needs Node ≥ 20). Leave empty to use \
+                         `node` from PATH, or point at a specific node.exe.",
                     );
                     ui.end_row();
                 });

@@ -222,7 +222,7 @@ pub(super) async fn line_aligned_tail_offset(path: &Path) -> u64 {
 /// from the end of the file (an hours-long yt-dlp progress log can reach tens
 /// of MB, and this runs at finalize — the worst moment for an extra full-file
 /// read on the recordings drive).
-pub(super) async fn read_log_tail(path: &Path, max_lines: usize) -> String {
+pub(crate) async fn read_log_tail(path: &Path, max_lines: usize) -> String {
     use crate::iomon::Cat;
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     // 80 lines of tool output fit comfortably in 64 KiB.

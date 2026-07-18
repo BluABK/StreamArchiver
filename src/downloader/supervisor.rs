@@ -2465,6 +2465,16 @@ progress_info: None,
                     Platform::YouTube.tag(),
                     log_death_reason(&outcome.log),
                 );
+                // If it died for lack of a GVS PO token, the provider server is
+                // down — retrying against it dead fails identically (observed
+                // 2026-07-18: girl_dm_ burned all 3 retries per take for 20+
+                // minutes). Bring the managed server up first so this retry
+                // resumes the same take against a live one.
+                if pot_token_failure(&outcome.log)
+                    && !crate::pot_server::ensure_up(std::time::Duration::from_secs(30)).await
+                {
+                    warn!(monitor_id, "PO token server still unreachable; retrying anyway");
+                }
                 crate::app_core::sleep_cancellable(SABR_RETRY_DELAY, &self.shutdown).await;
                 outcome = self
                     .run_process(
@@ -2489,6 +2499,15 @@ progress_info: None,
             }
             outcome
         };
+
+        // The take is over (retries exhausted, or the failure wasn't same-take
+        // resumable — e.g. a PO-token death at t=0 before any `.state` existed).
+        // If it died for lack of a PO token, kick the server watchdog now so the
+        // provider is healthy again before this monitor's ≥30s backoff expires
+        // and the NEXT take succeeds instead of repeating the crash.
+        if pot_token_failure(&outcome.log) {
+            crate::pot_server::nudge();
+        }
 
         self.stop_record_watchers(watcher_done, watcher, meta_done, meta_task, chat_done, chat_task)
             .await;

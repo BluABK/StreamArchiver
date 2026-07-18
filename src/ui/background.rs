@@ -72,6 +72,64 @@ impl StreamArchiverApp {
 
             ui.add_space(12.0);
 
+            // ── GVS PO token server (managed helper process) ─────────────
+            {
+                use crate::pot_server::PotMode;
+                let st = crate::pot_server::status();
+                ui.horizontal(|ui| {
+                    let (txt, color) = match &st.mode {
+                        PotMode::Managed { pid } => (
+                            format!(
+                                "running (managed) · pid {pid}{}",
+                                st.last_ping
+                                    .as_ref()
+                                    .map(|p| {
+                                        let s = p.uptime_secs as u64;
+                                        format!(" · up {}:{:02}:{:02} · v{}", s / 3600, (s % 3600) / 60, s % 60, p.version)
+                                    })
+                                    .unwrap_or_default()
+                            ),
+                            egui::Color32::from_rgb(0x39, 0xb0, 0x54),
+                        ),
+                        PotMode::External => (
+                            "running (external)".to_string(),
+                            egui::Color32::from_rgb(0x39, 0xb0, 0x54),
+                        ),
+                        PotMode::Starting => ("starting…".to_string(), egui::Color32::from_rgb(0xd9, 0xa4, 0x06)),
+                        PotMode::Down if st.desired == crate::pot_server::Desired::ForcedOff => {
+                            ("stopped by user".to_string(), egui::Color32::GRAY)
+                        }
+                        PotMode::Down => ("down — restarting".to_string(), egui::Color32::from_rgb(0xd9, 0x53, 0x4f)),
+                        PotMode::Disabled => ("not managed".to_string(), egui::Color32::GRAY),
+                        PotMode::Failed { reason } => (
+                            format!("failed: {reason}"),
+                            egui::Color32::from_rgb(0xd9, 0x53, 0x4f),
+                        ),
+                    };
+                    ui.strong("🎫 PO token server:").on_hover_text(
+                        "The bgutil GVS PO token provider server, managed by the app — \
+                         YouTube SABR captures fail without it. Auto-launched at startup, \
+                         health-checked every 30s, restarted on crash, started on demand \
+                         when a capture dies for lack of a token. Configure under \
+                         Settings → Downloads → GVS PO token server.",
+                    );
+                    ui.label(egui::RichText::new(txt).color(color)).on_hover_text(format!(
+                        "Health-checked via GET {}/ping. \"External\" = a server the app \
+                         didn't spawn is answering there (used as-is, never killed).",
+                        st.base_url
+                    ));
+                    if ui
+                        .small_button("📜 Log")
+                        .on_hover_text("Open a live tail of the server's log window.")
+                        .clicked()
+                    {
+                        self.show_pot_server_log = true;
+                    }
+                });
+            }
+
+            ui.add_space(12.0);
+
             // ── Planned (queued head backfills) ─────────────────────────
             // One-off, per-take work items awaiting `head_backfill_job`'s
             // fixed settle wait — distinct from the recurring jobs above.

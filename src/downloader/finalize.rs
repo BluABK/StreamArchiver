@@ -1156,6 +1156,19 @@ pub(super) fn sabr_resumable_failure(
         && !sabr_dvr_window_exceeded(log)
 }
 
+/// True when a capture died because yt-dlp couldn't get a GVS PO token — i.e.
+/// the bgutil provider server was down/unreachable, not anything wrong with
+/// the stream or the take. Matches the phrase shared by every shape the
+/// failure takes in a real log (`ERROR:`, `yt_dlp...PoTokenError:`,
+/// `DownloadError:`, and the `[sabr:stream] Got error: … Retrying (n/5)`
+/// warnings that precede them), as observed in the 2026-07-18 girl_dm_
+/// crash-loop. On a match the caller brings the managed server back up
+/// ([`crate::pot_server`]) before retrying, because retrying against a dead
+/// server fails identically every time.
+pub(super) fn pot_token_failure(log: &str) -> bool {
+    log.contains("requires a GVS PO Token") || log.contains("PoTokenError")
+}
+
 /// A one-line "why did the tool die" summary from a captured log tail, for
 /// retry/failure log messages: the last line that looks like an error (yt-dlp
 /// `ERROR:`, Python exceptions like `PermissionError:`, node `error:`), else
@@ -1483,6 +1496,26 @@ mod tests {
             !sabr_resumable_failure(true, true, true, "StreamStallError: not near live head"),
             "DVR window exceeded has its own recovery (fall back to live edge), not a same-take retry"
         );
+    }
+    #[test]
+    fn pot_token_failure_matches_real_shapes() {
+        // Every shape the 2026-07-18 girl_dm_ crash-loop actually logged.
+        for line in [
+            "ERROR: This stream requires a GVS PO Token to continue",
+            "yt_dlp.extractor.youtube._streaming.sabr.exceptions.PoTokenError: \
+             This stream requires a GVS PO Token to continue",
+            "yt_dlp.utils.DownloadError: This stream requires a GVS PO Token to continue",
+            "WARNING: [sabr:stream] Got error: This stream requires a GVS PO Token \
+             to continue. Retrying (5/5)...",
+        ] {
+            assert!(pot_token_failure(line), "{line:?} not classified");
+        }
+        // Other failures must not trigger a server restart.
+        assert!(!pot_token_failure(
+            "PermissionError: [WinError 5] Access is denied: 'tmp' -> '.state'"
+        ));
+        assert!(!pot_token_failure("Only images are available for download."));
+        assert!(!pot_token_failure(""));
     }
     #[test]
     fn log_death_reason_picks_error_over_trailing_progress() {
