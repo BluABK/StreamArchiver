@@ -1156,6 +1156,35 @@ pub(super) fn sabr_resumable_failure(
         && !sabr_dvr_window_exceeded(log)
 }
 
+/// A one-line "why did the tool die" summary from a captured log tail, for
+/// retry/failure log messages: the last line that looks like an error (yt-dlp
+/// `ERROR:`, Python exceptions like `PermissionError:`, node `error:`), else
+/// the last non-empty line. Needed because the tool's own log FILE is
+/// truncated by the next attempt (`process.rs` creates it fresh per spawn),
+/// so the main log's retry line is the only place the cause survives. Splits
+/// on `\r` too — yt-dlp progress rewrites make lines carriage-return
+/// separated. Capped so a pathological line can't flood the log.
+pub(super) fn log_death_reason(log: &str) -> String {
+    let lines: Vec<&str> =
+        log.split(['\n', '\r']).map(str::trim).filter(|l| !l.is_empty()).collect();
+    let reason = lines
+        .iter()
+        .rev()
+        .find(|l| {
+            ["ERROR", "Error", "error:", "Exception", "Traceback"]
+                .iter()
+                .any(|m| l.contains(m))
+        })
+        .or_else(|| lines.last())
+        .copied()
+        .unwrap_or("(no tool output captured)");
+    let mut reason = reason.to_string();
+    if reason.chars().count() > 300 {
+        reason = reason.chars().take(300).collect::<String>() + "…";
+    }
+    reason
+}
+
 impl Supervisor {
     /// Disk-aware startup repair for takes whose DB row claims a final output
     /// file (crash orphans, plus rows a pre-2026-07-11 blind promotion already
@@ -1454,6 +1483,22 @@ mod tests {
             !sabr_resumable_failure(true, true, true, "StreamStallError: not near live head"),
             "DVR window exceeded has its own recovery (fall back to live edge), not a same-take retry"
         );
+    }
+    #[test]
+    fn log_death_reason_picks_error_over_trailing_progress() {
+        // yt-dlp interleaves \r progress rewrites; the Python exception is the
+        // interesting line even when progress noise follows it.
+        let log = "[download] 1.2MiB\rPermissionError: [WinError 5] Access is denied: 'tmp' -> '.state'\r[download] 1.3MiB\r[download] 1.4MiB";
+        assert_eq!(
+            log_death_reason(log),
+            "PermissionError: [WinError 5] Access is denied: 'tmp' -> '.state'"
+        );
+        // No error marker anywhere -> last non-empty line, better than nothing.
+        assert_eq!(log_death_reason("line one\nline two\n\n"), "line two");
+        assert_eq!(log_death_reason(""), "(no tool output captured)");
+        // A pathological line is capped, not dumped whole.
+        let huge = format!("ERROR: {}", "x".repeat(1000));
+        assert!(log_death_reason(&huge).chars().count() <= 301);
     }
     #[test]
     fn plausible_media_output_rejects_working_files() {

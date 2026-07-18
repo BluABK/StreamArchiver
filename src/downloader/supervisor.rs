@@ -2455,11 +2455,15 @@ progress_info: None,
                 && !self.shutdown.load(Ordering::SeqCst)
             {
                 retries += 1;
+                // Quote the dying attempt's error here: the tool's own log
+                // file is truncated by the retry we're about to spawn, so this
+                // line is the only durable record of what killed it.
                 warn!(
                     monitor_id,
                     retries,
-                    "SABR capture died with resumable state left behind; retrying same take {}",
-                    Platform::YouTube.tag()
+                    "SABR capture died with resumable state left behind; retrying same take {} — cause: {}",
+                    Platform::YouTube.tag(),
+                    log_death_reason(&outcome.log),
                 );
                 crate::app_core::sleep_cancellable(SABR_RETRY_DELAY, &self.shutdown).await;
                 outcome = self
