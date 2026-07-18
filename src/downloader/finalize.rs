@@ -1198,6 +1198,28 @@ pub(super) fn log_death_reason(log: &str) -> String {
     reason
 }
 
+/// The genuinely diagnostic lines (errors, exceptions, tool warnings) from a
+/// tool-log tail, newline-joined — empty when the tail is only routine
+/// progress/status noise. For "surface any tool diagnostics" logging at
+/// teardown: a cleanly finished tool's tail is `\r`-rewritten progress
+/// (`[download] 100% of 4.75MiB …`), and dumping that raw put noise in the
+/// app log at WARN on every normal chat-download end. Splits on `\r` like
+/// [`log_death_reason`], dedups consecutive repeats (yt-dlp retry warnings),
+/// keeps the LAST `max_lines` (the terminal error outranks earlier retries).
+pub(super) fn diagnostic_log_lines(log: &str, max_lines: usize) -> String {
+    const MARKERS: [&str; 6] = ["ERROR", "Error", "error:", "Exception", "Traceback", "WARNING"];
+    let mut lines: Vec<&str> = log
+        .split(['\n', '\r'])
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && MARKERS.iter().any(|m| l.contains(m)))
+        .collect();
+    lines.dedup();
+    if lines.len() > max_lines {
+        lines.drain(..lines.len() - max_lines);
+    }
+    lines.join("\n")
+}
+
 impl Supervisor {
     /// Disk-aware startup repair for takes whose DB row claims a final output
     /// file (crash orphans, plus rows a pre-2026-07-11 blind promotion already
@@ -1516,6 +1538,27 @@ mod tests {
         ));
         assert!(!pot_token_failure("Only images are available for download."));
         assert!(!pot_token_failure(""));
+    }
+    #[test]
+    fn diagnostic_log_lines_drops_progress_noise() {
+        // The exact leak: a cleanly-finished chat download's tail is progress
+        // rewrites only — nothing diagnostic, so nothing should be logged.
+        assert_eq!(
+            diagnostic_log_lines("[download]  99% of 4.75MiB\r[download] 100% of 4.75MiB in 04:14:48 at 326.08B/s\n", 8),
+            ""
+        );
+        assert_eq!(diagnostic_log_lines("", 8), "");
+        // Real diagnostics survive, progress interleaved via \r is dropped,
+        // consecutive duplicate warnings collapse.
+        let log = "[download] 12%\rWARNING: [youtube] Retrying (1/3)...\rWARNING: [youtube] Retrying (1/3)...\r[download] 13%\nERROR: fragment not found";
+        assert_eq!(
+            diagnostic_log_lines(log, 8),
+            "WARNING: [youtube] Retrying (1/3)...\nERROR: fragment not found"
+        );
+        // Cap keeps the LAST lines — the terminal error, not the first retry.
+        let many = (1..=9).map(|i| format!("ERROR: e{i}")).collect::<Vec<_>>().join("\n");
+        let capped = diagnostic_log_lines(&many, 3);
+        assert_eq!(capped, "ERROR: e7\nERROR: e8\nERROR: e9");
     }
     #[test]
     fn log_death_reason_picks_error_over_trailing_progress() {

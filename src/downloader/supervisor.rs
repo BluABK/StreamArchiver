@@ -1840,10 +1840,15 @@ progress_info: None,
         let _ = self.store.clear_detached(DetachedKind::Chat, monitor_id);
         let stopped = self.stopping_chats.lock().unwrap().remove(&monitor_id);
         self.active_chats.lock().unwrap().remove(&monitor_id);
-        // Surface any yt-dlp diagnostics (auth failure, format unavailable, …).
+        // Surface any yt-dlp diagnostics (auth failure, format unavailable, …)
+        // — but only genuinely diagnostic lines. A clean stream-end's tail is
+        // just `\r` progress rewrites, and dumping it raw leaked noise like
+        // "[download] 100% of 4.75MiB …" into the app log at WARN on every
+        // normal chat end.
         let tail = read_log_tail(&log_path, 12).await;
-        if !tail.trim().is_empty() {
-            warn!(monitor_id, "chat yt-dlp log tail {tag}:\n{tail}");
+        let diag = diagnostic_log_lines(&tail, 8);
+        if !diag.is_empty() {
+            warn!(monitor_id, "chat yt-dlp diagnostics {tag}:\n{diag}");
         }
         if stopped {
             info!(monitor_id, "chat download stopped by user {tag}");
