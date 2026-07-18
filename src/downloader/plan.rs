@@ -85,16 +85,23 @@ pub(super) fn yt_audio_format_selector(audio: &str) -> Option<(String, bool)> {
     if audio.is_empty() {
         return None;
     }
+    // Every selector gets a `/b` fallback: the split-stream form (`bv*+ba…`)
+    // only matches sites that expose separate audio-only formats (YouTube,
+    // Twitch VODs). Sites with only muxed formats (NRK video) have no `ba.*`,
+    // and audio-only sites (NRK radio/podcasts) have no `bv*` — without the
+    // fallback yt-dlp dies with "Requested format is not available" instead
+    // of just taking the best it can get (verified against real NRK URLs:
+    // `bv*+ba.*/b` picks the best muxed rendition / the best audio).
     if audio.eq_ignore_ascii_case("all") || audio == "*" {
         // Every audio-only format (every language) as separate muxed streams.
-        return Some(("bv*+ba.*".to_string(), true));
+        return Some(("bv*+ba.*/b".to_string(), true));
     }
     let codes: Vec<&str> = audio.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
     if codes.is_empty() {
         return None;
     }
     let parts: Vec<String> = codes.iter().map(|c| format!("ba[language^={c}]")).collect();
-    Some((format!("bv*+{}", parts.join("+")), codes.len() > 1))
+    Some((format!("bv*+{}/b", parts.join("+")), codes.len() > 1))
 }
 
 /// Returns the URL yt-dlp should receive for a live YouTube recording.
@@ -1369,23 +1376,25 @@ mod tests {
     fn yt_audio_format_selector_builds_expected_selectors() {
         assert_eq!(yt_audio_format_selector(""), None);
         assert_eq!(yt_audio_format_selector("   "), None);
+        // The `/b` fallback keeps sites without split audio/video streams
+        // working (NRK video = muxed-only, NRK radio = audio-only).
         assert_eq!(
             yt_audio_format_selector("all"),
-            Some(("bv*+ba.*".to_string(), true))
+            Some(("bv*+ba.*/b".to_string(), true))
         );
         assert_eq!(
             yt_audio_format_selector("*"),
-            Some(("bv*+ba.*".to_string(), true))
+            Some(("bv*+ba.*/b".to_string(), true))
         );
         // A single language: no --audio-multistreams needed.
         assert_eq!(
             yt_audio_format_selector("en"),
-            Some(("bv*+ba[language^=en]".to_string(), false))
+            Some(("bv*+ba[language^=en]/b".to_string(), false))
         );
         // Multiple languages: muxed together, needs --audio-multistreams.
         assert_eq!(
             yt_audio_format_selector("en, de"),
-            Some(("bv*+ba[language^=en]+ba[language^=de]".to_string(), true))
+            Some(("bv*+ba[language^=en]+ba[language^=de]/b".to_string(), true))
         );
     }
 
@@ -1396,14 +1405,14 @@ mod tests {
         v.audio_tracks = "en".into();
         let plan = build_video_plan(&v, 1_700_000_000, "", "", "", &AuthSource::None, &[], None, &YtDlpBins::default());
         assert!(plan.args.iter().any(|a| a == "-f"));
-        assert!(plan.args.iter().any(|a| a == "bv*+ba[language^=en]"));
+        assert!(plan.args.iter().any(|a| a == "bv*+ba[language^=en]/b"));
         assert!(!plan.args.iter().any(|a| a == "--audio-multistreams"));
 
         // Multiple languages need --audio-multistreams to keep them all.
         let mut v2 = video(Tool::YtDlp, "https://youtube.com/watch?v=abc");
         v2.audio_tracks = "en,de".into();
         let plan2 = build_video_plan(&v2, 1_700_000_000, "", "", "", &AuthSource::None, &[], None, &YtDlpBins::default());
-        assert!(plan2.args.iter().any(|a| a == "bv*+ba[language^=en]+ba[language^=de]"));
+        assert!(plan2.args.iter().any(|a| a == "bv*+ba[language^=en]+ba[language^=de]/b"));
         assert!(plan2.args.iter().any(|a| a == "--audio-multistreams"));
 
         // A custom `quality` format string always wins over audio_tracks — two

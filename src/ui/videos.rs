@@ -1002,7 +1002,10 @@ impl StreamArchiverApp {
                          muxed tracks (YouTube VODs can carry a dub/descriptive-audio track \
                          alongside the original) — a plain code like 'en' matches 'en-US'/'en-GB' \
                          too. Empty = the tool's default (one track); 'all' (or '*') = every \
-                         track; or a comma-separated list of language codes. Ignored for yt-dlp \
+                         track; or a comma-separated list of language codes. On sites without \
+                         separate audio streams (muxed-only video like NRK, or audio-only \
+                         pages like podcasts) the selection gracefully falls back to the best \
+                         available format instead of failing. Ignored for yt-dlp \
                          when Quality is set to a custom format string (that always wins); \
                          ffmpeg keeps the chosen format's tracks either way.",
                     );

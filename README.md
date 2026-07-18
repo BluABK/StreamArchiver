@@ -1143,7 +1143,11 @@ tracks you keep.
   `bv*+ba[language^=en]+ba[language^=de] --audio-multistreams`), so a YouTube
   video's dub tracks or descriptive audio come along instead of whatever single
   track yt-dlp would've defaulted to. Language codes match by *prefix*, so
-  plain `en` also matches `en-US`/`en-GB`. Ignored when **Quality** is set to a
+  plain `en` also matches `en-US`/`en-GB`. The synthesized selector always ends
+  in a `/b` fallback, so sites without separate audio streams still download:
+  muxed-only video (NRK) takes its best combined rendition and audio-only pages
+  (NRK radio/podcasts) take their best audio, instead of dying with
+  `Requested format is not available`. Ignored when **Quality** is set to a
   custom yt-dlp format string — that always wins outright rather than trying to
   merge two `-f` selectors. Streamlink/ffmpeg behave the same as above.
 - **Subtitle tracks** — yt-dlp still fetches them the same way, but they're
