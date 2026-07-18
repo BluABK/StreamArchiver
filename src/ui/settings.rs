@@ -373,7 +373,11 @@ fn dynamic_live_cell(ui: &mut egui::Ui, letter: &str, local_ceiling: u32, cdn_ce
                     ));
                 // Ceiling + busy count as visible text, not hover-only —
                 // this cell is the live readout, and it should read like one.
-                ui.weak(format!("/{} · {} busy", s.ceiling, s.in_use));
+                ui.weak(format!("/{} · {} busy", s.ceiling, s.in_use)).on_hover_text(format!(
+                    "Ceiling {} (the configured max the adjuster grows toward) — {} of the \
+                     {} live permits are running a pass right now.",
+                    s.ceiling, s.in_use, s.current
+                ));
                 if resp.changed() {
                     new_pin_local = Some(v);
                 }
@@ -393,7 +397,11 @@ fn dynamic_live_cell(ui: &mut egui::Ui, letter: &str, local_ceiling: u32, cdn_ce
                          overrides the adjuster until cleared.",
                         s.in_use, s.current, s.ceiling
                     ));
-                ui.weak(format!("/{} · {} busy", s.ceiling, s.in_use));
+                ui.weak(format!("/{} · {} busy", s.ceiling, s.in_use)).on_hover_text(format!(
+                    "Ceiling {} (the configured max the adjuster grows toward) — {} of the \
+                     {} live permits are running a mux right now.",
+                    s.ceiling, s.in_use, s.current
+                ));
                 if resp.changed() {
                     new_pin_cdn = Some(v);
                 }
@@ -2293,7 +2301,11 @@ impl StreamArchiverApp {
                             }
                             any = true;
                             ui.horizontal(|ui| {
-                                ui.weak(format!("{letter}:"));
+                                ui.weak(format!("{letter}:")).on_hover_text(format!(
+                                    "Drive {letter}: has done bulk I/O this session and has no \
+                                     override row, so the Default limits (and this Dynamic \
+                                     setting) govern it. Live values shown to the right."
+                                ));
                                 dynamic_live_cell(
                                     ui,
                                     &letter,
