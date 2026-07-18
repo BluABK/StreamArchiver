@@ -90,7 +90,7 @@ fn next_build_patch() -> u64 {
 fn decode_platform_icons() {
     const SIZE: u32 = 32;
     let out = PathBuf::from(env_or("OUT_DIR", "."));
-    for name in ["twitch", "youtube", "kick"] {
+    for name in ["twitch", "youtube", "kick", "nrk", "nebula"] {
         let src = format!("assets/platform/{name}.png");
         println!("cargo:rerun-if-changed={src}");
         let img = image::open(&src)

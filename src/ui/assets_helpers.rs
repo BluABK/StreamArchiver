@@ -10,6 +10,8 @@ pub(super) fn platform_badge(ui: &mut egui::Ui, platform: Platform) -> egui::Res
         Platform::Twitch => ("T", Color32::from_rgb(0x91, 0x46, 0xFF), Color32::WHITE),
         Platform::YouTube => ("▶", Color32::from_rgb(0xFF, 0x00, 0x00), Color32::WHITE),
         Platform::Kick => ("K", Color32::from_rgb(0x53, 0xFC, 0x18), Color32::BLACK),
+        Platform::Nrk => ("N", Color32::from_rgb(0x00, 0x89, 0xE0), Color32::WHITE),
+        Platform::Nebula => ("⬢", Color32::from_rgb(0x5E, 0x5C, 0xE6), Color32::WHITE),
         Platform::Generic => ("●", Color32::from_gray(0x80), Color32::WHITE),
     };
     ui.label(
@@ -29,6 +31,8 @@ pub(super) const ICON_PX: f32 = 16.0;
 pub(super) static TWITCH_ICON: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/platform_twitch.rgba"));
 pub(super) static YOUTUBE_ICON: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/platform_youtube.rgba"));
 pub(super) static KICK_ICON: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/platform_kick.rgba"));
+pub(super) static NRK_ICON: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/platform_nrk.rgba"));
+pub(super) static NEBULA_ICON: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/platform_nebula.rgba"));
 
 /// GPU textures for the platform favicons, uploaded once and cheaply cloned
 /// (each `TextureHandle` is reference-counted).
@@ -37,6 +41,8 @@ pub(super) struct PlatformTextures {
     pub(super) twitch: egui::TextureHandle,
     pub(super) youtube: egui::TextureHandle,
     pub(super) kick: egui::TextureHandle,
+    pub(super) nrk: egui::TextureHandle,
+    pub(super) nebula: egui::TextureHandle,
 }
 
 impl PlatformTextures {
@@ -49,6 +55,8 @@ impl PlatformTextures {
             twitch: mk("twitch", TWITCH_ICON),
             youtube: mk("youtube", YOUTUBE_ICON),
             kick: mk("kick", KICK_ICON),
+            nrk: mk("nrk", NRK_ICON),
+            nebula: mk("nebula", NEBULA_ICON),
         }
     }
 
@@ -58,6 +66,8 @@ impl PlatformTextures {
             Platform::Twitch => Some(&self.twitch),
             Platform::YouTube => Some(&self.youtube),
             Platform::Kick => Some(&self.kick),
+            Platform::Nrk => Some(&self.nrk),
+            Platform::Nebula => Some(&self.nebula),
             Platform::Generic => None,
         }
     }
@@ -392,7 +402,7 @@ pub(super) fn channel_asset_accounts(monitors: &[&MonitorWithChannel]) -> Vec<As
     let mut out: Vec<AssetAccount> = Vec::new();
     for m in monitors {
         let platform = m.monitor.platform();
-        if platform == Platform::Generic {
+        if !platform.has_asset_fetcher() {
             continue;
         }
         let account = asset_account(&m.monitor.url, platform);
@@ -595,7 +605,8 @@ pub(super) fn monitor_import_identity(url: &str) -> String {
         Platform::Twitch => crate::detectors::twitch_login(url).unwrap_or_default().to_lowercase(),
         Platform::Kick => crate::detectors::kick_slug(url).unwrap_or_default().to_lowercase(),
         Platform::YouTube => yt_channel_id(url).unwrap_or_else(|| url.to_lowercase()),
-        Platform::Generic => url.to_lowercase(),
+        // No account parser — the whole URL is the identity.
+        Platform::Nrk | Platform::Nebula | Platform::Generic => url.to_lowercase(),
     }
 }
 
@@ -981,8 +992,8 @@ pub(super) fn resolve_instance_icon_small(
     ctx: &egui::Context,
 ) -> Option<egui::TextureHandle> {
     let platform = row.monitor.platform();
-    if platform == Platform::Generic {
-        return None; // no asset fetcher for generic URLs — nothing on disk
+    if !platform.has_asset_fetcher() {
+        return None; // no asset fetcher for this platform — nothing on disk
     }
     let account = asset_account(&row.monitor.url, platform);
     let key = format!("m{}", row.monitor.id);

@@ -344,6 +344,8 @@ pub(crate) mod test_util {
             Platform::Twitch => "https://twitch.tv/cool",
             Platform::YouTube => "https://youtube.com/@cool",
             Platform::Kick => "https://kick.com/cool",
+            Platform::Nrk => "https://tv.nrk.no/direkte/nrk1",
+            Platform::Nebula => "https://nebula.tv/videos/cool",
             Platform::Generic => "https://example.com/cool",
         };
         MonitorWithChannel {

@@ -7,19 +7,30 @@
 use serde::{Deserialize, Serialize};
 
 /// Streaming platform a channel belongs to. Drives default detection/tool choice.
+///
+/// `Nrk` (nrk.no, the Norwegian public broadcaster) and `Nebula` (nebula.tv)
+/// are "branded yt-dlp platforms": recognized URLs, own icon/label/log tag and
+/// per-platform defaults, but no platform-specific detectors or asset/meta
+/// fetchers — live detection falls back to the generic probe, exactly like
+/// `Generic`. Unknown platform strings parse to `Generic`, so rows written by
+/// a build with more variants degrade gracefully on an older one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Platform {
     Twitch,
     YouTube,
     Kick,
+    Nrk,
+    Nebula,
     Generic,
 }
 
 impl Platform {
-    pub const ALL: [Platform; 4] = [
+    pub const ALL: [Platform; 6] = [
         Platform::Twitch,
         Platform::YouTube,
         Platform::Kick,
+        Platform::Nrk,
+        Platform::Nebula,
         Platform::Generic,
     ];
 
@@ -28,6 +39,8 @@ impl Platform {
             Platform::Twitch => "twitch",
             Platform::YouTube => "youtube",
             Platform::Kick => "kick",
+            Platform::Nrk => "nrk",
+            Platform::Nebula => "nebula",
             Platform::Generic => "generic",
         }
     }
@@ -37,6 +50,8 @@ impl Platform {
             Platform::Twitch => "Twitch",
             Platform::YouTube => "YouTube",
             Platform::Kick => "Kick",
+            Platform::Nrk => "NRK",
+            Platform::Nebula => "Nebula",
             Platform::Generic => "Generic",
         }
     }
@@ -46,13 +61,16 @@ impl Platform {
             "twitch" => Platform::Twitch,
             "youtube" => Platform::YouTube,
             "kick" => Platform::Kick,
+            "nrk" => Platform::Nrk,
+            "nebula" => Platform::Nebula,
             _ => Platform::Generic,
         }
     }
 
     /// Parse a stored "preferred asset platform": an empty/unknown string means
-    /// `None` ("auto — first available"). `Generic` is not an asset source, so it
-    /// is never a valid preference and also maps to `None`.
+    /// `None` ("auto — first available"). Only platforms with asset fetchers
+    /// (Twitch/YouTube/Kick) are valid preferences; everything else maps to
+    /// `None`.
     pub fn parse_opt(s: &str) -> Option<Platform> {
         match s {
             "twitch" => Some(Platform::Twitch),
@@ -71,6 +89,11 @@ impl Platform {
             Platform::YouTube
         } else if u.contains("kick.com") {
             Platform::Kick
+        } else if u.contains("nrk.no") {
+            // nrk.no + subdomains (tv.nrk.no, radio.nrk.no).
+            Platform::Nrk
+        } else if u.contains("nebula.tv") || u.contains("watchnebula.com") {
+            Platform::Nebula
         } else {
             Platform::Generic
         }
@@ -85,6 +108,9 @@ impl Platform {
             Platform::Twitch => Tool::Streamlink,
             Platform::YouTube => Tool::YtDlp,
             Platform::Kick => Tool::Streamlink,
+            // yt-dlp has real NRK/Nebula extractors; streamlink has neither.
+            Platform::Nrk => Tool::YtDlp,
+            Platform::Nebula => Tool::YtDlp,
             Platform::Generic => Tool::Streamlink,
         }
     }
@@ -108,6 +134,9 @@ impl Platform {
             Platform::Twitch => DetectionMethod::TwitchApi,
             Platform::YouTube => DetectionMethod::Scrape,
             Platform::Kick => DetectionMethod::Scrape,
+            // No platform-specific detector — the tool-based liveness probe is
+            // the only live check that works for these.
+            Platform::Nrk | Platform::Nebula => DetectionMethod::GenericProbe,
             Platform::Generic => DetectionMethod::GenericProbe,
         }
     }
@@ -138,8 +167,33 @@ impl Platform {
                 DetectionMethod::GenericProbe,
                 DetectionMethod::Disabled,
             ],
-            Platform::Generic => &[DetectionMethod::GenericProbe, DetectionMethod::Disabled],
+            Platform::Nrk | Platform::Nebula | Platform::Generic => {
+                &[DetectionMethod::GenericProbe, DetectionMethod::Disabled]
+            }
         }
+    }
+
+    /// Whether a live title/game/viewer metadata fetcher exists for this
+    /// platform (drives the in-recording meta watcher, trigger matching, and
+    /// the meta-refresh warning). Branded-generic platforms (NRK/Nebula) have
+    /// none, same as `Generic`.
+    pub fn has_stream_meta(self) -> bool {
+        matches!(self, Platform::Twitch | Platform::YouTube | Platform::Kick)
+    }
+
+    /// Whether a channel-asset fetcher (icon/banner/emotes/about) exists for
+    /// this platform. Mirrors [`Platform::parse_opt`]'s valid set.
+    pub fn has_asset_fetcher(self) -> bool {
+        matches!(self, Platform::Twitch | Platform::YouTube | Platform::Kick)
+    }
+
+    /// Whether streamlink has no plugin for this platform's video pages, so
+    /// picking it for an on-demand download warrants a UI warning: it fails
+    /// with "No plugin can handle URL" on NRK/Nebula (yt-dlp has the real
+    /// extractors), and on Generic it only works for live streams on
+    /// streamlink's own supported-site list — not plain video pages.
+    pub fn streamlink_unsupported(self) -> bool {
+        matches!(self, Platform::Nrk | Platform::Nebula | Platform::Generic)
     }
 }
 
@@ -1470,6 +1524,17 @@ impl PlatformDownloadDefault {
             auto_title: false,
         }
     }
+
+    /// Serde-default seeds for fields added after [`DownloadDefaults`] first
+    /// shipped (old persisted JSON lacks them). The output dir is unknown at
+    /// deserialize time — [`DownloadDefaults::fill_empty_output_dirs`] fills
+    /// it at load.
+    fn seeded_nrk() -> PlatformDownloadDefault {
+        PlatformDownloadDefault::seeded(Platform::Nrk, "")
+    }
+    fn seeded_nebula() -> PlatformDownloadDefault {
+        PlatformDownloadDefault::seeded(Platform::Nebula, "")
+    }
 }
 
 /// Per-platform download defaults for the Videos tab, persisted as JSON in
@@ -1479,6 +1544,13 @@ pub struct DownloadDefaults {
     pub twitch: PlatformDownloadDefault,
     pub youtube: PlatformDownloadDefault,
     pub kick: PlatformDownloadDefault,
+    // Added after the struct first shipped: persisted JSON from older builds
+    // lacks these fields, so they deserialize to a placeholder seed (empty
+    // output dir) that `fill_empty_output_dirs` completes at load.
+    #[serde(default = "PlatformDownloadDefault::seeded_nrk")]
+    pub nrk: PlatformDownloadDefault,
+    #[serde(default = "PlatformDownloadDefault::seeded_nebula")]
+    pub nebula: PlatformDownloadDefault,
     pub generic: PlatformDownloadDefault,
 }
 
@@ -1488,6 +1560,8 @@ impl DownloadDefaults {
             twitch: PlatformDownloadDefault::seeded(Platform::Twitch, default_output_dir),
             youtube: PlatformDownloadDefault::seeded(Platform::YouTube, default_output_dir),
             kick: PlatformDownloadDefault::seeded(Platform::Kick, default_output_dir),
+            nrk: PlatformDownloadDefault::seeded(Platform::Nrk, default_output_dir),
+            nebula: PlatformDownloadDefault::seeded(Platform::Nebula, default_output_dir),
             generic: PlatformDownloadDefault::seeded(Platform::Generic, default_output_dir),
         }
     }
@@ -1497,6 +1571,8 @@ impl DownloadDefaults {
             Platform::Twitch => &self.twitch,
             Platform::YouTube => &self.youtube,
             Platform::Kick => &self.kick,
+            Platform::Nrk => &self.nrk,
+            Platform::Nebula => &self.nebula,
             Platform::Generic => &self.generic,
         }
     }
@@ -1506,7 +1582,22 @@ impl DownloadDefaults {
             Platform::Twitch => &mut self.twitch,
             Platform::YouTube => &mut self.youtube,
             Platform::Kick => &mut self.kick,
+            Platform::Nrk => &mut self.nrk,
+            Platform::Nebula => &mut self.nebula,
             Platform::Generic => &mut self.generic,
+        }
+    }
+
+    /// Complete placeholder entries that came from serde defaults (a platform
+    /// added after the struct was first persisted): any entry with an empty
+    /// output dir gets the app's current default. Run once at load, before
+    /// the defaults reach the Videos form.
+    pub fn fill_empty_output_dirs(&mut self, default_output_dir: &str) {
+        for platform in Platform::ALL {
+            let d = self.get_mut(platform);
+            if d.output_dir.trim().is_empty() {
+                d.output_dir = default_output_dir.to_string();
+            }
         }
     }
 
@@ -1563,6 +1654,12 @@ pub struct MonitorDefaults {
     pub twitch: PlatformMonitorDefault,
     pub youtube: PlatformMonitorDefault,
     pub kick: PlatformMonitorDefault,
+    // Added later; `#[serde(default)]` (all-None) keeps old persisted JSON
+    // loading — unset fields inherit from global/hardcoded like every other.
+    #[serde(default)]
+    pub nrk: PlatformMonitorDefault,
+    #[serde(default)]
+    pub nebula: PlatformMonitorDefault,
     pub generic: PlatformMonitorDefault,
 }
 
@@ -1572,6 +1669,8 @@ impl MonitorDefaults {
             Platform::Twitch => &self.twitch,
             Platform::YouTube => &self.youtube,
             Platform::Kick => &self.kick,
+            Platform::Nrk => &self.nrk,
+            Platform::Nebula => &self.nebula,
             Platform::Generic => &self.generic,
         }
     }
@@ -1581,6 +1680,8 @@ impl MonitorDefaults {
             Platform::Twitch => &mut self.twitch,
             Platform::YouTube => &mut self.youtube,
             Platform::Kick => &mut self.kick,
+            Platform::Nrk => &mut self.nrk,
+            Platform::Nebula => &mut self.nebula,
             Platform::Generic => &mut self.generic,
         }
     }
@@ -2283,6 +2384,52 @@ pub fn group_recordings(recordings: &[Recording]) -> Vec<StreamGroup> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nrk_nebula_platforms_detect_and_round_trip() {
+        // URL inference, including subdomains and the legacy Nebula domain.
+        assert_eq!(Platform::detect("https://www.nrk.no/video/77b5f517"), Platform::Nrk);
+        assert_eq!(Platform::detect("https://tv.nrk.no/direkte/nrk1"), Platform::Nrk);
+        assert_eq!(Platform::detect("https://nebula.tv/videos/some-video"), Platform::Nebula);
+        assert_eq!(Platform::detect("https://watchnebula.com/foo"), Platform::Nebula);
+        assert_eq!(Platform::detect("https://example.com/x"), Platform::Generic);
+        // as_str/parse round-trip for every platform (DB storage contract).
+        for p in Platform::ALL {
+            assert_eq!(Platform::parse(p.as_str()), p);
+        }
+        // yt-dlp is both the live and download tool (no streamlink plugin).
+        for p in [Platform::Nrk, Platform::Nebula] {
+            assert_eq!(p.default_tool(), Tool::YtDlp);
+            assert_eq!(p.default_download_tool(), Tool::YtDlp);
+            assert!(!p.has_stream_meta());
+            assert!(!p.has_asset_fetcher());
+            assert!(p.streamlink_unsupported());
+            // Not valid asset-source preferences.
+            assert_eq!(Platform::parse_opt(p.as_str()), None);
+        }
+    }
+
+    #[test]
+    fn download_defaults_json_backcompat_gains_nrk_nebula() {
+        // JSON persisted by a build that predates the nrk/nebula fields (the
+        // real shape from app_settings.download_defaults) must still load,
+        // with the new platforms seeded and their output dir filled at load.
+        let entry = r#"{"tool":"Streamlink","quality":"best","auth_kind":"Inherit",
+            "auth_value":"","output_dir":"C:\\out","filename_template":"{name}",
+            "extra_args":""}"#;
+        let old = format!(
+            r#"{{"twitch":{entry},"youtube":{entry},"kick":{entry},"generic":{entry}}}"#
+        );
+        let mut d: DownloadDefaults = serde_json::from_str(&old).expect("old JSON loads");
+        assert_eq!(d.nrk.tool, Tool::YtDlp);
+        assert_eq!(d.nebula.tool, Tool::YtDlp);
+        assert!(d.nrk.output_dir.is_empty(), "serde default can't know the dir");
+        d.fill_empty_output_dirs(r"D:\dl");
+        assert_eq!(d.nrk.output_dir, r"D:\dl");
+        assert_eq!(d.nebula.output_dir, r"D:\dl");
+        // Existing entries keep their configured dir.
+        assert_eq!(d.twitch.output_dir, r"C:\out");
+    }
 
     #[test]
     fn generic_download_tool_is_ytdlp_but_live_stays_streamlink() {

@@ -932,10 +932,10 @@ pub(super) async fn meta_watcher(
             Platform::Twitch => ctx.twitch_stream_meta(&url).await,
             Platform::Kick => ctx.kick_stream_meta(&url).await,
             Platform::YouTube => ctx.youtube_stream_meta(&url).await,
-            // No metadata source for generic monitors.
-            Platform::Generic => MetaFetch::Offline,
+            // No metadata source for generic/branded-generic monitors.
+            Platform::Nrk | Platform::Nebula | Platform::Generic => MetaFetch::Offline,
         };
-        if platform != Platform::Generic {
+        if platform.has_stream_meta() {
             // Only a genuine fetch failure counts toward the warning streak:
             // `Offline` is an authoritative answer (the stream ended while the
             // capture drains its tail) — frozen fields are expected then, and

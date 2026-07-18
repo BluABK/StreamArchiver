@@ -192,7 +192,7 @@ impl StreamArchiverApp {
                                 });
                             ui.end_row();
 
-                            if platform == Platform::Generic && d.tool == Tool::Streamlink {
+                            if platform.streamlink_unsupported() && d.tool == Tool::Streamlink {
                                 ui.label("");
                                 ui.label(
                                     egui::RichText::new(
@@ -203,11 +203,10 @@ impl StreamArchiverApp {
                                     .color(egui::Color32::from_rgb(0xd9, 0xa4, 0x06)),
                                 )
                                 .on_hover_text(
-                                    "Generic covers every site that isn't Twitch/YouTube/\
-                                     Kick. Streamlink only handles live streams on its \
-                                     supported sites; a regular video/VOD page fails with \
-                                     \"No plugin can handle URL\". yt-dlp's ~1800 \
-                                     extractors cover most sites (NRK, Vimeo, …).",
+                                    "Streamlink only handles live streams on its supported \
+                                     sites; a regular video/VOD page on this platform fails \
+                                     with \"No plugin can handle URL\". yt-dlp's ~1800 \
+                                     extractors cover most sites (NRK, Nebula, Vimeo, …).",
                                 );
                                 ui.end_row();
                             }
@@ -888,7 +887,7 @@ impl StreamArchiverApp {
                     // into it fails with "No plugin can handle URL", while
                     // yt-dlp's ~1800 extractors handle most of them. Warn
                     // in-place instead of letting the download die cryptically.
-                    if platform == Platform::Generic && vf.tool == Tool::Streamlink {
+                    if platform.streamlink_unsupported() && vf.tool == Tool::Streamlink {
                         ui.label("");
                         ui.label(
                             egui::RichText::new(
@@ -899,11 +898,11 @@ impl StreamArchiverApp {
                             .color(egui::Color32::from_rgb(0xd9, 0xa4, 0x06)),
                         )
                         .on_hover_text(
-                            "This URL didn't match a known platform (Twitch/YouTube/Kick), \
-                             and streamlink is a live-stream tool: on a normal video/VOD \
-                             page it fails with \"error: No plugin can handle URL\". \
-                             yt-dlp supports ~1800 sites (NRK, Vimeo, …) and is the \
-                             default for generic downloads.",
+                            "Streamlink has no plugin for this site's video pages and \
+                             fails with \"error: No plugin can handle URL\" — it's a \
+                             live-stream tool for its own supported-site list. yt-dlp \
+                             supports ~1800 sites (NRK, Nebula, Vimeo, …) and is the \
+                             default here.",
                         );
                         ui.end_row();
                     }

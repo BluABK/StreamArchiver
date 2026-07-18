@@ -67,7 +67,7 @@ impl StreamArchiverApp {
         // This instance's own asset account (None for Generic URLs — no asset
         // fetcher, so no assets section). Matched by (platform, slug) rather
         // than monitor id: two tools on one URL share the sibling's entry.
-        let inst_account: Option<AssetAccount> = if m.platform() == Platform::Generic {
+        let inst_account: Option<AssetAccount> = if !m.platform().has_asset_fetcher() {
             None
         } else {
             let slug = asset_account(&m.url, m.platform());

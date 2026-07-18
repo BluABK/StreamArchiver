@@ -2569,11 +2569,35 @@ impl DetectContext {
     // ----- generic probe via streamlink -----
 
     pub async fn detect_generic(&self, item: &DetectItem) -> DetectOutcome {
-        let mut cmd = tokio::process::Command::new("streamlink");
-        cmd.arg("--stream-url")
-            .arg(&item.url)
-            .arg("best")
-            .stdin(Stdio::null())
+        // Streamlink has no NRK/Nebula plugin (its probe would read "offline"
+        // forever), but yt-dlp has real extractors for both — probe those
+        // platforms via yt-dlp's live_status instead. Plain Generic keeps the
+        // streamlink probe (raw HLS pages / streamlink's live-site list).
+        let ytdlp_probe = item.platform.streamlink_unsupported()
+            && item.platform != crate::models::Platform::Generic;
+        let mut cmd = if ytdlp_probe {
+            let bin = self
+                .store
+                .get_setting("ytdlp_binary_path") // ui.rs K_YTDLP_BINARY
+                .ok()
+                .flatten()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "yt-dlp".to_string());
+            let mut cmd = tokio::process::Command::new(bin);
+            cmd.arg("--quiet")
+                .arg("--no-warnings")
+                .arg("--skip-download")
+                .arg("--no-playlist")
+                .arg("--print")
+                .arg("%(live_status)s")
+                .arg(&item.url);
+            cmd
+        } else {
+            let mut cmd = tokio::process::Command::new("streamlink");
+            cmd.arg("--stream-url").arg(&item.url).arg("best");
+            cmd
+        };
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
@@ -2582,12 +2606,22 @@ impl DetectContext {
 
         let child = match cmd.spawn() {
             Ok(c) => c,
-            Err(e) => return DetectOutcome::err(item.monitor_id, format!("spawn streamlink: {e}")),
+            Err(e) => {
+                let tool = if ytdlp_probe { "yt-dlp" } else { "streamlink" };
+                return DetectOutcome::err(item.monitor_id, format!("spawn {tool}: {e}"));
+            }
         };
         match tokio::time::timeout(Duration::from_secs(20), child.wait_with_output()).await {
             Ok(Ok(out)) => {
-                let live = out.status.success() && !out.stdout.is_empty();
-                debug!(monitor = item.monitor_id, live, "generic probe done");
+                let live = if ytdlp_probe {
+                    // live_status: is_live / was_live / not_live / is_upcoming /
+                    // post_live / NA. Only an actually-running live counts.
+                    out.status.success()
+                        && String::from_utf8_lossy(&out.stdout).trim() == "is_live"
+                } else {
+                    out.status.success() && !out.stdout.is_empty()
+                };
+                debug!(monitor = item.monitor_id, live, ytdlp_probe, "generic probe done");
                 if live {
                     DetectOutcome::live(item.monitor_id, "live")
                 } else {
@@ -3421,7 +3455,8 @@ fn monitor_needles(url: &str) -> Vec<String> {
                 out.push(format!("kick.com/{}", s.to_lowercase()));
             }
         }
-        Platform::Generic => {}
+        // No account-parser — the bare host/path needle below covers them.
+        Platform::Nrk | Platform::Nebula | Platform::Generic => {}
     }
     // The bare host/path (scheme + www stripped), as a catch-all / for generic URLs.
     let norm = url

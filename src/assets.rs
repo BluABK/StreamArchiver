@@ -66,7 +66,9 @@ pub fn account_slug(url: &str, platform: crate::models::Platform) -> String {
         Platform::Twitch => crate::detectors::twitch_login(url),
         Platform::Kick => crate::detectors::kick_slug(url).map(|s| s.to_lowercase()),
         Platform::YouTube => youtube_account_token(url),
-        Platform::Generic => None,
+        // No account-identity parser — the URL-hash fallback below keeps
+        // distinct URLs from colliding.
+        Platform::Nrk | Platform::Nebula | Platform::Generic => None,
     };
     let slug = match raw {
         Some(s) => crate::downloader::sanitize_filename(&s).to_lowercase(),

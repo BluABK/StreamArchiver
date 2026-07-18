@@ -315,6 +315,10 @@ impl StreamArchiverApp {
             }
             let _ = core.store.set_setting(K_GENERIC_TOOL_HEALED, "1");
         }
+        // Platforms added after the struct was first persisted (NRK/Nebula)
+        // deserialize with an empty output dir — complete them from the app
+        // default before the Videos form ever sees them.
+        download_defaults.fill_empty_output_dirs(&settings.default_output_dir);
 
         let monitor_defaults = core
             .store

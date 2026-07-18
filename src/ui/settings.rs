@@ -1749,6 +1749,8 @@ impl StreamArchiverApp {
                 ("  Twitch",   Some(Platform::Twitch)),
                 ("  YouTube",  Some(Platform::YouTube)),
                 ("  Kick",     Some(Platform::Kick)),
+                ("  NRK",      Some(Platform::Nrk)),
+                ("  Nebula",   Some(Platform::Nebula)),
                 ("  Generic",  Some(Platform::Generic)),
             ] {
                 let default_open = platform_opt.is_none();

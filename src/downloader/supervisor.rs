@@ -2933,7 +2933,7 @@ progress_info: None,
         // matching" — a trigger with e.g. just a leadtime configured (but
         // stop_on_unmatch off) still records until the stream ends, unchanged.
         let stop_rule = trigger_rule.clone().filter(|r| r.stop_on_unmatch);
-        let meta_task = (rec_id != 0 && meta_platform != Platform::Generic).then(|| {
+        let meta_task = (rec_id != 0 && meta_platform.has_stream_meta()).then(|| {
             tokio::spawn(meta_watcher(
                 self.ctx.clone(),
                 self.store.clone(),

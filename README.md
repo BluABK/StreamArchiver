@@ -191,13 +191,16 @@ list.
 URL's platform; edit any field to override it for that download. The
 **⚙ Per-platform defaults** panel to the right of the download form sets the
 default tool/quality/auth/output/filename/extra args for Twitch, YouTube, Kick,
-and Generic (each collapsible) — saved automatically. **Generic** covers every
-URL that isn't Twitch/YouTube/Kick — any of yt-dlp's ~1800 supported sites
-(NRK, Vimeo, …) — and defaults to **yt-dlp** for exactly that reason:
-streamlink is a live-stream tool and fails on a plain video page with
-`error: No plugin can handle URL` (the form shows an inline ⚠ warning if you
-combine a generic URL with streamlink; defaults saved before this change are
-healed to yt-dlp once, automatically). The form's **Auth** has a **Default
+NRK, Nebula, and Generic (each collapsible) — saved automatically. **NRK**
+(`nrk.no` incl. `tv.nrk.no`) and **Nebula** (`nebula.tv`) are recognized as
+their own platforms — own icon, defaults, and log tag — but ride yt-dlp's
+extractors (no platform-specific detection or channel-asset fetching; Nebula
+needs your subscription cookies via the Auth field). **Generic** covers every
+other URL — any of yt-dlp's ~1800 supported sites (Vimeo, …) — and defaults to
+**yt-dlp** for exactly that reason: streamlink is a live-stream tool and fails
+on a plain video page with `error: No plugin can handle URL` (the form shows an
+inline ⚠ warning if you combine such a URL with streamlink; defaults saved
+before this change are healed to yt-dlp once, automatically). The form's **Auth** has a **Default
 (per-platform)** option (selected by default, uses the platform default's auth)
 plus the explicit choices; **Inherit (global)** stays available and chains to the
 Settings → *Download authentication* default.
@@ -461,7 +464,7 @@ in-app for a one-line description of each.
 | **YouTube Data API** | YouTube | API key | one poll interval | `search.list?eventType=live`; reports the real go-live time. **Quota-limited (~100 checks/day)** — use a long interval. |
 | **Kick official API** | Kick | Client ID + Secret | one poll interval | client-credentials app token; more reliable than scraping (no Cloudflare). |
 | **Scrape poll** | YouTube `/live`, Kick, generic | No | one poll interval | **Default for YouTube/Kick**; no credentials, but fragile to site changes. Go-live time is approximate (`~`). |
-| **Generic probe** | any streamlink/yt-dlp URL | No | one poll interval | `streamlink --stream-url` liveness test; works anywhere those tools do. |
+| **Generic probe** | any streamlink/yt-dlp URL | No | one poll interval | `streamlink --stream-url` liveness test; works anywhere those tools do. For NRK/Nebula monitors the probe uses `yt-dlp --print live_status` instead (streamlink has no plugin for either). |
 | **Disabled** | any | No | manual only | No automatic checking at all — not polled by the scheduler, no push subscribed. **▶ Start** records immediately (there's no configured way to check first, so it trusts you) instead of erroring "not live". For channels you only ever want to record by hand. |
 
 **Polling vs. push (Helix vs. EventSub).** Helix *asks* "is it live?" every poll
@@ -1349,7 +1352,7 @@ quota usage (units and search calls against the daily cutoff), so you can see
 what these features are actually costing you.
 
 **Detection / API requests** (same tab) tracks cumulative poll/detect request
-counts **per platform** (Twitch, YouTube, Kick, Generic) across every
+counts **per platform** (Twitch, YouTube, Kick, NRK, Nebula, Generic) across every
 detection method — batched Twitch Helix polls, the WebSub/scrape fallback
 check, YouTube/Kick API probes, generic HTTP probes — with an error count,
 error rate, and the timestamp + detail of the most recent failure (hover the

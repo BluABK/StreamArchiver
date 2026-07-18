@@ -30,12 +30,15 @@ pub fn color_enabled() -> bool {
 pub struct PlatTag(pub Platform);
 
 impl PlatTag {
-    /// Brand color as RGB (Twitch purple, YouTube red, Kick green).
+    /// Brand color as RGB (Twitch purple, YouTube red, Kick green, NRK blue,
+    /// Nebula indigo).
     fn rgb(&self) -> (u8, u8, u8) {
         match self.0 {
             Platform::Twitch => (145, 70, 255), // #9146FF
             Platform::YouTube => (255, 68, 68), // #FF4444 (pure #FF0000 reads as an error color)
             Platform::Kick => (83, 252, 24),    // #53FC18
+            Platform::Nrk => (0, 137, 224),     // #0089E0 (nrk.no interface blue)
+            Platform::Nebula => (94, 92, 230),  // #5E5CE6 (nebula.tv accent indigo)
             Platform::Generic => (150, 150, 150),
         }
     }

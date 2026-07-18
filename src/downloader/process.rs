@@ -725,7 +725,7 @@ impl Supervisor {
                     watcher_done.clone(),
                 )));
             }
-            if m.monitor.platform() != Platform::Generic {
+            if m.monitor.platform().has_stream_meta() {
                 // A restart drops the in-memory TriggerRule the original
                 // try_begin/record call matched — recover it (frozen at start
                 // time, not re-resolved from the live rule lists) from the
