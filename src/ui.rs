@@ -123,6 +123,83 @@ enum View {
     Debug,
 }
 
+/// Timespan choices for the Stats view's detection-history graphs. Each span
+/// picks its own display bucket width so every view lands around 60–360
+/// points per line; the underlying `poll_history` table stores minute
+/// resolution regardless (aggregation happens in the query).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PollSpan {
+    Hour,
+    SixHours,
+    TwelveHours,
+    Day,
+    Week,
+    Month,
+}
+
+impl PollSpan {
+    const ALL: [PollSpan; 6] = [
+        PollSpan::Hour,
+        PollSpan::SixHours,
+        PollSpan::TwelveHours,
+        PollSpan::Day,
+        PollSpan::Week,
+        PollSpan::Month,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            PollSpan::Hour => "1 h",
+            PollSpan::SixHours => "6 h",
+            PollSpan::TwelveHours => "12 h",
+            PollSpan::Day => "24 h",
+            PollSpan::Week => "7 d",
+            PollSpan::Month => "30 d",
+        }
+    }
+
+    /// How far back the view reaches.
+    fn secs(self) -> i64 {
+        match self {
+            PollSpan::Hour => 3_600,
+            PollSpan::SixHours => 6 * 3_600,
+            PollSpan::TwelveHours => 12 * 3_600,
+            PollSpan::Day => 86_400,
+            PollSpan::Week => 7 * 86_400,
+            PollSpan::Month => 30 * 86_400,
+        }
+    }
+
+    /// Display bucket width for this span (what one plotted point covers).
+    fn bucket_secs(self) -> i64 {
+        match self {
+            PollSpan::Hour => 60,             // minute detail
+            PollSpan::SixHours => 300,        // 5 min
+            PollSpan::TwelveHours => 600,     // 10 min
+            PollSpan::Day => 1_800,           // 30 min
+            PollSpan::Week => 3 * 3_600,      // 3 h
+            PollSpan::Month => 12 * 3_600,    // 12 h
+        }
+    }
+
+    /// Human label for [`PollSpan::bucket_secs`] (tooltips, y-axis captions).
+    fn bucket_label(self) -> &'static str {
+        match self {
+            PollSpan::Hour => "1 min",
+            PollSpan::SixHours => "5 min",
+            PollSpan::TwelveHours => "10 min",
+            PollSpan::Day => "30 min",
+            PollSpan::Week => "3 h",
+            PollSpan::Month => "12 h",
+        }
+    }
+
+    /// Whether the graphs' relative time axis reads better in days than hours.
+    fn axis_in_days(self) -> bool {
+        matches!(self, PollSpan::Week | PollSpan::Month)
+    }
+}
+
 mod app;
 mod assets_helpers;
 mod background;
@@ -1106,6 +1183,13 @@ pub struct StreamArchiverApp {
     confirm_quit_stop: bool,
     /// Cached (ocr_stats, global_stats, poll_stats) for the Stats view; None = not yet loaded.
     stats_snapshot: Option<(OcrStats, GlobalStats, PollStats)>,
+    /// Selected timespan for the Stats view's detection-history graphs
+    /// (session-only, defaults to 24 h).
+    stats_poll_span: PollSpan,
+    /// Cached `poll_history` rows for the selected span; None = (re)query on
+    /// next Stats render. Invalidated separately from `stats_snapshot` so
+    /// flipping the span doesn't re-run the other stats queries.
+    stats_history: Option<Vec<crate::models::PollBucket>>,
     /// I/O tab: cached sampler history + counters snapshot (refreshed ~1×/s
     /// while the tab is open — never cloned per frame).
     io_hist: Vec<crate::iomon::Sample>,
@@ -1368,6 +1452,7 @@ impl eframe::App for StreamArchiverApp {
                     ui.selectable_value(&mut self.view, View::Settings, "Settings");
                     if ui.selectable_value(&mut self.view, View::Stats, "Stats").clicked() {
                         self.stats_snapshot = None; // force reload on tab open
+                        self.stats_history = None;
                     }
                     ui.selectable_value(&mut self.view, View::IoMonitor, "I/O");
                     if debug_view_enabled() {

@@ -450,6 +450,7 @@ impl StreamArchiverApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("⟳  Refresh").clicked() {
                         self.stats_snapshot = None;
+                        self.stats_history = None;
                     }
                     if ui.button("🗑  Reset").on_hover_text("Clear all accumulated OCR stats").clicked() {
                         let _ = self.core.store.set_setting(K_OCR_STATS, "{}");
@@ -625,7 +626,9 @@ impl StreamArchiverApp {
                         .clicked()
                     {
                         let _ = self.core.store.set_setting(crate::models::K_POLL_STATS, "{}");
+                        let _ = self.core.store.clear_poll_history();
                         self.stats_snapshot = None;
+                        self.stats_history = None;
                     }
                 });
             });
@@ -679,6 +682,191 @@ impl StreamArchiverApp {
                 });
             if poll.by_platform.values().all(|s| s.polls == 0) {
                 ui.weak("No polls recorded yet.");
+            }
+
+            // ── Recent errors — the actual failures behind the counters ─────
+            let mut recent: Vec<(Platform, crate::models::PollErrorEntry)> = Vec::new();
+            for p in Platform::ALL {
+                if let Some(s) = poll.by_platform.get(p.as_str()) {
+                    recent.extend(s.recent_errors.iter().cloned().map(|e| (p, e)));
+                }
+            }
+            recent.sort_by_key(|(_, e)| std::cmp::Reverse(e.at));
+            if !recent.is_empty() {
+                ui.add_space(6.0);
+                let header = egui::CollapsingHeader::new(format!("⚠ Recent errors ({})", recent.len()))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("poll_recent_errors_scroll")
+                            .max_height(280.0)
+                            .show(ui, |ui| {
+                                egui::Grid::new("poll_recent_errors_grid")
+                                    .num_columns(5)
+                                    .spacing([16.0, 3.0])
+                                    .striped(true)
+                                    .show(ui, |ui| {
+                                        ui.strong("Time");
+                                        ui.strong("Platform");
+                                        ui.strong("Channel");
+                                        ui.strong("Method")
+                                            .on_hover_text("Which detection method the failed check used (Helix API, Scrape, Probe, …)");
+                                        ui.strong("Error");
+                                        ui.end_row();
+                                        for (p, e) in &recent {
+                                            use chrono::{Local, TimeZone};
+                                            let when = Local
+                                                .timestamp_opt(e.at, 0)
+                                                .single()
+                                                .map(|dt| dt.format("%m-%d %H:%M:%S").to_string())
+                                                .unwrap_or_else(|| "—".into());
+                                            ui.label(when);
+                                            ui.label(p.label());
+                                            ui.label(&e.monitor);
+                                            ui.label(&e.method);
+                                            // Long details (URLs, HTTP bodies) get truncated
+                                            // in the cell; the full text lives on hover.
+                                            let short: String = if e.detail.chars().count() > 100 {
+                                                let cut: String = e.detail.chars().take(100).collect();
+                                                format!("{cut}…")
+                                            } else {
+                                                e.detail.clone()
+                                            };
+                                            ui.colored_label(HL_ERROR_TEXT, short)
+                                                .on_hover_text(&e.detail);
+                                            ui.end_row();
+                                        }
+                                    });
+                            });
+                    });
+                header.header_response.on_hover_text(format!(
+                    "The last {} individual poll/detect failures per platform, newest first \
+                     — what the Errors counter above actually counted. \
+                     Cleared by the Reset button.",
+                    crate::models::MAX_RECENT_POLL_ERRORS
+                ));
+            }
+
+            // ── History graphs (error rate per platform, volume per method) ─
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label("History:").on_hover_text(
+                    "Minute-resolution request history is kept for 60 days (poll_history \
+                     table); pick how far back the graphs look. Wider spans use wider \
+                     buckets so every view stays readable.",
+                );
+                for s in super::PollSpan::ALL {
+                    let resp = ui
+                        .selectable_label(self.stats_poll_span == s, s.label())
+                        .on_hover_text(format!(
+                            "Show the last {} in {} buckets",
+                            s.label(),
+                            s.bucket_label()
+                        ));
+                    if resp.clicked() && self.stats_poll_span != s {
+                        self.stats_poll_span = s;
+                        self.stats_history = None;
+                    }
+                }
+            });
+            let span = self.stats_poll_span;
+            if self.stats_history.is_none() {
+                let since = chrono::Utc::now().timestamp() - span.secs();
+                self.stats_history = Some(
+                    self.core
+                        .store
+                        .poll_history(since, span.bucket_secs())
+                        .unwrap_or_default(),
+                );
+            }
+            let history = self.stats_history.clone().unwrap_or_default();
+            if history.is_empty() {
+                ui.weak("No detection history in this timespan yet — it accumulates as monitors poll.");
+            } else {
+                let now = chrono::Utc::now().timestamp();
+                let to_x = |t: i64| (t - now) as f64 / 3600.0; // hours relative to now (negative)
+                let days = span.axis_in_days();
+                let fmt_x = move |h: f64| {
+                    if days { format!("{:+.1}d", h / 24.0) } else { format!("{h:+.1}h") }
+                };
+                let bucket_label = span.bucket_label();
+
+                ui.add_space(4.0);
+                ui.label("Error rate per platform:").on_hover_text(format!(
+                    "Failed checks as a percentage of all checks, per platform (all \
+                     detection methods folded together), in {bucket_label} buckets. \
+                     X axis is time relative to now. Line colors match the platforms' \
+                     log-tag brand colors. Periods with no polling at all are bridged \
+                     with straight segments.",
+                ));
+                // platform -> time-ordered (t, polls, errors), methods folded together.
+                let mut per_platform: std::collections::BTreeMap<&str, std::collections::BTreeMap<i64, (u64, u64)>> =
+                    Default::default();
+                for b in &history {
+                    let e = per_platform.entry(b.platform.as_str()).or_default().entry(b.t).or_insert((0, 0));
+                    e.0 += b.polls;
+                    e.1 += b.errors;
+                }
+                let fx = fmt_x;
+                egui_plot::Plot::new("poll_error_rate_plot")
+                    .height(160.0)
+                    .legend(egui_plot::Legend::default())
+                    .allow_scroll(false)
+                    .include_y(0.0)
+                    .x_axis_formatter(move |mark, _| fx(mark.value))
+                    .y_axis_formatter(|mark, _| format!("{:.0}%", mark.value))
+                    .label_formatter(move |name, v| format!("{name}\n{}: {:.1}%", fx(v.x), v.y))
+                    .show(ui, |plot_ui| {
+                        for p in Platform::ALL {
+                            let Some(buckets) = per_platform.get(p.as_str()) else { continue };
+                            let pts: Vec<[f64; 2]> = buckets
+                                .iter()
+                                .map(|(t, (polls, errors))| {
+                                    [to_x(*t), 100.0 * *errors as f64 / (*polls).max(1) as f64]
+                                })
+                                .collect();
+                            let (r, g, b) = p.tag().rgb();
+                            plot_ui.line(
+                                egui_plot::Line::new(p.label(), egui_plot::PlotPoints::from(pts))
+                                    .color(egui::Color32::from_rgb(r, g, b)),
+                            );
+                        }
+                    });
+
+                ui.add_space(8.0);
+                ui.label("Requests per kind:").on_hover_text(format!(
+                    "How many checks each detection method (Helix API, Scrape, Probe, \
+                     YT API, …) performed per {bucket_label} bucket, all platforms \
+                     combined. X axis is time relative to now.",
+                ));
+                // method -> time-ordered polls, platforms folded together.
+                let mut per_method: std::collections::BTreeMap<&str, std::collections::BTreeMap<i64, u64>> =
+                    Default::default();
+                for b in &history {
+                    *per_method.entry(b.method.as_str()).or_default().entry(b.t).or_insert(0) += b.polls;
+                }
+                egui_plot::Plot::new("poll_method_volume_plot")
+                    .height(160.0)
+                    .legend(egui_plot::Legend::default())
+                    .allow_scroll(false)
+                    .include_y(0.0)
+                    .x_axis_formatter(move |mark, _| fx(mark.value))
+                    .y_axis_formatter(|mark, _| format!("{:.0}", mark.value))
+                    .label_formatter(move |name, v| {
+                        format!("{name}\n{}: {:.0} requests / {bucket_label}", fx(v.x), v.y)
+                    })
+                    .show(ui, |plot_ui| {
+                        for (method, buckets) in &per_method {
+                            let pts: Vec<[f64; 2]> = buckets
+                                .iter()
+                                .map(|(t, polls)| [to_x(*t), *polls as f64])
+                                .collect();
+                            plot_ui.line(egui_plot::Line::new(
+                                method.to_string(),
+                                egui_plot::PlotPoints::from(pts),
+                            ));
+                        }
+                    });
             }
 
             ui.add_space(16.0);

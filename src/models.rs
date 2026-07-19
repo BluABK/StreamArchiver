@@ -1951,7 +1951,53 @@ pub struct PlatformPollStats {
     /// Detail string from the most recent error (mirrors what the
     /// scheduler's per-monitor state-change line logs for that outcome).
     pub last_error: String,
+    /// Ring buffer of the most recent individual errors (oldest first,
+    /// capped at [`MAX_RECENT_POLL_ERRORS`]) so the Stats view can list what
+    /// actually failed instead of only counting. `serde(default)` keeps
+    /// pre-existing persisted blobs loading (they simply start empty).
+    #[serde(default)]
+    pub recent_errors: Vec<PollErrorEntry>,
 }
+
+/// One individual failed poll/detect attempt, kept in
+/// [`PlatformPollStats::recent_errors`].
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct PollErrorEntry {
+    /// Unix timestamp of the failed check.
+    pub at: i64,
+    /// Channel name of the monitor whose check failed.
+    pub monitor: String,
+    /// Detection-method short label ([`DetectionMethod::short_label`]).
+    pub method: String,
+    /// Error detail — the same string the per-poll log line and the grid's
+    /// "Last error" hover show.
+    pub detail: String,
+}
+
+/// One aggregated time bucket of poll/detect history for a
+/// `(platform, method)` pair, as returned by `Store::poll_history` — the raw
+/// material for the Stats view's error-rate / request-volume graphs. Backed
+/// by the `poll_history` table (schema v56): stored at minute resolution,
+/// aggregated to whatever bucket width the requested view span calls for at
+/// query time. Kept flat (platform + method as fields) so the UI can group
+/// by whichever axis a plot needs.
+#[derive(Clone)]
+pub struct PollBucket {
+    /// Bucket start (unix secs, aligned down to the queried bucket width).
+    pub t: i64,
+    /// Platform key ([`Platform::as_str`]).
+    pub platform: String,
+    /// Detection-method short label ([`DetectionMethod::short_label`]).
+    pub method: String,
+    /// Poll/detect attempts that landed in this bucket.
+    pub polls: u64,
+    /// How many of those attempts errored.
+    pub errors: u64,
+}
+
+/// Per-platform cap on [`PlatformPollStats::recent_errors`] — old entries are
+/// dropped from the front once exceeded.
+pub const MAX_RECENT_POLL_ERRORS: usize = 50;
 
 /// Cumulative per-platform poll/detect stats (see [`PlatformPollStats`]),
 /// keyed by [`Platform::as_str`]. Persisted as one JSON blob under
@@ -1961,6 +2007,44 @@ pub struct PlatformPollStats {
 #[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PollStats {
     pub by_platform: std::collections::HashMap<String, PlatformPollStats>,
+}
+
+impl PollStats {
+    /// Fold one detect outcome in: the cumulative per-platform counters plus
+    /// the per-platform recent-error ring. The single entry point the
+    /// scheduler uses per outcome — pure, so the accumulation is
+    /// unit-testable without a scheduler. (The time-bucketed graph history is
+    /// separate — the `poll_history` table via `Store::record_poll_history`.)
+    pub fn record(
+        &mut self,
+        at: i64,
+        platform: Platform,
+        method: &str,
+        monitor: &str,
+        error: bool,
+        detail: &str,
+    ) {
+        let entry = self
+            .by_platform
+            .entry(platform.as_str().to_string())
+            .or_default();
+        entry.polls += 1;
+        if error {
+            entry.errors += 1;
+            entry.last_error_at = Some(at);
+            entry.last_error = detail.to_string();
+            entry.recent_errors.push(PollErrorEntry {
+                at,
+                monitor: monitor.to_string(),
+                method: method.to_string(),
+                detail: detail.to_string(),
+            });
+            if entry.recent_errors.len() > MAX_RECENT_POLL_ERRORS {
+                let excess = entry.recent_errors.len() - MAX_RECENT_POLL_ERRORS;
+                entry.recent_errors.drain(..excess);
+            }
+        }
+    }
 }
 
 /// Concrete values for the remux title-tag template tokens, filled by
@@ -2413,6 +2497,45 @@ mod tests {
             // Not valid asset-source preferences.
             assert_eq!(Platform::parse_opt(p.as_str()), None);
         }
+    }
+
+    #[test]
+    fn poll_stats_record_rings_recent_errors() {
+        let mut stats = PollStats::default();
+
+        // A success bumps only the poll counter.
+        stats.record(999_999, Platform::Twitch, "Helix API", "ch", false, "");
+        assert!(stats.by_platform["twitch"].recent_errors.is_empty());
+
+        // Ring cap: MAX+10 errors keep only the newest MAX, oldest dropped.
+        for i in 0..(MAX_RECENT_POLL_ERRORS as i64 + 10) {
+            stats.record(1_000_000 + i, Platform::Twitch, "Helix API", "ch", true, &format!("err {i}"));
+        }
+        let tw = &stats.by_platform["twitch"];
+        assert_eq!(tw.recent_errors.len(), MAX_RECENT_POLL_ERRORS);
+        assert_eq!(tw.recent_errors[0].detail, "err 10", "oldest dropped from the front");
+        assert_eq!(tw.recent_errors.last().unwrap().detail, format!("err {}", MAX_RECENT_POLL_ERRORS as i64 + 9));
+        assert_eq!(tw.last_error, tw.recent_errors.last().unwrap().detail, "last_error mirrors the newest entry");
+        // Platforms ring independently.
+        stats.record(2_000_000, Platform::YouTube, "Scrape", "yt", true, "yt boom");
+        assert_eq!(stats.by_platform["youtube"].recent_errors.len(), 1);
+        assert_eq!(stats.by_platform["twitch"].recent_errors.len(), MAX_RECENT_POLL_ERRORS);
+    }
+
+    #[test]
+    fn poll_stats_json_backcompat_gains_recent_errors() {
+        // JSON persisted by a build that predates recent_errors (the real
+        // shape from app_settings.poll_stats) must still load.
+        let old = r#"{"by_platform":{"twitch":{"polls":100,"errors":2,
+            "last_error_at":12345,"last_error":"boom"}}}"#;
+        let mut stats: PollStats = serde_json::from_str(old).expect("old JSON loads");
+        let tw = &stats.by_platform["twitch"];
+        assert_eq!(tw.polls, 100);
+        assert!(tw.recent_errors.is_empty());
+        // And keeps accumulating from there.
+        stats.record(20_000, Platform::Twitch, "Helix API", "ch", true, "later");
+        assert_eq!(stats.by_platform["twitch"].polls, 101);
+        assert_eq!(stats.by_platform["twitch"].recent_errors.len(), 1);
     }
 
     #[test]

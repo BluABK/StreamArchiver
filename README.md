@@ -1365,8 +1365,26 @@ error rate, and the timestamp + detail of the most recent failure (hover the
 timestamp for the full message). This is meant to surface *instability* that
 would otherwise only show up by combing the log: a platform's error rate
 climbing, or a recent DNS/auth failure repeating. A platform never polled
-(e.g. no Kick channels configured) simply doesn't appear. **Reset** clears
-the counters; they otherwise persist across restarts.
+(e.g. no Kick channels configured) simply doesn't appear.
+
+Below the counters, **⚠ Recent errors** expands to the actual individual
+failures behind the numbers — the last 50 per platform, newest first, each
+with its timestamp, platform, channel, detection method, and error detail
+(long messages are truncated in the cell; hover for the full text).
+
+Two **history graphs** plot the same request stream over time, with a
+timespan selector (**1 h / 6 h / 12 h / 24 h / 7 d / 30 d** — wider spans use
+wider buckets, from 1 min at 1 h up to 12 h at 30 d):
+
+- **Error rate per platform** — failed checks as a percentage of all checks,
+  one line per platform in its brand color (matching the log tags).
+- **Requests per kind** — request volume per detection method (Helix API,
+  Scrape, Probe, YT API, Kick API, …), all platforms combined.
+
+The graph data is stored at minute resolution in the database (`poll_history`
+table) and kept for 60 days; coarser views are aggregated at query time.
+**Reset** clears the counters, the recent-error list, and the graph history
+together; everything otherwise persists across restarts.
 
 ![Stats tab — Claude OCR usage/cost and YouTube Data API quota](doc/screenshots/stats-ocr.png)
 

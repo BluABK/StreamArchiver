@@ -206,20 +206,25 @@ async fn tick(
     // without needing to comb the log.
     if !outcomes.is_empty() {
         let mut stats = load_poll_stats(&ctx.store);
+        // (platform key, method label) -> (polls, errors) for this tick's
+        // fold into the minute-resolution poll_history table (Stats graphs).
+        let mut hist: HashMap<(&str, &str), (u64, u64)> = HashMap::new();
         for o in &outcomes {
-            let platform = meta
+            let (name, method, platform) = meta
                 .get(&o.monitor_id)
-                .map(|(_, _, p)| *p)
-                .unwrap_or(crate::models::Platform::Generic);
-            let entry = stats.by_platform.entry(platform.as_str().to_string()).or_default();
-            entry.polls += 1;
-            if o.error {
-                entry.errors += 1;
-                entry.last_error_at = Some(checked_at);
-                entry.last_error = o.detail.clone();
-            }
+                .map(|(n, m, p)| (n.as_str(), *m, *p))
+                .unwrap_or(("?", "?", crate::models::Platform::Generic));
+            stats.record(checked_at, platform, method, name, o.error, &o.detail);
+            let h = hist.entry((platform.as_str(), method)).or_default();
+            h.0 += 1;
+            h.1 += u64::from(o.error);
         }
         save_poll_stats(&ctx.store, &stats);
+        let counts: Vec<(&str, &str, u64, u64)> =
+            hist.into_iter().map(|((p, m), (polls, errors))| (p, m, polls, errors)).collect();
+        if let Err(e) = ctx.store.record_poll_history(checked_at, &counts) {
+            warn!("scheduler: failed to persist poll history: {e:#}");
+        }
     }
     for o in &outcomes {
         // This tick's `recording` snapshot was taken before the (possibly slow,
@@ -437,21 +442,19 @@ mod tests {
         assert!(stats.by_platform.is_empty());
 
         let mut stats = load_poll_stats(&store);
-        {
-            let e = stats.by_platform.entry(Platform::Twitch.as_str().to_string()).or_default();
-            e.polls += 1;
-        }
+        stats.record(12000, Platform::Twitch, "Helix API", "somechannel", false, "");
         save_poll_stats(&store, &stats);
 
         // A second tick's worth of outcomes folds onto the first, not replaces it.
         let mut stats = load_poll_stats(&store);
-        {
-            let e = stats.by_platform.entry(Platform::Twitch.as_str().to_string()).or_default();
-            e.polls += 1;
-            e.errors += 1;
-            e.last_error_at = Some(12345);
-            e.last_error = "error sending request for url (...)".into();
-        }
+        stats.record(
+            12345,
+            Platform::Twitch,
+            "Helix API",
+            "somechannel",
+            true,
+            "error sending request for url (...)",
+        );
         save_poll_stats(&store, &stats);
 
         let stats = load_poll_stats(&store);
@@ -460,6 +463,10 @@ mod tests {
         assert_eq!(tw.errors, 1);
         assert_eq!(tw.last_error_at, Some(12345));
         assert!(tw.last_error.contains("error sending request"));
+        // The individual error round-trips through the persisted JSON too.
+        assert_eq!(tw.recent_errors.len(), 1);
+        assert_eq!(tw.recent_errors[0].monitor, "somechannel");
+        assert_eq!(tw.recent_errors[0].method, "Helix API");
         // A platform that was never polled has no entry at all (not a
         // zeroed-out one) — the Stats view's "polls == 0 -> skip" check
         // relies on this via `.get(...).unwrap_or_default()`.

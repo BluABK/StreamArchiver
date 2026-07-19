@@ -1086,7 +1086,31 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 55)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 55);
+        if version < 56 {
+            // Minute-resolution poll/detect request history behind the Stats
+            // view's error-rate/request-volume graphs. One row per
+            // (minute-bucket, platform, detection-method); the scheduler
+            // upserts counter increments once per tick and prunes rows past
+            // the retention window (see `Store::record_poll_history`).
+            // Coarser views (hourly, daily, …) are SQL GROUP BY aggregations
+            // at query time, not extra tiers of storage. Deliberately no
+            // monitor FK: rows aggregate across monitors and must survive
+            // monitor deletion — this is request health, not channel history.
+            conn.execute_batch(
+                r#"
+                CREATE TABLE poll_history (
+                    bucket_t  INTEGER NOT NULL,
+                    platform  TEXT NOT NULL,
+                    method    TEXT NOT NULL,
+                    polls     INTEGER NOT NULL DEFAULT 0,
+                    errors    INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (bucket_t, platform, method)
+                ) WITHOUT ROWID;
+                "#,
+            )?;
+            conn.pragma_update(None, "user_version", 56)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 56);
         Ok(())
     }
 }

@@ -31,8 +31,9 @@ pub struct PlatTag(pub Platform);
 
 impl PlatTag {
     /// Brand color as RGB (Twitch purple, YouTube red, Kick green, NRK blue,
-    /// Nebula indigo).
-    fn rgb(&self) -> (u8, u8, u8) {
+    /// Nebula indigo). Also used by the Stats view's per-platform plot lines
+    /// so graph colors match the log tags.
+    pub(crate) fn rgb(&self) -> (u8, u8, u8) {
         match self.0 {
             Platform::Twitch => (145, 70, 255), // #9146FF
             Platform::YouTube => (255, 68, 68), // #FF4444 (pure #FF0000 reads as an error color)

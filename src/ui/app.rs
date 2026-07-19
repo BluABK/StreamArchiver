@@ -563,6 +563,8 @@ impl StreamArchiverApp {
             debug_test_title: "Test Stream Title".into(),
             debug_test_game: "Just Chatting".into(),
             stats_snapshot: None,
+            stats_poll_span: super::PollSpan::Day,
+            stats_history: None,
             io_hist: Vec::new(),
             io_snap: None,
             io_refreshed: None,

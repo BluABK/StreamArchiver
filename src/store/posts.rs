@@ -566,12 +566,122 @@ impl Store {
         )?;
         Ok(r)
     }
+
+    // ----- poll/detect request history (schema v56) -----
+
+    /// Fold one scheduler tick's poll/detect outcomes into the minute-bucket
+    /// `poll_history` table: one upsert-increment per `(platform, method)`
+    /// pair that saw traffic this tick (`counts` = platform key, method
+    /// short-label, polls, errors), then prune rows past the retention
+    /// window. Feeds the Stats view's graphs via [`Store::poll_history`].
+    pub fn record_poll_history(&self, at_unix: i64, counts: &[(&str, &str, u64, u64)]) -> Result<()> {
+        let bucket_t = at_unix - at_unix.rem_euclid(POLL_HISTORY_RAW_BUCKET_SECS);
+        let conn = self.db();
+        for (platform, method, polls, errors) in counts {
+            conn.execute(
+                "INSERT INTO poll_history(bucket_t, platform, method, polls, errors)
+                 VALUES(?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(bucket_t, platform, method) DO UPDATE SET
+                    polls = polls + excluded.polls,
+                    errors = errors + excluded.errors",
+                params![bucket_t, platform, method, *polls as i64, *errors as i64],
+            )?;
+        }
+        // Range delete on the PK's leading column — cheap even when nothing
+        // is old enough yet, so just run it every fold.
+        conn.execute(
+            "DELETE FROM poll_history WHERE bucket_t < ?1",
+            params![bucket_t - POLL_HISTORY_RETENTION_SECS],
+        )?;
+        Ok(())
+    }
+
+    /// Poll/detect history since `since_unix`, re-aggregated into
+    /// `bucket_secs`-wide buckets per `(platform, method)`, oldest first.
+    /// Coarser views (hour/day/week graphs) are pure query-time GROUP BYs
+    /// over the minute-resolution rows — there are no extra storage tiers.
+    pub fn poll_history(&self, since_unix: i64, bucket_secs: i64) -> Result<Vec<PollBucket>> {
+        let bucket_secs = bucket_secs.max(POLL_HISTORY_RAW_BUCKET_SECS);
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT (bucket_t / ?1) * ?1 AS tb, platform, method,
+                    SUM(polls), SUM(errors)
+             FROM poll_history
+             WHERE bucket_t >= ?2
+             GROUP BY tb, platform, method
+             ORDER BY tb",
+        )?;
+        let rows = stmt
+            .query_map(params![bucket_secs, since_unix], |r| {
+                Ok(PollBucket {
+                    t: r.get(0)?,
+                    platform: r.get(1)?,
+                    method: r.get(2)?,
+                    polls: r.get::<_, i64>(3)?.max(0) as u64,
+                    errors: r.get::<_, i64>(4)?.max(0) as u64,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Drop all poll/detect history (the Stats view's Reset button clears
+    /// the graphs together with the cumulative counters).
+    pub fn clear_poll_history(&self) -> Result<()> {
+        self.db().execute("DELETE FROM poll_history", [])?;
+        Ok(())
+    }
 }
+
+/// Raw storage resolution of the `poll_history` table (one minute).
+const POLL_HISTORY_RAW_BUCKET_SECS: i64 = 60;
+/// How much minute-resolution history is kept before pruning (60 days —
+/// roughly 430k rows worst-case with every platform and method active, a
+/// trivial table for SQLite).
+const POLL_HISTORY_RETENTION_SECS: i64 = 60 * 86_400;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::test_util::*;
+
+    #[test]
+    fn poll_history_upserts_aggregates_and_prunes() {
+        let store = Store::open_in_memory().unwrap();
+        let t0: i64 = 1_000_000 - 1_000_000_i64.rem_euclid(3600); // hour-aligned
+
+        // Two folds into the same minute bucket upsert-increment one row.
+        store.record_poll_history(t0 + 5, &[("twitch", "Helix API", 3, 1)]).unwrap();
+        store.record_poll_history(t0 + 30, &[("twitch", "Helix API", 2, 0)]).unwrap();
+        // Same minute, different pair -> its own row.
+        store.record_poll_history(t0 + 40, &[("youtube", "Scrape", 4, 4)]).unwrap();
+        // A later minute -> new bucket for the same pair.
+        store.record_poll_history(t0 + 90, &[("twitch", "Helix API", 1, 0)]).unwrap();
+
+        // Minute-resolution query sees the raw buckets.
+        let raw = store.poll_history(t0, 60).unwrap();
+        assert_eq!(raw.len(), 3);
+        let first = raw.iter().find(|b| b.t == t0 && b.platform == "twitch").unwrap();
+        assert_eq!((first.polls, first.errors), (5, 1), "same-minute folds accumulated");
+
+        // Query-time aggregation: an hour-wide bucket folds the minutes.
+        let hourly = store.poll_history(t0, 3600).unwrap();
+        assert_eq!(hourly.len(), 2, "one bucket per (platform, method)");
+        let tw = hourly.iter().find(|b| b.platform == "twitch").unwrap();
+        assert_eq!((tw.polls, tw.errors), (6, 1));
+        assert_eq!(tw.t, t0, "bucket start aligned down to the bucket width");
+
+        // `since` filters, and a fold ~61 days later prunes the old rows.
+        assert!(store.poll_history(t0 + 3600, 60).unwrap().is_empty());
+        store
+            .record_poll_history(t0 + 61 * 86_400, &[("twitch", "Helix API", 1, 0)])
+            .unwrap();
+        let all = store.poll_history(0, 60).unwrap();
+        assert_eq!(all.len(), 1, "everything from t0 aged out");
+
+        store.clear_poll_history().unwrap();
+        assert!(store.poll_history(0, 60).unwrap().is_empty());
+    }
 
     #[test]
     fn community_post_archive_dedupes_and_preserves_ocr() {
