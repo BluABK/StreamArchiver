@@ -568,6 +568,32 @@ pub async fn build_playlist(
     Ok(RecoveredPlaylist { text: out, total, present, unmuted_recovered, muted_used, missing })
 }
 
+/// The broadcast-timeline PTS (seconds) of a playlist's first media segment —
+/// the "position zero" anchor for the head backfill's PTS-exact splice math
+/// (see `downloader::pts_capture_offset`). Probes it by writing a one-segment
+/// absolutized slice of the playlist into `scratch_dir` and ffprobing its
+/// `format=start_time` (ffprobe fetches just that segment from the CDN, a few
+/// MB). Goes through [`build_playlist`] so muted-segment fallback and fMP4
+/// handling match what the real head mux will do. `None` on any failure — the
+/// caller falls back to wall-clock arithmetic.
+pub async fn first_segment_start_secs(
+    client: &reqwest::Client,
+    playlist_url: &str,
+    max_conc: usize,
+    scratch_dir: &Path,
+) -> Option<f64> {
+    // 0.5s cap keeps exactly the first segment (the cut lands one segment over).
+    let pl = build_playlist(client, playlist_url, max_conc, false, Some(0.5), None).await.ok()?;
+    if pl.present == 0 {
+        return None;
+    }
+    let tmp = scratch_dir.join("seg0-pts-probe.m3u8");
+    crate::iomon::fs::write(crate::iomon::Cat::Recovery, &tmp, &pl.text).await.ok()?;
+    let pts = crate::downloader::media_start_time_secs(&tmp).await;
+    let _ = crate::iomon::fs::remove_file(crate::iomon::Cat::Recovery, &tmp).await;
+    pts
+}
+
 /// Truncate a playlist to its first `max_secs` seconds of media (by summed
 /// `#EXTINF` durations, so the cut lands on a segment boundary — up to one
 /// segment over), and terminate it with `#EXT-X-ENDLIST` if the source lacks

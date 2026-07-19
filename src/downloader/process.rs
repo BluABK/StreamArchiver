@@ -1470,6 +1470,8 @@ impl Supervisor {
         self.finalizing.lock().unwrap().insert(monitor_id, rec_id);
         self.active.lock().unwrap().remove(&monitor_id);
         // Finalize: promote .cache → output dir, move companions, post-rename, purge.
+        // The raw `.ts`'s first PTS must be saved before the remux resets timestamps.
+        persist_capture_start_pts(&self.store, rec_id, &plan.capture_path).await;
         let mut final_path = promote_capture(
             &plan,
             &remux_opts_for_recording(&self.store, rec_id),

@@ -3099,7 +3099,9 @@ progress_info: None,
     ) -> PathBuf {
         // Promote the finished capture from the hidden `.cache\` up to the output
         // dir (remux .ts→.mkv, or move an already-final container); a failed/0-byte
-        // capture is left in `.cache\` for the startup sweep.
+        // capture is left in `.cache\` for the startup sweep. The raw `.ts`'s
+        // first PTS must be saved before the remux resets timestamps.
+        persist_capture_start_pts(&self.store, rec_id, &plan.capture_path).await;
         let mut final_path = promote_capture(
             plan,
             &remux_opts_for_recording(&self.store, rec_id),

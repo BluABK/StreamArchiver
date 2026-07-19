@@ -1110,7 +1110,20 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 56)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 56);
+        if version < 57 {
+            // The live capture's first MPEG-TS PTS (ffprobe `format=start_time`,
+            // seconds), probed off the raw growing `.ts`. Twitch HLS segments
+            // keep the broadcast's own PTS timeline, so this minus the DVR
+            // playlist's segment-0 PTS is the *exact* stream position where the
+            // capture joined — the head backfill cuts there instead of trusting
+            // wall-clock arithmetic (which overshoots by the broadcast latency,
+            // duplicating ~6s at the head/live splice). Persisted because the
+            // promote remux resets timestamps: once the take is an MKV the raw
+            // signal is gone, and a later manual "Backfill head" needs it.
+            conn.execute_batch("ALTER TABLE recording ADD COLUMN capture_start_pts REAL;")?;
+            conn.pragma_update(None, "user_version", 57)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 57);
         Ok(())
     }
 }

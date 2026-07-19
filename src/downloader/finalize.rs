@@ -570,6 +570,24 @@ pub(super) fn capture_log_path(capture_path: &Path, suffix: &str) -> PathBuf {
     dir.join(format!("{name}.{suffix}"))
 }
 
+/// Persist the raw capture's first MPEG-TS PTS onto its recording row before
+/// the promote remux erases it (MKV timestamps restart at ~0). It's the head
+/// backfill's exact-splice anchor (`pts_capture_offset`): a manual "Backfill
+/// head" on the finished take can only splice exactly if a raw-`.ts`-era value
+/// survives. No-op for non-`.ts` captures (no broadcast timeline) and for rows
+/// that already have a value (the in-recording head job writes it first).
+pub(super) async fn persist_capture_start_pts(store: &Store, rec_id: i64, capture_path: &Path) {
+    if rec_id <= 0
+        || !capture_path.extension().is_some_and(|e| e.eq_ignore_ascii_case("ts"))
+        || store.recording_capture_start_pts(rec_id).ok().flatten().is_some()
+    {
+        return;
+    }
+    if let Some(pts) = media_start_time_secs(capture_path).await {
+        let _ = store.set_recording_capture_start_pts(rec_id, pts);
+    }
+}
+
 /// Promote a finished capture from the `.cache\` working dir up to its final path
 /// in the output dir: remux (TS→MKV) or move (already-final container), deleting the
 /// cache source on success. A 0-byte/failed capture is left in `.cache\` (returns

@@ -295,6 +295,18 @@ to the recording. Doing this *during* the stream matters: DMCA mutes are applied
 minutes **after** the stream ends and scrub the original segments — a head
 fetched mid-stream carries the **original, un-muted audio**.
 
+The head is cut at a **PTS-exact splice point**: the live capture's raw `.ts`
+and the CDN playlist's segments carry the *same* broadcast MPEG-TS timeline, so
+comparing their `start_time`s pinpoints exactly where the capture joined, and
+the head ends precisely there — no duplicated seconds at the seam. (A pure
+wall-clock estimate systematically overshoots by the broadcast latency, ~5–15 s,
+which used to appear as a short backwards jump-cut at the `full.mkv` splice.)
+The capture's first PTS is also saved on the take the moment it finishes —
+before the MKV remux resets timestamps — so a later manual *Backfill head* can
+still splice exactly. If either PTS anchor is unavailable, or the two disagree
+by more than 60 s (timestamp discontinuity, non-TS capture), the job logs it
+and falls back to the wall-clock estimate.
+
 Once the live recording finishes, the head and the capture are **losslessly
 concatenated** (stream copy, no re-encode) into `{stem}.full.mkv` — a true
 full-stream file — and **both parts are kept**. The take shows a **🧩 head**

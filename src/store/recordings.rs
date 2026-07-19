@@ -157,6 +157,35 @@ impl Store {
         Ok(v.flatten())
     }
 
+    /// Record the live capture's first MPEG-TS PTS (ffprobe `format=start_time`,
+    /// seconds) — the exact-splice anchor for head backfills (see the v57
+    /// migration comment). First writer wins: the head-backfill job and the
+    /// finalize path both probe the same growing `.ts`, so whichever lands
+    /// first is the authoritative (identical) value, and a later re-probe of
+    /// an already-remuxed file (PTS reset to ~0) can never clobber it.
+    pub fn set_recording_capture_start_pts(&self, id: i64, pts_secs: f64) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE recording SET capture_start_pts=?2 WHERE id=?1 AND capture_start_pts IS NULL",
+            params![id, pts_secs],
+        )?;
+        Ok(())
+    }
+
+    /// The persisted capture-start PTS, if one was ever probed (`None` = never
+    /// probed, e.g. a take finished before this feature or a non-TS capture).
+    pub fn recording_capture_start_pts(&self, id: i64) -> Result<Option<f64>> {
+        let conn = self.db();
+        let v = conn
+            .query_row(
+                "SELECT capture_start_pts FROM recording WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, Option<f64>>(0),
+            )
+            .optional()?;
+        Ok(v.flatten())
+    }
+
     /// Set/clear a recording's pending-head-backfill marker. `"queued"` while
     /// `head_backfill_job` hasn't yet decided whether there's anything to
     /// fetch; `""` once it has (started fetching, or determined nothing was
@@ -1680,5 +1709,26 @@ mod tests {
         store.set_head_backfill_state(rid, "").unwrap();
         assert!(store.queued_head_backfills().unwrap().is_empty());
         assert_eq!(store.get_recording(rid).unwrap().unwrap().head_backfill_state, "");
+    }
+
+    #[test]
+    fn capture_start_pts_first_writer_wins() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        let rid = store
+            .insert_recording(mid, 100, "C:/tmp/a.mkv", Some(50), false, Some("s1"), None, "", "")
+            .unwrap();
+
+        // Never probed → None.
+        assert_eq!(store.recording_capture_start_pts(rid).unwrap(), None);
+
+        // First probe sticks…
+        store.set_recording_capture_start_pts(rid, 371.433).unwrap();
+        assert_eq!(store.recording_capture_start_pts(rid).unwrap(), Some(371.433));
+
+        // …and a later (post-remux, PTS-reset) write can't clobber it.
+        store.set_recording_capture_start_pts(rid, 0.0).unwrap();
+        assert_eq!(store.recording_capture_start_pts(rid).unwrap(), Some(371.433));
     }
 }

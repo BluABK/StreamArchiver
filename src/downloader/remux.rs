@@ -699,6 +699,39 @@ pub(super) async fn media_duration_secs(path: &Path) -> Option<i64> {
     }
 }
 
+/// First presentation timestamp of `path` in seconds via ffprobe
+/// (`format=start_time`), or `None` if it can't be determined. For a raw
+/// MPEG-TS capture (even a still-growing one — start_time comes from the
+/// first packets) this is the broadcast's own PTS timeline position, which is
+/// what the head backfill's exact-splice math needs; a remuxed MKV reports ~0
+/// (timestamps reset), which the caller's sanity window rejects. Also accepts
+/// a local `.m3u8` slice with absolute https segment URLs (the same
+/// protocol-whitelist arrangement `recovery::mux_playlist_to_mkv` feeds
+/// ffmpeg) — that's how the DVR playlist's segment-0 PTS is probed.
+pub async fn media_start_time_secs(path: &Path) -> Option<f64> {
+    let mut cmd = Command::new("ffprobe");
+    cmd.args(["-v", "error", "-hide_banner",
+              "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+              "-show_entries", "format=start_time",
+              "-of", "default=noprint_wrappers=1:nokey=1"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let out = tokio::time::timeout(Duration::from_secs(20), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let secs: f64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    if secs.is_finite() && secs >= 0.0 { Some(secs) } else { None }
+}
+
 /// True if the MKV at `path` already has at least one attachment stream (cover art).
 /// Runs `ffprobe` synchronously — only call from a blocking context or `spawn_blocking`.
 pub fn mkv_has_thumbnail(path: &Path) -> bool {

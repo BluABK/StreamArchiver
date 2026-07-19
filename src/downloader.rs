@@ -181,6 +181,39 @@ fn compute_missed_secs(went_live_at: i64, started_at: i64, captured: Option<i64>
         None => (started_at - went_live_at).max(0),
     }
 }
+
+/// One MPEG-TS 33-bit PTS wrap (2^33 ticks at 90 kHz), ≈ 26.5 hours.
+const MPEGTS_PTS_WRAP_SECS: f64 = 8_589_934_592.0 / 90_000.0;
+
+/// The exact stream position (seconds since go-live) where the live capture's
+/// first frame sits, derived from PTS instead of wall-clock arithmetic:
+/// Twitch's live segments and DVR-playlist segments share the broadcast's own
+/// MPEG-TS timeline, so `capture start_time − DVR segment-0 start_time` is the
+/// precise head/live splice point. The wall-clock `estimate` (today's
+/// `compute_missed_secs` result) systematically overshoots it by the broadcast
+/// latency (~5-15s), duplicating that much media at the `full.mkv` seam.
+///
+/// `None` when the PTS delta disagrees with the estimate by more than 60s —
+/// that rejects a wrong-timeline pairing wholesale: a remuxed capture whose
+/// timestamps were reset to ~0, a non-TS container, a PTS discontinuity, or a
+/// wrap we can't attribute. A single 33-bit wrap (streams > 26.5h) is
+/// corrected for before the check.
+fn pts_capture_offset(live_start: f64, seg0_start: f64, estimate_secs: f64) -> Option<f64> {
+    if !live_start.is_finite() || !seg0_start.is_finite() {
+        return None;
+    }
+    let mut delta = live_start - seg0_start;
+    if delta < 0.0 {
+        delta += MPEGTS_PTS_WRAP_SECS;
+    }
+    // A capture joining a >26.5h-old stream can also be one wrap short in the
+    // positive direction; pick whichever candidate lands nearest the estimate.
+    let wrapped = delta + MPEGTS_PTS_WRAP_SECS;
+    if (wrapped - estimate_secs).abs() < (delta - estimate_secs).abs() {
+        delta = wrapped;
+    }
+    ((delta - estimate_secs).abs() <= 60.0).then_some(delta)
+}
 #[derive(Clone)]
 pub struct Supervisor {
     store: Arc<Store>,
@@ -483,5 +516,46 @@ mod tests {
         // No measurable duration -> plain start-delay fallback, independent
         // of any reference.
         assert_eq!(compute_missed_secs(went_live_at, started_at, None, 999_999), started_at);
+    }
+
+    #[test]
+    fn pts_capture_offset_exact_within_sanity_window() {
+        // The Octopimp case: wall-clock said 377s missed, PTS says the capture
+        // actually joined at 371.4s -- the ~6s broadcast-latency overshoot.
+        let got = pts_capture_offset(371.433, 0.033, 377.0).unwrap();
+        assert!((got - 371.4).abs() < 0.01);
+
+        // DVR playlists whose timeline doesn't start at ~0 still work -- only
+        // the delta matters.
+        let got = pts_capture_offset(1500.0, 1128.6, 377.0).unwrap();
+        assert!((got - 371.4).abs() < 0.01);
+    }
+
+    #[test]
+    fn pts_capture_offset_rejects_wrong_timelines() {
+        // Remuxed MKV (timestamps reset to ~0) probed by mistake: delta ~0
+        // vs an estimate of 377s -> rejected, caller falls back to wall-clock.
+        assert_eq!(pts_capture_offset(0.0, 0.033, 377.0), None);
+        // Disagreement beyond the 60s window (PTS discontinuity, wrong file).
+        assert_eq!(pts_capture_offset(500.0, 0.0, 377.0), None);
+        // Non-finite probes never pass.
+        assert_eq!(pts_capture_offset(f64::NAN, 0.0, 377.0), None);
+        // Just inside the window still passes (latency can be large).
+        assert!(pts_capture_offset(420.0, 0.0, 377.0).is_some());
+    }
+
+    #[test]
+    fn pts_capture_offset_corrects_33bit_wrap() {
+        // A capture joining >26.5h in: the raw 90kHz PTS wrapped, so the naive
+        // delta is hugely negative; one wrap forward recovers the true offset.
+        let estimate = MPEGTS_PTS_WRAP_SECS + 400.0;
+        let live_start = 402.0; // wrapped back near zero
+        let got = pts_capture_offset(live_start, 0.0, estimate).unwrap();
+        assert!((got - (MPEGTS_PTS_WRAP_SECS + 402.0)).abs() < 0.01);
+
+        // Positive-but-one-wrap-short delta (seg0 sits just above the capture's
+        // wrapped PTS) also lands on the wrap-corrected candidate.
+        let got = pts_capture_offset(402.0, 1.0, estimate).unwrap();
+        assert!((got - (MPEGTS_PTS_WRAP_SECS + 401.0)).abs() < 0.01);
     }
 }

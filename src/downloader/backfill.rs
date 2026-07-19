@@ -155,18 +155,40 @@ impl Supervisor {
                 break;
             }
         }
+        // The raw growing `.ts` also carries the broadcast's own MPEG-TS
+        // timeline (the PTS-exact splice anchor, see `pts_capture_offset`).
+        // Grab it while the un-remuxed file still exists and persist it, so a
+        // later manual re-run — by then the take is a timestamp-reset MKV —
+        // can still splice exactly. A finished take skips the probe (wrong
+        // timeline) and reads back what a live run persisted, if anything.
+        let live_start_pts = match if missed_reference.is_none() {
+            media_start_time_secs(&capture_path).await
+        } else {
+            None
+        } {
+            Some(pts) => {
+                let _ = self.store.set_recording_capture_start_pts(rec_id, pts);
+                Some(pts)
+            }
+            None => self.store.recording_capture_start_pts(rec_id).ok().flatten(),
+        };
+        // Wall-clock estimate of the capture's own join offset (seconds since
+        // go-live). It overshoots the true offset by the broadcast latency —
+        // the PTS math below corrects that when it can, and sanity-checks
+        // against this estimate when it does.
+        let mut join_estimate = compute_missed_secs(
+            went_live_at,
+            started_at,
+            captured,
+            missed_reference.unwrap_or_else(now_unix),
+        );
         // Lead-time mode: `missed` is the configured fixed window, not derived
         // from go-live/captured — and it's an explicit user setting, not an
         // accidental-gap heuristic, so the `< 60s` sanity floor below doesn't
         // apply to it either.
         let mut missed = match lead_secs {
             Some(lead) => lead,
-            None => compute_missed_secs(
-                went_live_at,
-                started_at,
-                captured,
-                missed_reference.unwrap_or_else(now_unix),
-            ),
+            None => join_estimate,
         };
         if lead_secs.is_none() && missed < 60 {
             info!(rec_id, missed, "head backfill: gap too small, skipping");
@@ -224,29 +246,68 @@ impl Supervisor {
             finish(crate::events::TaskOutcome::Failed("live playlist not found".into()));
             return;
         };
-        if lead_secs.is_none() && captured.is_none() {
+        if captured.is_none() {
             // The capture wouldn't probe; the matched folder second is the true
-            // go-live moment — refine the fallback estimate with it. Not
-            // applicable in lead-time mode: `missed` there is the fixed
+            // go-live moment — refine the fallback estimate with it. `missed`
+            // only follows in normal mode: in lead-time mode it's the fixed
             // configured window, not a "distance since go-live" estimate.
-            missed = (started_at - found.matched_epoch).max(0);
+            join_estimate = (started_at - found.matched_epoch).max(0);
+            if lead_secs.is_none() {
+                missed = join_estimate;
+            }
         }
 
-        // Fetch only the head (+ a few seconds of seam overlap), fresh segments,
-        // no probing needed; `-t` trims the mux to the measured gap. In
-        // lead-time mode the slice doesn't start at the playlist's own
-        // beginning (the true go-live) — it starts `lead_secs` before THIS
-        // take's own start, so the CDN playlist (found via the real go-live
-        // anchor, which folder discovery still needs) gets an extra skip
-        // offset instead of being read from position zero.
-        let head_secs = missed as f64;
-        let skip_secs = lead_secs.map(|lead| (started_at - went_live_at - lead).max(0) as f64);
         // Source quality unless a specific rendition was requested (the
         // match-the-live-capture re-fetch), verified against what exists.
         let playlist_url = match &quality {
             Some(q) => crate::recovery::playlist_at_quality(&client, &found, q, max_conc).await,
             None => found.url.clone(),
         };
+        let cache = cache_dir(&out_dir);
+        let _ = crate::iomon::fs::create_dir_all(Cat::Recovery, &cache).await;
+        set_cache_hidden(&cache);
+        // PTS-exact splice point: the capture's `.ts` and the DVR playlist's
+        // segments share the broadcast's own MPEG-TS timeline, so their
+        // start_time difference is exactly where the capture joined. The
+        // wall-clock estimate overshoots that by the broadcast latency
+        // (~5-15s), which used to duplicate that much media at the full.mkv
+        // seam (the 6s backwards jumpcut). Fall back to the estimate when
+        // either anchor is unavailable or they disagree wildly.
+        let pts_offset = match live_start_pts {
+            Some(live) => {
+                crate::recovery::first_segment_start_secs(&client, &playlist_url, max_conc, &cache)
+                    .await
+                    .and_then(|seg0| pts_capture_offset(live, seg0, join_estimate as f64))
+            }
+            None => None,
+        };
+        match pts_offset {
+            Some(o) => info!(
+                rec_id,
+                "head backfill: PTS-exact splice at {o:.2}s (wall-clock estimate {join_estimate}s, corrected {:+.2}s)",
+                o - join_estimate as f64
+            ),
+            None => info!(
+                rec_id,
+                "head backfill: no PTS splice anchor — cutting at the wall-clock estimate {join_estimate}s"
+            ),
+        }
+        // Fetch only the head (+ a few seconds of seam overlap), fresh segments,
+        // no probing needed; `-t` trims the mux to the splice point. In
+        // lead-time mode the slice doesn't start at the playlist's own
+        // beginning (the true go-live) — it starts `lead_secs` before THIS
+        // take's own start, so the CDN playlist (found via the real go-live
+        // anchor, which folder discovery still needs) gets an extra skip
+        // offset instead of being read from position zero.
+        let head_secs = match (lead_secs, pts_offset) {
+            (Some(lead), _) => lead as f64,
+            (None, Some(offset)) => offset,
+            (None, None) => missed as f64,
+        };
+        let skip_secs = lead_secs.map(|lead| match pts_offset {
+            Some(offset) => (offset - lead as f64).max(0.0),
+            None => (started_at - went_live_at - lead).max(0) as f64,
+        });
         let playlist = match crate::recovery::build_playlist(
             &client,
             &playlist_url,
@@ -264,9 +325,6 @@ impl Supervisor {
                 return;
             }
         };
-        let cache = cache_dir(&out_dir);
-        let _ = crate::iomon::fs::create_dir_all(Cat::Recovery, &cache).await;
-        set_cache_hidden(&cache);
         let pl_path = cache.join(format!("{stem}.head.m3u8"));
         if let Err(e) = crate::iomon::fs::write(Cat::Recovery, &pl_path, &playlist.text).await {
             warn!(rec_id, "head backfill: cannot write playlist: {e:#}");
