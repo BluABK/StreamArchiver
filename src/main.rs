@@ -17,6 +17,7 @@ mod eventsub;
 mod fonts;
 mod google_oauth;
 mod grid_columns;
+mod disposal;
 mod head_backfill;
 mod hls_preview;
 mod imports;

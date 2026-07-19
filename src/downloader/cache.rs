@@ -59,7 +59,8 @@ pub fn set_cache_root(raw: &str) {
 }
 
 /// Drive letter of a path's prefix component (e.g. 'A' for `A:\x`), uppercased.
-pub(super) fn drive_of(path: &Path) -> Option<char> {
+/// `pub(crate)`: also used by `disposal::pick_trash_root`'s same-drive matching.
+pub(crate) fn drive_of(path: &Path) -> Option<char> {
     match path.components().next()? {
         std::path::Component::Prefix(p) => match p.kind() {
             std::path::Prefix::Disk(d) | std::path::Prefix::VerbatimDisk(d) => {

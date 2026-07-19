@@ -216,6 +216,9 @@ impl StreamArchiverApp {
                 .ok()
                 .flatten()
                 .is_none_or(|v| v != "0"),
+            join_cleanup: crate::disposal::global_join_cleanup(&core.store),
+            disposal_method: crate::disposal::global_method(&core.store),
+            disposal_trash_dirs: setting_or_empty(&core, crate::disposal::K_TRASH_DIRS),
             trigger_rules: crate::triggers::load_global_rules(&core.store),
             trigger_block_rules: crate::triggers::load_global_block_rules(&core.store),
             custom_tools: crate::downloader::load_custom_tools(&core.store),
@@ -1121,6 +1124,10 @@ impl StreamArchiverApp {
             fetch: form.head_backfill_fetch,
             replace: form.head_backfill_replace,
         };
+        let disposal_scope = crate::disposal::DisposalScope {
+            method: form.disposal_method,
+            join_cleanup: form.join_cleanup,
+        };
         let primary_pin = form.primary_pin;
 
         // Close the form immediately so the UI stays responsive while the DB
@@ -1170,6 +1177,7 @@ impl StreamArchiverApp {
                         mid,
                         &head_backfill_scope,
                     );
+                    let _ = crate::disposal::save_monitor_disposal_scope(&store, mid, &disposal_scope);
                     let _ = crate::platform_pref::save_monitor_pin(&store, mid, primary_pin);
                     let rows = store.list_monitors_with_channels().map_err(|e| e.to_string())?;
                     let next_streams =
@@ -1500,6 +1508,9 @@ impl StreamArchiverApp {
             (crate::head_backfill::K_HEAD_BACKFILL_FETCH, if s.head_backfill_fetch_new_take { "1" } else { "0" }),
             (crate::downloader::K_QUALITY_UPGRADE, if s.quality_upgrade_restart { "1" } else { "0" }),
             (crate::head_backfill::K_HEAD_BACKFILL_REPLACE, if s.head_backfill_replace_old { "1" } else { "0" }),
+            (crate::disposal::K_JOIN_CLEANUP, s.join_cleanup.as_str()),
+            (crate::disposal::K_DISPOSAL_METHOD, s.disposal_method.as_str()),
+            (crate::disposal::K_TRASH_DIRS, s.disposal_trash_dirs.trim()),
         ];
         for (k, v) in pairs {
             if let Err(e) = self.core.store.set_setting(k, v) {
@@ -1690,6 +1701,9 @@ impl StreamArchiverApp {
                         let hbsc = crate::head_backfill::load_monitor_head_backfill_scope(&self.core.store, self.rows[idx].monitor.id);
                         mf.head_backfill_fetch = hbsc.fetch;
                         mf.head_backfill_replace = hbsc.replace;
+                        let dsc = crate::disposal::load_monitor_disposal_scope(&self.core.store, self.rows[idx].monitor.id);
+                        mf.join_cleanup = dsc.join_cleanup;
+                        mf.disposal_method = dsc.method;
                         mf.primary_pin = crate::platform_pref::monitor_is_pinned(&self.core.store, self.rows[idx].monitor.id);
                         self.form = Some(mf);
                     }

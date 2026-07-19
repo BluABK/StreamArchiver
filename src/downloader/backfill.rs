@@ -415,23 +415,38 @@ impl Supervisor {
         else {
             return;
         };
+        let channel_id = self
+            .store
+            .get_monitor_with_channel(monitor_id)
+            .ok()
+            .flatten()
+            .map(|mw| mw.channel.id)
+            .unwrap_or(0); // no channel row → no channel override, global/monitor still apply
         for (old_id, old_path) in others {
             // Last chance to bake the old head into that take's own full.mkv
             // before the head file disappears out from under it.
             self.maybe_concat_backfill(old_id).await;
             let path = PathBuf::from(&old_path);
-            let removed = match crate::iomon::fs::remove_file(Cat::CacheSweep, &path).await {
-                Ok(()) => true,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-                Err(e) => {
-                    warn!(old_id, keep_rec_id, "head backfill: could not remove superseded head: {e:#}");
-                    false
+            // Already gone (user-pruned) counts as removed; otherwise the
+            // removal follows the configured disposal method (trash folder /
+            // Recycle Bin / permanent — see `crate::disposal`).
+            let removed = if !crate::iomon::fs::is_file_sync(Cat::CacheSweep, &path) {
+                Some("already gone")
+            } else {
+                match crate::disposal::dispose_media(&self.store, channel_id, monitor_id, &path)
+                    .await
+                {
+                    Ok(d) => Some(d.describe()),
+                    Err(e) => {
+                        warn!(old_id, keep_rec_id, "head backfill: could not remove superseded head: {e:#}");
+                        None
+                    }
                 }
             };
-            if removed {
+            if let Some(how) = removed {
                 let _ = self.store.clear_recording_backfill_path(old_id);
                 let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: old_id });
-                info!(old_id, keep_rec_id, "head backfill: superseded by a newer take's fresh head");
+                info!(old_id, keep_rec_id, "head backfill: superseded by a newer take's fresh head ({how})");
             }
         }
     }
@@ -940,21 +955,101 @@ impl Supervisor {
                 let _ = self
                     .store
                     .set_recording_full_path(rec_id, &dest.to_string_lossy());
+                // Opt-in parts cleanup (instance > channel > global; the
+                // default keeps both parts). Runs only after the duration
+                // sanity gate above accepted the join, and every removal goes
+                // through the configured disposal method (trash folder /
+                // Recycle Bin / permanent — see `crate::disposal`).
+                let note = self.post_join_cleanup(rec_id, &head_p, &live_p, &dest).await;
                 let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
                 info!(
                     rec_id,
-                    "head concat {}: full stream ready at {}",
+                    "head concat {}: full stream ready at {} ({note})",
                     Platform::Twitch.tag(),
                     dest.display()
                 );
-                finish(crate::events::TaskOutcome::CompletedWithNote(
-                    "head + live joined (parts kept)".into(),
-                ));
+                finish(crate::events::TaskOutcome::CompletedWithNote(format!(
+                    "head + live joined ({note})"
+                )));
             }
             Err(e) => {
                 warn!(rec_id, "head concat: promote failed: {e:#}");
                 finish(crate::events::TaskOutcome::Failed(format!("promote: {e}")));
             }
         }
+    }
+
+    /// Execute the effective post-join cleanup for a freshly-landed
+    /// `full.mkv`; returns a short outcome note for the log and the task's
+    /// Recent row ("parts kept", "head sent to Recycle Bin, capture moved to
+    /// trash", …). Failure never blocks the join: a part whose disposal fails
+    /// is simply kept, with its DB pointer intact.
+    async fn post_join_cleanup(
+        &self,
+        rec_id: i64,
+        head_p: &Path,
+        live_p: &Path,
+        full: &Path,
+    ) -> String {
+        let scope = self
+            .store
+            .get_recording(rec_id)
+            .ok()
+            .flatten()
+            .and_then(|r| self.store.get_monitor_with_channel(r.monitor_id).ok().flatten())
+            .map(|mw| (mw.channel.id, mw.monitor.id));
+        let Some((channel_id, monitor_id)) = scope else {
+            return "parts kept".into();
+        };
+        let cleanup = crate::disposal::effective_join_cleanup(&self.store, channel_id, monitor_id);
+        if cleanup == crate::disposal::JoinCleanup::Keep {
+            return "parts kept".into();
+        }
+        // Head first — only a successful disposal clears the DB pointer (the
+        // 🧩 head badge follows `backfill_path`).
+        let head_note =
+            match crate::disposal::dispose_media(&self.store, channel_id, monitor_id, head_p).await
+            {
+                Ok(d) => {
+                    let _ = self.store.clear_recording_backfill_path(rec_id);
+                    format!("head {}", d.describe())
+                }
+                Err(e) => {
+                    warn!(rec_id, "post-join cleanup: head disposal failed: {e:#} (head kept)");
+                    "head kept (disposal failed)".to_string()
+                }
+            };
+        if cleanup != crate::disposal::JoinCleanup::Both {
+            return head_note;
+        }
+        // The live capture is the take's main file: re-point the row at the
+        // full BEFORE removing it, so there is no window where `output_path`
+        // names a deleted file. Sidecars (chat/thumbnail) share the stem with
+        // the full and stay matched.
+        let full_s = full.to_string_lossy().into_owned();
+        let live_note = match self.store.update_recording_output_path(rec_id, &full_s) {
+            Ok(()) => {
+                match crate::disposal::dispose_media(&self.store, channel_id, monitor_id, live_p)
+                    .await
+                {
+                    Ok(d) => format!("capture {}", d.describe()),
+                    Err(e) => {
+                        warn!(
+                            rec_id,
+                            "post-join cleanup: live-capture disposal failed: {e:#} (kept alongside)"
+                        );
+                        "capture kept (disposal failed)".to_string()
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    rec_id,
+                    "post-join cleanup: could not re-point the take at the full: {e:#} (capture kept)"
+                );
+                "capture kept".to_string()
+            }
+        };
+        format!("{head_note}, {live_note}")
     }
 }

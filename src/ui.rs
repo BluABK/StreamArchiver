@@ -283,6 +283,12 @@ struct MonitorForm {
     /// the channel/global default). Loaded from / saved to the monitor scope map.
     head_backfill_fetch: Option<bool>,
     head_backfill_replace: Option<bool>,
+    /// Automatic-deletion overrides for this instance (`None` = inherit the
+    /// channel/global default): what happens to head/live parts after a
+    /// full.mkv join, and how automatic media deletes are executed. Loaded
+    /// from / saved to the monitor disposal scope map (`crate::disposal`).
+    join_cleanup: Option<crate::disposal::JoinCleanup>,
+    disposal_method: Option<crate::disposal::DisposalMethod>,
     /// "Always show this instance's info on the channel row when it's live" —
     /// the strongest tier of `crate::platform_pref` (beats both the channel
     /// and global platform preference). Loaded from / saved to the monitor
@@ -332,6 +338,8 @@ impl MonitorForm {
             vod_replace: None,
             head_backfill_fetch: None,
             head_backfill_replace: None,
+            join_cleanup: None,
+            disposal_method: None,
         }
     }
 
@@ -372,6 +380,8 @@ impl MonitorForm {
             vod_replace: None,
             head_backfill_fetch: None,
             head_backfill_replace: None,
+            join_cleanup: None,
+            disposal_method: None,
             primary_pin: false,
         }
     }
@@ -416,6 +426,8 @@ impl MonitorForm {
             vod_replace: None,
             head_backfill_fetch: None,
             head_backfill_replace: None,
+            join_cleanup: None,
+            disposal_method: None,
         }
     }
 }
@@ -434,6 +446,44 @@ fn tristate_combo(ui: &mut egui::Ui, id: &str, value: &mut Option<bool>) -> egui
             ui.selectable_value(value, None, "Inherit");
             ui.selectable_value(value, Some(true), "On");
             ui.selectable_value(value, Some(false), "Off");
+        })
+        .response
+}
+
+/// An **Inherit / Keep parts / Delete head / Delete head + capture** dropdown
+/// for an `Option<JoinCleanup>` override (`None` = inherit the level above).
+/// Returns the combo's response for hovers. See [`crate::disposal`].
+fn join_cleanup_combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    value: &mut Option<crate::disposal::JoinCleanup>,
+) -> egui::Response {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(value.map(crate::disposal::JoinCleanup::label).unwrap_or("Inherit"))
+        .show_ui(ui, |ui| {
+            ui.selectable_value(value, None, "Inherit");
+            for c in crate::disposal::JoinCleanup::ALL {
+                ui.selectable_value(value, Some(c), c.label());
+            }
+        })
+        .response
+}
+
+/// An **Inherit / Trash folder / Recycle Bin / Delete permanently** dropdown
+/// for an `Option<DisposalMethod>` override (`None` = inherit the level
+/// above). Returns the combo's response for hovers. See [`crate::disposal`].
+fn disposal_method_combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    value: &mut Option<crate::disposal::DisposalMethod>,
+) -> egui::Response {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(value.map(crate::disposal::DisposalMethod::label).unwrap_or("Inherit"))
+        .show_ui(ui, |ui| {
+            ui.selectable_value(value, None, "Inherit");
+            for m in crate::disposal::DisposalMethod::ALL {
+                ui.selectable_value(value, Some(m), m.label());
+            }
         })
         .response
 }
@@ -673,6 +723,15 @@ struct SettingsForm {
     /// Once a fresh head passes its integrity checks, delete older takes'
     /// now-redundant head files for the same stream. Default on.
     head_backfill_replace_old: bool,
+    // --- Automatic deletion (global defaults for the 3-level chain) ---
+    /// What happens to the head/live parts once a verified full.mkv join
+    /// lands. Default keeps both (the opt-in is choosing a delete variant).
+    join_cleanup: crate::disposal::JoinCleanup,
+    /// How automatic media deletions are executed (trash folder / Recycle
+    /// Bin / permanent). Default Recycle Bin.
+    disposal_method: crate::disposal::DisposalMethod,
+    /// `;`-separated trash folder list, one per drive (same-drive moves only).
+    disposal_trash_dirs: String,
     /// Global trigger-word rules (start recording on title/game match even with
     /// Auto off). Channel/instance Properties can extend/replace/disable them.
     trigger_rules: Vec<crate::triggers::TriggerRule>,
@@ -1612,6 +1671,8 @@ impl eframe::App for StreamArchiverApp {
                                     vod_replace: None,
                                     head_backfill_fetch: None,
                                     head_backfill_replace: None,
+                                    join_cleanup: None,
+                                    disposal_method: None,
                                     primary_platform_pref: None,
                                 });
                             }
@@ -1708,6 +1769,8 @@ impl eframe::App for StreamArchiverApp {
                 vod_replace: None,
                 head_backfill_fetch: None,
                 head_backfill_replace: None,
+                join_cleanup: None,
+                disposal_method: None,
                 primary_platform_pref: None,
             });
         }

@@ -509,6 +509,7 @@ impl StreamArchiverApp {
             self.settings_file_management_section(ui);
             self.settings_vod_download_section(ui);
             self.settings_head_backfill_section(ui);
+            self.settings_disposal_section(ui);
             self.settings_trigger_words_section(ui);
             self.settings_blacklist_triggers_section(ui);
             self.settings_vod_recovery_section(ui);
@@ -2413,6 +2414,102 @@ impl StreamArchiverApp {
             );
 
             // ── Trigger words ──────────────────────────────────────────────────
+            }
+    }
+
+    fn settings_disposal_section(&mut self, ui: &mut egui::Ui) {
+            if self.section_shown(SettingsTab::Downloads, "Automatic deletion", &["delete", "deletion", "cleanup", "trash", "recycle", "bin", "disposal", "join", "full", "parts", "head"]) {
+            ui.add_space(12.0);
+            ui.heading("Automatic deletion 🗑");
+            ui.label(
+                "What the app does when it deletes finished recordings on its own — the \
+                 post-join parts cleanup below, superseded old heads, and a live capture \
+                 replaced by its VOD. These are the GLOBAL defaults; override per-channel \
+                 (channel Properties) or per-instance (edit instance). Transient working \
+                 files (playlists, caches) are always plainly deleted.",
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("After full.mkv join:");
+                let v = &mut self.settings.join_cleanup;
+                egui::ComboBox::from_id_salt("settings_join_cleanup")
+                    .selected_text(v.label())
+                    .show_ui(ui, |ui| {
+                        for c in crate::disposal::JoinCleanup::ALL {
+                            ui.selectable_value(v, c, c.label());
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Once a verified full.mkv (head + live capture losslessly joined) \
+                         lands: keep both parts alongside it (safe, but a joined stream then \
+                         occupies DOUBLE its size), delete just the head, or delete both \
+                         parts — the take's main file then becomes the full. Cleanup only \
+                         runs after the join passes its duration sanity check, and every \
+                         removal uses the deletion method below.",
+                    );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Deleted media goes to:");
+                let v = &mut self.settings.disposal_method;
+                egui::ComboBox::from_id_salt("settings_disposal_method")
+                    .selected_text(v.label())
+                    .show_ui(ui, |ui| {
+                        for m in crate::disposal::DisposalMethod::ALL {
+                            ui.selectable_value(v, m, m.label());
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Trash folder: instant same-drive move into the folder(s) below — \
+                         you prune it yourself. Recycle Bin: the normal Windows bin \
+                         (restorable; note that drives without a bin, e.g. some removable \
+                         media, delete permanently instead). Delete permanently: gone \
+                         immediately. A failed move/recycle always leaves the file in \
+                         place — it is never escalated to a permanent delete.",
+                    );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Trash folder(s):");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.settings.disposal_trash_dirs)
+                        .hint_text(r"A:\streams\.sa-trash; G:\vods\.sa-trash")
+                        .desired_width(240.0),
+                )
+                .on_hover_text(
+                    "Only used when \"Trash folder\" is the (effective) method. One \
+                     folder per drive, ';'-separated — a trashed file is renamed into \
+                     the folder on ITS OWN drive (a multi-GB \"delete\" must never \
+                     become a cross-drive copy). Files on a drive with no folder \
+                     listed here fall back to the Recycle Bin. Name collisions get a \
+                     \" (1)\" suffix.",
+                );
+                if ui
+                    .button("Browse…")
+                    .on_hover_text(
+                        "Pick a folder — appended to the list (one folder per drive, \
+                         ';'-separated).",
+                    )
+                    .clicked()
+                {
+                    let first = self
+                        .settings
+                        .disposal_trash_dirs
+                        .split(';')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    self.pending_browse = Some(spawn_browse_folder(&first, |app, p| {
+                        let s = &mut app.settings.disposal_trash_dirs;
+                        if s.trim().is_empty() {
+                            *s = p;
+                        } else {
+                            *s = format!("{}; {}", s.trim().trim_end_matches(';'), p);
+                        }
+                    }));
+                }
+            });
             }
     }
 

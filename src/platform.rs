@@ -308,6 +308,45 @@ pub fn pid_listening_on(port: u16) -> Option<u32> {
     }
 }
 
+/// Send a file to the OS Recycle Bin (`SHFileOperationW` + `FOF_ALLOWUNDO`).
+/// Blocking — call from `spawn_blocking` on async paths. NB: on volumes
+/// without a Recycle Bin (some removable media) Windows deletes permanently;
+/// paths past the legacy 260-char limit can fail (shell API restriction) —
+/// the caller keeps the file on failure.
+#[cfg(windows)]
+pub fn recycle_path(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::UI::Shell::{
+        FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT,
+        SHFILEOPSTRUCTW, SHFileOperationW,
+    };
+    use windows::core::PCWSTR;
+    // pFrom is a double-NUL-terminated list of NUL-terminated paths.
+    let mut from: Vec<u16> = path.as_os_str().encode_wide().collect();
+    from.push(0);
+    from.push(0);
+    let mut op = SHFILEOPSTRUCTW {
+        wFunc: FO_DELETE,
+        pFrom: PCWSTR(from.as_ptr()),
+        fFlags: (FOF_ALLOWUNDO.0 | FOF_NOCONFIRMATION.0 | FOF_NOERRORUI.0 | FOF_SILENT.0) as u16,
+        ..Default::default()
+    };
+    let ret = unsafe { SHFileOperationW(&mut op) };
+    if ret == 0 && !op.fAnyOperationsAborted.as_bool() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "SHFileOperationW failed (code {ret:#x}, aborted {})",
+            op.fAnyOperationsAborted.as_bool()
+        )))
+    }
+}
+
+#[cfg(not(windows))]
+pub fn recycle_path(_path: &std::path::Path) -> std::io::Result<()> {
+    Err(std::io::Error::other("recycle bin is Windows-only"))
+}
+
 #[cfg(not(windows))]
 pub fn pid_listening_on(_port: u16) -> Option<u32> {
     None

@@ -309,7 +309,14 @@ and falls back to the wall-clock estimate.
 
 Once the live recording finishes, the head and the capture are **losslessly
 concatenated** (stream copy, no re-encode) into `{stem}.full.mkv` — a true
-full-stream file — and **both parts are kept**. The take shows a **🧩 head**
+full-stream file — and, by default, **both parts are kept**. Keeping the parts
+means a joined stream occupies double its size, so an opt-in **After full.mkv
+join** setting (Settings → Downloads → *Automatic deletion*; overridable
+per-channel and per-instance) can instead delete just the head, or both parts —
+in which case the take's main file becomes the full. The cleanup only runs
+after the join passes its duration sanity check, and removals follow the
+configured [deletion method](#automatic-deletion) (trash folder / Recycle Bin /
+permanent), so nothing is irrecoverably gone unless you chose that. The take shows a **🧩 head**
 badge while only the head exists and **🧩 full** once the join lands — visible
 on the stream's row directly for the common single-take case, and rolled up
 onto the stream row (in addition to each take's own row) when a reconnect
@@ -348,8 +355,34 @@ it off restores the original behavior (first take only).
 once a fresh head backfill passes its integrity checks — no CDN segment had to
 fall back to a silenced copy, and its duration is plausible — it supersedes
 every older take's head file for the same stream (a strict subset of the fresh
-one), which is deleted. A fresh head that fails its checks is still kept, just
-never used to replace anything, so nothing is ever lost to a bad check.
+one), which is removed via the configured
+[deletion method](#automatic-deletion). A fresh head that fails its checks is
+still kept, just never used to replace anything, so nothing is ever lost to a
+bad check.
+
+### Automatic deletion
+
+A few features delete finished recordings on their own: the post-join parts
+cleanup above, superseded old heads, and a live capture displaced by *Replace
+with VOD*. **Settings → Downloads → Automatic deletion** controls what such a
+delete actually does — with the usual global < channel < instance override
+chain (channel Properties / edit instance):
+
+- **Recycle Bin** (default): the normal Windows bin — restorable, needs no
+  setup. Note that drives without a bin (some removable media) delete
+  permanently instead; that's a Windows shell behavior.
+- **Trash folder**: an instant same-drive rename into a folder you configure
+  and prune yourself. Like the capture cache, the **Trash folder(s)** setting
+  is a `;`-separated list with one folder per drive — a trashed file always
+  moves to the folder on *its own* drive (a multi-GB "delete" must never
+  become a cross-drive copy), and files on a drive with no folder listed fall
+  back to the Recycle Bin. Name collisions get a ` (1)` suffix.
+- **Delete permanently**: gone immediately.
+
+A failed move or recycle always leaves the file in place (and logs why) — a
+disposal failure is never escalated to a more destructive method. Transient
+working files (playlists, cache leftovers, `.state`) are not media and are
+always plainly deleted regardless of these settings.
 
 **Manual "🧩 Backfill head."** Right-click an **instance** (targets its latest
 recording) or a specific **take** for a manual, on-demand head backfill —

@@ -15,6 +15,10 @@ pub(super) struct ChannelForm {
     /// Head-backfill-on-new-take overrides for this channel (`None` = inherit global).
     pub(super) head_backfill_fetch: Option<bool>,
     pub(super) head_backfill_replace: Option<bool>,
+    /// Automatic-deletion overrides for this channel (`None` = inherit global):
+    /// post-join parts cleanup, and how automatic media deletes are executed.
+    pub(super) join_cleanup: Option<crate::disposal::JoinCleanup>,
+    pub(super) disposal_method: Option<crate::disposal::DisposalMethod>,
     /// Preferred platform when this channel has multiple instances
     /// simultaneously live (`None` = inherit the global default).
     pub(super) primary_platform_pref: Option<Platform>,
@@ -216,6 +220,29 @@ impl StreamArchiverApp {
                                 );
                             ui.end_row();
 
+                            ui.label("After full.mkv join");
+                            join_cleanup_combo(ui, "chform_join_cleanup", &mut f.join_cleanup)
+                                .on_hover_text(
+                                    "Once a verified full.mkv (head + live capture joined) lands \
+                                     for a take in this channel: keep both parts (safe, doubles \
+                                     the stream's disk cost), delete just the head, or delete \
+                                     both parts (the take then points at the full). Deletions \
+                                     follow the deletion method below. Inherit follows the \
+                                     global default (Settings → Downloads → Automatic deletion).",
+                                );
+                            ui.end_row();
+
+                            ui.label("Automatic deletes go to");
+                            disposal_method_combo(ui, "chform_disposal_method", &mut f.disposal_method)
+                                .on_hover_text(
+                                    "How automatic media deletions for this channel are executed \
+                                     (post-join cleanup, superseded heads, a live capture \
+                                     replaced by its VOD): moved to the configured trash folder, \
+                                     sent to the Recycle Bin, or deleted permanently. Inherit \
+                                     follows the global default.",
+                                );
+                            ui.end_row();
+
                             ui.label("Preferred platform when multiple live");
                             platform_pref_combo(ui, "chform_platform_pref", &mut f.primary_platform_pref)
                                 .on_hover_text(
@@ -266,6 +293,10 @@ impl StreamArchiverApp {
                     fetch: f.head_backfill_fetch,
                     replace: f.head_backfill_replace,
                 };
+                let disposal_scope = crate::disposal::DisposalScope {
+                    method: f.disposal_method,
+                    join_cleanup: f.join_cleanup,
+                };
                 let res = match id_opt {
                     Some(id) => self
                         .core
@@ -286,6 +317,11 @@ impl StreamArchiverApp {
                             &self.core.store,
                             cid,
                             &head_backfill_scope,
+                        );
+                        let _ = crate::disposal::save_channel_disposal_scope(
+                            &self.core.store,
+                            cid,
+                            &disposal_scope,
                         );
                         let _ = crate::platform_pref::save_channel_primary_platform(
                             &self.core.store,
@@ -931,6 +967,9 @@ impl StreamArchiverApp {
                 let hbsc = crate::head_backfill::load_monitor_head_backfill_scope(&self.core.store, r.monitor.id);
                 mf.head_backfill_fetch = hbsc.fetch;
                 mf.head_backfill_replace = hbsc.replace;
+                let dsc = crate::disposal::load_monitor_disposal_scope(&self.core.store, r.monitor.id);
+                mf.join_cleanup = dsc.join_cleanup;
+                mf.disposal_method = dsc.method;
                 mf.primary_pin = crate::platform_pref::monitor_is_pinned(&self.core.store, r.monitor.id);
                 self.form = Some(mf);
             }
@@ -996,6 +1035,7 @@ impl StreamArchiverApp {
             if let Some(c) = self.channels.iter().find(|c| c.id == cid) {
                 let sc = crate::vod_archive::load_channel_vod_scope(&self.core.store, cid);
                 let hbsc = crate::head_backfill::load_channel_head_backfill_scope(&self.core.store, cid);
+                let dsc = crate::disposal::load_channel_disposal_scope(&self.core.store, cid);
                 let platform_pref = crate::platform_pref::channel_primary_platform(&self.core.store, cid);
                 self.channel_form = Some(ChannelForm {
                     id: Some(cid),
@@ -1005,6 +1045,8 @@ impl StreamArchiverApp {
                     vod_replace: sc.replace,
                     head_backfill_fetch: hbsc.fetch,
                     head_backfill_replace: hbsc.replace,
+                    join_cleanup: dsc.join_cleanup,
+                    disposal_method: dsc.method,
                     primary_platform_pref: platform_pref,
                 });
             }

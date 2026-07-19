@@ -687,11 +687,27 @@ impl Supervisor {
             match crate::iomon::fs::rename(Cat::Promote, &live, &backup).await {
                 Ok(()) => match crate::iomon::fs::rename(Cat::Promote, final_path, &live).await {
                     Ok(()) => {
-                        let _ = crate::iomon::fs::remove_file(Cat::Promote, &backup).await;
+                        // The displaced live capture follows the configured
+                        // disposal method (trash / Recycle Bin / permanent);
+                        // a failed disposal just leaves the .pre-vod.bak.
+                        let how = match crate::disposal::dispose_media(
+                            &self.store,
+                            channel_id,
+                            monitor_id,
+                            &backup,
+                        )
+                        .await
+                        {
+                            Ok(d) => d.describe(),
+                            Err(e) => {
+                                warn!(rec_id, "vod archive: displaced live capture disposal failed: {e:#} ({} left behind)", backup.display());
+                                "left behind (disposal failed)"
+                            }
+                        };
                         let live_s = live.to_string_lossy().into_owned();
                         let _ = self.store.update_recording_output_path(rec_id, &live_s);
                         let _ = self.store.set_recording_vod_archived(rec_id, &live_s, "replaced");
-                        info!(rec_id, "vod archive: replaced live recording with the published VOD");
+                        info!(rec_id, "vod archive: replaced live recording with the published VOD (original {how})");
                     }
                     Err(e) => {
                         // Put the live capture back; the VOD stays alongside.

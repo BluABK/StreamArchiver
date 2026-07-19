@@ -1667,6 +1667,29 @@ impl StreamArchiverApp {
                             );
                         ui.end_row();
 
+                        ui.label("After full.mkv join");
+                        join_cleanup_combo(ui, "form_join_cleanup", &mut form.join_cleanup)
+                            .on_hover_text(
+                                "Once a verified full.mkv (head + live capture joined) lands for \
+                                 a take of this instance: keep both parts (safe, doubles the \
+                                 stream's disk cost), delete just the head, or delete both parts \
+                                 (the take then points at the full). Deletions follow the \
+                                 deletion method below. Inherit follows the channel, then the \
+                                 global default (Settings → Downloads → Automatic deletion).",
+                            );
+                        ui.end_row();
+
+                        ui.label("Automatic deletes go to");
+                        disposal_method_combo(ui, "form_disposal_method", &mut form.disposal_method)
+                            .on_hover_text(
+                                "How automatic media deletions for this instance are executed \
+                                 (post-join cleanup, superseded heads, a live capture replaced \
+                                 by its VOD): moved to the configured trash folder, sent to the \
+                                 Recycle Bin, or deleted permanently. Inherit follows the \
+                                 channel, then the global default.",
+                            );
+                        ui.end_row();
+
                         ui.label("Pin as preferred platform");
                         ui.checkbox(&mut form.primary_pin, "").on_hover_text(
                             "Always show THIS instance's info on the channel row while it's \
