@@ -431,6 +431,29 @@ fn muted_variant(base: &str, canonical: &str) -> String {
     }
 }
 
+/// Absolutize a relative `#EXT-X-MAP:URI="…"` (the fMP4 init segment — Twitch
+/// packages HEVC/AV1 renditions as fMP4, unlike h264's plain `.ts`) against
+/// the playlist's own URL prefix. The rebuilt playlist is saved locally, so a
+/// relative init URI would make ffmpeg resolve it against the *local* cache
+/// directory — ENOENT on `…\.sa-cache\<ch>\init-0.mp4`, surfacing as
+/// "Error opening input file <playlist>" (the Saruei HEVC head-backfill
+/// failure, 2026-07-19). Media-segment lines are absolutized elsewhere; this
+/// covers the one URI that lives inside a tag. Unknown shapes pass through.
+fn absolutize_map_uri(line: &str, base: &str) -> String {
+    let Some(start) = line.find("URI=\"") else {
+        return line.to_string();
+    };
+    let uri_at = start + "URI=\"".len();
+    let Some(len) = line[uri_at..].find('"') else {
+        return line.to_string();
+    };
+    let uri = &line[uri_at..uri_at + len];
+    if uri.starts_with("http://") || uri.starts_with("https://") {
+        return line.to_string();
+    }
+    format!("{}{base}{}{}", &line[..uri_at], uri, &line[uri_at + len..])
+}
+
 /// A media-segment line, keyed by its position among segments.
 struct MediaSeg {
     pos: usize,
@@ -540,7 +563,11 @@ pub async fn build_playlist(
             continue;
         }
         if !is_segment_line(t) {
-            out.push_str(line);
+            if t.starts_with("#EXT-X-MAP") {
+                out.push_str(&absolutize_map_uri(line, &base));
+            } else {
+                out.push_str(line);
+            }
             out.push('\n');
             continue;
         }
@@ -1491,6 +1518,25 @@ mod tests {
             truncate_playlist_window(src, 0.0, 15.0),
             truncate_playlist(src, 15.0)
         );
+    }
+
+    #[test]
+    fn absolutize_map_uri_variants() {
+        let base = "https://host/abc_saruei_123/chunked/";
+        // The real Saruei HEVC DVR shape: relative init segment.
+        assert_eq!(
+            absolutize_map_uri("#EXT-X-MAP:URI=\"init-0.mp4\"", base),
+            "#EXT-X-MAP:URI=\"https://host/abc_saruei_123/chunked/init-0.mp4\""
+        );
+        // Extra attributes around the URI survive untouched.
+        assert_eq!(
+            absolutize_map_uri("#EXT-X-MAP:URI=\"init-0.mp4\",BYTERANGE=\"720@0\"", base),
+            "#EXT-X-MAP:URI=\"https://host/abc_saruei_123/chunked/init-0.mp4\",BYTERANGE=\"720@0\""
+        );
+        // Already-absolute URIs and unknown shapes pass through verbatim.
+        let abs = "#EXT-X-MAP:URI=\"https://cdn/other/init.mp4\"";
+        assert_eq!(absolutize_map_uri(abs, base), abs);
+        assert_eq!(absolutize_map_uri("#EXT-X-MAP:NOURI=1", base), "#EXT-X-MAP:NOURI=1");
     }
 
     #[test]
