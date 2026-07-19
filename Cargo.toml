@@ -27,7 +27,7 @@ tracing = "0.1.44"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tray-icon = "0.24.1"
-windows = { version = "0.62", features = ["Win32_System_JobObjects", "Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_Storage_FileSystem", "Win32_System_Com", "UI_Notifications", "Data_Xml_Dom", "Win32_UI_Controls", "Win32_UI_WindowsAndMessaging", "Win32_UI_Notifications", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Ioctl", "Win32_System_IO"] }
+windows = { version = "0.62", features = ["Win32_System_JobObjects", "Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_Storage_FileSystem", "Win32_System_Com", "UI_Notifications", "Data_Xml_Dom", "Win32_UI_Controls", "Win32_UI_WindowsAndMessaging", "Win32_UI_Notifications", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Ioctl", "Win32_System_IO", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
 # Direct dep required by the #[implement] proc-macro (it generates
 # `::windows_core::` paths that must resolve in THIS crate) — keep the version
 # in lockstep with `windows` above or the generated impls hit trait-version

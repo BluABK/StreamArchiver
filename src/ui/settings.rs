@@ -1550,8 +1550,9 @@ impl StreamArchiverApp {
                     format!("● running (external){}", ping_suffix(&st.last_ping)),
                     egui::Color32::from_rgb(0x39, 0xb0, 0x54),
                     "A server someone else started is answering on the configured port. \
-                     The app uses it but won't restart or stop it — Stop is disabled \
-                     because killing a process the app didn't spawn isn't safe."
+                     The app uses it as-is and won't restart it if it dies. To manage \
+                     it anyway: ⏹ Stop external kills it, ⚡ Take control replaces it \
+                     with an app-managed instance (watchdog, restarts, Stop button)."
                         .to_string(),
                 ),
                 PotMode::Starting => (
@@ -1621,12 +1622,48 @@ impl StreamArchiverApp {
                     .on_hover_text(
                         "Stop the managed server and keep it stopped for this session \
                          (the watchdog won't restart it until Start is clicked or the \
-                         app restarts). Disabled for an external server — the app never \
-                         kills a process it didn't spawn.",
+                         app restarts). For an external server use ⏹ Stop external / \
+                         ⚡ Take control instead.",
                     )
                     .clicked()
                 {
                     crate::pot_server::request_stop();
+                }
+                if st.mode == PotMode::External {
+                    if ui
+                        .button("⏹ Stop external")
+                        .on_hover_text(
+                            "Find the process listening on the configured port and kill \
+                             it, then stay stopped for this session (Start brings up a \
+                             managed instance instead). Caveat: for a server inside \
+                             Docker/WSL the port is owned by the Docker/WSL proxy \
+                             process — stop the container yourself instead.",
+                        )
+                        .clicked()
+                    {
+                        self.status = match crate::pot_server::stop_external() {
+                            Ok(pid) => format!("External PO token server (pid {pid}) stopped."),
+                            Err(e) => format!("Stop external failed: {e}"),
+                        };
+                    }
+                    if ui
+                        .button("⚡ Take control")
+                        .on_hover_text(
+                            "Kill the external server and immediately start an \
+                             app-managed instance on the same port — from then on the \
+                             watchdog supervises it (crash restarts, Stop button, pid \
+                             re-adoption across app runs). Same Docker/WSL caveat as \
+                             Stop external.",
+                        )
+                        .clicked()
+                    {
+                        self.status = match crate::pot_server::take_control() {
+                            Ok(pid) => format!(
+                                "Took control: external server (pid {pid}) replaced by a managed instance."
+                            ),
+                            Err(e) => format!("Take control failed: {e}"),
+                        };
+                    }
                 }
                 if ui
                     .button("📜 View log")

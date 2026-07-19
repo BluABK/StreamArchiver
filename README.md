@@ -1847,6 +1847,15 @@ server and holds for the session), **📜 View log** (a live-tailing window), an
 **📂 Open log file**. The **Background** view shows the same status one-liner
 with a log shortcut.
 
+When the server is **external**, two extra buttons appear: **⏹ Stop
+external** looks up which process owns the listening port (IPv4 or IPv6) and
+kills it, staying stopped for the session; **⚡ Take control** does the same
+kill but immediately starts an app-managed instance in its place — from then
+on the watchdog supervises it (crash restarts, working Stop button, pid
+re-adoption across app runs). Caveat: for a server inside Docker/WSL the
+port's owner is the Docker/WSL *port proxy*, not the server — stop the
+container yourself instead of using these buttons.
+
 The server's combined stdout+stderr goes to
 `%APPDATA%\StreamArchiver\data\logs\pot_server.log`, truncated at the first
 launch of each app run (restarts within a run append, so crash evidence

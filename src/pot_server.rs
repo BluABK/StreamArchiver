@@ -21,7 +21,9 @@
 //!   server's combined stdout+stderr in `logs\pot_server.log` ([`log_path`]).
 //!
 //! An **externally started** server is detected via the same ping and simply
-//! adopted as `External` — never spawned over, never killed. A server *we*
+//! adopted as `External` — never spawned over, never killed automatically.
+//! The user can still take it over explicitly ([`stop_external`] /
+//! [`take_control`], which find the port's owning pid). A server *we*
 //! spawned has its pid persisted so the next app run can re-adopt it as
 //! `Managed` (the default quit path leaves it running on purpose: detached
 //! SABR captures still need tokens after the app exits).
@@ -213,10 +215,53 @@ pub fn request_start() {
 
 /// User clicked Stop: kill the managed server (on the watchdog thread) and
 /// keep it down until Start is clicked or the app restarts. An External
-/// server is unaffected — we never kill what we didn't spawn.
+/// server needs [`stop_external`] instead — the watchdog holds no handle to
+/// kill it with.
 pub fn request_stop() {
     *DESIRED.lock().unwrap() = Desired::ForcedOff;
     nudge();
+}
+
+/// Kill the EXTERNAL server currently answering on the configured port, by
+/// looking up which process owns the listener. Only reachable from an
+/// explicit user click (the UI offers it only in `External` mode); returns
+/// the killed pid, or an error when no listener could be attributed. Sets
+/// `ForcedOff` first so the watchdog doesn't immediately respawn a managed
+/// replacement (that's [`take_control`]'s job).
+pub fn stop_external() -> Result<u32, String> {
+    *DESIRED.lock().unwrap() = Desired::ForcedOff;
+    let pid = kill_external_listener()?;
+    nudge();
+    Ok(pid)
+}
+
+/// Replace an external server with a managed one: kill the port's owner,
+/// then force our own instance up — from here on the watchdog supervises,
+/// restarts, and the Stop button works. Returns the killed pid.
+pub fn take_control() -> Result<u32, String> {
+    let pid = kill_external_listener()?;
+    *DESIRED.lock().unwrap() = Desired::ForcedOn;
+    nudge();
+    Ok(pid)
+}
+
+/// Find and kill the process listening on the configured port. The pid is
+/// re-checked against our own managed child (paranoia: the UI only offers
+/// this in External mode, but a race with the watchdog spawning must never
+/// kill our own fresh child via the "external" path).
+fn kill_external_listener() -> Result<u32, String> {
+    let port = base_url_port(&config().base_url);
+    let pid = crate::platform::pid_listening_on(port)
+        .ok_or_else(|| format!("no process found listening on port {port}"))?;
+    if pid == std::process::id() {
+        return Err("port is owned by this app process".to_string());
+    }
+    if OWNED_PID.lock().unwrap().is_some_and(|own| own == pid) {
+        return Err("server is already managed by this app".to_string());
+    }
+    info!(pid, port, "killing external PO token server (user request)");
+    crate::platform::kill_process_tree(pid);
+    Ok(pid)
 }
 
 /// Read the settings into the config snapshot and stage adoption of a server

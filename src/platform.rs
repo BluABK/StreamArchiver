@@ -235,6 +235,84 @@ pub fn wait_pid(pid: u32, shutdown: &std::sync::atomic::AtomicBool) -> Option<i6
     }
 }
 
+/// The pid of the process LISTENING on local TCP `port` (IPv4 or IPv6, any
+/// interface), or `None` if nothing listens there. Used to take control of an
+/// externally-started helper server (e.g. a manually-launched PO token
+/// server): the app never spawned it, so this is the only way to learn who
+/// owns the port. Note: for a server inside Docker/WSL the returned pid is
+/// the *port proxy* (com.docker.backend / wslrelay), not the server itself.
+#[cfg(windows)]
+pub fn pid_listening_on(port: u16) -> Option<u32> {
+    use windows::Win32::NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
+        MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
+    };
+    use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+
+    // dwLocalPort holds the port in network byte order in its low 16 bits.
+    let wanted = port.to_be() as u32;
+    // One fetch per address family: the server binds `[::]` (dual-stack) with
+    // an IPv4 `0.0.0.0` fallback, so either table may hold the listener.
+    unsafe fn table_lookup(family: u32, wanted: u32) -> Option<u32> {
+        unsafe {
+            let mut size: u32 = 0;
+            // First call sizes the buffer (returns ERROR_INSUFFICIENT_BUFFER).
+            let _ = GetExtendedTcpTable(
+                None,
+                &mut size,
+                false,
+                family,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            );
+            if size == 0 {
+                return None;
+            }
+            let mut buf = vec![0u8; size as usize];
+            let rc = GetExtendedTcpTable(
+                Some(buf.as_mut_ptr().cast()),
+                &mut size,
+                false,
+                family,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            );
+            if rc != 0 {
+                return None;
+            }
+            if family == AF_INET.0 as u32 {
+                let table = &*(buf.as_ptr() as *const MIB_TCPTABLE_OWNER_PID);
+                let rows = std::slice::from_raw_parts(
+                    table.table.as_ptr(),
+                    table.dwNumEntries as usize,
+                );
+                rows.iter()
+                    .find(|r: &&MIB_TCPROW_OWNER_PID| r.dwLocalPort == wanted)
+                    .map(|r| r.dwOwningPid)
+            } else {
+                let table = &*(buf.as_ptr() as *const MIB_TCP6TABLE_OWNER_PID);
+                let rows = std::slice::from_raw_parts(
+                    table.table.as_ptr(),
+                    table.dwNumEntries as usize,
+                );
+                rows.iter()
+                    .find(|r: &&MIB_TCP6ROW_OWNER_PID| r.dwLocalPort == wanted)
+                    .map(|r| r.dwOwningPid)
+            }
+        }
+    }
+    unsafe {
+        table_lookup(AF_INET.0 as u32, wanted)
+            .or_else(|| table_lookup(AF_INET6.0 as u32, wanted))
+            .filter(|pid| *pid != 0)
+    }
+}
+
+#[cfg(not(windows))]
+pub fn pid_listening_on(_port: u16) -> Option<u32> {
+    None
+}
+
 #[cfg(not(windows))]
 pub struct DetachedJob;
 
@@ -704,5 +782,23 @@ mod tests {
         let mine = procs.iter().find(|p| p.pid == me).expect("own pid in snapshot");
         assert!(!mine.name.is_empty());
         assert!(!mine.name.ends_with(".exe"));
+    }
+
+    #[test]
+    fn pid_listening_on_finds_own_listener() {
+        // Bind an ephemeral IPv4 listener in-process: the table lookup must
+        // attribute its port to this test process, and a port nobody uses
+        // (the one freed by dropping the listener) must return None.
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = l.local_addr().expect("addr").port();
+        assert_eq!(pid_listening_on(port), Some(std::process::id()));
+        drop(l);
+        assert_eq!(pid_listening_on(port), None);
+
+        // IPv6 listeners are found too (the POT server prefers [::]).
+        if let Ok(l6) = std::net::TcpListener::bind("[::1]:0") {
+            let port6 = l6.local_addr().expect("addr6").port();
+            assert_eq!(pid_listening_on(port6), Some(std::process::id()));
+        }
     }
 }
