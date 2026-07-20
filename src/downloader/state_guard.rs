@@ -45,8 +45,11 @@ pub const K_SABR_STATE_GUARD: &str = "sabr_state_guard";
 const GUARD_START_DELAY_SECS: u64 = 120;
 /// Re-acquire cadence. Each tick is one `read_dir` plus one cheap
 /// `CreateFile` per state file; a freshly-replaced `.state` sits unguarded
-/// for at most this long.
-const GUARD_TICK: Duration = Duration::from_millis(2000);
+/// for at most this long. Kept tight because a deep-rewinding SABR capture
+/// rewrites its state every second or so — at the original 2s tick the
+/// current state file was unguarded most of the time (2026-07-20 Maid Mint:
+/// locks kept landing between replaces despite the guard).
+const GUARD_TICK: Duration = Duration::from_millis(500);
 
 pub(super) fn state_guard_enabled(store: &Store) -> bool {
     store.get_setting(K_SABR_STATE_GUARD).ok().flatten().is_none_or(|v| v != "0")
@@ -194,17 +197,22 @@ impl Supervisor {
     }
 }
 
-/// Paths named in a tool's access-denied death line — the single-quoted
-/// operands of e.g. `[WinError 5] Access is denied: 'A:\\x\\tmp123' ->
-/// 'A:\\x\\y.state'`. Python reprs double the backslashes; both forms are
-/// normalized. Only absolute drive paths are kept (the quotes can hold
-/// anything).
+/// Paths named in a tool's access-denied death line — the quoted operands of
+/// e.g. `[WinError 5] Access is denied: 'A:\\x\\tmp123' -> "A:\\x\\Don't
+/// forget.state"`. Python quotes each operand with `'…'` normally but
+/// switches to `"…"` when the path itself contains an apostrophe (stream
+/// titles do — the Maid Mint "Don't forget your coffee!" take hid its
+/// `.state` path from the first version of this parser that way). Windows
+/// filenames can never contain `"`, so scanning for a matching same-quote
+/// terminator is unambiguous for both forms. Python-repr doubled backslashes
+/// are normalized; only absolute drive paths are kept.
 pub(super) fn parse_locked_paths(line: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut rest = line;
-    while let Some(start) = rest.find('\'') {
+    while let Some(start) = rest.find(['\'', '"']) {
+        let quote = rest.as_bytes()[start] as char;
         let after = &rest[start + 1..];
-        let Some(len) = after.find('\'') else { break };
+        let Some(len) = after.find(quote) else { break };
         let raw = &after[..len];
         let normalized = raw.replace("\\\\", "\\");
         let is_abs_drive = normalized.len() > 3
@@ -339,6 +347,21 @@ mod tests {
         // Single-backslash form (non-repr contexts) parses identically.
         let single = r"PermissionError: [WinError 5] Access is denied: 'C:\x\y.state'";
         assert_eq!(parse_locked_paths(single), vec![PathBuf::from(r"C:\x\y.state")]);
+
+        // The 2026-07-20 Maid Mint shape: the destination contains an
+        // apostrophe ("Don't"), so Python double-quotes THAT operand — the
+        // single-quote-only first version of this parser missed it entirely
+        // and the culprit query never saw the surviving .state file.
+        let mixed = r#"UnavailableVideoError: Unable to download video: [WinError 5] Access is denied: 'A:\\streams\\.sa-cache\\Maid Mint\\tmpmbfi87e8' -> "A:\\streams\\.sa-cache\\Maid Mint\\Maid Mint - Don't forget your coffee!.mkv.f140.mp4.state""#;
+        let paths = parse_locked_paths(mixed);
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        assert!(paths[0].to_string_lossy().ends_with("tmpmbfi87e8"));
+        assert_eq!(
+            paths[1],
+            PathBuf::from(
+                r"A:\streams\.sa-cache\Maid Mint\Maid Mint - Don't forget your coffee!.mkv.f140.mp4.state"
+            )
+        );
 
         // Quoted non-path operands are ignored; unrelated errors don't match.
         assert!(parse_locked_paths("ERROR: option 'foo' is unknown").is_empty());
