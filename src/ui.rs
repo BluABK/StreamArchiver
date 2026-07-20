@@ -621,6 +621,10 @@ struct SettingsForm {
     sabr_extractor_args: String,
     /// Experimental deep-rewind toggle (appends enable_live_deep_rewind=true).
     sabr_deep_rewind: bool,
+    /// Hold deny-read guard handles on SABR `.state` files while a from-start
+    /// capture runs (blocks backup/AV read locks that kill the checkpoint
+    /// replace). Default on; see `downloader::state_guard`.
+    sabr_state_guard: bool,
     /// Manual raw SABR args; non-empty overrides the format+extractor-args preset.
     sabr_raw_args: String,
     /// PO-token-provider `--extractor-args` (e.g. bgutil) for the SABR command.

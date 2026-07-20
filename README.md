@@ -1953,7 +1953,29 @@ itself ending, the take retries in place up to 3 times (5 s apart) with the
 identical output path, so yt-dlp's own SABR resume continues from the
 surviving fragments instead of restarting from scratch. The same resumability
 check also runs at app startup for a capture still mid-flight when the app
-was closed or crashed, picking it back up on the next launch. The player features handle this
+was closed or crashed, picking it back up on the next launch.
+
+**`.state` guard (lock prevention).** yt-dlp saves each checkpoint atomically
+(write a temp file, rename it over the old `.state`) — and on Windows that
+rename dies with `Access is denied` if any other process holds the old
+`.state` open without delete-sharing, which is exactly how backup/AV scanners
+open files. So while a from-start SABR capture runs, the app holds **deny-read
+guard handles** on its `.state` files: scanners can't acquire the killing lock
+at all, while yt-dlp's own checkpoint replace and success-path cleanup still
+work (delete stays shared). Guards start ~2 minutes after launch and are
+released the instant the tool exits (a resuming attempt must be able to
+*read* its state), and if a foreign process already holds a state file, the
+log names it via the Restart Manager. On by default — **Settings → Downloads
+→ SABR → "Guard .state files while recording"** is the killswitch.
+
+**Lock-culprit logging.** When a capture death *is* an access-denied file
+lock, the retry log line is followed by a `lock culprit:` line naming the
+process(es) currently holding the file (e.g. `bztransmit.exe (pid 4712,
+service)`) — queried right at death, while the scanner's lock is typically
+still live. The actionable fix is almost always adding the capture cache dirs
+to that tool's exclusion list; the guard and the in-flight retry cover
+whatever remains (the rename's millisecond-lived temp *source* file can't be
+guarded). The player features handle this
 (full behavior in [Watching in a media player](#watching-in-a-media-player)):
 
 - **⏵ Stream in player** finds the growing pair and merges it *in mpv*: the

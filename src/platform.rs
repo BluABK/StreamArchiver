@@ -308,6 +308,73 @@ pub fn pid_listening_on(port: u16) -> Option<u32> {
     }
 }
 
+/// Which processes currently hold open handles to any of `paths`, via the
+/// Restart Manager (the API behind Windows' "file in use by…" dialogs) —
+/// e.g. `"bztransmit.exe (pid 4712, service)"`. Works unelevated for files
+/// this process can access. Blocking (RM enumerates system state) — call
+/// from `spawn_blocking` on async paths. Empty = no holder found (the lock
+/// was already released, or RM couldn't see it).
+#[cfg(windows)]
+pub fn file_lock_holders(paths: &[std::path::PathBuf]) -> Vec<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::System::RestartManager::{
+        CCH_RM_SESSION_KEY, RM_PROCESS_INFO, RmEndSession, RmGetList, RmRegisterResources,
+        RmStartSession, RmService,
+    };
+    use windows::core::PCWSTR;
+
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    let wide: Vec<Vec<u16>> = paths
+        .iter()
+        .map(|p| p.as_os_str().encode_wide().chain(std::iter::once(0)).collect())
+        .collect();
+    let ptrs: Vec<PCWSTR> = wide.iter().map(|w| PCWSTR(w.as_ptr())).collect();
+    let mut session = 0u32;
+    let mut key = [0u16; CCH_RM_SESSION_KEY as usize + 1];
+    unsafe {
+        if RmStartSession(&mut session, None, windows::core::PWSTR(key.as_mut_ptr())).is_err() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if RmRegisterResources(session, Some(&ptrs), None, None).is_ok() {
+            let mut needed = 0u32;
+            let mut count = 0u32;
+            let mut reboot = 0u32;
+            // First call sizes the array (ERROR_MORE_DATA when non-empty).
+            let _ = RmGetList(session, &mut needed, &mut count, None, &mut reboot);
+            if needed > 0 {
+                let mut infos = vec![RM_PROCESS_INFO::default(); needed as usize];
+                count = needed;
+                if RmGetList(session, &mut needed, &mut count, Some(infos.as_mut_ptr()), &mut reboot)
+                    .is_ok()
+                {
+                    for info in infos.iter().take(count as usize) {
+                        let name_len =
+                            info.strAppName.iter().position(|&c| c == 0).unwrap_or(0);
+                        let name = String::from_utf16_lossy(&info.strAppName[..name_len]);
+                        let name = if name.is_empty() { "<unknown>".into() } else { name };
+                        let kind =
+                            if info.ApplicationType == RmService { ", service" } else { "" };
+                        out.push(format!(
+                            "{name} (pid {}{kind})",
+                            info.Process.dwProcessId
+                        ));
+                    }
+                }
+            }
+        }
+        let _ = RmEndSession(session);
+        out
+    }
+}
+
+#[cfg(not(windows))]
+pub fn file_lock_holders(_paths: &[std::path::PathBuf]) -> Vec<String> {
+    Vec::new()
+}
+
 /// Send a file to the OS Recycle Bin (`SHFileOperationW` + `FOF_ALLOWUNDO`).
 /// Blocking — call from `spawn_blocking` on async paths. NB: on volumes
 /// without a Recycle Bin (some removable media) Windows deletes permanently;
@@ -839,5 +906,28 @@ mod tests {
             let port6 = l6.local_addr().expect("addr6").port();
             assert_eq!(pid_listening_on(port6), Some(std::process::id()));
         }
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)] // test fixture I/O, not app I/O
+    fn file_lock_holders_names_self() {
+        // Hold a file open in-process; the Restart Manager must attribute the
+        // handle to this very process (that's the whole culprit-logging
+        // premise). An unheld file reports no holders.
+        let dir = std::env::temp_dir();
+        let p = dir.join(format!("sa-rm-selftest-{}.txt", std::process::id()));
+        std::fs::write(&p, b"x").expect("write fixture");
+        {
+            let _held = std::fs::File::open(&p).expect("hold open");
+            let holders = file_lock_holders(std::slice::from_ref(&p));
+            let me = std::process::id().to_string();
+            assert!(
+                holders.iter().any(|h| h.contains(&format!("pid {me}"))),
+                "self not reported as holder: {holders:?}"
+            );
+        }
+        let free = file_lock_holders(std::slice::from_ref(&p));
+        assert!(free.is_empty(), "no-holder file reported holders: {free:?}");
+        let _ = std::fs::remove_file(&p);
     }
 }

@@ -121,6 +121,13 @@ impl StreamArchiverApp {
             },
             // Absent ⇒ off; an explicit "1" enables it.
             sabr_deep_rewind: setting_or_empty(&core, K_SABR_DEEP_REWIND) == "1",
+            // Default ON: missing key or anything but "0" ⇒ true.
+            sabr_state_guard: core
+                .store
+                .get_setting(crate::downloader::K_SABR_STATE_GUARD)
+                .ok()
+                .flatten()
+                .is_none_or(|v| v != "0"),
             sabr_raw_args: setting_or_empty(&core, K_SABR_RAW_ARGS),
             // Absent ⇒ bgutil default; present (even empty) ⇒ honor it verbatim so
             // the user can disable it and rely on the plugin's auto-detection.
@@ -1450,6 +1457,7 @@ impl StreamArchiverApp {
             (K_SABR_FORMAT, s.sabr_format.trim()),
             (K_SABR_EXTRACTOR_ARGS, s.sabr_extractor_args.trim()),
             (K_SABR_DEEP_REWIND, if s.sabr_deep_rewind { "1" } else { "0" }),
+            (crate::downloader::K_SABR_STATE_GUARD, if s.sabr_state_guard { "1" } else { "0" }),
             (K_SABR_RAW_ARGS, s.sabr_raw_args.trim()),
             (K_SABR_POT_ARGS, s.sabr_pot_args.trim()),
             (K_SABR_CODEC_PREF, s.sabr_codec_pref.id()),

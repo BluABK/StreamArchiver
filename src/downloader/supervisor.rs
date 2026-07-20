@@ -2415,6 +2415,17 @@ progress_info: None,
         let outcome = if self.stopping_monitors.lock().unwrap().contains(&monitor_id) {
             ProcessOutcome { exit_code: None, log: String::new() }
         } else {
+            // From-start SABR captures get a `.state` guard alongside each
+            // attempt (deny-read handles that keep backup/AV from acquiring
+            // the locks that kill yt-dlp's checkpoint replace — see
+            // `state_guard.rs`). Spawned per attempt and stopped the moment
+            // the child exits: a resuming attempt must be able to READ its
+            // state, so guards never span a relaunch.
+            let sabr_capture = row.monitor.platform() == Platform::YouTube
+                && row.monitor.tool == Tool::YtDlp
+                && row.monitor.capture_from_start
+                && ytdlp_bins.sabr.usable();
+            let guard = self.spawn_sabr_state_guard(&plan, monitor_id, sabr_capture);
             let mut outcome = self
                 .run_process(
                     &self.active,
@@ -2435,6 +2446,7 @@ progress_info: None,
                     },
                 )
                 .await;
+            guard.stop().await;
             // A from-start SABR capture can die from a transient local hiccup
             // (antivirus/backup briefly locking its `.state` checkpoint file —
             // 2026-07-16: a 2h15m/1.75GB Maid Mint capture died exactly this way
@@ -2470,6 +2482,10 @@ progress_info: None,
                     Platform::YouTube.tag(),
                     log_death_reason(&outcome.log),
                 );
+                // Access-denied death: name the process holding the file
+                // (Restart Manager) while its lock is likely still live —
+                // the actionable output is "add this to the exclusion list".
+                self.log_lock_culprits(&outcome.log, monitor_id).await;
                 // If it died for lack of a GVS PO token, the provider server is
                 // down — retrying against it dead fails identically (observed
                 // 2026-07-18: girl_dm_ burned all 3 retries per take for 20+
@@ -2481,6 +2497,7 @@ progress_info: None,
                     warn!(monitor_id, "PO token server still unreachable; retrying anyway");
                 }
                 crate::app_core::sleep_cancellable(SABR_RETRY_DELAY, &self.shutdown).await;
+                let guard = self.spawn_sabr_state_guard(&plan, monitor_id, sabr_capture);
                 outcome = self
                     .run_process(
                         &self.active,
@@ -2501,6 +2518,7 @@ progress_info: None,
                         },
                     )
                     .await;
+                guard.stop().await;
             }
             outcome
         };

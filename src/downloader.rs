@@ -153,12 +153,16 @@ mod naming;
 mod plan;
 mod process;
 mod remux;
+mod state_guard;
 mod supervisor;
 mod tools;
 mod vod;
 
 #[allow(unused_imports)]
 use {backfill::*, supervisor::*, vod::*};
+pub use state_guard::K_SABR_STATE_GUARD;
+#[allow(unused_imports)]
+use state_guard::*;
 pub use cache::*;
 pub use finalize::*;
 pub use naming::*;
