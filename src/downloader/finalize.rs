@@ -1536,6 +1536,26 @@ mod tests {
             !sabr_resumable_failure(true, true, true, "StreamStallError: not near live head"),
             "DVR window exceeded has its own recovery (fall back to live edge), not a same-take retry"
         );
+        // The 2026-07-20 Maid Mint deaths: deep-rewind segment desync after a
+        // connection reset. Resuming genuinely progresses (each retry grew the
+        // downloaded ranges), so this must stay retryable — that take failed
+        // only because the fixed retry budget ran out (now refunded after a
+        // long-lived attempt).
+        assert!(sabr_resumable_failure(
+            true,
+            true,
+            true,
+            "yt_dlp.utils.DownloadError: Segment sequence number mismatch for format \
+             FormatId(itag=399, lmt=None, xtags=None): expected 648, received 9655"
+        ));
+        // "the streamer has disabled DVR" is an informational line, not the
+        // DVR-WINDOW-exceeded stall — it must not block a retry.
+        assert!(sabr_resumable_failure(
+            true,
+            true,
+            true,
+            "[download] Downloading from the live edge; the streamer has disabled DVR for this stream\nyt_dlp.utils.DownloadError: Segment sequence number mismatch"
+        ));
     }
     #[test]
     fn pot_token_failure_matches_real_shapes() {

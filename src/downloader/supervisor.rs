@@ -2458,6 +2458,15 @@ progress_info: None,
             // safe to reuse `None` across retries without cloning.
             const MAX_SABR_RETRIES: u32 = 3;
             const SABR_RETRY_DELAY: Duration = Duration::from_secs(5);
+            // The cap guards against tight CRASH-LOOPS (girl_dm_'s dead POT
+            // server: attempts dying ~40s apart), not against a long-lived
+            // take accumulating occasional transients — so an attempt that
+            // ran this long before dying refunds the whole budget. Without
+            // this, a 2h41m Maid Mint take (2026-07-20) was finalized failed
+            // by its 4th transient ever, two of whose attempts had each run
+            // over an hour (deep-rewind segment mismatches after connection
+            // resets on a DVR-disabled stream).
+            const SABR_RETRY_REFUND_SECS: u64 = 600;
             let mut retries = 0;
             while retries < MAX_SABR_RETRIES
                 && sabr_resumable_failure(
@@ -2498,6 +2507,7 @@ progress_info: None,
                 }
                 crate::app_core::sleep_cancellable(SABR_RETRY_DELAY, &self.shutdown).await;
                 let guard = self.spawn_sabr_state_guard(&plan, monitor_id, sabr_capture);
+                let attempt_started = std::time::Instant::now();
                 outcome = self
                     .run_process(
                         &self.active,
@@ -2519,6 +2529,18 @@ progress_info: None,
                     )
                     .await;
                 guard.stop().await;
+                // The resumed attempt may have ended any way here (another
+                // death, or the stream finishing cleanly) — either way a long
+                // run means the take is healthy, not crash-looping.
+                let ran = attempt_started.elapsed();
+                if ran >= Duration::from_secs(SABR_RETRY_REFUND_SECS) {
+                    info!(
+                        monitor_id,
+                        "SABR retry budget refunded — the resumed attempt ran {}m (occasional transience, not a crash loop)",
+                        ran.as_secs() / 60
+                    );
+                    retries = 0;
+                }
             }
             outcome
         };

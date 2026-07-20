@@ -1951,7 +1951,12 @@ like antivirus/backup briefly locking the `.state` file mid-write (Windows
 `PermissionError`/`Access is denied`) — and the failure wasn't the stream
 itself ending, the take retries in place up to 3 times (5 s apart) with the
 identical output path, so yt-dlp's own SABR resume continues from the
-surviving fragments instead of restarting from scratch. The same resumability
+surviving fragments instead of restarting from scratch. The 3-retry cap
+guards against tight *crash loops* (attempts dying seconds apart against, say,
+a dead token server) — an attempt that ran **10+ minutes** before dying
+refunds the whole budget, so a multi-hour take can absorb an occasional
+transient every hour indefinitely instead of being finalized as failed by its
+fourth one ever. The same resumability
 check also runs at app startup for a capture still mid-flight when the app
 was closed or crashed, picking it back up on the next launch.
 
