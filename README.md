@@ -1960,27 +1960,33 @@ fourth one ever. The same resumability
 check also runs at app startup for a capture still mid-flight when the app
 was closed or crashed, picking it back up on the next launch.
 
-**`.state` guard (lock prevention).** yt-dlp saves each checkpoint atomically
-(write a temp file, rename it over the old `.state`) — and on Windows that
-rename dies with `Access is denied` if any other process holds the old
-`.state` open without delete-sharing, which is exactly how backup/AV scanners
-open files. So while a from-start SABR capture runs, the app holds **deny-read
-guard handles** on its `.state` files: scanners can't acquire the killing lock
-at all, while yt-dlp's own checkpoint replace and success-path cleanup still
-work (delete stays shared). Guards start ~2 minutes after launch and are
-released the instant the tool exits (a resuming attempt must be able to
-*read* its state), and if a foreign process already holds a state file, the
-log names it via the Restart Manager. On by default — **Settings → Downloads
-→ SABR → "Guard .state files while recording"** is the killswitch.
+**Checkpoint locks (why they can kill a stock build, and why they don't kill
+this one).** yt-dlp saves each checkpoint atomically (write a temp file,
+rename it over the old `.state`) — and on Windows that rename dies with
+`Access is denied` if **any** other process holds an open handle on the
+`.state` at that instant, however politely shared: CPython ≥ 3.12 renames via
+`FILE_RENAME_INFO`, which rejects an open destination regardless of sharing
+mode. A backup/AV/indexing tool peeking at the file for half a second is
+enough to kill the entire download over one checkpoint. (The app briefly
+shipped a "deny-read guard handle" scheme to keep scanners off these files —
+it was removed after field data showed the guard's own handle triggered the
+exact same failure: *no* handle-holding scheme can coexist with that rename.)
+The durable fix lives in the bundled SABR dev build itself: its `.state`
+writer retries the rename for up to ~3 s and, if the file is still locked,
+skips that one checkpoint with a warning instead of dying — the next segment
+rewrites it seconds later. The in-flight retry above remains as backstop for
+stock builds without the patch.
 
 **Lock-culprit logging.** When a capture death *is* an access-denied file
 lock, the retry log line is followed by a `lock culprit:` line naming the
 process(es) currently holding the file (e.g. `bztransmit.exe (pid 4712,
 service)`) — queried right at death, while the scanner's lock is typically
-still live. The actionable fix is almost always adding the capture cache dirs
-to that tool's exclusion list; the guard and the in-flight retry cover
-whatever remains (the rename's millisecond-lived temp *source* file can't be
-guarded). The player features handle this
+still live. Because a Python tool's stderr can mangle non-ASCII path
+characters (the app forces UTF-8 output on the tools it spawns, but belt and
+suspenders), the query also covers the capture's surviving on-disk `.state`
+files discovered by directory listing, not just the paths parsed from the
+error line. The actionable fix is almost always adding the capture cache dirs
+to that tool's exclusion list. The player features handle this
 (full behavior in [Watching in a media player](#watching-in-a-media-player)):
 
 - **⏵ Stream in player** finds the growing pair and merges it *in mpv*: the

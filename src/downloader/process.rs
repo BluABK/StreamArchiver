@@ -1631,7 +1631,14 @@ impl Supervisor {
         // No kill_on_drop: the child must survive this task being dropped (detach).
         // A regular file handle (like a pipe) reads as isatty()=False, so yt-dlp
         // skips the console-width probe that crashes on a NUL handle.
+        // PYTHONIOENCODING: with stderr piped to a file, Python tools
+        // (yt-dlp, streamlink) default to the ANSI codepage and mangle
+        // non-ASCII path characters in error output (【】 dropped, ô → U+FFFD
+        // — 2026-07-20 Maid Mint: the mangled path blinded the lock-culprit
+        // parser). UTF-8 keeps logged paths byte-exact; non-Python tools
+        // ignore the variable.
         cmd.args(&plan.args)
+            .env("PYTHONIOENCODING", "utf-8")
             .stdin(Stdio::null())
             .stdout(Stdio::from(out_h))
             .stderr(Stdio::from(err_h));

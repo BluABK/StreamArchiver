@@ -1441,22 +1441,6 @@ impl StreamArchiverApp {
                         );
                     ui.end_row();
 
-                    ui.label("Guard .state files while recording");
-                    ui.checkbox(&mut self.settings.sabr_state_guard, "")
-                        .on_hover_text(
-                            "While a from-start SABR capture runs, hold deny-read guard \
-                             handles on its .state checkpoint files so backup/AV tools \
-                             can't take the read locks that make yt-dlp's checkpoint save \
-                             die with \"Access is denied\" (the capture then has to burn an \
-                             in-flight retry). yt-dlp's own writes and cleanup still work \
-                             (delete stays shared), and guards are released the moment the \
-                             tool exits so resuming can read the state. First acquire waits \
-                             ~2 minutes after launch for the same reason. If a foreign \
-                             process already holds a state file, the log names it \
-                             (Restart Manager) so you know what to exclude.",
-                        );
-                    ui.end_row();
-
                     ui.label("SABR manual args");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.settings.sabr_raw_args)
