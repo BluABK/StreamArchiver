@@ -196,11 +196,92 @@ pub async fn youtube_subscriptions(http: &Client, store: &Store) -> Result<Vec<I
     Ok(out)
 }
 
+/// Settings key for the persisted YouTube URL → `UC…` id resolution cache
+/// (JSON object, lowercased monitor URL → channel id). Bounded by the number
+/// of YouTube monitors, so it never needs eviction.
+const K_YT_UC_CACHE: &str = "yt_uc_resolve_cache";
+
+/// How many channel pages to scrape concurrently when resolving uncached URLs.
+const RESOLVE_CONCURRENCY: usize = 4;
+
+/// Resolve existing YouTube monitor `urls` (typically `@handle`-form, whose
+/// `UC…` id can't be read from the URL itself) to lowercased channel-id
+/// identities, for exact import dedup against a subscription's channel id.
+///
+/// Resolutions come from [`crate::websub::resolve_channel_uc`] (URL parse,
+/// else a channel-page scrape — no API key or quota) and are persisted in the
+/// settings table under [`K_YT_UC_CACHE`], so reopening the dialog never
+/// re-scrapes. A URL that fails to resolve is simply absent from the result —
+/// the dialog's fuzzy name dedup still applies to it.
+pub async fn resolve_yt_identities(
+    http: &Client,
+    store: &Store,
+    urls: &[String],
+) -> Vec<(String, String)> {
+    if urls.is_empty() {
+        return Vec::new();
+    }
+    let mut cache: std::collections::HashMap<String, String> = store
+        .get_setting(K_YT_UC_CACHE)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    let mut missing: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for u in urls {
+        let key = u.to_lowercase();
+        if !cache.contains_key(&key) && seen.insert(key) {
+            missing.push(u.clone());
+        }
+    }
+
+    let mut dirty = false;
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut queue = missing.into_iter();
+    loop {
+        while tasks.len() < RESOLVE_CONCURRENCY {
+            let Some(url) = queue.next() else { break };
+            let http = http.clone();
+            tasks.spawn(async move {
+                let uc = crate::websub::resolve_channel_uc(&http, &url).await;
+                (url, uc)
+            });
+        }
+        let Some(joined) = tasks.join_next().await else {
+            break;
+        };
+        if let Ok((url, Some(uc))) = joined {
+            cache.insert(url.to_lowercase(), uc);
+            dirty = true;
+        }
+    }
+    if dirty && let Ok(json) = serde_json::to_string(&cache) {
+        let _ = store.set_setting(K_YT_UC_CACHE, &json);
+    }
+
+    urls.iter()
+        .filter_map(|u| {
+            cache
+                .get(&u.to_lowercase())
+                .map(|uc| (u.clone(), uc.to_lowercase()))
+        })
+        .collect()
+}
+
 /// Create one channel container + its first monitor for an imported URL, reusing
 /// the same per-platform defaults a manual "Add stream" would (max-archival
 /// booleans on). `monitor_enabled` is the "Auto" choice (whether the scheduler
 /// auto-records it); `channel_enabled` is the container on/off (a "Disabled"
-/// import sets it false). Returns the new channel id.
+/// import sets it false — the master automation switch, so the channel sits
+/// fully dormant until re-enabled, exactly like flipping Enabled off in the
+/// grid). Container flags are seeded from the instance's, like a manual Add
+/// stream (`create_container_with_flags`), so a fresh import never starts with
+/// a channel/instance flag mismatch. `quality`/`out_dir` override the
+/// per-platform defaults for this one creation when non-empty (the dialog's
+/// "Overrides for this import" section). Returns the new channel id.
+#[allow(clippy::too_many_arguments)]
 pub fn create_monitor(
     store: &Store,
     defaults: &MonitorDefaults,
@@ -209,20 +290,29 @@ pub fn create_monitor(
     url: &str,
     monitor_enabled: bool,
     channel_enabled: bool,
+    quality: Option<&str>,
+    out_dir: Option<&str>,
 ) -> Result<i64> {
     let platform = Platform::detect(url);
-    let channel_id = store.create_container(name)?;
+    let channel_id =
+        store.create_container_with_flags(name, monitor_enabled, channel_enabled)?;
     let monitor = Monitor {
         id: 0,
         channel_id,
         url: url.to_string(),
         enabled: monitor_enabled,
-        automation_enabled: true,
+        automation_enabled: channel_enabled,
         tool: defaults.resolve_tool(platform),
         detection_method: defaults.resolve_detection(platform),
         poll_interval_secs: defaults.resolve_poll_interval(platform).max(5),
-        quality: defaults.resolve_quality(platform),
-        output_dir: defaults.resolve_output_dir(platform, default_out),
+        quality: match quality.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(q) => q.to_string(),
+            None => defaults.resolve_quality(platform),
+        },
+        output_dir: match out_dir.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(o) => o.to_string(),
+            None => defaults.resolve_output_dir(platform, default_out),
+        },
         filename_template: defaults.resolve_filename_template(platform),
         container: defaults.resolve_container(platform),
         capture_from_start: defaults.resolve_from_start(platform),
@@ -246,9 +336,6 @@ pub fn create_monitor(
         sabr_codec_custom: String::new(),
     };
     store.insert_monitor(&monitor)?;
-    if !channel_enabled {
-        store.set_channel_enabled(channel_id, false)?;
-    }
     Ok(channel_id)
 }
 
@@ -256,44 +343,115 @@ pub fn create_monitor(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn resolve_yt_identities_uses_url_and_cache_without_scraping() {
+        let store = Store::open_in_memory().unwrap();
+        let http = Client::new();
+
+        // A `/channel/UC…` URL resolves from the URL alone (no network), and the
+        // result lands in the persisted cache.
+        let ch = "https://www.youtube.com/channel/UCaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let out = resolve_yt_identities(&http, &store, &[ch.clone()]).await;
+        assert_eq!(out, vec![(ch.clone(), "ucaaaaaaaaaaaaaaaaaaaaaa".to_string())]);
+        let cached = store.get_setting(K_YT_UC_CACHE).unwrap().unwrap();
+        assert!(cached.contains("UCaaaaaaaaaaaaaaaaaaaaaa"));
+
+        // A pre-seeded cache entry (e.g. an @handle resolved on a previous open)
+        // is returned without any resolution attempt.
+        let handle = "https://www.youtube.com/@SomeHandle".to_string();
+        let seeded = serde_json::json!({
+            handle.to_lowercase(): "UCbbbbbbbbbbbbbbbbbbbbbb",
+        });
+        store.set_setting(K_YT_UC_CACHE, &seeded.to_string()).unwrap();
+        let out = resolve_yt_identities(&http, &store, &[handle.clone()]).await;
+        assert_eq!(out, vec![(handle, "ucbbbbbbbbbbbbbbbbbbbbbb".to_string())]);
+
+        // Empty input short-circuits.
+        assert!(resolve_yt_identities(&http, &store, &[]).await.is_empty());
+    }
+
     #[test]
-    fn create_monitor_sets_flags_and_platform() {
+    fn create_monitor_seeds_flags_at_both_levels() {
         let store = Store::open_in_memory().unwrap();
         let defaults = MonitorDefaults::default();
 
-        // Auto off (monitor disabled), not "Disabled" (channel on) → info-only.
-        let cid = create_monitor(
-            &store,
-            &defaults,
-            "C:/out",
-            "Cool",
-            "https://twitch.tv/cool",
-            false,
-            true,
-        )
-        .unwrap();
-        let rows = store.list_monitors_with_channels().unwrap();
-        let row = rows.iter().find(|r| r.channel.id == cid).unwrap();
-        assert!(!row.monitor.enabled, "Auto off → monitor disabled");
-        assert!(row.channel.enabled, "not 'Disabled' → channel on");
-        assert_eq!(row.monitor.platform(), Platform::Twitch);
-        assert_eq!(row.monitor.audio_tracks, "all"); // max-archival defaults
+        // Full Auto × Disabled matrix: the container's flags must mirror the
+        // instance's (Auto → enabled, master Enabled → automation_enabled) so an
+        // import never creates the channel/instance mismatch manual Add-stream
+        // avoids via create_container_with_flags.
+        for (auto, disabled) in [(false, false), (true, false), (false, true), (true, true)] {
+            let cid = create_monitor(
+                &store,
+                &defaults,
+                "C:/out",
+                &format!("Cool-{auto}-{disabled}"),
+                &format!("https://twitch.tv/cool_{auto}_{disabled}"),
+                auto,
+                !disabled,
+                None,
+                None,
+            )
+            .unwrap();
+            let rows = store.list_monitors_with_channels().unwrap();
+            let row = rows.iter().find(|r| r.channel.id == cid).unwrap();
+            assert_eq!(row.monitor.enabled, auto, "Auto choice → monitor.enabled");
+            assert_eq!(row.channel.enabled, auto, "Auto choice mirrored on the container");
+            assert_eq!(
+                row.monitor.automation_enabled, !disabled,
+                "'Disabled' → instance master switch off"
+            );
+            assert_eq!(
+                row.channel.automation_enabled, !disabled,
+                "'Disabled' → container master switch off (fully dormant)"
+            );
+            assert_eq!(row.monitor.platform(), Platform::Twitch);
+            assert_eq!(row.monitor.audio_tracks, "all"); // max-archival defaults
+        }
+    }
 
-        // Auto on + "Disabled" → monitor.enabled true but channel.enabled false.
-        let cid2 = create_monitor(
+    #[test]
+    fn create_monitor_applies_import_overrides() {
+        let store = Store::open_in_memory().unwrap();
+        let defaults = MonitorDefaults::default();
+
+        // Non-empty overrides win over the per-platform defaults…
+        let cid = create_monitor(
             &store,
             &defaults,
             "C:/out",
             "Tuber",
             "https://www.youtube.com/channel/UCabc",
             true,
-            false,
+            true,
+            Some("720p"),
+            Some(r"D:\yt"),
+        )
+        .unwrap();
+        let rows = store.list_monitors_with_channels().unwrap();
+        let row = rows.iter().find(|r| r.channel.id == cid).unwrap();
+        assert_eq!(row.monitor.quality, "720p");
+        assert_eq!(row.monitor.output_dir, r"D:\yt");
+        assert_eq!(row.monitor.platform(), Platform::YouTube);
+
+        // …while empty/whitespace overrides fall back to the defaults.
+        let cid2 = create_monitor(
+            &store,
+            &defaults,
+            "C:/out",
+            "Cool",
+            "https://twitch.tv/cool",
+            true,
+            true,
+            Some("  "),
+            Some(""),
         )
         .unwrap();
         let rows = store.list_monitors_with_channels().unwrap();
         let row2 = rows.iter().find(|r| r.channel.id == cid2).unwrap();
-        assert!(row2.monitor.enabled);
-        assert!(!row2.channel.enabled);
-        assert_eq!(row2.monitor.platform(), Platform::YouTube);
+        assert_eq!(row2.monitor.quality, defaults.resolve_quality(Platform::Twitch));
+        assert_eq!(
+            row2.monitor.output_dir,
+            defaults.resolve_output_dir(Platform::Twitch, "C:/out")
+        );
     }
 }

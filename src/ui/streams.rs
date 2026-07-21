@@ -26,7 +26,14 @@ pub(super) struct ChannelForm {
 /// Background load state of an import fetch (followed/subscriptions).
 pub(super) enum ImportLoadState {
     Loading,
-    Loaded(Vec<ImportCandidate>),
+    Loaded {
+        cands: Vec<ImportCandidate>,
+        /// Existing YouTube monitor URL → lowercased `UC…` identity, resolved in
+        /// the same background task (cached across opens), so `@handle`-added
+        /// monitors dedup exactly against a subscription's channel id instead of
+        /// only by name.
+        resolved: Vec<(String, String)>,
+    },
     Error(String),
 }
 
@@ -37,7 +44,9 @@ pub(super) struct ImportRow {
     pub(super) selected: bool,
     /// "Auto" — sets `monitor.enabled` (scheduler auto-records). Default off.
     pub(super) auto: bool,
-    /// "Disabled" — imports the container with `channel.enabled = false`.
+    /// "Disabled" — imports the channel with the master automation switch off
+    /// (`automation_enabled = false` on both container and instance): fully
+    /// dormant — no polling, detection, or fetches — until re-enabled.
     pub(super) disabled: bool,
     /// Already present in the app (matched an existing monitor by id/login) — shown
     /// greyed and not selectable, so an import can't create duplicates.
@@ -58,6 +67,11 @@ pub(super) struct ImportDialog {
     pub(super) loaded: bool,
     pub(super) search: String,
     pub(super) status: String,
+    /// Batch quality override for this import ("Overrides for this import"
+    /// section). Empty = each monitor gets its per-platform default quality.
+    pub(super) quality_override: String,
+    /// Batch output-directory override. Empty = per-platform default output dir.
+    pub(super) out_dir_override: String,
 }
 
 /// Self-mutating actions collected while rendering the Streams grid (whose
@@ -3050,6 +3064,23 @@ impl StreamArchiverApp {
         let load = Arc::new(Mutex::new(ImportLoadState::Loading));
         let load2 = load.clone();
         let store = self.core.store.clone();
+        // Existing YouTube monitors whose URL doesn't carry a `UC…` id (e.g.
+        // added by @handle) — resolved to channel ids in the fetch task so the
+        // dedup can match them exactly instead of only by name.
+        let unresolved_yt: Vec<String> = if platform == Platform::YouTube {
+            let mut seen = HashSet::new();
+            self.rows
+                .iter()
+                .filter(|r| {
+                    r.monitor.platform() == Platform::YouTube
+                        && yt_channel_id(&r.monitor.url).is_none()
+                })
+                .map(|r| r.monitor.url.clone())
+                .filter(|u| seen.insert(u.to_lowercase()))
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.core.rt.spawn(async move {
             let result = match reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
@@ -3063,7 +3094,12 @@ impl StreamArchiverApp {
                         _ => Err(anyhow::anyhow!("unsupported platform")),
                     };
                     match fetched {
-                        Ok(c) => ImportLoadState::Loaded(c),
+                        Ok(cands) => {
+                            let resolved =
+                                imports::resolve_yt_identities(&http, &store, &unresolved_yt)
+                                    .await;
+                            ImportLoadState::Loaded { cands, resolved }
+                        }
                         Err(e) => ImportLoadState::Error(e.to_string()),
                     }
                 }
@@ -3084,6 +3120,8 @@ impl StreamArchiverApp {
             loaded: false,
             search: String::new(),
             status: String::new(),
+            quality_override: String::new(),
+            out_dir_override: String::new(),
         });
     }
 
@@ -3097,31 +3135,43 @@ impl StreamArchiverApp {
         // viewport closure borrows the dialog.
         let promote = {
             let d = self.import_dialog.as_ref().unwrap();
-            !d.loaded && matches!(&*d.load.lock().unwrap(), ImportLoadState::Loaded(_))
+            !d.loaded && matches!(&*d.load.lock().unwrap(), ImportLoadState::Loaded { .. })
         };
         if promote {
-            // Confident dedup: per-platform identity (Twitch login / YouTube UC id).
-            let existing_ids: HashSet<(Platform, String)> = self
-                .rows
-                .iter()
-                .map(|r| (r.monitor.platform(), monitor_import_identity(&r.monitor.url)))
-                .collect();
-            // Fuzzy dedup: existing container names (catches a channel added under a
-            // URL form whose identity can't be matched, e.g. a YouTube @handle).
-            let existing_names: HashSet<String> =
-                self.rows.iter().map(|r| r.channel.name.to_lowercase()).collect();
-            let d = self.import_dialog.as_mut().unwrap();
             // Take the guard once (a second .lock() on the same thread would deadlock).
-            let cands = {
+            let (cands, resolved) = {
+                let d = self.import_dialog.as_ref().unwrap();
                 let mut g = d.load.lock().unwrap();
                 match std::mem::replace(&mut *g, ImportLoadState::Loading) {
-                    ImportLoadState::Loaded(c) => c,
+                    ImportLoadState::Loaded { cands, resolved } => (cands, resolved),
                     other => {
                         *g = other;
-                        Vec::new()
+                        (Vec::new(), Vec::new())
                     }
                 }
             };
+            // Confident dedup: per-platform identity (Twitch login / YouTube UC id).
+            // For YouTube monitors whose URL hides the UC id (@handle form), the
+            // background task's resolution (URL → id) supplies the exact identity.
+            let resolved: std::collections::HashMap<String, String> =
+                resolved.into_iter().collect();
+            let existing_ids: HashSet<(Platform, String)> = self
+                .rows
+                .iter()
+                .map(|r| {
+                    let identity = resolved
+                        .get(&r.monitor.url)
+                        .cloned()
+                        .unwrap_or_else(|| monitor_import_identity(&r.monitor.url));
+                    (r.monitor.platform(), identity)
+                })
+                .collect();
+            // Fuzzy dedup: existing container names (catches a channel added under a
+            // URL form whose identity can't be matched, e.g. a YouTube @handle
+            // whose page scrape failed).
+            let existing_names: HashSet<String> =
+                self.rows.iter().map(|r| r.channel.name.to_lowercase()).collect();
+            let d = self.import_dialog.as_mut().unwrap();
             d.rows = cands
                 .into_iter()
                 .map(|c| {
@@ -3173,7 +3223,7 @@ impl StreamArchiverApp {
                                     format!("Couldn't load: {e}"),
                                 );
                             }
-                            ImportLoadState::Loaded(_) => {
+                            ImportLoadState::Loaded { .. } => {
                                 ctx.request_repaint(); // will promote next frame
                             }
                         }
@@ -3202,7 +3252,8 @@ impl StreamArchiverApp {
                         egui::RichText::new(
                             "Tick the channels to import. \"Auto\" lets the scheduler \
                              auto-record (off = monitor only); \"Disabled\" imports the \
-                             channel turned off. Already-added channels are greyed out.",
+                             channel fully turned off (no polling until you enable it). \
+                             Already-added channels are greyed out.",
                         )
                         .small()
                         .weak(),
@@ -3243,6 +3294,46 @@ impl StreamArchiverApp {
                             }
                         }
                     });
+                    egui::CollapsingHeader::new("Overrides for this import")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            egui::Grid::new("import_overrides")
+                                .num_columns(2)
+                                .spacing([10.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.label("Quality");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut dialog.quality_override)
+                                            .hint_text("platform default")
+                                            .desired_width(140.0),
+                                    )
+                                    .on_hover_text(
+                                        "Quality for every channel imported in this batch \
+                                         (e.g. \"best\" or \"720p\"). Empty = each monitor \
+                                         gets its per-platform default quality, same as a \
+                                         manual Add stream.",
+                                    );
+                                    ui.end_row();
+                                    ui.label("Output dir");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut dialog.out_dir_override)
+                                            .hint_text("platform default")
+                                            .desired_width(320.0),
+                                    )
+                                    .on_hover_text(
+                                        "Output directory for every channel imported in \
+                                         this batch. Empty = the per-platform default \
+                                         output directory.",
+                                    );
+                                    ui.end_row();
+                                });
+                        })
+                        .header_response
+                        .on_hover_text(
+                            "Optional batch settings applied to every channel this import \
+                             creates, instead of the per-platform defaults. Individual \
+                             monitors can still be edited afterwards.",
+                        );
                     ui.add_space(4.0);
 
                     egui::ScrollArea::vertical()
@@ -3254,9 +3345,17 @@ impl StreamArchiverApp {
                                 .striped(true)
                                 .spacing([10.0, 4.0])
                                 .show(ui, |ui| {
-                                    ui.strong("Import");
-                                    ui.strong("Auto");
-                                    ui.strong("Disabled");
+                                    ui.strong("Import")
+                                        .on_hover_text("Create a monitor for this channel");
+                                    ui.strong("Auto").on_hover_text(
+                                        "Let the scheduler auto-record this channel when it \
+                                         goes live (off = monitor only)",
+                                    );
+                                    ui.strong("Disabled").on_hover_text(
+                                        "Import with the master Enabled switch off: fully \
+                                         dormant (no polling, detection, or fetches) until \
+                                         you enable it in the grid",
+                                    );
                                     ui.strong("Channel");
                                     ui.strong("ID");
                                     ui.strong("Info");
@@ -3340,6 +3439,8 @@ impl StreamArchiverApp {
         } else {
             Vec::new()
         };
+        let quality_override = dialog.quality_override.clone();
+        let out_dir_override = dialog.out_dir_override.clone();
         let close = do_close || !open;
 
         if do_import {
@@ -3358,6 +3459,8 @@ impl StreamArchiverApp {
                     url,
                     *auto,
                     !*disabled,
+                    Some(&quality_override),
+                    Some(&out_dir_override),
                 ) {
                     Ok(_) => ok += 1,
                     Err(e) => {

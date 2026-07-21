@@ -144,6 +144,46 @@ two tools on one URL.
    downloads, and **start at login** (autostart). Folder fields have a **Browse…**
    button.
 
+#### Bulk import: followed / subscribed channels (📥)
+
+Instead of adding channels one by one, import the ones you already follow:
+
+- **Twitch** — Settings → Accounts → *📥 Import followed channels* (needs a
+  connected Twitch account; older connections may need a reconnect to grant
+  the *follows* permission).
+- **YouTube** — Settings → Accounts → *📥 Import subscriptions* (needs a
+  connected Google account via the "Connect YouTube" device-code flow).
+
+A confirmation dialog lists every candidate with a search filter, an **All**
+master checkbox, and per-row choices:
+
+- **Import** — create the channel + monitor (same max-archival defaults as a
+  manual Add stream: chat log, thumbnails, chat assets, all audio/subtitle
+  tracks).
+- **Auto** (default off) — let the scheduler auto-record it. The channel's own
+  Auto switch is seeded to match, so a fresh import never starts with the
+  channel/instance mismatch the grid would AND together.
+- **Disabled** — import with the **master Enabled switch off** (channel and
+  instance): fully dormant — no polling, detection, or fetches — until you
+  enable it in the grid. Useful for "archive the list now, activate later".
+
+**Dedup**: channels you already monitor are greyed out ("added") — matched by
+Twitch login / Kick slug / YouTube channel id. YouTube monitors that were
+added by **@handle** URL (where the `UC…` id isn't in the URL) are resolved to
+their channel id in the background (a one-time channel-page scrape per URL,
+cached persistently), so they also match exactly. Only when resolution fails
+does the fallback name match kick in: a candidate whose *name* equals an
+existing channel's is flagged "(maybe added)" and left unticked, but can still
+be imported deliberately.
+
+**Overrides for this import** (collapsed section in the dialog): optionally
+set a **quality** and/or **output directory** applied to every channel this
+batch creates, instead of the per-platform defaults — e.g. point a hundred
+subscriptions at a spare drive at 720p in one go. Individual monitors can
+still be edited afterwards.
+
+Kick has no import (no user-level OAuth flow to read a follow list from).
+
 ### Videos (on-demand downloads)
 
 ![Videos tab — download form and history](doc/screenshots/videos-tab.png)
