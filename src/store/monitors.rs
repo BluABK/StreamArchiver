@@ -278,6 +278,46 @@ impl Store {
         Ok(())
     }
 
+    /// Make a monitor due for polling on the very next scheduler tick (resets
+    /// `last_checked_at`), without touching its state — how an EventSub
+    /// shared-chat push accelerates the collab refresh.
+    pub fn mark_monitor_poll_due(&self, id: i64) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE monitor SET last_checked_at = 0 WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// The monitor's current live-collab JSON (`monitor.last_collab`; '' when
+    /// none). Read back by the collab refresher's degraded path so a transient
+    /// Shared Chat fetch failure keeps showing the last-known partners.
+    pub fn monitor_last_collab(&self, id: i64) -> Result<String> {
+        let conn = self.db();
+        Ok(conn
+            .query_row(
+                "SELECT last_collab FROM monitor WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    /// Set (or clear, with `""`) the live "Stream Together" collab JSON shown
+    /// by the grid ([`crate::models::CollabLive`]) — a narrow single-column
+    /// setter like [`Self::set_monitor_viewers`], written by both the
+    /// scheduler's poll and the in-recording `meta_watcher`.
+    pub fn set_monitor_live_collab(&self, id: i64, collab_json: &str) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE monitor SET last_collab = ?2 WHERE id = ?1",
+            params![id, collab_json],
+        )?;
+        Ok(())
+    }
+
     /// Update just the live viewer count, independent of `set_monitor_live_meta`
     /// — used by the in-recording `meta_watcher` (`downloader.rs`), which polls
     /// title/game/viewers directly while the scheduler skips an actively-

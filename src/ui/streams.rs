@@ -108,6 +108,8 @@ struct StreamsOut {
     /// "Channel history" on a stream row: the owning monitor's all-time
     /// title/category change ledger, independent of any recording.
     open_history_popup: Option<i64>,
+    /// Channel id whose 🤝 collab-history window should open.
+    open_collab_history: Option<i64>,
 }
 
 #[derive(Clone, Copy)]
@@ -831,7 +833,8 @@ impl StreamArchiverApp {
                                     &mut tr, &groups[&mid][gi], mid, depth, &self.rows,
                                     &mut self.fs_probes, &self.settings,
                                     &self.background_tasks, &finalizing_recs, ad_breaks,
-                                    meta_logs, &exp_streams, now, &col_order, &mut out,
+                                    meta_logs, &self.collab_by_stream, &exp_streams, now,
+                                    &col_order, &mut out,
                                 );
                             }
                             Vis::Take { mid, gi, ti, depth } => {
@@ -840,7 +843,7 @@ impl StreamArchiverApp {
                                     mid, &self.core, &mut self.status,
                                     &mut self.fs_probes, &self.settings,
                                     &self.background_tasks, &finalizing_recs, ad_breaks,
-                                    meta_logs,
+                                    meta_logs, &self.collab_by_stream,
                                     &mut self.rename_rec_id, &mut self.rename_draft,
                                     &mut self.rename_preview,
                                     &mut self.show_rename_dialog, now, &col_order,
@@ -911,6 +914,7 @@ impl StreamArchiverApp {
             open_meta_popup,
             open_schedule_popup,
             open_history_popup,
+            open_collab_history,
         } = out;
         if let Some(rid) = open_ad_popup
             && !self.ad_popups.contains(&rid)
@@ -927,6 +931,9 @@ impl StreamArchiverApp {
             && !self.history_popups.contains(&mid)
         {
             self.history_popups.push(mid);
+        }
+        if let Some(cid) = open_collab_history.or(acts.open_collab_history) {
+            self.open_collab_history(cid);
         }
         if let Some(rec_id) = open_recover_take {
             self.open_recover_vod_from_seed(rec_id);
@@ -1310,6 +1317,9 @@ impl StreamArchiverApp {
             })
             .unwrap_or_default();
         let cur_viewers = primary.map(|m| m.last_viewers).unwrap_or(-1);
+        // Current "Stream Together" collab of the primary live instance —
+        // drives the 🤝 Collab cell and the name-cell " × Partner" suffix.
+        let cur_collab = primary.and_then(|m| m.live_collab.clone());
         // The channel's next stream = the SOONEST upcoming
         // across its instances (the past-recording primary
         // may be a different platform with no schedule).
@@ -1426,6 +1436,19 @@ impl StreamArchiverApp {
                                 .strong()
                                 .color(name_color),
                         );
+                        // "Stream Together" partners as a weak " × Partner"
+                        // suffix while a shared-chat session is live (title
+                        // @mentions stay in the 🤝 Collab column only).
+                        if let Some(c) = &cur_collab {
+                            let suffix = c.name_suffix();
+                            if !suffix.is_empty() {
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(suffix).weak())
+                                        .truncate(),
+                                )
+                                .on_hover_text(collab_hover(c));
+                            }
+                        }
                         disc = clicked;
                     }
                     "tool" => {
@@ -1579,6 +1602,11 @@ impl StreamArchiverApp {
                     }
                     "title" => {
                         meta_value_cell(ui, &cur_title);
+                    }
+                    "collab" => {
+                        if collab_cell(ui, cur_collab.as_ref()) {
+                            out.open_collab_history = Some(cid);
+                        }
                     }
                     "viewers" => {
                         if cur_viewers >= 0 {
@@ -1815,6 +1843,7 @@ impl StreamArchiverApp {
         finalizing_recs: &HashSet<i64>,
         ad_breaks: &HashMap<i64, Vec<AdBreak>>,
         meta_logs: &HashMap<i64, Vec<StreamMetaChange>>,
+        collab_by_stream: &HashMap<(i64, String), String>,
         exp_streams: &HashSet<String>,
         now: i64,
         col_order: &[usize],
@@ -2025,6 +2054,18 @@ impl StreamArchiverApp {
                     }
                     "title" => {
                         meta_value_cell(ui, g.title());
+                    }
+                    "collab" => {
+                        // Stored collab of this past/current broadcast, from
+                        // the preloaded (monitor, stream id) → names map.
+                        if let Some(sid) = &g.stream_id
+                            && let Some(names) = collab_by_stream.get(&(mid, sid.clone()))
+                        {
+                            ui.add(egui::Label::new(names).truncate()).on_hover_text(
+                                "Who this broadcast was streamed together with \
+                                 (recorded collab history; @name = from the title)",
+                            );
+                        }
                     }
                     "changes" => {
                         let det = meta_rec.and_then(|id| meta_logs.get(&id));
@@ -2250,6 +2291,19 @@ impl StreamArchiverApp {
                     out.open_history_popup = Some(mid);
                     ui.close();
                 }
+                if ui
+                    .button("🤝  Collab history")
+                    .on_hover_text(
+                        "Every \"Stream Together\" session recorded for this channel: \
+                         when, with whom, and who hosted (plus @mention-in-title \
+                         collabs).",
+                    )
+                    .clicked()
+                {
+                    out.open_collab_history =
+                        rows.iter().find(|r| r.monitor.id == mid).map(|r| r.channel.id);
+                    ui.close();
+                }
             });
             if disc {
                 out.toggle_stream = Some(g.key.clone());
@@ -2275,6 +2329,7 @@ impl StreamArchiverApp {
         finalizing_recs: &HashSet<i64>,
         ad_breaks: &HashMap<i64, Vec<AdBreak>>,
         meta_logs: &HashMap<i64, Vec<StreamMetaChange>>,
+        collab_by_stream: &HashMap<(i64, String), String>,
         rename_rec_id: &mut Option<i64>,
         rename_draft: &mut String,
         rename_preview: &mut String,
@@ -2462,6 +2517,16 @@ impl StreamArchiverApp {
                     }
                     "title" => {
                         meta_value_cell(ui, &t.title);
+                    }
+                    "collab" => {
+                        if let Some(sid) = &t.stream_id
+                            && let Some(names) = collab_by_stream.get(&(mid, sid.clone()))
+                        {
+                            ui.add(egui::Label::new(names).truncate()).on_hover_text(
+                                "Who this broadcast was streamed together with \
+                                 (recorded collab history; @name = from the title)",
+                            );
+                        }
                     }
                     "changes" => {
                         let det = meta_logs.get(&t.id);

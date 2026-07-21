@@ -567,6 +567,82 @@ impl StreamArchiverApp {
         !open
     }
 
+    // (collab history helpers below; state struct + line formatter at the
+    // bottom of this file)
+
+    /// Open the 🤝 collab-history window for a channel (loads its sessions
+    /// once; reopening refreshes).
+    pub(super) fn open_collab_history(&mut self, channel_id: i64) {
+        let sessions = self
+            .core
+            .store
+            .collab_sessions_for_channel(channel_id, 500)
+            .unwrap_or_default();
+        let channel_name = self
+            .channels
+            .iter()
+            .find(|c| c.id == channel_id)
+            .map(|c| c.name.clone())
+            .unwrap_or_default();
+        self.collab_history = Some(CollabHistoryState { channel_name, sessions });
+    }
+
+    /// The "🤝 Collab history" window: one line per stored "Stream Together"
+    /// session (newest first) — when, how long, with whom, who hosted, and
+    /// whether it came from Shared Chat or a title @mention.
+    #[allow(deprecated)]
+    pub(super) fn collab_history_window(&mut self, ctx: &egui::Context) {
+        let Some(state) = &self.collab_history else { return };
+        let mut open = true;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("collab_history_vp"),
+            egui::ViewportBuilder::default()
+                .with_title(format!("{} — collab history", state.channel_name))
+                .with_inner_size([560.0, 360.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if state.sessions.is_empty() {
+                        ui.label(
+                            "No collabs recorded yet. Sessions appear here once a live \
+                             Twitch instance is seen in a \"Stream Together\" shared \
+                             chat (or @mentions someone in its title).",
+                        );
+                        return;
+                    }
+                    ui.label(format!(
+                        "{} session(s), newest first. 💬 = Shared Chat (confirmed), \
+                         @ = title mention (heuristic); a duration ending in \"+\" is \
+                         still ongoing.",
+                        state.sessions.len()
+                    ));
+                    ui.add_space(6.0);
+                    let lines = collab_session_lines(&state.sessions);
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for line in &lines {
+                                ui.label(egui::RichText::new(line).monospace());
+                            }
+                        });
+                    ui.add_space(6.0);
+                    if ui
+                        .button("📋  Copy")
+                        .on_hover_text("Copy the session list as text")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(lines.join("\n"));
+                    }
+                });
+            },
+        );
+        if !open {
+            self.collab_history = None;
+        }
+    }
+
     /// Render every open title/category-changes window (one per take/stream).
     pub(super) fn meta_popup_windows(&mut self, ctx: &egui::Context) {
         let mut closed: Vec<i64> = Vec::new();
@@ -1841,4 +1917,41 @@ impl StreamArchiverApp {
             });
         }
     }
+}
+
+/// Backing state for the "🤝 Collab history" window (one at a time; opening
+/// another channel's history replaces it).
+pub(super) struct CollabHistoryState {
+    pub(super) channel_name: String,
+    pub(super) sessions: Vec<crate::models::CollabSessionRow>,
+}
+
+/// One line per stored collab session: start, duration (or "ongoing"), source
+/// marker (💬 Shared Chat / @ title mention), partners, and the host.
+pub(super) fn collab_session_lines(sessions: &[crate::models::CollabSessionRow]) -> Vec<String> {
+    sessions
+        .iter()
+        .map(|s| {
+            let start = fmt_datetime_short(s.first_seen_at);
+            let span = match s.ended_at {
+                Some(end) => fmt_duration((end - s.first_seen_at).max(0)),
+                // Still open: show how long it's been running so far.
+                None => format!("{}+", fmt_duration((s.last_seen_at - s.first_seen_at).max(0))),
+            };
+            let names: Vec<String> = s
+                .partners
+                .iter()
+                .map(|p| if p.from_title { format!("@{}", p.name) } else { p.name.clone() })
+                .collect();
+            let marker = if s.source == "shared_chat" { "💬" } else { "@" };
+            let host = if s.source != "shared_chat" || s.host_id.is_empty() {
+                String::new()
+            } else if let Some(h) = s.partners.iter().find(|p| p.id == s.host_id) {
+                format!("  (host: {})", h.name)
+            } else {
+                "  (host: this channel)".to_string()
+            };
+            format!("{start}  {span:>8}  {marker} {}{host}", names.join(", "))
+        })
+        .collect()
 }

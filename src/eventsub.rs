@@ -30,6 +30,12 @@
 //! `scheduler.rs`), a channel marked "live" would stay that way forever once
 //! the broadcast actually ended.
 //!
+//! Conduit mode additionally subscribes `channel.shared_chat.begin/update/end`
+//! ("Stream Together" collabs, default on via the `collab_eventsub` setting) —
+//! those events don't carry state themselves here; they just mark the monitor
+//! poll-due so the scheduler's collab refresh runs within a tick. User-token
+//! mode skips them: WebSocket transport caps TOTAL subscription cost at 10.
+//!
 //! NOTE: This path needs live Twitch credentials + a channel going live to
 //! verify end-to-end; use `--eventsub-test` to exercise it.
 
@@ -161,6 +167,27 @@ async fn run_session(
                  ({n_off} offline)",
                 uid_to_monitors.len()
             );
+            // "Stream Together" (Shared Chat) push notifications — conduit
+            // mode only: the conduit cost cap is 10,000, while WebSocket
+            // transport caps TOTAL cost at 10 (each other-broadcaster sub
+            // costs 1), where 3 extra types per channel would be untenable.
+            // Default on; the events just poke the scheduler to refresh
+            // collab state early (the poll routine stays the source of truth).
+            if collab_eventsub_enabled(store) {
+                let mut n_collab = 0usize;
+                for t in [
+                    "channel.shared_chat.begin",
+                    "channel.shared_chat.update",
+                    "channel.shared_chat.end",
+                ] {
+                    n_collab +=
+                        subscribe_type(&http, &client_id, token, t, &sub_transport, &uid_to_monitors)
+                            .await;
+                }
+                debug!(
+                    "eventsub: shared-chat (collab) subscriptions active ({n_collab} across 3 types)"
+                );
+            }
         }
         Transport::UserToken { token } => {
             let sub_transport = json!({ "method": "websocket", "session_id": session_id });
@@ -171,6 +198,14 @@ async fn run_session(
                  ({n_off} offline)",
                 uid_to_monitors.len()
             );
+            if collab_eventsub_enabled(store) {
+                debug!(
+                    "eventsub: skipping shared-chat (collab) subscriptions in user-token \
+                     mode — WebSocket transport caps total subscription cost at 10 \
+                     (collab updates come from polling instead; add a Client Secret \
+                     for conduit mode to enable pushes)"
+                );
+            }
         }
     }
     // Reconcile: anything already live should start recording now; anything
@@ -195,7 +230,7 @@ async fn run_session(
         use tokio_tungstenite::tungstenite::Message;
         match msg {
             Message::Text(text) => {
-                if handle_message(&text, &uid_to_monitors, live_tx, offline_tx) {
+                if handle_message(&text, &uid_to_monitors, live_tx, offline_tx, store) {
                     // session_reconnect — drop out and reconnect fresh.
                     return Ok(true);
                 }
@@ -215,6 +250,7 @@ fn handle_message(
     uid_to_monitors: &HashMap<String, Vec<i64>>,
     live_tx: &UnboundedSender<LiveSignal>,
     offline_tx: &UnboundedSender<OfflineSignal>,
+    store: &Store,
 ) -> bool {
     let Ok(v) = serde_json::from_str::<Value>(text) else {
         return false;
@@ -256,6 +292,29 @@ fn handle_message(
                         }
                     }
                 }
+                Some(
+                    t @ ("channel.shared_chat.begin"
+                    | "channel.shared_chat.update"
+                    | "channel.shared_chat.end"),
+                ) => {
+                    // Poke, don't parse: mark the monitor due so the very next
+                    // scheduler tick runs the full collab refresh (the poll
+                    // routine is the single source of truth for collab state).
+                    // No-op for pure-EventSub monitors (never scheduler-polled)
+                    // — their collab state comes from `meta_watcher` while
+                    // recording, or the next reconnect reconcile.
+                    if let Some(uid) = event["broadcaster_user_id"].as_str()
+                        && let Some(mons) = uid_to_monitors.get(uid)
+                    {
+                        for &mid in mons {
+                            debug!(
+                                "eventsub {}: {t} -> monitor {mid} (collab poll due)",
+                                crate::models::Platform::Twitch.tag()
+                            );
+                            let _ = store.mark_monitor_poll_due(mid);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -263,6 +322,17 @@ fn handle_message(
         _ => {}
     }
     false
+}
+
+/// Whether the "Collab via EventSub" setting is on (default: on). Only takes
+/// effect in conduit mode — see the subscribe sites.
+fn collab_eventsub_enabled(store: &Store) -> bool {
+    store
+        .get_setting("collab_eventsub")
+        .ok()
+        .flatten()
+        .map(|v| v != "0")
+        .unwrap_or(true)
 }
 
 fn app_credentials(store: &Store) -> Option<(String, String)> {

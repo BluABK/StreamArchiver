@@ -929,6 +929,16 @@ pub(super) async fn meta_watcher(
     let mut last_game: Option<String> = None;
     let mut cont_title = cont_title;
     let mut cont_game = cont_game;
+    // "Stream Together" collab refresh inputs (Twitch only): the in-recording
+    // half of the dual feed — the scheduler skips actively-recording monitors,
+    // so without this the Collab column would freeze for the whole take.
+    let collab_login =
+        (platform == Platform::Twitch).then(|| crate::detectors::twitch_login(&url)).flatten();
+    let collab_stream_id = match &collab_login {
+        Some(_) => store.recording_stream_id(rec_id).unwrap_or_default(),
+        None => String::new(),
+    };
+    let mut collab_bid: Option<String> = None;
     // Stop-on-unmatch state — see the doc comment above. `last_matched: None`
     // until the baseline poll; `unmatch_since: Some(t)` from the poll that
     // first observed a matching->non-matching transition, cleared the moment
@@ -1025,6 +1035,19 @@ pub(super) async fn meta_watcher(
                 && let Err(e) = store.set_monitor_viewers(monitor_id, v)
             {
                 warn!("update viewers failed: {e:#}");
+            }
+            if let Some(login) = &collab_login {
+                if collab_bid.is_none() {
+                    collab_bid = ctx.twitch_id_for_login(login).await;
+                }
+                ctx.refresh_twitch_collab(
+                    monitor_id,
+                    login,
+                    collab_bid.clone(),
+                    &collab_stream_id,
+                    &meta.title,
+                )
+                .await;
             }
             if let Some(rule) = &stop_rule
                 && !stop_sent

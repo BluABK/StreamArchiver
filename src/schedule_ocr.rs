@@ -481,8 +481,18 @@ fn map_events(events: Vec<OcrEvent>, opts: &OcrOpts) -> Vec<ScheduleSegment> {
         .into_iter()
         .filter_map(|e| {
             let start = event_start(&e, opts)?;
-            let title = match e.collab.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                Some(c) if !e.title.trim().is_empty() => format!("{} w/ {}", e.title.trim(), c),
+            let collab = e
+                .collab
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("")
+                .to_string();
+            // Collab is BOTH folded into the title (display continuity — the
+            // calendar shows the title everywhere) and stored structured in
+            // `collab` for the "With: …" detail line / 🤝 marker.
+            let title = match (!collab.is_empty(), !e.title.trim().is_empty()) {
+                (true, true) => format!("{} w/ {}", e.title.trim(), collab),
                 _ => e.title.trim().to_string(),
             };
             if title.is_empty() {
@@ -497,6 +507,7 @@ fn map_events(events: Vec<OcrEvent>, opts: &OcrOpts) -> Vec<ScheduleSegment> {
                 category: String::new(),
                 canceled: false,
                 video_id: None,
+                collab,
             })
         })
         .collect();

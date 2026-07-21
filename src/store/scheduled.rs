@@ -293,11 +293,29 @@ impl Store {
             }
         }
         {
+            // Own login for @mention self-exclusion (Twitch URLs; other
+            // platforms just get an empty exclusion string).
+            let own_login: String = tx
+                .query_row(
+                    "SELECT url FROM monitor WHERE id = ?1",
+                    params![monitor_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|url| crate::detectors::twitch_login(&url))
+                .unwrap_or_default();
             let mut stmt = tx.prepare(
-                "INSERT INTO schedule_segment(monitor_id, start_time, end_time, title, category, canceled, source, video_id)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO schedule_segment(monitor_id, start_time, end_time, title, category, canceled, source, video_id, collab)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
             for s in &segs_to_write {
+                // Collab names: the fetcher's explicit value (OCR) wins; else
+                // derive heuristically from @mentions in the title.
+                let collab = if s.collab.is_empty() {
+                    crate::models::title_mentions(&s.title, &own_login).join(", ")
+                } else {
+                    s.collab.clone()
+                };
                 stmt.execute(params![
                     monitor_id,
                     s.start_time,
@@ -307,6 +325,7 @@ impl Store {
                     s.canceled as i64,
                     source,
                     s.video_id.as_deref(),
+                    collab,
                 ])?;
             }
         }
@@ -569,7 +588,7 @@ impl Store {
     pub fn schedule_for_monitor(&self, monitor_id: i64, after: i64) -> Result<Vec<ScheduleSegment>> {
         let conn = self.db();
         let mut stmt = conn.prepare(
-            "SELECT id, monitor_id, start_time, end_time, title, category, canceled, video_id
+            "SELECT id, monitor_id, start_time, end_time, title, category, canceled, video_id, collab
              FROM schedule_segment
              WHERE monitor_id = ?1 AND canceled = 0 AND start_time >= ?2
              ORDER BY start_time",
@@ -585,6 +604,7 @@ impl Store {
                     category: r.get(5)?,
                     canceled: r.get::<_, i64>(6)? != 0,
                     video_id: r.get(7)?,
+                    collab: r.get(8)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -604,7 +624,7 @@ impl Store {
     ) -> Result<Vec<ScheduleSegment>> {
         let conn = self.db();
         let mut stmt = conn.prepare(
-            "SELECT id, monitor_id, start_time, end_time, title, category, canceled, video_id
+            "SELECT id, monitor_id, start_time, end_time, title, category, canceled, video_id, collab
              FROM schedule_segment
              WHERE monitor_id = ?1 AND source = ?2 AND canceled = 0
                AND start_time >= ?3
@@ -621,6 +641,7 @@ impl Store {
                     category: r.get(5)?,
                     canceled: r.get::<_, i64>(6)? != 0,
                     video_id: r.get(7)?,
+                    collab: r.get(8)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -674,7 +695,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT s.id, s.monitor_id, m.channel_id, c.name, m.url,
                     s.start_time, s.end_time, s.title, s.category, s.source,
-                    c.color, s.merged_into, s.auto_merge_excluded
+                    c.color, s.merged_into, s.auto_merge_excluded, s.collab
              FROM schedule_segment s
              JOIN monitor m ON m.id = s.monitor_id
              JOIN channel c ON c.id = m.channel_id
@@ -697,6 +718,7 @@ impl Store {
                     channel_color: r.get(10)?,
                     merged_into: r.get(11)?,
                     auto_merge_excluded: r.get::<_, i64>(12)? != 0,
+                    collab: r.get(13)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -727,6 +749,7 @@ mod tests {
             category: String::new(),
             canceled,
             video_id: None,
+            collab: String::new(),
         };
         // Out of order; a past one, a canceled one, and two future.
         store
@@ -786,6 +809,7 @@ mod tests {
             category: String::new(),
             canceled,
             video_id: None,
+            collab: String::new(),
         };
         store
             .replace_schedule_source(
@@ -834,6 +858,7 @@ mod tests {
             category: String::new(),
             canceled: false,
             video_id: None,
+            collab: String::new(),
         };
 
         // A platform segment and a Discord segment for the same monitor coexist.
@@ -883,6 +908,7 @@ mod tests {
             category: String::new(),
             canceled: false,
             video_id: None,
+            collab: String::new(),
         };
 
         // Auto source publishes the stream at t1; user corrects the time to t2.
@@ -927,6 +953,7 @@ mod tests {
             category: String::new(),
             canceled: false,
             video_id: None,
+            collab: String::new(),
         };
 
         // An OCR source emits a bogus occurrence; the user deletes it.
@@ -961,6 +988,7 @@ mod tests {
             category: cat.into(),
             canceled: false,
             video_id: None,
+            collab: String::new(),
         };
 
         // First run: everything is new → all "added".

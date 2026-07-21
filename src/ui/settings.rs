@@ -521,7 +521,7 @@ impl StreamArchiverApp {
     }
 
     fn settings_detection_credentials_section(&mut self, ui: &mut egui::Ui) {
-            if self.section_shown(SettingsTab::Accounts, "Detection credentials", &["twitch", "youtube", "kick", "client id", "secret", "api key", "credentials", "detection"]) {
+            if self.section_shown(SettingsTab::Accounts, "Detection credentials", &["twitch", "youtube", "kick", "client id", "secret", "api key", "credentials", "detection", "collab", "stream together", "shared chat", "eventsub"]) {
             ui.add_space(8.0);
             ui.heading("Detection credentials (optional)");
             ui.label("Used only by monitors set to an API detection method.");
@@ -554,6 +554,29 @@ impl StreamArchiverApp {
                     );
                     ui.end_row();
                 });
+
+            ui.add_space(6.0);
+            let mut collab_es = self.collab_eventsub;
+            if ui
+                .checkbox(&mut collab_es, "🤝 Collab updates via EventSub (conduit mode)")
+                .on_hover_text(
+                    "Also subscribe Twitch's shared-chat events \
+                     (channel.shared_chat.begin/update/end) so \"Stream Together\" \
+                     collabs show up within seconds instead of at the next poll. \
+                     Only active in conduit mode (Client ID + Secret set): the \
+                     direct-WebSocket fallback caps TOTAL subscriptions at cost 10, \
+                     which the 3 extra types per channel would blow through. \
+                     Polling keeps collabs working either way — this is just \
+                     faster. Takes effect on the next EventSub (re)connect.",
+                )
+                .changed()
+            {
+                self.collab_eventsub = collab_es;
+                let _ = self
+                    .core
+                    .store
+                    .set_setting("collab_eventsub", if collab_es { "1" } else { "0" });
+            }
 
             }
     }

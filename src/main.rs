@@ -521,6 +521,7 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
         last_game: String::new(),
         last_thumbnail_url: String::new(),
         last_viewers: -1,
+        live_collab: None,
     };
     let plan = downloader::build_plan(
         &row,

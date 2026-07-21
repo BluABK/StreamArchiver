@@ -1284,6 +1284,46 @@ from a stream row's right-click menu → **📝 Title/category history**: a
 scrollable, copyable, newest-first log with real dates/times (not
 take-relative offsets).
 
+### Stream Together collabs 🤝
+
+Twitch's **Stream Together** (merged/shared chat) collabs are detected, shown
+live, and archived:
+
+- **Detection** — the official Helix *Get Shared Chat Session* endpoint (no
+  extra scopes; the same Twitch credentials as detection), polled for every
+  live Twitch monitor on its own poll cadence, and every minute while it's
+  being recorded. Works whether the channel is the session's **host or a
+  guest**. Streams that collab without Shared Chat are still caught
+  heuristically: **@mentions in the live title** count as collaborators too,
+  shown as `@name` and marked "unconfirmed".
+- **Live display** — the channel/instance name gains a weak
+  `nihmune × Shylily`-style suffix while a shared-chat session is live
+  (confirmed partners only), and a **🤝 Collab** column lists everyone
+  (shared-chat partners first, then `@mentions`). Hover for the host,
+  session start, and source; **double-click** the cell for the history.
+  Stream/take rows show which collab a **past broadcast** was.
+- **History** — every session is stored (who, host, when, how long, source)
+  and linked to its broadcast. Right-click a stream row → **🤝 Collab
+  history** for the channel's full list; the **Stats** tab has a "🤝 Collabs"
+  overview of your most frequent partners across all channels. Collab
+  begin/change/end events also land in the 📝 title/category history ledger.
+- **Schedule** — scheduled streams carry collaborators too: the OCR schedule
+  reader's collab field and `@mentions` in segment titles show as a 🤝 marker
+  on calendar chips and a "With: …" line in event hovers.
+- **EventSub (optional, default on)** — in conduit mode (Client ID + Secret),
+  `channel.shared_chat.begin/update/end` subscriptions make collab changes
+  show up within seconds instead of at the next poll. The direct-WebSocket
+  fallback skips these: Twitch caps that transport's **total** subscription
+  cost at 10 (each subscription for another broadcaster costs 1 — today's
+  online+offline pair already limits it to ~5 channels), while conduits allow
+  10,000. Polling covers collabs either way; toggle under *Settings →
+  Accounts → Detection credentials*.
+
+Partner names are resolved via Helix *Get Users* and cached persistently
+(`twitch_user_name_cache`), so steady-state polling costs one extra request
+per live channel. Session history keeps the names **as observed at the
+time** — later renames don't rewrite it.
+
 ### Upcoming stream schedule
 
 The **Next stream** column shows when a channel's next stream is scheduled.

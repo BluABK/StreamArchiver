@@ -1017,6 +1017,10 @@ pub struct MonitorWithChannel {
     pub last_thumbnail_url: String,
     /// Last-detected live viewer count; `-1` = unknown/not applicable.
     pub last_viewers: i64,
+    /// Live Twitch "Stream Together" collab state, parsed from the
+    /// `monitor.last_collab` JSON column (written on every poll like
+    /// `last_title`). `None` = offline or not collabing.
+    pub live_collab: Option<CollabLive>,
 }
 
 impl MonitorWithChannel {
@@ -1027,6 +1031,161 @@ impl MonitorWithChannel {
     pub fn automation_on(&self) -> bool {
         self.channel.automation_enabled && self.monitor.automation_enabled
     }
+}
+
+/// One collaborator in a live Twitch "Stream Together" session (or a
+/// title-@mention heuristic hit). The monitored channel itself is never a
+/// partner — only the *other* people. Names are captured at observation time
+/// (a later rename doesn't rewrite history).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CollabPartner {
+    /// Twitch broadcaster id; empty for title-mention partners.
+    #[serde(default)]
+    pub id: String,
+    /// Login (lowercase); for title mentions this is the @name as typed.
+    #[serde(default)]
+    pub login: String,
+    /// Display name shown in the UI.
+    #[serde(default)]
+    pub name: String,
+    /// True when this partner came from an `@mention` in the stream title
+    /// rather than the Shared Chat session (heuristic, shown as `@name`).
+    #[serde(default)]
+    pub from_title: bool,
+}
+
+/// The live collab state persisted on `monitor.last_collab` as JSON (like
+/// `last_title`): current Shared Chat partners + title-mention partners.
+/// Cleared (empty column) when the channel is offline or not collabing.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CollabLive {
+    /// Host broadcaster id of the shared-chat session ('' = no shared chat,
+    /// i.e. title mentions only). May be the monitored channel itself.
+    #[serde(default)]
+    pub host_id: String,
+    /// When the shared-chat session was created (Twitch `created_at`), or when
+    /// we first observed the title mention. 0 = unknown.
+    #[serde(default)]
+    pub since_unix: i64,
+    #[serde(default)]
+    pub partners: Vec<CollabPartner>,
+}
+
+/// Comma-joined partner names: shared-chat partners first (display name),
+/// then title-mention partners as `@name`.
+pub fn collab_partner_names(partners: &[CollabPartner]) -> String {
+    let mut parts: Vec<String> = partners
+        .iter()
+        .filter(|p| !p.from_title)
+        .map(|p| p.name.clone())
+        .collect();
+    parts.extend(
+        partners
+            .iter()
+            .filter(|p| p.from_title)
+            .map(|p| format!("@{}", p.name)),
+    );
+    parts.join(", ")
+}
+
+impl CollabLive {
+    /// Parse the `monitor.last_collab` JSON; `None` when empty/invalid or no
+    /// partners (an empty session is displayed as "no collab").
+    pub fn parse(json: &str) -> Option<CollabLive> {
+        if json.is_empty() {
+            return None;
+        }
+        serde_json::from_str::<CollabLive>(json)
+            .ok()
+            .filter(|c| !c.partners.is_empty())
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// Comma-joined partner names for the Collab cell.
+    pub fn names(&self) -> String {
+        collab_partner_names(&self.partners)
+    }
+
+    /// Name-cell decoration: `" × A × B"` (shared-chat partners only — title
+    /// mentions stay in the Collab column, the name cell is for confirmed
+    /// sessions).
+    pub fn name_suffix(&self) -> String {
+        let mut out = String::new();
+        for p in self.partners.iter().filter(|p| !p.from_title) {
+            out.push_str(" × ");
+            out.push_str(&p.name);
+        }
+        out
+    }
+}
+
+/// One stored collab session (`collab_session` table, schema v58): a Twitch
+/// "Stream Together" shared-chat session (`source = "shared_chat"`) or a
+/// title-@mention heuristic hit (`source = "title"`), per monitor. See the
+/// v58 migration comment for the full semantics.
+#[derive(Clone, Debug)]
+pub struct CollabSessionRow {
+    #[allow(dead_code)]
+    pub id: i64,
+    // monitor_id/stream_id: carried for future "jump to that broadcast"
+    // linkage; the popup currently keys everything by channel.
+    #[allow(dead_code)]
+    pub monitor_id: i64,
+    /// `"shared_chat"` | `"title"`.
+    pub source: String,
+    /// Twitch shared-chat session id ('' for title source).
+    #[allow(dead_code)]
+    pub session_id: String,
+    /// Broadcast (Helix stream id) during which the session was observed.
+    #[allow(dead_code)]
+    pub stream_id: String,
+    /// Host broadcaster id ('' for title source). May be the monitored channel.
+    pub host_id: String,
+    /// Partners (the monitored channel itself is never included).
+    pub partners: Vec<CollabPartner>,
+    pub first_seen_at: i64,
+    pub last_seen_at: i64,
+    /// `None` = still active.
+    pub ended_at: Option<i64>,
+}
+
+/// `@mention` handles parsed from a stream/schedule title — the heuristic
+/// collab signal for streams that collab without (or before) Shared Chat.
+/// Twitch login shape: 3–25 chars of `[A-Za-z0-9_]`; an `@` glued to a
+/// preceding word (e.g. an email) is not a mention. Case-insensitive dedup,
+/// original casing and order preserved. `own` (the channel's own login/name,
+/// case-insensitive) is excluded — channels sometimes @mention themselves.
+pub fn title_mentions(title: &str, own: &str) -> Vec<String> {
+    let bytes = title.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for (i, _) in title.match_indices('@') {
+        if i > 0 {
+            // Boundary check: reject `foo@bar` (previous char is a word char).
+            let prev = bytes[i - 1];
+            if prev.is_ascii_alphanumeric() || prev == b'_' {
+                continue;
+            }
+        }
+        let rest = &title[i + 1..];
+        let end = rest
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(rest.len());
+        let handle = &rest[..end];
+        if !(3..=25).contains(&handle.len()) {
+            continue;
+        }
+        let lower = handle.to_lowercase();
+        if lower == own.to_lowercase() || seen.contains(&lower) {
+            continue;
+        }
+        seen.push(lower);
+        out.push(handle.to_string());
+    }
+    out
 }
 
 /// One advertisement break detected during a recording take.
@@ -1360,6 +1519,13 @@ pub struct ScheduleSegment {
     /// scraper so we can batch `videos.list` calls for exact scheduled times.
     /// `None` for Twitch, Discord, and old YouTube rows.
     pub video_id: Option<String>,
+    /// Collaborator names for this scheduled stream, comma-joined ('' = none):
+    /// the OCR source's explicit collab field, or `@mentions` parsed from the
+    /// segment title. `serde(default)` is load-bearing — segments are cached
+    /// as `decoded_json` in the community-post OCR archive, and old blobs
+    /// don't have this field.
+    #[serde(default)]
+    pub collab: String,
 }
 
 /// One upcoming scheduled stream joined with its channel + monitor, for the
@@ -1398,6 +1564,9 @@ pub struct UpcomingStream {
     /// When true, this segment is excluded from automatic time-overlap merge
     /// grouping with same-channel events.
     pub auto_merge_excluded: bool,
+    /// Collaborator names, comma-joined ('' = none). See
+    /// [`ScheduleSegment::collab`].
+    pub collab: String,
 }
 
 impl UpcomingStream {
@@ -2468,6 +2637,61 @@ pub fn group_recordings(recordings: &[Recording]) -> Vec<StreamGroup> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn title_mentions_parses_twitch_handles() {
+        // Basic extraction, order kept, case preserved.
+        assert_eq!(
+            title_mentions("COWGIRL DEBUT w/ @Shylily and @Ironmouse!", ""),
+            vec!["Shylily", "Ironmouse"]
+        );
+        // Own login excluded case-insensitively; dedup case-insensitive.
+        assert_eq!(
+            title_mentions("@NIHMUNE x @shylily x @Shylily collab", "nihmune"),
+            vec!["shylily"]
+        );
+        // Emails / glued @ are not mentions; length limits enforced.
+        assert!(title_mentions("mail me at foo@bar.com", "").is_empty());
+        assert!(title_mentions("just @ab or @x here", "").is_empty());
+        // Trailing punctuation naturally terminates the handle.
+        assert_eq!(title_mentions("with @zentreya!!!", ""), vec!["zentreya"]);
+        // Underscores are valid handle characters.
+        assert_eq!(title_mentions("ft. @girl_dm_", ""), vec!["girl_dm_"]);
+    }
+
+    #[test]
+    fn collab_live_json_and_display() {
+        let c = CollabLive {
+            host_id: "650".into(),
+            since_unix: 100,
+            partners: vec![
+                CollabPartner { id: "100".into(), login: "shylily".into(), name: "Shylily".into(), from_title: false },
+                CollabPartner { id: String::new(), login: "zen".into(), name: "Zen".into(), from_title: true },
+            ],
+        };
+        let parsed = CollabLive::parse(&c.to_json()).unwrap();
+        assert_eq!(parsed, c);
+        assert_eq!(parsed.names(), "Shylily, @Zen");
+        // Name suffix shows confirmed shared-chat partners only.
+        assert_eq!(parsed.name_suffix(), " × Shylily");
+        // Empty / partnerless JSON parses to None (renders as "no collab").
+        assert_eq!(CollabLive::parse(""), None);
+        assert_eq!(
+            CollabLive::parse(&CollabLive::default().to_json()),
+            None
+        );
+    }
+
+    #[test]
+    fn schedule_segment_deserializes_old_blobs_without_collab() {
+        // The community-post OCR archive caches segments as `decoded_json` —
+        // blobs written before schema v58 have no `collab` field and must
+        // keep deserializing (serde(default)).
+        let old = r#"{"id":0,"monitor_id":0,"start_time":100,"end_time":null,
+                      "title":"T","category":"","canceled":false,"video_id":null}"#;
+        let seg: ScheduleSegment = serde_json::from_str(old).unwrap();
+        assert_eq!(seg.collab, "");
+    }
 
     #[test]
     fn nrk_nebula_platforms_detect_and_round_trip() {

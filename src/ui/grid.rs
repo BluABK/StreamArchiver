@@ -182,18 +182,32 @@ pub(super) fn next_stream_cell(ui: &mut egui::Ui, at: Option<i64>, title: &str, 
 pub(super) fn meta_change_lines(changes: &[StreamMetaChange]) -> Vec<String> {
     changes
         .iter()
-        .filter(|c| !c.old_value.is_empty())
+        .filter(|c| !c.old_value.is_empty() || c.kind == "collab")
         .map(|c| {
             let at = fmt_duration(c.at_secs.max(0));
-            let kind = if c.kind == "category" { "Category" } else { "Title" };
-            let new = if c.new_value.is_empty() {
-                "(cleared)"
-            } else {
-                c.new_value.as_str()
-            };
-            format!("{at}  {kind}: {} → {new}", c.old_value)
+            format!("{at}  {}", change_transition(&c.kind, &c.old_value, &c.new_value))
         })
         .collect()
+}
+
+/// `Kind: old → new` with kind-appropriate empty-value wording. Collab rows
+/// keep their session-start events (empty `old` = the collab beginning, a
+/// meaningful moment, unlike title/category baselines which are just the
+/// first observation).
+pub(super) fn change_transition(kind: &str, old: &str, new: &str) -> String {
+    let label = match kind {
+        "category" => "Category",
+        "collab" => "Collab",
+        _ => "Title",
+    };
+    let (none_old, none_new) = if kind == "collab" {
+        ("(none)", "(ended)")
+    } else {
+        ("", "(cleared)")
+    };
+    let old = if old.is_empty() { none_old } else { old };
+    let new = if new.is_empty() { none_new } else { new };
+    format!("{label}: {old} → {new}")
 }
 /// One human-readable line per *actual* change in a monitor's all-time history
 /// (absolute date/time, not an offset — there's no single take to be relative
@@ -201,16 +215,10 @@ pub(super) fn meta_change_lines(changes: &[StreamMetaChange]) -> Vec<String> {
 pub(super) fn monitor_change_lines(changes: &[MonitorStreamChange]) -> Vec<String> {
     changes
         .iter()
-        .filter(|c| !c.old_value.is_empty())
+        .filter(|c| !c.old_value.is_empty() || c.kind == "collab")
         .map(|c| {
             let at = fmt_datetime_short(c.at_unix);
-            let kind = if c.kind == "category" { "Category" } else { "Title" };
-            let new = if c.new_value.is_empty() {
-                "(cleared)"
-            } else {
-                c.new_value.as_str()
-            };
-            format!("{at}  {kind}: {} → {new}", c.old_value)
+            format!("{at}  {}", change_transition(&c.kind, &c.old_value, &c.new_value))
         })
         .collect()
 }
@@ -349,6 +357,56 @@ pub(super) fn meta_value_cell(ui: &mut egui::Ui, value: &str) {
     ui.add(egui::Label::new(value).truncate());
 }
 
+/// Render a 🤝 Collab cell: comma-joined partner names (shared-chat partners
+/// first, title `@mentions` as `@name`), truncated to the column, with a
+/// detail hover (who, host, since-when, source). Blank when not collabing.
+/// Returns true on double-click (open the channel's 🤝 collab history).
+pub(super) fn collab_cell(ui: &mut egui::Ui, collab: Option<&crate::models::CollabLive>) -> bool {
+    let Some(c) = collab else { return false };
+    let names = c.names();
+    if names.is_empty() {
+        return false;
+    }
+    ui.add(egui::Label::new(names).sense(egui::Sense::click()).truncate())
+        .on_hover_text(format!(
+            "{}\n\nDouble-click for the full collab history.",
+            collab_hover(c)
+        ))
+        .double_clicked()
+}
+
+/// The 🤝 hover text: shared-chat partners with the host called out, the
+/// session start, and title-mention partners marked as the heuristic they are.
+pub(super) fn collab_hover(c: &crate::models::CollabLive) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let shared: Vec<&crate::models::CollabPartner> =
+        c.partners.iter().filter(|p| !p.from_title).collect();
+    if !shared.is_empty() {
+        let host = if c.host_id.is_empty() {
+            String::new()
+        } else if let Some(h) = shared.iter().find(|p| p.id == c.host_id) {
+            format!(" (host: {})", h.name)
+        } else {
+            " (host: this channel)".to_string()
+        };
+        let names: Vec<&str> = shared.iter().map(|p| p.name.as_str()).collect();
+        lines.push(format!("Streaming together with {}{host}", names.join(", ")));
+        if c.since_unix > 0 {
+            lines.push(format!("Shared chat since {}", fmt_datetime_short(c.since_unix)));
+        }
+    }
+    let mentions: Vec<String> = c
+        .partners
+        .iter()
+        .filter(|p| p.from_title)
+        .map(|p| format!("@{}", p.name))
+        .collect();
+    if !mentions.is_empty() {
+        lines.push(format!("@mentioned in the title (unconfirmed): {}", mentions.join(", ")));
+    }
+    lines.join("\n")
+}
+
 /// Parse the monitor id out of a [`StreamGroup`] key (`s<mid>:…` / `t<mid>:…`).
 pub(super) fn stream_key_monitor(key: &str) -> Option<i64> {
     let rest = key.strip_prefix('s').or_else(|| key.strip_prefix('t'))?;
@@ -410,7 +468,7 @@ pub(super) fn video_status_color(status: &str) -> egui::Color32 {
 /// `initial`-width columns, which start narrow and truncate (full value on
 /// hover). Each `id` is a stable persistence key: never reuse or change one
 /// once shipped.
-pub(super) const STREAM_COLUMNS: [GridCol; 22] = [
+pub(super) const STREAM_COLUMNS: [GridCol; 23] = [
     GridCol { id: "enabled",     title: "On",         tooltip: "Master switch. Off = fully dormant: no detection, recording, or asset/about/posts/schedule fetch until you act manually (▶ Start, ⟳ Refetch). Independent from Auto (which only gates automatic recording). The channel checkbox and each instance checkbox are independent.", min_width: 30.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "auto",        title: "Auto",       tooltip: "Auto-record: automatically record to disk when the stream goes live (a disk-space control). It does NOT gate detection, metadata, posts, schedules or assets — those always run while the channel is On. Manual Start still records, and trigger words (Settings → Downloads) can still start a recording while Auto is off. The channel checkbox and each instance checkbox are independent.", min_width: 36.0,  initial: 0.0,   sortable: true,  stretch: false },
     GridCol { id: "actions",     title: "Actions",    tooltip: "Per-row actions: start/stop recording, edit, add instance, open folder, delete.",            min_width: 126.0, initial: 0.0,   sortable: false, stretch: false },
@@ -424,6 +482,7 @@ pub(super) const STREAM_COLUMNS: [GridCol; 22] = [
     GridCol { id: "next_stream", title: "Next stream",tooltip: "Next scheduled stream (Twitch schedule / YouTube upcoming). Hover for its title; double-click for the full schedule.", min_width: 96.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "game",        title: "Game",       tooltip: "Current game / category of the most recent recording. Truncated — hover for the full name.", min_width: 60.0,  initial: 96.0,  sortable: true, stretch: false },
     GridCol { id: "title",       title: "Title",      tooltip: "Current stream title of the most recent recording. Truncated — hover for the full title.",   min_width: 80.0,  initial: 170.0, sortable: true, stretch: false },
+    GridCol { id: "collab",      title: "🤝 Collab",  tooltip: "Who this channel is streaming together with (Twitch \"Stream Together\" / Shared Chat, plus @mentions in the title shown as @name). Live rows show the current collab; stream/take rows show the collab recorded for that broadcast. Hover for host and details; right-click the channel for the full collab history.", min_width: 70.0, initial: 110.0, sortable: true, stretch: false },
     GridCol { id: "viewers",     title: "👁",         tooltip: "Live viewer count (Twitch / Kick; YouTube best-effort). Shown for a live channel even when not recording; blank when offline or unknown.", min_width: 44.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "changes",     title: "✏",          tooltip: "Title / game-category changes logged during the recording. Hover or double-click for the log.", min_width: 24.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "ads",         title: "📢",         tooltip: "Ad breaks detected (Twitch + streamlink); each is a hard cut. Hover for count + total time; double-click for the cut list.", min_width: 24.0, initial: 0.0, sortable: true, stretch: false },
@@ -1356,8 +1415,8 @@ pub(super) fn channel_cells(
         .unwrap_or(0);
     // In STREAM_COLUMNS order: Enabled, Auto, Actions(empty), Plat, Name, Tool,
     // Detection, Scheduled rec, Polled, State, Next stream, Game, Title,
-    // Viewers, ✏ (Changes), 📢 (Ads), Went Live, Started On, Lost, Duration,
-    // Ad-free, Added. MUST stay positionally 1:1 with STREAM_COLUMNS (every
+    // 🤝 Collab, Viewers, ✏ (Changes), 📢 (Ads), Went Live, Started On, Lost,
+    // Duration, Ad-free, Added. MUST stay positionally 1:1 with STREAM_COLUMNS (every
     // column needs an entry here even if it's just a blank placeholder like
     // "actions"/"detection"/"scheduled_rec" below) — `ordered_rows` indexes
     // this vec by the column's STREAM_COLUMNS position, so a missing entry
@@ -1412,6 +1471,10 @@ pub(super) fn channel_cells(
         },
         Cell::text(if rec.active { primary.last_recording_category.clone() } else { primary.last_game.clone() }),
         Cell::text(if rec.active { primary.last_recording_title.clone() } else { primary.last_title.clone() }),
+        // 🤝 Collab — the primary live instance's current partners.
+        Cell::text(
+            primary.live_collab.as_ref().map(|c| c.names()).unwrap_or_default(),
+        ),
         // Viewers — live count (blank when offline/unknown).
         Cell::num(
             primary.last_viewers.max(0) as f64,
@@ -1463,6 +1526,7 @@ pub(super) struct RowActions {
     pub(super) toggle_automation: Option<(i64, bool)>,
     pub(super) select: Option<i64>,                // monitor id
     pub(super) open_schedule: Option<i64>,         // monitor id (open its Next stream popup)
+    pub(super) open_collab_history: Option<i64>,   // channel id (open its 🤝 collab history)
     pub(super) properties: Option<i64>,            // monitor id
     pub(super) reorganize_monitor: Option<i64>,    // monitor id
     pub(super) reorganize_channel: Option<i64>,    // channel id
@@ -1804,6 +1868,15 @@ pub(super) fn render_instance_row(
                     avatar,
                     egui::RichText::new(instance_label(&row.monitor.url)).color(name_color),
                 );
+                // "Stream Together" partners as a weak " × Partner" suffix
+                // while this instance's shared-chat session is live.
+                if let Some(c) = &row.live_collab {
+                    let suffix = c.name_suffix();
+                    if !suffix.is_empty() {
+                        ui.add(egui::Label::new(egui::RichText::new(suffix).weak()).truncate())
+                            .on_hover_text(collab_hover(c));
+                    }
+                }
                 // inspect_with: props are only built while the inspector is
                 // open (this runs per row per frame). Auto-id caveat applies —
                 // the cell id derives from layout order within the table.
@@ -1934,6 +2007,11 @@ pub(super) fn render_instance_row(
             "title" => {
                 let v = if rec.active { &row.last_recording_title } else { &row.last_title };
                 meta_value_cell(ui, v);
+            }
+            "collab" => {
+                if collab_cell(ui, row.live_collab.as_ref()) {
+                    a.open_collab_history = Some(row.channel.id);
+                }
             }
             "viewers" => {
                 if row.last_viewers >= 0 {
@@ -2072,6 +2150,7 @@ mod tests {
             last_game: String::new(),
             last_thumbnail_url: String::new(),
             last_viewers: -1,
+            live_collab: None,
         }
     }
 

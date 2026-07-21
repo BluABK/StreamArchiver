@@ -563,7 +563,7 @@ impl Store {
                 COALESCE(r.trigger_info, ''),
                 m.automation_enabled, c.automation_enabled,
                 m.last_title, m.last_game, m.last_thumbnail_url, m.last_viewers,
-                m.last_live_since, m.last_live_since_approx
+                m.last_live_since, m.last_live_since_approx, m.last_collab
              FROM monitor m
              JOIN channel c ON c.id = m.channel_id
              LEFT JOIN recording r
@@ -640,6 +640,7 @@ impl Store {
                     last_game: r.get(54)?,
                     last_thumbnail_url: r.get(55)?,
                     last_viewers: r.get(56)?,
+                    live_collab: crate::models::CollabLive::parse(&r.get::<_, String>(59)?),
                     // Filled by the UI from next_scheduled_streams(), not this query.
                     next_stream_at: None,
                     next_stream_title: String::new(),
@@ -807,6 +808,21 @@ impl Store {
             )
             .optional()?;
         Ok(row)
+    }
+
+    /// One recording's platform stream id ('' when unknown/id-less) — links a
+    /// take to its broadcast, e.g. for keying the collab-session refresh.
+    pub fn recording_stream_id(&self, rec_id: i64) -> Result<String> {
+        let conn = self.db();
+        Ok(conn
+            .query_row(
+                "SELECT stream_id FROM recording WHERE id = ?1",
+                params![rec_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .unwrap_or_default())
     }
 
     /// Recordings whose head backfill exists but can't be losslessly joined

@@ -34,7 +34,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 57;
+const SCHEMA_VERSION: i64 = 58;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -128,6 +128,7 @@ pub struct NewCommunityPost {
     pub author_channel_id: String,
 }
 
+mod collab;
 mod migrations;
 mod monitors;
 mod posts;

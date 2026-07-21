@@ -203,6 +203,19 @@ pub struct StreamMeta {
     pub viewers: Option<i64>,
 }
 
+/// A live Twitch "Stream Together" (Shared Chat) session, as returned by
+/// Helix `GET /shared_chat/session`. Participants are broadcaster ids only —
+/// the queried channel itself is INCLUDED; display names come from a separate
+/// Get Users resolution (`twitch_user_names`).
+#[derive(Clone, Debug)]
+pub struct SharedChatSession {
+    pub session_id: String,
+    pub host_id: String,
+    pub participant_ids: Vec<String>,
+    /// Session start (Twitch `created_at`), unix seconds; 0 = unparsable.
+    pub created_at: i64,
+}
+
 /// Outcome of one in-recording metadata fetch (`*_stream_meta`). The split
 /// between [`Offline`](MetaFetch::Offline) and [`Failed`](MetaFetch::Failed)
 /// matters to the caller's failure-streak warning (`meta_watcher`): a stream
@@ -815,6 +828,276 @@ impl DetectContext {
         }
     }
 
+    // ----- Twitch "Stream Together" (Shared Chat) collabs -----
+
+    /// The active Shared Chat session for `broadcaster_id`, via Helix
+    /// `GET /shared_chat/session` (no scope needed — app token works; verified
+    /// live 2026-07-21). `Ok(None)` = definitively no session (the normal
+    /// case); `Err` = transient/auth failure, in which case the caller must
+    /// NOT end stored sessions or clear live state.
+    pub async fn twitch_shared_chat(
+        &self,
+        broadcaster_id: &str,
+    ) -> Result<Option<SharedChatSession>> {
+        let (client_id, token) = self.twitch_helix_auth().await?;
+        let resp = self
+            .http
+            .get("https://api.twitch.tv/helix/shared_chat/session")
+            .header("Client-Id", &client_id)
+            .bearer_auth(&token)
+            .query(&[("broadcaster_id", broadcaster_id)])
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            bail!("shared_chat/session got HTTP {}", resp.status());
+        }
+        let v: serde_json::Value = resp.json().await?;
+        let Some(item) = v["data"].as_array().and_then(|a| a.first()) else {
+            return Ok(None);
+        };
+        Ok(Some(SharedChatSession {
+            session_id: item["session_id"].as_str().unwrap_or("").to_string(),
+            host_id: item["host_broadcaster_id"].as_str().unwrap_or("").to_string(),
+            participant_ids: item["participants"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|p| p["broadcaster_id"].as_str())
+                .map(str::to_string)
+                .collect(),
+            created_at: item["created_at"].as_str().and_then(parse_rfc3339).unwrap_or(0),
+        }))
+    }
+
+    /// Resolve Twitch broadcaster ids to `(login, display_name)` via Helix Get
+    /// Users (100/call), backed by the persistent `twitch_user_name_cache`
+    /// settings blob — collab partners recur, so steady-state polls resolve
+    /// entirely from cache. Ids that fail to resolve are absent from the map.
+    /// (Renames go stale in the cache by design: names are captured for
+    /// display, and session history keeps the name at observation time anyway.)
+    pub async fn twitch_user_names(
+        &self,
+        ids: &[String],
+    ) -> HashMap<String, (String, String)> {
+        const K_CACHE: &str = "twitch_user_name_cache";
+        let mut cache: HashMap<String, (String, String)> = self
+            .store
+            .get_setting(K_CACHE)
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let missing: Vec<String> =
+            ids.iter().filter(|id| !cache.contains_key(*id)).cloned().collect();
+        if !missing.is_empty()
+            && let Ok((client_id, token)) = self.twitch_helix_auth().await
+        {
+            let mut dirty = false;
+            for chunk in missing.chunks(100) {
+                let query: Vec<(&str, &str)> =
+                    chunk.iter().map(|id| ("id", id.as_str())).collect();
+                let resp = self
+                    .http
+                    .get("https://api.twitch.tv/helix/users")
+                    .header("Client-Id", &client_id)
+                    .bearer_auth(&token)
+                    .query(&query)
+                    .send()
+                    .await;
+                let Ok(resp) = resp else { continue };
+                let Ok(v) = resp.json::<serde_json::Value>().await else { continue };
+                for u in v["data"].as_array().into_iter().flatten() {
+                    let (Some(id), Some(login)) = (u["id"].as_str(), u["login"].as_str()) else {
+                        continue;
+                    };
+                    let display = u["display_name"].as_str().unwrap_or(login);
+                    cache.insert(id.to_string(), (login.to_string(), display.to_string()));
+                    dirty = true;
+                }
+            }
+            if dirty && let Ok(json) = serde_json::to_string(&cache) {
+                let _ = self.store.set_setting(K_CACHE, &json);
+            }
+        }
+        ids.iter()
+            .filter_map(|id| cache.get(id).map(|v| (id.clone(), v.clone())))
+            .collect()
+    }
+
+    /// One live Twitch monitor's full collab refresh — the single routine both
+    /// feeds share (scheduler poll for live-not-recording, `meta_watcher` while
+    /// recording, EventSub pokes indirectly by forcing a poll): fetch the
+    /// Shared Chat session, resolve partner names, parse title `@mentions`,
+    /// upsert `collab_session` rows, end vanished sessions, log set changes to
+    /// the 📝 ledger (`kind = "collab"`), and write `monitor.last_collab` for
+    /// the grid. A failed Shared Chat fetch degrades gracefully: nothing is
+    /// ended or cleared, and previously-known shared-chat partners are kept in
+    /// the live JSON so the UI doesn't flicker.
+    pub async fn refresh_twitch_collab(
+        &self,
+        monitor_id: i64,
+        login: &str,
+        broadcaster_id: Option<String>,
+        stream_id: &str,
+        title: &str,
+    ) {
+        let now = crate::models::now_unix();
+        let bid = match broadcaster_id {
+            Some(b) if !b.is_empty() => Some(b),
+            _ => self.twitch_id_for_login(login).await,
+        };
+
+        let mut partners: Vec<crate::models::CollabPartner> = Vec::new();
+        let mut keep_sessions: Vec<String> = Vec::new();
+        let mut keep_streams: Vec<String> = Vec::new();
+        let mut host_id = String::new();
+        let mut since = 0i64;
+        let mut shared_ok = false;
+
+        if let Some(bid) = &bid {
+            match self.twitch_shared_chat(bid).await {
+                Ok(Some(sess)) => {
+                    shared_ok = true;
+                    let other_ids: Vec<String> = sess
+                        .participant_ids
+                        .iter()
+                        .filter(|id| *id != bid)
+                        .cloned()
+                        .collect();
+                    let names = self.twitch_user_names(&other_ids).await;
+                    let ps: Vec<crate::models::CollabPartner> = other_ids
+                        .iter()
+                        .map(|id| {
+                            let (l, n) = names
+                                .get(id)
+                                .cloned()
+                                .unwrap_or_else(|| (String::new(), format!("#{id}")));
+                            crate::models::CollabPartner {
+                                id: id.clone(),
+                                login: l,
+                                name: n,
+                                from_title: false,
+                            }
+                        })
+                        .collect();
+                    host_id = sess.host_id.clone();
+                    since = sess.created_at;
+                    if !ps.is_empty() {
+                        keep_sessions.push(sess.session_id.clone());
+                        match self.store.upsert_collab_session(
+                            monitor_id,
+                            "shared_chat",
+                            &sess.session_id,
+                            stream_id,
+                            &sess.host_id,
+                            &ps,
+                            sess.created_at,
+                            now,
+                        ) {
+                            Ok(Some((old, new))) => {
+                                let _ = self.store.insert_monitor_stream_change(
+                                    monitor_id, now, "collab", &old, &new,
+                                );
+                            }
+                            Ok(None) => {}
+                            Err(e) => debug!("collab: session upsert failed: {e:#}"),
+                        }
+                    }
+                    partners.extend(ps);
+                }
+                Ok(None) => shared_ok = true,
+                Err(e) => {
+                    debug!("collab: shared-chat fetch for {login} failed: {e:#}");
+                    // Keep showing what we knew — don't flicker on a blip.
+                    if let Some(prev) = self
+                        .store
+                        .monitor_last_collab(monitor_id)
+                        .ok()
+                        .and_then(|j| crate::models::CollabLive::parse(&j))
+                    {
+                        host_id = prev.host_id;
+                        since = prev.since_unix;
+                        partners.extend(prev.partners.into_iter().filter(|p| !p.from_title));
+                    }
+                }
+            }
+        }
+
+        let mentions = crate::models::title_mentions(title, login);
+        let title_ps: Vec<crate::models::CollabPartner> = mentions
+            .iter()
+            .filter(|m| {
+                !partners
+                    .iter()
+                    .any(|p| p.login.eq_ignore_ascii_case(m) || p.name.eq_ignore_ascii_case(m))
+            })
+            .map(|m| crate::models::CollabPartner {
+                id: String::new(),
+                login: m.to_lowercase(),
+                name: m.clone(),
+                from_title: true,
+            })
+            .collect();
+        if !title_ps.is_empty() && !stream_id.is_empty() {
+            keep_streams.push(stream_id.to_string());
+            match self.store.upsert_collab_session(
+                monitor_id, "title", "", stream_id, "", &title_ps, 0, now,
+            ) {
+                Ok(Some((old, new))) => {
+                    let _ = self
+                        .store
+                        .insert_monitor_stream_change(monitor_id, now, "collab", &old, &new);
+                }
+                Ok(None) => {}
+                Err(e) => debug!("collab: title-session upsert failed: {e:#}"),
+            }
+        }
+        partners.extend(title_ps);
+
+        // End sessions that vanished — but only when the Shared Chat answer was
+        // authoritative (success or definitive "none"), never on a failed fetch.
+        if shared_ok {
+            let keep_s: Vec<&str> = keep_sessions.iter().map(String::as_str).collect();
+            let keep_t: Vec<&str> = keep_streams.iter().map(String::as_str).collect();
+            match self.store.end_open_collab_sessions(monitor_id, &keep_s, &keep_t, now) {
+                Ok(closed) => {
+                    for names in closed {
+                        let _ = self
+                            .store
+                            .insert_monitor_stream_change(monitor_id, now, "collab", &names, "");
+                    }
+                }
+                Err(e) => debug!("collab: ending stale sessions failed: {e:#}"),
+            }
+        }
+
+        let json = if partners.is_empty() {
+            String::new()
+        } else {
+            crate::models::CollabLive { host_id, since_unix: since, partners }.to_json()
+        };
+        let _ = self.store.set_monitor_live_collab(monitor_id, &json);
+    }
+
+    /// Resolve a Twitch login to its broadcaster id via Helix Get Users,
+    /// seeding the name cache along the way. Used by the in-recording
+    /// `meta_watcher` path, which knows only the monitor URL.
+    pub async fn twitch_id_for_login(&self, login: &str) -> Option<String> {
+        let (client_id, token) = self.twitch_helix_auth().await.ok()?;
+        let resp = self
+            .http
+            .get("https://api.twitch.tv/helix/users")
+            .header("Client-Id", &client_id)
+            .bearer_auth(&token)
+            .query(&[("login", login)])
+            .send()
+            .await
+            .ok()?;
+        let v: serde_json::Value = resp.json().await.ok()?;
+        let u = v["data"].as_array().and_then(|a| a.first())?;
+        Some(u["id"].as_str()?.to_string())
+    }
+
     // ----- schedule (upcoming streams) -----
 
     /// A Twitch channel's upcoming scheduled streams via Helix `Get Channel Stream
@@ -906,6 +1189,7 @@ impl DetectContext {
                                 category: seg.category.map(|c| c.name).unwrap_or_default(),
                                 canceled: seg.canceled_until.is_some(),
                                 video_id: None,
+                                collab: String::new(),
                             })
                         })
                         .collect();
@@ -1030,6 +1314,7 @@ impl DetectContext {
                     category: String::new(),
                     canceled: false,
                     video_id: Some(id.clone()),
+                    collab: String::new(),
                 })
             })
             .collect();
@@ -2057,6 +2342,7 @@ impl DetectContext {
                             category: String::new(),
                             canceled: ev.canceled,
                             video_id: None,
+                            collab: String::new(),
                         });
                     }
                 }
@@ -4035,6 +4321,7 @@ fn fallback_seg(body: &str, center: usize, window: usize, start: i64) -> Schedul
         category: String::new(),
         canceled: false,
         video_id: nearest_video_id(slice, rel),
+        collab: String::new(),
     }
 }
 
@@ -4171,6 +4458,7 @@ fn collect_upcoming(v: &Value, out: &mut Vec<ScheduleSegment>) {
                         category: String::new(),
                         canceled: false,
                         video_id: None,
+                        collab: String::new(),
                     });
                 }
             }
@@ -4187,6 +4475,7 @@ fn collect_upcoming(v: &Value, out: &mut Vec<ScheduleSegment>) {
                         category: String::new(),
                         canceled: false,
                         video_id: Some(vid),
+                        collab: String::new(),
                     });
                 }
             }
@@ -4844,6 +5133,7 @@ mod tests {
             category: category.into(),
             canceled,
             video_id: None,
+            collab: String::new(),
         }
     }
 

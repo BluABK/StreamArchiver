@@ -30,6 +30,14 @@ impl StreamArchiverApp {
             .flatten()
             .as_deref()
             != Some("0");
+        // Collab (shared-chat) EventSub pushes default on; only "0" disables.
+        let collab_eventsub = core
+            .store
+            .get_setting("collab_eventsub")
+            .ok()
+            .flatten()
+            .as_deref()
+            != Some("0");
         // Do Not Disturb defaults off in both dimensions.
         let dnd_enabled =
             setting_or_empty(&core, crate::notifications::K_DND_ENABLED) == "1";
@@ -374,6 +382,7 @@ impl StreamArchiverApp {
             autostart_on,
             keep_downloads_on_quit,
             notifications_enabled,
+            collab_eventsub,
             dnd_enabled,
             dnd_schedule_enabled,
             dnd_start,
@@ -543,6 +552,8 @@ impl StreamArchiverApp {
             twitch_flow,
             google_flow,
             import_dialog: None,
+            collab_by_stream: HashMap::new(),
+            collab_history: None,
             status_bgcolor,
             show_actions,
             shorten_timestamps,
@@ -566,6 +577,7 @@ impl StreamArchiverApp {
             debug_test_title: "Test Stream Title".into(),
             debug_test_game: "Just Chatting".into(),
             stats_snapshot: None,
+            stats_collabs: Vec::new(),
             stats_poll_span: super::PollSpan::Day,
             stats_history: None,
             io_hist: Vec::new(),
@@ -646,6 +658,12 @@ impl StreamArchiverApp {
         match self.core.store.list_scheduled_recordings() {
             Ok(v) => self.scheduled_recordings = v,
             Err(e) => warn!("failed to load scheduled recordings: {e:#}"),
+        }
+        // Collab history map for the stream/take rows' 🤝 cells (small table,
+        // one query; avoids any per-frame DB access from the grid).
+        match self.core.store.collab_names_by_stream() {
+            Ok(m) => self.collab_by_stream = m,
+            Err(e) => warn!("failed to load collab sessions: {e:#}"),
         }
         // Drop expansion state for channels/monitors that no longer exist (avoids
         // an unbounded leak and "sticky" expansion if a row id is later reused).

@@ -1402,6 +1402,10 @@ impl StreamArchiverApp {
                 }
                 platform_icon(ui, ptex, s.platform());
                 schedule_source_badge(ui, &s.source);
+                if !s.collab.is_empty() {
+                    ui.add(egui::Label::new(egui::RichText::new("🤝").small()))
+                        .on_hover_text(format!("With: {}", s.collab));
+                }
                 let label_text = format!(
                     "{}  {}",
                     fmt_time_range(s.start_time, s.end_time),

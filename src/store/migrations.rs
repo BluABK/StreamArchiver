@@ -1123,7 +1123,43 @@ impl Store {
             conn.execute_batch("ALTER TABLE recording ADD COLUMN capture_start_pts REAL;")?;
             conn.pragma_update(None, "user_version", 57)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 57);
+        if version < 58 {
+            // Twitch "Stream Together" collab history. One row per observed
+            // collab session per monitor: `shared_chat` rows mirror Helix
+            // GET /shared_chat/session (session_id is Twitch's, participants
+            // are resolved to logins/display names at observation time and
+            // stored denormalized as JSON — names at the time of the collab
+            // are themselves history); `title` rows are @mention-derived
+            // (one per broadcast, keyed by stream_id, heuristic source).
+            // `ended_at` is stamped when the session disappears from a poll
+            // or the channel goes offline; NULL = still active. Set changes
+            // additionally feed monitor_stream_change (kind='collab') so the
+            // existing 📝 history popup shows them. `monitor.last_collab` is
+            // the live-display JSON (like last_title); `schedule_segment
+            // .collab` carries upcoming-collab names (OCR field / title
+            // mentions) for the calendar.
+            conn.execute_batch(
+                r#"
+                CREATE TABLE collab_session (
+                    id            INTEGER PRIMARY KEY,
+                    monitor_id    INTEGER NOT NULL REFERENCES monitor(id) ON DELETE CASCADE,
+                    source        TEXT NOT NULL,
+                    session_id    TEXT NOT NULL DEFAULT '',
+                    stream_id     TEXT NOT NULL DEFAULT '',
+                    host_id       TEXT NOT NULL DEFAULT '',
+                    participants  TEXT NOT NULL DEFAULT '[]',
+                    first_seen_at INTEGER NOT NULL,
+                    last_seen_at  INTEGER NOT NULL,
+                    ended_at      INTEGER
+                );
+                CREATE INDEX idx_collab_session_monitor ON collab_session(monitor_id, first_seen_at);
+                ALTER TABLE monitor ADD COLUMN last_collab TEXT NOT NULL DEFAULT '';
+                ALTER TABLE schedule_segment ADD COLUMN collab TEXT NOT NULL DEFAULT '';
+                "#,
+            )?;
+            conn.pragma_update(None, "user_version", 58)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 58);
         Ok(())
     }
 }

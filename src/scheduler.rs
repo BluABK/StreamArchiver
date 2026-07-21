@@ -94,11 +94,22 @@ async fn tick(
     let recording: std::collections::HashSet<i64> =
         active.lock().unwrap().keys().copied().collect();
 
+    // Twitch monitors' logins + whether they currently show a collab — inputs
+    // to the per-tick "Stream Together" refresh below.
+    let mut twitch_logins: HashMap<i64, String> = HashMap::new();
+    let mut prev_collab: HashMap<i64, bool> = HashMap::new();
+
     for row in &rows {
         let m = &row.monitor;
         prev_state.insert(m.id, m.last_state.clone());
         prev_meta_values.insert(m.id, (row.last_title.clone(), row.last_game.clone()));
         prev_live_since.insert(m.id, (m.last_live_since, m.last_live_since_approx));
+        if m.platform() == crate::models::Platform::Twitch {
+            if let Some(l) = crate::detectors::twitch_login(&m.url) {
+                twitch_logins.insert(m.id, l);
+            }
+            prev_collab.insert(m.id, row.live_collab.is_some());
+        }
         // Master "Enabled" switch off → fully dormant: no detection at all (nor
         // any recording/fetch elsewhere). The channel keeps its last state until
         // manually checked. Distinct from Auto (below), which never gates
@@ -365,6 +376,51 @@ async fn tick(
             let _ = live_tx.send(signal);
         }
     }
+
+    // ── Twitch "Stream Together" collab refresh ──
+    // Piggybacks each monitor's own poll cadence (only monitors polled this
+    // tick appear in `outcomes`). Live → fetch the Shared Chat session +
+    // title @mentions and persist (`refresh_twitch_collab` is the shared
+    // routine `meta_watcher` also uses while recording). Offline → end open
+    // sessions and clear the live column, once (guarded by `prev_collab` so
+    // permanently-offline channels don't cost a write per tick).
+    let collab_sem = Arc::new(Semaphore::new(MAX_CONCURRENCY));
+    let mut collab_set: JoinSet<()> = JoinSet::new();
+    for o in &outcomes {
+        let Some(login) = twitch_logins.get(&o.monitor_id).cloned() else {
+            continue;
+        };
+        if o.error {
+            continue; // no answer — keep whatever collab state we had
+        }
+        if o.live {
+            let ctx = ctx.clone();
+            let sem = collab_sem.clone();
+            let (mid, bid, sid, title) = (
+                o.monitor_id,
+                o.broadcaster_id.clone(),
+                o.stream_id.clone().unwrap_or_default(),
+                o.stream_title.clone().unwrap_or_default(),
+            );
+            collab_set.spawn(async move {
+                let _permit = sem.acquire().await.expect("semaphore");
+                ctx.refresh_twitch_collab(mid, &login, bid, &sid, &title).await;
+            });
+        } else if prev_collab.get(&o.monitor_id).copied().unwrap_or(false) {
+            match ctx.store.end_open_collab_sessions(o.monitor_id, &[], &[], checked_at) {
+                Ok(closed) => {
+                    for names in closed {
+                        let _ = ctx.store.insert_monitor_stream_change(
+                            o.monitor_id, checked_at, "collab", &names, "",
+                        );
+                    }
+                }
+                Err(e) => warn!("scheduler: ending collab sessions failed: {e:#}"),
+            }
+            let _ = ctx.store.set_monitor_live_collab(o.monitor_id, "");
+        }
+    }
+    while collab_set.join_next().await.is_some() {}
 
     min_wait.clamp(1, MAX_SLEEP_SECS) as u64
 }

@@ -774,6 +774,11 @@ pub struct StreamArchiverApp {
     /// Show desktop notifications (toasts) on recording start/finish/error.
     /// Persisted as the `notifications_enabled` setting; default on.
     notifications_enabled: bool,
+    /// Subscribe EventSub shared-chat ("Stream Together") events for instant
+    /// collab updates — conduit mode only (WebSocket transport's cost cap of
+    /// 10 can't afford 3 extra types/channel). Persisted as `collab_eventsub`;
+    /// default on. Polling covers collabs either way; this only speeds it up.
+    collab_eventsub: bool,
     /// Do Not Disturb: manually suppress toasts right now. Persisted as
     /// `dnd_enabled`; default off. See [`crate::notifications::dnd_active`].
     dnd_enabled: bool,
@@ -1186,6 +1191,12 @@ pub struct StreamArchiverApp {
     google_flow: Arc<Mutex<AuthFlow>>,
     /// Open "Import followed/subscriptions" confirmation dialog, if any.
     import_dialog: Option<ImportDialog>,
+    /// Stored collab history keyed by `(monitor_id, stream_id)` → partner
+    /// names, preloaded on row reload — lets stream/take rows show which
+    /// collab a past broadcast was without per-frame DB queries.
+    collab_by_stream: HashMap<(i64, String), String>,
+    /// Open "🤝 Collab history" popup: the channel id + its loaded sessions.
+    collab_history: Option<CollabHistoryState>,
     /// Whether Streams rows show a status background tint (recording / ad / error).
     /// Toggled from the top bar; persisted under [`K_STATUS_BGCOLOR`]. Keyboard
     /// row selection is still highlighted regardless.
@@ -1242,6 +1253,9 @@ pub struct StreamArchiverApp {
     confirm_quit_stop: bool,
     /// Cached (ocr_stats, global_stats, poll_stats) for the Stats view; None = not yet loaded.
     stats_snapshot: Option<(OcrStats, GlobalStats, PollStats)>,
+    /// Cached 🤝 collab-partner overview (name, sessions, last seen) for the
+    /// Stats view — loaded/refreshed together with `stats_snapshot`.
+    stats_collabs: Vec<(String, i64, i64)>,
     /// Selected timespan for the Stats view's detection-history graphs
     /// (session-only, defaults to 24 h).
     stats_poll_span: PollSpan,
@@ -1800,6 +1814,7 @@ impl eframe::App for StreamArchiverApp {
         self.ad_popup_windows(ui.ctx());
         self.meta_popup_windows(ui.ctx());
         self.history_popup_windows(ui.ctx());
+        self.collab_history_window(ui.ctx());
         self.schedule_popup_windows(ui.ctx());
         self.schedule_sources_window(ui.ctx());
         self.schedule_day_window(ui.ctx());

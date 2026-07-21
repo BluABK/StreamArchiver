@@ -226,6 +226,9 @@ pub(super) fn schedule_detail_line(s: &UpcomingStream) -> String {
     if !s.category.is_empty() {
         parts.push(format!("Category: {}", s.category));
     }
+    if !s.collab.is_empty() {
+        parts.push(format!("With: {}", s.collab));
+    }
     if !s.url.is_empty() {
         parts.push(s.url.clone());
     }
@@ -868,6 +871,7 @@ mod tests {
             channel_color: String::new(),
             merged_into: None,
             auto_merge_excluded: false,
+            collab: String::new(),
         }
     }
 
