@@ -435,7 +435,6 @@ impl StreamArchiverApp {
             let global = self.core.store.global_stats().unwrap_or_default();
             let poll = crate::scheduler::load_poll_stats(self.core.store.as_ref());
             self.stats_snapshot = Some((ocr, global, poll));
-            self.stats_collabs = self.core.store.collab_partner_overview().unwrap_or_default();
         }
         let (ocr, global, poll) = match self.stats_snapshot.clone() {
             Some(s) => s,
@@ -911,60 +910,9 @@ impl StreamArchiverApp {
                     ui.end_row();
                 });
 
-            ui.add_space(16.0);
-
-            // ── 🤝 Collabs ───────────────────────────────────────────────────
-            ui.heading("🤝 Collabs").on_hover_text(
-                "Everyone your monitored channels have streamed together with \
-                 (Twitch \"Stream Together\" shared chats, plus @mention-in-title \
-                 collabs), aggregated across all recorded sessions. Right-click a \
-                 channel row → 🤝 Collab history for its per-channel list.",
-            );
-            ui.separator();
-            if self.stats_collabs.is_empty() {
-                ui.weak(
-                    "No collabs recorded yet — sessions accumulate whenever a live \
-                     Twitch channel is seen streaming together with someone.",
-                );
-            } else {
-                ui.label(format!(
-                    "{} collab partner(s) seen. @name = only ever seen as a title \
-                     mention (unconfirmed).",
-                    self.stats_collabs.len()
-                ));
-                ui.add_space(4.0);
-                egui::Grid::new("collab_stats_grid")
-                    .num_columns(3)
-                    .striped(true)
-                    .spacing([32.0, 4.0])
-                    .show(ui, |ui| {
-                        ui.strong("Partner")
-                            .on_hover_text("Collaborator (most recent display name)");
-                        ui.strong("Sessions")
-                            .on_hover_text("How many recorded collab sessions include them");
-                        ui.strong("Last seen")
-                            .on_hover_text("When a session with them was last observed");
-                        ui.end_row();
-                        for (name, sessions, last_seen) in self.stats_collabs.iter().take(100) {
-                            ui.label(name);
-                            ui.label(sessions.to_string());
-                            ui.label(fmt_datetime_short(*last_seen));
-                            ui.end_row();
-                        }
-                    });
-                if self.stats_collabs.len() > 100 {
-                    ui.weak(format!(
-                        "(+{} more, by session count)",
-                        self.stats_collabs.len() - 100
-                    ))
-                    .on_hover_text(
-                        "Only the 100 most frequent partners are listed here; the \
-                         per-channel 🤝 Collab history windows show everything.",
-                    );
-                }
-            }
-
             ui.add_space(8.0);
+            // (The 🤝 Collabs partner table lives in the Channel Stats tab —
+            // this view is app/system health only.)
         });
     }
 }

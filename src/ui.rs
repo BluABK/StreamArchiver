@@ -118,6 +118,10 @@ enum View {
     Background,
     Files,
     Settings,
+    /// Per-channel viewer/follower/event history ("Channel Stats" tab).
+    ChannelStats,
+    /// App/system health ("App Stats" tab): OCR, API quota, poll health,
+    /// recording totals.
     Stats,
     IoMonitor,
     Debug,
@@ -135,16 +139,24 @@ enum PollSpan {
     Day,
     Week,
     Month,
+    ThreeMonths,
+    Year,
+    /// Everything ever sampled (Channel Stats keeps history forever; the poll
+    /// graphs' own table only retains 60 days, so it shows what exists).
+    All,
 }
 
 impl PollSpan {
-    const ALL: [PollSpan; 6] = [
+    const ALL: [PollSpan; 9] = [
         PollSpan::Hour,
         PollSpan::SixHours,
         PollSpan::TwelveHours,
         PollSpan::Day,
         PollSpan::Week,
         PollSpan::Month,
+        PollSpan::ThreeMonths,
+        PollSpan::Year,
+        PollSpan::All,
     ];
 
     fn label(self) -> &'static str {
@@ -155,6 +167,9 @@ impl PollSpan {
             PollSpan::Day => "24 h",
             PollSpan::Week => "7 d",
             PollSpan::Month => "30 d",
+            PollSpan::ThreeMonths => "90 d",
+            PollSpan::Year => "1 y",
+            PollSpan::All => "All",
         }
     }
 
@@ -167,6 +182,11 @@ impl PollSpan {
             PollSpan::Day => 86_400,
             PollSpan::Week => 7 * 86_400,
             PollSpan::Month => 30 * 86_400,
+            PollSpan::ThreeMonths => 90 * 86_400,
+            PollSpan::Year => 365 * 86_400,
+            // "Since forever": 50 years reaches past any sample without
+            // underflowing the `now - secs()` arithmetic callers do.
+            PollSpan::All => 50 * 365 * 86_400,
         }
     }
 
@@ -179,6 +199,9 @@ impl PollSpan {
             PollSpan::Day => 1_800,           // 30 min
             PollSpan::Week => 3 * 3_600,      // 3 h
             PollSpan::Month => 12 * 3_600,    // 12 h
+            PollSpan::ThreeMonths => 86_400,  // 1 d
+            PollSpan::Year => 3 * 86_400,     // 3 d
+            PollSpan::All => 7 * 86_400,      // 1 w
         }
     }
 
@@ -191,12 +214,22 @@ impl PollSpan {
             PollSpan::Day => "30 min",
             PollSpan::Week => "3 h",
             PollSpan::Month => "12 h",
+            PollSpan::ThreeMonths => "1 d",
+            PollSpan::Year => "3 d",
+            PollSpan::All => "1 w",
         }
     }
 
     /// Whether the graphs' relative time axis reads better in days than hours.
     fn axis_in_days(self) -> bool {
-        matches!(self, PollSpan::Week | PollSpan::Month)
+        matches!(
+            self,
+            PollSpan::Week
+                | PollSpan::Month
+                | PollSpan::ThreeMonths
+                | PollSpan::Year
+                | PollSpan::All
+        )
     }
 }
 
@@ -204,6 +237,7 @@ mod app;
 mod assets_helpers;
 mod background;
 mod calendar;
+mod channel_stats;
 mod chat;
 mod debug;
 mod dialogs;
@@ -697,6 +731,10 @@ struct SettingsForm {
     maintenance_apply_all: bool,
     /// Path to the media player binary (e.g. `C:\Progs\mpv\mpv.exe`).
     media_player_path: String,
+    /// Auto-compress viewer-history samples older than this many days into
+    /// 10-minute buckets (`0` = off, keep full resolution forever). Persisted
+    /// immediately as `viewer_history_downsample_days`.
+    viewer_downsample_days: i64,
     // --- Twitch VOD recovery ---
     /// Auto-recover a Twitch VOD when the VOD checker finds it DMCA-muted.
     auto_recover_muted: bool,
@@ -779,6 +817,11 @@ pub struct StreamArchiverApp {
     /// 10 can't afford 3 extra types/channel). Persisted as `collab_eventsub`;
     /// default on. Polling covers collabs either way; this only speeds it up.
     collab_eventsub: bool,
+    /// Subscribe EventSub `channel.raid` (both directions) so raids land in
+    /// the Channel Stats event history even while not recording — conduit
+    /// mode only, same cost-cap reasoning. Persisted as `raid_eventsub`;
+    /// default on. Chat still captures incoming raids while recording.
+    raid_eventsub: bool,
     /// Do Not Disturb: manually suppress toasts right now. Persisted as
     /// `dnd_enabled`; default off. See [`crate::notifications::dnd_active`].
     dnd_enabled: bool,
@@ -1263,6 +1306,20 @@ pub struct StreamArchiverApp {
     /// next Stats render. Invalidated separately from `stats_snapshot` so
     /// flipping the span doesn't re-run the other stats queries.
     stats_history: Option<Vec<crate::models::PollBucket>>,
+    /// Channel Stats view: selected channel (`None` = all-channels overview).
+    chstats_channel: Option<i64>,
+    /// Channel Stats view: selected timespan (session-only, defaults 30 d).
+    chstats_span: PollSpan,
+    /// Channel Stats view: cached query results for (channel, span);
+    /// `None` = (re)query on next render.
+    chstats_data: Option<channel_stats::ChStatsData>,
+    /// 📈 viewer-stats popup window (single-instance, like collab history).
+    viewer_stats_popup: Option<channel_stats::ViewerStatsPopup>,
+    /// Recent raw viewer samples per monitor for the 👁 column sparklines
+    /// (last hour), refreshed at most once per minute while Streams renders.
+    spark_data: std::collections::HashMap<i64, Vec<(i64, i64)>>,
+    /// When `spark_data` was last refreshed (unix secs; 0 = never).
+    spark_loaded_at: i64,
     /// I/O tab: cached sampler history + counters snapshot (refreshed ~1×/s
     /// while the tab is open — never cloned per frame).
     io_hist: Vec<crate::iomon::Sample>,
@@ -1523,7 +1580,30 @@ impl eframe::App for StreamArchiverApp {
                         self.files_scan = None; // force rescan on tab open
                     }
                     ui.selectable_value(&mut self.view, View::Settings, "Settings");
-                    if ui.selectable_value(&mut self.view, View::Stats, "Stats").clicked() {
+                    if ui
+                        .selectable_value(&mut self.view, View::ChannelStats, "Channel Stats")
+                        .on_hover_text(
+                            "Per-channel viewer/follower history graphs, sub/bits/raid \
+                             events, and collab overview.",
+                        )
+                        .clicked()
+                    {
+                        self.chstats_data = None; // force reload on tab open
+                        self.stats_collabs = self
+                            .core
+                            .store
+                            .collab_partner_overview()
+                            .unwrap_or_default();
+                    }
+                    if ui
+                        .selectable_value(&mut self.view, View::Stats, "App Stats")
+                        .on_hover_text(
+                            "App/system health: OCR usage, API quota, detection/poll \
+                             health, recording totals. Per-channel stats live in the \
+                             Channel Stats tab.",
+                        )
+                        .clicked()
+                    {
                         self.stats_snapshot = None; // force reload on tab open
                         self.stats_history = None;
                     }
@@ -1722,6 +1802,7 @@ impl eframe::App for StreamArchiverApp {
             View::Background => self.background_view(ui),
             View::Files => self.files_view(ui),
             View::Settings => self.settings_view(ui),
+            View::ChannelStats => self.channel_stats_view(ui),
             View::Stats => self.stats_view(ui),
             View::IoMonitor => self.io_view(ui),
             View::Debug => self.debug_view(ui),
@@ -1764,8 +1845,8 @@ impl eframe::App for StreamArchiverApp {
                         ui.close();
                     }
                 }
-                View::Videos | View::Stats | View::IoMonitor | View::Debug | View::Posts
-                | View::Files => {}
+                View::Videos | View::ChannelStats | View::Stats | View::IoMonitor
+                | View::Debug | View::Posts | View::Files => {}
             }
         });
         if ctx_add_stream {
@@ -1815,6 +1896,7 @@ impl eframe::App for StreamArchiverApp {
         self.meta_popup_windows(ui.ctx());
         self.history_popup_windows(ui.ctx());
         self.collab_history_window(ui.ctx());
+        self.viewer_stats_window(ui.ctx());
         self.schedule_popup_windows(ui.ctx());
         self.schedule_sources_window(ui.ctx());
         self.schedule_day_window(ui.ctx());

@@ -934,10 +934,9 @@ pub(super) async fn meta_watcher(
     // so without this the Collab column would freeze for the whole take.
     let collab_login =
         (platform == Platform::Twitch).then(|| crate::detectors::twitch_login(&url)).flatten();
-    let collab_stream_id = match &collab_login {
-        Some(_) => store.recording_stream_id(rec_id).unwrap_or_default(),
-        None => String::new(),
-    };
+    // Broadcast id for tagging collab sessions AND viewer-history samples
+    // (any platform — recordings carry the id when detection had one).
+    let sample_stream_id = store.recording_stream_id(rec_id).unwrap_or_default();
     let mut collab_bid: Option<String> = None;
     // Stop-on-unmatch state — see the doc comment above. `last_matched: None`
     // until the baseline poll; `unmatch_since: Some(t)` from the poll that
@@ -1031,10 +1030,18 @@ pub(super) async fn meta_watcher(
                     }
                 }
             }
-            if let Some(v) = meta.viewers
-                && let Err(e) = store.set_monitor_viewers(monitor_id, v)
-            {
-                warn!("update viewers failed: {e:#}");
+            if let Some(v) = meta.viewers {
+                if let Err(e) = store.set_monitor_viewers(monitor_id, v) {
+                    warn!("update viewers failed: {e:#}");
+                }
+                // The in-recording half of the viewer-history dual feed —
+                // the scheduler never samples an actively-recording monitor.
+                if let Err(e) = store.record_viewer_samples(
+                    now_unix(),
+                    &[(monitor_id, v, meta.followers, sample_stream_id.as_str())],
+                ) {
+                    warn!("record viewer history failed: {e:#}");
+                }
             }
             if let Some(login) = &collab_login {
                 if collab_bid.is_none() {
@@ -1044,7 +1051,7 @@ pub(super) async fn meta_watcher(
                     monitor_id,
                     login,
                     collab_bid.clone(),
-                    &collab_stream_id,
+                    &sample_stream_id,
                     &meta.title,
                 )
                 .await;

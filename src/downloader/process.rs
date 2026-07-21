@@ -765,6 +765,16 @@ impl Supervisor {
                     chat_path,
                     watcher_done.clone(),
                     self.shutdown.clone(),
+                    // Same live event capture as a fresh spawn; the broadcast
+                    // id comes off the re-attached recording row.
+                    Some(crate::chat::ChatEventCtx {
+                        store: self.store.clone(),
+                        monitor_id: m.monitor.id,
+                        stream_id: self
+                            .store
+                            .recording_stream_id(row.ref_id)
+                            .unwrap_or_default(),
+                    }),
                 )));
             }
         }

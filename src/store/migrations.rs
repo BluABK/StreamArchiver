@@ -1159,7 +1159,49 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 58)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 58);
+        if version < 59 {
+            // Channel stats history. `viewer_history`: one row per monitor
+            // per minute while live — viewers is the bucket peak (peak-
+            // preserving, so downsampling to coarser buckets via MAX keeps
+            // spikes), followers is the platform-reported total when the
+            // detection path carries one (Kick channel JSON; Twitch/YouTube
+            // expose none without owner credentials), stream_id ties samples
+            // to a broadcast where the platform provides ids. Kept forever
+            // by default; the optional auto-downsample rewrites rows older
+            // than a configurable age into 10-minute buckets (see
+            // `downsample_viewer_history`) instead of deleting them.
+            // `stream_event`: discrete channel events — subs/resubs/gift
+            // subs/bits parsed live from the recorded Twitch chat (IRC
+            // USERNOTICE / bits tags, so recording-time only), raids from
+            // chat and/or EventSub `channel.raid` (deduped on insert).
+            conn.execute_batch(
+                r#"
+                CREATE TABLE viewer_history (
+                    monitor_id INTEGER NOT NULL REFERENCES monitor(id) ON DELETE CASCADE,
+                    bucket_t   INTEGER NOT NULL,
+                    viewers    INTEGER NOT NULL,
+                    followers  INTEGER,
+                    stream_id  TEXT NOT NULL DEFAULT '',
+                    span_secs  INTEGER NOT NULL DEFAULT 60,
+                    PRIMARY KEY (monitor_id, bucket_t)
+                ) WITHOUT ROWID;
+                CREATE TABLE stream_event (
+                    id         INTEGER PRIMARY KEY,
+                    monitor_id INTEGER NOT NULL REFERENCES monitor(id) ON DELETE CASCADE,
+                    at         INTEGER NOT NULL,
+                    stream_id  TEXT NOT NULL DEFAULT '',
+                    kind       TEXT NOT NULL,
+                    actor      TEXT NOT NULL DEFAULT '',
+                    target     TEXT NOT NULL DEFAULT '',
+                    amount     INTEGER NOT NULL DEFAULT 0,
+                    tier       TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX idx_stream_event_monitor ON stream_event(monitor_id, at);
+                "#,
+            )?;
+            conn.pragma_update(None, "user_version", 59)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 59);
         Ok(())
     }
 }

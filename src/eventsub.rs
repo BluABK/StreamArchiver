@@ -160,8 +160,8 @@ async fn run_session(
             let conduit_id = ensure_conduit(&http, &client_id, token).await?;
             bind_shard(&http, &client_id, token, &conduit_id, &session_id).await?;
             let sub_transport = json!({ "method": "conduit", "conduit_id": conduit_id });
-            let n_on = subscribe_type(&http, &client_id, token, "stream.online", &sub_transport, &uid_to_monitors).await;
-            let n_off = subscribe_type(&http, &client_id, token, "stream.offline", &sub_transport, &uid_to_monitors).await;
+            let n_on = subscribe_type(&http, &client_id, token, "stream.online", "broadcaster_user_id", &sub_transport, &uid_to_monitors).await;
+            let n_off = subscribe_type(&http, &client_id, token, "stream.offline", "broadcaster_user_id", &sub_transport, &uid_to_monitors).await;
             info!(
                 "eventsub: connected (conduit {conduit_id}); {n_on}/{} channel(s) subscribed \
                  ({n_off} offline)",
@@ -180,19 +180,39 @@ async fn run_session(
                     "channel.shared_chat.update",
                     "channel.shared_chat.end",
                 ] {
-                    n_collab +=
-                        subscribe_type(&http, &client_id, token, t, &sub_transport, &uid_to_monitors)
-                            .await;
+                    n_collab += subscribe_type(
+                        &http, &client_id, token, t, "broadcaster_user_id",
+                        &sub_transport, &uid_to_monitors,
+                    )
+                    .await;
                 }
                 debug!(
                     "eventsub: shared-chat (collab) subscriptions active ({n_collab} across 3 types)"
                 );
             }
+            // Raids in/out — conduit mode only for the same cost-cap reason.
+            // `channel.raid` needs NO scope and filters on to_/from_
+            // broadcaster ids (one subscription per direction per channel).
+            // Events are written straight to `stream_event` for the Channel
+            // Stats view; the chat parser's raid capture dedups against these.
+            if raid_eventsub_enabled(store) {
+                let n_in = subscribe_type(
+                    &http, &client_id, token, "channel.raid", "to_broadcaster_user_id",
+                    &sub_transport, &uid_to_monitors,
+                )
+                .await;
+                let n_out = subscribe_type(
+                    &http, &client_id, token, "channel.raid", "from_broadcaster_user_id",
+                    &sub_transport, &uid_to_monitors,
+                )
+                .await;
+                debug!("eventsub: raid subscriptions active ({n_in} incoming / {n_out} outgoing)");
+            }
         }
         Transport::UserToken { token } => {
             let sub_transport = json!({ "method": "websocket", "session_id": session_id });
-            let n_on = subscribe_type(&http, &client_id, token, "stream.online", &sub_transport, &uid_to_monitors).await;
-            let n_off = subscribe_type(&http, &client_id, token, "stream.offline", &sub_transport, &uid_to_monitors).await;
+            let n_on = subscribe_type(&http, &client_id, token, "stream.online", "broadcaster_user_id", &sub_transport, &uid_to_monitors).await;
+            let n_off = subscribe_type(&http, &client_id, token, "stream.offline", "broadcaster_user_id", &sub_transport, &uid_to_monitors).await;
             info!(
                 "eventsub: connected (user-token); {n_on}/{} channel(s) subscribed \
                  ({n_off} offline)",
@@ -204,6 +224,13 @@ async fn run_session(
                      mode — WebSocket transport caps total subscription cost at 10 \
                      (collab updates come from polling instead; add a Client Secret \
                      for conduit mode to enable pushes)"
+                );
+            }
+            if raid_eventsub_enabled(store) {
+                debug!(
+                    "eventsub: skipping raid subscriptions in user-token mode — same \
+                     WebSocket cost cap as above (raids are still captured from chat \
+                     while recording)"
                 );
             }
         }
@@ -292,6 +319,47 @@ fn handle_message(
                         }
                     }
                 }
+                Some("channel.raid") => {
+                    // Record straight into `stream_event`: raid_in on the
+                    // target's monitors, raid_out on the source's (both when
+                    // both channels are monitored — two different rows on two
+                    // different monitors, not a duplicate). The store dedups
+                    // against the chat parser's raid capture.
+                    let from = event["from_broadcaster_user_name"]
+                        .as_str()
+                        .or_else(|| event["from_broadcaster_user_login"].as_str())
+                        .unwrap_or("");
+                    let to = event["to_broadcaster_user_name"]
+                        .as_str()
+                        .or_else(|| event["to_broadcaster_user_login"].as_str())
+                        .unwrap_or("");
+                    let viewers = event["viewers"].as_i64().unwrap_or(0);
+                    let at = crate::models::now_unix();
+                    if let Some(to_id) = event["to_broadcaster_user_id"].as_str()
+                        && let Some(mons) = uid_to_monitors.get(to_id)
+                    {
+                        for &mid in mons {
+                            info!(
+                                "eventsub {}: {from} raided {to} ({viewers} viewers) -> monitor {mid}",
+                                crate::models::Platform::Twitch.tag()
+                            );
+                            let _ = store
+                                .record_stream_event(mid, at, "", "raid_in", from, "", viewers, "");
+                        }
+                    }
+                    if let Some(from_id) = event["from_broadcaster_user_id"].as_str()
+                        && let Some(mons) = uid_to_monitors.get(from_id)
+                    {
+                        for &mid in mons {
+                            info!(
+                                "eventsub {}: {from} raided out to {to} ({viewers} viewers) -> monitor {mid}",
+                                crate::models::Platform::Twitch.tag()
+                            );
+                            let _ = store
+                                .record_stream_event(mid, at, "", "raid_out", from, to, viewers, "");
+                        }
+                    }
+                }
                 Some(
                     t @ ("channel.shared_chat.begin"
                     | "channel.shared_chat.update"
@@ -329,6 +397,19 @@ fn handle_message(
 fn collab_eventsub_enabled(store: &Store) -> bool {
     store
         .get_setting("collab_eventsub")
+        .ok()
+        .flatten()
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
+/// Whether the "Raids via EventSub" setting is on (default: on). Only takes
+/// effect in conduit mode — see the subscribe sites. Covers monitors with an
+/// EventSub detection method (that's who this task subscribes for); raids on
+/// other Twitch monitors are still captured from chat while recording.
+fn raid_eventsub_enabled(store: &Store) -> bool {
+    store
+        .get_setting("raid_eventsub")
         .ok()
         .flatten()
         .map(|v| v != "0")
@@ -517,19 +598,23 @@ async fn bind_shard(
     Ok(())
 }
 
-/// Subscribe `event_type` (`"stream.online"` or `"stream.offline"`) for each
-/// user id (skipping ones already enabled), over the given transport JSON
-/// (`{"method":"conduit","conduit_id":..}` or `{"method":"websocket",
-/// "session_id":..}`). Returns the count of channels covered.
+/// Subscribe `event_type` for each user id (skipping ones already enabled),
+/// over the given transport JSON (`{"method":"conduit","conduit_id":..}` or
+/// `{"method":"websocket","session_id":..}`). `cond_key` is the condition
+/// field the uid goes into — `broadcaster_user_id` for most types, but
+/// `channel.raid` filters on `to_broadcaster_user_id` /
+/// `from_broadcaster_user_id` instead (one direction per call). Returns the
+/// count of channels covered.
 async fn subscribe_type(
     http: &Client,
     client_id: &str,
     token: &str,
     event_type: &str,
+    cond_key: &str,
     transport: &Value,
     uid_to_monitors: &HashMap<String, Vec<i64>>,
 ) -> usize {
-    let existing = existing_subs(http, client_id, token, event_type).await;
+    let existing = existing_subs(http, client_id, token, event_type, cond_key).await;
     let mut covered = 0;
     for uid in uid_to_monitors.keys() {
         if existing.contains(uid) {
@@ -543,7 +628,7 @@ async fn subscribe_type(
             .json(&json!({
                 "type": event_type,
                 "version": "1",
-                "condition": { "broadcaster_user_id": uid },
+                "condition": { cond_key: uid },
                 "transport": transport
             }))
             .send()
@@ -571,6 +656,7 @@ async fn existing_subs(
     client_id: &str,
     token: &str,
     event_type: &str,
+    cond_key: &str,
 ) -> HashSet<String> {
     let mut set = HashSet::new();
     let mut after: Option<String> = None;
@@ -588,7 +674,7 @@ async fn existing_subs(
         if let Some(arr) = v["data"].as_array() {
             for s in arr {
                 if s["type"].as_str() == Some(event_type) {
-                    if let Some(uid) = s["condition"]["broadcaster_user_id"].as_str() {
+                    if let Some(uid) = s["condition"][cond_key].as_str() {
                         set.insert(uid.to_string());
                     }
                 }

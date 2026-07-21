@@ -76,6 +76,9 @@ pub struct DetectOutcome {
     /// Live viewer count at detection time (Twitch `viewer_count`, Kick
     /// viewers; YouTube best-effort). `None` when the platform/path omits it.
     pub stream_viewers: Option<i64>,
+    /// Follower total at detection time (Kick only — see
+    /// [`StreamMeta::followers`]). Feeds the `viewer_history` sampling.
+    pub stream_followers: Option<i64>,
 }
 
 impl DetectOutcome {
@@ -92,6 +95,7 @@ impl DetectOutcome {
             stream_title: None,
             stream_game: None,
             stream_viewers: None,
+            stream_followers: None,
         }
     }
     fn live_at(
@@ -129,6 +133,10 @@ impl DetectOutcome {
         self.stream_viewers = stream_viewers;
         self
     }
+    fn with_stream_followers(mut self, stream_followers: Option<i64>) -> DetectOutcome {
+        self.stream_followers = stream_followers;
+        self
+    }
     fn offline(monitor_id: i64) -> DetectOutcome {
         DetectOutcome {
             monitor_id,
@@ -142,6 +150,7 @@ impl DetectOutcome {
             stream_title: None,
             stream_game: None,
             stream_viewers: None,
+            stream_followers: None,
         }
     }
     fn err(monitor_id: i64, detail: impl Into<String>) -> DetectOutcome {
@@ -157,6 +166,7 @@ impl DetectOutcome {
             stream_title: None,
             stream_game: None,
             stream_viewers: None,
+            stream_followers: None,
         }
     }
 }
@@ -201,6 +211,11 @@ pub struct StreamMeta {
     /// has no reliable viewer field, so always `None` there — mirrors
     /// `DetectOutcome::stream_viewers`'s own platform coverage).
     pub viewers: Option<i64>,
+    /// Follower total at fetch time. Kick only — its channel JSON carries it
+    /// in responses we already pull. Twitch's follower total needs a
+    /// moderator-scoped user token and YouTube's subscriber count isn't in
+    /// the `/live` page, so both stay `None` (feeds `viewer_history`).
+    pub followers: Option<i64>,
 }
 
 /// A live Twitch "Stream Together" (Shared Chat) session, as returned by
@@ -804,6 +819,7 @@ impl DetectContext {
                         title: s.title,
                         game: s.game_name,
                         viewers: Some(s.viewer_count),
+                        followers: None,
                     });
                 }
                 reqwest::StatusCode::UNAUTHORIZED if using_user_token => {
@@ -2621,6 +2637,9 @@ impl DetectContext {
                         .with_stream_title(title)
                         .with_stream_game(game)
                         .with_stream_viewers(viewers)
+                        // Best-effort: present in some responses, harmlessly
+                        // absent otherwise (the v2 scrape path carries it too).
+                        .with_stream_followers(ch["followers_count"].as_i64())
                 } else {
                     DetectOutcome::offline(item.monitor_id)
                 }
@@ -2786,6 +2805,8 @@ impl DetectContext {
                 #[derive(Deserialize)]
                 struct KickResp {
                     livestream: Option<Livestream>,
+                    // Follower total, free in the same response (viewer_history).
+                    followers_count: Option<i64>,
                 }
                 match r.json::<KickResp>().await {
                     Ok(k) => {
@@ -2795,6 +2816,7 @@ impl DetectContext {
                             .unwrap_or(false);
                         if live {
                             DetectOutcome::live(item.monitor_id, "live")
+                                .with_stream_followers(k.followers_count)
                         } else {
                             DetectOutcome::offline(item.monitor_id)
                         }
@@ -4717,7 +4739,7 @@ fn parse_youtube_meta(body: &str) -> MetaFetch {
         .as_str()
         .unwrap_or_default()
         .to_string();
-    MetaFetch::Live(StreamMeta { title: title.to_string(), game, viewers: None })
+    MetaFetch::Live(StreamMeta { title: title.to_string(), game, viewers: None, followers: None })
 }
 
 /// Extract a live Kick stream's title + category from the v2 channel JSON.
@@ -4741,6 +4763,8 @@ fn parse_kick_meta(v: &Value) -> MetaFetch {
             .unwrap_or_default()
             .to_string(),
         viewers: ls["viewer_count"].as_i64().or_else(|| ls["viewers"].as_i64()),
+        // Top-level channel field, not part of the livestream object.
+        followers: v["followers_count"].as_i64(),
     })
 }
 

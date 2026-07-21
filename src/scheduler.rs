@@ -377,6 +377,33 @@ async fn tick(
         }
     }
 
+    // Fold this tick's live viewer/follower counts into the minute-bucket
+    // viewer_history table (Channel Stats graphs + grid sparklines). Only
+    // genuinely-live outcomes with a count sample; recording monitors are
+    // sampled by meta_watcher instead (the scheduler skips them entirely).
+    let samples: Vec<(i64, i64, Option<i64>, &str)> = outcomes
+        .iter()
+        .filter(|o| o.live && !o.error && o.stream_viewers.is_some())
+        .map(|o| {
+            (
+                o.monitor_id,
+                o.stream_viewers.unwrap_or(0),
+                o.stream_followers,
+                o.stream_id.as_deref().unwrap_or(""),
+            )
+        })
+        .collect();
+    if !samples.is_empty()
+        && let Err(e) = ctx.store.record_viewer_samples(checked_at, &samples)
+    {
+        warn!("scheduler: failed to persist viewer history: {e:#}");
+    }
+    // Optional auto-downsample of old viewer history (runs at most daily;
+    // a cheap two-settings-read no-op the rest of the time).
+    if let Err(e) = ctx.store.maybe_auto_downsample_viewer_history(checked_at) {
+        warn!("scheduler: viewer-history downsample failed: {e:#}");
+    }
+
     // ── Twitch "Stream Together" collab refresh ──
     // Piggybacks each monitor's own poll cadence (only monitors polled this
     // tick appear in `outcomes`). Live → fetch the Shared Chat session +

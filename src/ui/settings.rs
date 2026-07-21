@@ -513,6 +513,7 @@ impl StreamArchiverApp {
             self.settings_trigger_words_section(ui);
             self.settings_blacklist_triggers_section(ui);
             self.settings_vod_recovery_section(ui);
+            self.settings_stats_history_section(ui);
             self.settings_maintenance_section(ui);
             self.settings_diagnostics_section(ui);
 
@@ -576,6 +577,26 @@ impl StreamArchiverApp {
                     .core
                     .store
                     .set_setting("collab_eventsub", if collab_es { "1" } else { "0" });
+            }
+            let mut raid_es = self.raid_eventsub;
+            if ui
+                .checkbox(&mut raid_es, "📈 Raids via EventSub (conduit mode)")
+                .on_hover_text(
+                    "Subscribe Twitch's channel.raid events (incoming AND outgoing) \
+                     so raids land in the Channel Stats event history even while \
+                     nothing is recording. Needs no extra scopes; only active in \
+                     conduit mode (Client ID + Secret set) for the same \
+                     subscription-cost reason as the collab checkbox. Incoming \
+                     raids are also captured from chat while a recording with \
+                     Chat log runs. Takes effect on the next EventSub (re)connect.",
+                )
+                .changed()
+            {
+                self.raid_eventsub = raid_es;
+                let _ = self
+                    .core
+                    .store
+                    .set_setting("raid_eventsub", if raid_es { "1" } else { "0" });
             }
 
             }
@@ -2831,6 +2852,98 @@ impl StreamArchiverApp {
                 });
 
             // ── Maintenance ────────────────────────────────────────────────────
+            }
+    }
+
+    /// Immediate-save for the viewer-history auto-compress setting (the
+    /// checkbox/drag pair below saves on change, like the EventSub toggles).
+    fn save_viewer_downsample_days(&self) {
+        let _ = self.core.store.set_setting(
+            crate::store::K_VH_DOWNSAMPLE_DAYS,
+            &self.settings.viewer_downsample_days.to_string(),
+        );
+    }
+
+    fn settings_stats_history_section(&mut self, ui: &mut egui::Ui) {
+        if self.section_shown(
+            SettingsTab::Maintenance,
+            "Channel stats history",
+            &["stats", "viewer", "history", "downsample", "compress", "retention", "graph"],
+        ) {
+            ui.add_space(12.0);
+            ui.heading("Channel stats history 📈");
+            ui.label(
+                "Viewer/follower samples (one per minute while live) feed the Channel \
+                 Stats graphs and are kept forever by default. Old samples can be \
+                 compressed into 10-minute buckets — peaks and total airtime are \
+                 preserved, only the fine detail goes.",
+            );
+            let (rows, oldest, raw_rows) = self
+                .core
+                .store
+                .viewer_history_info()
+                .unwrap_or((0, None, 0));
+            ui.label(format!(
+                "Currently stored: {rows} samples ({raw_rows} at full resolution){}",
+                oldest
+                    .map(|t| format!(", oldest from {}", fmt_datetime_short(t)))
+                    .unwrap_or_default()
+            ))
+            .on_hover_text(
+                "A sample row is ~30 bytes; a channel that's live 8 h/day adds \
+                 ~480 rows/day at full resolution (48 once compressed).",
+            );
+            ui.horizontal(|ui| {
+                let mut auto_on = self.settings.viewer_downsample_days > 0;
+                if ui
+                    .checkbox(&mut auto_on, "Auto-compress samples older than")
+                    .on_hover_text(
+                        "Once a day, rewrite viewer samples older than this many days \
+                         into 10-minute buckets. Off = keep every minute-resolution \
+                         sample forever.",
+                    )
+                    .changed()
+                {
+                    self.settings.viewer_downsample_days = if auto_on { 90 } else { 0 };
+                    self.save_viewer_downsample_days();
+                }
+                let mut days = self.settings.viewer_downsample_days.max(1);
+                if ui
+                    .add_enabled(
+                        auto_on,
+                        egui::DragValue::new(&mut days).range(7..=3650).suffix(" days"),
+                    )
+                    .on_hover_text("Samples younger than this always stay full resolution")
+                    .changed()
+                    && auto_on
+                {
+                    self.settings.viewer_downsample_days = days;
+                    self.save_viewer_downsample_days();
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui
+                    .button("🗜 Compress now (older than 90 days)")
+                    .on_hover_text(
+                        "One-off compression of everything older than 90 days into \
+                         10-minute buckets, regardless of the auto setting. Cannot \
+                         be undone (the fine detail is gone), but graphs, peaks and \
+                         airtime keep working.",
+                    )
+                    .clicked()
+                {
+                    let cut = now_unix() - 90 * 86_400;
+                    match self.core.store.downsample_viewer_history(cut) {
+                        Ok((before, after)) => {
+                            self.status = format!(
+                                "Viewer history compressed: {before} samples -> {after}"
+                            );
+                        }
+                        Err(e) => self.status = format!("Compress failed: {e:#}"),
+                    }
+                }
+            });
+
             }
     }
 

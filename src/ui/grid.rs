@@ -439,6 +439,65 @@ pub(super) fn fmt_viewers(n: i64) -> String {
         n.to_string()
     }
 }
+/// 👁 cell: the current count plus a tiny inline last-hour trend sparkline
+/// (painter polyline — no per-row egui_plot cost). Empty for a negative
+/// (unknown/offline) count. Returns true on double-click (open 📈 stats).
+pub(super) fn viewers_cell(
+    ui: &mut egui::Ui,
+    viewers: i64,
+    spark: Option<&Vec<(i64, i64)>>,
+) -> bool {
+    if viewers < 0 {
+        return false;
+    }
+    let mut open_stats = false;
+    let resp = ui
+        .add(egui::Label::new(fmt_viewers(viewers)).truncate().sense(egui::Sense::click()))
+        .on_hover_text(format!(
+            "{viewers} viewers\nDouble-click for viewer history graphs (📈)"
+        ));
+    if resp.double_clicked() {
+        open_stats = true;
+    }
+    if let Some(pts) = spark
+        && pts.len() >= 2
+        && ui.available_width() >= 30.0
+    {
+        let w = ui.available_width().min(48.0);
+        let (rect, sresp) =
+            ui.allocate_exact_size(egui::vec2(w, 12.0), egui::Sense::click());
+        if ui.is_rect_visible(rect) {
+            let (t0, t1) = (pts[0].0, pts[pts.len() - 1].0);
+            let (lo, hi) = pts.iter().fold((i64::MAX, i64::MIN), |(lo, hi), (_, v)| {
+                (lo.min(*v), hi.max(*v))
+            });
+            let dt = (t1 - t0).max(1) as f32;
+            let dv = (hi - lo).max(1) as f32;
+            let line: Vec<egui::Pos2> = pts
+                .iter()
+                .map(|(t, v)| {
+                    egui::pos2(
+                        rect.left() + (*t - t0) as f32 / dt * rect.width(),
+                        rect.bottom() - (*v - lo) as f32 / dv * rect.height(),
+                    )
+                })
+                .collect();
+            let color = ui.visuals().weak_text_color();
+            ui.painter().add(egui::Shape::line(line, egui::Stroke::new(1.0, color)));
+        }
+        let sresp = sresp.on_hover_text(format!(
+            "Last hour: {} → {} (peak {})\nDouble-click for viewer history graphs (📈)",
+            fmt_viewers(pts[0].1),
+            fmt_viewers(pts[pts.len() - 1].1),
+            fmt_viewers(pts.iter().map(|(_, v)| *v).max().unwrap_or(0)),
+        ));
+        if sresp.double_clicked() {
+            open_stats = true;
+        }
+    }
+    open_stats
+}
+
 /// Theme color for a video download status string.
 pub(super) fn video_status_color(status: &str) -> egui::Color32 {
     use egui::Color32;
@@ -1527,6 +1586,7 @@ pub(super) struct RowActions {
     pub(super) select: Option<i64>,                // monitor id
     pub(super) open_schedule: Option<i64>,         // monitor id (open its Next stream popup)
     pub(super) open_collab_history: Option<i64>,   // channel id (open its 🤝 collab history)
+    pub(super) open_viewer_stats: Option<i64>,     // channel id (open its 📈 viewer stats)
     pub(super) properties: Option<i64>,            // monitor id
     pub(super) reorganize_monitor: Option<i64>,    // monitor id
     pub(super) reorganize_channel: Option<i64>,    // channel id
@@ -1573,6 +1633,9 @@ pub(super) fn render_instance_row(
     // Pre-formatted stop-hold description when a user Stop is suppressing
     // automatic restarts for this monitor (the ✋ state badge).
     stop_hold: Option<String>,
+    // This monitor's recent viewer samples (last hour) for the 👁 sparkline;
+    // `None` = no samples cached (offline or history disabled).
+    spark: Option<&Vec<(i64, i64)>>,
     order: &[usize],
     a: &mut RowActions,
 ) -> bool {
@@ -1739,6 +1802,17 @@ pub(super) fn render_instance_row(
         ui.separator();
         if ui.button("📁  Re-organize recordings").on_hover_text("Move all recordings for this monitor into/out of subdirectories.").clicked() {
             a.reorganize_monitor = Some(m.id);
+            ui.close();
+        }
+        if ui
+            .button("📈  Viewer stats")
+            .on_hover_text(
+                "Viewer/follower history graphs and sub/bits/raid events for this \
+                 channel (also in the Channel Stats tab, or double-click the 👁 cell).",
+            )
+            .clicked()
+        {
+            a.open_viewer_stats = Some(row.channel.id);
             ui.close();
         }
         ui.separator();
@@ -2014,9 +2088,8 @@ pub(super) fn render_instance_row(
                 }
             }
             "viewers" => {
-                if row.last_viewers >= 0 {
-                    ui.add(egui::Label::new(fmt_viewers(row.last_viewers)).truncate())
-                        .on_hover_text(format!("{} viewers", row.last_viewers));
+                if viewers_cell(ui, row.last_viewers, spark) {
+                    a.open_viewer_stats = Some(row.channel.id);
                 }
             }
             "changes" => {

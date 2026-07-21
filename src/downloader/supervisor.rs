@@ -2210,6 +2210,7 @@ progress_info: None,
                     stream_title: None,
                     stream_game: None,
                     stream_viewers: None,
+                    stream_followers: None,
                 }),
             DetectionMethod::GenericProbe => self.ctx.detect_generic(&item).await,
             DetectionMethod::YouTubeApi => self.ctx.detect_youtube_api(&item).await,
@@ -2228,6 +2229,7 @@ progress_info: None,
                 stream_title: None,
                 stream_game: None,
                 stream_viewers: None,
+                stream_followers: None,
             },
             _ => self.ctx.detect_scrape(&item).await,
         }
@@ -2409,8 +2411,15 @@ progress_info: None,
         let (meta_done, meta_task) =
             self.spawn_meta_watcher(&row, &trigger_rule, monitor_id, rec_id, started_at);
         self.spawn_quality_upgrade_watcher(&row, &plan, monitor_id, &stream_id);
-        let (chat_done, chat_task) =
-            self.spawn_chat_loggers(&row, &plan, &auth, &ytdlp_global_args, &ytdlp_bins, monitor_id);
+        let (chat_done, chat_task) = self.spawn_chat_loggers(
+            &row,
+            &plan,
+            &auth,
+            &ytdlp_global_args,
+            &ytdlp_bins,
+            monitor_id,
+            stream_id.as_deref().unwrap_or(""),
+        );
 
         // If a manual stop arrived while we were setting up (pid was 0 so kill
         // couldn't fire yet), honour it now: skip spawning the process entirely.
@@ -3025,6 +3034,7 @@ progress_info: None,
 
     /// Spawn the chat loggers for the take (native Twitch IRC logger and/or the
     /// yt-dlp live-chat sidecar). Returns `(chat_done, chat_task)`.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_chat_loggers(
         &self,
         row: &MonitorWithChannel,
@@ -3033,6 +3043,7 @@ progress_info: None,
         ytdlp_global_args: &[String],
         ytdlp_bins: &YtDlpBins,
         monitor_id: i64,
+        stream_id: &str,
     ) -> (Arc<AtomicBool>, Option<tokio::task::JoinHandle<()>>) {
         // Twitch chat -> a native anonymous IRC-over-WebSocket logger, written as
         // a `.chat.jsonl` sidecar in the OUTPUT dir (next to the final file, not in
@@ -3047,6 +3058,12 @@ progress_info: None,
                     chat_path,
                     chat_done.clone(),
                     self.shutdown.clone(),
+                    // Live event capture (subs/bits/raids -> stream_event).
+                    Some(crate::chat::ChatEventCtx {
+                        store: self.store.clone(),
+                        monitor_id,
+                        stream_id: stream_id.to_string(),
+                    }),
                 ))
             });
 

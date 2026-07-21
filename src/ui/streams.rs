@@ -110,6 +110,11 @@ struct StreamsOut {
     open_history_popup: Option<i64>,
     /// Channel id whose 🤝 collab-history window should open.
     open_collab_history: Option<i64>,
+    /// Channel id whose 📈 viewer-stats popup should open (span mode).
+    open_viewer_stats: Option<i64>,
+    /// `(channel id, window title, since, until)` — 📈 popup clamped to one
+    /// broadcast's time range ("Stream stats" on a stream row).
+    open_stream_stats: Option<(i64, String, i64, i64)>,
 }
 
 #[derive(Clone, Copy)]
@@ -391,6 +396,14 @@ impl StreamArchiverApp {
         }
 
         let now = crate::models::now_unix();
+        // 👁 sparkline data: the last hour of raw viewer samples per monitor,
+        // refreshed at most once a minute (samples only land once a minute, so
+        // querying any faster is pure waste). One small indexed query.
+        if now - self.spark_loaded_at >= 60 {
+            self.spark_loaded_at = now;
+            self.spark_data =
+                self.core.store.recent_viewer_history(now - 3_660).unwrap_or_default();
+        }
         let any_active = self
             .rows
             .iter()
@@ -813,8 +826,8 @@ impl StreamArchiverApp {
                                     channel_avatars, channel_name_colors, &ptex,
                                     active_ids, &finalizing_ids, &active_chat_ids,
                                     &ad_running, &exp_channels, now, sel_color,
-                                    status_bgcolor, &col_order, &mut out,
-                                    &cache.platform_pref,
+                                    status_bgcolor, &col_order, &self.spark_data,
+                                    &mut out, &cache.platform_pref,
                                 );
                             }
                             Vis::Instance { row: ri, depth } => {
@@ -825,7 +838,8 @@ impl StreamArchiverApp {
                                     &finalizing_ids, &active_chat_ids, selected_monitor,
                                     &exp_instances, instance_avatars,
                                     &stop_holds_snapshot, &ad_running, sel_color,
-                                    status_bgcolor, &col_order, &mut out,
+                                    status_bgcolor, &col_order, &self.spark_data,
+                                    &mut out,
                                 );
                             }
                             Vis::Stream { mid, gi, depth } => {
@@ -915,6 +929,8 @@ impl StreamArchiverApp {
             open_schedule_popup,
             open_history_popup,
             open_collab_history,
+            open_viewer_stats,
+            open_stream_stats,
         } = out;
         if let Some(rid) = open_ad_popup
             && !self.ad_popups.contains(&rid)
@@ -934,6 +950,12 @@ impl StreamArchiverApp {
         }
         if let Some(cid) = open_collab_history.or(acts.open_collab_history) {
             self.open_collab_history(cid);
+        }
+        if let Some(cid) = open_viewer_stats.or(acts.open_viewer_stats) {
+            self.open_viewer_stats(cid);
+        }
+        if let Some((cid, label, since, until)) = open_stream_stats {
+            self.open_stream_stats(cid, &label, since, until);
         }
         if let Some(rec_id) = open_recover_take {
             self.open_recover_vod_from_seed(rec_id);
@@ -1262,6 +1284,8 @@ impl StreamArchiverApp {
         sel_color: egui::Color32,
         status_bgcolor: bool,
         col_order: &[usize],
+        // Recent viewer samples per monitor for the 👁 sparkline (last hour).
+        spark: &HashMap<i64, Vec<(i64, i64)>>,
         out: &mut StreamsOut,
         platform_pref: &crate::platform_pref::PlatformPrefCtx,
     ) {
@@ -1609,9 +1633,9 @@ impl StreamArchiverApp {
                         }
                     }
                     "viewers" => {
-                        if cur_viewers >= 0 {
-                            ui.add(egui::Label::new(fmt_viewers(cur_viewers)).truncate())
-                                .on_hover_text(format!("{} viewers", cur_viewers));
+                        let sp = primary.and_then(|m| spark.get(&m.monitor.id));
+                        if viewers_cell(ui, cur_viewers, sp) {
+                            out.open_viewer_stats = Some(cid);
                         }
                     }
                     "changes" => {
@@ -1677,6 +1701,18 @@ impl StreamArchiverApp {
                     out.acts.reorganize_channel = Some(cid);
                     ui.close();
                 }
+                if ui
+                    .button("📈  Viewer stats")
+                    .on_hover_text(
+                        "Viewer/follower history graphs and sub/bits/raid events for \
+                         this channel (also in the Channel Stats tab, or double-click \
+                         the 👁 cell).",
+                    )
+                    .clicked()
+                {
+                    out.open_viewer_stats = Some(cid);
+                    ui.close();
+                }
                 ui.separator();
                 if ui.button("🗑  Delete channel").clicked() {
                     out.delete_channel = Some((cid, ch.name.clone()));
@@ -1719,6 +1755,8 @@ impl StreamArchiverApp {
         sel_color: egui::Color32,
         status_bgcolor: bool,
         col_order: &[usize],
+        // Recent viewer samples per monitor for the 👁 sparkline (last hour).
+        spark: &HashMap<i64, Vec<(i64, i64)>>,
         out: &mut StreamsOut,
     ) {
         let mid = row.monitor.id;
@@ -1822,6 +1860,7 @@ impl StreamArchiverApp {
             inst_latest_rec_id,
             scheduled_recordings,
             stop_hold_desc,
+            spark.get(&mid),
             col_order, &mut out.acts,
         ) {
             out.toggle_instance = Some(mid);
@@ -2302,6 +2341,29 @@ impl StreamArchiverApp {
                 {
                     out.open_collab_history =
                         rows.iter().find(|r| r.monitor.id == mid).map(|r| r.channel.id);
+                    ui.close();
+                }
+                if ui
+                    .button("📈  Stream stats")
+                    .on_hover_text(
+                        "Viewer graph and sub/bits/raid events for just this \
+                         broadcast's time window.",
+                    )
+                    .clicked()
+                {
+                    if let Some(r) = rows.iter().find(|r| r.monitor.id == mid) {
+                        let label = format!(
+                            "{} — {}",
+                            r.channel.name,
+                            fmt_datetime_short(g.started_at())
+                        );
+                        out.open_stream_stats = Some((
+                            r.channel.id,
+                            label,
+                            g.started_at(),
+                            g.ended_at().unwrap_or(0),
+                        ));
+                    }
                     ui.close();
                 }
             });

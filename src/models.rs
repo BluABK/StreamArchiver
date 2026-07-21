@@ -2164,6 +2164,65 @@ pub struct PollBucket {
     pub errors: u64,
 }
 
+/// One aggregated time bucket of a monitor's viewer/follower history, as
+/// returned by `Store::viewer_history_range` — the raw material for the
+/// Channel Stats graphs. Backed by the `viewer_history` table (schema v59):
+/// stored per monitor at minute resolution while live (peak within the
+/// minute), aggregated to the requested bucket width at query time with MAX
+/// so re-bucketing and downsampling never flatten spikes.
+#[derive(Clone)]
+pub struct ViewerBucket {
+    /// The monitor the samples came from (one plot line per monitor).
+    pub monitor_id: i64,
+    /// Bucket start (unix secs, aligned down to the queried bucket width).
+    pub t: i64,
+    /// Peak live viewer count within the bucket.
+    pub viewers: i64,
+    /// Platform-reported follower total, when the detection path carries one
+    /// (Kick today; Twitch/YouTube expose none without owner credentials).
+    pub followers: Option<i64>,
+}
+
+/// One discrete channel event from the `stream_event` table (schema v59):
+/// subs/resubs/gift subs/bits parsed live out of the recorded Twitch chat,
+/// raids from chat and/or EventSub `channel.raid`.
+#[derive(Clone)]
+pub struct StreamEventRow {
+    /// Kept for future per-instance filtering; queries are channel-scoped.
+    #[allow(dead_code)]
+    pub monitor_id: i64,
+    pub at: i64,
+    /// Broadcast id when known (`''` otherwise — filter by time instead).
+    #[allow(dead_code)]
+    pub stream_id: String,
+    /// `sub` | `resub` | `subgift` | `bits` | `raid_in` | `raid_out`.
+    pub kind: String,
+    /// Who did it: subscriber, gifter, cheerer, or incoming raider.
+    pub actor: String,
+    /// Gift recipient (`''` for a community batch) or outgoing-raid target.
+    pub target: String,
+    /// Bits cheered, gift-batch size, raid party size, or resub months.
+    pub amount: i64,
+    /// Twitch sub plan (`1000`/`2000`/`3000`/`Prime`) where applicable.
+    pub tier: String,
+}
+
+/// One channel's aggregate line in the Channel Stats overview table, as
+/// returned by `Store::channel_stats_overview` for the selected span.
+#[derive(Clone)]
+pub struct ChannelStatsRow {
+    pub channel_id: i64,
+    pub name: String,
+    /// Highest sampled viewer count in the span.
+    pub peak_viewers: i64,
+    /// Span-weighted average viewers while live.
+    pub avg_viewers: f64,
+    /// Seconds of sampled live airtime (sum of sample spans).
+    pub live_secs: i64,
+    /// Latest known follower total (Kick only today).
+    pub followers: Option<i64>,
+}
+
 /// Per-platform cap on [`PlatformPollStats::recent_errors`] — old entries are
 /// dropped from the front once exceeded.
 pub const MAX_RECENT_POLL_ERRORS: usize = 50;

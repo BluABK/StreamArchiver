@@ -1304,9 +1304,10 @@ live, and archived:
   Stream/take rows show which collab a **past broadcast** was.
 - **History** — every session is stored (who, host, when, how long, source)
   and linked to its broadcast. Right-click a stream row → **🤝 Collab
-  history** for the channel's full list; the **Stats** tab has a "🤝 Collabs"
-  overview of your most frequent partners across all channels. Collab
-  begin/change/end events also land in the 📝 title/category history ledger.
+  history** for the channel's full list; the **Channel Stats** tab has a
+  "🤝 Collabs" overview of your most frequent partners across all channels.
+  Collab begin/change/end events also land in the 📝 title/category history
+  ledger.
 - **Schedule** — scheduled streams carry collaborators too: the OCR schedule
   reader's collab field and `@mentions` in segment titles show as a 🤝 marker
   on calendar chips and a "With: …" line in event hovers.
@@ -1323,6 +1324,50 @@ Partner names are resolved via Helix *Get Users* and cached persistently
 (`twitch_user_name_cache`), so steady-state polling costs one extra request
 per live channel. Session history keeps the names **as observed at the
 time** — later renames don't rewrite it.
+
+### Channel stats & viewer history 📈
+
+Live viewer counts (and, on Kick, follower totals) are **sampled into a
+persistent time series** — one sample per minute while a channel is live,
+from the regular poll when idle and from the in-recording metadata refresh
+while recording. Discrete **stream events** are archived alongside:
+
+- **Subs, resubs, gift subs and bits** are parsed live out of the Twitch
+  chat feed (IRC `USERNOTICE`s and `bits` tags), so they're captured whenever
+  a recording with **Log chat** is running. Community gift batches count
+  once (the batch announcement carries the size; its per-recipient notices
+  are skipped so nothing double-counts). Third-party donations only appear
+  if a bot posts them as bits/chat — there's no API for them.
+- **Raids** (incoming *and* your channels' outgoing raid targets) arrive via
+  EventSub `channel.raid` in conduit mode (no extra scopes; toggle under
+  *Settings → Accounts → Detection credentials*, default on) — even while
+  nothing is recording. Incoming raids are also caught from chat while
+  recording; the two sources dedup against each other.
+
+Where to look:
+
+- **Channel Stats tab** — an all-channels comparison table (peak / average
+  viewers, sampled airtime, followers, subs/bits/raids in the selected span)
+  plus, per channel, **viewer and follower graphs** with event markers
+  (diamonds along the baseline), category-change and 🤝 collab-change lines,
+  and a full event list. Span selector from 1 h to All. The 🤝 Collabs
+  partner overview lives here too. (The old Stats tab is now **App Stats**
+  and keeps the app/system-health content.)
+- **📈 popups** — right-click a channel/instance → **Viewer stats** (or
+  double-click the 👁 cell) for the same graphs in a window; right-click a
+  stream row → **📈 Stream stats** for the graph clipped to just that
+  broadcast.
+- **👁 sparkline** — the Viewers column shows a tiny last-hour trend line
+  next to the live count (widen the column if it's cut off).
+
+Viewer history is **kept forever** by default (a sample row is ~30 bytes).
+Under *Settings → Maintenance → Channel stats history* you can compress old
+samples into 10-minute buckets — peaks and total airtime are preserved
+exactly (buckets store the peak; aggregation is peak-preserving all the way
+up) — either once via **Compress now** or automatically past a configurable
+age. Twitch and YouTube don't expose follower/subscriber totals without
+owner credentials, so only Kick followers are tracked; YouTube also reports
+no viewer count while recording.
 
 ### Upcoming stream schedule
 
@@ -1477,10 +1522,11 @@ OCR and scraping sources run on the **slow (6 h) cadence** only, never the 60 s 
 
 **OCR settings** (Settings → Schedule → OCR): the CLI command (default `claude`), primary model (default `haiku`), fallback model (default `sonnet`), default timezone name and UTC offset. Per-channel overrides for timezone, offset, Twitter/X handle, and the "other image" path live in **right-click → Properties → Schedule sources**.
 
-The **Stats** tab tracks cumulative **Claude OCR** usage (invocations, cache
+The **App Stats** tab tracks cumulative **Claude OCR** usage (invocations, cache
 hits, parse failures, tokens and cost per model) alongside **YouTube Data API**
 quota usage (units and search calls against the daily cutoff), so you can see
-what these features are actually costing you.
+what these features are actually costing you. (Per-channel numbers live in the
+separate **Channel Stats** tab — App Stats is app/system health only.)
 
 **Detection / API requests** (same tab) tracks cumulative poll/detect request
 counts **per platform** (Twitch, YouTube, Kick, NRK, Nebula, Generic) across every
@@ -1498,8 +1544,8 @@ with its timestamp, platform, channel, detection method, and error detail
 (long messages are truncated in the cell; hover for the full text).
 
 Two **history graphs** plot the same request stream over time, with a
-timespan selector (**1 h / 6 h / 12 h / 24 h / 7 d / 30 d** — wider spans use
-wider buckets, from 1 min at 1 h up to 12 h at 30 d):
+timespan selector (**1 h** up to **All** — wider spans use wider buckets,
+from 1 min at 1 h up to 1 week at All):
 
 - **Error rate per platform** — failed checks as a percentage of all checks,
   one line per platform in its brand color (matching the log tags).
@@ -2212,15 +2258,16 @@ type(s) and re-exports, with the implementation spread over
 `src/<module>/*.rs` submodules (`impl` blocks continue across files):
 
 - `src/store/` — SQLite persistence: `migrations`, plus per-domain query
-  clusters (`recordings`, `monitors`, `scheduled`, `vod`, `posts`, `videos`).
+  clusters (`recordings`, `monitors`, `scheduled`, `vod`, `posts`, `videos`,
+  `collab`, `stats_history`).
 - `src/downloader/` — capture pipeline: `cache` (`.sa-cache` layout),
   `tools`, `plan`, `supervisor`, `process`, `backfill`, `vod`, `remux`,
   `naming`, `finalize`.
 - `src/ui/` — egui app: `app` (pump/persistence), one module per view
   (`streams`, `videos`, `schedule`, `settings`, `files`, `io_view`, `posts`,
-  `background`, `issues`, `debug`), window clusters (`dialogs`, `properties`,
-  `chat`), and shared helpers (`grid`, `calendar`, `format`, `player`,
-  `assets_helpers`).
+  `background`, `channel_stats`, `issues`, `debug`), window clusters
+  (`dialogs`, `properties`, `chat`), and shared helpers (`grid`, `calendar`,
+  `format`, `player`, `assets_helpers`).
 
 Unit tests live in a `#[cfg(test)] mod tests` inside the submodule whose code
 they cover (they exercise private items and compile out of release builds).

@@ -38,6 +38,14 @@ impl StreamArchiverApp {
             .flatten()
             .as_deref()
             != Some("0");
+        // Raid EventSub pushes (Channel Stats events) default on likewise.
+        let raid_eventsub = core
+            .store
+            .get_setting("raid_eventsub")
+            .ok()
+            .flatten()
+            .as_deref()
+            != Some("0");
         // Do Not Disturb defaults off in both dimensions.
         let dnd_enabled =
             setting_or_empty(&core, crate::notifications::K_DND_ENABLED) == "1";
@@ -197,6 +205,13 @@ impl StreamArchiverApp {
                 let v = setting_or_empty(&core, K_MEDIA_PLAYER);
                 if v.is_empty() { r"C:\Progs\mpv\mpv.exe".into() } else { v }
             },
+            viewer_downsample_days: setting_or_empty(
+                &core,
+                crate::store::K_VH_DOWNSAMPLE_DAYS,
+            )
+            .trim()
+            .parse()
+            .unwrap_or(0),
             auto_recover_muted: setting_or_empty(&core, crate::recovery::K_AUTO_RECOVER_MUTED) == "1",
             auto_recover_deleted: setting_or_empty(&core, crate::recovery::K_AUTO_RECOVER_DELETED) == "1",
             recovery_cdn_hosts: setting_or_empty(&core, crate::recovery::K_RECOVERY_CDN_HOSTS),
@@ -383,6 +398,7 @@ impl StreamArchiverApp {
             keep_downloads_on_quit,
             notifications_enabled,
             collab_eventsub,
+            raid_eventsub,
             dnd_enabled,
             dnd_schedule_enabled,
             dnd_start,
@@ -580,6 +596,12 @@ impl StreamArchiverApp {
             stats_collabs: Vec::new(),
             stats_poll_span: super::PollSpan::Day,
             stats_history: None,
+            chstats_channel: None,
+            chstats_span: super::PollSpan::Month,
+            chstats_data: None,
+            viewer_stats_popup: None,
+            spark_data: std::collections::HashMap::new(),
+            spark_loaded_at: 0,
             io_hist: Vec::new(),
             io_snap: None,
             io_refreshed: None,
