@@ -168,6 +168,7 @@ impl Store {
         target: &str,
         amount: i64,
         tier: &str,
+        detail: &str,
     ) -> Result<bool> {
         let conn = self.db();
         if kind == "raid_in" || kind == "raid_out" {
@@ -185,9 +186,9 @@ impl Store {
             }
         }
         conn.execute(
-            "INSERT INTO stream_event(monitor_id, at, stream_id, kind, actor, target, amount, tier)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![monitor_id, at, stream_id, kind, actor, target, amount, tier],
+            "INSERT INTO stream_event(monitor_id, at, stream_id, kind, actor, target, amount, tier, detail)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![monitor_id, at, stream_id, kind, actor, target, amount, tier, detail],
         )?;
         Ok(true)
     }
@@ -202,7 +203,8 @@ impl Store {
     ) -> Result<Vec<StreamEventRow>> {
         let conn = self.db();
         let mut stmt = conn.prepare(
-            "SELECT e.monitor_id, e.at, e.stream_id, e.kind, e.actor, e.target, e.amount, e.tier
+            "SELECT e.monitor_id, e.at, e.stream_id, e.kind, e.actor, e.target, e.amount, e.tier,
+                    e.detail
              FROM stream_event e
              JOIN monitor m ON m.id = e.monitor_id
              WHERE m.channel_id = ?1 AND e.at >= ?2 AND e.at < ?3
@@ -219,6 +221,7 @@ impl Store {
                     target: r.get(5)?,
                     amount: r.get(6)?,
                     tier: r.get(7)?,
+                    detail: r.get(8)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -226,10 +229,12 @@ impl Store {
     }
 
     /// Per-channel event totals since `since_unix` for the overview table:
-    /// `channel_id -> [subs+resubs, gifted subs, bits, raids in, raids out]`.
-    /// Gifted subs sum `amount` (a mystery-gift row carries the batch size);
-    /// bits sum `amount`; raids count rows.
-    pub fn stream_event_totals(&self, since_unix: i64) -> Result<HashMap<i64, [i64; 5]>> {
+    /// `channel_id -> [subs+resubs, gifted subs, bits, raids in, raids out,
+    /// mod actions]`. Gifted subs sum `amount` (a mystery-gift row carries
+    /// the batch size); bits sum `amount`; raids count rows; mod actions
+    /// count deletions + timeouts + bans (chat-mode/role rows aren't
+    /// totaled — they're context, not volume).
+    pub fn stream_event_totals(&self, since_unix: i64) -> Result<HashMap<i64, [i64; 6]>> {
         let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT m.channel_id, e.kind,
@@ -239,7 +244,7 @@ impl Store {
              WHERE e.at >= ?1
              GROUP BY m.channel_id, e.kind",
         )?;
-        let mut out: HashMap<i64, [i64; 5]> = HashMap::new();
+        let mut out: HashMap<i64, [i64; 6]> = HashMap::new();
         let rows = stmt.query_map(params![since_unix], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
@@ -257,6 +262,7 @@ impl Store {
                 "bits" => e[2] += amount,
                 "raid_in" => e[3] += count,
                 "raid_out" => e[4] += count,
+                "msg_deleted" | "timeout" | "ban" => e[5] += count,
                 _ => {}
             }
         }
@@ -445,23 +451,35 @@ mod tests {
         let (cid, mid) = channel_with_monitor(&store);
         let t = 2_000_000;
 
-        assert!(store.record_stream_event(mid, t, "s1", "sub", "alice", "", 1, "1000").unwrap());
-        assert!(store.record_stream_event(mid, t + 1, "s1", "subgift", "bob", "", 5, "1000").unwrap());
-        assert!(store.record_stream_event(mid, t + 2, "s1", "bits", "carol", "", 500, "").unwrap());
+        assert!(store.record_stream_event(mid, t, "s1", "sub", "alice", "", 1, "1000", "").unwrap());
+        assert!(store.record_stream_event(mid, t + 1, "s1", "subgift", "bob", "", 5, "1000", "").unwrap());
+        assert!(store.record_stream_event(mid, t + 2, "s1", "bits", "carol", "", 500, "", "").unwrap());
         // Raid seen by chat, then again by EventSub 10s later -> one row.
-        assert!(store.record_stream_event(mid, t + 10, "s1", "raid_in", "dave", "", 250, "").unwrap());
-        assert!(!store.record_stream_event(mid, t + 20, "", "raid_in", "Dave", "", 250, "").unwrap());
+        assert!(store.record_stream_event(mid, t + 10, "s1", "raid_in", "dave", "", 250, "", "").unwrap());
+        assert!(!store.record_stream_event(mid, t + 20, "", "raid_in", "Dave", "", 250, "", "").unwrap());
         // Same raider well outside the window -> a genuinely new raid.
-        assert!(store.record_stream_event(mid, t + 1000, "", "raid_in", "dave", "", 99, "").unwrap());
+        assert!(store.record_stream_event(mid, t + 1000, "", "raid_in", "dave", "", 99, "", "").unwrap());
         // Bits are never deduped (two cheers in a minute are two events).
-        assert!(store.record_stream_event(mid, t + 30, "s1", "bits", "carol", "", 500, "").unwrap());
+        assert!(store.record_stream_event(mid, t + 30, "s1", "bits", "carol", "", 500, "", "").unwrap());
+        // Moderation kinds (v60): deletions/timeouts/bans fold into one
+        // "mod actions" total; chat-mode changes are context, not volume.
+        assert!(store
+            .record_stream_event(mid, t + 40, "s1", "msg_deleted", "eve", "", 0, "", "spam link")
+            .unwrap());
+        assert!(store.record_stream_event(mid, t + 41, "s1", "timeout", "eve", "", 600, "", "").unwrap());
+        assert!(store.record_stream_event(mid, t + 42, "s1", "ban", "mallory", "", 0, "", "").unwrap());
+        assert!(store
+            .record_stream_event(mid, t + 43, "s1", "chat_mode", "", "", 0, "", "Slow mode on (30s)")
+            .unwrap());
 
         let events = store.stream_events_range(cid, 0, i64::MAX).unwrap();
-        assert_eq!(events.len(), 6);
+        assert_eq!(events.len(), 10);
         assert_eq!(events[0].at, t + 1000, "newest first");
+        let del = events.iter().find(|e| e.kind == "msg_deleted").unwrap();
+        assert_eq!(del.detail, "spam link");
 
         let totals = store.stream_event_totals(0).unwrap();
         let e = totals.get(&cid).unwrap();
-        assert_eq!(e, &[1, 5, 1000, 2, 0], "subs, gifted, bits, raids in/out");
+        assert_eq!(e, &[1, 5, 1000, 2, 0, 3], "subs, gifted, bits, raids in/out, mod actions");
     }
 }

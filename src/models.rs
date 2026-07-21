@@ -2195,16 +2195,22 @@ pub struct StreamEventRow {
     /// Broadcast id when known (`''` otherwise — filter by time instead).
     #[allow(dead_code)]
     pub stream_id: String,
-    /// `sub` | `resub` | `subgift` | `bits` | `raid_in` | `raid_out`.
+    /// `sub` | `resub` | `subgift` | `bits` | `raid_in` | `raid_out`, plus
+    /// the chat-moderation kinds (v60): `msg_deleted` | `timeout` | `ban` |
+    /// `chat_clear` | `chat_mode` | `role_change`.
     pub kind: String,
     /// Who did it: subscriber, gifter, cheerer, or incoming raider.
     pub actor: String,
     /// Gift recipient (`''` for a community batch) or outgoing-raid target.
     pub target: String,
-    /// Bits cheered, gift-batch size, raid party size, or resub months.
+    /// Bits cheered, gift-batch size, raid party size, resub months, or
+    /// timeout seconds.
     pub amount: i64,
     /// Twitch sub plan (`1000`/`2000`/`3000`/`Prime`) where applicable.
     pub tier: String,
+    /// Free-text payload (schema v60): deleted-message excerpt, chat-mode
+    /// change description, or role-change description.
+    pub detail: String,
 }
 
 /// One channel's aggregate line in the Channel Stats overview table, as

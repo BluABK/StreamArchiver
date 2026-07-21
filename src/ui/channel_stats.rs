@@ -13,8 +13,8 @@ pub(super) struct ChStatsData {
     /// All-channels mode: per-channel viewer aggregates.
     overview: Vec<ChannelStatsRow>,
     /// All-channels mode: per-channel event totals
-    /// (`[subs, gifted, bits, raids in, raids out]`).
-    event_totals: std::collections::HashMap<i64, [i64; 5]>,
+    /// (`[subs, gifted, bits, raids in, raids out, mod actions]`).
+    event_totals: std::collections::HashMap<i64, [i64; 6]>,
     /// Single-channel mode: viewer/follower buckets.
     viewer: Vec<ViewerBucket>,
     /// Single-channel mode: discrete events, newest first.
@@ -51,6 +51,12 @@ fn event_color(kind: &str) -> egui::Color32 {
         "bits" => egui::Color32::from_rgb(0xff, 0x98, 0x00),
         "raid_in" => egui::Color32::from_rgb(0xab, 0x47, 0xbc),
         "raid_out" => egui::Color32::from_rgb(0x7e, 0x57, 0xc2),
+        "msg_deleted" => egui::Color32::from_rgb(0xef, 0x53, 0x50),
+        "timeout" => egui::Color32::from_rgb(0xff, 0xa7, 0x26),
+        "ban" => egui::Color32::from_rgb(0xc6, 0x28, 0x28),
+        "chat_clear" => egui::Color32::from_rgb(0x8d, 0x6e, 0x63),
+        "chat_mode" => egui::Color32::from_rgb(0x78, 0x90, 0x9c),
+        "role_change" => egui::Color32::from_rgb(0xff, 0xd5, 0x4f),
         _ => egui::Color32::GRAY,
     }
 }
@@ -64,6 +70,12 @@ fn event_label(kind: &str) -> &'static str {
         "bits" => "Bits",
         "raid_in" => "Raid in",
         "raid_out" => "Raid out",
+        "msg_deleted" => "Deleted msg",
+        "timeout" => "Timeout",
+        "ban" => "Ban",
+        "chat_clear" => "Chat clear",
+        "chat_mode" => "Chat mode",
+        "role_change" => "Role change",
         _ => "Event",
     }
 }
@@ -85,7 +97,25 @@ fn event_line(e: &StreamEventRow) -> String {
         "bits" => format!("{} cheered {} bits", e.actor, e.amount),
         "raid_in" => format!("{} raided in with {} viewers", e.actor, e.amount),
         "raid_out" => format!("raided out to {} with {} viewers", e.target, e.amount),
+        "msg_deleted" if e.detail.is_empty() => format!("{}'s message was deleted", e.actor),
+        "msg_deleted" => format!("{}'s message was deleted: \u{201c}{}\u{201d}", e.actor, e.detail),
+        "timeout" => format!("{} was timed out ({})", e.actor, fmt_timeout(e.amount)),
+        "ban" => format!("{} was banned", e.actor),
+        "chat_clear" => "chat was cleared".to_string(),
+        "chat_mode" => e.detail.clone(),
+        "role_change" => format!("{} {}", e.actor, e.detail),
         other => format!("{other} by {}", e.actor),
+    }
+}
+
+/// `600` → `10m`, `86400` → `24h` — timeout durations for event lines.
+fn fmt_timeout(secs: i64) -> String {
+    if secs >= 3600 && secs % 3600 == 0 {
+        format!("{}h", secs / 3600)
+    } else if secs >= 60 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
     }
 }
 
@@ -254,7 +284,7 @@ impl StreamArchiverApp {
         } else {
             let mut clicked: Option<i64> = None;
             egui::Grid::new("chstats_overview_grid")
-                .num_columns(7)
+                .num_columns(8)
                 .striped(true)
                 .spacing([24.0, 4.0])
                 .show(ui, |ui| {
@@ -275,6 +305,11 @@ impl StreamArchiverApp {
                     ui.strong("Bits / Raids").on_hover_text(
                         "Bits cheered (chat) and raids in/out (chat + EventSub)",
                     );
+                    ui.strong("Mod acts").on_hover_text(
+                        "Message deletions + timeouts + bans seen in chat while \
+                         recording (chat-mode and role changes aren't counted here — \
+                         they show as events on the channel's graphs)",
+                    );
                     ui.end_row();
                     for row in &data.overview {
                         if ui.link(&row.name).on_hover_text("Open this channel's graphs").clicked()
@@ -288,7 +323,7 @@ impl StreamArchiverApp {
                             row.followers.map(grid::fmt_viewers).unwrap_or_default(),
                         );
                         let ev = data.event_totals.get(&row.channel_id);
-                        let [subs, gifted, bits, rin, rout] =
+                        let [subs, gifted, bits, rin, rout, mod_acts] =
                             ev.copied().unwrap_or_default();
                         ui.label(if gifted > 0 {
                             format!("{subs} (+{gifted} gifted)")
@@ -296,6 +331,7 @@ impl StreamArchiverApp {
                             subs.to_string()
                         });
                         ui.label(format!("{bits} / {rin} in, {rout} out"));
+                        ui.label(mod_acts.to_string());
                         ui.end_row();
                     }
                 });

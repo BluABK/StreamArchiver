@@ -1343,6 +1343,10 @@ while recording. Discrete **stream events** are archived alongside:
   *Settings → Accounts → Detection credentials*, default on) — even while
   nothing is recording. Incoming raids are also caught from chat while
   recording; the two sources dedup against each other.
+- **Moderation events** — message deletions (with the deleted text), timeouts,
+  bans, chat clears, chat-mode changes and badge-inferred role changes, also
+  from the recorded chat (see *Chat logs* below for the replay integration).
+  Deletions + timeouts + bans roll up as **Mod acts** in the overview table.
 
 Where to look:
 
@@ -1580,6 +1584,19 @@ download captures `live_chat` (e.g. a YouTube VOD's chat replay) the same way.
 
 Chat sidecars sit next to the video and **follow it** if the file is renamed
 (see *Filename media info*), so they stay matched to their recording.
+
+**Moderation is archived too** (Twitch): the logger records single-message
+**deletions**, **timeouts/bans** and **full chat clears**, chat-mode changes
+(slow / subs-only / emote-only / followers-only / unique-chat), and
+badge-inferred **role changes** (someone starts or stops chatting with a
+mod/VIP badge — the only signal available anonymously, so it's best-effort
+and only visible when the person actually chats). In the chat replay,
+deleted/purged messages render **struck-through with the original text
+preserved** — the live chat hides what mods remove; the archive keeps
+receipts — and timeouts, bans, clears, mode changes and role changes appear
+as muted ℹ notice lines. The same events land in the **Channel Stats** event
+history (with a "Mod acts" column in the overview). Old chat logs load
+unchanged; they just predate the markers.
 
 ![Chat log viewer replaying an archived Twitch chat](doc/screenshots/chat-log-viewer.png)
 

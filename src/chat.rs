@@ -123,8 +123,9 @@ pub struct ChatEventCtx {
     pub stream_id: String,
 }
 
-/// One stream event parsed from a raw IRC line ([`parse_chat_event`]).
-/// Field semantics match the `stream_event` table (see `StreamEventRow`).
+/// One stream event parsed from a raw IRC line ([`parse_chat_event`] /
+/// [`EventTracker::track`]). Field semantics match the `stream_event` table
+/// (see `StreamEventRow`).
 #[derive(Debug, PartialEq)]
 struct ChatEvent {
     kind: &'static str,
@@ -132,6 +133,8 @@ struct ChatEvent {
     target: String,
     amount: i64,
     tier: String,
+    /// Free-text payload: deleted-message excerpt, chat-mode change, role change.
+    detail: String,
     /// Event time (unix secs, from `tmi-sent-ts` when present).
     ts: i64,
 }
@@ -159,6 +162,11 @@ struct ChatLine<'a> {
     /// empty; old logs without it simply render emote words as plain text.
     #[serde(skip_serializing_if = "str::is_empty")]
     emotes: &'a str,
+    /// Twitch message id (IRCv3 `id` tag) — what a later `CLEARMSG` deletion
+    /// marker references. Omitted when absent; old logs without it simply
+    /// can't match single-message deletions.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    id: &'a str,
 }
 
 /// Capture `url`'s Twitch chat to `path` until `done` (recording ended) or
@@ -236,6 +244,9 @@ async fn session(
     // Messages accumulate in the sink and hit disk a couple of times per
     // second at most (see ChatSink); flushed on every exit path below.
     let mut sink = ChatSink::new(path.to_path_buf());
+    // Moderation tracker (deletions/purges/room modes/role badges) — per
+    // connection, so its baselines reset with each reconnect.
+    let mut tracker = EventTracker::default();
 
     let result: anyhow::Result<()> = async {
         loop {
@@ -272,25 +283,43 @@ async fn session(
                         // sidecar's lossy PRIVMSG parse below discards — hook
                         // the raw line first. Rare events, so the synchronous
                         // DB write is fine here.
-                        if let Some(ev_ctx) = events
-                            && let Some(ev) = parse_chat_event(line)
-                        {
-                            match ev_ctx.store.record_stream_event(
-                                ev_ctx.monitor_id,
-                                ev.ts,
-                                &ev_ctx.stream_id,
-                                ev.kind,
-                                &ev.actor,
-                                &ev.target,
-                                ev.amount,
-                                &ev.tier,
-                            ) {
-                                Ok(true) => debug!(
-                                    "chat ({login}): event {} by {} (x{})",
-                                    ev.kind, ev.actor, ev.amount
-                                ),
-                                Ok(false) => {} // deduped (EventSub saw the raid first)
-                                Err(e) => debug!("chat ({login}): event record failed: {e:#}"),
+                        let mut db_events = Vec::new();
+                        if events.is_some() {
+                            db_events.extend(parse_chat_event(line));
+                        }
+                        // Moderation events: DB rows AND sidecar marker lines
+                        // (the chat replay strikes deleted/purged messages and
+                        // shows mode/role notices). Markers are written even
+                        // without a DB context — the archive stands alone.
+                        let (mod_events, mod_markers) = tracker.track(line);
+                        if events.is_some() {
+                            db_events.extend(mod_events);
+                        }
+                        for m in mod_markers {
+                            sink.push(&m);
+                        }
+                        if let Some(ev_ctx) = events {
+                            for ev in db_events {
+                                match ev_ctx.store.record_stream_event(
+                                    ev_ctx.monitor_id,
+                                    ev.ts,
+                                    &ev_ctx.stream_id,
+                                    ev.kind,
+                                    &ev.actor,
+                                    &ev.target,
+                                    ev.amount,
+                                    &ev.tier,
+                                    &ev.detail,
+                                ) {
+                                    Ok(true) => debug!(
+                                        "chat ({login}): event {} by {} (x{})",
+                                        ev.kind, ev.actor, ev.amount
+                                    ),
+                                    Ok(false) => {} // deduped (EventSub saw the raid first)
+                                    Err(e) => {
+                                        debug!("chat ({login}): event record failed: {e:#}")
+                                    }
+                                }
                             }
                         }
                         if let Some(json) = parse_privmsg(line) {
@@ -340,7 +369,8 @@ fn parse_privmsg(line: &str) -> Option<String> {
     let text = after.find(" :").map(|i| &after[i + 2..]).unwrap_or("");
     let login = prefix.split('!').next().unwrap_or(prefix);
 
-    let (mut display, mut color, mut badges, mut emotes, mut ts_ms) = ("", "", "", "", 0i64);
+    let (mut display, mut color, mut badges, mut emotes, mut id, mut ts_ms) =
+        ("", "", "", "", "", 0i64);
     for kv in tags.split(';') {
         let mut it = kv.splitn(2, '=');
         let (k, v) = (it.next().unwrap_or(""), it.next().unwrap_or(""));
@@ -349,6 +379,7 @@ fn parse_privmsg(line: &str) -> Option<String> {
             "color" => color = v,
             "badges" => badges = v,
             "emotes" => emotes = v,
+            "id" => id = v,
             "tmi-sent-ts" => ts_ms = v.parse().unwrap_or(0),
             _ => {}
         }
@@ -365,6 +396,7 @@ fn parse_privmsg(line: &str) -> Option<String> {
         color,
         badges,
         emotes,
+        id,
     })
     .ok()
 }
@@ -454,48 +486,249 @@ fn parse_chat_event(line: &str) -> Option<ChatEvent> {
     };
     let tier = plan.to_string();
 
+    let ev = |kind: &'static str, actor: String, target: String, amount: i64, tier: String| {
+        ChatEvent { kind, actor, target, amount, tier, detail: String::new(), ts }
+    };
     if after.starts_with("USERNOTICE ") {
         return match msg_id {
-            "sub" => Some(ChatEvent { kind: "sub", actor, target: String::new(), amount: 1, tier, ts }),
-            "resub" => Some(ChatEvent {
-                kind: "resub",
-                actor,
-                target: String::new(),
-                amount: months.max(1),
-                tier,
-                ts,
-            }),
-            "subgift" if !community_batch => Some(ChatEvent {
-                kind: "subgift",
-                actor,
-                target: recipient,
-                amount: 1,
-                tier,
-                ts,
-            }),
-            "submysterygift" => Some(ChatEvent {
-                kind: "subgift",
-                actor,
-                target: String::new(), // community batch, no single recipient
-                amount: gift_count.max(1),
-                tier,
-                ts,
-            }),
-            "raid" => Some(ChatEvent {
-                kind: "raid_in",
-                actor: if raider.is_empty() { actor } else { raider },
-                target: String::new(),
-                amount: viewer_count,
-                tier: String::new(),
-                ts,
-            }),
+            "sub" => Some(ev("sub", actor, String::new(), 1, tier)),
+            "resub" => Some(ev("resub", actor, String::new(), months.max(1), tier)),
+            "subgift" if !community_batch => Some(ev("subgift", actor, recipient, 1, tier)),
+            // Community batch: the announcement carries the size, no single recipient.
+            "submysterygift" => Some(ev("subgift", actor, String::new(), gift_count.max(1), tier)),
+            "raid" => Some(ev(
+                "raid_in",
+                if raider.is_empty() { actor } else { raider },
+                String::new(),
+                viewer_count,
+                String::new(),
+            )),
             _ => None,
         };
     }
     if bits > 0 && after.starts_with("PRIVMSG ") {
-        return Some(ChatEvent { kind: "bits", actor, target: String::new(), amount: bits, tier: String::new(), ts });
+        return Some(ev("bits", actor, String::new(), bits, String::new()));
     }
     None
+}
+
+/// Char-boundary-safe excerpt of a deleted message for the event ledger.
+fn excerpt(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(max).collect();
+    format!("{cut}…")
+}
+
+/// Stateful per-connection moderation tracker. Turns raw IRC lines into
+/// - DB stream events (`msg_deleted` / `timeout` / `ban` / `chat_clear` /
+///   `chat_mode` / `role_change`), and
+/// - sidecar **marker lines** for the chat replay (deletion/purge markers the
+///   replay applies as strikethrough, plus visible notice lines).
+///
+/// Stateful parts: the first ROOMSTATE after JOIN is the room's baseline
+/// (deltas after it are real changes worth logging), and role changes are
+/// inferred from a chatter's badge set changing between their own messages
+/// (Twitch removed IRC MODE, and the VIP/mod list APIs need broadcaster
+/// tokens — badge transitions are the only anonymous signal). Both baselines
+/// reset per connection, so a reconnect can never fabricate a change.
+#[derive(Default)]
+struct EventTracker {
+    /// Room baseline: (emote_only, followers_min ( -1 = off), r9k, slow_secs,
+    /// subs_only). `None` until the JOIN's first ROOMSTATE.
+    room: Option<(bool, i64, bool, i64, bool)>,
+    /// login -> (has mod badge, has VIP badge), first seen = baseline.
+    roles: std::collections::HashMap<String, (bool, bool)>,
+}
+
+impl EventTracker {
+    /// Feed one raw IRC line; returns `(db_events, sidecar_marker_lines)`.
+    fn track(&mut self, line: &str) -> (Vec<ChatEvent>, Vec<String>) {
+        let mut events = Vec::new();
+        let mut markers = Vec::new();
+        let Some(s) = line.strip_prefix('@') else {
+            return (events, markers);
+        };
+        let Some(sp) = s.find(' ') else {
+            return (events, markers);
+        };
+        let (tags, rest) = (&s[..sp], &s[sp + 1..]);
+        let Some(rest) = rest.strip_prefix(':') else {
+            return (events, markers);
+        };
+        let Some(sp) = rest.find(' ') else {
+            return (events, markers);
+        };
+        let after = &rest[sp + 1..];
+        let tag = |key: &str| -> Option<&str> {
+            tags.split(';').find_map(|kv| {
+                let mut it = kv.splitn(2, '=');
+                (it.next() == Some(key)).then(|| it.next().unwrap_or(""))
+            })
+        };
+        let ts = tag("tmi-sent-ts")
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or_else(|| crate::models::now_unix() * 1000);
+        let trailing = after.find(" :").map(|i| &after[i + 2..]).unwrap_or("");
+        let ev = |kind: &'static str, actor: String, amount: i64, detail: String| ChatEvent {
+            kind,
+            actor,
+            target: String::new(),
+            amount,
+            tier: String::new(),
+            detail,
+            ts: ts / 1000,
+        };
+
+        if after.starts_with("CLEARMSG ") {
+            // A single message deleted by a moderator; the trailing param is
+            // the original text (already archived — the marker just flags it).
+            let login = tag("login").unwrap_or("").to_string();
+            let target_id = tag("target-msg-id").unwrap_or("");
+            events.push(ev("msg_deleted", login.clone(), 0, excerpt(trailing, 120)));
+            if !target_id.is_empty() {
+                markers.push(format!(
+                    r#"{{"ts":{ts},"marker":"del","id":{}}}"#,
+                    serde_json::Value::from(target_id)
+                ));
+            }
+        } else if after.starts_with("CLEARCHAT ") {
+            let target = trailing.trim();
+            if target.is_empty() {
+                // Full chat clear.
+                events.push(ev("chat_clear", String::new(), 0, String::new()));
+                markers.push(format!(r#"{{"ts":{ts},"marker":"clear"}}"#));
+            } else {
+                let secs = tag("ban-duration").and_then(|v| v.parse::<i64>().ok());
+                match secs {
+                    Some(d) => {
+                        events.push(ev("timeout", target.to_string(), d, String::new()));
+                        markers.push(format!(
+                            r#"{{"ts":{ts},"marker":"purge","login":{},"secs":{d}}}"#,
+                            serde_json::Value::from(target)
+                        ));
+                    }
+                    None => {
+                        events.push(ev("ban", target.to_string(), 0, String::new()));
+                        markers.push(format!(
+                            r#"{{"ts":{ts},"marker":"purge","login":{}}}"#,
+                            serde_json::Value::from(target)
+                        ));
+                    }
+                }
+            }
+        } else if after.starts_with("ROOMSTATE ") {
+            let parse_flag = |k: &str| tag(k).map(|v| v == "1");
+            let parse_num = |k: &str| tag(k).and_then(|v| v.parse::<i64>().ok());
+            match &mut self.room {
+                // First ROOMSTATE after JOIN carries the full current state —
+                // that's the baseline, not a change.
+                None => {
+                    self.room = Some((
+                        parse_flag("emote-only").unwrap_or(false),
+                        parse_num("followers-only").unwrap_or(-1),
+                        parse_flag("r9k").unwrap_or(false),
+                        parse_num("slow").unwrap_or(0),
+                        parse_flag("subs-only").unwrap_or(false),
+                    ));
+                }
+                // Updates carry only the changed tag(s).
+                Some(room) => {
+                    let mut changes: Vec<String> = Vec::new();
+                    if let Some(v) = parse_flag("emote-only")
+                        && v != room.0
+                    {
+                        room.0 = v;
+                        changes.push(format!("Emote-only {}", if v { "on" } else { "off" }));
+                    }
+                    if let Some(v) = parse_num("followers-only")
+                        && v != room.1
+                    {
+                        room.1 = v;
+                        changes.push(if v < 0 {
+                            "Followers-only off".into()
+                        } else if v == 0 {
+                            "Followers-only on".into()
+                        } else {
+                            format!("Followers-only on ({v}m)")
+                        });
+                    }
+                    if let Some(v) = parse_flag("r9k")
+                        && v != room.2
+                    {
+                        room.2 = v;
+                        changes.push(format!("Unique-chat {}", if v { "on" } else { "off" }));
+                    }
+                    if let Some(v) = parse_num("slow")
+                        && v != room.3
+                    {
+                        room.3 = v;
+                        changes.push(if v > 0 {
+                            format!("Slow mode on ({v}s)")
+                        } else {
+                            "Slow mode off".into()
+                        });
+                    }
+                    if let Some(v) = parse_flag("subs-only")
+                        && v != room.4
+                    {
+                        room.4 = v;
+                        changes.push(format!("Subs-only {}", if v { "on" } else { "off" }));
+                    }
+                    for c in changes {
+                        events.push(ev("chat_mode", String::new(), 0, c.clone()));
+                        markers.push(format!(
+                            r#"{{"ts":{ts},"marker":"notice","text":{}}}"#,
+                            serde_json::Value::from(c)
+                        ));
+                    }
+                }
+            }
+        } else if after.starts_with("PRIVMSG ") {
+            // Role inference from badge transitions between a chatter's own
+            // messages. Baseline = their first message this connection.
+            let prefix = &rest[..sp];
+            let login = prefix.split('!').next().unwrap_or("").to_lowercase();
+            if login.is_empty() {
+                return (events, markers);
+            }
+            let badges = tag("badges").unwrap_or("");
+            if badges.contains("broadcaster/") {
+                return (events, markers);
+            }
+            let now_roles = (badges.contains("moderator/"), badges.contains("vip/"));
+            // `None` = first sighting -> baseline only, never an event.
+            if let Some(prev) = self.roles.insert(login.clone(), now_roles)
+                && prev != now_roles
+            {
+                let name = tag("display-name")
+                    .map(untag)
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or(login);
+                let mut deltas: Vec<&str> = Vec::new();
+                match (prev.0, now_roles.0) {
+                    (false, true) => deltas.push("gained the moderator badge"),
+                    (true, false) => deltas.push("lost the moderator badge"),
+                    _ => {}
+                }
+                match (prev.1, now_roles.1) {
+                    (false, true) => deltas.push("gained the VIP badge"),
+                    (true, false) => deltas.push("lost the VIP badge"),
+                    _ => {}
+                }
+                for d in deltas {
+                    events.push(ev("role_change", name.clone(), 0, d.to_string()));
+                    markers.push(format!(
+                        r#"{{"ts":{ts},"marker":"notice","text":{}}}"#,
+                        serde_json::Value::from(format!("{name} {d}"))
+                    ));
+                }
+            }
+        }
+        (events, markers)
+    }
 }
 
 #[cfg(test)]
@@ -615,5 +848,91 @@ mod tests {
         let announce = "@msg-id=announcement;display-name=Mod \
                         :tmi.twitch.tv USERNOTICE #streamer :big news";
         assert!(parse_chat_event(announce).is_none());
+    }
+
+    #[test]
+    fn tracks_deletions_timeouts_and_bans() {
+        let mut t = EventTracker::default();
+
+        let del = "@login=spammer;target-msg-id=abc-123;tmi-sent-ts=1700000010000 \
+                   :tmi.twitch.tv CLEARMSG #streamer :buy followers at example.com";
+        let (evs, marks) = t.track(del);
+        assert_eq!(evs.len(), 1);
+        assert_eq!((evs[0].kind, evs[0].actor.as_str()), ("msg_deleted", "spammer"));
+        assert_eq!(evs[0].detail, "buy followers at example.com");
+        assert_eq!(marks.len(), 1);
+        let m: serde_json::Value = serde_json::from_str(&marks[0]).unwrap();
+        assert_eq!((m["marker"].as_str(), m["id"].as_str()), (Some("del"), Some("abc-123")));
+
+        let timeout = "@ban-duration=600;tmi-sent-ts=1700000011000 \
+                       :tmi.twitch.tv CLEARCHAT #streamer :spammer";
+        let (evs, marks) = t.track(timeout);
+        assert_eq!((evs[0].kind, evs[0].amount), ("timeout", 600));
+        let m: serde_json::Value = serde_json::from_str(&marks[0]).unwrap();
+        assert_eq!(m["secs"].as_i64(), Some(600));
+
+        let ban = "@tmi-sent-ts=1700000012000 :tmi.twitch.tv CLEARCHAT #streamer :spammer";
+        let (evs, marks) = t.track(ban);
+        assert_eq!(evs[0].kind, "ban");
+        let m: serde_json::Value = serde_json::from_str(&marks[0]).unwrap();
+        assert!(m["secs"].is_null(), "no duration = permanent ban");
+
+        let clear = "@tmi-sent-ts=1700000013000 :tmi.twitch.tv CLEARCHAT #streamer";
+        let (evs, marks) = t.track(clear);
+        assert_eq!(evs[0].kind, "chat_clear");
+        let m: serde_json::Value = serde_json::from_str(&marks[0]).unwrap();
+        assert_eq!(m["marker"].as_str(), Some("clear"));
+    }
+
+    #[test]
+    fn roomstate_baseline_then_deltas() {
+        let mut t = EventTracker::default();
+        // The JOIN's full ROOMSTATE is a baseline, not a set of changes.
+        let baseline = "@emote-only=0;followers-only=-1;r9k=0;room-id=1;slow=0;subs-only=0 \
+                        :tmi.twitch.tv ROOMSTATE #streamer";
+        let (evs, marks) = t.track(baseline);
+        assert!(evs.is_empty() && marks.is_empty());
+        // A delta update carries only the changed tag.
+        let slow_on = "@room-id=1;slow=30 :tmi.twitch.tv ROOMSTATE #streamer";
+        let (evs, marks) = t.track(slow_on);
+        assert_eq!(evs.len(), 1);
+        assert_eq!((evs[0].kind, evs[0].detail.as_str()), ("chat_mode", "Slow mode on (30s)"));
+        let m: serde_json::Value = serde_json::from_str(&marks[0]).unwrap();
+        assert_eq!(m["text"].as_str(), Some("Slow mode on (30s)"));
+        // Re-sending the same value is not a change.
+        let (evs, _) = t.track(slow_on);
+        assert!(evs.is_empty());
+        let slow_off = "@room-id=1;slow=0 :tmi.twitch.tv ROOMSTATE #streamer";
+        let (evs, _) = t.track(slow_off);
+        assert_eq!(evs[0].detail, "Slow mode off");
+    }
+
+    #[test]
+    fn role_changes_inferred_from_badges() {
+        let mut t = EventTracker::default();
+        let msg = |badges: &str| {
+            format!(
+                "@badges={badges};display-name=Helper;tmi-sent-ts=1700000014000 \
+                 :helper!helper@helper.tmi.twitch.tv PRIVMSG #streamer :hi"
+            )
+        };
+        // First sighting = baseline, even with a badge already present.
+        let (evs, _) = t.track(&msg("vip/1,subscriber/3"));
+        assert!(evs.is_empty());
+        // VIP -> mod: one lost + one gained event.
+        let (evs, marks) = t.track(&msg("moderator/1,subscriber/3"));
+        let details: Vec<&str> = evs.iter().map(|e| e.detail.as_str()).collect();
+        assert!(details.contains(&"gained the moderator badge"));
+        assert!(details.contains(&"lost the VIP badge"));
+        assert_eq!(evs[0].kind, "role_change");
+        assert_eq!(evs[0].actor, "Helper");
+        assert_eq!(marks.len(), evs.len());
+        // Unchanged badges stay quiet; the broadcaster is never tracked.
+        let (evs, _) = t.track(&msg("moderator/1,subscriber/3"));
+        assert!(evs.is_empty());
+        let bc = "@badges=broadcaster/1;display-name=Streamer \
+                  :streamer!streamer@streamer.tmi.twitch.tv PRIVMSG #streamer :yo";
+        let (evs, _) = t.track(bc);
+        assert!(evs.is_empty());
     }
 }

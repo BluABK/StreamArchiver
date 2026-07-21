@@ -1201,7 +1201,16 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 59)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 59);
+        if version < 60 {
+            // Free-text payload for stream events: the deleted message's text
+            // excerpt (`msg_deleted`), the chat-mode change description
+            // (`chat_mode`, e.g. "Slow mode on (30s)"), or the role change
+            // (`role_change`, e.g. "gained the moderator badge"). Added for
+            // the chat-moderation event kinds; the v59 kinds leave it ''.
+            conn.execute_batch("ALTER TABLE stream_event ADD COLUMN detail TEXT NOT NULL DEFAULT '';")?;
+            conn.pragma_update(None, "user_version", 60)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 60);
         Ok(())
     }
 }

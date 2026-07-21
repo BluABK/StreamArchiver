@@ -51,6 +51,20 @@ pub(super) struct ChatMessage {
     /// Explicit hex colour from Twitch USERCOLOR; `None` when unset or YouTube.
     pub(super) color_override: Option<egui::Color32>,
     pub(super) platform: ChatPlatform,
+    /// Twitch: sender's lowercase login (deletion/purge markers match on it).
+    /// Empty for YouTube and pre-feature logs.
+    pub(super) login: String,
+    /// Twitch IRCv3 message id — what a `del` marker references. Empty for
+    /// YouTube / old logs (single-message deletions then can't match).
+    pub(super) msg_id: String,
+    /// `Some(reason)` once a moderation marker struck this message
+    /// ("deleted by a moderator", "timed out (10m)", …) — renders
+    /// strikethrough with the reason on hover. Applied by
+    /// [`ChatLog::apply_markers`], never set at parse time.
+    pub(super) deleted: Option<String>,
+    /// System notice line (chat-mode change, role change, timeout/ban
+    /// announcement) — renders as a muted ℹ line, no author.
+    pub(super) system: bool,
 }
 
 /// Height estimate for a chat row that hasn't been drawn yet (≈ one line).
@@ -60,6 +74,27 @@ pub(super) const CHAT_ROW_EST: f32 = 20.0;
 /// virtualized renderer need. Lives behind `ChatPopup::load_state`'s mutex;
 /// the UI renders straight from the guard (no per-frame clone) while the
 /// background tasks append/prepend under the same lock.
+/// A moderation marker parsed from the sidecar (written live by the chat
+/// logger next to the messages), applied to the in-memory log by
+/// [`ChatLog::apply_markers`].
+#[derive(Clone)]
+pub(super) enum ChatMarker {
+    /// A single message was deleted (matched by Twitch message id).
+    Delete { msg_id: String },
+    /// Everything a user said up to this point was purged (timeout/ban).
+    Purge { login: String, reason: String },
+    /// The whole chat was cleared.
+    Clear,
+}
+
+/// A marker plus when it happened (seconds from stream start, same clock as
+/// `ChatMessage::timestamp_secs`).
+#[derive(Clone)]
+pub(super) struct MarkerAt {
+    pub(super) ts_secs: f64,
+    pub(super) marker: ChatMarker,
+}
+
 pub(super) struct ChatLog {
     pub(super) messages: Vec<ChatMessage>,
     /// Measured row heights, parallel to `messages` (estimates until a row has
@@ -74,6 +109,55 @@ pub(super) struct ChatLog {
     /// True while the pre-tail (older) part of the file is still parsing in
     /// the background — the newest messages are already shown.
     pub(super) loading_older: bool,
+    /// Every moderation marker seen in the file. Kept so `apply_markers` can
+    /// re-run after the phase-2 splice (a tail marker may target a pre-tail
+    /// message that wasn't parsed yet when the marker arrived).
+    pub(super) markers: Vec<MarkerAt>,
+}
+
+impl ChatLog {
+    /// Strike out messages targeted by the stored moderation markers.
+    /// Idempotent full pass (one map-building walk over markers + one walk
+    /// over messages); called only when markers arrive or messages prepend,
+    /// not per frame.
+    pub(super) fn apply_markers(&mut self) {
+        if self.markers.is_empty() {
+            return;
+        }
+        let mut deleted_ids: HashMap<&str, ()> = HashMap::new();
+        // login -> (latest purge ts, reason)
+        let mut purges: HashMap<&str, (f64, &str)> = HashMap::new();
+        let mut clear_ts = f64::NEG_INFINITY;
+        for m in &self.markers {
+            match &m.marker {
+                ChatMarker::Delete { msg_id } => {
+                    deleted_ids.insert(msg_id.as_str(), ());
+                }
+                ChatMarker::Purge { login, reason } => {
+                    let e = purges.entry(login.as_str()).or_insert((m.ts_secs, reason));
+                    if m.ts_secs >= e.0 {
+                        *e = (m.ts_secs, reason);
+                    }
+                }
+                ChatMarker::Clear => clear_ts = clear_ts.max(m.ts_secs),
+            }
+        }
+        for msg in &mut self.messages {
+            if msg.system {
+                continue;
+            }
+            if !msg.msg_id.is_empty() && deleted_ids.contains_key(msg.msg_id.as_str()) {
+                msg.deleted = Some("deleted by a moderator".into());
+            } else if let Some((pts, reason)) =
+                (!msg.login.is_empty()).then(|| purges.get(msg.login.as_str())).flatten()
+                && msg.timestamp_secs <= *pts
+            {
+                msg.deleted = Some((*reason).to_string());
+            } else if msg.timestamp_secs <= clear_ts {
+                msg.deleted = Some("chat cleared".into());
+            }
+        }
+    }
 }
 
 pub(super) enum ChatLoadState {
@@ -467,6 +551,19 @@ pub(super) fn render_chat_message(
                 .small()
                 .color(ui.visuals().weak_text_color()),
         );
+        // System notice (moderation marker: mode change, timeout/ban, clear)
+        // — muted ℹ line, no author/badges.
+        if msg.system {
+            ui.label(
+                egui::RichText::new(format!("ℹ {}", msg.text))
+                    .italics()
+                    .color(ui.visuals().weak_text_color()),
+            )
+            .on_hover_text(
+                "Moderation/room event captured live from Twitch chat while recording",
+            );
+            return;
+        }
         // Badges
         for badge in &msg.badges {
             let (sym, color) = badge_display(badge, &msg.platform);
@@ -480,6 +577,23 @@ pub(super) fn render_chat_message(
                 .strong()
                 .color(name_color),
         );
+        // A moderator-struck message: the archived original renders
+        // struck-through (live chat hides it; the archive keeps receipts).
+        // Emotes drop to their text fallback so the strike reads clearly.
+        if let Some(reason) = &msg.deleted {
+            for seg in &msg.segments {
+                let t = match seg {
+                    ChatSegment::Text(t) => t.as_str(),
+                    ChatSegment::Emote { name, fallback_text, .. } => {
+                        fallback_text.as_deref().unwrap_or(name)
+                    }
+                };
+                ui.label(egui::RichText::new(t).strikethrough().weak())
+                    .on_hover_text(reason);
+            }
+            ui.label(egui::RichText::new(format!("({reason})")).small().weak().italics());
+            return;
+        }
         // Message body — text runs and (when enabled & on disk) inline emote images.
         let emote_h = (ui.text_style_height(&egui::TextStyle::Body) * 1.5).min(28.0);
         for seg in &msg.segments {
@@ -1019,6 +1133,8 @@ pub(super) struct ChatChunk {
     pub(super) messages: Vec<ChatMessage>,
     pub(super) fetches: Vec<EmojiFetch>,
     pub(super) parsed_to: u64,
+    /// Moderation markers found in this byte range (Twitch sidecars only).
+    pub(super) markers: Vec<MarkerAt>,
 }
 
 /// Split a text run into [`ChatSegment`]s, turning each Unicode-emoji cluster into
@@ -1118,13 +1234,19 @@ pub(super) fn parse_chat_chunk(
     let len = f.metadata()?.len();
     let end = to.unwrap_or(len).min(len);
     if from >= end {
-        return Ok(ChatChunk { messages: Vec::new(), fetches: Vec::new(), parsed_to: from });
+        return Ok(ChatChunk {
+            messages: Vec::new(),
+            fetches: Vec::new(),
+            parsed_to: from,
+            markers: Vec::new(),
+        });
     }
     f.seek(SeekFrom::Start(from))?;
     let is_yt = path.to_string_lossy().ends_with("live_chat.json");
     let start_ms = start_unix_secs as f64 * 1000.0;
     let mut messages = Vec::new();
     let mut fetches: Vec<EmojiFetch> = Vec::new();
+    let mut markers: Vec<MarkerAt> = Vec::new();
     let mut parsed_to = from;
     let mut pos = from;
     // Carries a partial line across window boundaries.
@@ -1163,6 +1285,17 @@ pub(super) fn parse_chat_chunk(
                 }
                 if is_yt {
                     parse_yt_chat_line(line, &mut messages, &mut fetches);
+                } else if line.contains("\"marker\":") {
+                    // Moderation marker / notice line (cheap substring gate —
+                    // markers are rare next to messages).
+                    if let Some((marker, notice)) = parse_twitch_marker_line(line, start_ms) {
+                        if let Some(m) = marker {
+                            markers.push(m);
+                        }
+                        if let Some(n) = notice {
+                            messages.push(n);
+                        }
+                    }
                 } else if let Some(m) =
                     parse_twitch_chat_line(line, start_ms, emote_map, twitch_dir, &mut fetches)
                 {
@@ -1176,7 +1309,7 @@ pub(super) fn parse_chat_chunk(
     // De-duplicate so the same emoji isn't downloaded once per occurrence.
     fetches.sort_by(|a, b| a.dest.cmp(&b.dest));
     fetches.dedup();
-    Ok(ChatChunk { messages, fetches, parsed_to })
+    Ok(ChatChunk { messages, fetches, parsed_to, markers })
 }
 
 /// The first line boundary within the file's last [`CHAT_TAIL_BYTES`] — where
@@ -1364,13 +1497,16 @@ pub(super) async fn load_chat(
     .await
     {
         Ok(chunk) => {
-            *state.lock().unwrap() = ChatLoadState::Loaded(ChatLog {
+            let mut log = ChatLog {
                 messages: chunk.messages,
                 row_heights: Vec::new(),
                 measured_width: 0.0,
                 parsed_to: chunk.parsed_to,
                 loading_older: head_end > 0,
-            });
+                markers: chunk.markers,
+            };
+            log.apply_markers();
+            *state.lock().unwrap() = ChatLoadState::Loaded(log);
             ctx.request_repaint();
             chunk.fetches
         }
@@ -1406,6 +1542,10 @@ pub(super) async fn load_chat(
                     }
                     log.messages.splice(0..0, older.messages);
                     log.loading_older = false;
+                    // Tail markers may target just-prepended older messages
+                    // (e.g. a ban purging someone's whole history).
+                    log.markers.extend(older.markers);
+                    log.apply_markers();
                 }
             }
             Err(_) => {
@@ -1472,6 +1612,14 @@ pub(super) async fn tail_chat(
             if log.parsed_to == from {
                 log.messages.extend(chunk.messages);
                 log.parsed_to = chunk.parsed_to;
+                // A live deletion/purge marker targets messages already shown
+                // — re-apply so they strike through on the next frame. (No new
+                // markers = nothing to do: appended messages postdate every
+                // stored marker.)
+                if !chunk.markers.is_empty() {
+                    log.markers.extend(chunk.markers);
+                    log.apply_markers();
+                }
             }
         }
         ctx.request_repaint();
@@ -1614,7 +1762,71 @@ pub(super) fn yt_action_to_msg(
         badges,
         color_override: None,
         platform: ChatPlatform::YouTube,
+        login: String::new(),
+        msg_id: String::new(),
+        deleted: None,
+        system: false,
     })
+}
+
+/// Parse a moderation **marker line** from a Twitch sidecar (written live by
+/// the chat logger: `{"ts":…,"marker":"del"|"purge"|"clear"|"notice",…}`).
+/// Returns the marker to apply (if any) and a visible system notice message
+/// (purges, clears, and `notice` lines get one; single deletions don't — the
+/// strikethrough is enough).
+fn parse_twitch_marker_line(line: &str, start_ms: f64) -> Option<(Option<MarkerAt>, Option<ChatMessage>)> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let kind = v["marker"].as_str()?;
+    let ts_secs = (v["ts"].as_f64().unwrap_or(0.0) - start_ms) / 1000.0;
+    let notice = |text: String| ChatMessage {
+        timestamp_secs: ts_secs,
+        author: String::new(),
+        segments: vec![ChatSegment::Text(text.clone())],
+        text,
+        badges: Vec::new(),
+        color_override: None,
+        platform: ChatPlatform::Twitch,
+        login: String::new(),
+        msg_id: String::new(),
+        deleted: None,
+        system: true,
+    };
+    match kind {
+        "del" => {
+            let id = v["id"].as_str().unwrap_or("");
+            if id.is_empty() {
+                return None;
+            }
+            let marker = ChatMarker::Delete { msg_id: id.to_string() };
+            Some((Some(MarkerAt { ts_secs, marker }), None))
+        }
+        "purge" => {
+            let login = v["login"].as_str().unwrap_or("").to_lowercase();
+            if login.is_empty() {
+                return None;
+            }
+            let reason = match v["secs"].as_i64() {
+                Some(s) if s >= 3600 && s % 3600 == 0 => format!("timed out ({}h)", s / 3600),
+                Some(s) if s >= 60 => format!("timed out ({}m)", s / 60),
+                Some(s) => format!("timed out ({s}s)"),
+                None => "banned".to_string(),
+            };
+            let n = notice(format!("{login} was {reason}"));
+            Some((
+                Some(MarkerAt { ts_secs, marker: ChatMarker::Purge { login, reason } }),
+                Some(n),
+            ))
+        }
+        "clear" => Some((
+            Some(MarkerAt { ts_secs, marker: ChatMarker::Clear }),
+            Some(notice("chat was cleared by moderators".into())),
+        )),
+        "notice" => {
+            let text = v["text"].as_str().unwrap_or("").to_string();
+            (!text.is_empty()).then(|| (None, Some(notice(text))))
+        }
+        _ => None,
+    }
 }
 
 /// Parse one line of a Twitch `.chat.jsonl` file. `start_ms` is the stream
@@ -1657,6 +1869,10 @@ pub(super) fn parse_twitch_chat_line(
         badges,
         color_override,
         platform: ChatPlatform::Twitch,
+        login: v["login"].as_str().unwrap_or("").to_lowercase(),
+        msg_id: v["id"].as_str().unwrap_or("").to_string(),
+        deleted: None,
+        system: false,
     })
 }
 
@@ -2164,6 +2380,79 @@ mod tests {
     use super::*;
     #[allow(unused_imports)]
     use std::path::PathBuf;
+
+    fn plain_msg(ts: f64, login: &str, msg_id: &str, text: &str) -> ChatMessage {
+        ChatMessage {
+            timestamp_secs: ts,
+            author: login.to_string(),
+            text: text.to_string(),
+            segments: vec![ChatSegment::Text(text.to_string())],
+            badges: Vec::new(),
+            color_override: None,
+            platform: ChatPlatform::Twitch,
+            login: login.to_string(),
+            msg_id: msg_id.to_string(),
+            deleted: None,
+            system: false,
+        }
+    }
+
+    #[test]
+    fn moderation_markers_strike_messages() {
+        // del marker: only the referenced message id is struck.
+        let (marker, notice) = parse_twitch_marker_line(
+            r#"{"ts":100000,"marker":"del","id":"abc"}"#,
+            0.0,
+        )
+        .expect("del marker parses");
+        assert!(notice.is_none(), "single deletions get no notice line");
+        // purge marker: notice line + purge of earlier messages by that login.
+        let (purge, purge_notice) = parse_twitch_marker_line(
+            r#"{"ts":150000,"marker":"purge","login":"spammer","secs":600}"#,
+            0.0,
+        )
+        .expect("purge marker parses");
+        let notice_msg = purge_notice.expect("purges announce themselves");
+        assert!(notice_msg.system);
+        assert_eq!(notice_msg.text, "spammer was timed out (10m)");
+
+        let mut log = ChatLog {
+            messages: vec![
+                plain_msg(50.0, "alice", "abc", "deleted one"),
+                plain_msg(60.0, "alice", "def", "kept"),
+                plain_msg(70.0, "spammer", "ggg", "spam early"),
+                plain_msg(200.0, "spammer", "hhh", "after the timeout"),
+                notice_msg,
+            ],
+            row_heights: Vec::new(),
+            measured_width: 0.0,
+            parsed_to: 0,
+            loading_older: false,
+            markers: vec![marker.unwrap(), purge.unwrap()],
+        };
+        log.apply_markers();
+        assert_eq!(log.messages[0].deleted.as_deref(), Some("deleted by a moderator"));
+        assert_eq!(log.messages[1].deleted, None, "same author, different id");
+        assert_eq!(log.messages[2].deleted.as_deref(), Some("timed out (10m)"));
+        assert_eq!(log.messages[3].deleted, None, "messages after the purge stand");
+        assert_eq!(log.messages[4].deleted, None, "system notices are never struck");
+        // Idempotent: re-applying changes nothing.
+        log.apply_markers();
+        assert_eq!(log.messages[1].deleted, None);
+    }
+
+    #[test]
+    fn old_sidecar_lines_without_id_still_parse() {
+        // Pre-v60 lines have no `id`/`login`-marker fields; they must load
+        // exactly as before, just without deletion matching.
+        let line = r#"{"ts":1700000000000,"login":"bob","name":"Bob","text":"hi"}"#;
+        let mut fetches = Vec::new();
+        let m = parse_twitch_chat_line(line, 1_700_000_000_000.0, &HashMap::new(), None, &mut fetches)
+            .expect("old line parses");
+        assert_eq!(m.msg_id, "");
+        assert_eq!(m.login, "bob");
+        assert!(!m.system && m.deleted.is_none());
+    }
 
     // ----- first-party emote offset parsing (IRC `emotes` tag) -----
 

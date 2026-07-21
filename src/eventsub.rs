@@ -343,8 +343,9 @@ fn handle_message(
                                 "eventsub {}: {from} raided {to} ({viewers} viewers) -> monitor {mid}",
                                 crate::models::Platform::Twitch.tag()
                             );
-                            let _ = store
-                                .record_stream_event(mid, at, "", "raid_in", from, "", viewers, "");
+                            let _ = store.record_stream_event(
+                                mid, at, "", "raid_in", from, "", viewers, "", "",
+                            );
                         }
                     }
                     if let Some(from_id) = event["from_broadcaster_user_id"].as_str()
@@ -355,8 +356,9 @@ fn handle_message(
                                 "eventsub {}: {from} raided out to {to} ({viewers} viewers) -> monitor {mid}",
                                 crate::models::Platform::Twitch.tag()
                             );
-                            let _ = store
-                                .record_stream_event(mid, at, "", "raid_out", from, to, viewers, "");
+                            let _ = store.record_stream_event(
+                                mid, at, "", "raid_out", from, to, viewers, "", "",
+                            );
                         }
                     }
                 }
