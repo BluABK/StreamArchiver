@@ -949,6 +949,9 @@ pub struct StreamArchiverApp {
     /// `(errors, warnings)`, and session-only text/severity filters.
     show_warnings: bool,
     warnings_rows: Vec<crate::store::CaptureAlertRow>,
+    /// recording_id → alert rollup for the Streams-grid take/stream badges
+    /// (refreshed on the same throttle as the 🚨 badge counts).
+    rec_alert_badges: std::collections::HashMap<i64, crate::store::RecAlertBadge>,
     warn_refreshed: Option<std::time::Instant>,
     warn_badge: (i64, i64),
     warn_search: String,
@@ -1346,6 +1349,10 @@ pub struct StreamArchiverApp {
     confirm_quit_stop: bool,
     /// Cached (ocr_stats, global_stats, poll_stats) for the Stats view; None = not yet loaded.
     stats_snapshot: Option<(OcrStats, GlobalStats, PollStats)>,
+    /// App Stats "Capture health": lifetime totals + per-day trend, loaded
+    /// with (and refreshed by) the same snapshot cycle as `stats_snapshot`.
+    stats_capture_health:
+        Option<(Vec<crate::store::AlertDailyStat>, crate::store::AlertHealthTotals)>,
     /// Cached 🤝 collab-partner overview (name, sessions, last seen) for the
     /// Stats view — loaded/refreshed together with `stats_snapshot`.
     stats_collabs: Vec<(String, i64, i64)>,

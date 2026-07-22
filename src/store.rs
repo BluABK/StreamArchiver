@@ -129,7 +129,9 @@ pub struct NewCommunityPost {
 }
 
 mod alerts;
-pub use alerts::{CaptureAlertRow, GapRangeRow, NewCaptureAlert};
+pub use alerts::{
+    AlertDailyStat, AlertHealthTotals, CaptureAlertRow, GapRangeRow, NewCaptureAlert, RecAlertBadge,
+};
 mod collab;
 mod migrations;
 mod monitors;

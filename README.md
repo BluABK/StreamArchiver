@@ -906,6 +906,17 @@ fresh damage always re-lights it. Each row links straight to the tool log
 take also lands in the 🔔 feed (errors additionally raise a desktop toast,
 DND-gated as usual). Alerts idle for 60 days age out at startup.
 
+**In-tree badges & trends.** The Streams grid mirrors the alert state right
+on the rows (all clickable — they open the Warnings window): a take (and its
+stream row, summed over takes/dual-capture legs) shows **🚨 lost data
+(N/M recovered)** while damage is outstanding, **🩹 recovered** (green, with
+a *(muted)* note when the DMCA fallback was used) once every lost range was
+re-fetched, or **⚠ tool warnings** for warning-only takes. **App Stats**
+gains a *Capture health* section: lifetime totals (error/warning alerts,
+segments lost, ranges recovered, ✂ muted) plus a per-day trend table — a
+rising "lost" column across days points at a systemic cause (saturated
+disk/uplink, failing enclosure) rather than one bad stream.
+
 **Lost-segment auto-recovery (Twitch).** For Twitch recordings the lost
 content usually still exists: the VOD CDN keeps the broadcast (even for
 channels with VODs disabled — the same sha1-folder rails as VOD recovery,

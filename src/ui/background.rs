@@ -435,6 +435,10 @@ impl StreamArchiverApp {
             let global = self.core.store.global_stats().unwrap_or_default();
             let poll = crate::scheduler::load_poll_stats(self.core.store.as_ref());
             self.stats_snapshot = Some((ocr, global, poll));
+            self.stats_capture_health = Some((
+                self.core.store.alert_daily_stats(30).unwrap_or_default(),
+                self.core.store.alert_health_totals().unwrap_or_default(),
+            ));
         }
         let (ocr, global, poll) = match self.stats_snapshot.clone() {
             Some(s) => s,
@@ -909,6 +913,108 @@ impl StreamArchiverApp {
                     ui.label("");
                     ui.end_row();
                 });
+
+            ui.add_space(16.0);
+
+            // ── Capture health (🚨 Warnings rollup + trend) ──────────────────
+            ui.heading("Capture health 🚨").on_hover_text(
+                "Rollup of the capture-alert scanner: data loss reported by the \
+                 capture tools' own logs (sequence gaps, failed fetches, tool \
+                 errors), the VOD gap-recovery outcomes, and a per-day trend so a \
+                 degrading disk/network shows up as a pattern instead of isolated \
+                 rows. Details live in the 🚨 Warnings window.",
+            );
+            ui.separator();
+            let (daily, totals) = self.stats_capture_health.clone().unwrap_or_default();
+            let crate::store::AlertHealthTotals {
+                errors: errs,
+                warnings: warns,
+                lost_segments: lost,
+                ranges_total: ranges,
+                ranges_done: done,
+                muted_segs: muted,
+            } = totals;
+            if errs == 0 && warns == 0 {
+                ui.weak("No capture problems on record — the tools' logs are clean.");
+            } else {
+                egui::Grid::new("capture_health_grid")
+                    .num_columns(4)
+                    .spacing([32.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Data-loss / error alerts");
+                        ui.strong(crate::models::group_thousands(errs))
+                            .on_hover_text("Alerts where content is missing from a capture (sequence gaps, failed fetches, tool errors).");
+                        ui.label("Tool warnings");
+                        ui.strong(crate::models::group_thousands(warns));
+                        ui.end_row();
+
+                        ui.label("Segments lost");
+                        ui.strong(format!(
+                            "{} (~{})",
+                            crate::models::group_thousands(lost),
+                            fmt_duration(lost * 2)
+                        ))
+                        .on_hover_text("Total live segments the capture tools dropped (~2s each on Twitch).");
+                        ui.label("Lost ranges recovered");
+                        let mark = if ranges > 0 && done == ranges { " ✔" } else { "" };
+                        ui.strong(if ranges > 0 {
+                            let m = if muted > 0 {
+                                format!(" · ✂ {} muted segs", crate::models::group_thousands(muted))
+                            } else {
+                                String::new()
+                            };
+                            format!("{done}/{ranges}{mark}{m}")
+                        } else {
+                            "—".into()
+                        })
+                        .on_hover_text(
+                            "Lost time ranges re-fetched from the Twitch VOD CDN into patch \
+                             files. ✂ = segments that only survived as DMCA-muted copies.",
+                        );
+                        ui.end_row();
+                    });
+                if !daily.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("Per day (last 30, by first occurrence, UTC)").strong())
+                        .on_hover_text(
+                            "A rising 'lost' column across days = a systemic problem \
+                             (saturated disk/uplink, a failing enclosure), not a one-off \
+                             stream hiccup.",
+                        );
+                    egui::Grid::new("capture_health_daily")
+                        .num_columns(5)
+                        .striped(true)
+                        .spacing([24.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.strong("Day");
+                            ui.strong("Errors");
+                            ui.strong("Warnings");
+                            ui.strong("Lost");
+                            ui.strong("Recovered");
+                            ui.end_row();
+                            for d in &daily {
+                                ui.label(&d.day);
+                                ui.label(crate::models::group_thousands(d.errors));
+                                ui.label(crate::models::group_thousands(d.warnings));
+                                ui.label(if d.lost_segments > 0 {
+                                    format!(
+                                        "{} segs (~{})",
+                                        crate::models::group_thousands(d.lost_segments),
+                                        fmt_duration(d.lost_segments * 2)
+                                    )
+                                } else {
+                                    "—".into()
+                                });
+                                ui.label(if d.ranges_total > 0 {
+                                    format!("{}/{}", d.recovered, d.ranges_total)
+                                } else {
+                                    "—".into()
+                                });
+                                ui.end_row();
+                            }
+                        });
+                }
+            }
 
             ui.add_space(8.0);
             // (The 🤝 Collabs partner table lives in the Channel Stats tab —

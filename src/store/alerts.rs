@@ -8,6 +8,8 @@
 //! clears `acked`, so fresh data loss re-lights the badge even on an alert
 //! the user already acknowledged.
 
+use std::collections::HashMap;
+
 use super::*;
 
 /// One alert to upsert, built by the log scanner each watchdog cycle.
@@ -62,6 +64,45 @@ pub struct CaptureAlertRow {
     pub recovered_muted: i64,
     pub last_line: String,
     pub acked: bool,
+}
+
+/// Per-recording rollup of its capture alerts, for the Streams-grid badges
+/// (take rows + summed per stream row).
+#[derive(Clone, Copy, Default)]
+pub struct RecAlertBadge {
+    /// Any error-severity alert (data loss / tool errors).
+    pub errors: bool,
+    /// Any warning-severity alert.
+    pub warnings: bool,
+    pub lost_segments: i64,
+    pub ranges_total: i64,
+    pub recovered: i64,
+    /// Muted-fallback segments inside the recovered patches.
+    pub muted: i64,
+}
+
+/// Lifetime capture-health rollup (the App Stats "Capture health" totals).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AlertHealthTotals {
+    pub errors: i64,
+    pub warnings: i64,
+    pub lost_segments: i64,
+    pub ranges_total: i64,
+    pub ranges_done: i64,
+    /// Muted-fallback segments inside the recovered (done) ranges.
+    pub muted_segs: i64,
+}
+
+/// One day of capture-alert activity (the App Stats trend table).
+#[derive(Clone, Debug)]
+pub struct AlertDailyStat {
+    /// UTC date (`YYYY-MM-DD`) of the alerts' first occurrences.
+    pub day: String,
+    pub errors: i64,
+    pub warnings: i64,
+    pub lost_segments: i64,
+    pub ranges_total: i64,
+    pub recovered: i64,
 }
 
 /// One lost time range queued for VOD recovery (broadcast-start offsets,
@@ -338,6 +379,90 @@ impl Store {
             "SELECT DISTINCT recording_id FROM gap_range WHERE state IN ('pending', 'fetching')",
         )?;
         let rows = st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Per-recording alert rollup for the Streams-grid take/stream badges,
+    /// refreshed on the Warnings window's throttle.
+    pub fn alert_badges_by_recording(&self) -> Result<HashMap<i64, RecAlertBadge>> {
+        let conn = self.db();
+        let mut st = conn.prepare(
+            "SELECT recording_id,
+                    MAX(CASE WHEN severity = 'error' THEN 1 ELSE 0 END),
+                    MAX(CASE WHEN severity != 'error' THEN 1 ELSE 0 END),
+                    SUM(lost_segments), MAX(ranges_total), MAX(recovered), MAX(recovered_muted)
+             FROM capture_alert WHERE recording_id IS NOT NULL
+             GROUP BY recording_id",
+        )?;
+        let rows = st
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    RecAlertBadge {
+                        errors: r.get::<_, i64>(1)? != 0,
+                        warnings: r.get::<_, i64>(2)? != 0,
+                        lost_segments: r.get(3)?,
+                        ranges_total: r.get(4)?,
+                        recovered: r.get(5)?,
+                        muted: r.get(6)?,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<HashMap<_, _>>>()?;
+        Ok(rows)
+    }
+
+    /// Lifetime capture-health totals for App Stats.
+    pub fn alert_health_totals(&self) -> Result<AlertHealthTotals> {
+        self.db()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM capture_alert WHERE severity = 'error'),
+                    (SELECT COUNT(*) FROM capture_alert WHERE severity != 'error'),
+                    (SELECT COALESCE(SUM(lost_segments), 0) FROM capture_alert),
+                    (SELECT COUNT(*) FROM gap_range),
+                    (SELECT COUNT(*) FROM gap_range WHERE state = 'done'),
+                    (SELECT COALESCE(SUM(muted_segs), 0) FROM gap_range WHERE state = 'done')",
+                [],
+                |r| {
+                    Ok(AlertHealthTotals {
+                        errors: r.get(0)?,
+                        warnings: r.get(1)?,
+                        lost_segments: r.get(2)?,
+                        ranges_total: r.get(3)?,
+                        ranges_done: r.get(4)?,
+                        muted_segs: r.get(5)?,
+                    })
+                },
+            )
+            .map_err(Into::into)
+    }
+
+    /// Per-day capture-alert activity for the App Stats trend table (UTC
+    /// date of each alert's FIRST occurrence, newest day first).
+    pub fn alert_daily_stats(&self, days: i64) -> Result<Vec<AlertDailyStat>> {
+        let cutoff = now_unix() - days * 86_400;
+        let conn = self.db();
+        let mut st = conn.prepare(
+            "SELECT date(first_at, 'unixepoch') AS d,
+                    SUM(CASE WHEN severity = 'error' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN severity != 'error' THEN 1 ELSE 0 END),
+                    SUM(lost_segments), SUM(ranges_total), SUM(recovered)
+             FROM capture_alert WHERE first_at >= ?1
+             GROUP BY d ORDER BY d DESC",
+        )?;
+        let rows = st
+            .query_map([cutoff], |r| {
+                Ok(AlertDailyStat {
+                    day: r.get(0)?,
+                    errors: r.get(1)?,
+                    warnings: r.get(2)?,
+                    lost_segments: r.get(3)?,
+                    ranges_total: r.get(4)?,
+                    recovered: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 

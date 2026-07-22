@@ -117,6 +117,9 @@ struct StreamsOut {
     open_stream_stats: Option<(i64, String, i64, i64)>,
     /// Channel id to open the 🚂 mark-hype-train dialog for.
     mark_hype: Option<i64>,
+    /// A capture-alert badge (🚨/🩹/⚠ on a take or stream row) was clicked —
+    /// open the Warnings window.
+    open_warnings: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -850,7 +853,7 @@ impl StreamArchiverApp {
                                     &mut self.fs_probes, &self.settings,
                                     &self.background_tasks, &finalizing_recs, ad_breaks,
                                     meta_logs, &self.collab_by_stream, &exp_streams, now,
-                                    &col_order, &mut out,
+                                    &col_order, &self.rec_alert_badges, &mut out,
                                 );
                             }
                             Vis::Take { mid, gi, ti, depth } => {
@@ -863,7 +866,7 @@ impl StreamArchiverApp {
                                     &mut self.rename_rec_id, &mut self.rename_draft,
                                     &mut self.rename_preview,
                                     &mut self.show_rename_dialog, now, &col_order,
-                                    &mut out,
+                                    &self.rec_alert_badges, &mut out,
                                 );
                             }
                             Vis::VodJob { mid, gi, ti, kind, depth } => {
@@ -934,7 +937,12 @@ impl StreamArchiverApp {
             open_viewer_stats,
             open_stream_stats,
             mark_hype,
+            open_warnings,
         } = out;
+        if open_warnings {
+            self.show_warnings = true;
+            self.warn_refreshed = None; // force an immediate refresh
+        }
         if let Some(rid) = open_ad_popup
             && !self.ad_popups.contains(&rid)
         {
@@ -1931,6 +1939,7 @@ impl StreamArchiverApp {
         exp_streams: &HashSet<String>,
         now: i64,
         col_order: &[usize],
+        rec_alerts: &HashMap<i64, crate::store::RecAlertBadge>,
         out: &mut StreamsOut,
     ) {
         let has_takes = stream_has_children(g);
@@ -2125,7 +2134,25 @@ impl StreamArchiverApp {
                         let gap_running = g.takes.iter().any(|t| {
                             gap_recover_running(background_tasks, t.id)
                         });
-                        take_status_badges(
+                        // Alert rollup over this stream's takes (a dual
+                        // capture's legs and retakes sum into one badge).
+                        let alert_agg = {
+                            let mut agg = crate::store::RecAlertBadge::default();
+                            let mut any = false;
+                            for t in &g.takes {
+                                if let Some(a) = rec_alerts.get(&t.id) {
+                                    any = true;
+                                    agg.errors |= a.errors;
+                                    agg.warnings |= a.warnings;
+                                    agg.lost_segments += a.lost_segments;
+                                    agg.ranges_total += a.ranges_total;
+                                    agg.recovered += a.recovered;
+                                    agg.muted += a.muted;
+                                }
+                            }
+                            any.then_some(agg)
+                        };
+                        if take_status_badges(
                             ui,
                             trigger_info,
                             vod_not_published,
@@ -2135,7 +2162,10 @@ impl StreamArchiverApp {
                             backfill_running,
                             backfill_queued,
                             gap_running,
-                        );
+                            alert_agg.as_ref(),
+                        ) {
+                            out.open_warnings = true;
+                        }
                     }
                     "game" => {
                         meta_value_cell(ui, g.category());
@@ -2447,6 +2477,7 @@ impl StreamArchiverApp {
         show_rename_dialog: &mut bool,
         now: i64,
         col_order: &[usize],
+        rec_alerts: &HashMap<i64, crate::store::RecAlertBadge>,
         out: &mut StreamsOut,
     ) {
         let t = &g.takes[ti];
@@ -2594,7 +2625,7 @@ impl StreamArchiverApp {
                         // this take — see the "📼 VOD backfill" row.
                         let vod_muted_secs = (t.vod_state.as_deref() == Some("found"))
                             .then(|| t.vod_muted_secs.unwrap_or(0));
-                        take_status_badges(
+                        if take_status_badges(
                             ui,
                             &t.trigger_info,
                             t.vod_state.as_deref() == Some("not_published"),
@@ -2604,7 +2635,10 @@ impl StreamArchiverApp {
                             head_backfill_running(background_tasks, t.id),
                             t.head_backfill_state == "queued",
                             gap_recover_running(background_tasks, t.id),
-                        );
+                            rec_alerts.get(&t.id),
+                        ) {
+                            out.open_warnings = true;
+                        }
                         // Published-VOD view count (from the checker's Get
                         // Videos polls — free data, refreshed while the mute
                         // watch runs).

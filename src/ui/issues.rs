@@ -375,6 +375,9 @@ impl StreamArchiverApp {
         let stale = self.warn_refreshed.map(|t| t.elapsed() >= interval).unwrap_or(true);
         if stale {
             self.warn_badge = self.core.store.alert_badge_counts().unwrap_or((0, 0));
+            // The Streams-grid take/stream badges ride the same throttle.
+            self.rec_alert_badges =
+                self.core.store.alert_badges_by_recording().unwrap_or_default();
             if self.show_warnings {
                 self.warnings_rows = self.core.store.list_capture_alerts(500).unwrap_or_default();
             }

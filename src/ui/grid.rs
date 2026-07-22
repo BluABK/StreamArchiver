@@ -1257,7 +1257,10 @@ pub(super) fn take_status_badges(
     backfill_running: bool,
     backfill_queued: bool,
     gap_recover_running: bool,
-) {
+    // Capture-alert rollup for this take (or summed over a stream's takes).
+    alert: Option<&crate::store::RecAlertBadge>,
+) -> bool {
+    let mut open_warnings = false;
     if !trigger_info.is_empty() {
         ui.colored_label(
             egui::Color32::from_rgb(0xe8, 0xc5, 0x4a),
@@ -1300,6 +1303,62 @@ pub(super) fn take_status_badges(
                  is in the Background tab.",
             );
     }
+    // Persistent capture-alert state (all badges click through to 🚨 Warnings).
+    if let Some(a) = alert {
+        let clickable = |ui: &mut egui::Ui, color: egui::Color32, text: String| {
+            ui.add(
+                egui::Label::new(egui::RichText::new(text).color(color))
+                    .sense(egui::Sense::click()),
+            )
+        };
+        let healed = a.errors && a.ranges_total > 0 && a.recovered == a.ranges_total;
+        if healed {
+            let text =
+                if a.muted > 0 { "🩹 recovered (muted)".to_string() } else { "🩹 recovered".to_string() };
+            let resp = clickable(ui, egui::Color32::from_rgb(110, 200, 130), text)
+                .on_hover_text(format!(
+                    "This capture lost {} segments (~{}), but every lost range was re-fetched \
+                     from the VOD into patch files next to the recording{}. Click for the \
+                     🚨 Warnings details.",
+                    crate::models::group_thousands(a.lost_segments),
+                    fmt_duration(a.lost_segments * 2),
+                    if a.muted > 0 {
+                        format!(" ({} segments only survived as DMCA-muted copies)", a.muted)
+                    } else {
+                        String::new()
+                    }
+                ));
+            open_warnings |= resp.clicked();
+        } else if a.errors && !gap_recover_running {
+            let text = if a.ranges_total > 0 {
+                format!("🚨 lost data ({}/{} recovered)", a.recovered, a.ranges_total)
+            } else {
+                "🚨 lost data".to_string()
+            };
+            let resp = clickable(ui, egui::Color32::from_rgb(230, 100, 100), text).on_hover_text(
+                format!(
+                    "The capture tool reported data loss: {} segments (~{}) missing.{} Click \
+                     for the 🚨 Warnings details.",
+                    crate::models::group_thousands(a.lost_segments),
+                    fmt_duration(a.lost_segments * 2),
+                    if a.ranges_total > 0 {
+                        " VOD re-fetch of the lost ranges is queued/in progress."
+                    } else {
+                        ""
+                    }
+                ),
+            );
+            open_warnings |= resp.clicked();
+        } else if !a.errors && a.warnings {
+            let resp = clickable(ui, egui::Color32::from_rgb(220, 175, 60), "⚠ tool warnings".into())
+                .on_hover_text(
+                    "The capture tool logged non-fatal warnings for this take — no data loss \
+                     detected. Click for the 🚨 Warnings details.",
+                );
+            open_warnings |= resp.clicked();
+        }
+    }
+    open_warnings
 }
 
 /// Whether a live `HeadBackfill` background task is currently working on
