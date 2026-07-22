@@ -2350,7 +2350,8 @@ pub struct RemuxOpts {
     pub embed_thumbnail: bool,
     /// Write a `title` metadata tag. `title_template` must be non-empty.
     pub embed_title: bool,
-    /// Template for the title tag. Tokens: `{title}` `{channel}` `{games}`
+    /// Template for the title tag. Tokens: `{title}` `{title_trimmed}`
+    /// (chat-command plugs stripped) `{channel}` `{games}`
     /// `{date}` `{year}` `{month}` `{day}` `{name}`. `"{title}"` is the
     /// recommended default.
     pub title_template: String,

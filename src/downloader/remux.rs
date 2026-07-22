@@ -567,6 +567,7 @@ pub(super) fn expand_title_tag(opts: &crate::models::RemuxOpts, dst: &Path) -> S
     };
     opts.title_template
         .replace("{name}", &name)
+        .replace("{title_trimmed}", &super::trim_title_commands(&title))
         .replace("{title}", &title)
         .replace("{channel}", &v.channel)
         .replace("{games}", &v.games)

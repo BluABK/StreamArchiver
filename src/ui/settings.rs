@@ -1984,7 +1984,7 @@ impl StreamArchiverApp {
                                             .hint_text(&ft_hint)
                                             .desired_width(150.0),
                                     ).on_hover_text(
-                                        "Tokens: {name} {date} {time} {timestamp} {year} {month} {day} {hour} {minute} {second} {title} {games} {video_id} {quality} {resolution} {height} {width} {fps} {vcodec} {acodec} {take} {tool} {mode} {platform} {went_live_date} {went_live_time}",
+                                        "Tokens: {name} {date} {time} {timestamp} {year} {month} {day} {hour} {minute} {second} {title} {title_trimmed} {games} {video_id} {quality} {resolution} {height} {width} {fps} {vcodec} {acodec} {take} {tool} {mode} {platform} {went_live_date} {went_live_time}",
                                     );
                                 });
                                 ui.label("");
@@ -2248,7 +2248,7 @@ impl StreamArchiverApp {
                                 .desired_width(200.0),
                         );
                     });
-                    ui.label("Template for the MKV title tag. Tokens: {title} {channel} {games} {date} {year} {month} {day} {name}");
+                    ui.label("Template for the MKV title tag. Tokens: {title} {title_trimmed} {channel} {games} {date} {year} {month} {day} {name}");
                     ui.end_row();
                     ui.checkbox(&mut self.settings.remux_embed_subs, "Embed subtitle sidecars");
                     ui.label("Copy .srt/.ass/.vtt sidecar files as subtitle streams in the MKV.");

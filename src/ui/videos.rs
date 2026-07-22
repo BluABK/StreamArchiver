@@ -974,7 +974,7 @@ impl StreamArchiverApp {
                             ));
                         }
                     });
-                    let tmpl_hint = "Variables: {name} {title} {channel} {date} {time} {timestamp} {year} {month} {day} {hour} {minute} {second} {tool} {mode} {platform} {video_id} {quality} {resolution} {height} {width} {fps} {vcodec} {acodec} {take} {games} {went_live_date} {went_live_time}";
+                    let tmpl_hint = "Variables: {name} {title} {title_trimmed} {channel} {date} {time} {timestamp} {year} {month} {day} {hour} {minute} {second} {tool} {mode} {platform} {video_id} {quality} {resolution} {height} {width} {fps} {vcodec} {acodec} {take} {games} {went_live_date} {went_live_time}";
                     ui.label("Filename template").on_hover_text(tmpl_hint);
                     ui.horizontal(|ui| {
                         let (del, save) = filename_preset_combo(
@@ -1767,6 +1767,7 @@ impl StreamArchiverApp {
             ]),
             ("Stream info", &[
                 ("{title}", "Stream title"),
+                ("{title_trimmed}", "Stream title without !command plugs / #ad tags"),
                 ("{games}", "Games / categories played"),
                 ("{quality}", "Configured quality selector"),
                 ("{platform}", "twitch · youtube · kick · generic"),

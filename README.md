@@ -1958,7 +1958,8 @@ yt-dlp's output templates):
 | Variable | Expands to |
 |---|---|
 | `{name}` | **Streams:** the channel (container) name. **Videos:** the **Name** field if set, else the auto-detected title, else `video`. |
-| `{title}` | The stream/video title. **Videos only**, and only when **Auto-detect** is on (live recordings don't resolve a title, so it's empty there). |
+| `{title}` | The stream/video title. **Streams:** the title at recording start (from the *Title & category change log*) — only known reliably once metadata polling has run, so it's filled by the **post-capture rename** (the file carries a `title-tba` placeholder until then); empty for generic URLs. **Videos:** when **Auto-detect** is on. |
+| `{title_trimmed}` | Like `{title}`, but with Twitch chat-command plugs stripped: `!gg !stoneforged !tangia`-style tokens, emoji glued to them (`🩸!youtube 💬!discord`), `#ad`/`#sponsored` tags, and the `\|`/`-` separators they leave dangling all go — `COWGIRL NUMI DEBUT!! SUBATHON TIME! [DAY 2] \| !gg !stoneforged !tangia` becomes `COWGIRL NUMI DEBUT!! SUBATHON TIME! [DAY 2]`. Real exclamations (`YAHOO!!`, `Karaoke !`) survive, interior text (`… \| 18+`) is untouched, and a title consisting of nothing but commands falls back to the full title. |
 | `{channel}` | The uploader/channel name. **Videos only**, when **Auto-detect** is on; empty otherwise. |
 | `{video_id}` | The platform **stream/video id**. **Streams:** set when detection knows it (Twitch Helix/EventSub, YouTube Data API, Kick API); empty for id-less methods (scrape / generic probe). **Videos:** set when **Auto-detect** is on. |
 | `{quality}` | The **configured quality selector** (e.g. `1080p60`, `best`, `bv*+ba`) — what you asked for, not necessarily the actual resolution (see `{resolution}`). |
@@ -2014,10 +2015,11 @@ variables:
 Probing uses the capture tool to resolve the stream and `ffprobe` to read it
 (post-rename `ffprobe`s the finished file). Applies to both Streams and Videos.
 
-`{games}` works the same way but is independent of this setting: because the
-categories played are only known once the stream ends, a template using `{games}`
-always gets a post-capture rename (and any subtitle/chat sidecars are moved along
-with the file).
+`{games}`, `{title}` and `{title_trimmed}` work the same way but are independent
+of this setting: because the categories played (and, for some platforms, the
+title) are only known after metadata polling / once the stream ends, a template
+using them always gets a post-capture rename (and any subtitle/chat sidecars are
+moved along with the file).
 
 Examples: `{name}_{date}_{time}` → `Layna_20260620_183001.mkv`; for a Videos
 download with **Auto-detect** on, `{channel} - {title} [{video_id}]` →

@@ -31,10 +31,11 @@ pub(super) fn template_wants_games(template: &str) -> bool {
     template.contains("{games}")
 }
 
-/// True if `template` uses `{title}` (may not be known at recording start for
-/// all platforms, so it also triggers a post-capture rename to fill the real value).
+/// True if `template` uses `{title}` or `{title_trimmed}` (may not be known at
+/// recording start for all platforms, so it also triggers a post-capture
+/// rename to fill the real value).
 pub(super) fn template_wants_title(template: &str) -> bool {
-    template.contains("{title}")
+    template.contains("{title}") || template.contains("{title_trimmed}")
 }
 
 /// True if `template` uses `{went_live_date}` or `{went_live_time}` (only known
@@ -376,6 +377,7 @@ pub(super) fn expand_template(template: &str, v: &TemplateVars) -> String {
     };
     let expanded = tmpl
         .replace("{name}", v.name)
+        .replace("{title_trimmed}", &trim_title_commands(v.title))
         .replace("{title}", v.title)
         .replace("{channel}", v.channel)
         .replace("{video_id}", v.video_id)
@@ -447,6 +449,117 @@ pub(crate) fn unique_stem(dir: &Path, stem: &str, ext: &str, ignore: Option<&Pat
     }
     // Pathological fallback (10k same-named files): stamp it so we never clobber.
     format!("{stem} ({})", now_unix())
+}
+
+/// Separator characters that delimit title segments and command clusters
+/// (`A | !gg !tts`, `!WCC | !impulse | …`, `on !gamemasters - !schedule`).
+/// Deliberately EXCLUDES `+` (part of `18+`) and `:` (subtitles).
+const TITLE_SEP_CHARS: &[char] =
+    &['|', '‖', '—', '–', '-', '~', '•', '·', '>', '/', ',', ';', '&', '→'];
+
+/// Collapse whitespace runs to single spaces and trim.
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `{title_trimmed}`: the stream title with Twitch chat-command plugs
+/// (`!gg !stoneforged !tangia`, `||🩸!youtube 💬!discord`) and `#ad` /
+/// `#sponsored` disclosure tags removed, plus the separators/emoji they leave
+/// orphaned. Rules were derived from a 630-title corpus (2026-07-22):
+///
+/// - A command is `!` at a non-alphanumeric boundary followed by ≥ 2
+///   `[A-Za-z0-9_]` — so trailing exclamations (`YAHOO!!!!`, `Karaoke !`)
+///   survive, while `!gg`, `!24`, `!FF` and emoji-glued `🩸!youtube` don't.
+/// - Cleanup runs ONLY when something was removed: a command-free title is
+///   returned verbatim.
+/// - Head/tail segments left without any alphanumeric content (`||🩸 💬`,
+///   a lone `|` after `!gsupps !store |`) are dropped along with their
+///   separator; interior text is never touched (`… | 18+` keeps its `+`,
+///   `A --> B` keeps its arrow). Emptied bracket pairs (`(!rules)` → `()`)
+///   are removed.
+/// - A title that consists ONLY of commands falls back to the original.
+pub(crate) fn trim_title_commands(title: &str) -> String {
+    let chars: Vec<char> = title.chars().collect();
+    let mut out = String::with_capacity(title.len());
+    let mut removed = false;
+    // The previous SIGNIFICANT char: the one before `i` in the ORIGINAL text,
+    // except a removed token counts as its `!`/`#` — so glued runs like
+    // `!gg!tts` still match after the first removal.
+    let mut prev: Option<char> = None;
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '!' && !prev.map(char::is_alphanumeric).unwrap_or(false) {
+            let mut j = i + 1;
+            while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                j += 1;
+            }
+            if j - i >= 3 {
+                removed = true;
+                prev = Some('!');
+                i = j;
+                continue;
+            }
+        }
+        if c == '#'
+            && let Some(tag_len) = ["ad", "sponsored"].iter().find_map(|tag| {
+                let end = i + 1 + tag.len();
+                (chars.len() >= end
+                    && chars[i + 1..end].iter().collect::<String>().eq_ignore_ascii_case(tag)
+                    && chars.get(end).map(|c| !c.is_ascii_alphanumeric()).unwrap_or(true))
+                .then_some(tag.len())
+            })
+        {
+            removed = true;
+            prev = Some('#');
+            i += 1 + tag_len;
+            continue;
+        }
+        out.push(c);
+        prev = Some(c);
+        i += 1;
+    }
+    if !removed {
+        return title.to_string();
+    }
+
+    let is_sep = |c: &char| TITLE_SEP_CHARS.contains(c);
+    let mut t = collapse_ws(&out);
+    for _ in 0..20 {
+        // Emptied bracket pairs first — `(!rules)` became `()`.
+        for pair in ["( )", "()", "[ ]", "[]", "{ }", "{}", "【】", "（）"] {
+            t = t.replace(pair, "");
+        }
+        t = collapse_ws(&t);
+        let before = t.clone();
+        let mut cs: Vec<char> = t.chars().collect();
+        // Tail: bare separator/whitespace runs, then a final segment with no
+        // alphanumeric content at all (command-decoration emoji, `||🩸 💬`).
+        while matches!(cs.last(), Some(c) if is_sep(c) || c.is_whitespace()) {
+            cs.pop();
+        }
+        if let Some(idx) = cs.iter().rposition(is_sep)
+            && idx > 0
+            && !cs[idx + 1..].iter().any(|c| c.is_alphanumeric())
+        {
+            cs.truncate(idx);
+        }
+        // Head mirror: junk before the first separator.
+        while matches!(cs.first(), Some(c) if is_sep(c) || c.is_whitespace()) {
+            cs.remove(0);
+        }
+        if let Some(idx) = cs.iter().position(is_sep)
+            && idx > 0
+            && !cs[..idx].iter().any(|c| c.is_alphanumeric())
+        {
+            cs.drain(..=idx);
+        }
+        t = cs.into_iter().collect::<String>().trim().to_string();
+        if t == before {
+            break;
+        }
+    }
+    if t.is_empty() { title.trim().to_string() } else { t }
 }
 
 pub(crate) fn sanitize_filename(s: &str) -> String {
@@ -902,6 +1015,88 @@ mod tests {
             },
         );
         assert_eq!(name, "Bad_Name__20231114");
+    }
+
+    #[test]
+    fn trim_title_commands_on_real_corpus_shapes() {
+        // All inputs below are REAL titles from the 2026-07-22 DB corpus.
+        let cases = [
+            // Trailing pipe + command cluster (the most common shape).
+            (
+                "COWGIRL NUMI DEBUT!! SUBATHON TIME! [DAY 2] | !gg !stoneforged !tangia",
+                "COWGIRL NUMI DEBUT!! SUBATHON TIME! [DAY 2]",
+            ),
+            // Pipe-separated command list, and `18+` must keep its plus.
+            (
+                "🎮 Collab Time! 🎨 Body Painter Arc - No One Will Spot Me | 18+ | !linktree | !discord | !patreon | !merch | !youtooz",
+                "🎮 Collab Time! 🎨 Body Painter Arc - No One Will Spot Me | 18+",
+            ),
+            // Emoji glued to commands + `||` — orphaned decorations go too.
+            (
+                "My OBS Crashed :) Guess IM cooked  ||🩸!youtube 💬!discord !gamersupps 🎮!games",
+                "My OBS Crashed :) Guess IM cooked",
+            ),
+            // …but a legit emoji ENDING of the title itself survives.
+            (
+                "VIRGIN EXPERIENCE: THE AMAZING DIGITAL CIRCUS🤡🎪 ||🩸!youtube 💬!discord",
+                "VIRGIN EXPERIENCE: THE AMAZING DIGITAL CIRCUS🤡🎪",
+            ),
+            // Leading command block: the head junk goes, the title stays.
+            ("!gsupps !store | Hanging Out :) | Gears 4 Later", "Hanging Out :) | Gears 4 Later"),
+            // A bracket pair emptied by the removal disappears.
+            (
+                "What happens if Twitch Chat runs 4 countries at once? (!rules)",
+                "What happens if Twitch Chat runs 4 countries at once?",
+            ),
+            // #ad / #sponsored disclosure tags are junk too.
+            ("Checking out Altered Alma at 11:30! !alma #ad", "Checking out Altered Alma at 11:30!"),
+            // Digit commands (`!24`) and mid-title `> ` shapes.
+            (
+                "🚨[HUGE EVENT]🚨12 HOUR PT.2 [Card Opening> UNHINGED] ||🩸!youtube 💬!discord 🎮!games !tcg #ad",
+                "🚨[HUGE EVENT]🚨12 HOUR PT.2 [Card Opening> UNHINGED]",
+            ),
+            // Command as the object of a dash-separated tail.
+            (
+                "Octopath Travveler speedrun ft. @MochaJones10 on !gamemasters - !schedule",
+                "Octopath Travveler speedrun ft. @MochaJones10 on",
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(trim_title_commands(input), want, "input: {input}");
+        }
+
+        // False-positive guards: exclamations are not commands; a command-free
+        // title comes back VERBATIM (no cleanup pass at all).
+        for verbatim in [
+            "CHIBI PLAYS MARIO YAHOO!!!!!!!",
+            "Beach Day ~ 🏖️ More Karaoke !",
+            "AoE2 climb to 2k all week!  //  Mostly Walking Mon",
+            "Hamtaro Ham-Hams Unite!",
+            "【Karaoke】Let me sing for you!!!",
+        ] {
+            assert_eq!(trim_title_commands(verbatim), verbatim);
+        }
+
+        // A title that is ONLY commands falls back to the original.
+        assert_eq!(trim_title_commands("!gg !tts"), "!gg !tts");
+    }
+
+    #[test]
+    fn title_trimmed_token_expands_and_triggers_rename() {
+        // The token flows through expand_template…
+        let stem = expand_template(
+            "{name} - {title_trimmed}",
+            &TemplateVars {
+                name: "Chan",
+                title: "It's a collab day innit | !froot !frusic",
+                ..Default::default()
+            },
+        );
+        assert_eq!(stem, "Chan - It's a collab day innit");
+        // …and counts as "wants title" so the post-capture rename fires and
+        // the pre-rename stem gets the title-tba placeholder.
+        assert!(template_wants_title("{name}_{title_trimmed}"));
+        assert!(!template_wants_title("{name}_{date}"));
     }
 
     #[test]
