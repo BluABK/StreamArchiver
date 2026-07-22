@@ -621,8 +621,28 @@ pub(super) fn render_chat_message(
                         && file.as_ref().is_some_and(|f| {
                             match draw_cached_emote(ui, cache, f, animate, emote_h, now, misses, ctx)
                             {
-                                Some(resp) => {
-                                    resp.on_hover_text(name);
+                                Some((resp, tex)) => {
+                                    queue_alt_image_preview(ctx, &resp, &tex);
+                                    let resp = resp.on_hover_text(format!(
+                                        "{name}\nAlt: preview full size · right-click: more"
+                                    ));
+                                    let path = f.clone();
+                                    resp.context_menu(|ui| {
+                                        if ui.button("Copy Image").clicked() {
+                                            copy_emote_image_to_clipboard(&path);
+                                            ui.close();
+                                        }
+                                        if ui.button("Open File").clicked() {
+                                            open_path(&path);
+                                            ui.close();
+                                        }
+                                        if ui.button("Open Folder").clicked() {
+                                            if let Some(dir) = path.parent() {
+                                                open_path(dir);
+                                            }
+                                            ui.close();
+                                        }
+                                    });
                                     true
                                 }
                                 None => false,
@@ -744,7 +764,7 @@ pub(super) fn emote_viewer_grid(
                     // Alt-hover: show enlarged image + emote info as a tooltip.
                     // on_hover_ui_at_pointer takes self; clone the response so
                     // img_resp stays usable for the label below.
-                    if let Some(resp) = img_resp.clone() {
+                    if let Some((resp, _)) = img_resp.clone() {
                         if resp.hovered() && ctx.input(|i| i.modifiers.alt) {
                             let (epath, ename, eid, eext) = (
                                 e.path.clone(),
@@ -838,6 +858,10 @@ pub(super) fn emote_viewer_grid(
 /// Promotes a freshly-decoded entry to GPU textures (UI-thread upload), advances
 /// the animation against the global clock `now`, and records `last_drawn` for LRU.
 #[allow(clippy::too_many_arguments)]
+/// Draws the emote and returns its `Response` plus a clone of the texture it
+/// drew — the clone lets callers queue the standard Alt-hover full-resolution
+/// preview ([`queue_alt_image_preview`]) without reaching back into the
+/// mutex-guarded cache.
 pub(super) fn draw_cached_emote(
     ui: &mut egui::Ui,
     cache: &Mutex<HashMap<std::path::PathBuf, crate::emote_anim::EmoteLoad>>,
@@ -847,7 +871,7 @@ pub(super) fn draw_cached_emote(
     now: f64,
     misses: &mut Vec<std::path::PathBuf>,
     ctx: &egui::Context,
-) -> Option<egui::Response> {
+) -> Option<(egui::Response, egui::TextureHandle)> {
     use crate::emote_anim::EmoteLoad;
     let mut g = cache.lock().unwrap_or_else(|e| e.into_inner());
     // Promote Decoded → Ready by uploading the frames to GPU textures here (must be
@@ -875,7 +899,12 @@ pub(super) fn draw_cached_emote(
             let size = egui::vec2(s.x * scale, s.y * scale);
             if animate && anim.is_animated() {
                 let (tex, remaining) = anim.frame_at(now);
-                let resp = ui.add(egui::Image::from_texture(tex).fit_to_exact_size(size));
+                let tex = tex.clone();
+                let resp = ui.add(
+                    egui::Image::from_texture(&tex)
+                        .fit_to_exact_size(size)
+                        .sense(egui::Sense::click()),
+                );
                 // Only schedule the next frame for emotes actually on screen, so a
                 // scrolled-away animation doesn't keep waking the UI.
                 if ui.is_rect_visible(resp.rect) {
@@ -883,10 +912,16 @@ pub(super) fn draw_cached_emote(
                         remaining.min(1.0),
                     ));
                 }
-                Some(resp)
+                Some((resp, tex))
             } else {
                 let (tex, _) = anim.frame_at(0.0);
-                Some(ui.add(egui::Image::from_texture(tex).fit_to_exact_size(size)))
+                let tex = tex.clone();
+                let resp = ui.add(
+                    egui::Image::from_texture(&tex)
+                        .fit_to_exact_size(size)
+                        .sense(egui::Sense::click()),
+                );
+                Some((resp, tex))
             }
         }
     }

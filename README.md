@@ -1811,6 +1811,11 @@ unchanged; they just predate the markers. Replies carry a small **↩ name**
 prefix showing who they answer, and **📣 mod announcements** show as notice
 lines too.
 
+Emote images in the replay have the app's standard image affordances:
+**Alt-hover** shows a full-resolution floating preview, and **right-click**
+offers *Copy Image*, *Open File*, and *Open Folder* for the cached emote
+file.
+
 ![Chat log viewer replaying an archived Twitch chat](doc/screenshots/chat-log-viewer.png)
 
 ### YouTube community posts (📣 Posts)
