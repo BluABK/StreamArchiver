@@ -474,6 +474,23 @@ async fn tick(
     }
     while collab_set.join_next().await.is_some() {}
 
+    // ── Hype-train confirmation (anonymous GQL) ──
+    // One aliased batch request covers every live Twitch monitor polled this
+    // tick (recording monitors are meta_watcher's job). Confirmed trains
+    // land/refresh their stream_event row and calibrate the chat inference.
+    // No false-positive sweep here: this cadence is per-monitor poll
+    // intervals, too coarse to declare an inferred burst unconfirmed.
+    let hype_targets: Vec<(i64, String, String)> = outcomes
+        .iter()
+        .filter(|o| o.live && !o.error)
+        .filter_map(|o| {
+            twitch_logins.get(&o.monitor_id).map(|l| {
+                (o.monitor_id, l.clone(), o.stream_id.clone().unwrap_or_default())
+            })
+        })
+        .collect();
+    ctx.refresh_hype_trains(&hype_targets, false).await;
+
     min_wait.clamp(1, MAX_SLEEP_SECS) as u64
 }
 

@@ -1615,6 +1615,7 @@ pub(super) struct RowActions {
     pub(super) open_schedule: Option<i64>,         // monitor id (open its Next stream popup)
     pub(super) open_collab_history: Option<i64>,   // channel id (open its 🤝 collab history)
     pub(super) open_viewer_stats: Option<i64>,     // channel id (open its 📈 viewer stats)
+    pub(super) mark_hype: Option<i64>,             // channel id (open the 🚂 mark-train dialog)
     pub(super) properties: Option<i64>,            // monitor id
     pub(super) reorganize_monitor: Option<i64>,    // monitor id
     pub(super) reorganize_channel: Option<i64>,    // channel id
@@ -1841,6 +1842,18 @@ pub(super) fn render_instance_row(
             .clicked()
         {
             a.open_viewer_stats = Some(row.channel.id);
+            ui.close();
+        }
+        if ui
+            .button("🚂  Mark hype train…")
+            .on_hover_text(
+                "A hype train is running (or just ran) and wasn't captured? \
+                 Record it manually — the start time you give also teaches the \
+                 chat-side inference what it should have caught.",
+            )
+            .clicked()
+        {
+            a.mark_hype = Some(row.channel.id);
             ui.close();
         }
         ui.separator();

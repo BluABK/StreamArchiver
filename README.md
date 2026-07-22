@@ -1372,12 +1372,37 @@ while recording. Discrete **stream events** are archived alongside:
   bans, chat clears, chat-mode changes and badge-inferred role changes, also
   from the recorded chat (see *Chat logs* below for the replay integration).
   Deletions + timeouts + bans roll up as **Mod acts** in the overview table.
-- **Hype trains (inferred)** — Twitch's real Hype Train API needs a
-  broadcaster-scoped token (and the anonymous PubSub feed is gone), so a
-  **hype-train-like burst** event fires instead when the recorded chat sees
-  5+ sub/gift/bits contributions from 3+ distinct chatters within 5 minutes —
-  marked with an asterisk in the UI to flag that it's a proxy, not Twitch's
-  own train state (no level/goal data).
+- **Hype trains** are captured three ways, one event row per train:
+  - **Confirmed** — the app polls Twitch's *public* hype-train state
+    (the same anonymous GQL data every logged-out viewer sees on the site;
+    no credentials or scopes) for every live Twitch channel: one batched
+    request per poll tick, plus once a minute per recording channel. A
+    confirmed train keeps updating its row while it runs — **level, total
+    points, top contributors (conductors), golden-kappa flag** — and
+    supersedes any inferred sibling. Toggle under *Settings → Maintenance →
+    Hype trains* (default on). Twitch's streamer-set kickoff thresholds
+    themselves aren't readable anonymously — and don't need to be, see
+    auto-tune below.
+  - **Inferred** — the fallback when polling is off or broken: the recorded
+    chat scores every sub/gift/bits/Hype Chat contribution in **points**
+    (configurable weights; tier-2/3 subs count 2×/5×) and flags a
+    train-like burst when a window's summed points, event count and
+    distinct-chatter count all pass their thresholds. Everything is
+    editable under *Settings → Maintenance → Hype trains*, with optional
+    **per-channel sensitivity overrides** (⚙ in the Channel Stats view) for
+    channels much smaller/bigger than your average.
+  - **Manual** — 🚂 *Mark hype train* (Channel Stats button, channel/instance
+    right-click, or right-click a sub/bits event → *"a train started
+    here"*) records a train the automatic capture missed, with a
+    minutes-ago or absolute start time and optional duration.
+
+  **Auto-tune** (default on) calibrates the inference against ground truth:
+  a confirmed or manually-marked train the inference missed **loosens** the
+  thresholds toward what was actually observed before kickoff; an inferred
+  burst Twitch never confirmed — or one you 🗑-delete from the event list —
+  **tightens** them past that burst's size. Every adjustment is listed in
+  the tuning log in Settings; floors and caps keep a single odd sample from
+  disabling detection either way.
 
 Where to look:
 

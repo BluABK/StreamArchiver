@@ -41,8 +41,9 @@ pub(super) struct ViewerStatsPopup {
     /// selector); `None` = the popup's own span selector applies.
     range: Option<(i64, i64)>,
     span: super::PollSpan,
-    /// Lazily-loaded graph data; `None` = (re)query.
-    data: Option<StatsRange>,
+    /// Lazily-loaded graph data; `None` = (re)query. `pub(super)` so the 🚂
+    /// mark dialog can invalidate it after inserting an event.
+    pub(super) data: Option<StatsRange>,
     /// Events-list filter text (window-local).
     filter: String,
 }
@@ -85,7 +86,7 @@ fn event_label(kind: &str) -> &'static str {
         "chat_clear" => "Chat clear",
         "chat_mode" => "Chat mode",
         "role_change" => "Role change",
-        "hype_train" => "Hype train*",
+        "hype_train" => "Hype train",
         "dono" => "Hype Chat",
         "first_chat" => "First chat",
         "milestone" => "Milestone",
@@ -118,9 +119,10 @@ fn event_line(e: &StreamEventRow) -> String {
         "chat_clear" => "chat was cleared".to_string(),
         "chat_mode" => e.detail.clone(),
         "role_change" => format!("{} {}", e.actor, e.detail),
-        // Inferred from contribution bursts — Twitch's real Hype Train API
-        // needs a broadcaster token, so this is a proxy, hence the asterisk.
-        "hype_train" => format!("hype-train-like burst — {}", e.detail),
+        // The detail names its own source: "(confirmed)" = live GQL state
+        // (level, points, conductors), "(inferred)" = chat-burst proxy,
+        // "marked manually" = user-recorded via the 🚂 dialog.
+        "hype_train" => e.detail.clone(),
         // Hype Chat: a paid pinned message (real on-platform money).
         "dono" => format!("{} sent a {} Hype Chat", e.actor, e.detail),
         "first_chat" if e.detail.is_empty() => format!("{} chatted for the first time", e.actor),
@@ -235,6 +237,37 @@ impl StreamArchiverApp {
                         .core
                         .store
                         .set_setting("chstats_auto_refresh", if auto { "1" } else { "0" });
+                }
+                if ui
+                    .button("🚂 Mark hype train")
+                    .on_hover_text(
+                        "Record a hype train the automatic capture missed: you give \
+                         the start time (or how many minutes ago it kicked off) and \
+                         the stored contributions right before it teach the \
+                         inference what to catch next time.",
+                    )
+                    .clicked()
+                {
+                    self.hype_mark_channel = self.chstats_channel.unwrap_or(0);
+                    self.hype_mark_abs.clear();
+                    self.show_hype_mark = true;
+                }
+                if let Some(cid) = self.chstats_channel
+                    && ui
+                        .button("⚙ Sensitivity")
+                        .on_hover_text(
+                            "Per-channel hype-train inference override: raise or \
+                             lower this channel's burst thresholds without touching \
+                             the global tuning (Settings → Maintenance → Hype \
+                             trains).",
+                        )
+                        .clicked()
+                {
+                    self.hype_override_draft = crate::hype::load_overrides(&self.core.store)
+                        .get(&cid)
+                        .copied()
+                        .unwrap_or_default();
+                    self.hype_override_for = Some(cid);
                 }
             });
             // Auto refresh: invalidate the cache once a minute and keep a
@@ -625,7 +658,9 @@ impl StreamArchiverApp {
         }
 
         ui.add_space(10.0);
-        events_table_ui(ui, "chstats_events", &data.events, 200, &mut self.chstats_event_filter);
+        let ev_out =
+            events_table_ui(ui, "chstats_events", &data.events, 200, &mut self.chstats_event_filter);
+        self.apply_events_table_out(channel_id, ev_out);
 
         if let Some((started, ended)) = open_clip {
             let name = self
@@ -636,6 +671,44 @@ impl StreamArchiverApp {
                 .unwrap_or_default();
             let label = format!("{name} — {}", fmt_datetime_short(started));
             self.open_stream_stats(channel_id, &label, started, ended);
+        }
+    }
+
+    /// Execute the events table's right-click actions (shared by the Channel
+    /// Stats view and the 📈 popup): open the 🚂 mark dialog prefilled with a
+    /// row's timestamp, or delete a hype row (tightening the tuning when an
+    /// INFERRED burst is deleted — that's a confirmed false positive).
+    fn apply_events_table_out(&mut self, channel_id: i64, out: EventsTableOut) {
+        if let Some(at) = out.mark_at {
+            self.hype_mark_channel = channel_id;
+            self.hype_mark_abs = chrono::DateTime::from_timestamp(at, 0)
+                .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_default();
+            self.show_hype_mark = true;
+        }
+        if let Some((event_id, tighten, monitor_id, at)) = out.delete {
+            if tighten {
+                let tuning = crate::hype::load_tuning(&self.core.store);
+                let (pts, events, _) = crate::hype::observed_burst(
+                    &self.core.store,
+                    monitor_id,
+                    at - tuning.window_secs,
+                    at + 1,
+                    &tuning,
+                );
+                crate::hype::tighten_for_false(
+                    &self.core.store,
+                    pts,
+                    events,
+                    "a deleted inferred train",
+                );
+                self.hype_tuning = crate::hype::load_tuning(&self.core.store);
+            }
+            let _ = self.core.store.delete_stream_event(event_id);
+            self.chstats_data = None;
+            if let Some(p) = &mut self.viewer_stats_popup {
+                p.data = None;
+            }
         }
     }
 
@@ -706,6 +779,7 @@ impl StreamArchiverApp {
         let popup = self.viewer_stats_popup.as_mut().unwrap();
         let mut open = true;
         let mut new_span: Option<super::PollSpan> = None;
+        let mut ev_out = EventsTableOut::default();
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("viewer_stats_vp"),
             egui::ViewportBuilder::default()
@@ -760,7 +834,7 @@ impl StreamArchiverApp {
                             bucket,
                         );
                         ui.add_space(8.0);
-                        events_table_ui(
+                        ev_out = events_table_ui(
                             ui,
                             "viewer_stats_popup_events",
                             events,
@@ -778,6 +852,7 @@ impl StreamArchiverApp {
         if !open {
             self.viewer_stats_popup = None;
         }
+        self.apply_events_table_out(popup_channel, ev_out);
     }
 }
 
@@ -1032,6 +1107,18 @@ fn viewer_gap_secs(pts: &[(i64, i64)]) -> i64 {
     (deltas[deltas.len() / 2] * 3).max(600)
 }
 
+/// Row actions picked from the events table's right-click menu — the caller
+/// (which owns `self`/the channel context) executes them.
+#[derive(Default)]
+pub(super) struct EventsTableOut {
+    /// "🚂 A train started here" on a contribution row — that row's unix ts.
+    pub mark_at: Option<i64>,
+    /// 🗑 on a hype_train row: `(event id, tighten, monitor_id, at)` —
+    /// `tighten` is true for inferred rows (deleting one is a false-positive
+    /// signal for the auto-tune).
+    pub delete: Option<(i64, bool, i64, i64)>,
+}
+
 /// The recent-events table shown under the graphs, with a live text filter
 /// (user, recipient, kind, or detail — case-insensitive).
 fn events_table_ui(
@@ -1040,9 +1127,10 @@ fn events_table_ui(
     events: &[StreamEventRow],
     limit: usize,
     filter: &mut String,
-) {
+) -> EventsTableOut {
+    let mut out = EventsTableOut::default();
     if events.is_empty() {
-        return;
+        return out;
     }
     let q = filter.trim().to_lowercase();
     let shown: Vec<&StreamEventRow> = events
@@ -1064,7 +1152,9 @@ fn events_table_ui(
         ui.label(count).on_hover_text(
             "Subs, resubs, gift subs and bits come from the recorded chat (so only \
              while a recording with Chat log was running); raids come from chat \
-             and/or EventSub. Newest first.",
+             and/or EventSub; hype trains from live polling, chat inference, or \
+             manual marks. Newest first. Right-click a sub/bits row for \"🚂 a \
+             train started here\", or a hype-train row to delete it.",
         );
         ui.label("🔍");
         ui.add(
@@ -1083,17 +1173,67 @@ fn events_table_ui(
     });
     if shown.is_empty() {
         ui.weak("No events match the filter.");
-        return;
+        return out;
     }
     egui::Grid::new(id).num_columns(3).striped(true).spacing([16.0, 2.0]).show(ui, |ui| {
         for e in shown.iter().take(limit) {
             ui.label(fmt_datetime_short(e.at));
             ui.colored_label(event_color(&e.kind), event_label(&e.kind));
-            ui.label(event_line(e));
+            let line = ui.label(event_line(e));
+            // Row actions (labels are hover-sense — re-interact with click
+            // sense on the same rect so right-click registers).
+            let is_contrib =
+                matches!(e.kind.as_str(), "sub" | "resub" | "subgift" | "bits" | "dono");
+            let is_hype = e.kind == "hype_train";
+            if is_contrib || is_hype {
+                let ctx_resp = ui.interact(
+                    line.rect,
+                    egui::Id::new(id).with("evctx").with(e.id),
+                    egui::Sense::click(),
+                );
+                ctx_resp.context_menu(|ui| {
+                    if is_contrib
+                        && ui
+                            .button("🚂 A train started here")
+                            .on_hover_text(
+                                "Mark a hype train as kicking off at this event's \
+                                 time — opens the manual-mark dialog with the \
+                                 timestamp prefilled.",
+                            )
+                            .clicked()
+                    {
+                        out.mark_at = Some(e.at);
+                        ui.close();
+                    }
+                    if is_hype {
+                        let inferred = e.detail.contains("(inferred)");
+                        let (label, hover) = if inferred {
+                            (
+                                "🗑 Not a train (delete & tighten)",
+                                "Delete this inferred burst AND count it as a false \
+                                 positive: with auto-tune on, the thresholds move up \
+                                 past this burst's size so it wouldn't fire again.",
+                            )
+                        } else {
+                            (
+                                "🗑 Delete event",
+                                "Remove this train from the history. No tuning \
+                                 change (confirmed/manual trains aren't inference \
+                                 mistakes).",
+                            )
+                        };
+                        if ui.button(label).on_hover_text(hover).clicked() {
+                            out.delete = Some((e.id, inferred, e.monitor_id, e.at));
+                            ui.close();
+                        }
+                    }
+                });
+            }
             ui.end_row();
         }
     });
     if shown.len() > limit {
         ui.weak(format!("(+{} more in this span)", shown.len() - limit));
     }
+    out
 }

@@ -251,11 +251,24 @@ async fn session(
     // Moderation tracker (deletions/purges/room modes/role badges) — per
     // connection, so its baselines reset with each reconnect.
     let mut tracker = EventTracker::default();
+    if let Some(ctx) = events {
+        tracker.tuning = load_hype_tuning(ctx);
+    }
+    let mut tuning_loaded = crate::models::now_unix();
 
     let result: anyhow::Result<()> = async {
         loop {
             if done.load(Ordering::SeqCst) || shutdown.load(Ordering::SeqCst) {
                 return Ok(());
+            }
+            // Keep the hype tuning current mid-recording (Settings edits and
+            // auto-tune adjustments apply within TUNING_REFRESH_SECS). The
+            // loop wakes at least once a second, so this can't starve.
+            if let Some(ctx) = events
+                && crate::models::now_unix() - tuning_loaded >= TUNING_REFRESH_SECS
+            {
+                tuning_loaded = crate::models::now_unix();
+                tracker.tuning = load_hype_tuning(ctx);
             }
             // 1s read timeout so the stop flags are re-checked even on a quiet
             // chat — and the flush timer fires even when no message arrives.
@@ -303,10 +316,16 @@ async fn session(
                         if let Some(ev) = contribution {
                             // Sub/gift/bits contributions also feed the
                             // hype-train inference (burst -> one extra event
-                            // + a replay notice).
+                            // + a replay notice), weighted by the tuning.
+                            let pts = crate::hype::contribution_points(
+                                ev.kind,
+                                ev.amount,
+                                &ev.tier,
+                                &tracker.tuning,
+                            );
                             if matches!(ev.kind, "sub" | "resub" | "subgift" | "bits" | "dono")
                                 && let Some((hype, marker)) =
-                                    tracker.note_contribution(ev.ts, &ev.actor)
+                                    tracker.note_contribution(ev.ts, &ev.actor, pts)
                             {
                                 sink.push(&marker);
                                 if events.is_some() {
@@ -363,6 +382,20 @@ async fn session(
     // buffered tail must land on disk before the reconnect/finalize.
     let flushed = sink.flush().await;
     result.and(flushed)
+}
+
+/// The effective hype tuning for this chat session's channel (global merged
+/// with the channel's override). Falls back to defaults when the monitor row
+/// is gone — better a default-tuned inference than none.
+fn load_hype_tuning(ctx: &ChatEventCtx) -> crate::hype::HypeTuning {
+    let channel_id = ctx
+        .store
+        .get_monitor_with_channel(ctx.monitor_id)
+        .ok()
+        .flatten()
+        .map(|m| m.channel.id)
+        .unwrap_or(0);
+    crate::hype::load_effective(&ctx.store, channel_id)
 }
 
 /// Parse a (possibly tag-prefixed) IRC line into a JSON log line, or `None` if it
@@ -638,32 +671,34 @@ struct EventTracker {
     room: Option<(bool, i64, bool, i64, bool)>,
     /// login -> (has mod badge, has VIP badge), first seen = baseline.
     roles: std::collections::HashMap<String, (bool, bool)>,
-    /// Recent sub/gift/bits contributions `(ts, actor)` within
-    /// [`HYPE_WINDOW_SECS`] — the hype-train inference input.
-    contrib: std::collections::VecDeque<(i64, String)>,
+    /// Recent sub/gift/bits contributions `(ts, actor, hype points)` within
+    /// the tuning's window — the hype-train inference input.
+    contrib: std::collections::VecDeque<(i64, String, i64)>,
     /// A hype-train-like burst is currently flagged (no re-trigger until the
     /// contribution window drains empty).
     hype_active: bool,
+    /// Inference weights/thresholds ([`crate::hype`]) — loaded per channel at
+    /// session start and refreshed every [`TUNING_REFRESH_SECS`] so Settings
+    /// edits reach a running recording; defaults when chat has no DB context.
+    tuning: crate::hype::HypeTuning,
 }
 
-/// Hype-train inference window (matches Twitch's 5-minute train timer).
-const HYPE_WINDOW_SECS: i64 = 300;
-/// Contributions within the window needed to flag a burst…
-const HYPE_MIN_EVENTS: usize = 5;
-/// …from at least this many distinct people (a single whale gifting in
-/// batches is generous, but it isn't a train).
-const HYPE_MIN_ACTORS: usize = 3;
+/// How often a live session re-reads the hype tuning from settings.
+const TUNING_REFRESH_SECS: i64 = 300;
 
 impl EventTracker {
-    /// Note one sub/gift/bits contribution and infer a **hype-train-like
-    /// burst**: Twitch's real Hype Train API needs a broadcaster-scoped token
-    /// (and anonymous PubSub is gone), so this is the honest anonymous proxy —
-    /// [`HYPE_MIN_EVENTS`] contributions from [`HYPE_MIN_ACTORS`] distinct
-    /// chatters within [`HYPE_WINDOW_SECS`]. One event per burst; re-arms only
-    /// after the window drains empty (no contribution for 5 minutes).
-    fn note_contribution(&mut self, ts: i64, actor: &str) -> Option<(ChatEvent, String)> {
-        self.contrib.push_back((ts, actor.to_lowercase()));
-        while self.contrib.front().is_some_and(|(t, _)| ts - t > HYPE_WINDOW_SECS) {
+    /// Note one sub/gift/bits contribution (pre-scored via
+    /// [`crate::hype::contribution_points`]) and infer a **hype-train-like
+    /// burst**: enough points/events from enough distinct chatters within the
+    /// tuning window (all gates from [`crate::hype::HypeTuning`] — the values
+    /// GQL confirmations and manual marks auto-tune). This inference is the
+    /// fallback signal; a GQL-confirmed train supersedes and deletes its
+    /// `(inferred)` rows. One event per burst; re-arms only after the window
+    /// drains empty.
+    fn note_contribution(&mut self, ts: i64, actor: &str, points: i64) -> Option<(ChatEvent, String)> {
+        self.contrib.push_back((ts, actor.to_lowercase(), points));
+        let window = self.tuning.window_secs.max(1);
+        while self.contrib.front().is_some_and(|(t, ..)| ts - t > window) {
             self.contrib.pop_front();
         }
         // Everything older drained away -> any previous burst is over.
@@ -674,21 +709,26 @@ impl EventTracker {
             return None;
         }
         let uniq: std::collections::HashSet<&str> =
-            self.contrib.iter().map(|(_, a)| a.as_str()).collect();
-        if self.contrib.len() < HYPE_MIN_EVENTS || uniq.len() < HYPE_MIN_ACTORS {
+            self.contrib.iter().map(|(_, a, _)| a.as_str()).collect();
+        let pts: i64 = self.contrib.iter().map(|(.., p)| p).sum();
+        if (self.contrib.len() as i64) < self.tuning.min_events
+            || (uniq.len() as i64) < self.tuning.min_actors
+            || (self.tuning.min_points > 0 && pts < self.tuning.min_points)
+        {
             return None;
         }
         self.hype_active = true;
         let detail = format!(
-            "{} contributions from {} chatters in 5 min (inferred)",
+            "{} contributions ({pts} pts) from {} chatters in {} min (inferred)",
             self.contrib.len(),
-            uniq.len()
+            uniq.len(),
+            (window + 59) / 60,
         );
         let ev = ChatEvent {
             kind: "hype_train",
             actor: String::new(),
             target: String::new(),
-            amount: self.contrib.len() as i64,
+            amount: pts,
             tier: String::new(),
             detail: detail.clone(),
             ts,
@@ -1120,32 +1160,45 @@ mod tests {
 
     #[test]
     fn hype_train_burst_inference() {
+        // Defaults: window 300s, min 1000 pts, 3 events, 2 actors.
         let mut t = EventTracker::default();
-        // Four contributions from three people: still below the event floor.
-        assert!(t.note_contribution(1000, "a").is_none());
-        assert!(t.note_contribution(1010, "b").is_none());
-        assert!(t.note_contribution(1020, "c").is_none());
-        assert!(t.note_contribution(1030, "a").is_none());
-        // Fifth event, three uniques -> burst flagged exactly once.
-        let (ev, marker) = t.note_contribution(1040, "b").expect("burst fires");
-        assert_eq!((ev.kind, ev.amount), ("hype_train", 5));
-        assert!(ev.detail.contains("5 contributions from 3 chatters"));
+        // Two subs from two people: event floor not reached yet.
+        assert!(t.note_contribution(1000, "a", 500).is_none());
+        assert!(t.note_contribution(1010, "b", 500).is_none());
+        // Third event crosses all gates (1500 pts, 3 events, 2 actors).
+        let (ev, marker) = t.note_contribution(1020, "a", 500).expect("burst fires");
+        assert_eq!((ev.kind, ev.amount), ("hype_train", 1500));
+        assert!(ev.detail.contains("3 contributions (1500 pts) from 2 chatters"), "{}", ev.detail);
+        assert!(ev.detail.ends_with("(inferred)"), "{}", ev.detail);
         let m: serde_json::Value = serde_json::from_str(&marker).unwrap();
         assert!(m["text"].as_str().unwrap().starts_with("Hype-train-like burst"));
         // More contributions during the active burst stay quiet.
-        assert!(t.note_contribution(1100, "d").is_none());
+        assert!(t.note_contribution(1100, "d", 500).is_none());
         // After the window drains (>5 min gap), a new burst can fire again.
-        assert!(t.note_contribution(2000, "a").is_none());
-        assert!(t.note_contribution(2010, "b").is_none());
-        assert!(t.note_contribution(2020, "c").is_none());
-        assert!(t.note_contribution(2030, "d").is_none());
-        assert!(t.note_contribution(2040, "e").is_some(), "re-armed after the lapse");
+        assert!(t.note_contribution(2000, "a", 500).is_none());
+        assert!(t.note_contribution(2010, "b", 500).is_none());
+        assert!(t.note_contribution(2020, "c", 500).is_some(), "re-armed after the lapse");
 
-        // A single whale mass-gifting never counts as a train.
+        // A single whale mass-gifting never counts as a train (actor gate).
         let mut t = EventTracker::default();
         for i in 0..10 {
-            assert!(t.note_contribution(3000 + i, "whale").is_none());
+            assert!(t.note_contribution(3000 + i, "whale", 2500).is_none());
         }
+
+        // Points gate: many tiny cheers from many people still need the
+        // summed points when the gate is enabled.
+        let mut t = EventTracker::default();
+        assert!(t.note_contribution(4000, "a", 100).is_none());
+        assert!(t.note_contribution(4010, "b", 100).is_none());
+        assert!(t.note_contribution(4020, "c", 100).is_none(), "300 pts < 1000");
+        assert!(t.note_contribution(4030, "d", 700).is_some(), "1000 pts reached");
+
+        // min_points = 0 disables the points gate entirely.
+        let mut t = EventTracker::default();
+        t.tuning.min_points = 0;
+        assert!(t.note_contribution(5000, "a", 1).is_none());
+        assert!(t.note_contribution(5010, "b", 1).is_none());
+        assert!(t.note_contribution(5020, "c", 1).is_some(), "count gates alone decide");
     }
 
     #[test]

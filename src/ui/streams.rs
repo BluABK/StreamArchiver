@@ -115,6 +115,8 @@ struct StreamsOut {
     /// `(channel id, window title, since, until)` — 📈 popup clamped to one
     /// broadcast's time range ("Stream stats" on a stream row).
     open_stream_stats: Option<(i64, String, i64, i64)>,
+    /// Channel id to open the 🚂 mark-hype-train dialog for.
+    mark_hype: Option<i64>,
 }
 
 #[derive(Clone, Copy)]
@@ -931,6 +933,7 @@ impl StreamArchiverApp {
             open_collab_history,
             open_viewer_stats,
             open_stream_stats,
+            mark_hype,
         } = out;
         if let Some(rid) = open_ad_popup
             && !self.ad_popups.contains(&rid)
@@ -956,6 +959,11 @@ impl StreamArchiverApp {
         }
         if let Some((cid, label, since, until)) = open_stream_stats {
             self.open_stream_stats(cid, &label, since, until);
+        }
+        if let Some(cid) = mark_hype.or(acts.mark_hype) {
+            self.hype_mark_channel = cid;
+            self.hype_mark_abs.clear();
+            self.show_hype_mark = true;
         }
         if let Some(rec_id) = open_recover_take {
             self.open_recover_vod_from_seed(rec_id);
@@ -1736,6 +1744,18 @@ impl StreamArchiverApp {
                     .clicked()
                 {
                     out.open_viewer_stats = Some(cid);
+                    ui.close();
+                }
+                if ui
+                    .button("🚂  Mark hype train…")
+                    .on_hover_text(
+                        "A hype train is running (or just ran) and wasn't captured? \
+                         Record it manually — the start time you give also teaches \
+                         the chat-side inference what it should have caught.",
+                    )
+                    .clicked()
+                {
+                    out.mark_hype = Some(cid);
                     ui.close();
                 }
                 ui.separator();

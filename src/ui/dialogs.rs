@@ -1085,6 +1085,330 @@ impl StreamArchiverApp {
         }
     }
 
+    /// "🚂 Mark hype train" dialog: records a train the automatic capture
+    /// missed (channel + start time + optional duration), then retro-scores
+    /// the stored contributions right before the start so the inference can
+    /// be loosened toward what it should have caught (the auto-tune's
+    /// manual-label path).
+    #[allow(deprecated)]
+    pub(super) fn hype_mark_window(&mut self, ctx: &egui::Context) {
+        if !self.show_hype_mark {
+            return;
+        }
+        let mut open = true;
+        let mut do_mark = false;
+        let mut channel = self.hype_mark_channel;
+        let mut mins_ago = self.hype_mark_mins_ago;
+        let mut abs = self.hype_mark_abs.clone();
+        let mut dur = self.hype_mark_dur;
+        let mut channels: Vec<(i64, String)> =
+            self.channels.iter().map(|c| (c.id, c.name.clone())).collect();
+        channels.sort_by_key(|(_, n)| n.to_lowercase());
+
+        // Absolute local time wins when parseable; else "minutes ago".
+        let parse_abs = |s: &str| -> Option<i64> {
+            let dt = chrono::NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%d %H:%M").ok()?;
+            use chrono::offset::LocalResult;
+            match dt.and_local_timezone(chrono::Local) {
+                LocalResult::Single(t) | LocalResult::Ambiguous(t, _) => Some(t.timestamp()),
+                LocalResult::None => None,
+            }
+        };
+        let abs_ts = parse_abs(&abs);
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("hype_mark_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("Mark hype train")
+                .with_inner_size([460.0, 240.0])
+                .with_resizable(false),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.add_space(4.0);
+                    ui.label(
+                        "Record a hype train that ran without being captured. The \
+                         contributions stored just before the start teach the \
+                         inference what to catch next time.",
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Channel:");
+                        let sel = channels
+                            .iter()
+                            .find(|(id, _)| *id == channel)
+                            .map(|(_, n)| n.clone())
+                            .unwrap_or_else(|| "— pick —".into());
+                        egui::ComboBox::from_id_salt("hype_mark_channel")
+                            .selected_text(sel)
+                            .show_ui(ui, |ui| {
+                                for (cid, name) in &channels {
+                                    if ui.selectable_label(channel == *cid, name).clicked() {
+                                        channel = *cid;
+                                    }
+                                }
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Started:");
+                        ui.add(
+                            egui::DragValue::new(&mut mins_ago).range(0..=1440).suffix(" min ago"),
+                        )
+                        .on_hover_text(
+                            "How long ago the train kicked off — used when no \
+                             absolute time is given below.",
+                        );
+                        ui.label("or at");
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut abs)
+                                .desired_width(130.0)
+                                .hint_text("YYYY-MM-DD HH:MM"),
+                        );
+                        resp.on_hover_text(
+                            "Absolute local start time — wins over 'minutes ago' \
+                             when filled in and parseable.",
+                        );
+                        if !abs.trim().is_empty() && abs_ts.is_none() {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(0xe0, 0xb0, 0x6c),
+                                "⚠ format",
+                            );
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Duration:");
+                        ui.add(egui::DragValue::new(&mut dur).range(0..=240).suffix(" min"))
+                            .on_hover_text(
+                                "Optional — how long the train ran (0 = unknown). \
+                                 Recorded in the event's detail only.",
+                            );
+                    });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let ok = ui.add_enabled(channel != 0, egui::Button::new("✔  Mark"));
+                        if ok
+                            .on_hover_text(
+                                "Insert the train into the channel's event history \
+                                 and (with auto-tune on) loosen the inference if it \
+                                 should have fired on the stored contributions.",
+                            )
+                            .clicked()
+                        {
+                            do_mark = true;
+                        }
+                        if ui.button("✖  Cancel").clicked() {
+                            open = false;
+                        }
+                    });
+                });
+            },
+        );
+
+        self.hype_mark_channel = channel;
+        self.hype_mark_mins_ago = mins_ago;
+        self.hype_mark_abs = abs;
+        self.hype_mark_dur = dur;
+
+        if do_mark && channel != 0 {
+            let start = abs_ts.unwrap_or_else(|| now_unix() - mins_ago.max(0) * 60);
+            self.record_manual_hype_train(channel, start, dur);
+            self.show_hype_mark = false;
+        } else if !open {
+            self.show_hype_mark = false;
+        }
+    }
+
+    /// Insert a manually-marked hype train for `channel_id` starting at
+    /// `start` and feed the auto-tune from the contributions stored in the
+    /// window before it (mirrors what a GQL confirmation does).
+    fn record_manual_hype_train(&mut self, channel_id: i64, start: i64, dur_min: i64) {
+        let store = &self.core.store;
+        // The train belongs to the channel's Twitch monitor (trains are
+        // Twitch-only); fall back to any monitor so the mark never fails.
+        let rows = store.list_monitors_with_channels().unwrap_or_default();
+        let monitor_id = rows
+            .iter()
+            .filter(|r| r.channel.id == channel_id)
+            .find(|r| r.monitor.platform() == crate::models::Platform::Twitch)
+            .or_else(|| rows.iter().find(|r| r.channel.id == channel_id))
+            .map(|r| r.monitor.id);
+        let Some(monitor_id) = monitor_id else {
+            self.status = "Mark failed: channel has no instances".into();
+            return;
+        };
+        let tuning = crate::hype::load_tuning(store);
+        let win = tuning.window_secs.max(1);
+        let observed =
+            crate::hype::observed_burst(store, monitor_id, start - win, start + 60, &tuning);
+        let mut detail = format!(
+            "marked manually — {} pts / {} contributions / {} chatters on record before kickoff",
+            observed.0, observed.1, observed.2
+        );
+        if dur_min > 0 {
+            detail.push_str(&format!(" · ran ~{dur_min} min"));
+        }
+        let _ = store.record_stream_event(
+            monitor_id,
+            start,
+            "",
+            "hype_train",
+            "",
+            "",
+            observed.0,
+            &format!("manual:{start}"),
+            &detail,
+        );
+        // Same rule as a GQL confirmation: an inferred row near the start
+        // means the inference caught it (superseded, no tuning); otherwise
+        // stored contributions become a loosening sample.
+        match store.delete_inferred_hype_near(monitor_id, start, win) {
+            Ok(n) if n > 0 => {}
+            _ => {
+                if observed.1 > 0 {
+                    crate::hype::loosen_for_missed(store, observed, "a manual mark");
+                    self.hype_tuning = crate::hype::load_tuning(store);
+                }
+            }
+        }
+        self.chstats_data = None;
+        if let Some(p) = &mut self.viewer_stats_popup {
+            p.data = None;
+        }
+        self.status = "Hype train marked".into();
+    }
+
+    /// "⚙ Sensitivity" per-channel hype-train override editor (opened from
+    /// the Channel Stats controls row; `hype_override_for` = channel id).
+    #[allow(deprecated)]
+    pub(super) fn hype_override_window(&mut self, ctx: &egui::Context) {
+        let Some(channel_id) = self.hype_override_for else { return };
+        let name = self
+            .channels
+            .iter()
+            .find(|c| c.id == channel_id)
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| format!("channel {channel_id}"));
+        let global = crate::hype::load_tuning(&self.core.store);
+        let mut draft = self.hype_override_draft;
+        let mut open = true;
+        let mut do_save = false;
+
+        // One row per gate: a "use global" checkbox + a DragValue that only
+        // exists while overridden.
+        fn gate_row(
+            ui: &mut egui::Ui,
+            label: &str,
+            hover: &str,
+            slot: &mut Option<i64>,
+            global: i64,
+            range: std::ops::RangeInclusive<i64>,
+            suffix: &str,
+        ) {
+            ui.label(label).on_hover_text(hover.to_string());
+            let mut use_global = slot.is_none();
+            if ui
+                .checkbox(&mut use_global, "use global")
+                .on_hover_text(format!("Global value: {global}{suffix}"))
+                .changed()
+            {
+                *slot = if use_global { None } else { Some(global) };
+            }
+            match slot {
+                Some(v) => {
+                    ui.add(egui::DragValue::new(v).range(range).suffix(suffix))
+                        .on_hover_text("This channel's value — the global tuning is untouched");
+                }
+                None => {
+                    ui.weak(format!("{global}{suffix}"));
+                }
+            }
+            ui.end_row();
+        }
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("hype_override_vp"),
+            egui::ViewportBuilder::default()
+                .with_title(format!("{name} — hype sensitivity"))
+                .with_inner_size([420.0, 210.0])
+                .with_resizable(false),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.add_space(4.0);
+                    ui.label(
+                        "Override the burst thresholds for this channel only — a \
+                         small channel's trains ride on far fewer contributions \
+                         than a big one's. Weights and window stay global \
+                         (Settings → Maintenance → Hype trains).",
+                    );
+                    ui.add_space(6.0);
+                    egui::Grid::new("hype_override_grid")
+                        .num_columns(3)
+                        .spacing([10.0, 6.0])
+                        .show(ui, |ui| {
+                            gate_row(
+                                ui,
+                                "Min points",
+                                "Summed contribution points needed in the window \
+                                 (0 = points gate off for this channel).",
+                                &mut draft.min_points,
+                                global.min_points,
+                                0..=10_000,
+                                " pts",
+                            );
+                            gate_row(
+                                ui,
+                                "Min contributions",
+                                "Separate sub/gift/bits/Hype Chat events needed.",
+                                &mut draft.min_events,
+                                global.min_events,
+                                1..=20,
+                                "",
+                            );
+                            gate_row(
+                                ui,
+                                "Min chatters",
+                                "Distinct contributors needed.",
+                                &mut draft.min_actors,
+                                global.min_actors,
+                                1..=10,
+                                "",
+                            );
+                        });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("✔  Save")
+                            .on_hover_text(
+                                "Store the override (checked rows keep following \
+                                 the global tuning). Applies to running \
+                                 recordings within 5 minutes.",
+                            )
+                            .clicked()
+                        {
+                            do_save = true;
+                        }
+                        if ui.button("✖  Cancel").clicked() {
+                            open = false;
+                        }
+                    });
+                });
+            },
+        );
+
+        self.hype_override_draft = draft;
+        if do_save {
+            crate::hype::save_override(&self.core.store, channel_id, draft);
+            self.hype_override_for = None;
+        } else if !open {
+            self.hype_override_for = None;
+        }
+    }
+
     /// Dialog for naming and saving a custom filename-template preset.
     #[allow(deprecated)]
     pub(super) fn save_preset_window(&mut self, ctx: &egui::Context) {

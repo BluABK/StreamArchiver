@@ -54,6 +54,9 @@ impl StreamArchiverApp {
             .flatten()
             .as_deref()
             != Some("0");
+        // Hype-train GQL confirmation defaults on; tuning blob for Settings.
+        let hype_gql = crate::hype::gql_enabled(&core.store);
+        let hype_tuning = crate::hype::load_tuning(&core.store);
         // Do Not Disturb defaults off in both dimensions.
         let dnd_enabled =
             setting_or_empty(&core, crate::notifications::K_DND_ENABLED) == "1";
@@ -611,6 +614,15 @@ impl StreamArchiverApp {
             chstats_loaded_at: 0,
             chstats_event_filter: String::new(),
             viewer_stats_popup: None,
+            hype_gql,
+            hype_tuning,
+            show_hype_mark: false,
+            hype_mark_channel: 0,
+            hype_mark_mins_ago: 5,
+            hype_mark_abs: String::new(),
+            hype_mark_dur: 0,
+            hype_override_for: None,
+            hype_override_draft: crate::hype::HypeOverride::default(),
             spark_data: std::collections::HashMap::new(),
             spark_loaded_at: 0,
             io_hist: Vec::new(),

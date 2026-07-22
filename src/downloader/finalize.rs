@@ -1125,6 +1125,15 @@ pub(super) async fn meta_watcher(
                     &meta.title,
                 )
                 .await;
+                // Hype-train confirmation, recording-time half of the dual
+                // feed. The 60 s cadence makes "no train" a tight statement,
+                // so this side also runs the false-positive sweep that
+                // tightens the inference tuning.
+                ctx.refresh_hype_trains(
+                    &[(monitor_id, login.clone(), sample_stream_id.clone())],
+                    true,
+                )
+                .await;
             }
             if let Some(rule) = &stop_rule
                 && !stop_sent

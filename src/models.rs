@@ -2201,6 +2201,9 @@ pub struct ViewerBucket {
 /// raids from chat and/or EventSub `channel.raid`.
 #[derive(Clone)]
 pub struct StreamEventRow {
+    /// Row id — the events table's 🗑 delete and "train started here"
+    /// actions target it.
+    pub id: i64,
     /// Kept for future per-instance filtering; queries are channel-scoped.
     #[allow(dead_code)]
     pub monitor_id: i64,
@@ -2219,7 +2222,9 @@ pub struct StreamEventRow {
     /// Bits cheered, gift-batch size, raid party size, resub months, or
     /// timeout seconds.
     pub amount: i64,
-    /// Twitch sub plan (`1000`/`2000`/`3000`/`Prime`) where applicable.
+    /// Twitch sub plan (`1000`/`2000`/`3000`/`Prime`) where applicable. For
+    /// `hype_train` rows this is the train's key instead: the GQL execution
+    /// id (confirmed), `manual:<ts>` (user-marked), or `''` (inferred).
     pub tier: String,
     /// Free-text payload (schema v60): deleted-message excerpt, chat-mode
     /// change description, or role-change description.
@@ -2401,6 +2406,22 @@ pub fn now_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// `1234567` → `"1,234,567"` (readout formatting for big counts).
+pub fn group_thousands(n: i64) -> String {
+    let s = n.abs().to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3 + 1);
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    if n < 0 {
+        out.push('-');
+    }
+    out.chars().rev().collect()
 }
 
 /// One recording attempt ("take") of a stream — a single capture-process run.

@@ -20,6 +20,7 @@ mod grid_columns;
 mod disposal;
 mod head_backfill;
 mod hls_preview;
+mod hype;
 mod imports;
 mod inspector;
 mod io_gate;

@@ -204,7 +204,7 @@ impl Store {
         let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT e.monitor_id, e.at, e.stream_id, e.kind, e.actor, e.target, e.amount, e.tier,
-                    e.detail
+                    e.detail, e.id
              FROM stream_event e
              JOIN monitor m ON m.id = e.monitor_id
              WHERE m.channel_id = ?1 AND e.at >= ?2 AND e.at < ?3
@@ -222,10 +222,118 @@ impl Store {
                     amount: r.get(6)?,
                     tier: r.get(7)?,
                     detail: r.get(8)?,
+                    id: r.get(9)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// The hype-scoreable contributions for one monitor in `[since, until)`:
+    /// `(kind, actor, amount, tier)`, oldest first. Feeds
+    /// `hype::observed_burst` (retro-analysis of a train's run-up).
+    pub fn contribution_events_range(
+        &self,
+        monitor_id: i64,
+        since: i64,
+        until: i64,
+    ) -> Result<Vec<(String, String, i64, String)>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT kind, actor, amount, tier FROM stream_event
+             WHERE monitor_id = ?1 AND at >= ?2 AND at < ?3
+               AND kind IN ('sub','resub','subgift','bits','dono')
+             ORDER BY at",
+        )?;
+        let rows = stmt
+            .query_map(params![monitor_id, since, until], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Upsert a GQL-confirmed hype train, keyed on `(monitor_id,
+    /// kind='hype_train', tier=train_id)` — one row per train that keeps
+    /// updating (level/points/detail) while the train runs. Returns `true`
+    /// when this is the FIRST sighting (caller then dedups inferred rows and
+    /// feeds the auto-tune).
+    pub fn upsert_hype_train_event(
+        &self,
+        monitor_id: i64,
+        started_at: i64,
+        stream_id: &str,
+        train_id: &str,
+        total_points: i64,
+        detail: &str,
+    ) -> Result<bool> {
+        let conn = self.db();
+        let updated = conn.execute(
+            "UPDATE stream_event
+             SET at = ?3, amount = ?4, detail = ?5,
+                 stream_id = CASE WHEN ?6 != '' THEN ?6 ELSE stream_id END
+             WHERE monitor_id = ?1 AND kind = 'hype_train' AND tier = ?2",
+            params![monitor_id, train_id, started_at, total_points, detail, stream_id],
+        )?;
+        if updated > 0 {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT INTO stream_event(monitor_id, at, stream_id, kind, actor, target, amount, tier, detail)
+             VALUES(?1, ?2, ?3, 'hype_train', '', '', ?4, ?5, ?6)",
+            params![monitor_id, started_at, stream_id, total_points, train_id, detail],
+        )?;
+        Ok(true)
+    }
+
+    /// Delete chat-inferred hype_train rows near `at` (a confirmed train
+    /// supersedes them). Returns how many were removed — non-zero means the
+    /// inference had caught this train (no loosening needed).
+    pub fn delete_inferred_hype_near(&self, monitor_id: i64, at: i64, window: i64) -> Result<usize> {
+        let conn = self.db();
+        let n = conn.execute(
+            "DELETE FROM stream_event
+             WHERE monitor_id = ?1 AND kind = 'hype_train'
+               AND detail LIKE '%(inferred)%'
+               AND at BETWEEN ?2 - ?3 AND ?2 + ?3",
+            params![monitor_id, at, window],
+        )?;
+        Ok(n)
+    }
+
+    /// Inferred hype_train rows for `monitor_id` since `since` that no GQL
+    /// poll has confirmed or already marked: `(id, at)`. The false-positive
+    /// sweep marks each via [`Self::mark_hype_unconfirmed`].
+    pub fn unconfirmed_inferred_hype(&self, monitor_id: i64, since: i64) -> Result<Vec<(i64, i64)>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id, at FROM stream_event
+             WHERE monitor_id = ?1 AND kind = 'hype_train' AND at >= ?2
+               AND detail LIKE '%(inferred)%' AND detail NOT LIKE '%· unconfirmed%'",
+        )?;
+        let rows = stmt
+            .query_map(params![monitor_id, since], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Stamp an inferred hype row as GQL-unconfirmed (idempotence marker for
+    /// the false-positive auto-tune — each row tightens at most once).
+    pub fn mark_hype_unconfirmed(&self, event_id: i64) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE stream_event SET detail = detail || ' · unconfirmed'
+             WHERE id = ?1 AND detail NOT LIKE '%· unconfirmed%'",
+            params![event_id],
+        )?;
+        Ok(())
+    }
+
+    /// Delete one stream event by id (the events table's 🗑 action).
+    pub fn delete_stream_event(&self, event_id: i64) -> Result<()> {
+        let conn = self.db();
+        conn.execute("DELETE FROM stream_event WHERE id = ?1", params![event_id])?;
+        Ok(())
     }
 
     /// Per-channel event totals since `since_unix` for the overview table:
@@ -533,6 +641,50 @@ mod tests {
         assert_eq!((a.peak_viewers, a.live_secs), (300, 120));
         assert_eq!(a.totals, [0, 20, 0, 1, 0, 0], "gift batch + time-matched raid");
         assert_eq!(a.ended - a.started, 120, "sample envelope spans both buckets");
+    }
+
+    #[test]
+    fn hype_train_upsert_dedup_and_sweep_helpers() {
+        let store = Store::open_in_memory().unwrap();
+        let (cid, mid) = channel_with_monitor(&store);
+        let t = 3_000_000;
+
+        // Chat inference fires first…
+        store
+            .record_stream_event(mid, t, "s1", "hype_train", "", "", 1500, "", "3 contributions (1500 pts) from 2 chatters in 5 min (inferred)")
+            .unwrap();
+        // …then GQL confirms the real train: first sighting inserts…
+        assert!(store.upsert_hype_train_event(mid, t + 30, "s1", "tr-1", 2000, "level 1 · 2,000 pts (confirmed)").unwrap());
+        // …and its inferred sibling near the kickoff gets superseded.
+        assert_eq!(store.delete_inferred_hype_near(mid, t + 30, 300).unwrap(), 1);
+        // Later polls update the SAME row (level/points rise).
+        assert!(!store.upsert_hype_train_event(mid, t + 30, "s1", "tr-1", 9000, "level 4 · 9,000 pts (confirmed)").unwrap());
+        let events = store.stream_events_range(cid, 0, i64::MAX).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].amount, 9000);
+        assert_eq!(events[0].tier, "tr-1");
+        assert!(events[0].detail.contains("level 4"));
+
+        // Contribution scan feeds hype::observed_burst (only scoreable kinds).
+        store.record_stream_event(mid, t + 100, "s1", "sub", "a", "", 1, "1000", "").unwrap();
+        store.record_stream_event(mid, t + 101, "s1", "bits", "b", "", 300, "", "").unwrap();
+        store.record_stream_event(mid, t + 102, "s1", "first_chat", "c", "", 1, "", "").unwrap();
+        assert_eq!(store.contribution_events_range(mid, t + 100, t + 200).unwrap().len(), 2);
+
+        // False-positive sweep: an unconfirmed inferred row is found once,
+        // marked, then never returned again; delete removes it for good.
+        store
+            .record_stream_event(mid, t + 500, "s1", "hype_train", "", "", 400, "", "3 contributions (400 pts) from 2 chatters in 5 min (inferred)")
+            .unwrap();
+        let rows = store.unconfirmed_inferred_hype(mid, 0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, t + 500);
+        store.mark_hype_unconfirmed(rows[0].0).unwrap();
+        assert!(store.unconfirmed_inferred_hype(mid, 0).unwrap().is_empty());
+        let ev = store.stream_events_range(cid, 0, i64::MAX).unwrap();
+        assert!(ev.iter().any(|e| e.detail.ends_with("· unconfirmed")));
+        store.delete_stream_event(rows[0].0).unwrap();
+        assert_eq!(store.stream_events_range(cid, 0, i64::MAX).unwrap().len(), 4);
     }
 
     #[test]

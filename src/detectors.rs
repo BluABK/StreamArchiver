@@ -281,6 +281,125 @@ pub struct CollabGroup {
 /// requests send (same id streamlink/yt-dlp use for playback queries).
 const TWITCH_WEB_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
 
+/// Logins per aliased hype-train GQL request (a 10-login batch measured
+/// ~90 ms; 30 keeps the query size comfortable).
+const HYPE_GQL_CHUNK: usize = 30;
+
+/// How far back the recording-time sweep looks for inferred hype rows that
+/// no GQL poll confirmed (each tightens the tuning once, then is marked).
+const HYPE_FALSE_LOOKBACK_SECS: i64 = 900;
+
+/// One channel's live hype train from anonymous GQL (`channel.hypeTrain.
+/// execution` — the same state the site shows every logged-out viewer).
+/// This is GROUND TRUTH for the chat-side inference: confirmed trains
+/// supersede inferred ones and calibrate the tuning. Unofficial API: parsed
+/// defensively, callers degrade to inference-only when it breaks.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HypeTrainState {
+    /// Twitch's execution id — the `stream_event` upsert key (`tier` column).
+    pub train_id: String,
+    /// Kickoff time, unix seconds (0 = unparsable).
+    pub started_at: i64,
+    /// Current level (1-based).
+    pub level: i64,
+    /// Total points contributed so far (all levels).
+    pub total: i64,
+    /// Rare all-emote-unlock golden kappa train.
+    pub golden_kappa: bool,
+    /// Contribution breakdown: `(action, quantity)` — e.g. `("CHEER", 6349)`,
+    /// `("TIER_1_GIFTED_SUB", 71)`.
+    pub participations: Vec<(String, i64)>,
+    /// Current conductors (top contributors): `(display name, source
+    /// "BITS"/"SUBS", quantity)`.
+    pub conductors: Vec<(String, String, i64)>,
+}
+
+/// Parse one `channel.hypeTrain` GQL node. `None` when no train is running
+/// (`execution: null`) or the node shape is unrecognizable.
+fn parse_hype_train(node: &Value) -> Option<HypeTrainState> {
+    let ex = &node["execution"];
+    if ex.is_null() {
+        return None;
+    }
+    let train_id = ex["id"].as_str()?.to_string();
+    let started_at = ex["startedAt"].as_str().and_then(parse_rfc3339).unwrap_or(0);
+    let level = ex["progress"]["level"]["value"].as_i64().unwrap_or(0);
+    let total = ex["progress"]["total"].as_i64().unwrap_or(0);
+    let golden_kappa = ex["isGoldenKappaTrain"].as_bool().unwrap_or(false);
+    let participations = ex["participations"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| {
+                    Some((p["action"].as_str()?.to_string(), p["quantity"].as_i64()?))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let conductors = ex["conductors"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| {
+                    let u = &c["user"];
+                    let name = u["displayName"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| u["login"].as_str())?
+                        .to_string();
+                    let qty = c["participation"]
+                        .as_array()
+                        .map(|ps| ps.iter().filter_map(|p| p["quantity"].as_i64()).sum())
+                        .unwrap_or(0);
+                    Some((name, c["source"].as_str().unwrap_or("").to_string(), qty))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(HypeTrainState {
+        train_id,
+        started_at,
+        level,
+        total,
+        golden_kappa,
+        participations,
+        conductors,
+    })
+}
+
+impl HypeTrainState {
+    /// The `stream_event.detail` line for this train, e.g.
+    /// `"level 17 · 140,909 pts · top: rose (1,000 bits), igiv (25 subs) ·
+    /// golden kappa (confirmed)"`.
+    pub fn detail(&self) -> String {
+        let mut s = format!(
+            "level {} · {} pts",
+            self.level.max(1),
+            crate::models::group_thousands(self.total)
+        );
+        if !self.conductors.is_empty() {
+            let tops: Vec<String> = self
+                .conductors
+                .iter()
+                .map(|(name, source, qty)| {
+                    let unit = match source.as_str() {
+                        "BITS" => "bits",
+                        "SUBS" => "subs",
+                        _ => "pts",
+                    };
+                    format!("{name} ({} {unit})", crate::models::group_thousands(*qty))
+                })
+                .collect();
+            s.push_str(&format!(" · top: {}", tops.join(", ")));
+        }
+        if self.golden_kappa {
+            s.push_str(" · golden kappa");
+        }
+        s.push_str(" (confirmed)");
+        s
+    }
+}
+
 /// Settings-blob cache of extra Get Users fields we'd otherwise discard:
 /// `login (lowercase) -> (broadcaster_type, account created_at unix)`.
 /// Fills opportunistically whenever a Get Users response passes through
@@ -1323,6 +1442,170 @@ impl DetectContext {
             return Ok(None);
         }
         Ok(Some(CollabGroup { group_id, members }))
+    }
+
+    /// Live hype-train state for up to a batch of Twitch logins via the web
+    /// client's anonymous GQL (`channel.hypeTrain` — `execution`/`approaching`
+    /// are public; only the streamer's `config` is auth-blocked). Aliased
+    /// sub-queries, chunked [`HYPE_GQL_CHUNK`] logins per request.
+    /// `Ok(map[login] = None)` is the authoritative "no train right now";
+    /// `Err` = transport/schema failure (callers must NOT treat that as
+    /// "no train" — the poll simply wasn't watching).
+    pub async fn twitch_hype_trains(
+        &self,
+        logins: &[&str],
+    ) -> anyhow::Result<std::collections::HashMap<String, Option<HypeTrainState>>> {
+        let mut out = std::collections::HashMap::new();
+        for chunk in logins.chunks(HYPE_GQL_CHUNK) {
+            // Logins come from `twitch_login` — lowercase `[a-z0-9_]`, safe to
+            // embed. Aliases can't start with a digit, hence the `c` prefix.
+            let subs: String = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, login)| {
+                    format!(
+                        "c{i}: user(login: \"{login}\") {{ channel {{ hypeTrain {{ \
+                         execution {{ id startedAt expiresAt \
+                           progress {{ total level {{ value }} }} \
+                           participations {{ action quantity }} \
+                           conductors {{ source user {{ login displayName }} \
+                             participation {{ quantity }} }} \
+                           isGoldenKappaTrain }} \
+                         approaching {{ expiresAt }} }} }} }} "
+                    )
+                })
+                .collect();
+            let body = serde_json::json!({ "query": format!("query {{ {subs}}}") });
+            let resp = self
+                .http
+                .post("https://gql.twitch.tv/gql")
+                .header("Client-Id", TWITCH_WEB_CLIENT_ID)
+                .json(&body)
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                anyhow::bail!("gql {}", resp.status());
+            }
+            let v: Value = resp.json().await?;
+            if let Some(errs) = v["errors"].as_array()
+                && !errs.is_empty()
+            {
+                anyhow::bail!("gql error: {}", errs[0]["message"].as_str().unwrap_or("?"));
+            }
+            for (i, login) in chunk.iter().enumerate() {
+                let node = &v["data"][format!("c{i}")]["channel"]["hypeTrain"];
+                out.insert(login.to_string(), parse_hype_train(node));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Confirm hype trains for a set of live Twitch monitors and feed the
+    /// auto-tune — the single routine both feeds share (scheduler poll for
+    /// live-not-recording, `meta_watcher` while recording). `targets` =
+    /// `(monitor_id, login, stream_id)`. For each running train: upsert its
+    /// one `stream_event` row (keyed on the execution id; level/points keep
+    /// updating while it runs), delete the chat-inferred rows it supersedes,
+    /// and — when the inference plainly missed it despite stored
+    /// contributions — loosen the tuning. With `sweep_false` (the
+    /// recording-time 60 s cadence, where "no train" is a tight statement),
+    /// recent unconfirmed inferred rows are marked and tighten the tuning
+    /// once each. No-op when the `hype_gql` setting is off; a transport
+    /// failure changes nothing (we simply weren't watching).
+    pub async fn refresh_hype_trains(&self, targets: &[(i64, String, String)], sweep_false: bool) {
+        if targets.is_empty() || !crate::hype::gql_enabled(&self.store) {
+            return;
+        }
+        let logins: Vec<&str> = targets.iter().map(|(_, l, _)| l.as_str()).collect();
+        let states = match self.twitch_hype_trains(&logins).await {
+            Ok(s) => s,
+            Err(e) => {
+                debug!("hype: GQL train check failed: {e:#}");
+                return;
+            }
+        };
+        let now = crate::models::now_unix();
+        for (monitor_id, login, stream_id) in targets {
+            match states.get(login.as_str()) {
+                Some(Some(t)) => {
+                    let started = if t.started_at > 0 { t.started_at } else { now };
+                    let detail = t.detail();
+                    match self.store.upsert_hype_train_event(
+                        *monitor_id,
+                        started,
+                        stream_id,
+                        &t.train_id,
+                        t.total,
+                        &detail,
+                    ) {
+                        Ok(true) => {
+                            info!("hype: 🚂 {login} train confirmed — {detail}");
+                            self.tune_on_confirmed(*monitor_id, login, started);
+                        }
+                        Ok(false) => debug!("hype: {login} train update — {detail}"),
+                        Err(e) => warn!("hype: persisting {login} train failed: {e:#}"),
+                    }
+                }
+                Some(None) if sweep_false => {
+                    // Authoritative "no train" while we poll every minute:
+                    // any inferred burst still unconfirmed after its window
+                    // was a false positive.
+                    let tuning = crate::hype::load_tuning(&self.store);
+                    let rows = self
+                        .store
+                        .unconfirmed_inferred_hype(*monitor_id, now - HYPE_FALSE_LOOKBACK_SECS)
+                        .unwrap_or_default();
+                    for (id, at) in rows {
+                        // Give a fresh burst one full window to get confirmed
+                        // before calling it false (kickoff can lag the burst).
+                        if now - at < tuning.window_secs {
+                            continue;
+                        }
+                        let _ = self.store.mark_hype_unconfirmed(id);
+                        let (pts, events, _) = crate::hype::observed_burst(
+                            &self.store,
+                            *monitor_id,
+                            at - tuning.window_secs,
+                            at + 1,
+                            &tuning,
+                        );
+                        info!("hype: {login} inferred burst at {at} unconfirmed by Twitch — tightening");
+                        crate::hype::tighten_for_false(&self.store, pts, events, "an unconfirmed burst");
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// First sighting of a confirmed train: drop the inferred rows it
+    /// supersedes; if there were none but chat HAD stored contributions
+    /// around the kickoff, the inference missed a real train — loosen.
+    fn tune_on_confirmed(&self, monitor_id: i64, login: &str, started_at: i64) {
+        let tuning = crate::hype::load_tuning(&self.store);
+        let win = tuning.window_secs.max(1);
+        match self.store.delete_inferred_hype_near(monitor_id, started_at, win) {
+            Ok(n) if n > 0 => {
+                debug!("hype: {login} inference had caught it ({n} inferred row(s) superseded)");
+            }
+            Ok(_) => {
+                let observed = crate::hype::observed_burst(
+                    &self.store,
+                    monitor_id,
+                    started_at - win,
+                    started_at + 60,
+                    &tuning,
+                );
+                if observed.1 > 0 {
+                    info!(
+                        "hype: {login} inference missed a confirmed train ({} pts / {} events / {} chatters before kickoff)",
+                        observed.0, observed.1, observed.2
+                    );
+                    crate::hype::loosen_for_missed(&self.store, observed, "a confirmed train");
+                }
+            }
+            Err(e) => debug!("hype: inferred-row dedup failed for {login}: {e:#}"),
+        }
     }
 
     /// Resolve a Twitch login to its broadcaster id via Helix Get Users,
@@ -5099,6 +5382,42 @@ mod tests {
         assert_eq!(yt_compact_number("998"), Some(998));
         assert_eq!(yt_compact_number("2,100"), Some(2100));
         assert_eq!(yt_compact_number("1B"), Some(1_000_000_000));
+    }
+
+    #[test]
+    fn parse_hype_train_fixture() {
+        // Trimmed from a real live response (caseoh_, level-17 train).
+        let json: Value = serde_json::from_str(
+            r#"{"execution":{"id":"2c532b36-b67d-4557-a463-d16ffec3748d",
+                "startedAt":"2026-07-22T02:06:10.830999686Z",
+                "expiresAt":"2026-07-22T02:18:22.230281301Z",
+                "progress":{"total":140909,"level":{"value":17,"goal":163600}},
+                "participations":[{"action":"CHEER","source":"BITS","quantity":6349},
+                                  {"action":"TIER_1_GIFTED_SUB","source":"SUBS","quantity":71}],
+                "conductors":[{"source":"BITS","user":{"login":"rose","displayName":"Rose"},
+                               "participation":[{"action":"CHEER","quantity":1000}]}],
+                "isGoldenKappaTrain":false},
+                "approaching":null}"#,
+        )
+        .unwrap();
+        let t = parse_hype_train(&json).expect("train");
+        assert_eq!(t.train_id, "2c532b36-b67d-4557-a463-d16ffec3748d");
+        assert!(t.started_at > 1_700_000_000, "{}", t.started_at);
+        assert_eq!(t.level, 17);
+        assert_eq!(t.total, 140_909);
+        assert!(!t.golden_kappa);
+        assert_eq!(t.participations.len(), 2);
+        assert_eq!(t.conductors, vec![("Rose".into(), "BITS".into(), 1000)]);
+        let d = t.detail();
+        assert!(d.contains("level 17"), "{d}");
+        assert!(d.contains("140,909 pts"), "{d}");
+        assert!(d.contains("Rose (1,000 bits)"), "{d}");
+        assert!(d.ends_with("(confirmed)"), "{d}");
+
+        // No train running (the normal case) — authoritative None.
+        let idle: Value =
+            serde_json::from_str(r#"{"execution":null,"approaching":null}"#).unwrap();
+        assert!(parse_hype_train(&idle).is_none());
     }
 
     #[test]

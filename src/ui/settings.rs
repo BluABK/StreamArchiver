@@ -514,6 +514,7 @@ impl StreamArchiverApp {
             self.settings_blacklist_triggers_section(ui);
             self.settings_vod_recovery_section(ui);
             self.settings_stats_history_section(ui);
+            self.settings_hype_trains_section(ui);
             self.settings_maintenance_section(ui);
             self.settings_diagnostics_section(ui);
 
@@ -2943,6 +2944,179 @@ impl StreamArchiverApp {
                     }
                 }
             });
+
+            }
+    }
+
+    fn settings_hype_trains_section(&mut self, ui: &mut egui::Ui) {
+        if self.section_shown(
+            SettingsTab::Maintenance,
+            "Hype trains",
+            &["hype", "train", "inference", "weights", "points", "gql", "auto-tune", "burst", "kickoff"],
+        ) {
+            ui.add_space(12.0);
+            ui.heading("Hype trains 🚂");
+            ui.label(
+                "Twitch hype trains are captured two ways: the public train state is \
+                 polled while a channel is live (confirmed trains, with level, points \
+                 and top contributors), and the chat logger infers train-like bursts \
+                 from subs/bits while recording (the fallback when polling is off or \
+                 broken). Confirmed trains replace inferred ones and calibrate the \
+                 inference below.",
+            );
+            let mut gql = self.hype_gql;
+            if ui
+                .checkbox(&mut gql, "Confirm trains via Twitch (recommended)")
+                .on_hover_text(
+                    "Ask Twitch's public GQL endpoint for the live hype-train state — \
+                     one batched request per poll tick for live channels, one per \
+                     minute per recording channel. Anonymous, no credentials or \
+                     scopes; the same data every logged-out viewer sees. Confirmed \
+                     trains supersede inferred bursts and feed the auto-tune.",
+                )
+                .changed()
+            {
+                self.hype_gql = gql;
+                let _ = self
+                    .core
+                    .store
+                    .set_setting(crate::hype::K_HYPE_GQL, if gql { "1" } else { "0" });
+            }
+            let mut auto = self.hype_tuning.auto_tune;
+            if ui
+                .checkbox(&mut auto, "Auto-tune the inference")
+                .on_hover_text(
+                    "Confirmed or manually-marked trains the chat inference missed \
+                     LOOSEN the thresholds below; bursts Twitch never confirmed and \
+                     inferred events you 🗑-delete TIGHTEN them. Every adjustment is \
+                     listed in the tuning log.",
+                )
+                .changed()
+            {
+                self.hype_tuning.auto_tune = auto;
+                crate::hype::save_tuning(&self.core.store, &self.hype_tuning);
+            }
+            ui.add_space(4.0);
+            let mut tuning_changed = false;
+            egui::Grid::new("hype_tuning_grid")
+                .num_columns(4)
+                .spacing([12.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("Burst window").on_hover_text(
+                        "Contributions must fall within this sliding window to count \
+                         toward one burst (Twitch's own train timer is 5 minutes).",
+                    );
+                    tuning_changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut self.hype_tuning.window_secs)
+                                .range(60..=900)
+                                .suffix(" s"),
+                        )
+                        .on_hover_text("60–900 seconds")
+                        .changed();
+                    ui.label("Min points").on_hover_text(
+                        "Summed contribution points needed in the window (weights \
+                         below). 0 disables the points gate — the event/chatter \
+                         counts alone decide.",
+                    );
+                    tuning_changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut self.hype_tuning.min_points)
+                                .range(0..=10_000)
+                                .suffix(" pts"),
+                        )
+                        .on_hover_text("0 = points gate off")
+                        .changed();
+                    ui.end_row();
+                    ui.label("Min contributions").on_hover_text(
+                        "Number of separate sub/gift/bits/Hype Chat events needed in \
+                         the window.",
+                    );
+                    tuning_changed |= ui
+                        .add(egui::DragValue::new(&mut self.hype_tuning.min_events).range(1..=20))
+                        .changed();
+                    ui.label("Min chatters").on_hover_text(
+                        "Distinct contributors needed — keeps a single whale's gift \
+                         batch from counting as a train.",
+                    );
+                    tuning_changed |= ui
+                        .add(egui::DragValue::new(&mut self.hype_tuning.min_actors).range(1..=10))
+                        .changed();
+                    ui.end_row();
+                    ui.label("Points per bit").on_hover_text(
+                        "Weight of one cheered bit (Twitch's own rate is 1).",
+                    );
+                    tuning_changed |= ui
+                        .add(egui::DragValue::new(&mut self.hype_tuning.w_bits).range(0..=100))
+                        .changed();
+                    ui.label("Points per sub").on_hover_text(
+                        "Weight of a tier-1 sub or resub (tier 2 counts double, \
+                         tier 3 five-fold). Twitch's own rate is 500.",
+                    );
+                    tuning_changed |= ui
+                        .add(egui::DragValue::new(&mut self.hype_tuning.w_sub).range(0..=5000))
+                        .changed();
+                    ui.end_row();
+                    ui.label("Points per gifted sub").on_hover_text(
+                        "Weight of each sub inside a gift batch (Twitch's rate: 500).",
+                    );
+                    tuning_changed |= ui
+                        .add(egui::DragValue::new(&mut self.hype_tuning.w_gift).range(0..=5000))
+                        .changed();
+                    ui.label("Points per Hype Chat cent").on_hover_text(
+                        "Weight of one currency minor unit (cent) of a paid pinned \
+                         message — 1 makes a $5.00 Hype Chat worth one sub.",
+                    );
+                    tuning_changed |= ui
+                        .add(egui::DragValue::new(&mut self.hype_tuning.w_dono).range(0..=100))
+                        .changed();
+                    ui.end_row();
+                });
+            if tuning_changed {
+                crate::hype::save_tuning(&self.core.store, &self.hype_tuning);
+            }
+            ui.horizontal(|ui| {
+                if ui
+                    .button("↺ Defaults")
+                    .on_hover_text(
+                        "Reset window, gates and weights to the built-in defaults \
+                         (300 s / 1000 pts / 3 events / 2 chatters, Twitch-rate \
+                         weights). The tuning log is kept.",
+                    )
+                    .clicked()
+                {
+                    let log = std::mem::take(&mut self.hype_tuning.log);
+                    let auto = self.hype_tuning.auto_tune;
+                    self.hype_tuning = crate::hype::HypeTuning { log, auto_tune: auto, ..Default::default() };
+                    crate::hype::save_tuning(&self.core.store, &self.hype_tuning);
+                }
+                if ui
+                    .button("⟳ Reload")
+                    .on_hover_text(
+                        "Re-read the stored values — the auto-tune adjusts them in \
+                         the background while this page is open.",
+                    )
+                    .clicked()
+                {
+                    self.hype_tuning = crate::hype::load_tuning(&self.core.store);
+                }
+            });
+            egui::CollapsingHeader::new("Tuning log")
+                .id_salt("hype_tuning_log")
+                .show(ui, |ui| {
+                    if self.hype_tuning.log.is_empty() {
+                        ui.weak("No auto-tune adjustments yet.");
+                    }
+                    for line in &self.hype_tuning.log {
+                        ui.label(line);
+                    }
+                })
+                .header_response
+                .on_hover_text(
+                    "What the auto-tune changed and why, newest first (last 20). \
+                     Per-channel sensitivity overrides are edited from the Channel \
+                     Stats view's ⚙ button.",
+                );
 
             }
     }

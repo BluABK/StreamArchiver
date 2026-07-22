@@ -1354,6 +1354,29 @@ pub struct StreamArchiverApp {
     chstats_event_filter: String,
     /// 📈 viewer-stats popup window (single-instance, like collab history).
     viewer_stats_popup: Option<channel_stats::ViewerStatsPopup>,
+    /// Confirm hype trains via anonymous Twitch GQL polling. Persisted as
+    /// `hype_gql` ([`crate::hype::K_HYPE_GQL`]); default on.
+    hype_gql: bool,
+    /// Cached copy of the global hype-train tuning blob for the Settings
+    /// widgets (auto-tune also rewrites the stored blob in the background —
+    /// the section's ⟳ reloads).
+    hype_tuning: crate::hype::HypeTuning,
+    /// "🚂 Mark hype train" dialog visibility.
+    show_hype_mark: bool,
+    /// Mark dialog: preselected channel id (0 = pick).
+    hype_mark_channel: i64,
+    /// Mark dialog: "minutes ago" start shortcut (used when the absolute
+    /// field below is empty).
+    hype_mark_mins_ago: i64,
+    /// Mark dialog: absolute local start time `YYYY-MM-DD HH:MM` (optional;
+    /// wins over "minutes ago" when parseable).
+    hype_mark_abs: String,
+    /// Mark dialog: train duration in minutes (0 = unknown).
+    hype_mark_dur: i64,
+    /// "⚙ Hype sensitivity" per-channel override editor: open for this
+    /// channel id (`None` = closed) + its draft values.
+    hype_override_for: Option<i64>,
+    hype_override_draft: crate::hype::HypeOverride,
     /// Recent raw viewer samples per monitor for the 👁 column sparklines
     /// (last hour), refreshed at most once per minute while Streams renders.
     spark_data: std::collections::HashMap<i64, Vec<(i64, i64)>>,
@@ -1936,6 +1959,8 @@ impl eframe::App for StreamArchiverApp {
         self.history_popup_windows(ui.ctx());
         self.collab_history_window(ui.ctx());
         self.viewer_stats_window(ui.ctx());
+        self.hype_mark_window(ui.ctx());
+        self.hype_override_window(ui.ctx());
         self.schedule_popup_windows(ui.ctx());
         self.schedule_sources_window(ui.ctx());
         self.schedule_day_window(ui.ctx());
