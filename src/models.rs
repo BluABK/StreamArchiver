@@ -2213,6 +2213,24 @@ pub struct StreamEventRow {
     pub detail: String,
 }
 
+/// One broadcast's aggregate line in the Channel Stats per-stream breakdown
+/// (`Store::stream_stats_breakdown`): the viewer envelope of every sample
+/// tagged with one `stream_id`, plus the events that fell inside it.
+#[derive(Clone)]
+pub struct StreamStatRow {
+    pub stream_id: String,
+    /// First/last sampled moment of the broadcast (unix secs).
+    pub started: i64,
+    pub ended: i64,
+    pub peak_viewers: i64,
+    pub avg_viewers: f64,
+    /// Seconds of sampled live airtime.
+    pub live_secs: i64,
+    /// `[subs, gifted, bits, raids in, raids out, mod actions]` — same layout
+    /// as `Store::stream_event_totals`.
+    pub totals: [i64; 6],
+}
+
 /// One channel's aggregate line in the Channel Stats overview table, as
 /// returned by `Store::channel_stats_overview` for the selected span.
 #[derive(Clone)]

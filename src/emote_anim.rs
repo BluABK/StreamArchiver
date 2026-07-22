@@ -15,8 +15,14 @@ use image::AnimationDecoder;
 /// Frames are downscaled so their longest side is ≤ this (≈2× the 28 px render
 /// height, kept for crispness on hi-DPI). The dominant memory saving.
 const TARGET_PX: u32 = 56;
-/// Per-frame delay floor (20 fps) — clamps absurdly fast GIFs and the repaint rate.
-const MIN_DELAY: f32 = 0.05;
+/// Per-frame delay floor (50 fps) — clamps the repaint rate and the fastest
+/// legitimate frames. Kept at browser speed: the old 50 ms (20 fps) floor made
+/// common 25–40 ms Twitch/7TV emotes run 1.25–2× slower than on the site.
+const MIN_DELAY: f32 = 0.02;
+/// Browser junk-delay rule: GIF delays at/below ~10 ms are legacy "unspecified"
+/// values (encoders wrote 0–1 cs) and every browser plays them at 100 ms —
+/// match that instead of racing at the literal value.
+const JUNK_DELAY: f32 = 0.011;
 
 /// One emote's state in the cache.
 pub enum EmoteLoad {
@@ -109,7 +115,9 @@ fn collect_frames<'a>(
         } else {
             (num as f32 / den as f32) / 1000.0
         };
-        delays.push(secs.max(MIN_DELAY));
+        // Browser-compatible timing: junk (≤~10 ms) delays play at 100 ms,
+        // everything else at its own speed down to the 20 ms floor.
+        delays.push(if secs <= JUNK_DELAY { 0.1 } else { secs.max(MIN_DELAY) });
         imgs.push(f.into_buffer());
     }
     Some((imgs, delays))

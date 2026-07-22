@@ -1949,8 +1949,24 @@ impl StreamArchiverApp {
         } else {
             channel_name.clone()
         };
-        let active = viewer.active.clone();
-        let deprecated = viewer.deprecated.clone();
+        let mut filter = viewer.filter.clone();
+        let mut sort = viewer.sort;
+        // Filter + sort applied to on-open snapshots each frame (the lists are
+        // small — a few hundred entries at most for a big 7TV channel).
+        let shown = |list: &[ViewerEmote]| -> Vec<ViewerEmote> {
+            let q = filter.trim().to_lowercase();
+            let mut out: Vec<ViewerEmote> = list
+                .iter()
+                .filter(|e| q.is_empty() || e.name.to_lowercase().contains(&q))
+                .cloned()
+                .collect();
+            sort.apply(&mut out);
+            out
+        };
+        let active_all = viewer.active.len();
+        let active = shown(&viewer.active);
+        let deprecated = shown(&viewer.deprecated);
+        let deprecated_all = viewer.deprecated.len();
         let current_properties = viewer.emote_properties.clone();
         // viewer borrow ends here; all derived values are owned or Copy
 
@@ -1988,15 +2004,58 @@ impl StreamArchiverApp {
                         ui.heading(provider.label());
                         // Active tally, plus the deprecated count when any — so the two
                         // reconcile with the launcher button (which counts the universe).
-                        let mut tally = format!(
-                            "· {} emote{}",
-                            active.len(),
-                            if active.len() == 1 { "" } else { "s" },
-                        );
-                        if !deprecated.is_empty() {
-                            tally.push_str(&format!(" · {} deprecated", deprecated.len()));
+                        // While filtering, show "matches of total".
+                        let filtering = !filter.trim().is_empty();
+                        let mut tally = if filtering {
+                            format!("· {} of {} emotes", active.len(), active_all)
+                        } else {
+                            format!(
+                                "· {} emote{}",
+                                active.len(),
+                                if active.len() == 1 { "" } else { "s" },
+                            )
+                        };
+                        if deprecated_all > 0 {
+                            if filtering {
+                                tally.push_str(&format!(
+                                    " · {} of {} deprecated",
+                                    deprecated.len(),
+                                    deprecated_all
+                                ));
+                            } else {
+                                tally.push_str(&format!(" · {} deprecated", deprecated.len()));
+                            }
                         }
                         ui.label(egui::RichText::new(tally).weak());
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("🔍");
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut filter)
+                                .hint_text("Filter emotes…")
+                                .desired_width(180.0),
+                        );
+                        resp.on_hover_text(
+                            "Show only emotes whose code contains this text \
+                             (case-insensitive)",
+                        );
+                        if !filter.is_empty() && ui.small_button("✖").on_hover_text("Clear filter").clicked() {
+                            filter.clear();
+                        }
+                        ui.separator();
+                        ui.label("Sort:");
+                        egui::ComboBox::from_id_salt("emote_viewer_sort")
+                            .selected_text(sort.label())
+                            .show_ui(ui, |ui| {
+                                for s in EmoteSort::ALL {
+                                    ui.selectable_value(&mut sort, s, s.label());
+                                }
+                            })
+                            .response
+                            .on_hover_text(
+                                "Order of the grid: by code, or animated (GIF/WebP) \
+                                 emotes first",
+                            );
                     });
                     ui.separator();
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -2006,7 +2065,11 @@ impl StreamArchiverApp {
                         // available" above a populated list would contradict itself.
                         if active.is_empty() && deprecated.is_empty() {
                             ui.add_space(8.0);
-                            ui.weak("No emotes available for this provider.");
+                            if active_all + deprecated_all > 0 {
+                                ui.weak("No emotes match the filter.");
+                            } else {
+                                ui.weak("No emotes available for this provider.");
+                            }
                         } else if !active.is_empty() {
                             emote_viewer_grid(
                                 ui,
@@ -2123,6 +2186,11 @@ impl StreamArchiverApp {
             if let Some(viewer) = self.emote_viewers.get_mut(idx) {
                 viewer.emote_properties = None;
             }
+        }
+        // Persist the filter/sort edits for the next frame (session-only state).
+        if let Some(viewer) = self.emote_viewers.get_mut(idx) {
+            viewer.filter = filter;
+            viewer.sort = sort;
         }
 
         self.pump_emote_decodes(decode_misses, now, ctx);

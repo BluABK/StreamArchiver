@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 
 use super::*;
-use crate::models::{ChannelStatsRow, StreamEventRow, ViewerBucket};
+use crate::models::{ChannelStatsRow, StreamEventRow, StreamStatRow, ViewerBucket};
 
 /// Raw sampling resolution (one minute; matches the poll/meta cadence).
 pub const VH_RAW_BUCKET_SECS: i64 = 60;
@@ -269,6 +269,70 @@ impl Store {
         Ok(out)
     }
 
+    /// Per-broadcast breakdown for `channel_id` since `since_unix`, newest
+    /// first: one row per distinct `stream_id` seen in the viewer samples
+    /// (id-less scrape-path samples can't be attributed and are skipped),
+    /// with events folded in — matched by stream id where the event carries
+    /// one (chat events do), else by falling inside the broadcast's sampled
+    /// time range ±15 min (EventSub raids store no id).
+    pub fn stream_stats_breakdown(
+        &self,
+        channel_id: i64,
+        since_unix: i64,
+    ) -> Result<Vec<StreamStatRow>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT v.stream_id, MIN(v.bucket_t), MAX(v.bucket_t + v.span_secs),
+                    MAX(v.viewers),
+                    CAST(SUM(v.viewers * v.span_secs) AS REAL) / MAX(SUM(v.span_secs), 1),
+                    SUM(v.span_secs)
+             FROM viewer_history v
+             JOIN monitor m ON m.id = v.monitor_id
+             WHERE m.channel_id = ?1 AND v.bucket_t >= ?2 AND v.stream_id != ''
+             GROUP BY v.stream_id
+             ORDER BY 2 DESC",
+        )?;
+        let mut rows = stmt
+            .query_map(params![channel_id, since_unix], |r| {
+                Ok(StreamStatRow {
+                    stream_id: r.get(0)?,
+                    started: r.get(1)?,
+                    ended: r.get(2)?,
+                    peak_viewers: r.get(3)?,
+                    avg_viewers: r.get(4)?,
+                    live_secs: r.get(5)?,
+                    totals: [0; 6],
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        // Release the connection guard BEFORE the nested store call below —
+        // the DB mutex is not re-entrant, so holding it here would deadlock.
+        drop(conn);
+        if rows.is_empty() {
+            return Ok(rows);
+        }
+        for e in self.stream_events_range(channel_id, since_unix, i64::MAX)? {
+            let hit = if e.stream_id.is_empty() {
+                rows.iter_mut().find(|s| e.at >= s.started - 900 && e.at <= s.ended + 900)
+            } else {
+                rows.iter_mut().find(|s| s.stream_id == e.stream_id)
+            };
+            if let Some(s) = hit {
+                match e.kind.as_str() {
+                    "sub" | "resub" => s.totals[0] += 1,
+                    "subgift" => s.totals[1] += e.amount.max(1),
+                    "bits" => s.totals[2] += e.amount,
+                    "raid_in" => s.totals[3] += 1,
+                    "raid_out" => s.totals[4] += 1,
+                    "msg_deleted" | "timeout" | "ban" => s.totals[5] += 1,
+                    _ => {}
+                }
+            }
+        }
+        Ok(rows)
+    }
+
     /// Title/category/collab changes for `channel_id`'s monitors in
     /// `[since, until)` — graph markers for the Channel Stats plots.
     /// Returns `(at, kind, new_value)`, oldest first.
@@ -443,6 +507,32 @@ mod tests {
         assert_eq!((b2, a2), (1, 1));
         let (total, oldest, raw) = store.viewer_history_info().unwrap();
         assert_eq!((total, oldest, raw), (1, Some(t0), 0));
+    }
+
+    #[test]
+    fn per_stream_breakdown_groups_samples_and_events() {
+        let store = Store::open_in_memory().unwrap();
+        let (cid, mid) = channel_with_monitor(&store);
+        let t0: i64 = 5_000_000 - 5_000_000_i64.rem_euclid(60);
+        // Broadcast A: two minutes; broadcast B an hour later: one minute.
+        store.record_viewer_samples(t0, &[(mid, 100, None, "sA")]).unwrap();
+        store.record_viewer_samples(t0 + 60, &[(mid, 300, None, "sA")]).unwrap();
+        store.record_viewer_samples(t0 + 3600, &[(mid, 50, None, "sB")]).unwrap();
+        // Chat event carries the stream id; EventSub raid doesn't (matched by
+        // time containment); an id-less orphan far outside both is dropped.
+        store.record_stream_event(mid, t0 + 30, "sA", "subgift", "g", "", 20, "1000", "").unwrap();
+        store.record_stream_event(mid, t0 + 40, "", "raid_in", "r", "", 500, "", "").unwrap();
+        store.record_stream_event(mid, t0 + 3610, "sB", "bits", "c", "", 100, "", "").unwrap();
+        store.record_stream_event(mid, t0 + 7200, "", "sub", "x", "", 1, "1000", "").unwrap();
+
+        let rows = store.stream_stats_breakdown(cid, 0).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].stream_id, "sB", "newest first");
+        assert_eq!(rows[0].totals, [0, 0, 100, 0, 0, 0]);
+        let a = &rows[1];
+        assert_eq!((a.peak_viewers, a.live_secs), (300, 120));
+        assert_eq!(a.totals, [0, 20, 0, 1, 0, 0], "gift batch + time-matched raid");
+        assert_eq!(a.ended - a.started, 120, "sample envelope spans both buckets");
     }
 
     #[test]

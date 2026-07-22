@@ -133,6 +133,11 @@ enum View {
 /// resolution regardless (aggregation happens in the query).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PollSpan {
+    OneMin,
+    FiveMin,
+    TenMin,
+    FifteenMin,
+    ThirtyMin,
     Hour,
     SixHours,
     TwelveHours,
@@ -147,7 +152,12 @@ enum PollSpan {
 }
 
 impl PollSpan {
-    const ALL: [PollSpan; 9] = [
+    const ALL: [PollSpan; 14] = [
+        PollSpan::OneMin,
+        PollSpan::FiveMin,
+        PollSpan::TenMin,
+        PollSpan::FifteenMin,
+        PollSpan::ThirtyMin,
         PollSpan::Hour,
         PollSpan::SixHours,
         PollSpan::TwelveHours,
@@ -161,6 +171,11 @@ impl PollSpan {
 
     fn label(self) -> &'static str {
         match self {
+            PollSpan::OneMin => "1 m",
+            PollSpan::FiveMin => "5 m",
+            PollSpan::TenMin => "10 m",
+            PollSpan::FifteenMin => "15 m",
+            PollSpan::ThirtyMin => "30 m",
             PollSpan::Hour => "1 h",
             PollSpan::SixHours => "6 h",
             PollSpan::TwelveHours => "12 h",
@@ -176,6 +191,11 @@ impl PollSpan {
     /// How far back the view reaches.
     fn secs(self) -> i64 {
         match self {
+            PollSpan::OneMin => 60,
+            PollSpan::FiveMin => 5 * 60,
+            PollSpan::TenMin => 10 * 60,
+            PollSpan::FifteenMin => 15 * 60,
+            PollSpan::ThirtyMin => 30 * 60,
             PollSpan::Hour => 3_600,
             PollSpan::SixHours => 6 * 3_600,
             PollSpan::TwelveHours => 12 * 3_600,
@@ -193,6 +213,12 @@ impl PollSpan {
     /// Display bucket width for this span (what one plotted point covers).
     fn bucket_secs(self) -> i64 {
         match self {
+            // Sub-hour spans all show the raw minute samples.
+            PollSpan::OneMin
+            | PollSpan::FiveMin
+            | PollSpan::TenMin
+            | PollSpan::FifteenMin
+            | PollSpan::ThirtyMin => 60,
             PollSpan::Hour => 60,             // minute detail
             PollSpan::SixHours => 300,        // 5 min
             PollSpan::TwelveHours => 600,     // 10 min
@@ -208,6 +234,11 @@ impl PollSpan {
     /// Human label for [`PollSpan::bucket_secs`] (tooltips, y-axis captions).
     fn bucket_label(self) -> &'static str {
         match self {
+            PollSpan::OneMin
+            | PollSpan::FiveMin
+            | PollSpan::TenMin
+            | PollSpan::FifteenMin
+            | PollSpan::ThirtyMin => "1 min",
             PollSpan::Hour => "1 min",
             PollSpan::SixHours => "5 min",
             PollSpan::TwelveHours => "10 min",
@@ -1313,6 +1344,14 @@ pub struct StreamArchiverApp {
     /// Channel Stats view: cached query results for (channel, span);
     /// `None` = (re)query on next render.
     chstats_data: Option<channel_stats::ChStatsData>,
+    /// Channel Stats view: re-run the queries once a minute while the tab is
+    /// open (new samples land at that cadence). Persisted as
+    /// `chstats_auto_refresh`; default on.
+    chstats_auto: bool,
+    /// When `chstats_data` was last loaded (unix secs) — drives auto refresh.
+    chstats_loaded_at: i64,
+    /// Events-list filter text in the Channel Stats view (session-only).
+    chstats_event_filter: String,
     /// 📈 viewer-stats popup window (single-instance, like collab history).
     viewer_stats_popup: Option<channel_stats::ViewerStatsPopup>,
     /// Recent raw viewer samples per monitor for the 👁 column sparklines

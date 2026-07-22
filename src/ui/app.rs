@@ -46,6 +46,14 @@ impl StreamArchiverApp {
             .flatten()
             .as_deref()
             != Some("0");
+        // Channel Stats auto refresh defaults on likewise.
+        let chstats_auto = core
+            .store
+            .get_setting("chstats_auto_refresh")
+            .ok()
+            .flatten()
+            .as_deref()
+            != Some("0");
         // Do Not Disturb defaults off in both dimensions.
         let dnd_enabled =
             setting_or_empty(&core, crate::notifications::K_DND_ENABLED) == "1";
@@ -599,6 +607,9 @@ impl StreamArchiverApp {
             chstats_channel: None,
             chstats_span: super::PollSpan::Month,
             chstats_data: None,
+            chstats_auto,
+            chstats_loaded_at: 0,
+            chstats_event_filter: String::new(),
             viewer_stats_popup: None,
             spark_data: std::collections::HashMap::new(),
             spark_loaded_at: 0,

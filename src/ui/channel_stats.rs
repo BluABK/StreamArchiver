@@ -5,7 +5,7 @@
 //! scheduler + `meta_watcher`, chat parser, and EventSub raid handler.
 
 use super::*;
-use crate::models::{ChannelStatsRow, StreamEventRow, ViewerBucket};
+use crate::models::{ChannelStatsRow, StreamEventRow, StreamStatRow, ViewerBucket};
 
 /// Cached query results for the Channel Stats view — reloaded whenever the
 /// channel/span selection changes (or on tab re-open / ⟳).
@@ -22,6 +22,8 @@ pub(super) struct ChStatsData {
     /// Single-channel mode: title/category/collab ledger markers
     /// (`at, kind, new_value`).
     changes: Vec<(i64, String, String)>,
+    /// Single-channel mode: per-broadcast breakdown rows, newest first.
+    streams: Vec<StreamStatRow>,
 }
 
 /// One loaded graph window's worth of data: viewer buckets, discrete events,
@@ -41,6 +43,8 @@ pub(super) struct ViewerStatsPopup {
     span: super::PollSpan,
     /// Lazily-loaded graph data; `None` = (re)query.
     data: Option<StatsRange>,
+    /// Events-list filter text (window-local).
+    filter: String,
 }
 
 /// Marker color per event kind (legend + points on the graphs).
@@ -57,6 +61,7 @@ fn event_color(kind: &str) -> egui::Color32 {
         "chat_clear" => egui::Color32::from_rgb(0x8d, 0x6e, 0x63),
         "chat_mode" => egui::Color32::from_rgb(0x78, 0x90, 0x9c),
         "role_change" => egui::Color32::from_rgb(0xff, 0xd5, 0x4f),
+        "hype_train" => egui::Color32::from_rgb(0xff, 0x40, 0x81),
         _ => egui::Color32::GRAY,
     }
 }
@@ -76,6 +81,7 @@ fn event_label(kind: &str) -> &'static str {
         "chat_clear" => "Chat clear",
         "chat_mode" => "Chat mode",
         "role_change" => "Role change",
+        "hype_train" => "Hype train*",
         _ => "Event",
     }
 }
@@ -104,6 +110,9 @@ fn event_line(e: &StreamEventRow) -> String {
         "chat_clear" => "chat was cleared".to_string(),
         "chat_mode" => e.detail.clone(),
         "role_change" => format!("{} {}", e.actor, e.detail),
+        // Inferred from contribution bursts — Twitch's real Hype Train API
+        // needs a broadcaster token, so this is a proxy, hence the asterisk.
+        "hype_train" => format!("hype-train-like burst — {}", e.detail),
         other => format!("{other} by {}", e.actor),
     }
 }
@@ -134,6 +143,7 @@ impl StreamArchiverApp {
     /// Load the Channel Stats data for the current (channel, span) selection.
     fn load_chstats(&mut self) {
         let now = now_unix();
+        self.chstats_loaded_at = now;
         let since = now - self.chstats_span.secs();
         let store = &self.core.store;
         let data = match self.chstats_channel {
@@ -143,6 +153,7 @@ impl StreamArchiverApp {
                 viewer: Vec::new(),
                 events: Vec::new(),
                 changes: Vec::new(),
+                streams: Vec::new(),
             },
             Some(cid) => ChStatsData {
                 overview: Vec::new(),
@@ -152,6 +163,7 @@ impl StreamArchiverApp {
                     .unwrap_or_default(),
                 events: store.stream_events_range(cid, since, i64::MAX).unwrap_or_default(),
                 changes: store.monitor_changes_range(cid, since, i64::MAX).unwrap_or_default(),
+                streams: store.stream_stats_breakdown(cid, since).unwrap_or_default(),
             },
         };
         self.chstats_data = Some(data);
@@ -192,7 +204,34 @@ impl StreamArchiverApp {
                     self.stats_collabs =
                         self.core.store.collab_partner_overview().unwrap_or_default();
                 }
+                let mut auto = self.chstats_auto;
+                if ui
+                    .checkbox(&mut auto, "Auto refresh")
+                    .on_hover_text(
+                        "Re-run the queries once a minute while this tab is open \
+                         (new viewer samples land at that cadence). Off = the view \
+                         is a snapshot until you hit ⟳.",
+                    )
+                    .changed()
+                {
+                    self.chstats_auto = auto;
+                    let _ = self
+                        .core
+                        .store
+                        .set_setting("chstats_auto_refresh", if auto { "1" } else { "0" });
+                }
             });
+            // Auto refresh: invalidate the cache once a minute and keep a
+            // repaint scheduled so the tick fires without mouse input.
+            if self.chstats_auto {
+                let age = now_unix() - self.chstats_loaded_at;
+                if age >= 60 && self.chstats_data.is_some() {
+                    self.chstats_data = None;
+                }
+                ui.ctx().request_repaint_after(std::time::Duration::from_secs(
+                    (60 - age).clamp(1, 60) as u64,
+                ));
+            }
             ui.separator();
 
             // ── Channel + span selection ──
@@ -416,10 +455,172 @@ impl StreamArchiverApp {
             &data.events,
             &data.changes,
             &labels,
-            span.bucket_label(),
+            span.bucket_secs(),
         );
+
+        // ── Top supporters (Twitch-style gifter/cheerer leaderboards, but
+        // over OUR archive and the selected span instead of Twitch's weekly
+        // reset) ──
+        let gifters = top_contributors(&data.events, "subgift", 10);
+        let cheerers = top_contributors(&data.events, "bits", 10);
+        if !gifters.is_empty() || !cheerers.is_empty() {
+            ui.add_space(10.0);
+            ui.horizontal_top(|ui| {
+                if !gifters.is_empty() {
+                    ui.vertical(|ui| {
+                        ui.label("🎁 Top gifters:").on_hover_text(
+                            "Most subs gifted within the selected span, from the \
+                             recorded chat (so only streams recorded with Chat log \
+                             count). Community batches count their full size.",
+                        );
+                        egui::Grid::new("chstats_top_gifters")
+                            .num_columns(3)
+                            .striped(true)
+                            .spacing([12.0, 2.0])
+                            .show(ui, |ui| {
+                                for (i, (name, total)) in gifters.iter().enumerate() {
+                                    ui.label(rank_label(i));
+                                    ui.label(name);
+                                    ui.label(format!("🎁 {total}"));
+                                    ui.end_row();
+                                }
+                            });
+                    });
+                    ui.add_space(24.0);
+                }
+                if !cheerers.is_empty() {
+                    ui.vertical(|ui| {
+                        ui.label("💎 Top cheerers:").on_hover_text(
+                            "Most bits cheered within the selected span, from the \
+                             recorded chat (so only streams recorded with Chat log \
+                             count).",
+                        );
+                        egui::Grid::new("chstats_top_cheerers")
+                            .num_columns(3)
+                            .striped(true)
+                            .spacing([12.0, 2.0])
+                            .show(ui, |ui| {
+                                for (i, (name, total)) in cheerers.iter().enumerate() {
+                                    ui.label(rank_label(i));
+                                    ui.label(name);
+                                    ui.label(format!("💎 {total}"));
+                                    ui.end_row();
+                                }
+                            });
+                    });
+                }
+            });
+        }
+
+        // ── Raid history ──
+        let raids: Vec<&StreamEventRow> = data
+            .events
+            .iter()
+            .filter(|e| e.kind == "raid_in" || e.kind == "raid_out")
+            .collect();
+        if !raids.is_empty() {
+            ui.add_space(10.0);
+            egui::CollapsingHeader::new(format!("⚔ Raid history ({})", raids.len()))
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "Incoming raids come from chat (while recording) and \
+                             EventSub; outgoing raids are EventSub-only (conduit \
+                             mode). Newest first.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    egui::Grid::new("chstats_raids")
+                        .num_columns(3)
+                        .striped(true)
+                        .spacing([16.0, 2.0])
+                        .show(ui, |ui| {
+                            for e in &raids {
+                                ui.label(fmt_datetime_short(e.at));
+                                if e.kind == "raid_in" {
+                                    ui.colored_label(
+                                        event_color("raid_in"),
+                                        format!("→ in from {}", e.actor),
+                                    );
+                                } else {
+                                    ui.colored_label(
+                                        event_color("raid_out"),
+                                        format!("← out to {}", e.target),
+                                    );
+                                }
+                                ui.label(format!("{} viewers", e.amount));
+                                ui.end_row();
+                            }
+                        });
+                });
+        }
+
+        // ── Per-broadcast breakdown ──
+        let mut open_clip: Option<(i64, i64)> = None;
+        if !data.streams.is_empty() {
+            ui.add_space(10.0);
+            ui.label(format!("Streams ({}):", data.streams.len())).on_hover_text(
+                "Per-broadcast breakdown of the span: every broadcast whose viewer \
+                 samples carried the platform's stream id (scrape-detected \
+                 broadcasts without an id can't be attributed and aren't listed). \
+                 Newest first. 📈 opens the graph clipped to that broadcast.",
+            );
+            egui::Grid::new("chstats_streams")
+                .num_columns(9)
+                .striped(true)
+                .spacing([16.0, 2.0])
+                .show(ui, |ui| {
+                    ui.strong("Started");
+                    ui.strong("Airtime").on_hover_text("Sampled live time");
+                    ui.strong("Peak");
+                    ui.strong("Avg").on_hover_text("Airtime-weighted average viewers");
+                    ui.strong("Subs").on_hover_text("Subs + resubs (gifted in parens)");
+                    ui.strong("Bits");
+                    ui.strong("Raids");
+                    ui.strong("Mod").on_hover_text("Deletions + timeouts + bans");
+                    ui.strong("");
+                    ui.end_row();
+                    for s in &data.streams {
+                        ui.label(fmt_datetime_short(s.started));
+                        ui.label(fmt_duration_hm(s.live_secs));
+                        ui.label(grid::fmt_viewers(s.peak_viewers));
+                        ui.label(grid::fmt_viewers(s.avg_viewers.round() as i64));
+                        let [subs, gifted, bits, rin, rout, mods] = s.totals;
+                        ui.label(if gifted > 0 {
+                            format!("{subs} (+{gifted} gifted)")
+                        } else {
+                            subs.to_string()
+                        });
+                        ui.label(bits.to_string());
+                        ui.label(format!("{rin} in, {rout} out"));
+                        ui.label(mods.to_string());
+                        if ui
+                            .small_button("📈")
+                            .on_hover_text("Open the viewer graph clipped to this broadcast")
+                            .clicked()
+                        {
+                            open_clip = Some((s.started, s.ended));
+                        }
+                        ui.end_row();
+                    }
+                });
+        }
+
         ui.add_space(10.0);
-        events_table_ui(ui, "chstats_events", &data.events, 200);
+        events_table_ui(ui, "chstats_events", &data.events, 200, &mut self.chstats_event_filter);
+
+        if let Some((started, ended)) = open_clip {
+            let name = self
+                .channels
+                .iter()
+                .find(|c| c.id == channel_id)
+                .map(|c| c.name.clone())
+                .unwrap_or_default();
+            let label = format!("{name} — {}", fmt_datetime_short(started));
+            self.open_stream_stats(channel_id, &label, started, ended);
+        }
     }
 
     /// Open the 📈 popup for a whole channel (span-driven).
@@ -436,6 +637,7 @@ impl StreamArchiverApp {
             range: None,
             span: super::PollSpan::Day,
             data: None,
+            filter: String::new(),
         });
     }
 
@@ -457,6 +659,7 @@ impl StreamArchiverApp {
             range: Some((since - 900, until + 900)),
             span: super::PollSpan::Day,
             data: None,
+            filter: String::new(),
         });
     }
 
@@ -526,9 +729,10 @@ impl StreamArchiverApp {
                             ui.weak("No samples in this range.");
                             return;
                         }
-                        let bucket_label = match popup.range {
-                            Some(_) => "auto",
-                            None => popup.span.bucket_label(),
+                        // Same bucket-width rule as the load above.
+                        let bucket = match popup.range {
+                            Some((s, u)) => ((u - s) / 200).max(60),
+                            None => popup.span.bucket_secs(),
                         };
                         viewer_graph_ui(
                             ui,
@@ -537,10 +741,16 @@ impl StreamArchiverApp {
                             events,
                             changes,
                             &labels,
-                            bucket_label,
+                            bucket,
                         );
                         ui.add_space(8.0);
-                        events_table_ui(ui, "viewer_stats_popup_events", events, 100);
+                        events_table_ui(
+                            ui,
+                            "viewer_stats_popup_events",
+                            events,
+                            100,
+                            &mut popup.filter,
+                        );
                     });
                 });
             },
@@ -555,11 +765,48 @@ impl StreamArchiverApp {
     }
 }
 
+/// Top contributors of one event kind within the loaded span:
+/// `(display name, total amount)` sorted by total, case-insensitive identity.
+fn top_contributors(events: &[StreamEventRow], kind: &str, limit: usize) -> Vec<(String, i64)> {
+    let mut by_actor: std::collections::HashMap<String, (String, i64)> = Default::default();
+    for e in events.iter().filter(|e| e.kind == kind && !e.actor.is_empty()) {
+        let entry = by_actor
+            .entry(e.actor.to_lowercase())
+            .or_insert_with(|| (e.actor.clone(), 0));
+        entry.1 += e.amount.max(1);
+    }
+    let mut out: Vec<(String, i64)> = by_actor.into_values().collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
+    out.truncate(limit);
+    out
+}
+
+/// Medal for leaderboard ranks 1–3, plain number beyond.
+fn rank_label(i: usize) -> String {
+    match i {
+        0 => "🥇".into(),
+        1 => "🥈".into(),
+        2 => "🥉".into(),
+        n => format!("{}", n + 1),
+    }
+}
+
 /// `3h 24m`-style duration for airtime cells.
 fn fmt_duration_hm(secs: i64) -> String {
     let h = secs / 3600;
     let m = (secs % 3600) / 60;
     if h > 0 { format!("{h}h {m:02}m") } else { format!("{m}m") }
+}
+
+/// `60` → `1 min`, `600` → `10 min`, `43200` → `12 h` — bucket-width caption.
+fn fmt_bucket(secs: i64) -> String {
+    if secs >= 86_400 {
+        format!("{} d", secs / 86_400)
+    } else if secs >= 3_600 {
+        format!("{} h", secs / 3_600)
+    } else {
+        format!("{} min", (secs / 60).max(1))
+    }
 }
 
 /// The shared viewer/follower graph: one viewer line per monitor, event
@@ -572,7 +819,7 @@ fn viewer_graph_ui(
     events: &[StreamEventRow],
     changes: &[(i64, String, String)],
     labels: &std::collections::HashMap<i64, String>,
-    bucket_label: &str,
+    bucket_secs: i64,
 ) {
     let now = now_unix();
     let to_x = |t: i64| (t - now) as f64 / 3600.0; // hours relative to now
@@ -581,17 +828,28 @@ fn viewer_graph_ui(
         .map(|b| (now - b.t) as f64 / 3600.0)
         .unwrap_or(1.0)
         .max(1.0);
-    let days = span_hours > 48.0;
+    // Wall-clock axis labels (local time) — the relative "-0.1h" style made it
+    // impossible to line the graph up with the events table's timestamps.
+    let multi_day = span_hours > 48.0;
     let fmt_x = move |h: f64| {
-        if days { format!("{:+.1}d", h / 24.0) } else { format!("{h:+.1}h") }
+        use chrono::TimeZone;
+        let t = now + (h * 3600.0).round() as i64;
+        match chrono::Local.timestamp_opt(t, 0).single() {
+            Some(d) if multi_day => d.format("%d %b %H:%M").to_string(),
+            Some(d) => d.format("%H:%M").to_string(),
+            None => String::new(),
+        }
     };
+    let bucket_label = fmt_bucket(bucket_secs);
 
     ui.label("Viewers:").on_hover_text(format!(
         "Peak live viewers per {bucket_label} bucket, one line per platform \
-         instance. Diamonds along the baseline are events (subs, bits, \
-         raids); dotted vertical lines are category changes; 🤝 lines are \
-         collab set changes. X axis is time relative to now. Gaps mean the \
-         channel was offline (no samples).",
+         instance, plotted at each bucket's center. Diamonds are events \
+         (subs, bits, raids, …) at their exact time, placed at the event's \
+         own size — a raid's party size lands near the viewer level it \
+         delivered, single subs hug the baseline. Dotted vertical lines are \
+         category changes; 🤝 lines are collab set changes. X axis is local \
+         clock time. Gaps mean the channel was offline (no samples).",
     ));
     // monitor -> time-ordered points; split a line where a gap exceeds ~3
     // buckets so offline time doesn't render as a misleading bridge.
@@ -600,7 +858,10 @@ fn viewer_graph_ui(
         per_monitor.entry(b.monitor_id).or_default().push((b.t, b.viewers));
     }
     let fx = fmt_x;
-    egui_plot::Plot::new(format!("{id_prefix}_viewer_plot"))
+    // Filled per frame while the pointer is near event markers — the plot's
+    // own label can only show coordinates; this names who did it.
+    let mut hover_events: Vec<String> = Vec::new();
+    let plot_resp = egui_plot::Plot::new(format!("{id_prefix}_viewer_plot"))
         .height(220.0)
         .legend(egui_plot::Legend::default())
         .allow_scroll(false)
@@ -636,7 +897,11 @@ fn viewer_graph_ui(
                     {
                         segments.push(std::mem::take(&mut seg));
                     }
-                    seg.push([to_x(*t), *v as f64]);
+                    // Bucket-CENTER placement: a bucket's peak covers
+                    // [t, t+bucket), so plotting at t start would shift the
+                    // line half a bucket early next to the exact-time event
+                    // markers (visible as "misaligned raids" on wide spans).
+                    seg.push([to_x(*t + bucket_secs / 2), *v as f64]);
                     prev_t = Some(*t);
                 }
                 if !seg.is_empty() {
@@ -649,10 +914,16 @@ fn viewer_graph_ui(
                     plot_ui.line(egui_plot::Line::new(n, egui_plot::PlotPoints::from(s)));
                 }
             }
-            // Event markers along the baseline, grouped by kind for the legend.
+            // Event markers, grouped by kind for the legend. Y = the event's
+            // own size (bits, gift-batch count, raid party, timeout secs), so
+            // hovering reads the real number and a 2.6K raid sits right at
+            // the viewer level it delivered; 1-unit events hug the baseline.
             let mut by_kind: std::collections::BTreeMap<&str, Vec<[f64; 2]>> = Default::default();
             for e in events {
-                by_kind.entry(e.kind.as_str()).or_default().push([to_x(e.at), 0.0]);
+                by_kind
+                    .entry(e.kind.as_str())
+                    .or_default()
+                    .push([to_x(e.at), e.amount.max(0) as f64]);
             }
             for (kind, pts) in by_kind {
                 plot_ui.points(
@@ -662,7 +933,33 @@ fn viewer_graph_ui(
                         .color(event_color(kind)),
                 );
             }
+            // Who-did-it hover: name every event whose marker is within a few
+            // pixels of the pointer (a gift train stacks many diamonds).
+            if let Some(ptr) = plot_ui.pointer_coordinate() {
+                let tf = *plot_ui.transform();
+                let ptr_px = tf.position_from_point(&ptr);
+                for e in events {
+                    let px = tf.position_from_point(&egui_plot::PlotPoint::new(
+                        to_x(e.at),
+                        e.amount.max(0) as f64,
+                    ));
+                    if px.distance(ptr_px) < 8.0 {
+                        hover_events
+                            .push(format!("{} — {}", fmt_datetime_short(e.at), event_line(e)));
+                    }
+                }
+            }
         });
+    if !hover_events.is_empty() {
+        plot_resp.response.on_hover_ui_at_pointer(|ui| {
+            for line in hover_events.iter().take(12) {
+                ui.label(line);
+            }
+            if hover_events.len() > 12 {
+                ui.weak(format!("(+{} more here)", hover_events.len() - 12));
+            }
+        });
+    }
 
     // Follower plot only when there's any follower data (Kick).
     let has_followers = viewer.iter().any(|b| b.followers.is_some());
@@ -686,7 +983,10 @@ fn viewer_graph_ui(
                     Default::default();
                 for b in viewer {
                     if let Some(f) = b.followers {
-                        per_monitor.entry(b.monitor_id).or_default().push([to_x(b.t), f as f64]);
+                        per_monitor
+                            .entry(b.monitor_id)
+                            .or_default()
+                            .push([to_x(b.t + bucket_secs / 2), f as f64]);
                     }
                 }
                 for (mid, pts) in per_monitor {
@@ -711,25 +1011,68 @@ fn viewer_gap_secs(pts: &[(i64, i64)]) -> i64 {
     (deltas[deltas.len() / 2] * 3).max(600)
 }
 
-/// The recent-events table shown under the graphs.
-fn events_table_ui(ui: &mut egui::Ui, id: &str, events: &[StreamEventRow], limit: usize) {
+/// The recent-events table shown under the graphs, with a live text filter
+/// (user, recipient, kind, or detail — case-insensitive).
+fn events_table_ui(
+    ui: &mut egui::Ui,
+    id: &str,
+    events: &[StreamEventRow],
+    limit: usize,
+    filter: &mut String,
+) {
     if events.is_empty() {
         return;
     }
-    ui.label(format!("Events ({}):", events.len())).on_hover_text(
-        "Subs, resubs, gift subs and bits come from the recorded chat (so only \
-         while a recording with Chat log was running); raids come from chat \
-         and/or EventSub. Newest first.",
-    );
+    let q = filter.trim().to_lowercase();
+    let shown: Vec<&StreamEventRow> = events
+        .iter()
+        .filter(|e| {
+            q.is_empty()
+                || e.actor.to_lowercase().contains(&q)
+                || e.target.to_lowercase().contains(&q)
+                || e.detail.to_lowercase().contains(&q)
+                || event_label(&e.kind).to_lowercase().contains(&q)
+        })
+        .collect();
+    ui.horizontal(|ui| {
+        let count = if q.is_empty() {
+            format!("Events ({}):", events.len())
+        } else {
+            format!("Events ({} of {}):", shown.len(), events.len())
+        };
+        ui.label(count).on_hover_text(
+            "Subs, resubs, gift subs and bits come from the recorded chat (so only \
+             while a recording with Chat log was running); raids come from chat \
+             and/or EventSub. Newest first.",
+        );
+        ui.label("🔍");
+        ui.add(
+            egui::TextEdit::singleline(filter)
+                .hint_text("Filter events…")
+                .desired_width(180.0),
+        )
+        .on_hover_text(
+            "Show only events mentioning this text: who did it, who received it, \
+             the event kind, or the detail (deleted-message text, mode change, …). \
+             Case-insensitive.",
+        );
+        if !filter.is_empty() && ui.small_button("✖").on_hover_text("Clear filter").clicked() {
+            filter.clear();
+        }
+    });
+    if shown.is_empty() {
+        ui.weak("No events match the filter.");
+        return;
+    }
     egui::Grid::new(id).num_columns(3).striped(true).spacing([16.0, 2.0]).show(ui, |ui| {
-        for e in events.iter().take(limit) {
+        for e in shown.iter().take(limit) {
             ui.label(fmt_datetime_short(e.at));
             ui.colored_label(event_color(&e.kind), event_label(&e.kind));
             ui.label(event_line(e));
             ui.end_row();
         }
     });
-    if events.len() > limit {
-        ui.weak(format!("(+{} more in this span)", events.len() - limit));
+    if shown.len() > limit {
+        ui.weak(format!("(+{} more in this span)", shown.len() - limit));
     }
 }

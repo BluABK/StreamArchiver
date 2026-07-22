@@ -284,9 +284,7 @@ async fn session(
                         // the raw line first. Rare events, so the synchronous
                         // DB write is fine here.
                         let mut db_events = Vec::new();
-                        if events.is_some() {
-                            db_events.extend(parse_chat_event(line));
-                        }
+                        let contribution = parse_chat_event(line);
                         // Moderation events: DB rows AND sidecar marker lines
                         // (the chat replay strikes deleted/purged messages and
                         // shows mode/role notices). Markers are written even
@@ -297,6 +295,23 @@ async fn session(
                         }
                         for m in mod_markers {
                             sink.push(&m);
+                        }
+                        if let Some(ev) = contribution {
+                            // Sub/gift/bits contributions also feed the
+                            // hype-train inference (burst -> one extra event
+                            // + a replay notice).
+                            if matches!(ev.kind, "sub" | "resub" | "subgift" | "bits")
+                                && let Some((hype, marker)) =
+                                    tracker.note_contribution(ev.ts, &ev.actor)
+                            {
+                                sink.push(&marker);
+                                if events.is_some() {
+                                    db_events.push(hype);
+                                }
+                            }
+                            if events.is_some() {
+                                db_events.push(ev);
+                            }
                         }
                         if let Some(ev_ctx) = events {
                             for ev in db_events {
@@ -540,9 +555,69 @@ struct EventTracker {
     room: Option<(bool, i64, bool, i64, bool)>,
     /// login -> (has mod badge, has VIP badge), first seen = baseline.
     roles: std::collections::HashMap<String, (bool, bool)>,
+    /// Recent sub/gift/bits contributions `(ts, actor)` within
+    /// [`HYPE_WINDOW_SECS`] — the hype-train inference input.
+    contrib: std::collections::VecDeque<(i64, String)>,
+    /// A hype-train-like burst is currently flagged (no re-trigger until the
+    /// contribution window drains empty).
+    hype_active: bool,
 }
 
+/// Hype-train inference window (matches Twitch's 5-minute train timer).
+const HYPE_WINDOW_SECS: i64 = 300;
+/// Contributions within the window needed to flag a burst…
+const HYPE_MIN_EVENTS: usize = 5;
+/// …from at least this many distinct people (a single whale gifting in
+/// batches is generous, but it isn't a train).
+const HYPE_MIN_ACTORS: usize = 3;
+
 impl EventTracker {
+    /// Note one sub/gift/bits contribution and infer a **hype-train-like
+    /// burst**: Twitch's real Hype Train API needs a broadcaster-scoped token
+    /// (and anonymous PubSub is gone), so this is the honest anonymous proxy —
+    /// [`HYPE_MIN_EVENTS`] contributions from [`HYPE_MIN_ACTORS`] distinct
+    /// chatters within [`HYPE_WINDOW_SECS`]. One event per burst; re-arms only
+    /// after the window drains empty (no contribution for 5 minutes).
+    fn note_contribution(&mut self, ts: i64, actor: &str) -> Option<(ChatEvent, String)> {
+        self.contrib.push_back((ts, actor.to_lowercase()));
+        while self.contrib.front().is_some_and(|(t, _)| ts - t > HYPE_WINDOW_SECS) {
+            self.contrib.pop_front();
+        }
+        // Everything older drained away -> any previous burst is over.
+        if self.contrib.len() == 1 {
+            self.hype_active = false;
+        }
+        if self.hype_active {
+            return None;
+        }
+        let uniq: std::collections::HashSet<&str> =
+            self.contrib.iter().map(|(_, a)| a.as_str()).collect();
+        if self.contrib.len() < HYPE_MIN_EVENTS || uniq.len() < HYPE_MIN_ACTORS {
+            return None;
+        }
+        self.hype_active = true;
+        let detail = format!(
+            "{} contributions from {} chatters in 5 min (inferred)",
+            self.contrib.len(),
+            uniq.len()
+        );
+        let ev = ChatEvent {
+            kind: "hype_train",
+            actor: String::new(),
+            target: String::new(),
+            amount: self.contrib.len() as i64,
+            tier: String::new(),
+            detail: detail.clone(),
+            ts,
+        };
+        let marker = format!(
+            r#"{{"ts":{},"marker":"notice","text":{}}}"#,
+            ts * 1000,
+            serde_json::Value::from(format!("Hype-train-like burst: {detail}"))
+        );
+        Some((ev, marker))
+    }
+
     /// Feed one raw IRC line; returns `(db_events, sidecar_marker_lines)`.
     fn track(&mut self, line: &str) -> (Vec<ChatEvent>, Vec<String>) {
         let mut events = Vec::new();
@@ -905,6 +980,36 @@ mod tests {
         let slow_off = "@room-id=1;slow=0 :tmi.twitch.tv ROOMSTATE #streamer";
         let (evs, _) = t.track(slow_off);
         assert_eq!(evs[0].detail, "Slow mode off");
+    }
+
+    #[test]
+    fn hype_train_burst_inference() {
+        let mut t = EventTracker::default();
+        // Four contributions from three people: still below the event floor.
+        assert!(t.note_contribution(1000, "a").is_none());
+        assert!(t.note_contribution(1010, "b").is_none());
+        assert!(t.note_contribution(1020, "c").is_none());
+        assert!(t.note_contribution(1030, "a").is_none());
+        // Fifth event, three uniques -> burst flagged exactly once.
+        let (ev, marker) = t.note_contribution(1040, "b").expect("burst fires");
+        assert_eq!((ev.kind, ev.amount), ("hype_train", 5));
+        assert!(ev.detail.contains("5 contributions from 3 chatters"));
+        let m: serde_json::Value = serde_json::from_str(&marker).unwrap();
+        assert!(m["text"].as_str().unwrap().starts_with("Hype-train-like burst"));
+        // More contributions during the active burst stay quiet.
+        assert!(t.note_contribution(1100, "d").is_none());
+        // After the window drains (>5 min gap), a new burst can fire again.
+        assert!(t.note_contribution(2000, "a").is_none());
+        assert!(t.note_contribution(2010, "b").is_none());
+        assert!(t.note_contribution(2020, "c").is_none());
+        assert!(t.note_contribution(2030, "d").is_none());
+        assert!(t.note_contribution(2040, "e").is_some(), "re-armed after the lapse");
+
+        // A single whale mass-gifting never counts as a train.
+        let mut t = EventTracker::default();
+        for i in 0..10 {
+            assert!(t.note_contribution(3000 + i, "whale").is_none());
+        }
     }
 
     #[test]

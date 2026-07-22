@@ -1347,16 +1347,38 @@ while recording. Discrete **stream events** are archived alongside:
   bans, chat clears, chat-mode changes and badge-inferred role changes, also
   from the recorded chat (see *Chat logs* below for the replay integration).
   Deletions + timeouts + bans roll up as **Mod acts** in the overview table.
+- **Hype trains (inferred)** — Twitch's real Hype Train API needs a
+  broadcaster-scoped token (and the anonymous PubSub feed is gone), so a
+  **hype-train-like burst** event fires instead when the recorded chat sees
+  5+ sub/gift/bits contributions from 3+ distinct chatters within 5 minutes —
+  marked with an asterisk in the UI to flag that it's a proxy, not Twitch's
+  own train state (no level/goal data).
 
 Where to look:
 
 - **Channel Stats tab** — an all-channels comparison table (peak / average
-  viewers, sampled airtime, followers, subs/bits/raids in the selected span)
-  plus, per channel, **viewer and follower graphs** with event markers
-  (diamonds along the baseline), category-change and 🤝 collab-change lines,
-  and a full event list. Span selector from 1 h to All. The 🤝 Collabs
-  partner overview lives here too. (The old Stats tab is now **App Stats**
-  and keeps the app/system-health content.)
+  viewers, sampled airtime, followers, subs/bits/raids/mod-acts in the
+  selected span) plus, per channel:
+  - **viewer and follower graphs** with event markers (diamonds at their
+    exact time, plotted at the event's own size — a raid's party size lands
+    near the viewer level it delivered), category-change and 🤝 collab-change
+    lines. Hovering a marker names **who did it** (gifter, cheerer, raider —
+    stacked markers list everyone under the pointer). The x-axis shows
+    **local clock time** (matching the event list) and viewer lines plot at
+    bucket centers so they line up with the markers.
+  - **🎁 Top gifters / 💎 Top cheerers** leaderboards — like Twitch's weekly
+    panels, but over your own archive and the selected span.
+  - **⚔ Raid history** — every incoming/outgoing raid with time, partner,
+    and party size.
+  - a **per-broadcast breakdown table** (started, airtime, peak/avg viewers,
+    subs, bits, raids, mod acts per stream — 📈 opens the graph clipped to
+    that broadcast), and a **filterable event list** (type a name to see
+    everything one user did).
+
+  Span selector from **1 m** to **All**; an **Auto refresh** checkbox re-runs
+  the queries once a minute while the tab is open. The 🤝 Collabs partner
+  overview lives here too. (The old Stats tab is now **App Stats** and keeps
+  the app/system-health content.)
 - **📈 popups** — right-click a channel/instance → **Viewer stats** (or
   double-click the 👁 cell) for the same graphs in a window; right-click a
   stream row → **📈 Stream stats** for the graph clipped to just that
@@ -1709,9 +1731,12 @@ collapse/expand choices are remembered across restarts:
   viewer (see *About page archive* below).
 - **View emotes** — one launcher per account+provider that has emotes, opening an
   **emote viewer**: a grid of every emote with its chat code (animated emotes play
-  when *Animate emotes* is on in Settings). Codes still listed in the manifest whose
-  image has gone from the cache are shown separately under **Deprecated (no longer
-  available)**. Sibling accounts open separate viewer windows.
+  when *Animate emotes* is on in Settings, at browser-accurate speed). A 🔍
+  **filter** box narrows the grid by code (case-insensitive; the tally shows
+  *matches of total*), and a **Sort** dropdown orders by name A→Z / Z→A or
+  animated-first. Codes still listed in the manifest whose image has gone from
+  the cache are shown separately under **Deprecated (no longer available)**.
+  Sibling accounts open separate viewer windows.
 
   ![Emote viewer windows for a channel's Twitch and 7TV emote sets](doc/screenshots/emote-viewer.png)
 

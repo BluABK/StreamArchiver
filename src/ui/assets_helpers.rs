@@ -149,6 +149,46 @@ pub(super) struct EmoteViewer {
     /// Set when this channel's assets were refetched while the window stayed
     /// open (the lists are an on-open snapshot).
     pub(super) stale: bool,
+    /// Live filter text — case-insensitive substring match on the emote code.
+    pub(super) filter: String,
+    /// Current sort order for the grids.
+    pub(super) sort: EmoteSort,
+}
+
+/// Sort orders for the emote-viewer grids.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum EmoteSort {
+    NameAsc,
+    NameDesc,
+    /// GIF/animated-WebP files first (by extension — a static WebP can slip
+    /// in, but the cache stores animated variants with these extensions).
+    AnimatedFirst,
+}
+
+impl EmoteSort {
+    pub(super) const ALL: [EmoteSort; 3] =
+        [EmoteSort::NameAsc, EmoteSort::NameDesc, EmoteSort::AnimatedFirst];
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            EmoteSort::NameAsc => "Name A→Z",
+            EmoteSort::NameDesc => "Name Z→A",
+            EmoteSort::AnimatedFirst => "Animated first",
+        }
+    }
+
+    /// Sort `list` in place (ties always break alphabetically).
+    pub(super) fn apply(self, list: &mut [ViewerEmote]) {
+        match self {
+            EmoteSort::NameAsc => list.sort_by_key(|e| e.name.to_lowercase()),
+            EmoteSort::NameDesc => {
+                list.sort_by_key(|e| std::cmp::Reverse(e.name.to_lowercase()))
+            }
+            EmoteSort::AnimatedFirst => list.sort_by_key(|e| {
+                (!matches!(e.ext.as_str(), "gif" | "webp"), e.name.to_lowercase())
+            }),
+        }
+    }
 }
 
 impl EmoteViewer {
@@ -171,6 +211,8 @@ impl EmoteViewer {
             deprecated,
             emote_properties: None,
             stale: false,
+            filter: String::new(),
+            sort: EmoteSort::NameAsc,
         }
     }
 }
