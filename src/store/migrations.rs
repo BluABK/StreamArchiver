@@ -1233,7 +1233,23 @@ impl Store {
             conn.execute_batch("ALTER TABLE monitor ADD COLUMN last_tags TEXT NOT NULL DEFAULT '';")?;
             conn.pragma_update(None, "user_version", 62)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 62);
+        if version < 63 {
+            // More free-ride Helix/scrape data (the "what are we discarding"
+            // audit): the stream's language + game id from every Twitch poll
+            // (game id enables box-art lookups later; both persist through
+            // offline as "the channel's usual values"), and the published
+            // VOD's view count from the VOD checker's Get Videos calls
+            // (NULL = never seen).
+            conn.execute_batch(
+                r#"
+                ALTER TABLE monitor ADD COLUMN last_language TEXT NOT NULL DEFAULT '';
+                ALTER TABLE monitor ADD COLUMN last_game_id TEXT NOT NULL DEFAULT '';
+                ALTER TABLE recording ADD COLUMN vod_views INTEGER;
+                "#,
+            )?;
+            conn.pragma_update(None, "user_version", 63)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 63);
         Ok(())
     }
 }

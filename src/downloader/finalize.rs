@@ -884,8 +884,8 @@ pub(super) const META_POLL_INTERVAL_SECS: i64 = 60;
 /// the source answers offline or is unavailable (see [`MetaFetch`]
 /// (crate::detectors::MetaFetch) — only `Failed` counts as a broken refresh).
 ///
-/// Also refreshes `monitor.last_viewers` every cycle (Twitch/Kick only —
-/// YouTube's scrape has no viewer field). This is the ONLY place that field
+/// Also refreshes `monitor.last_viewers` every cycle (Twitch/Kick exactly;
+/// YouTube from the watch page's scraped "watching now"). This is the ONLY place that field
 /// gets updated while a recording is active: `scheduler::tick` skips an
 /// actively-recording monitor entirely (the supervisor owns its state until
 /// the tool exits), so without this the Viewers column would freeze at

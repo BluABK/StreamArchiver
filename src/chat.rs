@@ -167,6 +167,10 @@ struct ChatLine<'a> {
     /// can't match single-message deletions.
     #[serde(skip_serializing_if = "str::is_empty")]
     id: &'a str,
+    /// Display name of the message this replies to (`reply-parent-display-name`)
+    /// — the replay renders an "↩ name" prefix. Omitted when not a reply.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    reply: &'a str,
 }
 
 /// Capture `url`'s Twitch chat to `path` until `done` (recording ended) or
@@ -300,7 +304,7 @@ async fn session(
                             // Sub/gift/bits contributions also feed the
                             // hype-train inference (burst -> one extra event
                             // + a replay notice).
-                            if matches!(ev.kind, "sub" | "resub" | "subgift" | "bits")
+                            if matches!(ev.kind, "sub" | "resub" | "subgift" | "bits" | "dono")
                                 && let Some((hype, marker)) =
                                     tracker.note_contribution(ev.ts, &ev.actor)
                             {
@@ -384,8 +388,8 @@ fn parse_privmsg(line: &str) -> Option<String> {
     let text = after.find(" :").map(|i| &after[i + 2..]).unwrap_or("");
     let login = prefix.split('!').next().unwrap_or(prefix);
 
-    let (mut display, mut color, mut badges, mut emotes, mut id, mut ts_ms) =
-        ("", "", "", "", "", 0i64);
+    let (mut display, mut color, mut badges, mut emotes, mut id, mut reply_raw, mut ts_ms) =
+        ("", "", "", "", "", "", 0i64);
     for kv in tags.split(';') {
         let mut it = kv.splitn(2, '=');
         let (k, v) = (it.next().unwrap_or(""), it.next().unwrap_or(""));
@@ -395,10 +399,12 @@ fn parse_privmsg(line: &str) -> Option<String> {
             "badges" => badges = v,
             "emotes" => emotes = v,
             "id" => id = v,
+            "reply-parent-display-name" => reply_raw = v,
             "tmi-sent-ts" => ts_ms = v.parse().unwrap_or(0),
             _ => {}
         }
     }
+    let reply = untag(reply_raw);
     if ts_ms == 0 {
         ts_ms = crate::models::now_unix() * 1000;
     }
@@ -412,6 +418,7 @@ fn parse_privmsg(line: &str) -> Option<String> {
         badges,
         emotes,
         id,
+        reply: &reply,
     })
     .ok()
 }
@@ -468,6 +475,14 @@ fn parse_chat_event(line: &str) -> Option<ChatEvent> {
     let mut plan = "";
     let (mut recipient, mut raider) = (String::new(), String::new());
     let mut community_batch = false;
+    let mut streak = 0i64;
+    let mut lifetime_gifts = 0i64;
+    let mut milestone_value = 0i64;
+    let mut milestone_cat = "";
+    let mut paid_amount = 0i64;
+    let mut paid_currency = "";
+    let mut paid_exponent = 2u32;
+    let mut first_msg = false;
     for kv in tags.split(';') {
         let mut it = kv.splitn(2, '=');
         let (k, v) = (it.next().unwrap_or(""), it.next().unwrap_or(""));
@@ -488,6 +503,14 @@ fn parse_chat_event(line: &str) -> Option<ChatEvent> {
             }
             "msg-param-displayName" => raider = untag(v),
             "msg-param-community-gift-id" => community_batch = true,
+            "msg-param-streak-months" => streak = v.parse().unwrap_or(0),
+            "msg-param-sender-count" => lifetime_gifts = v.parse().unwrap_or(0),
+            "msg-param-value" => milestone_value = v.parse().unwrap_or(0),
+            "msg-param-category" => milestone_cat = v,
+            "pinned-chat-paid-amount" => paid_amount = v.parse().unwrap_or(0),
+            "pinned-chat-paid-currency" => paid_currency = v,
+            "pinned-chat-paid-exponent" => paid_exponent = v.parse().unwrap_or(2),
+            "first-msg" => first_msg = v == "1",
             _ => {}
         }
     }
@@ -501,28 +524,88 @@ fn parse_chat_event(line: &str) -> Option<ChatEvent> {
     };
     let tier = plan.to_string();
 
-    let ev = |kind: &'static str, actor: String, target: String, amount: i64, tier: String| {
-        ChatEvent { kind, actor, target, amount, tier, detail: String::new(), ts }
+    let ev = |kind: &'static str, actor: String, target: String, amount: i64, tier: String, detail: String| {
+        ChatEvent { kind, actor, target, amount, tier, detail, ts }
     };
+    let text = after.find(" :").map(|i| &after[i + 2..]).unwrap_or("");
     if after.starts_with("USERNOTICE ") {
         return match msg_id {
-            "sub" => Some(ev("sub", actor, String::new(), 1, tier)),
-            "resub" => Some(ev("resub", actor, String::new(), months.max(1), tier)),
-            "subgift" if !community_batch => Some(ev("subgift", actor, recipient, 1, tier)),
+            "sub" => Some(ev("sub", actor, String::new(), 1, tier, String::new())),
+            "resub" => Some(ev(
+                "resub",
+                actor,
+                String::new(),
+                months.max(1),
+                tier,
+                // Watch/sub streak, when the subscriber chose to share it.
+                if streak > 0 { format!("{streak}-month streak") } else { String::new() },
+            )),
+            "subgift" if !community_batch => Some(ev(
+                "subgift",
+                actor,
+                recipient,
+                1,
+                tier,
+                if lifetime_gifts > 0 { format!("{lifetime_gifts} gifts lifetime") } else { String::new() },
+            )),
             // Community batch: the announcement carries the size, no single recipient.
-            "submysterygift" => Some(ev("subgift", actor, String::new(), gift_count.max(1), tier)),
+            "submysterygift" => Some(ev(
+                "subgift",
+                actor,
+                String::new(),
+                gift_count.max(1),
+                tier,
+                if lifetime_gifts > 0 { format!("{lifetime_gifts} gifts lifetime") } else { String::new() },
+            )),
             "raid" => Some(ev(
                 "raid_in",
                 if raider.is_empty() { actor } else { raider },
                 String::new(),
                 viewer_count,
                 String::new(),
+                String::new(),
+            )),
+            // Watch-streak (and similar) milestone celebrations.
+            "viewermilestone" if milestone_value > 0 => Some(ev(
+                "milestone",
+                actor,
+                String::new(),
+                milestone_value,
+                String::new(),
+                if milestone_cat.is_empty() {
+                    format!("milestone {milestone_value}")
+                } else {
+                    format!("{} {milestone_value}", untag(milestone_cat))
+                },
+            )),
+            // Moderator announcements (the highlighted 📣 messages).
+            "announcement" => Some(ev(
+                "announcement",
+                actor,
+                String::new(),
+                0,
+                String::new(),
+                excerpt(text, 160),
             )),
             _ => None,
         };
     }
-    if bits > 0 && after.starts_with("PRIVMSG ") {
-        return Some(ev("bits", actor, String::new(), bits, String::new()));
+    if after.starts_with("PRIVMSG ") {
+        if bits > 0 {
+            return Some(ev("bits", actor, String::new(), bits, String::new(), String::new()));
+        }
+        // Hype Chat: a PAID pinned message — real on-platform money, carried
+        // as minor currency units + exponent (500 + 2 -> 5.00).
+        if paid_amount > 0 {
+            let value = paid_amount as f64 / 10f64.powi(paid_exponent as i32);
+            let detail = format!("{value:.prec$} {paid_currency}", prec = paid_exponent as usize);
+            return Some(ev("dono", actor, String::new(), paid_amount, paid_currency.to_string(), detail));
+        }
+        // First-time chatter (excluded from graph markers — too dense — but
+        // listed/filterable in the events table).
+        if first_msg {
+            return Some(ev("first_chat", actor, String::new(), 0, String::new(), excerpt(text, 80)));
+        }
     }
     None
 }
@@ -693,6 +776,20 @@ impl EventTracker {
                         ));
                     }
                 }
+            }
+        } else if after.starts_with("USERNOTICE ") {
+            // Moderator announcements show as 📣 notice lines in the replay
+            // (the DB event comes from `parse_chat_event`; this is display).
+            if tag("msg-id") == Some("announcement") && !trailing.is_empty() {
+                let name = tag("display-name")
+                    .map(untag)
+                    .filter(|n| !n.is_empty())
+                    .or_else(|| tag("login").map(str::to_string))
+                    .unwrap_or_default();
+                markers.push(format!(
+                    r#"{{"ts":{ts},"marker":"notice","text":{}}}"#,
+                    serde_json::Value::from(format!("📣 {name}: {trailing}"))
+                ));
             }
         } else if after.starts_with("ROOMSTATE ") {
             let parse_flag = |k: &str| tag(k).map(|v| v == "1");
@@ -916,13 +1013,52 @@ mod tests {
         let ev = parse_chat_event(raid).expect("raid parses");
         assert_eq!((ev.kind, ev.actor.as_str(), ev.amount), ("raid_in", "Raider", 1234));
 
-        // Plain chat and other notices are not events.
+        // Plain chat is not an event…
         let plain = "@badges=;display-name=Bob;tmi-sent-ts=1 \
                      :bob!bob@bob.tmi.twitch.tv PRIVMSG #streamer :hi";
         assert!(parse_chat_event(plain).is_none());
+        // …but mod announcements are (with the text as detail).
         let announce = "@msg-id=announcement;display-name=Mod \
                         :tmi.twitch.tv USERNOTICE #streamer :big news";
-        assert!(parse_chat_event(announce).is_none());
+        let ev = parse_chat_event(announce).expect("announcement parses");
+        assert_eq!((ev.kind, ev.actor.as_str(), ev.detail.as_str()), ("announcement", "Mod", "big news"));
+    }
+
+    #[test]
+    fn parses_hype_chat_first_msg_and_milestone() {
+        // Hype Chat: paid pinned message, minor units + exponent.
+        let hype = "@badges=;display-name=Fan;pinned-chat-paid-amount=500;\
+                    pinned-chat-paid-currency=USD;pinned-chat-paid-exponent=2;\
+                    pinned-chat-paid-level=ONE;tmi-sent-ts=1700000020000 \
+                    :fan!fan@fan.tmi.twitch.tv PRIVMSG #streamer :take my money";
+        let ev = parse_chat_event(hype).expect("hype chat parses");
+        assert_eq!((ev.kind, ev.amount, ev.tier.as_str()), ("dono", 500, "USD"));
+        assert_eq!(ev.detail, "5.00 USD");
+
+        // First-time chatter.
+        let first = "@badges=;display-name=Newbie;first-msg=1;tmi-sent-ts=1700000021000 \
+                     :newbie!newbie@newbie.tmi.twitch.tv PRIVMSG #streamer :hello world";
+        let ev = parse_chat_event(first).expect("first-msg parses");
+        assert_eq!((ev.kind, ev.detail.as_str()), ("first_chat", "hello world"));
+
+        // Watch-streak milestone.
+        let ms = "@display-name=Loyal;login=loyal;msg-id=viewermilestone;\
+                  msg-param-category=watch-streak;msg-param-value=15;\
+                  tmi-sent-ts=1700000022000 :tmi.twitch.tv USERNOTICE #streamer";
+        let ev = parse_chat_event(ms).expect("milestone parses");
+        assert_eq!((ev.kind, ev.amount, ev.detail.as_str()), ("milestone", 15, "watch-streak 15"));
+
+        // Resub streak + gifter lifetime totals land in the detail.
+        let resub = "@display-name=OldFan;login=oldfan;msg-id=resub;\
+                     msg-param-cumulative-months=24;msg-param-streak-months=12;\
+                     msg-param-sub-plan=1000 :tmi.twitch.tv USERNOTICE #streamer";
+        let ev = parse_chat_event(resub).expect("resub parses");
+        assert_eq!(ev.detail, "12-month streak");
+        let gift = "@display-name=Whale;login=whale;msg-id=submysterygift;\
+                    msg-param-mass-gift-count=20;msg-param-sender-count=663;\
+                    msg-param-sub-plan=1000 :tmi.twitch.tv USERNOTICE #streamer";
+        let ev = parse_chat_event(gift).expect("mystery gift parses");
+        assert_eq!((ev.amount, ev.detail.as_str()), (20, "663 gifts lifetime"));
     }
 
     #[test]

@@ -1697,7 +1697,9 @@ impl StreamArchiverApp {
                     "tags" => {
                         let cur_tags =
                             primary.map(|m| m.last_tags.clone()).unwrap_or_default();
-                        meta_value_cell(ui, &cur_tags);
+                        let cur_lang =
+                            primary.map(|m| m.last_language.clone()).unwrap_or_default();
+                        tags_cell(ui, &cur_tags, &cur_lang);
                     }
                     _ => {}
                 }});
@@ -2578,6 +2580,15 @@ impl StreamArchiverApp {
                             head_backfill_running(background_tasks, t.id),
                             t.head_backfill_state == "queued",
                         );
+                        // Published-VOD view count (from the checker's Get
+                        // Videos polls — free data, refreshed while the mute
+                        // watch runs).
+                        if let Some(v) = t.vod_views.filter(|v| *v > 0) {
+                            ui.weak(format!("📼 {}", fmt_viewers(v))).on_hover_text(format!(
+                                "The published VOD had {v} views when last checked \
+                                 (the VOD checker polls it for ~2 h after publication)."
+                            ));
+                        }
                         // In-progress / needs-attention badges
                         let needs_remux = t.output_path.ends_with(".ts")
                             && crate::downloader::path_in_cache(&t.output_path);

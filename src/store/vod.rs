@@ -139,6 +139,14 @@ impl Store {
 
     /// Update only the muted-seconds count (post-find mute watcher) — must not
     /// clobber `vod_state`/`vod_id` the way `set_recording_vod_found` would.
+    /// Latest published-VOD view count (narrow setter — the checker and the
+    /// mute watch refresh it without touching vod_state/vod_id).
+    pub fn set_recording_vod_views(&self, id: i64, views: i64) -> Result<()> {
+        let conn = self.db();
+        conn.execute("UPDATE recording SET vod_views=?2 WHERE id=?1", params![id, views])?;
+        Ok(())
+    }
+
     pub fn set_recording_vod_muted_secs(&self, id: i64, muted_secs: i64) -> Result<()> {
         let conn = self.db();
         conn.execute(

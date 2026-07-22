@@ -75,8 +75,11 @@ pub(super) async fn check_twitch_vod(
         )
         .await
         {
-            Ok(Some((vod_id, muted_secs))) => {
+            Ok(Some((vod_id, muted_secs, views))) => {
                 let _ = store.set_recording_vod_found(rec_id, &vod_id, muted_secs);
+                if views > 0 {
+                    let _ = store.set_recording_vod_views(rec_id, views);
+                }
                 let _ = events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
                 info!(rec_id, vod_id, muted_secs, "{} VOD found", Platform::Twitch.tag());
                 let archive_on = archive_download_enabled(&store, rec_id);
@@ -286,14 +289,16 @@ pub(super) fn match_twitch_vod(
     data: &[serde_json::Value],
     stream_id: Option<&str>,
     went_live_at: Option<i64>,
-) -> Option<(String, i64)> {
-    let entry = |item: &serde_json::Value| -> Option<(String, i64)> {
+) -> Option<(String, i64, i64)> {
+    let entry = |item: &serde_json::Value| -> Option<(String, i64, i64)> {
         let vod_id = item["id"].as_str()?;
         let muted_secs: i64 = item["muted_segments"]
             .as_array()
             .map(|segs| segs.iter().filter_map(|s| s["duration"].as_i64()).sum())
             .unwrap_or(0);
-        Some((vod_id.to_string(), muted_secs))
+        // View count rides the same response — free data.
+        let views = item["view_count"].as_i64().unwrap_or(0);
+        Some((vod_id.to_string(), muted_secs, views))
     };
     if let Some(want) = stream_id.filter(|s| !s.is_empty()) {
         return data
@@ -331,7 +336,7 @@ pub(super) async fn poll_twitch_vod(
     user_id: &str,
     stream_id: Option<&str>,
     went_live_at: Option<i64>,
-) -> anyhow::Result<Option<(String, i64)>> {
+) -> anyhow::Result<Option<(String, i64, i64)>> {
     use anyhow::bail;
     let resp = client
         .get("https://api.twitch.tv/helix/videos")
@@ -365,6 +370,7 @@ pub(super) async fn resolve_twitch_vod_by_stream(
         .await
         .ok()
         .flatten()
+        .map(|(id, muted, _views)| (id, muted))
 }
 
 /// Keep re-checking a freshly-published, currently-clean VOD for a late DMCA
@@ -396,7 +402,14 @@ pub(super) async fn watch_vod_mute(
         };
         let muted_secs = match poll_twitch_vod_muted(&ctx.http_client(), &client_id, &token, vod_id).await
         {
-            Ok(Some(m)) => m,
+            Ok(Some((m, views))) => {
+                // The view count rides every poll — keep it fresh while the
+                // watch runs (the closest thing to a final per-VOD figure).
+                if views > 0 {
+                    let _ = store.set_recording_vod_views(rec_id, views);
+                }
+                m
+            }
             Ok(None) => return, // VOD delisted — nothing left to watch
             Err(e) => {
                 warn!(rec_id, vod_id, "mute watch poll error: {e:#}");
@@ -445,14 +458,14 @@ pub(super) async fn watch_vod_mute(
     }
 }
 
-/// Current muted-segment seconds for a KNOWN VOD via Helix `/videos?id=`.
-/// `Ok(None)` = the VOD is no longer listed (deleted/expired).
+/// Current `(muted-segment seconds, view count)` for a KNOWN VOD via Helix
+/// `/videos?id=`. `Ok(None)` = the VOD is no longer listed (deleted/expired).
 pub(super) async fn poll_twitch_vod_muted(
     client: &reqwest::Client,
     client_id: &str,
     token: &str,
     vod_id: &str,
-) -> anyhow::Result<Option<i64>> {
+) -> anyhow::Result<Option<(i64, i64)>> {
     use anyhow::bail;
     let resp = client
         .get("https://api.twitch.tv/helix/videos")
@@ -476,7 +489,7 @@ pub(super) async fn poll_twitch_vod_muted(
         .as_array()
         .map(|segs| segs.iter().filter_map(|s| s["duration"].as_i64()).sum())
         .unwrap_or(0);
-    Ok(Some(muted))
+    Ok(Some((muted, item["view_count"].as_i64().unwrap_or(0))))
 }
 
 impl Supervisor {
@@ -771,7 +784,7 @@ impl Supervisor {
                     helix = self.ctx.twitch_helix_auth().await.ok();
                 }
                 if let Some((cid, tok)) = helix.as_ref()
-                    && let Ok(Some(m)) =
+                    && let Ok(Some((m, _views))) =
                         poll_twitch_vod_muted(&self.ctx.http_client(), cid, tok, vid).await
                 {
                     muted_secs = m;
@@ -846,20 +859,22 @@ mod tests {
                 "id": "2817816829", "stream_id": "320421899867",
                 "created_at": "2026-07-11T23:14:35Z",
                 "muted_segments": [{"duration": 180}, {"duration": 30}],
+                "view_count": 4321,
             }),
         ];
-        // Known stream id → exact match (and muted segments summed), even
-        // though the wrong VOD sorts first and sits inside the window.
+        // Known stream id → exact match (and muted segments summed + view
+        // count carried), even though the wrong VOD sorts first and sits
+        // inside the window.
         let wl = Some(crate::detectors::parse_rfc3339("2026-07-11T23:14:31Z").unwrap());
         assert_eq!(
             match_twitch_vod(&data, Some("320421899867"), wl),
-            Some(("2817816829".into(), 210))
+            Some(("2817816829".into(), 210, 4321))
         );
         // Known id, VOD not in the page → not published, no neighbor-grabbing.
         assert_eq!(match_twitch_vod(&data, Some("111"), wl), None);
         // No id (legacy row) → old window behavior: newest within the window.
-        assert_eq!(match_twitch_vod(&data, None, wl), Some(("2817892940".into(), 0)));
+        assert_eq!(match_twitch_vod(&data, None, wl), Some(("2817892940".into(), 0, 0)));
         // No id and no anchor → most recent archive.
-        assert_eq!(match_twitch_vod(&data, None, None), Some(("2817892940".into(), 0)));
+        assert_eq!(match_twitch_vod(&data, None, None), Some(("2817892940".into(), 0, 0)));
     }
 }

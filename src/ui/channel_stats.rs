@@ -62,6 +62,10 @@ fn event_color(kind: &str) -> egui::Color32 {
         "chat_mode" => egui::Color32::from_rgb(0x78, 0x90, 0x9c),
         "role_change" => egui::Color32::from_rgb(0xff, 0xd5, 0x4f),
         "hype_train" => egui::Color32::from_rgb(0xff, 0x40, 0x81),
+        "dono" => egui::Color32::from_rgb(0x66, 0xbb, 0x6a),
+        "first_chat" => egui::Color32::from_rgb(0x90, 0xa4, 0xae),
+        "milestone" => egui::Color32::from_rgb(0x26, 0xc6, 0xda),
+        "announcement" => egui::Color32::from_rgb(0x5c, 0x9d, 0xff),
         _ => egui::Color32::GRAY,
     }
 }
@@ -82,6 +86,10 @@ fn event_label(kind: &str) -> &'static str {
         "chat_mode" => "Chat mode",
         "role_change" => "Role change",
         "hype_train" => "Hype train*",
+        "dono" => "Hype Chat",
+        "first_chat" => "First chat",
+        "milestone" => "Milestone",
+        "announcement" => "Announcement",
         _ => "Event",
     }
 }
@@ -113,6 +121,14 @@ fn event_line(e: &StreamEventRow) -> String {
         // Inferred from contribution bursts — Twitch's real Hype Train API
         // needs a broadcaster token, so this is a proxy, hence the asterisk.
         "hype_train" => format!("hype-train-like burst — {}", e.detail),
+        // Hype Chat: a paid pinned message (real on-platform money).
+        "dono" => format!("{} sent a {} Hype Chat", e.actor, e.detail),
+        "first_chat" if e.detail.is_empty() => format!("{} chatted for the first time", e.actor),
+        "first_chat" => {
+            format!("{} chatted for the first time: \u{201c}{}\u{201d}", e.actor, e.detail)
+        }
+        "milestone" => format!("{} hit a {}", e.actor, e.detail),
+        "announcement" => format!("📣 {}: {}", e.actor, e.detail),
         other => format!("{other} by {}", e.actor),
     }
 }
@@ -317,8 +333,8 @@ impl StreamArchiverApp {
         if data.viewer.is_empty() && data.overview.is_empty() {
             ui.weak(
                 "No viewer history in this span yet — samples accumulate whenever \
-                 a monitored channel is live (viewer counts come from Twitch and \
-                 Kick; YouTube provides none while recording).",
+                 a monitored channel is live (Twitch and Kick report exact counts; \
+                 YouTube's are scraped from the watch page).",
             );
         } else {
             let mut clicked: Option<i64> = None;
@@ -920,6 +936,11 @@ fn viewer_graph_ui(
             // the viewer level it delivered; 1-unit events hug the baseline.
             let mut by_kind: std::collections::BTreeMap<&str, Vec<[f64; 2]>> = Default::default();
             for e in events {
+                // First-time chatters are too dense to mark (dozens per
+                // stream) — they stay in the events list below, filterable.
+                if e.kind == "first_chat" {
+                    continue;
+                }
                 by_kind
                     .entry(e.kind.as_str())
                     .or_default()
@@ -938,7 +959,7 @@ fn viewer_graph_ui(
             if let Some(ptr) = plot_ui.pointer_coordinate() {
                 let tf = *plot_ui.transform();
                 let ptr_px = tf.position_from_point(&ptr);
-                for e in events {
+                for e in events.iter().filter(|e| e.kind != "first_chat") {
                     let px = tf.position_from_point(&egui_plot::PlotPoint::new(
                         to_x(e.at),
                         e.amount.max(0) as f64,

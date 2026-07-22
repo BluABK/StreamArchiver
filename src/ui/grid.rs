@@ -351,6 +351,21 @@ pub(super) fn ts_went_live_label(ui: &mut egui::Ui, secs: i64, approx: bool) {
 /// hover automatically when the label is elided (`show_tooltip_when_elided`
 /// defaults to true), so we add no explicit tooltip — a second one would just
 /// stack a duplicate.
+/// Tags cell: the truncated tag list, with the broadcast language appended to
+/// the hover when known (it arrives from the same Helix response).
+pub(super) fn tags_cell(ui: &mut egui::Ui, tags: &str, language: &str) {
+    if tags.is_empty() && language.is_empty() {
+        return;
+    }
+    let hover = match (tags.is_empty(), language.is_empty()) {
+        (false, false) => format!("{tags}\nLanguage: {language}"),
+        (false, true) => tags.to_string(),
+        (true, false) => format!("Language: {language}"),
+        (true, true) => unreachable!(),
+    };
+    ui.add(egui::Label::new(tags).truncate()).on_hover_text(hover);
+}
+
 pub(super) fn meta_value_cell(ui: &mut egui::Ui, value: &str) {
     if value.is_empty() {
         return;
@@ -2151,7 +2166,7 @@ pub(super) fn render_instance_row(
                 ui.label(fmt_date(row.channel.created_at));
             }
             "tags" => {
-                meta_value_cell(ui, &row.last_tags);
+                tags_cell(ui, &row.last_tags, &row.last_language);
             }
             _ => {}
         }});
@@ -2254,6 +2269,7 @@ mod tests {
             live_collab: None,
             capture_offline: false,
             last_tags: String::new(),
+            last_language: String::new(),
         }
     }
 

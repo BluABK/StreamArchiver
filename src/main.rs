@@ -524,6 +524,7 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
         live_collab: None,
         capture_offline: false,
         last_tags: String::new(),
+        last_language: String::new(),
     };
     let plan = downloader::build_plan(
         &row,

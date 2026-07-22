@@ -326,6 +326,17 @@ async fn tick(
         } else {
             (None, false)
         };
+        // Language + game id only when the source carries them (Twitch);
+        // kept through offline as the channel's usual values.
+        if (o.stream_language.is_some() || o.stream_game_id.is_some())
+            && let Err(e) = ctx.store.set_monitor_stream_extras(
+                o.monitor_id,
+                o.stream_language.as_deref().unwrap_or(""),
+                o.stream_game_id.as_deref().unwrap_or(""),
+            )
+        {
+            warn!("scheduler: failed to persist stream extras for {}: {e:#}", o.monitor_id);
+        }
         if let Err(e) = ctx.store.set_monitor_live_meta(
             o.monitor_id,
             title,

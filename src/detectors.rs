@@ -82,6 +82,11 @@ pub struct DetectOutcome {
     /// Stream tags at detection time, `", "`-joined (Twitch Helix `tags`;
     /// Kick best-effort). `None` when the platform/path omits them.
     pub stream_tags: Option<String>,
+    /// Broadcast language code (Twitch `language`, e.g. `"en"`).
+    pub stream_language: Option<String>,
+    /// Platform game/category id (Twitch `game_id`) — stored for box-art
+    /// lookups; not displayed directly.
+    pub stream_game_id: Option<String>,
 }
 
 impl DetectOutcome {
@@ -100,6 +105,8 @@ impl DetectOutcome {
             stream_viewers: None,
             stream_followers: None,
             stream_tags: None,
+            stream_language: None,
+            stream_game_id: None,
         }
     }
     fn live_at(
@@ -145,6 +152,14 @@ impl DetectOutcome {
         self.stream_tags = stream_tags;
         self
     }
+    fn with_stream_language(mut self, stream_language: Option<String>) -> DetectOutcome {
+        self.stream_language = stream_language;
+        self
+    }
+    fn with_stream_game_id(mut self, stream_game_id: Option<String>) -> DetectOutcome {
+        self.stream_game_id = stream_game_id;
+        self
+    }
     fn offline(monitor_id: i64) -> DetectOutcome {
         DetectOutcome {
             monitor_id,
@@ -160,6 +175,8 @@ impl DetectOutcome {
             stream_viewers: None,
             stream_followers: None,
             stream_tags: None,
+            stream_language: None,
+            stream_game_id: None,
         }
     }
     fn err(monitor_id: i64, detail: impl Into<String>) -> DetectOutcome {
@@ -177,6 +194,8 @@ impl DetectOutcome {
             stream_viewers: None,
             stream_followers: None,
             stream_tags: None,
+            stream_language: None,
+            stream_game_id: None,
         }
     }
 }
@@ -217,14 +236,13 @@ struct TwitchToken {
 pub struct StreamMeta {
     pub title: String,
     pub game: String,
-    /// Live viewer count at fetch time (Twitch/Kick; YouTube's `/live` scrape
-    /// has no reliable viewer field, so always `None` there — mirrors
-    /// `DetectOutcome::stream_viewers`'s own platform coverage).
+    /// Live viewer count at fetch time (Twitch/Kick exact; YouTube scraped
+    /// from the watch page's "watching now" figure — best-effort).
     pub viewers: Option<i64>,
-    /// Follower total at fetch time. Kick only — its channel JSON carries it
-    /// in responses we already pull. Twitch's follower total needs a
-    /// moderator-scoped user token and YouTube's subscriber count isn't in
-    /// the `/live` page, so both stay `None` (feeds `viewer_history`).
+    /// Follower/subscriber total at fetch time: Kick's channel JSON carries
+    /// it exactly; YouTube's is the page's rounded "1.62M" figure. Twitch's
+    /// needs a moderator-scoped user token, so it stays `None`. (Feeds
+    /// `viewer_history`.)
     pub followers: Option<i64>,
     /// Stream tags, `", "`-joined (Twitch Helix / Kick best-effort; empty
     /// when the platform has none — YouTube exposes no tag list).
@@ -262,6 +280,50 @@ pub struct CollabGroup {
 /// The Twitch web client's own public Client-ID — what its anonymous GQL
 /// requests send (same id streamlink/yt-dlp use for playback queries).
 const TWITCH_WEB_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
+
+/// Settings-blob cache of extra Get Users fields we'd otherwise discard:
+/// `login (lowercase) -> (broadcaster_type, account created_at unix)`.
+/// Fills opportunistically whenever a Get Users response passes through
+/// (collab name resolution, id lookups); read by the Properties windows.
+const K_TWITCH_USER_INFO: &str = "twitch_user_info_cache";
+
+/// Fold one Get Users JSON object into [`K_TWITCH_USER_INFO`]. Best-effort:
+/// serialization or store errors just skip the update.
+fn cache_twitch_user_info(store: &crate::store::Store, u: &Value) {
+    let Some(login) = u["login"].as_str() else { return };
+    let btype = u["broadcaster_type"].as_str().unwrap_or("").to_string();
+    let created =
+        u["created_at"].as_str().and_then(parse_rfc3339).unwrap_or(0);
+    if btype.is_empty() && created == 0 {
+        return;
+    }
+    let mut cache: std::collections::HashMap<String, (String, i64)> = store
+        .get_setting(K_TWITCH_USER_INFO)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let entry = (btype, created);
+    if cache.get(&login.to_lowercase()) == Some(&entry) {
+        return;
+    }
+    cache.insert(login.to_lowercase(), entry);
+    if let Ok(json) = serde_json::to_string(&cache) {
+        let _ = store.set_setting(K_TWITCH_USER_INFO, &json);
+    }
+}
+
+/// Cached extra account info for a Twitch login (see [`K_TWITCH_USER_INFO`]):
+/// `(broadcaster_type, account created_at unix)`. `None` until some Get Users
+/// call has passed the account through the cache.
+pub fn cached_twitch_user_info(
+    store: &crate::store::Store,
+    login: &str,
+) -> Option<(String, i64)> {
+    let cache: std::collections::HashMap<String, (String, i64)> =
+        serde_json::from_str(&store.get_setting(K_TWITCH_USER_INFO).ok().flatten()?).ok()?;
+    cache.get(&login.to_lowercase()).cloned()
+}
 
 /// Outcome of one in-recording metadata fetch (`*_stream_meta`). The split
 /// between [`Offline`](MetaFetch::Offline) and [`Failed`](MetaFetch::Failed)
@@ -620,6 +682,10 @@ impl DetectContext {
             viewer_count: Option<i64>,
             #[serde(default)]
             tags: Option<Vec<String>>,
+            #[serde(default)]
+            language: Option<String>,
+            #[serde(default)]
+            game_id: Option<String>,
         }
         #[derive(Deserialize)]
         struct StreamsResp {
@@ -644,23 +710,16 @@ impl DetectContext {
 
                 match resp {
                     Ok(r) if r.status().is_success() => {
-                        // login -> (went_live, stream_id, user_id, thumbnail_url, title, game, viewers, tags)
-                        #[allow(clippy::type_complexity)]
-                        let live: HashMap<String, (Option<i64>, Option<String>, String, String, Option<String>, Option<String>, Option<i64>, Option<String>)> =
+                        // login -> the full live Stream row (the old field
+                        // tuple outgrew itself once tags/language arrived).
+                        let live: HashMap<String, Stream> =
                             match r.json::<StreamsResp>().await
                         {
                             Ok(sr) => sr
                                 .data
                                 .into_iter()
                                 .filter(|s| s.kind == "live")
-                                .map(|s| {
-                                    let when = s.started_at.as_deref().and_then(parse_rfc3339);
-                                    let tags = s.tags.map(|t| t.join(", "));
-                                    (
-                                        s.user_login.to_lowercase(),
-                                        (when, Some(s.id), s.user_id, s.thumbnail_url, s.title, s.game_name, s.viewer_count, tags),
-                                    )
-                                })
+                                .map(|s| (s.user_login.to_lowercase(), s))
                                 .collect(),
                             Err(e) => {
                                 for l in chunk {
@@ -678,15 +737,21 @@ impl DetectContext {
                             let key = l.to_lowercase();
                             for mid in &login_to_mons[l] {
                                 outcomes.push(match live.get(&key) {
-                                    Some((went, id, uid, thumb, title, game, viewers, tags)) => {
-                                        DetectOutcome::live_at(*mid, "live", *went)
-                                            .with_stream_id(id.clone())
-                                            .with_broadcaster_id(Some(uid.clone()))
-                                            .with_thumbnail_url(Some(thumb.clone()))
-                                            .with_stream_title(title.clone())
-                                            .with_stream_game(game.clone())
-                                            .with_stream_viewers(*viewers)
-                                            .with_stream_tags(tags.clone())
+                                    Some(s) => {
+                                        let went =
+                                            s.started_at.as_deref().and_then(parse_rfc3339);
+                                        DetectOutcome::live_at(*mid, "live", went)
+                                            .with_stream_id(Some(s.id.clone()))
+                                            .with_broadcaster_id(Some(s.user_id.clone()))
+                                            .with_thumbnail_url(Some(s.thumbnail_url.clone()))
+                                            .with_stream_title(s.title.clone())
+                                            .with_stream_game(s.game_name.clone())
+                                            .with_stream_viewers(s.viewer_count)
+                                            .with_stream_tags(
+                                                s.tags.as_ref().map(|t| t.join(", ")),
+                                            )
+                                            .with_stream_language(s.language.clone())
+                                            .with_stream_game_id(s.game_id.clone())
                                     }
                                     None => DetectOutcome::offline(*mid),
                                 });
@@ -967,6 +1032,7 @@ impl DetectContext {
                     };
                     let display = u["display_name"].as_str().unwrap_or(login);
                     cache.insert(id.to_string(), (login.to_string(), display.to_string()));
+                    cache_twitch_user_info(&self.store, u);
                     dirty = true;
                 }
             }
@@ -1275,6 +1341,7 @@ impl DetectContext {
             .ok()?;
         let v: serde_json::Value = resp.json().await.ok()?;
         let u = v["data"].as_array().and_then(|a| a.first())?;
+        cache_twitch_user_info(&self.store, u);
         Some(u["id"].as_str()?.to_string())
     }
 
@@ -2892,6 +2959,10 @@ impl DetectContext {
                         .with_thumbnail_url(thumbnail_url)
                         .with_stream_id(video_id)
                         .with_stream_title(title)
+                        // Both scraped from the page's ytInitialData blob:
+                        // "N watching now" + the rounded subscriber count.
+                        .with_stream_viewers(yt_watching_now(&body))
+                        .with_stream_followers(yt_subscriber_count(&body))
                 } else {
                     DetectOutcome::offline(item.monitor_id)
                 }
@@ -4910,10 +4981,69 @@ fn parse_youtube_meta(body: &str) -> MetaFetch {
     MetaFetch::Live(StreamMeta {
         title: title.to_string(),
         game,
-        viewers: None,
-        followers: None,
-        tags: String::new(),
+        // Both live in the page's OTHER blob (`ytInitialData`), so they're
+        // string-scanned from the raw body: "N watching now" and the
+        // channel's (approximate, "1.62M"-style) subscriber count.
+        viewers: yt_watching_now(body),
+        followers: yt_subscriber_count(body),
+        tags: pr["videoDetails"]["keywords"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|k| k.as_str()).collect::<Vec<_>>().join(", "))
+            .unwrap_or_default(),
     })
+}
+
+/// The live "N watching now" count from a YouTube watch page's
+/// `ytInitialData` (string-scanned — the blob is ~1.5 MB of JSON and this is
+/// the only field we need). `None` when absent (not live / layout change).
+fn yt_watching_now(body: &str) -> Option<i64> {
+    let start = body.find("videoViewCountRenderer")?;
+    let window = &body[start..(start + 600).min(body.len())];
+    // Only a LIVE view-count renderer counts — a VOD's "123,456 views" uses
+    // the same renderer without the isLive flag.
+    if !window.contains("\"isLive\":true") {
+        return None;
+    }
+    // First quoted "text"/"simpleText" value containing a digit is the count
+    // (e.g. {"runs":[{"text":"1,234"},{"text":" watching now"}]}).
+    for key in ["\"text\":\"", "\"simpleText\":\""] {
+        let mut rest = window;
+        while let Some(i) = rest.find(key) {
+            let v = &rest[i + key.len()..];
+            let end = v.find('"')?;
+            let digits: String = v[..end].chars().filter(|c| c.is_ascii_digit()).collect();
+            if !digits.is_empty() {
+                return digits.parse().ok();
+            }
+            rest = &v[end..];
+        }
+    }
+    None
+}
+
+/// The channel's approximate subscriber count from a watch page's owner
+/// block (`"subscriberCountText":{"simpleText":"1.62M subscribers"}`).
+/// Approximate by nature — YouTube only publishes the rounded figure.
+fn yt_subscriber_count(body: &str) -> Option<i64> {
+    let start = body.find("subscriberCountText")?;
+    let window = &body[start..(start + 300).min(body.len())];
+    let key = "\"simpleText\":\"";
+    let i = window.find(key)?;
+    let v = &window[i + key.len()..];
+    let end = v.find('"')?;
+    yt_compact_number(v[..end].split_whitespace().next()?)
+}
+
+/// `"1.62M"` → 1_620_000, `"12.3K"` → 12_300, `"998"` → 998.
+fn yt_compact_number(s: &str) -> Option<i64> {
+    let (mult, num) = match s.chars().last()? {
+        'K' | 'k' => (1_000.0, &s[..s.len() - 1]),
+        'M' | 'm' => (1_000_000.0, &s[..s.len() - 1]),
+        'B' | 'b' => (1_000_000_000.0, &s[..s.len() - 1]),
+        _ => (1.0, s),
+    };
+    let n: f64 = num.replace(',', "").parse().ok()?;
+    Some((n * mult).round() as i64)
 }
 
 /// Extract a live Kick stream's title + category from the v2 channel JSON.
@@ -4952,6 +5082,24 @@ fn parse_kick_meta(v: &Value) -> MetaFetch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn yt_watching_now_and_subscribers_parse() {
+        let live = r#"..."viewCount":{"videoViewCountRenderer":{"viewCount":{"runs":[{"text":"1,234"},{"text":" watching now"}]},"isLive":true}}..."#;
+        assert_eq!(yt_watching_now(live), Some(1234));
+        // A VOD's renderer (no isLive) must NOT be mistaken for live viewers.
+        let vod = r#"..."viewCount":{"videoViewCountRenderer":{"viewCount":{"simpleText":"123,456 views"}}}..."#;
+        assert_eq!(yt_watching_now(vod), None);
+        let simple = r#"..."videoViewCountRenderer":{"viewCount":{"simpleText":"87 watching now"},"isLive":true}..."#;
+        assert_eq!(yt_watching_now(simple), Some(87));
+
+        let owner = r#"..."subscriberCountText":{"accessibility":{"accessibilityData":{"label":"1.62 million subscribers"}},"simpleText":"1.62M subscribers"}..."#;
+        assert_eq!(yt_subscriber_count(owner), Some(1_620_000));
+        assert_eq!(yt_compact_number("12.3K"), Some(12_300));
+        assert_eq!(yt_compact_number("998"), Some(998));
+        assert_eq!(yt_compact_number("2,100"), Some(2100));
+        assert_eq!(yt_compact_number("1B"), Some(1_000_000_000));
+    }
 
     #[test]
     fn parse_twitch_login() {

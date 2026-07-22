@@ -1355,8 +1355,14 @@ while recording. Discrete **stream events** are archived alongside:
   chat feed (IRC `USERNOTICE`s and `bits` tags), so they're captured whenever
   a recording with **Log chat** is running. Community gift batches count
   once (the batch announcement carries the size; its per-recipient notices
-  are skipped so nothing double-counts). Third-party donations only appear
-  if a bot posts them as bits/chat — there's no API for them.
+  are skipped so nothing double-counts). Resubs carry the shared **streak**,
+  gifts the gifter's **lifetime total**. Third-party donations only appear
+  if a bot posts them as bits/chat — there's no API for them — but **Hype
+  Chats** (Twitch's paid pinned messages) ARE captured, with their real
+  amount and currency.
+- **First-time chatters, watch-streak milestones and mod announcements**
+  are archived from chat too (first chats stay off the graphs — too dense —
+  but are in the filterable event list).
 - **Raids** (incoming *and* your channels' outgoing raid targets) arrive via
   EventSub `channel.raid` in conduit mode (no extra scopes; toggle under
   *Settings → Accounts → Detection credentials*, default on) — even while
@@ -1410,9 +1416,10 @@ Under *Settings → Maintenance → Channel stats history* you can compress old
 samples into 10-minute buckets — peaks and total airtime are preserved
 exactly (buckets store the peak; aggregation is peak-preserving all the way
 up) — either once via **Compress now** or automatically past a configurable
-age. Twitch and YouTube don't expose follower/subscriber totals without
-owner credentials, so only Kick followers are tracked; YouTube also reports
-no viewer count while recording.
+age. Follower counts: Kick's is exact (from its channel JSON), YouTube's is
+the watch page's rounded subscriber figure; Twitch's needs a moderator-scoped
+token, so it isn't tracked. YouTube live viewers are scraped from the watch
+page's "watching now" figure.
 
 ### Upcoming stream schedule
 
@@ -1637,7 +1644,9 @@ preserved** — the live chat hides what mods remove; the archive keeps
 receipts — and timeouts, bans, clears, mode changes and role changes appear
 as muted ℹ notice lines. The same events land in the **Channel Stats** event
 history (with a "Mod acts" column in the overview). Old chat logs load
-unchanged; they just predate the markers.
+unchanged; they just predate the markers. Replies carry a small **↩ name**
+prefix showing who they answer, and **📣 mod announcements** show as notice
+lines too.
 
 ![Chat log viewer replaying an archived Twitch chat](doc/screenshots/chat-log-viewer.png)
 

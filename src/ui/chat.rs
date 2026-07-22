@@ -65,6 +65,9 @@ pub(super) struct ChatMessage {
     /// System notice line (chat-mode change, role change, timeout/ban
     /// announcement) — renders as a muted ℹ line, no author.
     pub(super) system: bool,
+    /// Display name this message replies to (Twitch reply threads) — rendered
+    /// as a small "↩ name" prefix. Empty when not a reply / pre-feature logs.
+    pub(super) reply_to: String,
 }
 
 /// Height estimate for a chat row that hasn't been drawn yet (≈ one line).
@@ -577,6 +580,15 @@ pub(super) fn render_chat_message(
                 .strong()
                 .color(name_color),
         );
+        // Reply-thread prefix (Twitch): who this message answers.
+        if !msg.reply_to.is_empty() {
+            ui.label(
+                egui::RichText::new(format!("↩ {}", msg.reply_to))
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            )
+            .on_hover_text("This message is a reply in a thread");
+        }
         // A moderator-struck message: the archived original renders
         // struck-through (live chat hides it; the archive keeps receipts).
         // Emotes drop to their text fallback so the strike reads clearly.
@@ -1766,6 +1778,7 @@ pub(super) fn yt_action_to_msg(
         msg_id: String::new(),
         deleted: None,
         system: false,
+        reply_to: String::new(),
     })
 }
 
@@ -1790,6 +1803,7 @@ fn parse_twitch_marker_line(line: &str, start_ms: f64) -> Option<(Option<MarkerA
         msg_id: String::new(),
         deleted: None,
         system: true,
+        reply_to: String::new(),
     };
     match kind {
         "del" => {
@@ -1873,6 +1887,7 @@ pub(super) fn parse_twitch_chat_line(
         msg_id: v["id"].as_str().unwrap_or("").to_string(),
         deleted: None,
         system: false,
+        reply_to: v["reply"].as_str().unwrap_or("").to_string(),
     })
 }
 
@@ -2394,6 +2409,7 @@ mod tests {
             msg_id: msg_id.to_string(),
             deleted: None,
             system: false,
+            reply_to: String::new(),
         }
     }
 
@@ -2687,6 +2703,7 @@ mod tests {
             trigger_info: String::new(),
             head_backfill_state: String::new(),
             trigger_rule_json: String::new(),
+            vod_views: None,
         }
     }
 

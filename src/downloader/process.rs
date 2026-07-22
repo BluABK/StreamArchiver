@@ -165,6 +165,7 @@ pub(super) fn recording_from_detached(row: &DetachedRow) -> Recording {
         vod_id: None,
         vod_state: None,
         vod_muted_secs: None,
+        vod_views: None,
         recovery_state: None,
         recovered_path: None,
         vod_dl_state: None,

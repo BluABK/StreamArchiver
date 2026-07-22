@@ -297,6 +297,18 @@ impl Store {
         Ok(())
     }
 
+    /// Stream language + game/category id (Twitch), written on live polls
+    /// that carry them and deliberately NOT cleared on offline — they read as
+    /// "the channel's usual language / last game id" (v63).
+    pub fn set_monitor_stream_extras(&self, id: i64, language: &str, game_id: &str) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE monitor SET last_language = ?2, last_game_id = ?3 WHERE id = ?1",
+            params![id, language, game_id],
+        )?;
+        Ok(())
+    }
+
     /// Make a monitor due for polling on the very next scheduler tick (resets
     /// `last_checked_at`), without touching its state — how an EventSub
     /// shared-chat push accelerates the collab refresh.

@@ -1031,6 +1031,9 @@ pub struct MonitorWithChannel {
     /// Twitch Helix / Kick best-effort — empty when offline or untagged).
     /// Changes ride the 📝 ledgers as kind `tags`.
     pub last_tags: String,
+    /// Broadcast language code (Twitch, e.g. `"en"`; schema v63). Persists
+    /// through offline as the channel's usual language.
+    pub last_language: String,
 }
 
 impl MonitorWithChannel {
@@ -2449,6 +2452,9 @@ pub struct Recording {
     /// N/A). `0` = clean copy online; `> 0` = damaged — the online copy is missing
     /// content, making the local recording the authoritative archive.
     pub vod_muted_secs: Option<i64>,
+    /// Published-VOD view count from the checker's Get Videos polls (v63).
+    /// `None` = never observed; refreshed while the mute watch runs.
+    pub vod_views: Option<i64>,
     /// CDN VOD-recovery status — a namespace disjoint from `status`/`vod_state`.
     /// `None` = never attempted. `"recovering"` = in progress; `"recovered"` =
     /// full timeline muxed; `"partial"` = some segments were gone; `"failed"` =
@@ -2934,6 +2940,7 @@ mod tests {
             vod_id: None,
             vod_state: None,
             vod_muted_secs: None,
+            vod_views: None,
             recovery_state: None,
             recovered_path: None,
             vod_dl_state: None,

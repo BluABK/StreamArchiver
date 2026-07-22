@@ -564,7 +564,7 @@ impl Store {
                 m.automation_enabled, c.automation_enabled,
                 m.last_title, m.last_game, m.last_thumbnail_url, m.last_viewers,
                 m.last_live_since, m.last_live_since_approx, m.last_collab,
-                m.capture_offline, m.last_tags
+                m.capture_offline, m.last_tags, m.last_language
              FROM monitor m
              JOIN channel c ON c.id = m.channel_id
              LEFT JOIN recording r
@@ -644,6 +644,7 @@ impl Store {
                     live_collab: crate::models::CollabLive::parse(&r.get::<_, String>(59)?),
                     capture_offline: r.get::<_, i64>(60)? != 0,
                     last_tags: r.get(61)?,
+                    last_language: r.get(62)?,
                     // Filled by the UI from next_scheduled_streams(), not this query.
                     next_stream_at: None,
                     next_stream_title: String::new(),
@@ -675,7 +676,7 @@ impl Store {
                     recovery_state, recovered_path,
                     vod_dl_state, vod_dl_path, vod_dl_video_id,
                     backfill_path, full_path, COALESCE(trigger_info, ''),
-                    head_backfill_state, COALESCE(trigger_rule_json, '')
+                    head_backfill_state, COALESCE(trigger_rule_json, ''), vod_views
              FROM recording WHERE monitor_id = ?1 ORDER BY started_at, id",
         )?;
         let rows = stmt
@@ -714,6 +715,7 @@ impl Store {
                     trigger_info: r.get(30)?,
                     head_backfill_state: r.get(31)?,
                     trigger_rule_json: r.get(32)?,
+                    vod_views: r.get(33)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -740,7 +742,7 @@ impl Store {
             recovery_state, recovered_path,
             vod_dl_state, vod_dl_path, vod_dl_video_id,
             backfill_path, full_path, COALESCE(trigger_info, ''),
-            head_backfill_state, COALESCE(trigger_rule_json, '')";
+            head_backfill_state, COALESCE(trigger_rule_json, ''), vod_views";
 
     fn map_recording_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::models::Recording> {
         Ok(crate::models::Recording {
@@ -777,6 +779,7 @@ impl Store {
             trigger_info: r.get(30)?,
             head_backfill_state: r.get(31)?,
             trigger_rule_json: r.get(32)?,
+            vod_views: r.get(33)?,
         })
     }
 
@@ -886,6 +889,7 @@ impl Store {
                     vod_id: None,
                     vod_state: None,
                     vod_muted_secs: None,
+                    vod_views: None,
                     recovery_state: None,
                     recovered_path: None,
                     vod_dl_state: None,
@@ -947,6 +951,7 @@ impl Store {
                     vod_id: None,
                     vod_state: None,
                     vod_muted_secs: None,
+                    vod_views: None,
                     recovery_state: None,
                     recovered_path: None,
                     vod_dl_state: None,
@@ -1031,6 +1036,7 @@ impl Store {
                     vod_id: None,
                     vod_state: None,
                     vod_muted_secs: None,
+                    vod_views: None,
                     recovery_state: None,
                     recovered_path: None,
                     vod_dl_state: None,
@@ -1107,6 +1113,7 @@ impl Store {
                     vod_id: None,
                     vod_state: None,
                     vod_muted_secs: None,
+                    vod_views: None,
                     recovery_state: None,
                     recovered_path: None,
                     vod_dl_state: None,
@@ -1164,6 +1171,7 @@ impl Store {
                     vod_id: None,
                     vod_state: None,
                     vod_muted_secs: None,
+                    vod_views: None,
                     recovery_state: None,
                     recovered_path: None,
                     vod_dl_state: None,
@@ -1359,6 +1367,7 @@ impl Store {
                     vod_id: None,
                     vod_state: None,
                     vod_muted_secs: None,
+                    vod_views: None,
                     recovery_state: None,
                     recovered_path: None,
                     vod_dl_state: None,

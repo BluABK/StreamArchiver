@@ -430,6 +430,31 @@ impl StreamArchiverApp {
             }
         });
 
+        // Extra Twitch account facts, cached opportunistically from Get Users
+        // responses (collab name resolution / id lookups) — absent until one
+        // has passed through.
+        if acc.platform == Platform::Twitch
+            && let Some((btype, created)) =
+                crate::detectors::cached_twitch_user_info(&self.core.store, &acc.account)
+        {
+            let mut parts: Vec<String> = Vec::new();
+            match btype.as_str() {
+                "partner" => parts.push("Twitch Partner".into()),
+                "affiliate" => parts.push("Twitch Affiliate".into()),
+                _ => {}
+            }
+            if created > 0 {
+                parts.push(format!("account created {}", fmt_date(created)));
+            }
+            if !parts.is_empty() {
+                ui.add_space(2.0);
+                ui.weak(parts.join(" · ")).on_hover_text(
+                    "From Twitch's public account info (Get Users), cached when \
+                     the app last looked this account up.",
+                );
+            }
+        }
+
         // Thumbnails: this account's original icon/banner. Hover for
         // size, Alt to preview full-res, click to open the file.
         let own_thumbs: Vec<&AssetThumb> = thumbs
