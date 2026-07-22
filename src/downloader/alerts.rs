@@ -394,8 +394,10 @@ pub(super) fn parse_capture_log_name(name: &str) -> Option<(String, String, Opti
             (matches!(tag, "twitch" | "youtube" | "kick") && parts.next().is_none())
                 .then(|| (tag.to_string(), id.to_string()))
         })?;
-    // Take timestamp: the first "YYYY-MM-DD HH-MM-SS" in the name, local time
-    // (that's how capture stems are built).
+    // Take timestamp: the first "YYYY-MM-DD HH-MM-SS" in the name. Capture
+    // stems use UTC ({date}/{time} are civil_from_unix_utc — documented in
+    // the README), NOT local time: parsing as local shifted every match by
+    // the UTC offset and unbound the whole first retro sweep (2026-07-22).
     let ts = regex_lite::Regex::new(r"(\d{4})-(\d{2})-(\d{2}) (\d{2})-(\d{2})-(\d{2})")
         .ok()
         .and_then(|re| {
@@ -407,13 +409,7 @@ pub(super) fn parse_capture_log_name(name: &str) -> Option<(String, String, Opti
                 get(3)?,
             )?;
             let time = chrono::NaiveTime::from_hms_opt(get(4)?, get(5)?, get(6)?)?;
-            use chrono::TimeZone;
-            match chrono::Local.from_local_datetime(&date.and_time(time)) {
-                chrono::LocalResult::Single(dt) | chrono::LocalResult::Ambiguous(dt, _) => {
-                    Some(dt.timestamp())
-                }
-                chrono::LocalResult::None => None,
-            }
+            Some(date.and_time(time).and_utc().timestamp())
         });
     Some((platform, id, ts))
 }
@@ -713,8 +709,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!((platform.as_str(), id.as_str()), ("twitch", "320438670041"));
-        // Local-time parse — just assert it resolved to a plausible epoch.
-        assert!(ts.is_some_and(|t| t > 1_700_000_000));
+        // Stem timestamps are UTC: 2026-07-22 02:50:48 UTC exactly — a
+        // local-time parse would be off by the UTC offset and miss the
+        // ±300 s recording-binding window (the first retro sweep's bug).
+        assert_eq!(ts, Some(1_784_688_648));
 
         // YouTube SABR names (title may carry 【】 and its own brackets).
         let (platform, id, _) = parse_capture_log_name(
