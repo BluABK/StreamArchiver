@@ -1113,6 +1113,13 @@ polled regardless).
 
 **Rule anatomy.** Each rule is structured, not just a word:
 
+- **Label** — an optional name ("Deletion-flagged title", "Unarchived
+  karaoke"). Labeled rules lead with it everywhere a match is reported —
+  notifications, the ⚡ badge tooltip — as `Label (title ~ /pattern/)`, so a
+  long regex isn't the only identification.
+- **📝 Note** — optional free text that stays with the rule in the editor:
+  caveats, provenance, warnings ("dangerously broad — watch for false
+  positives"). Never used for matching and never shown in notifications.
 - **Field** — match against the *Title*, the *Game* (category), or *Any field*.
 - **Match** — *Contains* (case-insensitive substring; phrases like `no vod`
   match as a whole) or *Regex* (case-insensitive by default — start the pattern

@@ -143,6 +143,19 @@ pub(super) fn trigger_rules_editor(
         let r = &mut rules[i];
         ui.horizontal(|ui| {
             ui.checkbox(&mut r.enabled, "").on_hover_text("Rule enabled");
+            ui.push_id((salt, "label", i), |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut r.label)
+                        .hint_text("Label…")
+                        .desired_width(120.0),
+                )
+            })
+            .inner
+            .on_hover_text(
+                "Optional name for this rule (\"Deletion-flagged title\", \"Unarchived \
+                 karaoke\") — shown in notifications and the ⚡ badge instead of leaving \
+                 a long regex as the only identification.",
+            );
             egui::ComboBox::from_id_salt((salt, "field", i))
                 .selected_text(r.field.label())
                 .width(86.0)
@@ -190,6 +203,23 @@ pub(super) fn trigger_rules_editor(
             if ui.small_button("🗑").on_hover_text("Remove this rule").clicked() {
                 remove = Some(i);
             }
+        });
+        ui.horizontal(|ui| {
+            ui.add_space(24.0); // roughly align under the row above
+            ui.label("📝").on_hover_text("Note (free text, stays with the rule)");
+            ui.push_id((salt, "note", i), |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut r.note)
+                        .hint_text("Note… (caveats, provenance — e.g. \"broad rule, watch for false positives\")")
+                        .desired_width(460.0),
+                )
+            })
+            .inner
+            .on_hover_text(
+                "Optional free-text note shown only here in the editor — record caveats or \
+                 warnings (e.g. \"dangerously broad — blacklist per channel if it misfires\"). \
+                 Not used for matching and not shown in notifications.",
+            );
         });
         if !with_actions {
             continue;

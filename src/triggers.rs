@@ -81,6 +81,16 @@ pub struct TriggerRule {
     /// Per-rule kill switch (kept in the list but ignored when false).
     #[serde(default = "d_true")]
     pub enabled: bool,
+    /// Optional human-readable name ("Deletion-flagged title", "Unarchived
+    /// karaoke") — shown in the rule editor, notifications and the ⚡ badge
+    /// instead of leaving a long regex as the only identification.
+    #[serde(default)]
+    pub label: String,
+    /// Optional free-text note for the rule editor — caveats, provenance,
+    /// warnings ("dangerously broad — watch for false positives"). Not part
+    /// of match descriptions; purely documentation next to the rule.
+    #[serde(default)]
+    pub note: String,
     #[serde(default)]
     pub field: TriggerField,
     /// `false` = case-insensitive substring; `true` = regex (case-insensitive
@@ -117,6 +127,8 @@ impl Default for TriggerRule {
     fn default() -> Self {
         TriggerRule {
             enabled: true,
+            label: String::new(),
+            note: String::new(),
             field: TriggerField::Any,
             regex: false,
             pattern: String::new(),
@@ -336,7 +348,9 @@ pub struct TriggerHit {
 
 impl TriggerHit {
     /// Short human description, e.g. `title ~ "karaoke"` — stored on the
-    /// recording row and shown in notifications / badge tooltips.
+    /// recording row and shown in notifications / badge tooltips. A labeled
+    /// rule leads with its label, so a long regex isn't the only
+    /// identification.
     pub fn describe(&self) -> String {
         let mut s = format!(
             "{} ~ {}{}{}",
@@ -345,6 +359,10 @@ impl TriggerHit {
             self.rule.pattern,
             if self.rule.regex { "/" } else { "\"" },
         );
+        let label = self.rule.label.trim();
+        if !label.is_empty() {
+            s = format!("{label} ({s})");
+        }
         match self.rule.capture_from_start {
             Some(true) => s.push_str(" · capture-from-start forced on"),
             Some(false) => s.push_str(" · capture-from-start forced off"),
@@ -554,6 +572,8 @@ mod tests {
             mode: TriggerMode::Extend,
             rules: vec![TriggerRule {
                 enabled: true,
+                label: "Karaoke".into(),
+                note: "broad rule — watch for false positives".into(),
                 field: TriggerField::Game,
                 regex: true,
                 pattern: "sing".into(),
@@ -588,5 +608,21 @@ mod tests {
         .unwrap();
         assert!(!old.stop_on_unmatch);
         assert_eq!(old.lead_secs, 0);
+        assert!(old.label.is_empty() && old.note.is_empty());
+    }
+
+    #[test]
+    fn labeled_rule_leads_describe_with_its_label() {
+        let mut r = rule(TriggerField::Title, true, r"delet\w+.{0,30}(video|vod)");
+        r.label = "Deletion-flagged title".into();
+        r.note = "note text never appears in describe()".into();
+        let hit = first_match(&[r], Some("I will delete this video in 2 days"), None).unwrap();
+        assert_eq!(
+            hit.describe(),
+            "Deletion-flagged title (title ~ /delet\\w+.{0,30}(video|vod)/)"
+        );
+        // Unlabeled rules keep the bare form (asserted throughout the tests
+        // above); the note is editor-only documentation.
+        assert!(!hit.describe().contains("note text"));
     }
 }
