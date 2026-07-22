@@ -384,6 +384,8 @@ impl StreamArchiverApp {
             Ack(i64),
             AckAll,
             OpenLog(String),
+            /// Open the folder holding a recording's recovered patch files.
+            OpenPatches(i64),
         }
         let mut act: Option<Act> = None;
 
@@ -476,34 +478,44 @@ impl StreamArchiverApp {
                         for &i in &visible {
                             let r = &self.warnings_rows[i];
                             let error = r.severity == "error";
-                            // Row tint: red for errors, yellow for warnings —
-                            // dimmed once acknowledged.
-                            let tint = match (error, r.acked) {
-                                (true, false) => egui::Color32::from_rgba_unmultiplied(120, 25, 25, 70),
-                                (true, true) => egui::Color32::from_rgba_unmultiplied(120, 25, 25, 25),
-                                (false, false) => egui::Color32::from_rgba_unmultiplied(120, 95, 10, 70),
-                                (false, true) => egui::Color32::from_rgba_unmultiplied(120, 95, 10, 25),
-                            };
-                            let accent = if error {
-                                egui::Color32::from_rgb(230, 100, 100)
+                            // Fully healed: every lost range was re-fetched
+                            // from the VOD — the row flips green so recovered
+                            // damage doesn't keep reading as an open wound.
+                            let healed = r.ranges_total > 0 && r.recovered == r.ranges_total;
+                            // Row tint: green when healed, red for errors,
+                            // yellow for warnings — dimmed once acknowledged.
+                            let (rgb, accent) = if healed {
+                                ((25, 95, 45), egui::Color32::from_rgb(110, 200, 130))
+                            } else if error {
+                                ((120, 25, 25), egui::Color32::from_rgb(230, 100, 100))
                             } else {
-                                egui::Color32::from_rgb(220, 175, 60)
+                                ((120, 95, 10), egui::Color32::from_rgb(220, 175, 60))
                             };
+                            let alpha = if r.acked { 25 } else { 70 };
+                            let tint = egui::Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, alpha);
                             egui::Frame::group(ui.style()).fill(tint).show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     let (icon, kind_label) = alert_kind_label(&r.kind);
+                                    let icon = if healed { "✅" } else { icon };
                                     ui.label(egui::RichText::new(icon).color(accent))
-                                        .on_hover_text(if error {
+                                        .on_hover_text(if healed {
+                                            "Recovered — every lost range was re-fetched from the \
+                                             VOD; the content exists as patch files next to the \
+                                             recording."
+                                        } else if error {
                                             "ERROR — content is missing from this capture."
                                         } else {
                                             "Warning — the tool complained, no data loss detected."
                                         });
                                     ui.vertical(|ui| {
-                                        let title = if r.channel.is_empty() {
+                                        let mut title = if r.channel.is_empty() {
                                             kind_label.to_string()
                                         } else {
                                             format!("{kind_label} — {}", r.channel)
                                         };
+                                        if healed {
+                                            title.push_str(" — recovered");
+                                        }
                                         let mut rich = egui::RichText::new(title).strong();
                                         if !r.acked {
                                             rich = rich.color(accent);
@@ -558,6 +570,19 @@ impl StreamArchiverApp {
                                             {
                                                 act = Some(Act::OpenLog(r.take_key.clone()));
                                             }
+                                            if r.recovered > 0
+                                                && let Some(rec_id) = r.recording_id
+                                                && ui
+                                                    .button("🩹 Patches")
+                                                    .on_hover_text(
+                                                        "Open the folder with the recovered patch \
+                                                         files ({stem}.recovered-….mkv) — the \
+                                                         re-fetched content for each lost range.",
+                                                    )
+                                                    .clicked()
+                                            {
+                                                act = Some(Act::OpenPatches(rec_id));
+                                            }
                                         },
                                     );
                                 });
@@ -588,6 +613,23 @@ impl StreamArchiverApp {
             }
             Some(Act::OpenLog(path)) => {
                 crate::platform::open_path(std::path::Path::new(&path));
+            }
+            Some(Act::OpenPatches(rec_id)) => {
+                // The patch files sit next to the recording; take the first
+                // done range's out_path and open its folder.
+                let dir = self
+                    .core
+                    .store
+                    .gap_ranges_in_state(rec_id, "done")
+                    .unwrap_or_default()
+                    .iter()
+                    .find(|g| !g.out_path.is_empty())
+                    .and_then(|g| {
+                        std::path::Path::new(&g.out_path).parent().map(std::path::Path::to_path_buf)
+                    });
+                if let Some(dir) = dir {
+                    crate::platform::open_path(&dir);
+                }
             }
             None => {}
         }

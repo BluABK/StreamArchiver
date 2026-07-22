@@ -917,7 +917,10 @@ data). Each range lands as a **patch file next to the recording**
 patches into the main MKV; for a seamless single file use the post-stream
 **VOD download** feature. Recovery progress shows as a Background job, a
 **🩹 recovering gaps…** badge on the take row, and a *"5/7 lost ranges
-recovered ✔"* line on the Warnings row. Toggle: Settings → Downloads →
+recovered ✔"* line on the Warnings row — and once **every** range is
+recovered the row flips **green** ("Lost segments — Nihmune — recovered",
+✅) so healed damage stops reading as an open wound; a **🩹 Patches**
+button opens the folder with the recovered files. Toggle: Settings → Downloads →
 Twitch VOD recovery → *Recover lost segments automatically* (default on);
 per-range failures retry up to 5 times and never affect the capture itself.
 

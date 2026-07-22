@@ -48,7 +48,7 @@ pub struct CaptureAlertRow {
     // `NotificationRow`'s convention).
     #[allow(dead_code)]
     pub monitor_id: Option<i64>,
-    #[allow(dead_code)]
+    /// Drives the 🩹 Patches row action (open the recovered files' folder).
     pub recording_id: Option<i64>,
     #[allow(dead_code)]
     pub video_id: Option<i64>,
@@ -74,9 +74,8 @@ pub struct GapRangeRow {
     #[allow(dead_code)]
     pub state: String,
     pub attempts: i64,
-    /// Recovered patch file once `done` (kept for a future "open patch" row
-    /// action in the Warnings window).
-    #[allow(dead_code)]
+    /// Recovered patch file once `done` (the 🩹 Patches action opens its
+    /// folder).
     pub out_path: String,
 }
 
