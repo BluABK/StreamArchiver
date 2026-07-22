@@ -317,6 +317,25 @@ impl Store {
         Ok(rows)
     }
 
+    /// Whether a CONFIRMED hype_train row already exists for `monitor_id`
+    /// within `window` seconds of `at` — lets the false-positive sweep treat
+    /// a leftover inferred row as superseded instead of mislabeling a real
+    /// train's tail-end contribution burst as a false positive (the normal
+    /// per-poll dedup, `DetectContext::dedupe_inferred_hype` in
+    /// `detectors.rs`, should already have caught it — this is the backstop
+    /// for whatever narrow window that missed).
+    pub fn confirmed_hype_near(&self, monitor_id: i64, at: i64, window: i64) -> bool {
+        self.db()
+            .query_row(
+                "SELECT 1 FROM stream_event
+                 WHERE monitor_id = ?1 AND kind = 'hype_train' AND detail LIKE '%(confirmed)%'
+                   AND at BETWEEN ?2 - ?3 AND ?2 + ?3 LIMIT 1",
+                params![monitor_id, at, window],
+                |_| Ok(()),
+            )
+            .is_ok()
+    }
+
     /// Stamp an inferred hype row as GQL-unconfirmed (idempotence marker for
     /// the false-positive auto-tune — each row tightens at most once).
     pub fn mark_hype_unconfirmed(&self, event_id: i64) -> Result<()> {
@@ -685,6 +704,32 @@ mod tests {
         assert!(ev.iter().any(|e| e.detail.ends_with("· unconfirmed")));
         store.delete_stream_event(rows[0].0).unwrap();
         assert_eq!(store.stream_events_range(cid, 0, i64::MAX).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn confirmed_hype_near_detects_window_and_kind() {
+        let store = Store::open_in_memory().unwrap();
+        let (_, mid) = channel_with_monitor(&store);
+        let t = 4_000_000;
+
+        // No rows at all yet.
+        assert!(!store.confirmed_hype_near(mid, t, 300));
+
+        // An INFERRED row alone must not count as "confirmed nearby" — that
+        // would defeat the sweep backstop's whole point (it exists to tell
+        // a real confirmed train apart from the inferred row itself).
+        store
+            .record_stream_event(mid, t, "s1", "hype_train", "", "", 500, "", "… (inferred)")
+            .unwrap();
+        assert!(!store.confirmed_hype_near(mid, t, 300));
+
+        // A confirmed train lands 200s later — within a 300s window, found;
+        // outside a tighter 60s window, not.
+        assert!(store.upsert_hype_train_event(mid, t + 200, "s1", "tr-9", 9000, "level 3 · 9,000 pts (confirmed)").unwrap());
+        assert!(store.confirmed_hype_near(mid, t, 300));
+        assert!(!store.confirmed_hype_near(mid, t, 60));
+        // Symmetric from the confirmed row's own timestamp too.
+        assert!(store.confirmed_hype_near(mid, t + 200, 10));
     }
 
     #[test]

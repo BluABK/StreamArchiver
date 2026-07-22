@@ -916,9 +916,30 @@ fn fmt_bucket(secs: i64) -> String {
     }
 }
 
-/// The shared viewer/follower graph: one viewer line per monitor, event
-/// markers along the baseline, category/collab changes as vertical lines,
-/// plus a separate follower plot when any follower data exists.
+/// Draw the category/collab-change vertical lines shared by the viewer and
+/// events plots, so a marker in either panel still lines up with a category
+/// switch.
+fn draw_change_vlines(
+    plot_ui: &mut egui_plot::PlotUi,
+    changes: &[(i64, String, String)],
+    to_x: impl Fn(i64) -> f64,
+) {
+    for (t, kind, _new) in changes {
+        let (color, style) = match kind.as_str() {
+            "category" => (egui::Color32::from_gray(120), egui_plot::LineStyle::dotted_dense()),
+            "collab" => (egui::Color32::from_rgb(0x42, 0xa5, 0xf5), egui_plot::LineStyle::dashed_loose()),
+            _ => continue, // title changes are too chatty to mark
+        };
+        plot_ui.vline(egui_plot::VLine::new(String::new(), to_x(*t)).color(color).style(style));
+    }
+}
+
+/// The shared viewer/events/follower graph: one viewer line per monitor on
+/// its own plot, event markers (subs, bits, hype trains, …) on a SEPARATE
+/// plot with its own scale — a hype train's point total can be tens of
+/// thousands, which used to share the viewer-count axis and flatten it —
+/// category/collab changes as vertical lines mirrored on both, plus a
+/// separate follower plot when any follower data exists.
 fn viewer_graph_ui(
     ui: &mut egui::Ui,
     id_prefix: &str,
@@ -951,12 +972,11 @@ fn viewer_graph_ui(
 
     ui.label("Viewers:").on_hover_text(format!(
         "Peak live viewers per {bucket_label} bucket, one line per platform \
-         instance, plotted at each bucket's center. Diamonds are events \
-         (subs, bits, raids, …) at their exact time, placed at the event's \
-         own size — a raid's party size lands near the viewer level it \
-         delivered, single subs hug the baseline. Dotted vertical lines are \
+         instance, plotted at each bucket's center. Dotted vertical lines are \
          category changes; 🤝 lines are collab set changes. X axis is local \
-         clock time. Gaps mean the channel was offline (no samples).",
+         clock time. Gaps mean the channel was offline (no samples). Events \
+         (subs, bits, raids, hype trains, …) are on their own plot below, on \
+         their own scale.",
     ));
     // monitor -> time-ordered points; split a line where a gap exceeds ~3
     // buckets so offline time doesn't render as a misleading bridge.
@@ -965,10 +985,7 @@ fn viewer_graph_ui(
         per_monitor.entry(b.monitor_id).or_default().push((b.t, b.viewers));
     }
     let fx = fmt_x;
-    // Filled per frame while the pointer is near event markers — the plot's
-    // own label can only show coordinates; this names who did it.
-    let mut hover_events: Vec<String> = Vec::new();
-    let plot_resp = egui_plot::Plot::new(format!("{id_prefix}_viewer_plot"))
+    egui_plot::Plot::new(format!("{id_prefix}_viewer_plot"))
         .height(220.0)
         .legend(egui_plot::Legend::default())
         .allow_scroll(false)
@@ -980,16 +997,7 @@ fn viewer_graph_ui(
         })
         .show(ui, |plot_ui| {
             // Category / collab change markers first (under the data).
-            for (t, kind, _new) in changes {
-                let (color, style) = match kind.as_str() {
-                    "category" => (egui::Color32::from_gray(120), egui_plot::LineStyle::dotted_dense()),
-                    "collab" => (egui::Color32::from_rgb(0x42, 0xa5, 0xf5), egui_plot::LineStyle::dashed_loose()),
-                    _ => continue, // title changes are too chatty to mark
-                };
-                plot_ui.vline(
-                    egui_plot::VLine::new(String::new(), to_x(*t)).color(color).style(style),
-                );
-            }
+            draw_change_vlines(plot_ui, changes, to_x);
             for (mid, pts) in &per_monitor {
                 let name = labels.get(mid).cloned().unwrap_or_else(|| format!("monitor {mid}"));
                 // Split at gaps > 3 buckets (offline time).
@@ -1021,10 +1029,37 @@ fn viewer_graph_ui(
                     plot_ui.line(egui_plot::Line::new(n, egui_plot::PlotPoints::from(s)));
                 }
             }
+        });
+
+    // Events plot: subs/bits/raids/hype trains/… on their OWN scale, kept
+    // off the viewer plot above — a single big hype train's point total
+    // (tens of thousands) used to share the viewer-count axis and flatten
+    // the viewer line to nothing.
+    ui.add_space(8.0);
+    ui.label("Events:").on_hover_text(
+        "Chat/channel events (subs, bits, raids, hype trains, timeouts, …) \
+         at their exact time, placed at the event's own size — a raid's \
+         party size lands near the viewer level it delivered, a hype \
+         train near its point total, 1-unit events hug the baseline. \
+         Dotted/dashed vertical lines mirror the category/collab changes \
+         above. Hover a marker to see who did it.",
+    );
+    // Filled per frame while the pointer is near event markers — the plot's
+    // own label can only show coordinates; this names who did it.
+    let mut hover_events: Vec<String> = Vec::new();
+    let events_resp = egui_plot::Plot::new(format!("{id_prefix}_events_plot"))
+        .height(140.0)
+        .legend(egui_plot::Legend::default())
+        .allow_scroll(false)
+        .include_y(0.0)
+        .x_axis_formatter(move |mark, _| fx(mark.value))
+        .y_axis_formatter(|mark, _| grid::fmt_viewers(mark.value.max(0.0) as i64))
+        .show(ui, |plot_ui| {
+            draw_change_vlines(plot_ui, changes, to_x);
             // Event markers, grouped by kind for the legend. Y = the event's
-            // own size (bits, gift-batch count, raid party, timeout secs), so
-            // hovering reads the real number and a 2.6K raid sits right at
-            // the viewer level it delivered; 1-unit events hug the baseline.
+            // own size (bits, gift-batch count, raid party, hype-train
+            // points, timeout secs) — a scale shared only among events, not
+            // with viewer count.
             let mut by_kind: std::collections::BTreeMap<&str, Vec<[f64; 2]>> = Default::default();
             for e in events {
                 // First-time chatters are too dense to mark (dozens per
@@ -1063,7 +1098,7 @@ fn viewer_graph_ui(
             }
         });
     if !hover_events.is_empty() {
-        plot_resp.response.on_hover_ui_at_pointer(|ui| {
+        events_resp.response.on_hover_ui_at_pointer(|ui| {
             for line in hover_events.iter().take(12) {
                 ui.label(line);
             }

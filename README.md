@@ -1571,8 +1571,11 @@ while recording. Discrete **stream events** are archived alongside:
     request per poll tick, plus once a minute per recording channel. A
     confirmed train keeps updating its row while it runs — **level, total
     points, top contributors (conductors), golden-kappa flag** — and
-    supersedes any inferred sibling. Toggle under *Settings → Maintenance →
-    Hype trains* (default on). Twitch's streamer-set kickoff thresholds
+    supersedes any inferred sibling on every confirmed poll for as long as
+    the train runs (not just its first sighting, so a later contribution
+    burst re-inferred mid-train still gets cleaned up). Toggle under
+    *Settings → Maintenance → Hype trains* (default on). Twitch's
+    streamer-set kickoff thresholds
     themselves aren't readable anonymously — and don't need to be, see
     auto-tune below.
   - **Inferred** — the fallback when polling is off or broken: the recorded
@@ -1601,10 +1604,16 @@ Where to look:
 - **Channel Stats tab** — an all-channels comparison table (peak / average
   viewers, sampled airtime, followers, subs/bits/raids/mod-acts in the
   selected span) plus, per channel:
-  - **viewer and follower graphs** with event markers (diamonds at their
-    exact time, plotted at the event's own size — a raid's party size lands
-    near the viewer level it delivered), category-change and 🤝 collab-change
-    lines. Hovering a marker names **who did it** (gifter, cheerer, raider —
+  - a **viewer graph**, a separate **events graph** right below it (subs,
+    bits, raids, hype trains, … as diamonds at their exact time, plotted at
+    the event's own size — a raid's party size lands near the viewer level
+    it delivered, a hype train near its point total), and a **follower
+    graph** when the platform exposes one. The events graph is kept off the
+    viewer graph's own scale on purpose — a single big hype train's point
+    total (tens of thousands) used to share the viewer-count axis and
+    flatten the viewer line to nothing. Both the viewer and events graphs
+    show the same category-change and 🤝 collab-change lines for context.
+    Hovering an event marker names **who did it** (gifter, cheerer, raider —
     stacked markers list everyone under the pointer). The x-axis shows
     **local clock time** (matching the event list) and viewer lines plot at
     bucket centers so they line up with the markers.

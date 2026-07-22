@@ -1542,7 +1542,17 @@ impl DetectContext {
                             info!("hype: 🚂 {login} train confirmed — {detail}");
                             self.tune_on_confirmed(*monitor_id, login, started);
                         }
-                        Ok(false) => debug!("hype: {login} train update — {detail}"),
+                        Ok(false) => {
+                            debug!("hype: {login} train update — {detail}");
+                            // A long train's contributions can ebb and flow
+                            // enough to re-arm chat-side inference well after
+                            // the first-confirm dedup already ran once — keep
+                            // sweeping any freshly-inferred duplicate on every
+                            // update poll (without re-running the one-shot
+                            // loosen/tighten auto-tune below, which only makes
+                            // sense as a first-sighting judgment).
+                            self.dedupe_inferred_hype(*monitor_id, started);
+                        }
                         Err(e) => warn!("hype: persisting {login} train failed: {e:#}"),
                     }
                 }
@@ -1559,6 +1569,17 @@ impl DetectContext {
                         // Give a fresh burst one full window to get confirmed
                         // before calling it false (kickoff can lag the burst).
                         if now - at < tuning.window_secs {
+                            continue;
+                        }
+                        // A confirmed train can still cover this row even
+                        // though the per-poll dedup already moved past it
+                        // (e.g. this burst landed in the final seconds before
+                        // the train's last confirmed-update poll) — supersede
+                        // it silently instead of mislabeling a real train's
+                        // tail-end burst as a false positive.
+                        if self.store.confirmed_hype_near(*monitor_id, at, tuning.window_secs) {
+                            let _ =
+                                self.store.delete_inferred_hype_near(*monitor_id, at, tuning.window_secs);
                             continue;
                         }
                         let _ = self.store.mark_hype_unconfirmed(id);
@@ -1581,14 +1602,17 @@ impl DetectContext {
     /// First sighting of a confirmed train: drop the inferred rows it
     /// supersedes; if there were none but chat HAD stored contributions
     /// around the kickoff, the inference missed a real train — loosen.
+    /// Later update polls for the SAME (already-confirmed) train re-run only
+    /// the dedup half via [`Self::dedupe_inferred_hype`] directly — the
+    /// loosen/tighten judgment below is a one-shot call, not a per-poll one.
     fn tune_on_confirmed(&self, monitor_id: i64, login: &str, started_at: i64) {
         let tuning = crate::hype::load_tuning(&self.store);
         let win = tuning.window_secs.max(1);
-        match self.store.delete_inferred_hype_near(monitor_id, started_at, win) {
-            Ok(n) if n > 0 => {
+        match self.dedupe_inferred_hype(monitor_id, started_at) {
+            Some(n) if n > 0 => {
                 debug!("hype: {login} inference had caught it ({n} inferred row(s) superseded)");
             }
-            Ok(_) => {
+            Some(_) => {
                 let observed = crate::hype::observed_burst(
                     &self.store,
                     monitor_id,
@@ -1604,8 +1628,20 @@ impl DetectContext {
                     crate::hype::loosen_for_missed(&self.store, observed, "a confirmed train");
                 }
             }
-            Err(e) => debug!("hype: inferred-row dedup failed for {login}: {e:#}"),
+            None => debug!("hype: inferred-row dedup failed for {login}"),
         }
+    }
+
+    /// Delete chat-inferred hype-train rows superseded by a confirmed train
+    /// near `started_at`. Safe to call repeatedly for the same train across
+    /// its whole lifetime (every confirmed-update poll, not just the first)
+    /// — a long train's contributions can re-arm inference well after the
+    /// train already confirmed once, leaving a later duplicate that the
+    /// one-shot [`Self::tune_on_confirmed`] call can no longer catch.
+    /// Returns `None` on a store error (logged by the caller).
+    fn dedupe_inferred_hype(&self, monitor_id: i64, started_at: i64) -> Option<usize> {
+        let win = crate::hype::load_tuning(&self.store).window_secs.max(1);
+        self.store.delete_inferred_hype_near(monitor_id, started_at, win).ok()
     }
 
     /// Resolve a Twitch login to its broadcaster id via Helix Get Users,
