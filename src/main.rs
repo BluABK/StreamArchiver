@@ -522,6 +522,7 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
         last_thumbnail_url: String::new(),
         last_viewers: -1,
         live_collab: None,
+        capture_offline: false,
     };
     let plan = downloader::build_plan(
         &row,

@@ -1021,6 +1021,12 @@ pub struct MonitorWithChannel {
     /// `monitor.last_collab` JSON column (written on every poll like
     /// `last_title`). `None` = offline or not collabing.
     pub live_collab: Option<CollabLive>,
+    /// The platform says this channel's stream has ENDED while its capture
+    /// tool is still running (live-from-start DVR drain, tail download, or
+    /// final mux). Set/cleared by `meta_watcher` (schema v61); only
+    /// meaningful while `last_state == "recording"`. Drives the ⏬ badge so
+    /// a post-stream drain doesn't read as "live".
+    pub capture_offline: bool,
 }
 
 impl MonitorWithChannel {

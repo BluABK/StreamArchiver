@@ -231,6 +231,25 @@ pub struct SharedChatSession {
     pub created_at: i64,
 }
 
+/// A live Twitch "Stream Together" collaboration GROUP (the site's
+/// "with A, B, C" line), from the anonymous GQL query the web client itself
+/// uses. This is the FULL member list — Helix's Shared Chat session is only
+/// the subset that actually merged chats (the Nihmune incident: a 5-person
+/// collab with a 2-person shared chat). Unofficial API: parsed defensively,
+/// and every caller degrades to shared-chat + title mentions when it breaks.
+#[derive(Clone, Debug)]
+pub struct CollabGroup {
+    /// Twitch's opaque group id — the collab-session key when no Shared Chat
+    /// session exists to attach members to.
+    pub group_id: String,
+    /// `(broadcaster id, login, display name)` — INCLUDES the queried channel.
+    pub members: Vec<(String, String, String)>,
+}
+
+/// The Twitch web client's own public Client-ID — what its anonymous GQL
+/// requests send (same id streamlink/yt-dlp use for playback queries).
+const TWITCH_WEB_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
+
 /// Outcome of one in-recording metadata fetch (`*_stream_meta`). The split
 /// between [`Offline`](MetaFetch::Offline) and [`Failed`](MetaFetch::Failed)
 /// matters to the caller's failure-streak warning (`meta_watcher`): a stream
@@ -1039,6 +1058,63 @@ impl DetectContext {
             }
         }
 
+        // Stream Together GROUP membership (the site's "with A, B, C" line,
+        // via the web client's own anonymous GQL query): Shared Chat is only
+        // the SUBSET of a group that merged chats — members can collab
+        // without it (the Nihmune incident: 5-person collab, 2-person shared
+        // chat). Members found here are confirmed partners (not title
+        // heuristics). Extras union into the open shared-chat session when
+        // one exists; with none, the group id keys its own session. A failed
+        // fetch changes nothing — shared chat + mentions keep working.
+        match self.twitch_collab_group(login).await {
+            Ok(Some(group)) => {
+                let fresh: Vec<crate::models::CollabPartner> = group
+                    .members
+                    .iter()
+                    .filter(|(id, l, _)| {
+                        Some(id.as_str()) != bid.as_deref() && !l.eq_ignore_ascii_case(login)
+                    })
+                    .filter(|(id, _, _)| !partners.iter().any(|p| &p.id == id))
+                    .map(|(id, l, n)| crate::models::CollabPartner {
+                        id: id.clone(),
+                        login: l.clone(),
+                        name: if n.is_empty() { l.clone() } else { n.clone() },
+                        from_title: false,
+                    })
+                    .collect();
+                if !fresh.is_empty() {
+                    let session_key = match keep_sessions.first() {
+                        Some(k) => k.clone(),
+                        None => {
+                            keep_sessions.push(group.group_id.clone());
+                            group.group_id.clone()
+                        }
+                    };
+                    match self.store.upsert_collab_session(
+                        monitor_id,
+                        "shared_chat",
+                        &session_key,
+                        stream_id,
+                        &host_id,
+                        &fresh,
+                        since,
+                        now,
+                    ) {
+                        Ok(Some((old, new))) => {
+                            let _ = self.store.insert_monitor_stream_change(
+                                monitor_id, now, "collab", &old, &new,
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(e) => debug!("collab: group upsert failed: {e:#}"),
+                    }
+                    partners.extend(fresh);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => debug!("collab: group fetch for {login} failed: {e:#}"),
+        }
+
         let mentions = crate::models::title_mentions(title, login);
         let title_ps: Vec<crate::models::CollabPartner> = mentions
             .iter()
@@ -1090,9 +1166,77 @@ impl DetectContext {
         let json = if partners.is_empty() {
             String::new()
         } else {
+            // Group-only collabs (no shared-chat session) carry no start
+            // time; keep the previously-displayed one, else stamp now — a
+            // 1970 "since" in the hover would be nonsense.
+            if since == 0 {
+                since = self
+                    .store
+                    .monitor_last_collab(monitor_id)
+                    .ok()
+                    .and_then(|j| crate::models::CollabLive::parse(&j))
+                    .map(|p| p.since_unix)
+                    .filter(|s| *s > 0)
+                    .unwrap_or(now);
+            }
             crate::models::CollabLive { host_id, since_unix: since, partners }.to_json()
         };
         let _ = self.store.set_monitor_live_collab(monitor_id, &json);
+    }
+
+    /// The channel's live "Stream Together" collaboration group via the web
+    /// client's anonymous GQL query (see [`CollabGroup`]). `Ok(None)` is the
+    /// authoritative "not in a collab group right now"; `Err` = network/HTTP/
+    /// schema failure (callers keep working from Shared Chat + mentions).
+    pub async fn twitch_collab_group(&self, login: &str) -> anyhow::Result<Option<CollabGroup>> {
+        // `login` comes from `twitch_login` — lowercase `[a-z0-9_]`, safe to
+        // embed in the query string directly.
+        let body = serde_json::json!({
+            "query": format!(
+                "query {{ user(login: \"{login}\") {{ channel {{ collaboration {{ \
+                 id collaborators {{ user {{ id login displayName }} }} }} }} }} }}"
+            )
+        });
+        let resp = self
+            .http
+            .post("https://gql.twitch.tv/gql")
+            .header("Client-Id", TWITCH_WEB_CLIENT_ID)
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("gql {}", resp.status());
+        }
+        let v: Value = resp.json().await?;
+        if let Some(errs) = v["errors"].as_array()
+            && !errs.is_empty()
+        {
+            anyhow::bail!("gql error: {}", errs[0]["message"].as_str().unwrap_or("?"));
+        }
+        let collab = &v["data"]["user"]["channel"]["collaboration"];
+        if collab.is_null() {
+            return Ok(None); // not collabing (or unknown login) — authoritative
+        }
+        let group_id = collab["id"].as_str().unwrap_or_default().to_string();
+        let members: Vec<(String, String, String)> = collab["collaborators"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|c| {
+                        let u = &c["user"];
+                        Some((
+                            u["id"].as_str()?.to_string(),
+                            u["login"].as_str()?.to_string(),
+                            u["displayName"].as_str().unwrap_or_default().to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if group_id.is_empty() || members.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(CollabGroup { group_id, members }))
     }
 
     /// Resolve a Twitch login to its broadcaster id via Helix Get Users,

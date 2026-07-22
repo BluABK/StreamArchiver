@@ -1210,7 +1210,20 @@ impl Store {
             conn.execute_batch("ALTER TABLE stream_event ADD COLUMN detail TEXT NOT NULL DEFAULT '';")?;
             conn.pragma_update(None, "user_version", 60)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 60);
+        if version < 61 {
+            // "Stream ended, capture still finishing" flag: set by the
+            // in-recording meta watcher once the platform authoritatively
+            // reports the channel offline while the capture tool is still
+            // running (live-from-start backlog drain, tail download, or the
+            // final mux of a huge file). The grid shows a distinct ⏬ state
+            // instead of the live-looking "recording" (the Layna incident:
+            // a SABR DVR drain kept "recording" up for hours post-stream).
+            conn.execute_batch(
+                "ALTER TABLE monitor ADD COLUMN capture_offline INTEGER NOT NULL DEFAULT 0;",
+            )?;
+            conn.pragma_update(None, "user_version", 61)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 61);
         Ok(())
     }
 }

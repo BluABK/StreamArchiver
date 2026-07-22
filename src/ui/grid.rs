@@ -1199,6 +1199,15 @@ pub(super) const FINALIZING_HOVER: &str =
      running or queued at the disk gate (large backlogs can take hours). \
      Watch progress and the queue in the Background view.";
 
+/// Hover for the ⏬ state badge: the channel is offline but its capture tool
+/// hasn't exited yet.
+pub(super) const CAPTURE_OFFLINE_HOVER: &str =
+    "Stream ENDED — the channel is offline, but the capture is still \
+     finishing: a live-from-start capture keeps downloading the stream's \
+     recorded backlog until it reaches the end, and huge files mux for a \
+     while afterwards. The recording completes on its own; nothing is being \
+     missed. (⏹ still stops it early if you don't want the rest.)";
+
 /// Icon + color for the State column. Returns `(icon, text_color)`.
 pub(super) fn state_icon(state: &str) -> (&'static str, egui::Color32) {
     use egui::Color32;
@@ -2018,8 +2027,20 @@ pub(super) fn render_instance_row(
                         resp.on_hover_text(FINALIZING_HOVER);
                     } else if is_failed {
                         resp.on_hover_text(fail_hover(&row.last_recording_log));
+                    } else if recording && row.capture_offline {
+                        resp.on_hover_text(CAPTURE_OFFLINE_HOVER);
                     } else {
                         resp.on_hover_text(&m.last_state);
+                    }
+                    if recording && !finalizing && row.capture_offline {
+                        // The channel is NOT live anymore — the capture is
+                        // draining backlog/tail or muxing. Without this the
+                        // plain "recording" state reads as "live".
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xd0, 0xa0, 0x40),
+                            egui::RichText::new("⏬").small(),
+                        )
+                        .on_hover_text(CAPTURE_OFFLINE_HOVER);
                     }
                     if chat_active {
                         ui.colored_label(
@@ -2224,6 +2245,7 @@ mod tests {
             last_thumbnail_url: String::new(),
             last_viewers: -1,
             live_collab: None,
+            capture_offline: false,
         }
     }
 

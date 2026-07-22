@@ -950,6 +950,16 @@ pub(super) async fn meta_watcher(
     // the rest of the recording — mirrors the batched-Helix-poll fix in
     // `detect_twitch`. `None` until the first fetch settles (no baseline noise).
     let mut fetch_failing: Option<bool> = None;
+    // "Stream ended, capture still finishing" tracking (⏬ badge): consecutive
+    // authoritative Offline answers while the capture runs. Two in a row set
+    // the flag (one could be a platform blip at the exact poll moment);
+    // a Live answer clears it. Reset at watcher start so a stale flag from a
+    // previous take can't mislabel this one.
+    let mut offline_streak = 0u32;
+    let mut offline_flagged = false;
+    if let Err(e) = store.set_monitor_capture_offline(monitor_id, false) {
+        warn!("clear capture-offline flag failed: {e:#}");
+    }
     loop {
         if done.load(Ordering::SeqCst) || shutdown.load(Ordering::SeqCst) {
             return;
@@ -980,6 +990,38 @@ pub(super) async fn meta_watcher(
                 info!(monitor_id, rec_id, "live title/game/viewer refresh recovered for {}", platform.tag());
             }
             fetch_failing = Some(failing_now);
+            // ⏬ tracking: the platform authoritatively saying "offline" while
+            // this capture still runs means the broadcast ended and the tool
+            // is draining backlog/tail or muxing — flag it so the grid stops
+            // implying "live". Two consecutive answers guard against a blip;
+            // `Failed` (no answer) never changes the flag.
+            match &fetched {
+                MetaFetch::Offline => {
+                    offline_streak += 1;
+                    if offline_streak >= 2 && !offline_flagged {
+                        offline_flagged = true;
+                        info!(
+                            monitor_id, rec_id,
+                            "stream ended on {} — capture still finishing \
+                             (backlog/tail download or final mux)",
+                            platform.tag()
+                        );
+                        if let Err(e) = store.set_monitor_capture_offline(monitor_id, true) {
+                            warn!("set capture-offline flag failed: {e:#}");
+                        }
+                    }
+                }
+                MetaFetch::Live(_) => {
+                    offline_streak = 0;
+                    if offline_flagged {
+                        offline_flagged = false;
+                        if let Err(e) = store.set_monitor_capture_offline(monitor_id, false) {
+                            warn!("clear capture-offline flag failed: {e:#}");
+                        }
+                    }
+                }
+                MetaFetch::Failed => {}
+            }
         }
         if let MetaFetch::Live(meta) = fetched {
             let at = (now_unix() - started_at).max(0);

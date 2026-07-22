@@ -563,7 +563,8 @@ impl Store {
                 COALESCE(r.trigger_info, ''),
                 m.automation_enabled, c.automation_enabled,
                 m.last_title, m.last_game, m.last_thumbnail_url, m.last_viewers,
-                m.last_live_since, m.last_live_since_approx, m.last_collab
+                m.last_live_since, m.last_live_since_approx, m.last_collab,
+                m.capture_offline
              FROM monitor m
              JOIN channel c ON c.id = m.channel_id
              LEFT JOIN recording r
@@ -641,6 +642,7 @@ impl Store {
                     last_thumbnail_url: r.get(55)?,
                     last_viewers: r.get(56)?,
                     live_collab: crate::models::CollabLive::parse(&r.get::<_, String>(59)?),
+                    capture_offline: r.get::<_, i64>(60)? != 0,
                     // Filled by the UI from next_scheduled_streams(), not this query.
                     next_stream_at: None,
                     next_stream_title: String::new(),

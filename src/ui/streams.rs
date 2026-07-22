@@ -1491,12 +1491,30 @@ impl StreamArchiverApp {
                             } else {
                                 icon.to_string()
                             };
-                            let hover = if live_count > 1 {
+                            // Every recording instance reports its stream
+                            // ended -> the channel is NOT live; the captures
+                            // are just draining/muxing. Show ⏬ so the row
+                            // stops reading as "live".
+                            let all_draining = mons.iter().all(|m| {
+                                !active_ids.contains(&m.monitor.id)
+                                    || finalizing_ids.contains(&m.monitor.id)
+                                    || m.capture_offline
+                            });
+                            let hover = if all_draining {
+                                CAPTURE_OFFLINE_HOVER.to_string()
+                            } else if live_count > 1 {
                                 format!("recording ({live_count} instances live)")
                             } else {
                                 "recording".to_string()
                             };
-                            ui.colored_label(color, label).on_hover_text(hover);
+                            ui.colored_label(color, label).on_hover_text(hover.clone());
+                            if all_draining {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(0xd0, 0xa0, 0x40),
+                                    egui::RichText::new("⏬").small(),
+                                )
+                                .on_hover_text(hover);
+                            }
                         } else if fin_count > 0 {
                             let (icon, color) = state_icon("finalizing");
                             let label = if fin_count > 1 {

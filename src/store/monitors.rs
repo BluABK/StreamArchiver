@@ -333,6 +333,20 @@ impl Store {
         Ok(())
     }
 
+    /// Flag/clear "the platform says the stream ended but the capture tool is
+    /// still running" (live-from-start backlog drain, tail download, final
+    /// mux). Set by `meta_watcher` on repeated authoritative offline answers,
+    /// cleared on a live answer and at the start of every new watcher. Drives
+    /// the ⏬ state badge (schema v61).
+    pub fn set_monitor_capture_offline(&self, id: i64, on: bool) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE monitor SET capture_offline = ?2 WHERE id = ?1",
+            params![id, on as i64],
+        )?;
+        Ok(())
+    }
+
     pub fn clear_channel_errors(&self, channel_id: i64) -> Result<()> {
         let conn = self.db();
         conn.execute(

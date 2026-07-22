@@ -122,6 +122,15 @@ two tools on one URL.
    the capture process exits, so a stream that drops and comes back is
    re-captured immediately even while the old take's remux is still queued.
 
+   Similarly, a capture whose **stream has already ended** but whose tool is
+   still running — a live-from-start capture draining the stream's recorded
+   backlog (which can take hours, especially with I/O throttling), or yt-dlp
+   muxing a huge file — shows a **⏬ badge** next to the recording state on
+   the instance and channel rows, so a post-stream drain doesn't read as
+   "live". Detected from the in-recording metadata refresh (two consecutive
+   authoritative "offline" answers); the recording completes normally on its
+   own, and ⏹ still stops it early if you don't want the rest.
+
    The instance and channel rows represent **present state only** — once an
    instance is neither recording nor live, its Went Live/Started On/Duration/
    Lost time cells go blank rather than showing a past recording's numbers
@@ -1293,9 +1302,15 @@ live, and archived:
   extra scopes; the same Twitch credentials as detection), polled for every
   live Twitch monitor on its own poll cadence, and every minute while it's
   being recorded. Works whether the channel is the session's **host or a
-  guest**. Streams that collab without Shared Chat are still caught
-  heuristically: **@mentions in the live title** count as collaborators too,
-  shown as `@name` and marked "unconfirmed".
+  guest**. Since Shared Chat only covers the members who actually merged
+  chats — a Stream Together group can be bigger (seen live: a 5-person
+  collab with a 2-person shared chat) — the **full collaboration group**
+  (the site's "with A, B, C" line) is also fetched via the web client's own
+  anonymous GQL query and unioned in; if that unofficial query ever breaks,
+  detection silently falls back to Shared Chat alone. Streams that collab
+  without either are still caught heuristically: **@mentions in the live
+  title** count as collaborators too, shown as `@name` and marked
+  "unconfirmed".
 - **Live display** — the channel/instance name gains a weak
   `nihmune × Shylily`-style suffix while a shared-chat session is live
   (confirmed partners only), and a **🤝 Collab** column lists everyone
