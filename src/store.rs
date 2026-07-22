@@ -285,6 +285,10 @@ pub mod db_lock {
         pub(super) file: &'static str,
         pub(super) line: u32,
         pub(super) since: Instant,
+        /// Tags which acquisition wrote this entry, so the outgoing holder's
+        /// `Drop` can compare-and-clear instead of blindly overwriting —
+        /// see `HOLDER_TOKEN` below.
+        pub(super) token: u64,
     }
 
     impl Entry {
@@ -297,6 +301,10 @@ pub mod db_lock {
     pub(super) static WAITERS: parking_lot::Mutex<Vec<(u64, Entry)>> =
         parking_lot::Mutex::new(Vec::new());
     pub(super) static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+    /// Separate id space from `NEXT_TOKEN` (that one orders the WAITERS
+    /// queue) — mints a unique id per successful acquisition so the outgoing
+    /// holder can tell "is HOLDER still mine?" before clearing it.
+    pub(super) static HOLDER_TOKEN: AtomicU64 = AtomicU64::new(1);
     pub(super) static SLOW_WAITS: AtomicU64 = AtomicU64::new(0);
     pub(super) static LONG_HOLDS: AtomicU64 = AtomicU64::new(0);
     pub(super) static SLOW_EVENTS: parking_lot::Mutex<VecDeque<SlowEvent>> =
@@ -348,6 +356,27 @@ pub mod db_lock {
         }
     }
 
+    /// Remove `*slot` iff it's still tagged with `token` — a plain
+    /// unconditional clear would risk wiping a fresh entry written by
+    /// another thread that raced in and acquired the lock between the real
+    /// unlock and this call. A no-op when someone else already holds it.
+    /// Generic over the mutex (rather than hardwired to `HOLDER`) so it's
+    /// independently unit-testable against a throwaway local instance — the
+    /// process-wide `HOLDER` static is shared by every test in the binary
+    /// (each `Store::open_in_memory()` still goes through the real `db()`),
+    /// so asserting on it directly would be racy under `cargo test`'s
+    /// parallel runner.
+    pub(super) fn clear_holder_if_matches_in(slot: &parking_lot::Mutex<Option<Entry>>, token: u64) {
+        let mut h = slot.lock();
+        if h.as_ref().is_some_and(|e| e.token == token) {
+            *h = None;
+        }
+    }
+
+    pub(super) fn clear_holder_if_matches(token: u64) {
+        clear_holder_if_matches_in(&HOLDER, token)
+    }
+
     pub(super) fn push_event(ev: SlowEvent) {
         let mut q = SLOW_EVENTS.lock();
         if q.len() >= SLOW_EVENTS_CAP {
@@ -364,23 +393,48 @@ pub mod db_lock {
 /// RAII guard returned by [`Store::db`]. Logs a warning when the lock is held
 /// longer than 200 ms, showing the call-site that acquired it — useful for
 /// identifying which store method is the bottleneck.
+///
+/// `inner` is an `Option` solely so `Drop` can release the real mutex as its
+/// very first action (`self.inner.take()`) — before any of the bookkeeping/
+/// logging below, which is not instant (tracing dispatch, a locked VecDeque
+/// push). It is `Some` for the guard's entire externally-visible lifetime;
+/// only `Drop::drop` ever sees it `None`.
 struct DbGuard<'a> {
-    inner: parking_lot::FairMutexGuard<'a, Connection>,
+    inner: Option<parking_lot::FairMutexGuard<'a, Connection>>,
     acquired_at: std::time::Instant,
     caller: &'static std::panic::Location<'static>,
+    /// This guard's `db_lock::HOLDER_TOKEN` — lets `Drop` compare-and-clear.
+    token: u64,
 }
 
 impl std::ops::Deref for DbGuard<'_> {
     type Target = Connection;
-    fn deref(&self) -> &Connection { &*self.inner }
+    fn deref(&self) -> &Connection {
+        self.inner.as_deref().expect("DbGuard.inner is only None mid-drop")
+    }
 }
 
 impl std::ops::DerefMut for DbGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Connection { &mut *self.inner }
+    fn deref_mut(&mut self) -> &mut Connection {
+        self.inner.as_deref_mut().expect("DbGuard.inner is only None mid-drop")
+    }
 }
 
 impl Drop for DbGuard<'_> {
     fn drop(&mut self) {
+        // Release the REAL lock first, before any bookkeeping/logging below
+        // (which is not instant: tracing dispatch, a locked VecDeque push for
+        // a long hold). Waiters unblock immediately instead of waiting out
+        // our logging too, and — the point of doing this here rather than
+        // letting the field drop naturally after this function returns — it
+        // closes a holder-attribution race: the old ordering cleared HOLDER
+        // to None *before* actually unlocking, so a waiter whose try_lock()
+        // genuinely failed (we still held the real mutex) could read HOLDER
+        // as already-empty and misattribute its wait to "<holder unknown>"
+        // (see [[db-lock-holder-unknown]] — this is that bug's sibling on
+        // the release side rather than the acquire side).
+        drop(self.inner.take());
+
         // Count every DB access (ops + cumulative hold time) at the single
         // chokepoint all queries pass through; byte-level growth is sampled
         // from the db/WAL file sizes by the I/O monitor instead.
@@ -392,10 +446,12 @@ impl Drop for DbGuard<'_> {
             self.acquired_at.elapsed(),
             true,
         );
-        // Clear the holder slot BEFORE the inner guard releases the mutex
-        // (field drop runs after this body), so the next holder never races
-        // an overwrite from us.
-        *db_lock::HOLDER.lock() = None;
+        // Compare-and-clear: only remove OUR entry. Between the unlock above
+        // and this line, another thread may already have acquired the real
+        // mutex and written its own HOLDER entry — a blind overwrite here
+        // would wipe that fresh, correct entry back to "no one" while they
+        // still hold it.
+        db_lock::clear_holder_if_matches(self.token);
         let ms = self.acquired_at.elapsed().as_millis();
         if ms >= 200 {
             db_lock::LONG_HOLDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -449,21 +505,26 @@ impl Store {
         // we're still in that logging, before HOLDER is updated, would
         // otherwise blame "<holder unknown>" despite us clearly holding the
         // lock (seen live: a wait logged unknown immediately after another
-        // thread's own contended acquisition).
-        let set_holder = || {
+        // thread's own contended acquisition). Returns the token this entry
+        // was tagged with, so `DbGuard::drop` can compare-and-clear.
+        let set_holder = || -> u64 {
+            let holder_token =
+                db_lock::HOLDER_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             *db_lock::HOLDER.lock() = Some(db_lock::Entry {
                 thread: db_lock::thread_name(),
                 file: caller.file(),
                 line: caller.line(),
                 since: std::time::Instant::now(),
+                token: holder_token,
             });
+            holder_token
         };
         // Uncontended fast path (parking_lot's fair unlock hands the mutex
         // directly to the next queued waiter, so try_lock can't barge).
-        let g = match self.conn.try_lock() {
+        let (g, holder_token) = match self.conn.try_lock() {
             Some(g) => {
-                set_holder();
-                g
+                let holder_token = set_holder();
+                (g, holder_token)
             }
             None => {
                 // Contended: remember who we're stuck behind (the holder at
@@ -486,6 +547,7 @@ impl Store {
                         file: caller.file(),
                         line: caller.line(),
                         since: t,
+                        token,
                     },
                 ));
                 // Leaves the queue on every exit path (incl. unwinds).
@@ -497,7 +559,7 @@ impl Store {
                 }
                 let _wg = WaiterGuard(token);
                 let g = self.conn.lock();
-                set_holder();
+                let holder_token = set_holder();
                 let wait_ms = t.elapsed().as_millis();
                 if wait_ms >= 50 {
                     db_lock::SLOW_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -525,10 +587,10 @@ impl Store {
                         "store: DB lock wait"
                     );
                 }
-                g
+                (g, holder_token)
             }
         };
-        DbGuard { inner: g, acquired_at: std::time::Instant::now(), caller }
+        DbGuard { inner: Some(g), acquired_at: std::time::Instant::now(), caller, token: holder_token }
     }
 
     /// Open (or create) the database at `path`, set pragmas, and migrate.
@@ -726,5 +788,43 @@ mod tests {
             store.get_setting("twitch_client_id").unwrap().as_deref(),
             Some("xyz789")
         );
+    }
+
+    /// A stale `DbGuard::drop` (delayed by its own slow-hold logging) must
+    /// never wipe a fresh holder that already raced in and re-acquired the
+    /// real mutex in the meantime — that overwrite is what previously made
+    /// "who holds it" briefly report `None` even though the lock was
+    /// genuinely, continuously held (see [[db-lock-holder-unknown]]). Uses a
+    /// throwaway local mutex (not the process-wide `HOLDER` static) so it
+    /// can't be perturbed by unrelated tests' own `Store::db()` calls.
+    #[test]
+    fn holder_compare_and_clear_never_wipes_a_fresher_entry() {
+        let slot: parking_lot::Mutex<Option<db_lock::Entry>> = parking_lot::Mutex::new(None);
+        let entry = |token| db_lock::Entry {
+            thread: "t".into(),
+            file: "f",
+            line: 1,
+            since: std::time::Instant::now(),
+            token,
+        };
+
+        // Our own entry is still there → the clear takes effect.
+        *slot.lock() = Some(entry(1));
+        db_lock::clear_holder_if_matches_in(&slot, 1);
+        assert!(slot.lock().is_none());
+
+        // Someone else already raced in and holds it now (different token)
+        // — our late clear must be a no-op, not an overwrite to None.
+        *slot.lock() = Some(entry(2));
+        db_lock::clear_holder_if_matches_in(&slot, 1);
+        let held = slot.lock();
+        assert!(held.is_some(), "a fresher holder's entry must survive a stale clear");
+        assert_eq!(held.as_ref().unwrap().token, 2);
+        drop(held);
+
+        // Already empty → no-op, no panic.
+        *slot.lock() = None;
+        db_lock::clear_holder_if_matches_in(&slot, 1);
+        assert!(slot.lock().is_none());
     }
 }
