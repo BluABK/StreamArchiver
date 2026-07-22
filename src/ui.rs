@@ -1020,6 +1020,9 @@ pub struct StreamArchiverApp {
     /// `None` = both severities; `Some(true)` = errors only, `Some(false)` =
     /// warnings only.
     warn_sev_filter: Option<bool>,
+    /// Hide acknowledged rows in the Warnings window (session-only, not
+    /// persisted — the window always opens showing everything).
+    warn_hide_acked: bool,
     /// The YouTube posts feed (a top-level tab AND a pop-out window sharing one
     /// render fn): loaded rows, load throttle, session-only channel + text
     /// filters, and a lazy visible-only texture cache keyed by content hash.

@@ -454,6 +454,7 @@ impl StreamArchiverApp {
             warn_badge: (0, 0),
             warn_search: String::new(),
             warn_sev_filter: None,
+            warn_hide_acked: false,
             show_posts_window: false,
             posts: Vec::new(),
             posts_refreshed: None,

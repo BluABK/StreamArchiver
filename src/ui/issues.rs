@@ -408,7 +408,8 @@ impl StreamArchiverApp {
             .enumerate()
             .filter(|(_, r)| {
                 let cat = crate::downloader::alert_category(&r.kind, &r.last_line).1;
-                sev.map(|errs_only| (r.severity == "error") == errs_only).unwrap_or(true)
+                (!self.warn_hide_acked || !r.acked)
+                    && sev.map(|errs_only| (r.severity == "error") == errs_only).unwrap_or(true)
                     && (q.is_empty()
                         || r.channel.to_lowercase().contains(&q)
                         || r.kind.to_lowercase().contains(&q)
@@ -481,6 +482,11 @@ impl StreamArchiverApp {
                         {
                             self.warn_search.clear();
                         }
+                        ui.checkbox(&mut self.warn_hide_acked, "Hide acknowledged").on_hover_text(
+                            "Only show alerts that still need attention — acknowledged rows \
+                             (including healed/superseded ones you've cleared) drop out of \
+                             the list until new damage un-acknowledges them again.",
+                        );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
                                 .button("✔ Acknowledge all")

@@ -935,8 +935,10 @@ fresh damage always re-lights it. Each row also carries a **category chip**
 (💾 Disk full, 🔒 Access denied, 📡 Network drop, 🎫 PO token, 💤 Not live
 yet, …) derived from the offending log line; the **✔ Ack group…** menu
 acknowledges a whole category at once (e.g. every "Disk full" alert from one
-bad night) and the filter box matches category names. The menu also leads
-with a **✅ Fixed** group — one click acknowledges every *green* row (fully
+bad night) and the filter box matches category names. A **Hide acknowledged**
+checkbox keeps the list down to what still needs attention — rows drop out
+once acked and reappear only if fresh damage un-acknowledges them. The menu
+also leads with a **✅ Fixed** group — one click acknowledges every *green* row (fully
 recovered or superseded) while leaving unhealed red and yellow rows alone. Each row links
 straight to the tool log (📂), shows the last matching line on hover, and
 the first occurrence per take also lands in the 🔔 feed (errors additionally
