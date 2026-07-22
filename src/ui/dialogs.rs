@@ -643,6 +643,105 @@ impl StreamArchiverApp {
         }
     }
 
+    /// Open the "which streams was this collab in" drill-down for `partner`
+    /// (the display name from the aggregate Collabs table's Sessions count).
+    pub(super) fn open_partner_sessions(&mut self, partner: &str) {
+        let rows = self.core.store.collab_sessions_for_partner(partner).unwrap_or_default();
+        self.partner_sessions =
+            Some(PartnerSessionsState { partner: partner.to_string(), rows });
+    }
+
+    /// The "🤝 {partner} — sessions" window: every stored collab session that
+    /// partner appeared in, across all monitored channels — the drill-down
+    /// from the App Stats Collabs table's Sessions count. Each row can jump
+    /// straight to that channel's Streams row.
+    #[allow(deprecated)]
+    pub(super) fn partner_sessions_window(&mut self, ctx: &egui::Context) {
+        let Some(state) = &self.partner_sessions else { return };
+        let mut open = true;
+        let mut jump: Option<i64> = None;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("partner_sessions_vp"),
+            egui::ViewportBuilder::default()
+                .with_title(format!("🤝 {} — sessions", state.partner))
+                .with_inner_size([560.0, 360.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if state.rows.is_empty() {
+                        ui.label("No sessions found for this partner.");
+                        return;
+                    }
+                    ui.label(format!(
+                        "{} session(s), newest first. 💬 = Shared Chat (confirmed), \
+                         @ = title mention (heuristic); a duration ending in \"+\" is \
+                         still ongoing.",
+                        state.rows.len()
+                    ));
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
+                        egui::Grid::new("partner_sessions_grid")
+                            .num_columns(5)
+                            .striped(true)
+                            .spacing([12.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.strong("Channel");
+                                ui.strong("Start");
+                                ui.strong("Duration");
+                                ui.strong("With");
+                                ui.label("");
+                                ui.end_row();
+                                for s in &state.rows {
+                                    ui.label(&s.channel_name).on_hover_text(format!(
+                                        "Broadcast (stream id): {}",
+                                        if s.stream_id.is_empty() { "unknown" } else { &s.stream_id }
+                                    ));
+                                    ui.label(fmt_datetime_short(s.first_seen_at));
+                                    let span = match s.ended_at {
+                                        Some(end) => fmt_duration((end - s.first_seen_at).max(0)),
+                                        None => format!(
+                                            "{}+",
+                                            fmt_duration(
+                                                (s.last_seen_at - s.first_seen_at).max(0)
+                                            )
+                                        ),
+                                    };
+                                    ui.label(span);
+                                    let marker = if s.source == "shared_chat" { "💬" } else { "@" };
+                                    let with = if s.co_partners.is_empty() {
+                                        marker.to_string()
+                                    } else {
+                                        format!("{marker} {}", s.co_partners.join(", "))
+                                    };
+                                    ui.label(with);
+                                    if ui
+                                        .small_button("Jump")
+                                        .on_hover_text(
+                                            "Switch to Streams and select this channel's row.",
+                                        )
+                                        .clicked()
+                                    {
+                                        jump = Some(s.monitor_id);
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    });
+                });
+            },
+        );
+        if !open {
+            self.partner_sessions = None;
+        }
+        if let Some(mid) = jump {
+            self.switch_view(View::Streams);
+            self.selected_monitor = Some(mid);
+            self.partner_sessions = None;
+        }
+    }
+
     /// Render every open title/category-changes window (one per take/stream).
     pub(super) fn meta_popup_windows(&mut self, ctx: &egui::Context) {
         let mut closed: Vec<i64> = Vec::new();
@@ -2248,6 +2347,13 @@ impl StreamArchiverApp {
 pub(super) struct CollabHistoryState {
     pub(super) channel_name: String,
     pub(super) sessions: Vec<crate::models::CollabSessionRow>,
+}
+
+/// Backing state for the "🤝 {partner} — sessions" drill-down window (one at
+/// a time; opening another partner's sessions replaces it).
+pub(super) struct PartnerSessionsState {
+    pub(super) partner: String,
+    pub(super) rows: Vec<crate::store::PartnerSessionRow>,
 }
 
 /// One line per stored collab session: start, duration (or "ongoing"), source

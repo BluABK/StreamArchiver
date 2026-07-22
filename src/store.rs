@@ -133,6 +133,7 @@ pub use alerts::{
     AlertDailyStat, AlertHealthTotals, CaptureAlertRow, GapRangeRow, NewCaptureAlert, RecAlertBadge,
 };
 mod collab;
+pub use collab::PartnerSessionRow;
 mod migrations;
 mod monitors;
 mod posts;

@@ -594,6 +594,7 @@ impl StreamArchiverApp {
             import_dialog: None,
             collab_by_stream: HashMap::new(),
             collab_history: None,
+            partner_sessions: None,
             status_bgcolor,
             show_actions,
             shorten_timestamps,

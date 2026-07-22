@@ -11,6 +11,26 @@
 use super::*;
 use crate::models::{CollabPartner, CollabSessionRow, collab_partner_names};
 
+/// One collab session a specific partner appeared in, across every monitored
+/// channel — see [`Store::collab_sessions_for_partner`].
+pub struct PartnerSessionRow {
+    /// The monitor whose channel this session was recorded on — resolves to
+    /// the Streams row a "Jump" action selects.
+    pub monitor_id: i64,
+    pub channel_name: String,
+    /// `"shared_chat"` | `"title"`.
+    pub source: String,
+    /// Broadcast (Helix stream id) the session was observed during.
+    pub stream_id: String,
+    pub first_seen_at: i64,
+    pub last_seen_at: i64,
+    /// `None` = still active.
+    pub ended_at: Option<i64>,
+    /// Everyone else in the session besides the queried partner (a 3-way
+    /// collab shows its other members here), title mentions prefixed `@`.
+    pub co_partners: Vec<String>,
+}
+
 impl Store {
     /// Insert or refresh the open collab session identified by
     /// (`monitor_id`, `source`, key) — key is `session_id` for `shared_chat`
@@ -215,6 +235,61 @@ impl Store {
         Ok(out)
     }
 
+    /// Every stored session a specific partner (by display name,
+    /// case-insensitive) appeared in, across ALL monitored channels, newest
+    /// first — the drill-down from the aggregate Collabs table's "Sessions"
+    /// count ("which streams was this collab in?").
+    pub fn collab_sessions_for_partner(&self, name: &str) -> Result<Vec<PartnerSessionRow>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT cs.monitor_id, ch.name, cs.source, cs.stream_id, cs.participants,
+                    cs.first_seen_at, cs.last_seen_at, cs.ended_at
+             FROM collab_session cs
+             JOIN monitor m ON m.id = cs.monitor_id
+             JOIN channel ch ON ch.id = m.channel_id
+             ORDER BY cs.first_seen_at DESC, cs.id DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, Option<i64>>(7)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut out = Vec::new();
+        for (monitor_id, channel_name, source, stream_id, json, first_seen_at, last_seen_at, ended_at) in
+            rows
+        {
+            let partners: Vec<CollabPartner> = serde_json::from_str(&json).unwrap_or_default();
+            if !partners.iter().any(|p| p.name.eq_ignore_ascii_case(name)) {
+                continue;
+            }
+            let co_partners = partners
+                .iter()
+                .filter(|p| !p.name.eq_ignore_ascii_case(name))
+                .map(|p| if p.from_title { format!("@{}", p.name) } else { p.name.clone() })
+                .collect();
+            out.push(PartnerSessionRow {
+                monitor_id,
+                channel_name,
+                source,
+                stream_id,
+                first_seen_at,
+                last_seen_at,
+                ended_at,
+                co_partners,
+            });
+        }
+        Ok(out)
+    }
+
     /// `(monitor_id, stream_id) → comma-joined partner names` for every stored
     /// session with a stream id — lets the grid's stream/take rows show which
     /// collab a past broadcast was, from one cheap preloaded map.
@@ -347,5 +422,22 @@ mod tests {
             by_stream.get(&(mid, "st-1".into())).unwrap(),
             "Shylily, Ironmouse, @Zentreya"
         );
+
+        // Drill-down: Sessions count → which streams. Case-insensitive match,
+        // co-partners exclude the queried name, channel name is joined in.
+        let lily_sessions = store.collab_sessions_for_partner("shylily").unwrap();
+        assert_eq!(lily_sessions.len(), 1);
+        assert_eq!(lily_sessions[0].channel_name, "Numi");
+        assert_eq!(lily_sessions[0].monitor_id, mid);
+        assert_eq!(lily_sessions[0].stream_id, "st-1");
+        assert_eq!(lily_sessions[0].co_partners, vec!["Ironmouse".to_string()]);
+        assert!(lily_sessions[0].ended_at.is_some());
+
+        let zen_sessions = store.collab_sessions_for_partner("Zentreya").unwrap();
+        assert_eq!(zen_sessions.len(), 1);
+        assert_eq!(zen_sessions[0].source, "title");
+        assert!(zen_sessions[0].co_partners.is_empty());
+
+        assert!(store.collab_sessions_for_partner("nobody").unwrap().is_empty());
     }
 }

@@ -450,6 +450,7 @@ impl StreamArchiverApp {
                 self.stats_collabs.len()
             ));
             ui.add_space(4.0);
+            let mut drill_down: Option<String> = None;
             egui::Grid::new("collab_stats_grid")
                 .num_columns(3)
                 .striped(true)
@@ -458,17 +459,32 @@ impl StreamArchiverApp {
                     ui.strong("Partner")
                         .on_hover_text("Collaborator (most recent display name)");
                     ui.strong("Sessions")
-                        .on_hover_text("How many recorded collab sessions include them");
+                        .on_hover_text(
+                            "How many recorded collab sessions include them — click to see \
+                             which streams.",
+                        );
                     ui.strong("Last seen")
                         .on_hover_text("When a session with them was last observed");
                     ui.end_row();
                     for (name, sessions, last_seen) in self.stats_collabs.iter().take(100) {
                         ui.label(name);
-                        ui.label(sessions.to_string());
+                        if ui
+                            .add(
+                                egui::Label::new(sessions.to_string())
+                                    .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text("Click to see which streams this collab occurred in.")
+                            .clicked()
+                        {
+                            drill_down = Some(name.clone());
+                        }
                         ui.label(fmt_datetime_short(*last_seen));
                         ui.end_row();
                     }
                 });
+            if let Some(name) = drill_down {
+                self.open_partner_sessions(&name);
+            }
             if self.stats_collabs.len() > 100 {
                 ui.weak(format!(
                     "(+{} more, by session count)",

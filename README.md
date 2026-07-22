@@ -1463,8 +1463,12 @@ live, and archived:
   and linked to its broadcast. Right-click a stream row → **🤝 Collab
   history** for the channel's full list; the **Channel Stats** tab has a
   "🤝 Collabs" overview of your most frequent partners across all channels.
-  Collab begin/change/end events also land in the 📝 title/category history
-  ledger.
+  **Click a partner's Sessions count** in that overview for a drill-down —
+  every stored session with them, which channel and broadcast it was on,
+  how long it ran, and who else was in it (for 3+-way collabs) — with a
+  **Jump** button per row that switches to Streams and selects that
+  channel. Collab begin/change/end events also land in the 📝 title/category
+  history ledger.
 - **Schedule** — scheduled streams carry collaborators too: the OCR schedule
   reader's collab field and `@mentions` in segment titles show as a 🤝 marker
   on calendar chips and a "With: …" line in event hovers.

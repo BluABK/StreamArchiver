@@ -1360,6 +1360,10 @@ pub struct StreamArchiverApp {
     collab_by_stream: HashMap<(i64, String), String>,
     /// Open "🤝 Collab history" popup: the channel id + its loaded sessions.
     collab_history: Option<CollabHistoryState>,
+    /// Open "which streams was this collab in" drill-down: the partner name
+    /// and every session they appeared in, across all channels. Opened by
+    /// clicking a partner's Sessions count in the App Stats Collabs table.
+    partner_sessions: Option<PartnerSessionsState>,
     /// Whether Streams rows show a status background tint (recording / ad / error).
     /// Toggled from the top bar; persisted under [`K_STATUS_BGCOLOR`]. Keyboard
     /// row selection is still highlighted regardless.
@@ -2200,6 +2204,7 @@ impl eframe::App for StreamArchiverApp {
         self.meta_popup_windows(ui.ctx());
         self.history_popup_windows(ui.ctx());
         self.collab_history_window(ui.ctx());
+        self.partner_sessions_window(ui.ctx());
         self.viewer_stats_window(ui.ctx());
         self.hype_mark_window(ui.ctx());
         self.hype_override_window(ui.ctx());
