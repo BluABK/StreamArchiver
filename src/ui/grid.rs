@@ -198,6 +198,7 @@ pub(super) fn change_transition(kind: &str, old: &str, new: &str) -> String {
     let label = match kind {
         "category" => "Category",
         "collab" => "Collab",
+        "tags" => "Tags",
         _ => "Title",
     };
     let (none_old, none_new) = if kind == "collab" {
@@ -527,7 +528,7 @@ pub(super) fn video_status_color(status: &str) -> egui::Color32 {
 /// `initial`-width columns, which start narrow and truncate (full value on
 /// hover). Each `id` is a stable persistence key: never reuse or change one
 /// once shipped.
-pub(super) const STREAM_COLUMNS: [GridCol; 23] = [
+pub(super) const STREAM_COLUMNS: [GridCol; 24] = [
     GridCol { id: "enabled",     title: "On",         tooltip: "Master switch. Off = fully dormant: no detection, recording, or asset/about/posts/schedule fetch until you act manually (▶ Start, ⟳ Refetch). Independent from Auto (which only gates automatic recording). The channel checkbox and each instance checkbox are independent.", min_width: 30.0, initial: 0.0, sortable: true, stretch: false },
     GridCol { id: "auto",        title: "Auto",       tooltip: "Auto-record: automatically record to disk when the stream goes live (a disk-space control). It does NOT gate detection, metadata, posts, schedules or assets — those always run while the channel is On. Manual Start still records, and trigger words (Settings → Downloads) can still start a recording while Auto is off. The channel checkbox and each instance checkbox are independent.", min_width: 36.0,  initial: 0.0,   sortable: true,  stretch: false },
     GridCol { id: "actions",     title: "Actions",    tooltip: "Per-row actions: start/stop recording, edit, add instance, open folder, delete.",            min_width: 126.0, initial: 0.0,   sortable: false, stretch: false },
@@ -551,6 +552,7 @@ pub(super) const STREAM_COLUMNS: [GridCol; 23] = [
     GridCol { id: "duration",    title: "Duration",   tooltip: "How long we've recorded (ticks while live).",                                               min_width: 56.0,  initial: 0.0,   sortable: true, stretch: false },
     GridCol { id: "ad_free",     title: "Ad-free",    tooltip: "Marked or auto-detected ad-free (sub / Turbo / Premium) — captures have no ad-break cuts.", min_width: 54.0,  initial: 0.0,   sortable: true, stretch: false },
     GridCol { id: "added",       title: "Added",      tooltip: "When the channel was added.",                                                               min_width: 84.0,  initial: 0.0,   sortable: true, stretch: false },
+    GridCol { id: "tags",        title: "Tags",       tooltip: "The live stream's tags (Twitch; Kick when set). Hover for the full list; changes are archived — see 📝 Title/category history.", min_width: 0.0, initial: 120.0, sortable: true, stretch: false },
 ];
 
 /// Total Streams columns, including the non-sortable Actions slot.
@@ -1576,6 +1578,8 @@ pub(super) fn channel_cells(
             Cell::num(key, label)
         },
         Cell::num(channel.created_at as f64, fmt_date(channel.created_at)),
+        // Tags — the primary live instance's current tag list.
+        Cell::text(primary.last_tags.clone()),
     ]
 }
 
@@ -2146,6 +2150,9 @@ pub(super) fn render_instance_row(
             "added" => {
                 ui.label(fmt_date(row.channel.created_at));
             }
+            "tags" => {
+                meta_value_cell(ui, &row.last_tags);
+            }
             _ => {}
         }});
     }
@@ -2246,6 +2253,7 @@ mod tests {
             last_viewers: -1,
             live_collab: None,
             capture_offline: false,
+            last_tags: String::new(),
         }
     }
 

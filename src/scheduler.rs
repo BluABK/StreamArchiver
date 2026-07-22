@@ -85,11 +85,11 @@ async fn tick(
     // continuing live session with no platform-reported go-live time keeps its
     // originally-stamped approximation instead of drifting forward every poll.
     let mut prev_live_since: HashMap<i64, (Option<i64>, bool)> = HashMap::new();
-    // monitor id -> the currently-persisted (title, game), captured before this
-    // tick's writes, so a change can be detected and archived to
+    // monitor id -> the currently-persisted (title, game, tags), captured
+    // before this tick's writes, so a change can be detected and archived to
     // `monitor_stream_change` — the continuous history that spans live-not-
     // recording time too (recording-time changes come from `meta_watcher`).
-    let mut prev_meta_values: HashMap<i64, (String, String)> = HashMap::new();
+    let mut prev_meta_values: HashMap<i64, (String, String, String)> = HashMap::new();
 
     let recording: std::collections::HashSet<i64> =
         active.lock().unwrap().keys().copied().collect();
@@ -102,7 +102,8 @@ async fn tick(
     for row in &rows {
         let m = &row.monitor;
         prev_state.insert(m.id, m.last_state.clone());
-        prev_meta_values.insert(m.id, (row.last_title.clone(), row.last_game.clone()));
+        prev_meta_values
+            .insert(m.id, (row.last_title.clone(), row.last_game.clone(), row.last_tags.clone()));
         prev_live_since.insert(m.id, (m.last_live_since, m.last_live_since_approx));
         if m.platform() == crate::models::Platform::Twitch {
             if let Some(l) = crate::detectors::twitch_login(&m.url) {
@@ -266,15 +267,16 @@ async fn tick(
         // Auto-record flag, so the grid can show a live channel's title/game/
         // viewers without a recording. Cleared (empty + -1) when offline/errored
         // or when the platform omits a field.
-        let (title, game, thumb, viewers) = if o.live && !o.error {
+        let (title, game, thumb, viewers, tags) = if o.live && !o.error {
             (
                 o.stream_title.as_deref().unwrap_or(""),
                 o.stream_game.as_deref().unwrap_or(""),
                 o.thumbnail_url.as_deref().unwrap_or(""),
                 o.stream_viewers.unwrap_or(-1),
+                o.stream_tags.as_deref().unwrap_or(""),
             )
         } else {
-            ("", "", "", -1)
+            ("", "", "", -1, "")
         };
         // Archive a title/category change to the continuous per-monitor
         // history the moment this poll observes it — independent of whether
@@ -283,7 +285,9 @@ async fn tick(
         // transition worth logging (recording-time changes come from
         // `meta_watcher` instead; the scheduler never polls an active
         // recording, so there's no overlap/double-logging between the two).
-        if o.live && !o.error && let Some((prev_title, prev_game)) = prev_meta_values.get(&o.monitor_id) {
+        if o.live && !o.error
+            && let Some((prev_title, prev_game, prev_tags)) = prev_meta_values.get(&o.monitor_id)
+        {
             if title != prev_title {
                 let _ = ctx.store.insert_monitor_stream_change(
                     o.monitor_id, checked_at, "title", prev_title, title,
@@ -292,6 +296,14 @@ async fn tick(
             if game != prev_game {
                 let _ = ctx.store.insert_monitor_stream_change(
                     o.monitor_id, checked_at, "category", prev_game, game,
+                );
+            }
+            // Only when the source actually carries tags: a Twitch poll with
+            // none genuinely means "no tags", but a source that omits them
+            // entirely (YouTube scrape) must not log a fake "cleared" event.
+            if o.stream_tags.is_some() && tags != prev_tags {
+                let _ = ctx.store.insert_monitor_stream_change(
+                    o.monitor_id, checked_at, "tags", prev_tags, tags,
                 );
             }
         }
@@ -322,6 +334,7 @@ async fn tick(
             viewers,
             live_since,
             live_since_approx,
+            tags,
         ) {
             warn!(
                 "scheduler: failed to persist live meta for {}: {e:#}",
@@ -372,7 +385,8 @@ async fn tick(
             .with_broadcaster_id(o.broadcaster_id.clone())
             .with_stream_title(o.stream_title.clone())
             .with_stream_game(o.stream_game.clone())
-            .with_stream_viewers(o.stream_viewers);
+            .with_stream_viewers(o.stream_viewers)
+            .with_stream_tags(o.stream_tags.clone());
             let _ = live_tx.send(signal);
         }
     }

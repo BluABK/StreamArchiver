@@ -1255,14 +1255,18 @@ Power-user **Extra args** are appended after these, so they can still override.
 
 ### Title & category change log
 
-While a stream records, StreamArchiver polls its metadata and logs every **title**
-and **game/category** change for that take — so the archive captures *what* the
-broadcast was, not just the footage. (The normal scheduler pauses polling during a
-recording, so this runs as a dedicated per-recording poller.)
+While a stream records, StreamArchiver polls its metadata and logs every **title**,
+**game/category**, and **tag** change for that take — so the archive captures
+*what* the broadcast was, not just the footage. (The normal scheduler pauses
+polling during a recording, so this runs as a dedicated per-recording poller.)
 
 - **Game** and **Title** columns show the *current* (latest-logged) value of the
   most recent recording, updating live as the stream changes. Both are narrow and
   truncated — **hover** to read the full value.
+- A **Tags** column shows the live stream's tag list (Twitch; Kick when set —
+  YouTube has no tag list). Tag changes are archived like title/category ones:
+  they appear in the per-take Changes log and the all-time 📝 history as
+  `Tags: old → new` rows.
 - A **Changes** column counts only *actual* changes for the latest take — the
   value each field *started* with is the initial state, not a change, so it isn't
   counted or listed (it still shows as the `old` side of the first real change).

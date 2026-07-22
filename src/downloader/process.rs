@@ -752,6 +752,7 @@ impl Supervisor {
                     stop_rule,
                     m.last_title.clone(),
                     m.last_game.clone(),
+                    m.last_tags.clone(),
                 )));
             }
             // Twitch chat logger is a native in-process task (not a tracked

@@ -452,6 +452,7 @@ pub(crate) mod test_util {
             last_viewers: -1,
             live_collab: None,
             capture_offline: false,
+            last_tags: String::new(),
         }
     }
     pub fn video(tool: Tool, url: &str) -> Video {

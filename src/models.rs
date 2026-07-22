@@ -1027,6 +1027,10 @@ pub struct MonitorWithChannel {
     /// meaningful while `last_state == "recording"`. Drives the ⏬ badge so
     /// a post-stream drain doesn't read as "live".
     pub capture_offline: bool,
+    /// Live stream tags, `", "`-joined (`monitor.last_tags`, schema v62;
+    /// Twitch Helix / Kick best-effort — empty when offline or untagged).
+    /// Changes ride the 📝 ledgers as kind `tags`.
+    pub last_tags: String,
 }
 
 impl MonitorWithChannel {

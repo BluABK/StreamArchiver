@@ -273,6 +273,10 @@ pub struct LiveSignal {
     pub stream_game: Option<String>,
     /// Live viewer count at detection time, if the platform provided it.
     pub stream_viewers: Option<i64>,
+    /// Stream tags at detection time (", "-joined), if the platform provided
+    /// them — carried so try_begin's live-meta writes don't clobber the tags
+    /// the scheduler's own poll just stored (same rationale as viewers).
+    pub stream_tags: Option<String>,
 }
 
 impl LiveSignal {
@@ -287,6 +291,7 @@ impl LiveSignal {
             stream_title: None,
             stream_game: None,
             stream_viewers: None,
+            stream_tags: None,
         }
     }
 
@@ -318,6 +323,11 @@ impl LiveSignal {
 
     pub fn with_stream_viewers(mut self, stream_viewers: Option<i64>) -> LiveSignal {
         self.stream_viewers = stream_viewers;
+        self
+    }
+
+    pub fn with_stream_tags(mut self, stream_tags: Option<String>) -> LiveSignal {
+        self.stream_tags = stream_tags;
         self
     }
 }

@@ -1694,6 +1694,11 @@ impl StreamArchiverApp {
                     "added" => {
                         ui.label(fmt_date(ch.created_at));
                     }
+                    "tags" => {
+                        let cur_tags =
+                            primary.map(|m| m.last_tags.clone()).unwrap_or_default();
+                        meta_value_cell(ui, &cur_tags);
+                    }
                     _ => {}
                 }});
             }

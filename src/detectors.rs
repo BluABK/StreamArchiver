@@ -79,6 +79,9 @@ pub struct DetectOutcome {
     /// Follower total at detection time (Kick only — see
     /// [`StreamMeta::followers`]). Feeds the `viewer_history` sampling.
     pub stream_followers: Option<i64>,
+    /// Stream tags at detection time, `", "`-joined (Twitch Helix `tags`;
+    /// Kick best-effort). `None` when the platform/path omits them.
+    pub stream_tags: Option<String>,
 }
 
 impl DetectOutcome {
@@ -96,6 +99,7 @@ impl DetectOutcome {
             stream_game: None,
             stream_viewers: None,
             stream_followers: None,
+            stream_tags: None,
         }
     }
     fn live_at(
@@ -137,6 +141,10 @@ impl DetectOutcome {
         self.stream_followers = stream_followers;
         self
     }
+    fn with_stream_tags(mut self, stream_tags: Option<String>) -> DetectOutcome {
+        self.stream_tags = stream_tags;
+        self
+    }
     fn offline(monitor_id: i64) -> DetectOutcome {
         DetectOutcome {
             monitor_id,
@@ -151,6 +159,7 @@ impl DetectOutcome {
             stream_game: None,
             stream_viewers: None,
             stream_followers: None,
+            stream_tags: None,
         }
     }
     fn err(monitor_id: i64, detail: impl Into<String>) -> DetectOutcome {
@@ -167,6 +176,7 @@ impl DetectOutcome {
             stream_game: None,
             stream_viewers: None,
             stream_followers: None,
+            stream_tags: None,
         }
     }
 }
@@ -216,6 +226,9 @@ pub struct StreamMeta {
     /// moderator-scoped user token and YouTube's subscriber count isn't in
     /// the `/live` page, so both stay `None` (feeds `viewer_history`).
     pub followers: Option<i64>,
+    /// Stream tags, `", "`-joined (Twitch Helix / Kick best-effort; empty
+    /// when the platform has none — YouTube exposes no tag list).
+    pub tags: String,
 }
 
 /// A live Twitch "Stream Together" (Shared Chat) session, as returned by
@@ -605,6 +618,8 @@ impl DetectContext {
             title: Option<String>,
             game_name: Option<String>,
             viewer_count: Option<i64>,
+            #[serde(default)]
+            tags: Option<Vec<String>>,
         }
         #[derive(Deserialize)]
         struct StreamsResp {
@@ -629,9 +644,9 @@ impl DetectContext {
 
                 match resp {
                     Ok(r) if r.status().is_success() => {
-                        // login -> (went_live, stream_id, user_id, thumbnail_url, title, game, viewers)
+                        // login -> (went_live, stream_id, user_id, thumbnail_url, title, game, viewers, tags)
                         #[allow(clippy::type_complexity)]
-                        let live: HashMap<String, (Option<i64>, Option<String>, String, String, Option<String>, Option<String>, Option<i64>)> =
+                        let live: HashMap<String, (Option<i64>, Option<String>, String, String, Option<String>, Option<String>, Option<i64>, Option<String>)> =
                             match r.json::<StreamsResp>().await
                         {
                             Ok(sr) => sr
@@ -640,9 +655,10 @@ impl DetectContext {
                                 .filter(|s| s.kind == "live")
                                 .map(|s| {
                                     let when = s.started_at.as_deref().and_then(parse_rfc3339);
+                                    let tags = s.tags.map(|t| t.join(", "));
                                     (
                                         s.user_login.to_lowercase(),
-                                        (when, Some(s.id), s.user_id, s.thumbnail_url, s.title, s.game_name, s.viewer_count),
+                                        (when, Some(s.id), s.user_id, s.thumbnail_url, s.title, s.game_name, s.viewer_count, tags),
                                     )
                                 })
                                 .collect(),
@@ -662,7 +678,7 @@ impl DetectContext {
                             let key = l.to_lowercase();
                             for mid in &login_to_mons[l] {
                                 outcomes.push(match live.get(&key) {
-                                    Some((went, id, uid, thumb, title, game, viewers)) => {
+                                    Some((went, id, uid, thumb, title, game, viewers, tags)) => {
                                         DetectOutcome::live_at(*mid, "live", *went)
                                             .with_stream_id(id.clone())
                                             .with_broadcaster_id(Some(uid.clone()))
@@ -670,6 +686,7 @@ impl DetectContext {
                                             .with_stream_title(title.clone())
                                             .with_stream_game(game.clone())
                                             .with_stream_viewers(*viewers)
+                                            .with_stream_tags(tags.clone())
                                     }
                                     None => DetectOutcome::offline(*mid),
                                 });
@@ -799,6 +816,8 @@ impl DetectContext {
             game_name: String,
             #[serde(default)]
             viewer_count: i64,
+            #[serde(default)]
+            tags: Vec<String>,
         }
         #[derive(Deserialize)]
         struct Resp {
@@ -839,6 +858,7 @@ impl DetectContext {
                         game: s.game_name,
                         viewers: Some(s.viewer_count),
                         followers: None,
+                        tags: s.tags.join(", "),
                     });
                 }
                 reqwest::StatusCode::UNAUTHORIZED if using_user_token => {
@@ -2774,6 +2794,9 @@ impl DetectContext {
                     let viewers = stream["viewer_count"]
                         .as_i64()
                         .or_else(|| stream["viewers"].as_i64());
+                    let tags = stream["tags"].as_array().map(|a| {
+                        a.iter().filter_map(|t| t.as_str()).collect::<Vec<_>>().join(", ")
+                    });
                     DetectOutcome::live_at(item.monitor_id, "live", went)
                         .with_stream_id(id)
                         .with_broadcaster_id(kick_slug(&item.url).map(|s| s.to_string()))
@@ -2784,6 +2807,7 @@ impl DetectContext {
                         // Best-effort: present in some responses, harmlessly
                         // absent otherwise (the v2 scrape path carries it too).
                         .with_stream_followers(ch["followers_count"].as_i64())
+                        .with_stream_tags(tags)
                 } else {
                     DetectOutcome::offline(item.monitor_id)
                 }
@@ -4883,7 +4907,13 @@ fn parse_youtube_meta(body: &str) -> MetaFetch {
         .as_str()
         .unwrap_or_default()
         .to_string();
-    MetaFetch::Live(StreamMeta { title: title.to_string(), game, viewers: None, followers: None })
+    MetaFetch::Live(StreamMeta {
+        title: title.to_string(),
+        game,
+        viewers: None,
+        followers: None,
+        tags: String::new(),
+    })
 }
 
 /// Extract a live Kick stream's title + category from the v2 channel JSON.
@@ -4909,6 +4939,13 @@ fn parse_kick_meta(v: &Value) -> MetaFetch {
         viewers: ls["viewer_count"].as_i64().or_else(|| ls["viewers"].as_i64()),
         // Top-level channel field, not part of the livestream object.
         followers: v["followers_count"].as_i64(),
+        // Best-effort: v2 livestreams carry a tags array when set.
+        tags: ls["tags"]
+            .as_array()
+            .map(|a| {
+                a.iter().filter_map(|t| t.as_str()).collect::<Vec<_>>().join(", ")
+            })
+            .unwrap_or_default(),
     })
 }
 

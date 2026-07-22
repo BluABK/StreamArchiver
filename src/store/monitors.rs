@@ -267,14 +267,33 @@ impl Store {
         viewers: i64,
         live_since: Option<i64>,
         live_since_approx: bool,
+        tags: &str,
     ) -> Result<()> {
         let conn = self.db();
         conn.execute(
             "UPDATE monitor SET last_title = ?2, last_game = ?3,
                  last_thumbnail_url = ?4, last_viewers = ?5,
-                 last_live_since = ?6, last_live_since_approx = ?7 WHERE id = ?1",
-            params![id, title, game, thumbnail_url, viewers, live_since, live_since_approx as i64],
+                 last_live_since = ?6, last_live_since_approx = ?7,
+                 last_tags = ?8 WHERE id = ?1",
+            params![
+                id,
+                title,
+                game,
+                thumbnail_url,
+                viewers,
+                live_since,
+                live_since_approx as i64,
+                tags
+            ],
         )?;
+        Ok(())
+    }
+
+    /// Narrow tags-only setter for the in-recording refresh (`meta_watcher`)
+    /// — mirrors [`Store::set_monitor_viewers`]'s single-column rationale.
+    pub fn set_monitor_tags(&self, id: i64, tags: &str) -> Result<()> {
+        let conn = self.db();
+        conn.execute("UPDATE monitor SET last_tags = ?2 WHERE id = ?1", params![id, tags])?;
         Ok(())
     }
 
@@ -569,6 +588,7 @@ mod tests {
         store
             .set_monitor_live_meta(
                 mid, "Ranked grind", "VALORANT", "https://t/x.jpg", 1234, Some(1_000_000), true,
+                "Vtuber, English",
             )
             .unwrap();
         let r = row(&store);
@@ -580,7 +600,7 @@ mod tests {
         assert!(r.monitor.last_live_since_approx);
 
         store
-            .set_monitor_live_meta(mid, "", "", "", -1, None, false)
+            .set_monitor_live_meta(mid, "", "", "", -1, None, false, "")
             .unwrap();
         let r = row(&store);
         assert_eq!(r.last_title, "");

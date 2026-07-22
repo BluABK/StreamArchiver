@@ -924,11 +924,14 @@ pub(super) async fn meta_watcher(
     // continuous history even when the title genuinely hadn't changed.
     cont_title: String,
     cont_game: String,
+    cont_tags: String,
 ) {
     let mut last_title: Option<String> = None;
     let mut last_game: Option<String> = None;
+    let mut last_tags: Option<String> = None;
     let mut cont_title = cont_title;
     let mut cont_game = cont_game;
+    let mut cont_tags = cont_tags;
     // "Stream Together" collab refresh inputs (Twitch only): the in-recording
     // half of the dual feed — the scheduler skips actively-recording monitors,
     // so without this the Collab column would freeze for the whole take.
@@ -1069,6 +1072,31 @@ pub(super) async fn meta_watcher(
                     match store.insert_meta_change(rec_id, at, "category", &old, &meta.game) {
                         Ok(_) => changed = true,
                         Err(e) => warn!("insert category change failed: {e:#}"),
+                    }
+                }
+            }
+            // Tags: same rule again, in both ledgers. An empty value from a
+            // tagless source (YouTube's scrape has no tag list) only ever
+            // compares against empty, so it can never log a fake "cleared".
+            if meta.tags != cont_tags {
+                if let Err(e) = store.insert_monitor_stream_change(
+                    monitor_id, now_unix(), "tags", &cont_tags, &meta.tags,
+                ) {
+                    warn!("insert monitor tags change failed: {e:#}");
+                }
+                cont_tags = meta.tags.clone();
+                if let Err(e) = store.set_monitor_tags(monitor_id, &meta.tags) {
+                    warn!("update tags failed: {e:#}");
+                }
+            }
+            if last_tags.as_deref() != Some(meta.tags.as_str()) {
+                let baseline = last_tags.is_none();
+                let old = last_tags.take().unwrap_or_default();
+                last_tags = Some(meta.tags.clone());
+                if !(baseline && meta.tags.is_empty()) {
+                    match store.insert_meta_change(rec_id, at, "tags", &old, &meta.tags) {
+                        Ok(_) => changed = true,
+                        Err(e) => warn!("insert tags change failed: {e:#}"),
                     }
                 }
             }

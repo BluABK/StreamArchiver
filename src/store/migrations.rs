@@ -1223,7 +1223,17 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 61)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 61);
+        if version < 62 {
+            // Live stream tags (", "-joined; Twitch Helix / Kick best-effort),
+            // tracked exactly like last_title/last_game: the current value
+            // lives here for the grid's Tags column, and every change lands
+            // in the continuous `monitor_stream_change` ledger (kind='tags')
+            // plus the per-take `stream_meta_change` log — so tag history
+            // rides the existing 📝 popups with no extra tables.
+            conn.execute_batch("ALTER TABLE monitor ADD COLUMN last_tags TEXT NOT NULL DEFAULT '';")?;
+            conn.pragma_update(None, "user_version", 62)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 62);
         Ok(())
     }
 }

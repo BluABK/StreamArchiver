@@ -67,7 +67,7 @@ impl Supervisor {
                     if self.shutdown.load(Ordering::SeqCst) {
                         continue; // draining: don't start new recordings
                     }
-                    self.try_begin(signal.monitor_id, signal.went_live_at, signal.approximate, signal.stream_id, signal.thumbnail_url, signal.broadcaster_id, signal.stream_title, signal.stream_game, signal.stream_viewers, false, false);
+                    self.try_begin(signal.monitor_id, signal.went_live_at, signal.approximate, signal.stream_id, signal.thumbnail_url, signal.broadcaster_id, signal.stream_title, signal.stream_game, signal.stream_viewers, signal.stream_tags, false, false);
                 }
                 Some(monitor_id) = offline_rx.recv() => {
                     self.handle_offline_signal(monitor_id);
@@ -1112,7 +1112,7 @@ progress_info: None,
                     }
                     let occurrence_start = rule.next_run_at.unwrap_or(now);
                     if self.try_begin(
-                        rule.monitor_id, Some(now), true, None, None, None, None, None, None, true, true,
+                        rule.monitor_id, Some(now), true, None, None, None, None, None, None, None, true, true,
                     ) {
                         info!(
                             monitor_id = rule.monitor_id,
@@ -1164,6 +1164,7 @@ progress_info: None,
         stream_title: Option<String>,
         stream_game: Option<String>,
         stream_viewers: Option<i64>,
+        stream_tags: Option<String>,
         bypass_backoff: bool,
         forced: bool,
     ) -> bool {
@@ -1237,6 +1238,7 @@ progress_info: None,
                 self.active.lock().unwrap().remove(&monitor_id);
                 let this = self.clone();
                 let row_bg = row.clone();
+                let stream_tags_bg = stream_tags.clone();
                 tokio::spawn(async move {
                     let o = this.check_one(&row_bg).await;
                     if o.live {
@@ -1252,6 +1254,7 @@ progress_info: None,
                                 o.stream_title,
                                 o.stream_game,
                                 o.stream_viewers.or(stream_viewers),
+                                o.stream_tags.or(stream_tags_bg),
                                 bypass_backoff,
                                 forced,
                             );
@@ -1270,6 +1273,7 @@ progress_info: None,
                                 Some(String::new()),
                                 None,
                                 o.stream_viewers.or(stream_viewers),
+                                o.stream_tags,
                                 bypass_backoff,
                                 forced,
                             );
@@ -1290,6 +1294,7 @@ progress_info: None,
                 };
                 let _ = self.store.set_monitor_live_meta(
                     monitor_id, "", "", "", stream_viewers.unwrap_or(-1), live_since, live_since_approx,
+                    stream_tags.as_deref().unwrap_or(""),
                 );
                 return false;
             }
@@ -1322,6 +1327,7 @@ progress_info: None,
                 stream_viewers.unwrap_or(-1),
                 live_since,
                 live_since_approx,
+                stream_tags.as_deref().unwrap_or(""),
             );
             // Log + notify once per broadcast — try_begin re-runs on every
             // poll while the stream stays live.
@@ -1378,6 +1384,7 @@ progress_info: None,
                 stream_viewers.unwrap_or(-1),
                 live_since,
                 live_since_approx,
+                stream_tags.as_deref().unwrap_or(""),
             );
             return false;
         }
@@ -1467,7 +1474,7 @@ progress_info: None,
         // check_one (which would just report "not live" and never proceed).
         if row.monitor.detection_method == DetectionMethod::Disabled {
             if user_initiated {
-                self.try_begin(monitor_id, Some(now_unix()), true, None, None, None, None, None, None, true, true);
+                self.try_begin(monitor_id, Some(now_unix()), true, None, None, None, None, None, None, None, true, true);
             }
             return;
         }
@@ -1480,7 +1487,7 @@ progress_info: None,
                     Some(t) => (Some(t), false),
                     None => (Some(now_unix()), true),
                 };
-                self.try_begin(monitor_id, went, approx, outcome.stream_id, outcome.thumbnail_url, outcome.broadcaster_id, outcome.stream_title, outcome.stream_game, outcome.stream_viewers, true, user_initiated);
+                self.try_begin(monitor_id, went, approx, outcome.stream_id, outcome.thumbnail_url, outcome.broadcaster_id, outcome.stream_title, outcome.stream_game, outcome.stream_viewers, outcome.stream_tags, true, user_initiated);
             } else {
                 // Auto off + automatic trigger: just update the state + live
                 // meta (title/game/thumbnail/viewers/go-live time) so the UI
@@ -1499,6 +1506,7 @@ progress_info: None,
                     outcome.stream_viewers.unwrap_or(-1),
                     live_since,
                     live_since_approx,
+                    outcome.stream_tags.as_deref().unwrap_or(""),
                 );
             }
         } else if user_initiated {
@@ -2211,6 +2219,7 @@ progress_info: None,
                     stream_game: None,
                     stream_viewers: None,
                     stream_followers: None,
+                    stream_tags: None,
                 }),
             DetectionMethod::GenericProbe => self.ctx.detect_generic(&item).await,
             DetectionMethod::YouTubeApi => self.ctx.detect_youtube_api(&item).await,
@@ -2230,6 +2239,7 @@ progress_info: None,
                 stream_game: None,
                 stream_viewers: None,
                 stream_followers: None,
+                stream_tags: None,
             },
             _ => self.ctx.detect_scrape(&item).await,
         }
@@ -2991,6 +3001,7 @@ progress_info: None,
                 stop_rule,
                 row.last_title.clone(),
                 row.last_game.clone(),
+                row.last_tags.clone(),
             ))
         });
         (meta_done, meta_task)
