@@ -853,7 +853,8 @@ impl StreamArchiverApp {
                                     &mut self.fs_probes, &self.settings,
                                     &self.background_tasks, &finalizing_recs, ad_breaks,
                                     meta_logs, &self.collab_by_stream, &exp_streams, now,
-                                    &col_order, &self.rec_alert_badges, &mut out,
+                                    &col_order, &self.rec_alert_badges,
+                                    active_ids, &finalizing_ids, &mut out,
                                 );
                             }
                             Vis::Take { mid, gi, ti, depth } => {
@@ -866,7 +867,8 @@ impl StreamArchiverApp {
                                     &mut self.rename_rec_id, &mut self.rename_draft,
                                     &mut self.rename_preview,
                                     &mut self.show_rename_dialog, now, &col_order,
-                                    &self.rec_alert_badges, &mut out,
+                                    &self.rec_alert_badges,
+                                    active_ids, &finalizing_ids, &mut out,
                                 );
                             }
                             Vis::VodJob { mid, gi, ti, kind, depth } => {
@@ -1940,8 +1942,22 @@ impl StreamArchiverApp {
         now: i64,
         col_order: &[usize],
         rec_alerts: &HashMap<i64, crate::store::RecAlertBadge>,
+        // Whether the owning monitor has a live capture process right now —
+        // same source of truth as the instance row's own Stop button, so
+        // the stream row's "Stop recording" entry agrees with it (rather
+        // than a possibly-stale DB status).
+        active_ids: &HashSet<i64>,
+        finalizing_ids: &HashSet<i64>,
         out: &mut StreamsOut,
     ) {
+        // Both must agree: the DB status ties the live process to THIS
+        // broadcast specifically (the monitor could already be capturing a
+        // newer one while an older StreamGroup's row is still on screen),
+        // and active_ids/finalizing_ids rule out a stale "recording" status
+        // left behind by a crash with no live process to actually stop.
+        let recording = g.status() == "recording"
+            && active_ids.contains(&mid)
+            && !finalizing_ids.contains(&mid);
         let has_takes = stream_has_children(g);
         let expanded = exp_streams.contains(&g.key);
         let when = fmt_went_live(g.went_live_at, g.went_live_approx);
@@ -2240,6 +2256,43 @@ impl StreamArchiverApp {
             }
             tr.response().context_menu(|ui| {
                 ui.set_min_width(180.0);
+                if recording {
+                    if ui
+                        .button("⏹  Stop recording")
+                        .on_hover_text(
+                            "Stops the take and holds automatic restarts until this channel \
+                             goes offline and starts a NEW broadcast. ▶ Start (instance row) \
+                             clears the hold.",
+                        )
+                        .clicked()
+                    {
+                        out.acts.stop = Some((mid, None));
+                        ui.close();
+                    }
+                    if ui
+                        .button("⏹  Stop for 6 hours")
+                        .on_hover_text(
+                            "Stops the take and holds automatic restarts for 6 hours, \
+                             regardless of offline/online cycles.",
+                        )
+                        .clicked()
+                    {
+                        out.acts.stop = Some((mid, Some(6)));
+                        ui.close();
+                    }
+                    if ui
+                        .button("⏹  Stop for 12 hours")
+                        .on_hover_text(
+                            "Stops the take and holds automatic restarts for 12 hours, \
+                             regardless of offline/online cycles.",
+                        )
+                        .clicked()
+                    {
+                        out.acts.stop = Some((mid, Some(12)));
+                        ui.close();
+                    }
+                    ui.separator();
+                }
                 let dir_ok =
                     dir.as_ref().is_some_and(|d| fs_probes.is_dir(d));
                 if ui
@@ -2479,9 +2532,19 @@ impl StreamArchiverApp {
         now: i64,
         col_order: &[usize],
         rec_alerts: &HashMap<i64, crate::store::RecAlertBadge>,
+        // Same source of truth as the instance row's Stop button — see the
+        // comment on `stream_row`'s copy of these parameters.
+        active_ids: &HashSet<i64>,
+        finalizing_ids: &HashSet<i64>,
         out: &mut StreamsOut,
     ) {
         let t = &g.takes[ti];
+        // This specific take must be the DB's current "recording" one (not
+        // an older take of the same multi-take stream) AND the live
+        // process/finalize state must agree — see `stream_row`'s comment.
+        let recording = t.is_active()
+            && active_ids.contains(&mid)
+            && !finalizing_ids.contains(&mid);
         let take_variant = dual_take_variant(g, t);
         let dir = std::path::Path::new(&t.output_path)
             .parent()
@@ -2731,6 +2794,43 @@ impl StreamArchiverApp {
             }
             tr.response().context_menu(|ui| {
                 ui.set_min_width(180.0);
+                if recording {
+                    if ui
+                        .button("⏹  Stop recording")
+                        .on_hover_text(
+                            "Stops the take and holds automatic restarts until this channel \
+                             goes offline and starts a NEW broadcast. ▶ Start (instance row) \
+                             clears the hold.",
+                        )
+                        .clicked()
+                    {
+                        out.acts.stop = Some((mid, None));
+                        ui.close();
+                    }
+                    if ui
+                        .button("⏹  Stop for 6 hours")
+                        .on_hover_text(
+                            "Stops the take and holds automatic restarts for 6 hours, \
+                             regardless of offline/online cycles.",
+                        )
+                        .clicked()
+                    {
+                        out.acts.stop = Some((mid, Some(6)));
+                        ui.close();
+                    }
+                    if ui
+                        .button("⏹  Stop for 12 hours")
+                        .on_hover_text(
+                            "Stops the take and holds automatic restarts for 12 hours, \
+                             regardless of offline/online cycles.",
+                        )
+                        .clicked()
+                    {
+                        out.acts.stop = Some((mid, Some(12)));
+                        ui.close();
+                    }
+                    ui.separator();
+                }
                 // Offer re-remux when the finalized file is still a .ts
                 // (the automatic remux failed at recording end).
                 let needs_remux = t.output_path.ends_with(".ts")

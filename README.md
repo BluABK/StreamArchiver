@@ -489,9 +489,13 @@ immediately re-record the stream you just stopped. **Stop for 6 hours** /
 offline/online cycles. A held instance shows a **✋** badge in its State cell
 (hover for when the hold ends); **▶ Start** always clears the hold. Holds
 survive an app restart. Automated stops (a trigger's *only-while-matching*
-auto-stop, scheduled stops, the quality-upgrade restart) never hold. A stream/take row's menu offers Open folder
-/ Open file / Stream in player / Play new instance / Copy path (and Delete for
-a take). The inline per-row buttons (▶/⏹ ⏵ ▷ ✏ ➕ 🗑) do the same.
+auto-stop, scheduled stops, the quality-upgrade restart) never hold. A
+stream/take row's menu offers the same **⏹ Stop recording** / **Stop for 6
+hours** / **Stop for 12 hours** options too, right on the take that's
+actually recording (or the stream currently capturing it) — not just the
+instance row — plus Open folder / Open file / Stream in player / Play new
+instance / Copy path (and Delete for a take). The inline per-row buttons
+(▶/⏹ ⏵ ▷ ✏ ➕ 🗑) do the same.
 
 The inline **Actions** column can be hidden via **Settings → Display → Show
 Actions column** (applies to the Streams and Videos tables) to reclaim width — the
