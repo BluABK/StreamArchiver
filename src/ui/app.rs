@@ -223,6 +223,9 @@ impl StreamArchiverApp {
             .trim()
             .parse()
             .unwrap_or(0),
+            token_style_branded: setting_or_empty(&core, crate::downloader::K_TOKEN_STYLE)
+                == "branded",
+            token_overrides: setting_or_empty(&core, crate::downloader::K_TOKEN_OVERRIDES),
             gap_recover: setting_or_empty(&core, crate::downloader::K_GAP_RECOVER) != "0",
             auto_recover_muted: setting_or_empty(&core, crate::recovery::K_AUTO_RECOVER_MUTED) == "1",
             auto_recover_deleted: setting_or_empty(&core, crate::recovery::K_AUTO_RECOVER_DELETED) == "1",
@@ -1568,6 +1571,8 @@ impl StreamArchiverApp {
             (K_FILE_SPLIT_THUMBS, s.file_split_thumbs.trim()),
             (K_FILE_SPLIT_LOGS,   s.file_split_logs.trim()),
             (K_MEDIA_PLAYER, s.media_player_path.trim()),
+            (crate::downloader::K_TOKEN_STYLE, if s.token_style_branded { "branded" } else { "plain" }),
+            (crate::downloader::K_TOKEN_OVERRIDES, s.token_overrides.trim()),
             (crate::downloader::K_GAP_RECOVER, if s.gap_recover { "1" } else { "0" }),
             (crate::recovery::K_AUTO_RECOVER_MUTED, if s.auto_recover_muted { "1" } else { "0" }),
             (crate::recovery::K_AUTO_RECOVER_DELETED, if s.auto_recover_deleted { "1" } else { "0" }),
@@ -1619,6 +1624,11 @@ impl StreamArchiverApp {
         // Apply the (possibly changed) date format + short-timestamp pattern to the live UI.
         set_active_date_fmt(self.settings.date_fmt);
         set_short_ts_pattern(&self.settings.short_ts_fmt);
+        // Re-install the filename token style so new plans/renames/previews
+        // pick the change up without a restart.
+        crate::downloader::set_global_token_style(crate::downloader::load_token_style(
+            &self.core.store,
+        ));
         // Per-disk I/O limits: the global throttle/rate-limit controls are the
         // defaults; the per-drive overrides come from the table. Permit
         // changes take effect immediately on save, including for a dynamic-

@@ -1137,6 +1137,51 @@ impl StreamArchiverApp {
                         });
                     ui.end_row();
 
+                    ui.label("Filename token style").on_hover_text(
+                        "Casing for the machine-value tokens {vcodec} {acodec} \
+                         {platform} {platform_short} {tool} {mode}: \"As reported\" \
+                         keeps the tools' lowercase values (h264, aac, twitch); \
+                         \"Branded\" uses proper trademark/spec casing (H.264, AAC, \
+                         Twitch, YouTube, SABR). Applies on Save to NEW names — \
+                         existing files are never renamed.",
+                    );
+                    egui::ComboBox::from_id_salt("token_style_cb")
+                        .selected_text(if self.settings.token_style_branded {
+                            "Branded (H.264, AAC, YouTube)"
+                        } else {
+                            "As reported (h264, aac, youtube)"
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.settings.token_style_branded,
+                                false,
+                                "As reported (h264, aac, youtube)",
+                            );
+                            ui.selectable_value(
+                                &mut self.settings.token_style_branded,
+                                true,
+                                "Branded (H.264, AAC, YouTube)",
+                            );
+                        });
+                    ui.end_row();
+
+                    ui.label("Token text overrides").on_hover_text(
+                        "Custom text for individual token values, one per line: \
+                         `value=Text` (matches that value in any token, \
+                         case-insensitive) or `kind:value=Text` for one token only \
+                         — e.g. `aac=AAC`, `h264=x264`, \
+                         `platform_short:youtube=YT2`. Overrides win over the \
+                         Branded style. Kinds: vcodec, acodec, platform, \
+                         platform_short, tool, mode.",
+                    );
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.settings.token_overrides)
+                            .desired_rows(2)
+                            .desired_width(300.0)
+                            .hint_text("aac=AAC\nplatform_short:youtube=YT"),
+                    );
+                    ui.end_row();
+
                     ui.label("Date format").on_hover_text(
                         "How dates and timestamps are shown throughout the app \
                          (the Polled / Went Live / Started On / Added columns, the \
@@ -1984,7 +2029,7 @@ impl StreamArchiverApp {
                                             .hint_text(&ft_hint)
                                             .desired_width(150.0),
                                     ).on_hover_text(
-                                        "Tokens: {name} {date} {time} {timestamp} {year} {month} {day} {hour} {minute} {second} {title} {title_trimmed} {games} {video_id} {quality} {resolution} {height} {width} {fps} {vcodec} {acodec} {take} {tool} {mode} {platform} {went_live_date} {went_live_time}",
+                                        "Tokens: {name} {date} {time} {timestamp} {year} {month} {day} {hour} {minute} {second} {title} {title_trimmed} {games} {video_id} {quality} {resolution} {height} {width} {fps} {vcodec} {acodec} {take} {tool} {mode} {platform} {platform_short} {went_live_date} {went_live_time}",
                                     );
                                 });
                                 ui.label("");

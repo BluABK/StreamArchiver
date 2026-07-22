@@ -348,12 +348,162 @@ pub struct TemplateVars<'a> {
     pub secs: i64,
     /// When the broadcast went live (unix secs); 0 means unknown → {went_live_date}/{went_live_time} render empty.
     pub went_live: i64,
+    /// Casing/override style for machine-value tokens (`{vcodec}` `{acodec}`
+    /// `{platform}` `{platform_short}` `{tool}` `{mode}`). `None` = plain.
+    pub style: Option<&'a TokenStyle>,
 }
 
 /// Preview a filename template with the given variable set. Extension not included.
 /// Sanitizes and guarantees a non-empty result (falls back to `{name}_{date}_{time}`).
 pub fn preview_filename(template: &str, vars: &TemplateVars<'_>) -> String {
     expand_template(template, vars)
+}
+
+/// Settings key: casing style for machine-value tokens (`{vcodec}` `{acodec}`
+/// `{platform}` `{platform_short}` `{tool}` `{mode}`). `"branded"` = proper
+/// trademark/spec casing (AAC, H.264, YouTube); anything else = as reported
+/// (lowercase, today's behavior).
+pub const K_TOKEN_STYLE: &str = "filename_token_style";
+/// Settings key: user overrides for token values, one per line —
+/// `value=Text` (any token) or `kind:value=Text` (one token kind, e.g.
+/// `platform_short:youtube=YT2`). Overrides win over the branded map.
+pub const K_TOKEN_OVERRIDES: &str = "filename_token_overrides";
+
+/// How machine-value template tokens are rendered. [`Default`] = as-reported
+/// lowercase with no overrides (exactly the pre-feature output).
+#[derive(Clone, Default)]
+pub struct TokenStyle {
+    pub branded: bool,
+    /// `(kind, lowercase value, replacement)`; empty kind = any token kind.
+    pub overrides: Vec<(String, String, String)>,
+}
+
+/// Parse the overrides setting: one `value=Text` / `kind:value=Text` per line;
+/// blank lines and lines without `=` are ignored.
+pub fn parse_token_overrides(raw: &str) -> Vec<(String, String, String)> {
+    raw.lines()
+        .filter_map(|line| {
+            let (key, text) = line.split_once('=')?;
+            let (key, text) = (key.trim(), text.trim());
+            if key.is_empty() || text.is_empty() {
+                return None;
+            }
+            let (kind, value) = match key.split_once(':') {
+                Some((k, v)) => (k.trim().to_lowercase(), v.trim().to_lowercase()),
+                None => (String::new(), key.to_lowercase()),
+            };
+            Some((kind, value, text.to_string()))
+        })
+        .collect()
+}
+
+/// Load the configured [`TokenStyle`] from settings.
+pub fn load_token_style(store: &Store) -> TokenStyle {
+    TokenStyle {
+        branded: store.get_setting(K_TOKEN_STYLE).ok().flatten().as_deref() == Some("branded"),
+        overrides: parse_token_overrides(
+            &store.get_setting(K_TOKEN_OVERRIDES).ok().flatten().unwrap_or_default(),
+        ),
+    }
+}
+
+/// Process-wide token style, read by every template expansion that doesn't
+/// override it explicitly (`TemplateVars::style`). Set at startup and on every
+/// settings save — passing it through the dozens of plan/stem/preview call
+/// chains would be pure plumbing. Tests never touch it (they pass an explicit
+/// style), so the default-plain global keeps them deterministic.
+static GLOBAL_TOKEN_STYLE: std::sync::OnceLock<std::sync::RwLock<TokenStyle>> =
+    std::sync::OnceLock::new();
+
+fn global_style_lock() -> &'static std::sync::RwLock<TokenStyle> {
+    GLOBAL_TOKEN_STYLE.get_or_init(|| std::sync::RwLock::new(TokenStyle::default()))
+}
+
+/// Install the current settings' token style (startup + settings save).
+pub fn set_global_token_style(style: TokenStyle) {
+    *global_style_lock().write().unwrap() = style;
+}
+
+fn global_token_style() -> TokenStyle {
+    global_style_lock().read().unwrap().clone()
+}
+
+/// Proper trademark/spec casing for a known machine value (`branded` style).
+fn branded_value(kind: &str, value_lc: &str) -> Option<&'static str> {
+    Some(match (kind, value_lc) {
+        ("vcodec", "h264") => "H.264",
+        ("vcodec", "h265") => "H.265",
+        ("vcodec", "hevc") => "HEVC",
+        ("vcodec", "av1") => "AV1",
+        ("vcodec", "vp9") => "VP9",
+        ("vcodec", "vp8") => "VP8",
+        ("acodec", "aac") => "AAC",
+        ("acodec", "opus") => "Opus",
+        ("acodec", "mp3") => "MP3",
+        ("acodec", "mp4a") => "MP4A",
+        ("acodec", "vorbis") => "Vorbis",
+        ("acodec", "flac") => "FLAC",
+        ("acodec", "ac3") => "AC3",
+        ("acodec", "eac3") => "EAC3",
+        ("platform", "twitch") => "Twitch",
+        ("platform", "youtube") => "YouTube",
+        ("platform", "kick") => "Kick",
+        ("platform", "nrk") => "NRK",
+        ("platform", "nebula") => "Nebula",
+        ("platform", "generic") => "Generic",
+        ("platform_short", "twitch") => "TTV",
+        ("platform_short", "youtube") => "YT",
+        ("platform_short", "kick") => "Kick",
+        ("platform_short", "nrk") => "NRK",
+        ("platform_short", "nebula") => "Neb",
+        ("platform_short", "generic") => "Gen",
+        // yt-dlp's brand IS lowercase — only the others gain a capital.
+        ("tool", "streamlink") => "Streamlink",
+        ("tool", "ffmpeg") => "FFmpeg",
+        ("mode", "live") => "Live",
+        ("mode", "sabr") => "SABR",
+        ("mode", "dash") => "DASH",
+        ("mode", "hybrid") => "Hybrid",
+        ("mode", "hybrid-dash") => "Hybrid-DASH",
+        ("mode", "direct") => "Direct",
+        ("mode", "vod") => "VOD",
+        ("mode", "chat") => "Chat",
+        _ => return None,
+    })
+}
+
+/// Lowercase short form of a platform value (`{platform_short}`); unknown
+/// platforms fall back to the full value.
+fn short_platform(platform_lc: &str) -> &str {
+    match platform_lc {
+        "twitch" => "ttv",
+        "youtube" => "yt",
+        "kick" => "kick",
+        "nrk" => "nrk",
+        "nebula" => "neb",
+        "generic" => "gen",
+        other => other,
+    }
+}
+
+/// Render one machine-value token: user override → branded map (when on) →
+/// the raw value. `platform_short` shortens first, then styles.
+fn styled_token(kind: &str, raw: &str, st: &TokenStyle) -> String {
+    let value_lc = raw.to_lowercase();
+    if let Some((.., text)) = st
+        .overrides
+        .iter()
+        .find(|(k, v, _)| (k.is_empty() || k == kind) && *v == value_lc)
+    {
+        return text.clone();
+    }
+    if st.branded && let Some(b) = branded_value(kind, &value_lc) {
+        return b.to_string();
+    }
+    if kind == "platform_short" {
+        return short_platform(&value_lc).to_string();
+    }
+    raw.to_string()
 }
 
 /// Expand a filename template using our own (tool-agnostic) variables so the
@@ -375,6 +525,14 @@ pub(super) fn expand_template(template: &str, v: &TemplateVars) -> String {
     } else {
         template
     };
+    let global;
+    let style = match v.style {
+        Some(s) => s,
+        None => {
+            global = global_token_style();
+            &global
+        }
+    };
     let expanded = tmpl
         .replace("{name}", v.name)
         .replace("{title_trimmed}", &trim_title_commands(v.title))
@@ -386,11 +544,12 @@ pub(super) fn expand_template(template: &str, v: &TemplateVars) -> String {
         .replace("{height}", v.height)
         .replace("{width}", v.width)
         .replace("{fps}", v.fps)
-        .replace("{vcodec}", v.vcodec)
-        .replace("{acodec}", v.acodec)
-        .replace("{tool}", v.tool)
-        .replace("{mode}", v.mode)
-        .replace("{platform}", v.platform)
+        .replace("{vcodec}", &styled_token("vcodec", v.vcodec, style))
+        .replace("{acodec}", &styled_token("acodec", v.acodec, style))
+        .replace("{tool}", &styled_token("tool", v.tool, style))
+        .replace("{mode}", &styled_token("mode", v.mode, style))
+        .replace("{platform_short}", &styled_token("platform_short", v.platform, style))
+        .replace("{platform}", &styled_token("platform", v.platform, style))
         .replace("{take}", v.take)
         .replace("{games}", v.games)
         .replace("{date}", &date)
@@ -1079,6 +1238,70 @@ mod tests {
 
         // A title that is ONLY commands falls back to the original.
         assert_eq!(trim_title_commands("!gg !tts"), "!gg !tts");
+    }
+
+    #[test]
+    fn token_style_brands_shortens_and_overrides() {
+        // Plain (default) — exactly the pre-feature output, plus the new
+        // {platform_short} in lowercase.
+        let plain = expand_template(
+            "{platform} {platform_short} {vcodec} {acodec} {mode} {tool}",
+            &TemplateVars {
+                platform: "youtube",
+                vcodec: "h264",
+                acodec: "aac",
+                mode: "sabr",
+                tool: "streamlink",
+                ..Default::default()
+            },
+        );
+        assert_eq!(plain, "youtube yt h264 aac sabr streamlink");
+
+        // Branded: trademark/spec casing; yt-dlp stays lowercase (its brand).
+        let branded = TokenStyle { branded: true, overrides: Vec::new() };
+        let out = expand_template(
+            "{platform} {platform_short} {vcodec} {acodec} {mode} {tool}",
+            &TemplateVars {
+                platform: "twitch",
+                vcodec: "h264",
+                acodec: "aac",
+                mode: "vod",
+                tool: "yt-dlp",
+                style: Some(&branded),
+                ..Default::default()
+            },
+        );
+        assert_eq!(out, "Twitch TTV H.264 AAC VOD yt-dlp");
+
+        // Overrides beat the branded map; kind-scoped keys hit one token only.
+        let styled = TokenStyle {
+            branded: true,
+            overrides: parse_token_overrides(
+                "h264=x264\nplatform_short:youtube=YT2\nignored line\n=empty\n",
+            ),
+        };
+        let out = expand_template(
+            "{platform} {platform_short} {vcodec}",
+            &TemplateVars {
+                platform: "youtube",
+                vcodec: "H264", // matching is case-insensitive on the value
+                style: Some(&styled),
+                ..Default::default()
+            },
+        );
+        assert_eq!(out, "YouTube YT2 x264");
+
+        // Unknown values pass through untouched in every style.
+        let out = expand_template(
+            "{vcodec} {platform_short}",
+            &TemplateVars {
+                platform: "weirdtv",
+                vcodec: "prores",
+                style: Some(&branded),
+                ..Default::default()
+            },
+        );
+        assert_eq!(out, "prores weirdtv");
     }
 
     #[test]

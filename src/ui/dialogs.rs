@@ -1069,7 +1069,7 @@ impl StreamArchiverApp {
                     video_id: "", quality: "", resolution: "", height: "",
                     width: "", fps: "", vcodec: "", acodec: "",
                     take: "", games: "", tool: "", mode: "", platform: "",
-                    secs: 0, went_live: 0,
+                    secs: 0, went_live: 0, style: None,
                 },
             );
         }
@@ -2175,7 +2175,7 @@ impl StreamArchiverApp {
                         });
                         ui.end_row();
 
-                        let fn_tmpl_hint = "{name} {date} {time} {year} {month} {day} {hour} {minute} {second} {title} {title_trimmed} {games} {video_id} {quality} {resolution} {height} {width} {fps} {vcodec} {acodec} {take} {tool} {mode} {platform} {went_live_date} {went_live_time} {timestamp}";
+                        let fn_tmpl_hint = "{name} {date} {time} {year} {month} {day} {hour} {minute} {second} {title} {title_trimmed} {games} {video_id} {quality} {resolution} {height} {width} {fps} {vcodec} {acodec} {take} {tool} {mode} {platform} {platform_short} {went_live_date} {went_live_time} {timestamp}";
                         ui.label("Filename template").on_hover_text(fn_tmpl_hint);
                         ui.horizontal(|ui| {
                             let custom_presets = self.custom_presets.as_slice();

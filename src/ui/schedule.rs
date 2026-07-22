@@ -182,6 +182,9 @@ pub(super) fn build_preview_filename(
         games: &games_s,
         secs: started_at,
         went_live,
+        // None = the global (settings-configured) token style — previews
+        // match what a real capture would be named.
+        style: None,
     };
     crate::downloader::preview_filename(template, &vars)
 }

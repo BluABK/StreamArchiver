@@ -1969,6 +1969,7 @@ yt-dlp's output templates):
 | `{vcodec}` | Actual video codec (e.g. `h264`, `hevc`, `av1`). Same probing requirement. |
 | `{take}` | **Streams:** this monitor's attempt number (1, 2, 3, …) — a built-in way to keep names unique when you omit `{date}`/`{time}`. Empty for Videos. |
 | `{games}` | **Streams:** the distinct game/category names played during the recording (Twitch, Kick & YouTube — see *Title & category change log*), in order of first appearance, joined with `, ` and length-capped. Only known once the stream ends, so it's filled by a **post-capture rename** (see below). Empty for generic URLs / Videos / when no category was logged. |
+| `{platform_short}` | Short platform tag to shave filename length: `ttv` `yt` `kick` `gen` `nrk` `neb` (`TTV` `YT` `Kick` `Gen` `NRK` `Neb` in the *Branded* token style). |
 | `{date}` | Capture-start date, **UTC**, `YYYYMMDD` (e.g. `20260620`). |
 | `{time}` | Capture-start time, **UTC**, `HHMMSS` (e.g. `183001`). |
 | `{timestamp}` | Capture start as a **Unix timestamp** (whole seconds). |
@@ -1983,6 +1984,18 @@ Notes:
 - Unknown `{…}` tokens are left as literal text; only the variables above are
   substituted.
 - If a template expands to nothing usable, it falls back to `{name}_{date}_{time}`.
+- **Token style & overrides** (Settings → Defaults): the machine-value tokens
+  (`{vcodec}` `{acodec}` `{platform}` `{platform_short}` `{tool}` `{mode}`)
+  default to the tools' own lowercase values (`h264`, `aac`, `twitch`).
+  Switching **Filename token style** to *Branded* renders proper
+  trademark/spec casing instead — `H.264`, `HEVC`, `AV1`, `AAC`, `Opus`,
+  `Twitch`, `YouTube`, `SABR`, `VOD`, `FFmpeg` (yt-dlp stays lowercase; that
+  IS its brand). **Token text overrides** go further: one `value=Text` line
+  per mapping (`h264=x264`), optionally scoped to one token kind
+  (`platform_short:youtube=YT2`) — overrides beat the branded map, matching
+  is case-insensitive, unknown values always pass through unchanged. Applies
+  to new names (and post-capture renames) from the moment you Save; existing
+  files are never renamed.
 - **Collisions are handled automatically:** if the target file already exists, the
   app appends ` (2)`, ` (3)`, … (file-manager style) rather than overwriting — so
   even a template with no unique part (e.g. just `{name}`) never clobbers an

@@ -974,7 +974,7 @@ impl StreamArchiverApp {
                             ));
                         }
                     });
-                    let tmpl_hint = "Variables: {name} {title} {title_trimmed} {channel} {date} {time} {timestamp} {year} {month} {day} {hour} {minute} {second} {tool} {mode} {platform} {video_id} {quality} {resolution} {height} {width} {fps} {vcodec} {acodec} {take} {games} {went_live_date} {went_live_time}";
+                    let tmpl_hint = "Variables: {name} {title} {title_trimmed} {channel} {date} {time} {timestamp} {year} {month} {day} {hour} {minute} {second} {tool} {mode} {platform} {platform_short} {video_id} {quality} {resolution} {height} {width} {fps} {vcodec} {acodec} {take} {games} {went_live_date} {went_live_time}";
                     ui.label("Filename template").on_hover_text(tmpl_hint);
                     ui.horizontal(|ui| {
                         let (del, save) = filename_preset_combo(
@@ -1771,6 +1771,7 @@ impl StreamArchiverApp {
                 ("{games}", "Games / categories played"),
                 ("{quality}", "Configured quality selector"),
                 ("{platform}", "twitch · youtube · kick · generic"),
+                ("{platform_short}", "Short platform tag: ttv · yt · kick · gen (TTV/YT/… in Branded style)"),
                 ("{mode}", "live · sabr · dash · hybrid · direct · vod"),
                 ("{tool}", "streamlink · yt-dlp · ffmpeg"),
             ]),

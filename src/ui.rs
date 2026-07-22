@@ -766,6 +766,11 @@ struct SettingsForm {
     /// 10-minute buckets (`0` = off, keep full resolution forever). Persisted
     /// immediately as `viewer_history_downsample_days`.
     viewer_downsample_days: i64,
+    /// Branded casing (H.264, AAC, YouTube…) for machine-value filename
+    /// tokens; false = as reported by the tools (h264, aac, youtube).
+    token_style_branded: bool,
+    /// Raw `value=Text` / `kind:value=Text` override lines for token values.
+    token_overrides: String,
     // --- Twitch VOD recovery ---
     /// Re-fetch a live capture's lost segments (sequence gaps) from the VOD
     /// CDN automatically, while the stream is still running. Default on.

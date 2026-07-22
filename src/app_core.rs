@@ -110,6 +110,10 @@ pub struct AppCore {
 
 impl AppCore {
     pub fn new(store: Arc<Store>) -> Result<Arc<AppCore>> {
+        // Install the filename token style (branded casing / user overrides)
+        // so every template expansion — plans, renames, previews — sees it,
+        // regardless of which entry point built the core.
+        crate::downloader::set_global_token_style(crate::downloader::load_token_style(&store));
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
