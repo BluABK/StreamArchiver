@@ -278,13 +278,15 @@ impl Supervisor {
             };
             match self.store.upsert_capture_alert(&alert) {
                 Ok((alert_id, was_new)) => {
+                    // Log level mirrors the alert severity: an error alert
+                    // means content is MISSING from the capture.
                     if *severity == "error" {
-                        warn!(
+                        error!(
                             ref_id,
                             "capture alert [{label}]: {hit_kind} ×{count} (+{lost} lost segments) — {last_line}"
                         );
                     } else {
-                        debug!(ref_id, "capture alert [{label}]: {hit_kind} ×{count} — {last_line}");
+                        warn!(ref_id, "capture alert [{label}]: {hit_kind} ×{count} — {last_line}");
                     }
                     if was_new {
                         let (title, body) = alert_message(hit_kind, &label, *lost, last_line, twitch);

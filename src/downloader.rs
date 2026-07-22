@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::detectors::{DetectContext, DetectItem, DetectOutcome};
 use crate::events::{AppEvent, EventTx, LiveSignal, ManualCommand};
