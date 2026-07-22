@@ -30,6 +30,18 @@ static NICK_SEQ: AtomicU64 = AtomicU64::new(0);
 /// the recording's finalize (which joins this task when the capture ends).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// Bound every `ws.send()` once connected, for the same reason as
+/// `CONNECT_TIMEOUT` above but for the steady-state PING/PONG replies: a
+/// half-dead connection (TCP black-holed after a network blip — no clean
+/// close, no read error) can leave an unprotected write pending forever.
+/// `ws.next()` already has its own 1s read timeout; writes had none, and a
+/// hung write here blocks the read loop from ever reaching its own
+/// `done`/`shutdown` check again — confirmed live (2026-07-23): two
+/// channels' finalize sequences stuck for hours/days with `status =
+/// "recording"` and a long-dead capture process, because `stop_record_watchers`
+/// joins this task without an abort fallback.
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Resolve once `done` or `shutdown` is set, to race against a blocking connect.
 async fn wait_stopped(done: &AtomicBool, shutdown: &AtomicBool) {
     while !done.load(Ordering::SeqCst) && !shutdown.load(Ordering::SeqCst) {
@@ -293,7 +305,9 @@ async fn session(
                         }
                         // Twitch IRC keepalive: reply so the server doesn't drop us.
                         if let Some(token) = line.strip_prefix("PING ") {
-                            ws.send(Message::Text(format!("PONG {token}").into())).await?;
+                            timeout(SEND_TIMEOUT, ws.send(Message::Text(format!("PONG {token}").into())))
+                                .await
+                                .map_err(|_| anyhow::anyhow!("chat PONG reply timed out"))??;
                             continue;
                         }
                         // Stream events (subs/bits/raids) live in tags the
@@ -369,7 +383,7 @@ async fn session(
                     }
                 }
                 Message::Ping(payload) => {
-                    let _ = ws.send(Message::Pong(payload)).await;
+                    let _ = timeout(SEND_TIMEOUT, ws.send(Message::Pong(payload))).await;
                 }
                 Message::Close(_) => return Err(anyhow::anyhow!("chat websocket close frame")),
                 _ => {}

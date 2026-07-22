@@ -2607,7 +2607,7 @@ progress_info: None,
             crate::pot_server::nudge();
         }
 
-        self.stop_record_watchers(watcher_done, watcher, meta_done, meta_task, chat_done, chat_task)
+        Self::stop_record_watchers(watcher_done, watcher, meta_done, meta_task, chat_done, chat_task)
             .await;
         // Capture over, finalize begins — the promote below can sit in the disk-
         // gate queue for hours, so tell the UI this monitor is "finalizing", not
@@ -3147,7 +3147,6 @@ progress_info: None,
 
     /// Stop the per-take watchers once the capture process has exited.
     async fn stop_record_watchers(
-        &self,
         watcher_done: Arc<AtomicBool>,
         watcher: Option<tokio::task::JoinHandle<()>>,
         meta_done: Arc<AtomicBool>,
@@ -3155,6 +3154,9 @@ progress_info: None,
         chat_done: Arc<AtomicBool>,
         chat_task: Option<tokio::task::JoinHandle<()>>,
     ) {
+        /// How long the chat logger gets to notice `chat_done` and flush/exit
+        /// on its own before it's force-aborted (see the comment below).
+        const CHAT_STOP_GRACE: Duration = Duration::from_secs(10);
         // Stop the catch-up watcher before we touch the capture file (so it can't
         // race finalize's authoritative lost-time write). Abort rather than wait:
         // the watcher only checks its done flag at the start of each sleep tick, so
@@ -3177,8 +3179,24 @@ progress_info: None,
         }
         // Stop the chat logger and let it flush/close its sidecar before we touch
         // the capture file (the post-rename moves the .chat.jsonl alongside it).
+        // Bounded grace period, NOT an unconditional wait: `log_twitch_chat`
+        // checks its `done` flag reliably in the steady state, but a half-dead
+        // WebSocket (TCP black-holed after a network blip — no clean close, no
+        // read error) could leave an in-flight write hung indefinitely with
+        // nothing here to time it out — and since this join has no abort
+        // fallback, that would wedge this WHOLE function forever: `active`
+        // never gets freed (below), the DB row never leaves "recording", and
+        // the monitor can never be re-recorded. Confirmed live (2026-07-23):
+        // girl_dm_ and Nihmune both stuck for hours/days this exact way. Give
+        // it CHAT_STOP_GRACE to exit cleanly like the comment above always
+        // intended; abort past that — a truncated last line or two in the
+        // sidecar beats a permanently wedged monitor.
         chat_done.store(true, Ordering::SeqCst);
-        if let Some(t) = chat_task {
+        if let Some(mut t) = chat_task
+            && tokio::time::timeout(CHAT_STOP_GRACE, &mut t).await.is_err()
+        {
+            warn!("chat logger didn't stop within {CHAT_STOP_GRACE:?} — aborting it");
+            t.abort();
             let _ = t.await;
         }
     }
@@ -3585,5 +3603,77 @@ progress_info: None,
         });
         info!(monitor_id, bytes, status, "dash companion finished");
         self.active_secondary.lock().unwrap().remove(&monitor_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the girl_dm_/Nihmune incident (2026-07-23): a chat
+    /// task that never notices its `done` flag (simulating a `ws.send()` hung
+    /// on a half-dead connection) must not wedge `stop_record_watchers`
+    /// forever — it has to abort and return within its bounded grace period.
+    /// Real-time (no `tokio::time::pause` — this crate doesn't pull in
+    /// tokio's `test-util` feature), so this genuinely takes a few seconds;
+    /// the hung task sleeps well past the grace period, not forever, so a
+    /// regression (the old unconditional `t.await`) fails fast instead of
+    /// hanging the whole suite.
+    #[tokio::test]
+    async fn stop_record_watchers_aborts_a_hung_chat_task() {
+        let watcher_done = Arc::new(AtomicBool::new(false));
+        let meta_done = Arc::new(AtomicBool::new(false));
+        let chat_done = Arc::new(AtomicBool::new(false));
+        // Deliberately ignores `chat_done` — stands in for a task stuck inside
+        // an unprotected network/disk await, same as the real bug.
+        let chat_task = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let started = std::time::Instant::now();
+        Supervisor::stop_record_watchers(
+            watcher_done,
+            None,
+            meta_done,
+            None,
+            chat_done.clone(),
+            Some(chat_task),
+        )
+        .await;
+
+        // Returned (didn't hang forever) and did so around the grace window,
+        // not after waiting out the hung task's own 30s sleep.
+        assert!(started.elapsed() < Duration::from_secs(20));
+        // The done flag was still set even though the task ignored it — the
+        // abort path is what actually recovers, not a missed signal.
+        assert!(chat_done.load(Ordering::SeqCst));
+    }
+
+    /// The common case: a chat task that DOES notice `done` promptly exits on
+    /// its own, well inside the grace period — no abort needed.
+    #[tokio::test]
+    async fn stop_record_watchers_lets_a_cooperative_chat_task_exit_on_its_own() {
+        let watcher_done = Arc::new(AtomicBool::new(false));
+        let meta_done = Arc::new(AtomicBool::new(false));
+        let chat_done = Arc::new(AtomicBool::new(false));
+        let task_done = chat_done.clone();
+        let chat_task = tokio::spawn(async move {
+            while !task_done.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        let started = std::time::Instant::now();
+        Supervisor::stop_record_watchers(
+            watcher_done,
+            None,
+            meta_done,
+            None,
+            chat_done,
+            Some(chat_task),
+        )
+        .await;
+
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
