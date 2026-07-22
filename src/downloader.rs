@@ -126,6 +126,10 @@ struct AdSink {
     capture_path: PathBuf,
     /// Shared map the UI reads to tint a row while an ad is playing.
     ad_active: AdActive,
+    /// Twitch channel login, when known — feeds `Supervisor::spawn_ad_probe`
+    /// (the live-manifest ad detector, see `ad_probe.rs`) alongside the
+    /// log-line detector above; `None` skips the probe (URL didn't parse).
+    login: Option<String>,
 }
 
 /// The plan for one recording: the command to run plus the files involved.
@@ -146,6 +150,7 @@ pub struct DownloadPlan {
     pub mode: String,
 }
 
+mod ad_probe;
 mod alerts;
 mod backfill;
 mod cache;
@@ -161,8 +166,9 @@ mod tools;
 mod vod;
 
 #[allow(unused_imports)]
-use {alerts::*, backfill::*, gap_recover::*, supervisor::*, vod::*};
+use {ad_probe::*, alerts::*, backfill::*, gap_recover::*, supervisor::*, vod::*};
 pub use alerts::alert_category;
+pub use ad_probe::K_AD_PROBE;
 pub use gap_recover::K_GAP_RECOVER;
 #[allow(unused_imports)]
 use lock_culprit::*;

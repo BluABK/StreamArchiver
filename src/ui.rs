@@ -847,6 +847,11 @@ struct SettingsForm {
     recovery_quality: String,
     /// Concurrent-HEAD cap for the CDN probes (empty = default 8).
     recovery_max_conc: String,
+    // --- Twitch ad-break detection ---
+    /// Poll the live Twitch manifest directly for ad-break markers, alongside
+    /// streamlink's own (fragile) log line. Default on; never affects the
+    /// capture itself.
+    ad_probe: bool,
     // --- Post-stream VOD download (global defaults for the 3-level chain) ---
     /// Download the platform's published VOD after a stream ends (alongside).
     vod_dl_enabled: bool,

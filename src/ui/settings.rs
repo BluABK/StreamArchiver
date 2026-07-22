@@ -543,6 +543,7 @@ impl StreamArchiverApp {
             self.settings_trigger_words_section(ui);
             self.settings_blacklist_triggers_section(ui);
             self.settings_vod_recovery_section(ui);
+            self.settings_ad_probe_section(ui);
             self.settings_stats_history_section(ui);
             self.settings_hype_trains_section(ui);
             self.settings_maintenance_section(ui);
@@ -2941,6 +2942,33 @@ impl StreamArchiverApp {
 
             // ── Maintenance ────────────────────────────────────────────────────
             }
+    }
+
+    fn settings_ad_probe_section(&mut self, ui: &mut egui::Ui) {
+        if self.section_shown(
+            SettingsTab::Downloads,
+            "Twitch ad-break detection",
+            &["ad", "ads", "advertisement", "ad break", "ad probe", "manifest", "📢"],
+        ) {
+            ui.add_space(12.0);
+            ui.heading("Twitch ad-break detection 📢");
+            ui.label(
+                "Streamlink already cuts Twitch ads out of the recording on its own — this only \
+                 controls whether we ALSO log where those cuts happened (the 📢 Ads column, \
+                 cut-list popup). Polls the live stream's own manifest directly (the same public \
+                 access every Twitch player uses) every ~10s for ad markers; never affects the \
+                 capture itself.",
+            );
+            ui.add_space(6.0);
+            ui.checkbox(&mut self.settings.ad_probe, "Detect ad breaks from the live manifest")
+                .on_hover_text(
+                    "Reads the live Twitch playlist directly to find ad-break markers, in \
+                     addition to streamlink's own log line (which needs extra metadata Twitch \
+                     doesn't always send, and in practice misses almost every real break). \
+                     Degrades soft on failure — a sustained problem shows up as an 🚨 Warnings \
+                     alert instead of failing silently.",
+                );
+        }
     }
 
     /// Immediate-save for the viewer-history auto-compress setting (the

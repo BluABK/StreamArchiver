@@ -697,13 +697,18 @@ impl Supervisor {
                 from_start: m.monitor.capture_from_start,
                 capture_path: PathBuf::from(&row.capture_path),
                 ad_active: self.ad_active.clone(),
+                login: crate::detectors::twitch_login(&m.monitor.url),
             });
-        let (ad_tx, ad_task) = match ad_sink {
+        let (ad_tx, ad_task, probe_task) = match ad_sink {
             Some(sink) => {
+                let login = sink.login.clone();
                 let (tx, jh) = spawn_ad_processor(sink);
-                (Some(tx), Some(jh))
+                let probe = login.filter(|_| ad_probe_enabled(&self.store)).map(|login| {
+                    self.spawn_ad_probe(login, row.monitor_id.unwrap_or(0), row.ref_id, tx.clone(), done.clone())
+                });
+                (Some(tx), Some(jh), probe)
             }
-            None => (None, None),
+            None => (None, None, None),
         };
 
         // Re-spawn the live watchers exactly as the in-session record() path does —
@@ -816,6 +821,9 @@ impl Supervisor {
         watcher_done.store(true, Ordering::SeqCst);
         let _ = tail.await;
         if let Some(t) = ad_task {
+            let _ = t.await;
+        }
+        if let Some(t) = probe_task {
             let _ = t.await;
         }
         for w in watchers {
@@ -1758,23 +1766,31 @@ impl Supervisor {
             }
         }
 
-        // Ad-break processor (Twitch+streamlink only): the tailer forwards each
-        // `(detected_at, duration)` over a channel; a dedicated task does the
-        // (potentially slow) ffprobe + DB insert. Same helper drives re-attach.
-        let (ad_tx, ad_task) = match ads {
-            Some(sink) => {
-                let (tx, jh) = spawn_ad_processor(sink);
-                (Some(tx), Some(jh))
-            }
-            None => (None, None),
-        };
-
         // One tailer reads the growing log file and does everything the two pipe
         // readers used to: parse progress/speed (yt-dlp `--progress-template`) and
         // streamlink ad-break lines. It stops once the process has exited (`done`)
         // and it has drained to EOF. Tailing a file (not a pipe) is what lets a
         // re-attach after restart reconstruct live state from the same code path.
         let done = Arc::new(AtomicBool::new(false));
+
+        // Ad-break processor (Twitch+streamlink only): the tailer forwards each
+        // `(detected_at, duration)` over a channel; a dedicated task does the
+        // (potentially slow) ffprobe + DB insert. Same helper drives re-attach.
+        // The live-manifest probe (`ad_probe.rs`) is a second, independent
+        // producer on the same channel — see its module doc for why the
+        // log-line detector alone misses almost every real ad break.
+        let (ad_tx, ad_task, probe_task) = match ads {
+            Some(sink) => {
+                let login = sink.login.clone();
+                let (tx, jh) = spawn_ad_processor(sink);
+                let probe = login.filter(|_| ad_probe_enabled(&self.store)).map(|login| {
+                    self.spawn_ad_probe(login, detach.monitor_id.unwrap_or(0), detach.ref_id, tx.clone(), done.clone())
+                });
+                (Some(tx), Some(jh), probe)
+            }
+            None => (None, None, None),
+        };
+
         let tail = tokio::spawn(tail_log(
             log_path.clone(),
             0,
@@ -1814,6 +1830,9 @@ impl Supervisor {
         stall.abort();
         let _ = tail.await;
         if let Some(t) = ad_task {
+            let _ = t.await;
+        }
+        if let Some(t) = probe_task {
             let _ = t.await;
         }
         // Closing the job here terminates any stragglers (e.g. yt-dlp's ffmpeg).

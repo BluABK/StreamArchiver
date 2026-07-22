@@ -1022,6 +1022,33 @@ button opens the folder with the recovered files. Toggle: Settings → Downloads
 Twitch VOD recovery → *Recover lost segments automatically* (default on);
 per-range failures retry up to 5 times and never affect the capture itself.
 
+### Twitch ad-break detection
+
+Streamlink already cuts Twitch ads out of the recording on its own (each
+break becomes a hard cut in the finished file) — this feature is purely about
+*logging where those cuts happened*, so the **📢 Ads** column (count + total
+time, hover for a summary, double-click for the cut-list — offsets into the
+finished file) reflects reality instead of staying blank. There are two
+independent detectors feeding the same table:
+
+- **Streamlink's own log line** (`Detected advertisement break of N
+  second(s)`) — cheap, but only fires when Twitch's ad metadata includes an
+  extra commercial-id/roll-type field it doesn't always send. A census of
+  real capture logs found this line in **zero** of 155 real Twitch takes,
+  despite every one of them showing streamlink's unconditional `Will skip ad
+  segments` banner — meaning the detector had been effectively blind since it
+  shipped.
+- **Live-manifest probe** (Settings → Downloads → *Twitch ad-break
+  detection*, default on) — polls the live stream's own HLS playlist
+  directly, roughly every 10 s, via the same public access every Twitch
+  player (and streamlink itself) uses, and reads the `EXT-X-DATERANGE` ad
+  markers straight off the manifest. This needs only the tag's start time and
+  duration — not the extra fields the log-line detector requires — so it
+  catches ad breaks the log line misses entirely. Read-only: it never touches
+  the capture, and a sustained failure (an upstream API change, a network
+  blip) backs off and files a 🚨 Warnings alert instead of retrying forever
+  or failing silently.
+
 ### Notifications, background jobs & process manager
 
 - **🔔 Notifications** — the bell button in the toolbar (badges with the unread

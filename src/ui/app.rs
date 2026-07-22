@@ -232,6 +232,7 @@ impl StreamArchiverApp {
             recovery_cdn_hosts: setting_or_empty(&core, crate::recovery::K_RECOVERY_CDN_HOSTS),
             recovery_quality: setting_or_empty(&core, crate::recovery::K_RECOVERY_QUALITY),
             recovery_max_conc: setting_or_empty(&core, crate::recovery::K_RECOVERY_MAX_CONC),
+            ad_probe: setting_or_empty(&core, crate::downloader::K_AD_PROBE) != "0",
             vod_dl_enabled: setting_or_empty(&core, crate::vod_archive::K_VOD_DL_ENABLED) == "1",
             vod_dl_replace: setting_or_empty(&core, crate::vod_archive::K_VOD_DL_REPLACE) == "1",
             // Default ON: missing key or anything but "0" ⇒ true.
@@ -1585,6 +1586,7 @@ impl StreamArchiverApp {
             (crate::recovery::K_RECOVERY_CDN_HOSTS, s.recovery_cdn_hosts.trim()),
             (crate::recovery::K_RECOVERY_QUALITY, s.recovery_quality.trim()),
             (crate::recovery::K_RECOVERY_MAX_CONC, s.recovery_max_conc.trim()),
+            (crate::downloader::K_AD_PROBE, if s.ad_probe { "1" } else { "0" }),
             (crate::vod_archive::K_VOD_DL_ENABLED, if s.vod_dl_enabled { "1" } else { "0" }),
             (crate::vod_archive::K_VOD_DL_REPLACE, if s.vod_dl_replace { "1" } else { "0" }),
             (crate::head_backfill::K_HEAD_BACKFILL_FETCH, if s.head_backfill_fetch_new_take { "1" } else { "0" }),

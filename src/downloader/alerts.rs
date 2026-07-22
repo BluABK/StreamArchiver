@@ -124,6 +124,7 @@ pub fn alert_category(kind: &str, last_line: &str) -> (&'static str, &'static st
     match kind {
         "sequence_gap" => return ("⛔", "Lost segments"),
         "fetch_failed" => return ("⛔", "Failed fetches"),
+        "ad_probe_degraded" => return ("🛰", "Ad probe degraded"),
         _ => {}
     }
     let l = last_line.to_lowercase();

@@ -3008,6 +3008,7 @@ progress_info: None,
                 from_start,
                 capture_path: plan.capture_path.clone(),
                 ad_active: self.ad_active.clone(),
+                login: crate::detectors::twitch_login(&row.monitor.url),
             })
     }
 
