@@ -418,13 +418,27 @@ impl StreamArchiverApp {
             })
             .map(|(i, _)| i)
             .collect();
-        // Unacked alerts grouped by category, for the "Ack group" menu.
+        // Unacked alerts grouped by category, for the "Ack group" menu —
+        // plus a state-based "Fixed" group covering every green row (fully
+        // recovered or superseded), so healed history clears in one click.
         let mut ack_groups: std::collections::BTreeMap<(&str, &str), Vec<i64>> =
             std::collections::BTreeMap::new();
+        let mut fixed_ids: Vec<i64> = Vec::new();
         for r in &self.warnings_rows {
             if !r.acked {
                 let cat = crate::downloader::alert_category(&r.kind, &r.last_line);
                 ack_groups.entry(cat).or_default().push(r.id);
+                // Mirrors the row-tint logic below: healed (every lost range
+                // re-fetched) or superseded (a later completed take covers
+                // the dead one).
+                let healed = r.ranges_total > 0 && r.recovered == r.ranges_total;
+                let superseded = !healed
+                    && r.severity == "error"
+                    && r.superseded
+                    && r.ranges_total == 0;
+                if healed || superseded {
+                    fixed_ids.push(r.id);
+                }
             }
         }
 
@@ -482,6 +496,23 @@ impl StreamArchiverApp {
                             ui.menu_button("✔ Ack group…", |ui| {
                                 if ack_groups.is_empty() {
                                     ui.weak("Nothing unacknowledged.");
+                                }
+                                if !fixed_ids.is_empty() {
+                                    if ui
+                                        .button(format!("✅ Fixed ({})", fixed_ids.len()))
+                                        .on_hover_text(
+                                            "Acknowledge every green row at once — alerts whose \
+                                             damage was fully recovered from the VOD, or whose \
+                                             failed take was superseded by a later completed \
+                                             take. Red (unhealed) and yellow rows are left \
+                                             untouched.",
+                                        )
+                                        .clicked()
+                                    {
+                                        act = Some(Act::AckGroup(fixed_ids.clone()));
+                                        ui.close();
+                                    }
+                                    ui.separator();
                                 }
                                 for ((icon, label), ids) in &ack_groups {
                                     if ui
