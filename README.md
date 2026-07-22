@@ -894,24 +894,45 @@ matching lines into persistent alerts:
   found!`), normal "a new stream may have started" endings, and bgutil
   POT-server ping blips — all of which print on routine captures and carry
   no per-take signal. Genuinely anomalous warnings (e.g. `segment alignment
-  mismatch across downloaded formats`) still surface.
+  mismatch across downloaded formats`) still surface. Premature-spawn
+  probes (`This live event will begin in 2 days.` / `The channel is not
+  currently live`) are warnings too: nothing was live, so nothing was lost —
+  but they flag over-eager liveness detection worth noticing.
 
 Alerts aggregate: one row per take and problem kind, whose counters grow as
 more lines appear. The toolbar button badges with the unacked counts (red
 fill when any error is unacknowledged, yellow for warnings only); **✔ Ack**
 per row or **Acknowledge all** clears the badge while keeping the row for
 reference — and *new* occurrences automatically un-acknowledge the row, so
-fresh damage always re-lights it. Each row links straight to the tool log
-(📂), shows the last matching line on hover, and the first occurrence per
-take also lands in the 🔔 feed (errors additionally raise a desktop toast,
-DND-gated as usual). Alerts idle for 60 days age out at startup.
+fresh damage always re-lights it. Each row also carries a **category chip**
+(💾 Disk full, 🔒 Access denied, 📡 Network drop, 🎫 PO token, 💤 Not live
+yet, …) derived from the offending log line; the **✔ Ack group…** menu
+acknowledges a whole category at once (e.g. every "Disk full" alert from one
+bad night) and the filter box matches category names. Each row links
+straight to the tool log (📂), shows the last matching line on hover, and
+the first occurrence per take also lands in the 🔔 feed (errors additionally
+raise a desktop toast, DND-gated as usual). Alerts idle for 60 days age out
+at startup.
+
+**Superseded failures heal themselves.** When a capture attempt dies (e.g.
+an antivirus-held rename, a disk-full night that later cleared), the
+scheduler starts a fresh take of the same broadcast — and new takes re-fetch
+the full stream head (SABR deep rewind / Twitch VOD head backfill), so a
+*completed* later take should cover the dead one's content. Error alerts on
+such takes automatically flip **green 🔁 "superseded by a later take"**,
+stop counting toward the 🚨 badge, and the take row shows a **🔁
+superseded** badge instead of a red one — no manual ack needed. (Takes with
+outstanding lost ranges keep their normal recovered/unrecovered rendering;
+this only applies where a sibling take genuinely covers the broadcast.)
 
 **In-tree badges & trends.** The Streams grid mirrors the alert state right
 on the rows (all clickable — they open the Warnings window): a take (and its
 stream row, summed over takes/dual-capture legs) shows **🚨 lost data
 (N/M recovered)** while damage is outstanding, **🩹 recovered** (green, with
 a *(muted)* note when the DMCA fallback was used) once every lost range was
-re-fetched, or **⚠ tool warnings** for warning-only takes. **App Stats**
+re-fetched, **🔁 superseded** (green) when a later completed take covers a
+failed one, or **⚠ tool warnings** for warning-only takes. Recovery progress
+updates the N/M counter live, after every recovered range. **App Stats**
 gains a *Capture health* section: lifetime totals (error/warning alerts,
 segments lost, ranges recovered, ✂ muted) plus a per-day trend table — a
 rising "lost" column across days points at a systemic cause (saturated

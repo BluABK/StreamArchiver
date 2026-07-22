@@ -1349,6 +1349,15 @@ pub(super) fn take_status_badges(
                 ),
             );
             open_warnings |= resp.clicked();
+        } else if a.superseded {
+            let resp = clickable(ui, egui::Color32::from_rgb(110, 200, 130), "🔁 superseded".into())
+                .on_hover_text(
+                    "This capture attempt died (see 🚨 Warnings), but a later take of the same \
+                     broadcast completed — new takes re-fetch the full stream head (deep \
+                     rewind / VOD backfill), so the completed take should cover this one's \
+                     content. Click for the 🚨 Warnings details.",
+                );
+            open_warnings |= resp.clicked();
         } else if !a.errors && a.warnings {
             let resp = clickable(ui, egui::Color32::from_rgb(220, 175, 60), "⚠ tool warnings".into())
                 .on_hover_text(

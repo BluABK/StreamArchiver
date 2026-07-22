@@ -162,6 +162,7 @@ mod vod;
 
 #[allow(unused_imports)]
 use {alerts::*, backfill::*, gap_recover::*, supervisor::*, vod::*};
+pub use alerts::alert_category;
 pub use gap_recover::K_GAP_RECOVER;
 #[allow(unused_imports)]
 use lock_culprit::*;

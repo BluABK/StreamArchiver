@@ -69,6 +69,15 @@ pub(super) fn classify_line(line: &str) -> Option<LineHit> {
         return Some(LineHit { kind: "sequence_gap", severity: "error", lost: Some((p, 1)) });
     }
 
+    // Premature spawn: yt-dlp was pointed at an upcoming/offline channel
+    // (`ERROR: [youtube] …: This live event will begin in 2 days.`). Nothing
+    // was live, so nothing was lost — surfaced as a warning because it still
+    // flags over-eager liveness detection worth noticing, not capture damage.
+    if l.contains("This live event will begin in") || l.contains("The channel is not currently live")
+    {
+        return Some(LineHit { kind: "tool_warning", severity: "warning", lost: None });
+    }
+
     // yt-dlp hard errors.
     if l.starts_with("ERROR:") || l.contains("yt_dlp.utils.DownloadError") {
         return Some(LineHit { kind: "tool_error", severity: "error", lost: None });
@@ -106,6 +115,59 @@ pub(super) fn classify_line(line: &str) -> Option<LineHit> {
         return Some(LineHit { kind: "tool_warning", severity: "warning", lost: None });
     }
     None
+}
+
+/// Coarse alert category `(icon, label)`, derived from the kind and the last
+/// matched log line. Powers the Warnings window's per-row category chips and
+/// its "Ack group" batch action ("acknowledge all Disk full alerts at once").
+pub fn alert_category(kind: &str, last_line: &str) -> (&'static str, &'static str) {
+    match kind {
+        "sequence_gap" => return ("⛔", "Lost segments"),
+        "fetch_failed" => return ("⛔", "Failed fetches"),
+        _ => {}
+    }
+    let l = last_line.to_lowercase();
+    if l.contains("no space left on device") {
+        return ("💾", "Disk full");
+    }
+    if l.contains("access is denied") || l.contains("permission denied") {
+        return ("🔒", "Access denied");
+    }
+    if l.contains("live event will begin") || l.contains("not currently live") {
+        return ("💤", "Not live yet");
+    }
+    if l.contains("po token") {
+        return ("🎫", "PO token");
+    }
+    if l.contains("sequence number mismatch") {
+        return ("🔀", "Sequence mismatch");
+    }
+    if l.contains("stream stalled") {
+        return ("🐌", "Stream stalled");
+    }
+    let network = [
+        "connection broken",
+        "connectionreset",
+        "forcibly closed",
+        "0 bytes read",
+        "timed out",
+        "timeout",
+        "getaddrinfo",
+        "name resolution",
+        "unable to open url",
+        "incomplete read",
+        "remote end closed",
+    ];
+    if network.iter().any(|m| l.contains(m)) {
+        return ("📡", "Network drop");
+    }
+    if l.contains("failed to resume sequence") {
+        return ("🔁", "Invalid resume file");
+    }
+    if l.contains("alignment mismatch") {
+        return ("↔", "A/V alignment");
+    }
+    if kind == "tool_error" { ("❌", "Other errors") } else { ("⚠", "Other warnings") }
 }
 
 /// Leading unsigned integer of `s` (digits up to the first non-digit).
@@ -681,6 +743,44 @@ mod tests {
             .kind,
             "tool_warning"
         );
+    }
+
+    #[test]
+    fn not_live_probes_are_warnings() {
+        // Real lines from premature spawns (liveness detection fired before
+        // the event started) — nothing was live, so nothing was lost.
+        for line in [
+            "ERROR: [youtube] C0Q3xmHN8Lk: This live event will begin in 2 days.",
+            "ERROR: [youtube] eooR4LXPuXI: This live event will begin in 11 hours.",
+            "ERROR: [youtube:tab] @deorio: The channel is not currently live",
+        ] {
+            let hit = classify_line(line).unwrap();
+            assert_eq!((hit.kind, hit.severity), ("tool_warning", "warning"), "{line}");
+        }
+    }
+
+    #[test]
+    fn alert_categories_from_real_lines() {
+        // Real last_line shapes from the live DB (2026-07-22).
+        let cases = [
+            ("tool_error", "ERROR: Unable to download video: [Errno 28] No space left on device", "Disk full"),
+            ("tool_error", "ERROR: Unable to download video: [WinError 5] Access is denied: 'A:\\x\\tmp1' -> 'A:\\x\\final.mkv'", "Access denied"),
+            ("tool_warning", "ERROR: [youtube] C0Q3xmHN8Lk: This live event will begin in 2 days.", "Not live yet"),
+            ("tool_error", "yt_dlp.utils.DownloadError: This stream requires a GVS PO Token to continue", "PO token"),
+            ("tool_error", "yt_dlp.utils.DownloadError: Segment sequence number mismatch for format FormatId(itag=140, ...): expected 2514, received 8397", "Sequence mismatch"),
+            ("tool_error", "yt_dlp.utils.DownloadError: Stream stalled; no activity detected in 3 requests and 11.3 seconds and not near live head.", "Stream stalled"),
+            ("tool_error", "ERROR: unable to download video data: (\"Connection broken: ConnectionResetError(10054, ...)\")", "Network drop"),
+            ("tool_error", "ERROR: unable to download video data: 0 bytes read", "Network drop"),
+            ("tool_warning", "WARNING: Failed to resume sequence 1 for format 140: Existing sequence 1 file is not valid; removing", "Invalid resume file"),
+            ("tool_warning", "WARNING: Detected a segment alignment mismatch across downloaded formats.", "A/V alignment"),
+            ("tool_error", "ERROR: something novel exploded", "Other errors"),
+            ("tool_warning", "WARNING: something novel is off", "Other warnings"),
+            ("sequence_gap", "whatever", "Lost segments"),
+            ("fetch_failed", "whatever", "Failed fetches"),
+        ];
+        for (kind, line, want) in cases {
+            assert_eq!(alert_category(kind, line).1, want, "{kind}: {line}");
+        }
     }
 
     #[test]

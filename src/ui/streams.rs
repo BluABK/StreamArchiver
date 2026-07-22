@@ -2148,6 +2148,7 @@ impl StreamArchiverApp {
                                     agg.ranges_total += a.ranges_total;
                                     agg.recovered += a.recovered;
                                     agg.muted += a.muted;
+                                    agg.superseded |= a.superseded;
                                 }
                             }
                             any.then_some(agg)

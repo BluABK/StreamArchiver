@@ -64,13 +64,21 @@ pub struct CaptureAlertRow {
     pub recovered_muted: i64,
     pub last_line: String,
     pub acked: bool,
+    /// Computed at query time: this alert's take failed, but a later take of
+    /// the SAME broadcast completed — new takes re-fetch the full stream head
+    /// (deep rewind / VOD head backfill), so the completed sibling should
+    /// cover the dead take's content. Superseded errors stop counting toward
+    /// the 🚨 badge.
+    pub superseded: bool,
 }
 
 /// Per-recording rollup of its capture alerts, for the Streams-grid badges
 /// (take rows + summed per stream row).
 #[derive(Clone, Copy, Default)]
 pub struct RecAlertBadge {
-    /// Any error-severity alert (data loss / tool errors).
+    /// Any error-severity alert (data loss / tool errors) still standing —
+    /// superseded tool errors (no lost ranges, covered by a completed sibling
+    /// take) are reported via `superseded` instead.
     pub errors: bool,
     /// Any warning-severity alert.
     pub warnings: bool,
@@ -79,6 +87,9 @@ pub struct RecAlertBadge {
     pub recovered: i64,
     /// Muted-fallback segments inside the recovered patches.
     pub muted: i64,
+    /// The take failed but a later take of the same broadcast completed (see
+    /// [`CaptureAlertRow::superseded`]).
+    pub superseded: bool,
 }
 
 /// Lifetime capture-health rollup (the App Stats "Capture health" totals).
@@ -130,6 +141,18 @@ const ALERT_COLS: &str = "id, first_at, last_at, kind, severity, source, take_ke
      recording_id, video_id, channel, count, lost_segments, ranges_total, recovered, \
      recovered_muted, last_line, acked";
 
+/// SQL for the computed `superseded` flag: the alert's take FAILED, but a
+/// sibling take of the same broadcast (monitor + stream id) COMPLETED. New
+/// takes re-fetch the full stream head (SABR deep rewind / Twitch VOD head
+/// backfill), so the completed sibling should cover the dead take's content —
+/// the failure healed itself at the stream level.
+const ALERT_SUPERSEDED_SQL: &str = "COALESCE((SELECT r.status = 'failed'
+         AND r.stream_id IS NOT NULL AND r.stream_id != ''
+         AND EXISTS(SELECT 1 FROM recording r2
+                    WHERE r2.monitor_id = r.monitor_id AND r2.stream_id = r.stream_id
+                      AND r2.id != r.id AND r2.status = 'completed')
+     FROM recording r WHERE r.id = capture_alert.recording_id), 0)";
+
 fn alert_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<CaptureAlertRow> {
     Ok(CaptureAlertRow {
         id: r.get(0)?,
@@ -150,6 +173,7 @@ fn alert_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<CaptureAlertRow> {
         recovered_muted: r.get(15)?,
         last_line: r.get(16)?,
         acked: r.get::<_, i64>(17)? != 0,
+        superseded: r.get::<_, i64>(18)? != 0,
     })
 }
 
@@ -201,24 +225,42 @@ impl Store {
     pub fn list_capture_alerts(&self, limit: i64) -> Result<Vec<CaptureAlertRow>> {
         let conn = self.db();
         let mut st = conn.prepare(&format!(
-            "SELECT {ALERT_COLS} FROM capture_alert ORDER BY last_at DESC, id DESC LIMIT ?1"
+            "SELECT {ALERT_COLS}, {ALERT_SUPERSEDED_SQL}
+             FROM capture_alert ORDER BY last_at DESC, id DESC LIMIT ?1"
         ))?;
         let rows = st.query_map([limit], alert_from_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
-    /// Unacked `(errors, warnings)` — the 🚨 button badge.
+    /// Unacked `(errors, warnings)` — the 🚨 button badge. Superseded errors
+    /// with no lost ranges (a completed sibling take covers the broadcast)
+    /// are excluded: the failure healed itself, no red badge needed.
     pub fn alert_badge_counts(&self) -> Result<(i64, i64)> {
         let conn = self.db();
         conn.query_row(
-            "SELECT
-                COALESCE(SUM(CASE WHEN severity = 'error' THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN severity != 'error' THEN 1 ELSE 0 END), 0)
-             FROM capture_alert WHERE acked = 0",
+            &format!(
+                "SELECT
+                    COALESCE(SUM(CASE WHEN severity = 'error'
+                        AND NOT (ranges_total = 0 AND {ALERT_SUPERSEDED_SQL})
+                        THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN severity != 'error' THEN 1 ELSE 0 END), 0)
+                 FROM capture_alert WHERE acked = 0"
+            ),
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(Into::into)
+    }
+
+    /// Batch-acknowledge a set of alerts (the Warnings window's "Ack group"
+    /// per-category action).
+    pub fn ack_capture_alerts(&self, ids: &[i64]) -> Result<()> {
+        let conn = self.db();
+        let mut st = conn.prepare("UPDATE capture_alert SET acked = 1 WHERE id = ?1")?;
+        for id in ids {
+            st.execute([id])?;
+        }
+        Ok(())
     }
 
     pub fn ack_capture_alert(&self, id: i64) -> Result<()> {
@@ -386,25 +428,34 @@ impl Store {
     /// refreshed on the Warnings window's throttle.
     pub fn alert_badges_by_recording(&self) -> Result<HashMap<i64, RecAlertBadge>> {
         let conn = self.db();
-        let mut st = conn.prepare(
+        let mut st = conn.prepare(&format!(
             "SELECT recording_id,
                     MAX(CASE WHEN severity = 'error' THEN 1 ELSE 0 END),
                     MAX(CASE WHEN severity != 'error' THEN 1 ELSE 0 END),
-                    SUM(lost_segments), MAX(ranges_total), MAX(recovered), MAX(recovered_muted)
+                    SUM(lost_segments), MAX(ranges_total), MAX(recovered), MAX(recovered_muted),
+                    {ALERT_SUPERSEDED_SQL}
              FROM capture_alert WHERE recording_id IS NOT NULL
-             GROUP BY recording_id",
-        )?;
+             GROUP BY recording_id"
+        ))?;
         let rows = st
             .query_map([], |r| {
+                let errors = r.get::<_, i64>(1)? != 0;
+                let ranges_total = r.get(4)?;
+                let superseded = r.get::<_, i64>(7)? != 0;
                 Ok((
                     r.get::<_, i64>(0)?,
                     RecAlertBadge {
-                        errors: r.get::<_, i64>(1)? != 0,
+                        // A superseded take with no lost ranges shows the
+                        // green 🔁 badge instead of a red error one; takes
+                        // WITH ranges keep normal lost/recovered rendering
+                        // (gap recovery still patches failed takes).
+                        errors: errors && !(superseded && ranges_total == 0),
                         warnings: r.get::<_, i64>(2)? != 0,
                         lost_segments: r.get(3)?,
-                        ranges_total: r.get(4)?,
+                        ranges_total,
                         recovered: r.get(5)?,
                         muted: r.get(6)?,
+                        superseded,
                     },
                 ))
             })?
@@ -542,6 +593,54 @@ mod tests {
         // Retro-sweep guard: the take is known once ANY alert row exists.
         assert!(store.alert_exists_for_take("A:\\x.ts.log"));
         assert!(!store.alert_exists_for_take("A:\\other.ts.log"));
+    }
+
+    #[test]
+    fn superseded_by_completed_sibling_take() {
+        let store = Store::open_in_memory().unwrap();
+        {
+            let conn = store.db();
+            conn.execute(
+                "INSERT INTO channel(id, name, url, platform, created_at)
+                 VALUES(1, 'c', 'u', 'youtube', 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO monitor(id, channel_id, tool, detection_method, output_dir)
+                 VALUES(1, 1, 'yt-dlp', 'poll', 'o')",
+                [],
+            )
+            .unwrap();
+        }
+        let dead =
+            store.insert_recording(1, 100, "a.ts", None, false, Some("VID"), None, "", "").unwrap();
+        let mut a = gap_alert("A:\\dead.log");
+        a.kind = "tool_error".into();
+        a.lost_segments = 0;
+        a.recording_id = Some(dead);
+        store.upsert_capture_alert(&a).unwrap();
+
+        // Take failed, no sibling yet → NOT superseded, badge counts it.
+        store.finish_recording(dead, 200, 0, Some(1), "failed", "a.ts", "").unwrap();
+        assert!(!store.list_capture_alerts(10).unwrap()[0].superseded);
+        assert_eq!(store.alert_badge_counts().unwrap().0, 1);
+
+        // A later take of the same broadcast completes → superseded; the
+        // error leaves the badge and the grid badge flips to 🔁.
+        let retry =
+            store.insert_recording(1, 300, "b.ts", None, false, Some("VID"), None, "", "").unwrap();
+        store.finish_recording(retry, 400, 9, Some(0), "completed", "b.mkv", "").unwrap();
+        let row = store.list_capture_alerts(10).unwrap().remove(0);
+        assert!(row.superseded);
+        assert_eq!(store.alert_badge_counts().unwrap().0, 0);
+        let badges = store.alert_badges_by_recording().unwrap();
+        let b = badges.get(&dead).unwrap();
+        assert!(b.superseded && !b.errors);
+
+        // Batch ack (the "Ack group" action).
+        store.ack_capture_alerts(&[row.id]).unwrap();
+        assert!(store.list_capture_alerts(10).unwrap()[0].acked);
     }
 
     #[test]

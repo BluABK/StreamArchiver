@@ -392,6 +392,8 @@ impl StreamArchiverApp {
         enum Act {
             Ack(i64),
             AckAll,
+            /// Batch-ack every alert of one category ("Ack all disk full").
+            AckGroup(Vec<i64>),
             OpenLog(String),
             /// Open the folder holding a recording's recovered patch files.
             OpenPatches(i64),
@@ -405,15 +407,26 @@ impl StreamArchiverApp {
             .iter()
             .enumerate()
             .filter(|(_, r)| {
+                let cat = crate::downloader::alert_category(&r.kind, &r.last_line).1;
                 sev.map(|errs_only| (r.severity == "error") == errs_only).unwrap_or(true)
                     && (q.is_empty()
                         || r.channel.to_lowercase().contains(&q)
                         || r.kind.to_lowercase().contains(&q)
+                        || cat.to_lowercase().contains(&q)
                         || r.last_line.to_lowercase().contains(&q)
                         || r.take_key.to_lowercase().contains(&q))
             })
             .map(|(i, _)| i)
             .collect();
+        // Unacked alerts grouped by category, for the "Ack group" menu.
+        let mut ack_groups: std::collections::BTreeMap<(&str, &str), Vec<i64>> =
+            std::collections::BTreeMap::new();
+        for r in &self.warnings_rows {
+            if !r.acked {
+                let cat = crate::downloader::alert_category(&r.kind, &r.last_line);
+                ack_groups.entry(cat).or_default().push(r.id);
+            }
+        }
 
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("warnings_vp"),
@@ -466,6 +479,30 @@ impl StreamArchiverApp {
                             {
                                 act = Some(Act::AckAll);
                             }
+                            ui.menu_button("✔ Ack group…", |ui| {
+                                if ack_groups.is_empty() {
+                                    ui.weak("Nothing unacknowledged.");
+                                }
+                                for ((icon, label), ids) in &ack_groups {
+                                    if ui
+                                        .button(format!("{icon} {label} ({})", ids.len()))
+                                        .on_hover_text(format!(
+                                            "Acknowledge all {} unacknowledged '{label}' \
+                                             alert(s) at once.",
+                                            ids.len()
+                                        ))
+                                        .clicked()
+                                    {
+                                        act = Some(Act::AckGroup(ids.clone()));
+                                        ui.close();
+                                    }
+                                }
+                            })
+                            .response
+                            .on_hover_text(
+                                "Acknowledge one whole category at once — e.g. every 'Disk \
+                                 full' alert from one bad night, without touching the rest.",
+                            );
                         });
                     });
                     ui.separator();
@@ -491,9 +528,15 @@ impl StreamArchiverApp {
                             // from the VOD — the row flips green so recovered
                             // damage doesn't keep reading as an open wound.
                             let healed = r.ranges_total > 0 && r.recovered == r.ranges_total;
+                            // Superseded: the take died, but a later take of
+                            // the same broadcast completed — the failure
+                            // healed itself at the stream level. (Takes with
+                            // lost ranges keep normal recovery rendering.)
+                            let superseded =
+                                !healed && error && r.superseded && r.ranges_total == 0;
                             // Row tint: green when healed, red for errors,
                             // yellow for warnings — dimmed once acknowledged.
-                            let (rgb, accent) = if healed {
+                            let (rgb, accent) = if healed || superseded {
                                 ((25, 95, 45), egui::Color32::from_rgb(110, 200, 130))
                             } else if error {
                                 ((120, 25, 25), egui::Color32::from_rgb(230, 100, 100))
@@ -505,9 +548,22 @@ impl StreamArchiverApp {
                             egui::Frame::group(ui.style()).fill(tint).show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     let (icon, kind_label) = alert_kind_label(&r.kind);
-                                    let icon = if healed { "✅" } else { icon };
+                                    let icon = if healed {
+                                        "✅"
+                                    } else if superseded {
+                                        "🔁"
+                                    } else {
+                                        icon
+                                    };
                                     ui.label(egui::RichText::new(icon).color(accent))
-                                        .on_hover_text(if healed {
+                                        .on_hover_text(if superseded {
+                                            "Superseded — this capture attempt died, but a later \
+                                             take of the same broadcast completed. New takes \
+                                             re-fetch the full stream head (deep rewind / VOD \
+                                             backfill), so the completed take should cover this \
+                                             one's content. This alert no longer counts toward \
+                                             the 🚨 badge."
+                                        } else if healed {
                                             "Recovered — every lost range was re-fetched from the \
                                              VOD; the content exists as patch files next to the \
                                              recording. Ranges that only survived as DMCA-muted \
@@ -531,6 +587,8 @@ impl StreamArchiverApp {
                                             } else {
                                                 " — recovered"
                                             });
+                                        } else if superseded {
+                                            title.push_str(" — superseded by a later take");
                                         }
                                         let mut rich = egui::RichText::new(title).strong();
                                         if !r.acked {
@@ -559,6 +617,17 @@ impl StreamArchiverApp {
                                                 ui.small(format!("· {}", r.source))
                                                     .on_hover_text("The capture tool whose log reported this.");
                                             }
+                                            let (cicon, clabel) = crate::downloader::alert_category(
+                                                &r.kind,
+                                                &r.last_line,
+                                            );
+                                            ui.small(format!("· {cicon} {clabel}"))
+                                                .on_hover_text(
+                                                    "Alert category — the ✔ Ack group menu \
+                                                     acknowledges every alert of one category \
+                                                     at once, and the filter box matches \
+                                                     category names.",
+                                                );
                                         });
                                     });
                                     ui.with_layout(
@@ -626,6 +695,15 @@ impl StreamArchiverApp {
                     r.acked = true;
                 }
                 self.warn_badge = (0, 0);
+            }
+            Some(Act::AckGroup(ids)) => {
+                let _ = self.core.store.ack_capture_alerts(&ids);
+                for r in &mut self.warnings_rows {
+                    if ids.contains(&r.id) {
+                        r.acked = true;
+                    }
+                }
+                self.warn_badge = self.core.store.alert_badge_counts().unwrap_or((0, 0));
             }
             Some(Act::OpenLog(path)) => {
                 crate::platform::open_path(std::path::Path::new(&path));

@@ -259,13 +259,15 @@ impl Supervisor {
                     fail(format!("promote: {e}"));
                 }
             }
-        }
 
-        // Reflect progress on the alert row + the takes table.
-        if let Ok((total, done, muted)) = self.store.gap_range_progress(rec_id) {
-            let _ = self.store.set_alert_recovery(rec_id, total, done, muted);
+            // Reflect progress on the alert row + the takes table after every
+            // range — a backlog job can run for a long time, and the Warnings
+            // row / grid badge should tick up as ranges land, not at the end.
+            if let Ok((total, done, muted)) = self.store.gap_range_progress(rec_id) {
+                let _ = self.store.set_alert_recovery(rec_id, total, done, muted);
+            }
+            let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
         }
-        let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
         let note = if muted_total > 0 {
             format!("{ok}/{} range(s) recovered ({muted_total} segments muted)", ranges.len())
         } else {
