@@ -1703,12 +1703,14 @@ impl eframe::App for StreamArchiverApp {
                     ui.separator();
 
                     // ── Primary tabs, collapsing into » before they can ever
-                    // reach the right-aligned status buttons ──
-                    const PRIMARY: [(View, &str); 4] = [
-                        (View::Streams, "Streams"),
-                        (View::Videos, "Videos"),
-                        (View::Schedule, "Schedule"),
-                        (View::Posts, "Posts"),
+                    // reach the right-aligned status buttons. Icon-only —
+                    // hover shows the full name — so four tabs cost roughly
+                    // what one word used to. ──
+                    const PRIMARY: [(View, &str, &str); 4] = [
+                        (View::Streams, "📺", "Streams"),
+                        (View::Videos, "🎬", "Videos"),
+                        (View::Schedule, "🗓", "Schedule"),
+                        (View::Posts, "📣", "Posts"),
                     ];
                     const VIEWS_MENU: &str = "Views ⏷";
                     const HELP_MENU: &str = "Help ⏷";
@@ -1725,7 +1727,7 @@ impl eframe::App for StreamArchiverApp {
                             + ui.spacing().item_spacing.x
                     };
                     let widths: Vec<f32> =
-                        PRIMARY.iter().map(|(_, l)| item_w(ui, l)).collect();
+                        PRIMARY.iter().map(|(_, icon, _)| item_w(ui, icon)).collect();
                     let fixed_w: f32 =
                         [VIEWS_MENU, HELP_MENU, "⚙"].iter().map(|l| item_w(ui, l)).sum();
                     // The right cluster's width is only known from last frame
@@ -1747,8 +1749,8 @@ impl eframe::App for StreamArchiverApp {
                     self.topbar.visible = visible;
 
                     let mut switch: Option<View> = None;
-                    for (v, label) in PRIMARY.iter().take(visible) {
-                        let resp = ui.selectable_label(self.view == *v, *label);
+                    for (v, icon, name) in PRIMARY.iter().take(visible) {
+                        let resp = ui.selectable_label(self.view == *v, *icon).on_hover_text(*name);
                         let resp = if *v == View::Streams {
                             resp.inspect("View tab: Streams", &[])
                         } else {
@@ -1760,8 +1762,11 @@ impl eframe::App for StreamArchiverApp {
                     }
                     if visible < PRIMARY.len() {
                         ui.menu_button("»", |ui| {
-                            for (v, label) in PRIMARY.iter().skip(visible) {
-                                if ui.selectable_label(self.view == *v, *label).clicked() {
+                            for (v, icon, name) in PRIMARY.iter().skip(visible) {
+                                if ui
+                                    .selectable_label(self.view == *v, format!("{icon} {name}"))
+                                    .clicked()
+                                {
                                     switch = Some(*v);
                                     ui.close();
                                 }
@@ -1773,21 +1778,27 @@ impl eframe::App for StreamArchiverApp {
 
                     // ── Views ▾: secondary views + display toggles. Stays
                     // open on toggle clicks (CloseOnClickOutside); view
-                    // entries close it explicitly. ──
-                    let secondary: &[(View, &str, &str)] = &[
+                    // entries close it explicitly. Each entry is either an
+                    // icon (when one reads unambiguously on its own) or a
+                    // shortened name (when it doesn't) — full name always in
+                    // the hover text alongside the existing description. ──
+                    let secondary: &[(View, &str, &str, &str)] = &[
                         (
                             View::Background,
+                            "🔄 Background",
                             "Background",
                             "Background jobs and periodic fetcher toggles.",
                         ),
                         (
                             View::Files,
+                            "📁 Files",
                             "Files",
                             "Recording file paths: drive mapping, batch output-directory \
                              edits, DB path relocation.",
                         ),
                         (
                             View::ChannelStats,
+                            "Ch. Stats",
                             "Channel Stats",
                             "Per-channel viewer/follower history graphs, sub/bits/raid \
                              events, and collab overview.",
@@ -1795,17 +1806,19 @@ impl eframe::App for StreamArchiverApp {
                         (
                             View::Stats,
                             "App Stats",
+                            "App Stats",
                             "App/system health: OCR usage, API quota, detection/poll \
                              health, recording totals, capture health. Per-channel stats \
                              live in Channel Stats.",
                         ),
                         (
                             View::IoMonitor,
-                            "I/O",
+                            "💾 I/O",
+                            "I/O monitor",
                             "Live disk & network I/O monitor (per-category attribution, \
                              gate queues).",
                         ),
-                        (View::Debug, "Debug", "Internal debug view."),
+                        (View::Debug, "🐞 Debug", "Debug", "Internal debug view."),
                     ];
                     let secondary_active =
                         secondary.iter().any(|(v, ..)| *v == self.view);
@@ -1816,13 +1829,13 @@ impl eframe::App for StreamArchiverApp {
                             egui::PopupCloseBehavior::CloseOnClickOutside,
                         ))
                         .ui(ui, |ui| {
-                            for (v, label, hover) in secondary {
+                            for (v, label, name, hover) in secondary {
                                 if *v == View::Debug && !debug_view_enabled() {
                                     continue;
                                 }
                                 if ui
                                     .selectable_label(self.view == *v, *label)
-                                    .on_hover_text(*hover)
+                                    .on_hover_text(format!("{name}\n{hover}"))
                                     .clicked()
                                 {
                                     switch = Some(*v);

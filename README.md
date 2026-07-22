@@ -51,12 +51,15 @@ The window has three tabs: **Streams** (monitor channels for live broadcasts),
 
 ### The top bar
 
-The most-used views — **Streams, Videos, Schedule, Posts** — are always-visible
-tabs. Everything else lives in two dropdown menus plus one icon:
+The most-used views — **📺 Streams, 🎬 Videos, 🗓 Schedule, 📣 Posts** — are
+always-visible tabs, shown as icons only (hover any tab for its name) so four
+tabs cost roughly what one word used to. Everything else lives in two dropdown
+menus plus one icon:
 
-- **Views ▾** — the secondary views (Background, Files, Channel Stats, App
-  Stats, I/O, and Debug when enabled) and the two display toggles (*Status
-  bgcolor*, *Short timestamps* — the menu stays open while toggling).
+- **Views ▾** — the secondary views (🔄 Background, 📁 Files, *Ch. Stats*,
+  *App Stats*, 💾 I/O, and 🐞 Debug when enabled — each hovers to its full
+  name) and the two display toggles (*Status bgcolor*, *Short timestamps* —
+  the menu stays open while toggling).
 - **Help ▾** — **📖 Help** (this manual, rendered in-app; see below) and
   **ℹ About** (version/build/commit info and the app's data locations, with
   open-folder and copy buttons — the info that used to sit in the top bar).
