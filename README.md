@@ -1799,7 +1799,11 @@ window, with a channel filter and text search; each new post also raises a
 notification. To keep the feed responsive with a large backlog, only 30 posts
 are laid out at a time — a **Show 30 more** button at the bottom reveals
 further ones (filtering/search apply to the whole backlog either way, not just
-what's currently shown).
+what's currently shown). Attached images have the app's standard image
+affordances: **Alt-hover** shows a full-resolution floating preview, **click**
+opens the archived file, and **right-click** offers *Copy Image* (to the
+clipboard), *Open File*, *Open Folder*, and *Copy URL* (the original source
+URL).
 
 - **Post kinds.** A channel's community tab mixes the channel's **own posts**,
   **viewer posts** (fans posting in the channel's Community space), and

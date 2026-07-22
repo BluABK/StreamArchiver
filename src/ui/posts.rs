@@ -75,6 +75,9 @@ impl StreamArchiverApp {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     self.render_posts_feed(ui);
                 });
+                // Child viewports draw their own copy of the Alt-hover
+                // overlay — the main viewport's draw call can't reach here.
+                draw_alt_image_preview(ctx);
             },
         );
         if !open {
@@ -261,7 +264,7 @@ impl StreamArchiverApp {
                             .iter()
                             .filter(|m| m.kind == "image" && !m.local_path.is_empty())
                         {
-                            self.show_post_image(ui, &m.content_hash, &m.local_path);
+                            self.show_post_image(ui, &m.content_hash, &m.local_path, &m.image_url);
                         }
                         // Reshared/quoted original, as an indented quote card.
                         if !p.shared_json.is_empty()
@@ -291,7 +294,12 @@ impl StreamArchiverApp {
                                 for m in p.media.iter().filter(|m| {
                                     m.kind == "shared_image" && !m.local_path.is_empty()
                                 }) {
-                                    self.show_post_image(ui, &m.content_hash, &m.local_path);
+                                    self.show_post_image(
+                                        ui,
+                                        &m.content_hash,
+                                        &m.local_path,
+                                        &m.image_url,
+                                    );
                                 }
                             });
                         }
@@ -365,7 +373,18 @@ impl StreamArchiverApp {
     /// placeholder is reserved and `is_rect_visible` gates the load), so memory
     /// scales with what's scrolled, not the whole feed. A crude cap clears the
     /// cache if it grows large.
-    pub(super) fn show_post_image(&mut self, ui: &mut egui::Ui, hash: &str, path: &str) {
+    ///
+    /// Loaded images get the standard image affordances (matching the About
+    /// panel / chat emotes): Alt-hover full-resolution preview, click to open
+    /// the file, and a right-click menu (copy image / open file / open folder
+    /// / copy the source URL).
+    pub(super) fn show_post_image(
+        &mut self,
+        ui: &mut egui::Ui,
+        hash: &str,
+        path: &str,
+        image_url: &str,
+    ) {
         const MAX_W: f32 = 520.0;
         const MAX_H: f32 = 420.0;
         const PLACEHOLDER_H: f32 = 160.0;
@@ -376,7 +395,39 @@ impl StreamArchiverApp {
         match cached {
             Some(Some((tex, _))) => {
                 let w = ui.available_width().min(MAX_W);
-                ui.add(egui::Image::from_texture(&tex).max_width(w).max_height(MAX_H));
+                let resp = ui.add(
+                    egui::Image::from_texture(&tex)
+                        .max_width(w)
+                        .max_height(MAX_H)
+                        .sense(egui::Sense::click()),
+                );
+                queue_alt_image_preview(ui.ctx(), &resp, &tex);
+                let resp = resp.on_hover_text(
+                    "Alt: preview full size · click: open file · right-click: more",
+                );
+                if resp.clicked() {
+                    crate::platform::open_path(std::path::Path::new(path));
+                }
+                resp.context_menu(|ui| {
+                    if ui.button("Copy Image").clicked() {
+                        copy_emote_image_to_clipboard(std::path::Path::new(path));
+                        ui.close();
+                    }
+                    if ui.button("Open File").clicked() {
+                        crate::platform::open_path(std::path::Path::new(path));
+                        ui.close();
+                    }
+                    if ui.button("Open Folder").clicked() {
+                        if let Some(dir) = std::path::Path::new(path).parent() {
+                            crate::platform::open_path(dir);
+                        }
+                        ui.close();
+                    }
+                    if !image_url.is_empty() && ui.button("Copy URL").clicked() {
+                        ui.ctx().copy_text(image_url.to_string());
+                        ui.close();
+                    }
+                });
             }
             Some(None) => {} // failed to decode — render nothing
             None => {
