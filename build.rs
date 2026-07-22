@@ -45,6 +45,7 @@ fn main() {
 
     decode_platform_icons();
     decode_provider_logos();
+    generate_help_images();
 
     // Embed a Windows application manifest requesting Common Controls v6 (required
     // for TaskDialogIndirect), DPI awareness, and visual styles. Without this,
@@ -138,6 +139,43 @@ fn decode_provider_logos() {
         std::fs::write(out.join(format!("logo_{name}.rgba")), &rgba)
             .unwrap_or_else(|e| panic!("write logo_{name}.rgba: {e}"));
     }
+}
+
+/// Embed every `doc/screenshots/*.png` for the in-app Help view: write
+/// `OUT_DIR/help_images.rs` declaring `HELP_IMAGES: &[(&str, &[u8])]` whose URI
+/// keys (`bytes://doc/screenshots/<name>.png`, forward slashes) match the
+/// README's image references exactly — the Help renderer registers each with
+/// `ctx.include_bytes` so `![…](doc/screenshots/…)` resolves offline. Raw PNG
+/// bytes; egui's already-compiled image loader decodes at runtime.
+fn generate_help_images() {
+    let dir = PathBuf::from("doc/screenshots");
+    println!("cargo:rerun-if-changed=doc/screenshots");
+    let manifest = PathBuf::from(env_or("CARGO_MANIFEST_DIR", "."));
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| n.to_lowercase().ends_with(".png"))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    let mut src = String::from(
+        "/// Help-view screenshots embedded at build time (URI, raw PNG bytes).\n\
+         pub(super) static HELP_IMAGES: &[(&str, &[u8])] = &[\n",
+    );
+    for name in &names {
+        println!("cargo:rerun-if-changed=doc/screenshots/{name}");
+        let abs = manifest.join("doc").join("screenshots").join(name);
+        src.push_str(&format!(
+            "    (\"bytes://doc/screenshots/{name}\", include_bytes!(r\"{}\")),\n",
+            abs.display()
+        ));
+    }
+    src.push_str("];\n");
+    let out = PathBuf::from(env_or("OUT_DIR", "."));
+    std::fs::write(out.join("help_images.rs"), src)
+        .unwrap_or_else(|e| panic!("write help_images.rs: {e}"));
 }
 
 fn env_or(key: &str, default: &str) -> String {

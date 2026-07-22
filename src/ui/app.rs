@@ -467,6 +467,8 @@ impl StreamArchiverApp {
             quitting: false,
             heartbeat,
             view: View::Streams,
+            help: None,
+            topbar: TopBarLayout::default(),
             rows: Vec::new(),
             channels: Vec::new(),
             videos: Vec::new(),
@@ -1680,6 +1682,30 @@ impl StreamArchiverApp {
         self.persist_monitor_defaults();
         self.status = "Settings saved.".into();
     }
+    /// Single entry point for changing the active view — every switching path
+    /// (top-bar tabs, the Views/Help menus, the » overflow menu, keyboard
+    /// shortcuts, in-view jump links) goes through here so the per-view
+    /// on-open side effects always run. Re-selecting the already-active view
+    /// re-runs them too, which doubles as a manual refresh (matches the old
+    /// tab `clicked()` behavior).
+    pub(super) fn switch_view(&mut self, v: View) {
+        self.view = v;
+        match v {
+            View::Posts => self.posts_refreshed = None, // force reload on open
+            View::Files => self.files_scan = None,      // force rescan on open
+            View::ChannelStats => {
+                self.chstats_data = None; // force reload on open
+                self.stats_collabs =
+                    self.core.store.collab_partner_overview().unwrap_or_default();
+            }
+            View::Stats => {
+                self.stats_snapshot = None; // force reload on open
+                self.stats_history = None;
+            }
+            _ => {}
+        }
+    }
+
     /// Process global keyboard shortcuts once per frame, before drawing.
     ///
     /// While a modal (add/edit form or delete confirmation) is open, only `Esc`
@@ -1721,14 +1747,14 @@ impl StreamArchiverApp {
         }
 
         if ctx.input_mut(|i| i.consume_shortcut(&ADD)) {
-            self.view = View::Streams;
+            self.switch_view(View::Streams);
             self.form = Some(MonitorForm::new_channel(
                 &self.monitor_defaults,
                 &self.settings.default_output_dir,
             ));
         }
         if ctx.input_mut(|i| i.consume_shortcut(&SETTINGS)) {
-            self.view = View::Settings;
+            self.switch_view(View::Settings);
         }
         if ctx.input_mut(|i| i.consume_shortcut(&REFRESH)) {
             // Drop all per-monitor recording/ad/meta/schedule caches so the next

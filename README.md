@@ -49,6 +49,30 @@ The window has three tabs: **Streams** (monitor channels for live broadcasts),
 
 ## Using it
 
+### The top bar
+
+The most-used views — **Streams, Videos, Schedule, Posts** — are always-visible
+tabs. Everything else lives in two dropdown menus plus one icon:
+
+- **Views ▾** — the secondary views (Background, Files, Channel Stats, App
+  Stats, I/O, and Debug when enabled) and the two display toggles (*Status
+  bgcolor*, *Short timestamps* — the menu stays open while toggling).
+- **Help ▾** — **📖 Help** (this manual, rendered in-app; see below) and
+  **ℹ About** (version/build/commit info and the app's data locations, with
+  open-folder and copy buttons — the info that used to sit in the top bar).
+- **⚙** — Settings (also `Ctrl+,`).
+
+At narrow window widths the primary tabs collapse (right-to-left) into a
+**»** overflow menu instead of overlapping the status buttons on the right —
+those (Issues, Warnings, the bell, Scheduled rec, Posts, Process manager)
+always stay visible and clickable.
+
+**📖 Help** renders this README inside the app — table of contents on the
+left (with a filter box), one section at a time, screenshots included, and
+cross-reference links that jump between sections. Everything is embedded in
+the binary at build time, so it works offline and always matches the running
+version.
+
 ### Table columns (Streams, Videos, Background, Processes, Issues)
 
 Every data table's columns can be **hidden/shown** and **resized** by

@@ -125,6 +125,67 @@ enum View {
     Stats,
     IoMonitor,
     Debug,
+    /// In-app manual (the embedded README, sectioned) + About (version/build
+    /// info and data paths). Reached via the Help ▾ menu.
+    Help,
+}
+
+/// Previous-frame top-bar measurements driving the primary-tab overflow: tabs
+/// collapse into a `»` menu before the left content can ever reach the
+/// right-aligned status buttons.
+struct TopBarLayout {
+    /// Width the right-to-left button cluster used last frame (0.0 on the
+    /// very first frame — the caller substitutes a conservative reservation).
+    right_w: f32,
+    /// How many primary tabs were visible last frame (hysteresis anchor).
+    visible: usize,
+}
+
+impl Default for TopBarLayout {
+    fn default() -> Self {
+        // `visible = MAX` means "unconstrained" — the first frame takes the
+        // pure fit count without a growth-hysteresis penalty.
+        TopBarLayout { right_w: 0.0, visible: usize::MAX }
+    }
+}
+
+/// How many leading primary tabs fit: all of them when the row fits whole;
+/// otherwise the largest prefix that fits alongside the `»` overflow button.
+/// Shrinking applies immediately (overlap must never happen), but growing
+/// past `prev_visible` requires `hysteresis` px of spare room so a width
+/// sitting exactly on the boundary doesn't flicker tabs in and out.
+fn partition_tabs(
+    widths: &[f32],
+    budget: f32,
+    overflow_w: f32,
+    prev_visible: usize,
+    hysteresis: f32,
+) -> usize {
+    let n = widths.len();
+    let total: f32 = widths.iter().sum();
+    // Ideal count at this width, ignoring hysteresis.
+    let fit = if total <= budget {
+        n
+    } else {
+        let mut used = overflow_w;
+        let mut k = 0;
+        for w in widths {
+            if used + w > budget {
+                break;
+            }
+            used += w;
+            k += 1;
+        }
+        k
+    };
+    let prev = prev_visible.min(n);
+    if fit <= prev {
+        return fit; // shrink (or no change): apply immediately
+    }
+    // Growth: only take the extra tabs when the grown layout has spare room.
+    let grown_used =
+        if fit == n { total } else { overflow_w + widths[..fit].iter().sum::<f32>() };
+    if grown_used + hysteresis <= budget { fit } else { prev }
 }
 
 /// Timespan choices for the Stats view's detection-history graphs. Each span
@@ -275,6 +336,7 @@ mod dialogs;
 mod files;
 mod format;
 mod grid;
+mod help;
 mod io_view;
 mod issues;
 mod player;
@@ -287,7 +349,7 @@ mod streams;
 mod videos;
 
 #[allow(unused_imports)]
-use {app::*, assets_helpers::*, background::*, calendar::*, chat::*, debug::*, dialogs::*, files::*, format::*, grid::*, io_view::*, issues::*, player::*, posts::*, properties::*, schedule::*, settings::*, streams::*, videos::*};
+use {app::*, assets_helpers::*, background::*, calendar::*, chat::*, debug::*, dialogs::*, files::*, format::*, grid::*, help::*, io_view::*, issues::*, player::*, posts::*, properties::*, schedule::*, settings::*, streams::*, videos::*};
 
 /// Backing state for the add/edit dialog. `name` is the channel (container) name;
 /// `url` is this *instance's* source URL (the platform is derived from it).
@@ -988,6 +1050,11 @@ pub struct StreamArchiverApp {
     heartbeat: crate::watchdog::Heartbeat,
 
     view: View,
+    /// Help/About view state, built lazily on first open (parses the embedded
+    /// README once).
+    help: Option<HelpState>,
+    /// Previous-frame top-bar measurements for the tab-overflow algorithm.
+    topbar: TopBarLayout,
     rows: Vec<MonitorWithChannel>,
     /// All channel containers (incl. empty ones), for the Streams tree.
     channels: Vec<Channel>,
@@ -1629,106 +1696,213 @@ impl eframe::App for StreamArchiverApp {
             .show_inside(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading("StreamArchiver");
-                    let built_dt = env!("BUILD_UNIX")
-                        .parse::<i64>()
-                        .ok()
-                        .and_then(|s| chrono::DateTime::from_timestamp(s, 0))
-                        .map(|dt| dt.with_timezone(&chrono::Local));
-                    let built_short = built_dt
-                        .map(|dt| dt.format("%m-%d %H:%M").to_string())
-                        .unwrap_or_default();
-                    let built_full = built_dt
-                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-                        .unwrap_or_default();
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "v{} · {} · built {built_short}",
-                            env!("APP_VERSION"),
-                            env!("GIT_HASH"),
-                        ))
-                        .small()
-                        .color(egui::Color32::from_gray(0x90)),
-                    )
-                    .on_hover_text(format!(
-                        "StreamArchiver v{} · build {}\ncommit {}\ncompiled {built_full}",
-                        env!("APP_VERSION"),
-                        env!("BUILD_NUMBER"),
-                        env!("GIT_HASH"),
-                    ));
                     ui.separator();
-                    ui.selectable_value(&mut self.view, View::Streams, "Streams")
-                        .inspect("View tab: Streams", &[]);
-                    ui.selectable_value(&mut self.view, View::Videos, "Videos");
-                    ui.selectable_value(&mut self.view, View::Schedule, "Schedule");
-                    if ui.selectable_value(&mut self.view, View::Posts, "Posts").clicked() {
-                        self.posts_refreshed = None; // force reload on tab open
+
+                    // ── Primary tabs, collapsing into » before they can ever
+                    // reach the right-aligned status buttons ──
+                    const PRIMARY: [(View, &str); 4] = [
+                        (View::Streams, "Streams"),
+                        (View::Videos, "Videos"),
+                        (View::Schedule, "Schedule"),
+                        (View::Posts, "Posts"),
+                    ];
+                    const VIEWS_MENU: &str = "Views ⏷";
+                    const HELP_MENU: &str = "Help ⏷";
+                    // Approximate on-screen width of a button-like widget with
+                    // `label` (galley + button padding + item spacing) — egui
+                    // caches galleys, so this is cheap per frame.
+                    let item_w = |ui: &egui::Ui, label: &str| -> f32 {
+                        let font = egui::TextStyle::Button.resolve(ui.style());
+                        ui.painter()
+                            .layout_no_wrap(label.to_string(), font, egui::Color32::WHITE)
+                            .rect
+                            .width()
+                            + 2.0 * ui.spacing().button_padding.x
+                            + ui.spacing().item_spacing.x
+                    };
+                    let widths: Vec<f32> =
+                        PRIMARY.iter().map(|(_, l)| item_w(ui, l)).collect();
+                    let fixed_w: f32 =
+                        [VIEWS_MENU, HELP_MENU, "⚙"].iter().map(|l| item_w(ui, l)).sum();
+                    // The right cluster's width is only known from last frame
+                    // (it renders after us); first frame reserves generously.
+                    let right_reserved = if self.topbar.right_w > 0.0 {
+                        self.topbar.right_w
+                    } else {
+                        600.0
+                    };
+                    let budget =
+                        (ui.available_width() - right_reserved - fixed_w - 16.0).max(0.0);
+                    let visible = partition_tabs(
+                        &widths,
+                        budget,
+                        item_w(ui, "»"),
+                        self.topbar.visible,
+                        16.0,
+                    );
+                    self.topbar.visible = visible;
+
+                    let mut switch: Option<View> = None;
+                    for (v, label) in PRIMARY.iter().take(visible) {
+                        let resp = ui.selectable_label(self.view == *v, *label);
+                        let resp = if *v == View::Streams {
+                            resp.inspect("View tab: Streams", &[])
+                        } else {
+                            resp
+                        };
+                        if resp.clicked() {
+                            switch = Some(*v);
+                        }
                     }
-                    ui.selectable_value(&mut self.view, View::Background, "Background");
-                    if ui.selectable_value(&mut self.view, View::Files, "Files").clicked() {
-                        self.files_scan = None; // force rescan on tab open
+                    if visible < PRIMARY.len() {
+                        ui.menu_button("»", |ui| {
+                            for (v, label) in PRIMARY.iter().skip(visible) {
+                                if ui.selectable_label(self.view == *v, *label).clicked() {
+                                    switch = Some(*v);
+                                    ui.close();
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text("Tabs that don't fit at this window width.");
                     }
-                    ui.selectable_value(&mut self.view, View::Settings, "Settings");
-                    if ui
-                        .selectable_value(&mut self.view, View::ChannelStats, "Channel Stats")
-                        .on_hover_text(
+
+                    // ── Views ▾: secondary views + display toggles. Stays
+                    // open on toggle clicks (CloseOnClickOutside); view
+                    // entries close it explicitly. ──
+                    let secondary: &[(View, &str, &str)] = &[
+                        (
+                            View::Background,
+                            "Background",
+                            "Background jobs and periodic fetcher toggles.",
+                        ),
+                        (
+                            View::Files,
+                            "Files",
+                            "Recording file paths: drive mapping, batch output-directory \
+                             edits, DB path relocation.",
+                        ),
+                        (
+                            View::ChannelStats,
+                            "Channel Stats",
                             "Per-channel viewer/follower history graphs, sub/bits/raid \
                              events, and collab overview.",
-                        )
-                        .clicked()
-                    {
-                        self.chstats_data = None; // force reload on tab open
-                        self.stats_collabs = self
-                            .core
-                            .store
-                            .collab_partner_overview()
-                            .unwrap_or_default();
-                    }
-                    if ui
-                        .selectable_value(&mut self.view, View::Stats, "App Stats")
-                        .on_hover_text(
+                        ),
+                        (
+                            View::Stats,
+                            "App Stats",
                             "App/system health: OCR usage, API quota, detection/poll \
-                             health, recording totals. Per-channel stats live in the \
-                             Channel Stats tab.",
-                        )
+                             health, recording totals, capture health. Per-channel stats \
+                             live in Channel Stats.",
+                        ),
+                        (
+                            View::IoMonitor,
+                            "I/O",
+                            "Live disk & network I/O monitor (per-category attribution, \
+                             gate queues).",
+                        ),
+                        (View::Debug, "Debug", "Internal debug view."),
+                    ];
+                    let secondary_active =
+                        secondary.iter().any(|(v, ..)| *v == self.view);
+                    let views_btn =
+                        egui::Button::new(VIEWS_MENU).selected(secondary_active);
+                    egui::containers::menu::MenuButton::from_button(views_btn)
+                        .config(egui::containers::menu::MenuConfig::new().close_behavior(
+                            egui::PopupCloseBehavior::CloseOnClickOutside,
+                        ))
+                        .ui(ui, |ui| {
+                            for (v, label, hover) in secondary {
+                                if *v == View::Debug && !debug_view_enabled() {
+                                    continue;
+                                }
+                                if ui
+                                    .selectable_label(self.view == *v, *label)
+                                    .on_hover_text(*hover)
+                                    .clicked()
+                                {
+                                    switch = Some(*v);
+                                    ui.close();
+                                }
+                            }
+                            ui.separator();
+                            if ui
+                                .checkbox(&mut self.status_bgcolor, "Status bgcolor")
+                                .on_hover_text(
+                                    "Tint Streams rows by status (recording / ad playing / \
+                                     failed). Row selection is still highlighted when this \
+                                     is off.",
+                                )
+                                .changed()
+                            {
+                                let _ = self.core.store.set_setting(
+                                    K_STATUS_BGCOLOR,
+                                    if self.status_bgcolor { "1" } else { "0" },
+                                );
+                            }
+                            if ui
+                                .checkbox(&mut self.shorten_timestamps, "Short timestamps")
+                                .on_hover_text(
+                                    "Show timestamps in a compact short format (e.g. \
+                                     21/06 14:02) instead of the full datetime. Hover any \
+                                     timestamp for the full value. The short format is \
+                                     configurable in Settings → Display.",
+                                )
+                                .changed()
+                            {
+                                set_short_ts(self.shorten_timestamps);
+                                let _ = self.core.store.set_setting(
+                                    K_SHORT_TIMESTAMPS,
+                                    if self.shorten_timestamps { "1" } else { "0" },
+                                );
+                            }
+                        })
+                        .0
+                        .on_hover_text("Secondary views and display toggles.");
+
+                    // ── Help ▾ ──
+                    ui.menu_button(HELP_MENU, |ui| {
+                        if ui
+                            .button("📖 Help")
+                            .on_hover_text(
+                                "The full manual, in-app (works offline — it's embedded \
+                                 in the binary).",
+                            )
+                            .clicked()
+                        {
+                            switch = Some(View::Help);
+                            ui.close();
+                        }
+                        if ui
+                            .button("ℹ About")
+                            .on_hover_text(
+                                "Version, build and commit info, and where this app keeps \
+                                 its data.",
+                            )
+                            .clicked()
+                        {
+                            self.help.get_or_insert_default().selected = 0;
+                            switch = Some(View::Help);
+                            ui.close();
+                        }
+                    })
+                    .response
+                    .on_hover_text("Manual and version info.");
+
+                    // ── ⚙ Settings ──
+                    if ui
+                        .selectable_label(self.view == View::Settings, "⚙")
+                        .on_hover_text("Settings (Ctrl+,)")
                         .clicked()
                     {
-                        self.stats_snapshot = None; // force reload on tab open
-                        self.stats_history = None;
+                        switch = Some(View::Settings);
                     }
-                    ui.selectable_value(&mut self.view, View::IoMonitor, "I/O");
-                    if debug_view_enabled() {
-                        ui.selectable_value(&mut self.view, View::Debug, "Debug");
+
+                    if let Some(v) = switch {
+                        self.switch_view(v);
                     }
-                    ui.separator();
-                    if ui
-                        .checkbox(&mut self.status_bgcolor, "Status bgcolor")
-                        .on_hover_text(
-                            "Tint Streams rows by status (recording / ad playing / failed). \
-                             Row selection is still highlighted when this is off.",
-                        )
-                        .changed()
-                    {
-                        let _ = self.core.store.set_setting(
-                            K_STATUS_BGCOLOR,
-                            if self.status_bgcolor { "1" } else { "0" },
-                        );
-                    }
-                    if ui
-                        .checkbox(&mut self.shorten_timestamps, "Short timestamps")
-                        .on_hover_text(
-                            "Show timestamps in a compact short format (e.g. 21/06 14:02) \
-                             instead of the full datetime. Hover any timestamp for the full value. \
-                             The short format is configurable in Settings → Display.",
-                        )
-                        .changed()
-                    {
-                        set_short_ts(self.shorten_timestamps);
-                        let _ = self.core.store.set_setting(
-                            K_SHORT_TIMESTAMPS,
-                            if self.shorten_timestamps { "1" } else { "0" },
-                        );
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+
+                    let right_w = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Pinned far-right and shown on every view — the process
                         // manager is a global utility, not Background-specific.
                         if ui
@@ -1902,7 +2076,12 @@ impl eframe::App for StreamArchiverApp {
                                 self.reset_streams_columns = true;
                             }
                         }
-                    });
+                        // Report the cluster's used width for next frame's
+                        // tab-overflow budget (it renders after the tabs, so
+                        // the current frame can only know last frame's value).
+                        ui.min_rect().width()
+                    }).inner;
+                    self.topbar.right_w = right_w;
                 });
             });
 
@@ -1930,6 +2109,7 @@ impl eframe::App for StreamArchiverApp {
             View::Stats => self.stats_view(ui),
             View::IoMonitor => self.io_view(ui),
             View::Debug => self.debug_view(ui),
+            View::Help => self.help_view(ui),
         });
 
         // ── Main-panel context menu (right-click on empty space) ──
@@ -1970,7 +2150,7 @@ impl eframe::App for StreamArchiverApp {
                     }
                 }
                 View::Videos | View::ChannelStats | View::Stats | View::IoMonitor
-                | View::Debug | View::Posts | View::Files => {}
+                | View::Debug | View::Posts | View::Files | View::Help => {}
             }
         });
         if ctx_add_stream {

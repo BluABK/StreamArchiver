@@ -1230,7 +1230,7 @@ impl StreamArchiverApp {
             .ctx()
             .data_mut(|d| d.remove_temp::<i64>(egui::Id::new("sched_jump")))
         {
-            self.view = View::Streams;
+            self.switch_view(View::Streams);
             self.selected_monitor = Some(mid);
         }
         if let Some(mid) = ui
