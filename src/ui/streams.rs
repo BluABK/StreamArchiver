@@ -1140,11 +1140,28 @@ impl StreamArchiverApp {
             self.status = "Checking channel… will record if live.".into();
         }
         if let Some((id, hours)) = acts.stop {
-            self.core
-                .manual(ManualCommand::StopHoldFor { monitor_id: id, hours });
+            self.core.manual(ManualCommand::StopHoldFor {
+                monitor_id: id,
+                hours,
+                allow_triggers: false,
+            });
             self.status = match hours {
                 Some(h) => format!("Stopping — auto-record held for {h} hours."),
                 None => "Stopping — auto-record held until a new broadcast.".into(),
+            };
+        }
+        if let Some((id, hours)) = acts.stop_allow_triggers {
+            self.core.manual(ManualCommand::StopHoldFor {
+                monitor_id: id,
+                hours,
+                allow_triggers: true,
+            });
+            self.status = match hours {
+                Some(h) => format!(
+                    "Stopping — auto-record held for {h} hours (trigger words can still fire)."
+                ),
+                None => "Stopping — auto-record held until a new broadcast (trigger words can still fire)."
+                    .into(),
             };
         }
         if let Some(id) = acts.stop_chat {
@@ -1898,13 +1915,19 @@ impl StreamArchiverApp {
                 .max_by_key(|t| t.started_at)
                 .map(|t| t.id)
         });
-        let stop_hold_desc = stop_holds_snapshot.get(&mid).map(|h| match h {
-            crate::downloader::StopHold::Until(t) => {
-                format!("until {}", fmt_datetime_short(*t))
+        let stop_hold_desc = stop_holds_snapshot.get(&mid).map(|h| {
+            let mut s = match h {
+                crate::downloader::StopHold::Until { at, .. } => {
+                    format!("until {}", fmt_datetime_short(*at))
+                }
+                crate::downloader::StopHold::FreshStream { .. } => {
+                    "until this channel starts a new broadcast".to_string()
+                }
+            };
+            if h.allow_triggers() {
+                s.push_str(" (trigger words can still start a recording)");
             }
-            crate::downloader::StopHold::FreshStream { .. } => {
-                "until this channel starts a new broadcast".to_string()
-            }
+            s
         });
         if render_instance_row(
             tr, row, ptex, now, recording, finalizing, chat_active,
@@ -2257,40 +2280,7 @@ impl StreamArchiverApp {
             tr.response().context_menu(|ui| {
                 ui.set_min_width(180.0);
                 if recording {
-                    if ui
-                        .button("⏹  Stop recording")
-                        .on_hover_text(
-                            "Stops the take and holds automatic restarts until this channel \
-                             goes offline and starts a NEW broadcast. ▶ Start (instance row) \
-                             clears the hold.",
-                        )
-                        .clicked()
-                    {
-                        out.acts.stop = Some((mid, None));
-                        ui.close();
-                    }
-                    if ui
-                        .button("⏹  Stop for 6 hours")
-                        .on_hover_text(
-                            "Stops the take and holds automatic restarts for 6 hours, \
-                             regardless of offline/online cycles.",
-                        )
-                        .clicked()
-                    {
-                        out.acts.stop = Some((mid, Some(6)));
-                        ui.close();
-                    }
-                    if ui
-                        .button("⏹  Stop for 12 hours")
-                        .on_hover_text(
-                            "Stops the take and holds automatic restarts for 12 hours, \
-                             regardless of offline/online cycles.",
-                        )
-                        .clicked()
-                    {
-                        out.acts.stop = Some((mid, Some(12)));
-                        ui.close();
-                    }
+                    stop_recording_submenus(ui, mid, &mut out.acts);
                     ui.separator();
                 }
                 let dir_ok =
@@ -2795,40 +2785,7 @@ impl StreamArchiverApp {
             tr.response().context_menu(|ui| {
                 ui.set_min_width(180.0);
                 if recording {
-                    if ui
-                        .button("⏹  Stop recording")
-                        .on_hover_text(
-                            "Stops the take and holds automatic restarts until this channel \
-                             goes offline and starts a NEW broadcast. ▶ Start (instance row) \
-                             clears the hold.",
-                        )
-                        .clicked()
-                    {
-                        out.acts.stop = Some((mid, None));
-                        ui.close();
-                    }
-                    if ui
-                        .button("⏹  Stop for 6 hours")
-                        .on_hover_text(
-                            "Stops the take and holds automatic restarts for 6 hours, \
-                             regardless of offline/online cycles.",
-                        )
-                        .clicked()
-                    {
-                        out.acts.stop = Some((mid, Some(6)));
-                        ui.close();
-                    }
-                    if ui
-                        .button("⏹  Stop for 12 hours")
-                        .on_hover_text(
-                            "Stops the take and holds automatic restarts for 12 hours, \
-                             regardless of offline/online cycles.",
-                        )
-                        .clicked()
-                    {
-                        out.acts.stop = Some((mid, Some(12)));
-                        ui.close();
-                    }
+                    stop_recording_submenus(ui, mid, &mut out.acts);
                     ui.separator();
                 }
                 // Offer re-remux when the finalized file is still a .ts

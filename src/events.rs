@@ -463,8 +463,12 @@ pub enum ManualCommand {
     /// restarts — `hours: None` until the channel starts a NEW broadcast,
     /// `Some(h)` for a fixed number of hours. Manual Start clears the hold.
     /// Automated stops (trigger stop-on-unmatch, scheduled auto-stop, quality
-    /// upgrade) use plain `Stop` and never hold.
-    StopHoldFor { monitor_id: i64, hours: Option<i64> },
+    /// upgrade) use plain `Stop` and never hold. `allow_triggers`: a
+    /// trigger-word match can still start a fresh recording during the hold
+    /// (only plain Auto-record polls/pushes are suppressed) — the "Stop
+    /// (allow triggers)" action, for stopping the main broadcast but still
+    /// wanting to catch e.g. an impromptu karaoke segment later.
+    StopHoldFor { monitor_id: i64, hours: Option<i64>, allow_triggers: bool },
     /// Re-fetch a mismatched head backfill at the LIVE capture's own rendition
     /// (the Issues fix for `head_backfill_state == "mismatch"`): the live take
     /// joined before Twitch listed the source rendition, so the source-quality

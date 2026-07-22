@@ -314,8 +314,9 @@ pub struct Supervisor {
 }
 
 /// Why automatic restarts are suppressed for a monitor after a user Stop.
-/// Blocks every automatic start path — polls, pushes, and trigger rules; a
-/// manual ▶ Start always clears it.
+/// Blocks polls and pushes always; blocks trigger-word matches too unless
+/// `allow_triggers` is set (the "Stop (allow triggers)" action) — a manual
+/// ▶ Start always clears it regardless.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum StopHold {
     /// Until a NEW broadcast appears: a different stream id, or a newer
@@ -323,9 +324,31 @@ pub enum StopHold {
     FreshStream {
         stream_id: Option<String>,
         went_live_at: Option<i64>,
+        /// A trigger-word match can still start a fresh recording during
+        /// the hold (e.g. an impromptu karaoke segment mid-broadcast) —
+        /// only plain Auto-record (polls/pushes) is suppressed. `#[serde(default)]`
+        /// so a hold persisted before this field existed loads as `false`
+        /// (the original, fully-blocking behavior).
+        #[serde(default)]
+        allow_triggers: bool,
     },
     /// Until this unix timestamp, regardless of offline/online cycles.
-    Until(i64),
+    Until {
+        at: i64,
+        /// See `FreshStream::allow_triggers`.
+        #[serde(default)]
+        allow_triggers: bool,
+    },
+}
+
+impl StopHold {
+    pub fn allow_triggers(&self) -> bool {
+        match self {
+            StopHold::FreshStream { allow_triggers, .. } | StopHold::Until { allow_triggers, .. } => {
+                *allow_triggers
+            }
+        }
+    }
 }
 
 pub type StopHolds = Arc<Mutex<HashMap<i64, StopHold>>>;
@@ -530,6 +553,33 @@ mod tests {
         // No measurable duration -> plain start-delay fallback, independent
         // of any reference.
         assert_eq!(compute_missed_secs(went_live_at, started_at, None, 999_999), started_at);
+    }
+
+    #[test]
+    fn stop_hold_allow_triggers_roundtrips_and_defaults_on_old_json() {
+        let store = Store::open_in_memory().unwrap();
+
+        // Round-trip through the settings JSON, both variants, both flags.
+        let holds: HashMap<i64, StopHold> = HashMap::from([
+            (1, StopHold::Until { at: 1_000, allow_triggers: true }),
+            (2, StopHold::FreshStream { stream_id: Some("s".into()), went_live_at: Some(5), allow_triggers: false }),
+        ]);
+        persist_stop_holds(&store, &holds);
+        let loaded = load_stop_holds(&store);
+        assert!(loaded.get(&1).unwrap().allow_triggers());
+        assert!(!loaded.get(&2).unwrap().allow_triggers());
+
+        // A FreshStream hold persisted before this field existed (no
+        // "allow_triggers" key at all) must still load — defaulting to the
+        // original, fully-blocking behavior — not silently vanish.
+        store
+            .set_setting(
+                K_STOP_HOLDS,
+                r#"[[3,{"FreshStream":{"stream_id":null,"went_live_at":null}}]]"#,
+            )
+            .unwrap();
+        let loaded = load_stop_holds(&store);
+        assert!(!loaded.get(&3).unwrap().allow_triggers());
     }
 
     #[test]

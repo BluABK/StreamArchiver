@@ -1682,12 +1682,68 @@ pub(super) fn channel_cells(
     ]
 }
 
+/// Renders the "Stop recording" and "Stop (allow triggers)" submenus — each
+/// offering the same three hold durations (until a new broadcast / 6 hours /
+/// 12 hours) — as a self-contained block of context-menu items. Shared by
+/// the instance, stream, and take row context menus so all three offer
+/// identical Stop actions without repeating the six buttons inline (which,
+/// added to everything else already in these menus, made them uncomfortably
+/// tall).
+pub(super) fn stop_recording_submenus(ui: &mut egui::Ui, mid: i64, a: &mut RowActions) {
+    ui.menu_button("⏹  Stop recording", |ui| {
+        if ui.button("Stop recording").clicked() {
+            a.stop = Some((mid, None));
+            ui.close();
+        }
+        if ui.button("Stop for 6 hours").clicked() {
+            a.stop = Some((mid, Some(6)));
+            ui.close();
+        }
+        if ui.button("Stop for 12 hours").clicked() {
+            a.stop = Some((mid, Some(12)));
+            ui.close();
+        }
+    })
+    .response
+    .on_hover_text(
+        "Stops the take and holds EVERY automatic restart — polls, pushes, and \
+         trigger-word matches alike — until this channel goes offline and starts \
+         a NEW broadcast (or the chosen timer expires). ▶ Start clears the hold.",
+    );
+    ui.menu_button("⏹  Stop (allow triggers)", |ui| {
+        if ui.button("Stop recording").clicked() {
+            a.stop_allow_triggers = Some((mid, None));
+            ui.close();
+        }
+        if ui.button("Stop for 6 hours").clicked() {
+            a.stop_allow_triggers = Some((mid, Some(6)));
+            ui.close();
+        }
+        if ui.button("Stop for 12 hours").clicked() {
+            a.stop_allow_triggers = Some((mid, Some(12)));
+            ui.close();
+        }
+    })
+    .response
+    .on_hover_text(
+        "Like Stop, but a trigger-word match can still start a fresh recording \
+         during the hold — e.g. you stop the main broadcast, but an impromptu \
+         karaoke segment later still gets captured. Plain Auto-record (polls/\
+         pushes) stays suppressed either way. ▶ Start clears the hold.",
+    );
+}
+
 /// Self-mutating actions collected while rendering a capture-instance row.
 #[derive(Default)]
 pub(super) struct RowActions {
     pub(super) start: Option<i64>,                 // monitor id
     /// `(monitor id, hold hours)` — `None` hours = hold until a new broadcast.
+    /// Blocks every automatic restart, including trigger-word matches.
     pub(super) stop: Option<(i64, Option<i64>)>,
+    /// Same as `stop`, but the hold lets a trigger-word match still start a
+    /// fresh recording during it (e.g. an impromptu karaoke segment) — only
+    /// plain Auto-record (polls/pushes) stays suppressed.
+    pub(super) stop_allow_triggers: Option<(i64, Option<i64>)>,
     pub(super) stop_chat: Option<i64>,             // monitor id
     pub(super) view_chat: Option<i64>,             // monitor id
     pub(super) edit: Option<i64>,                  // monitor id
@@ -1759,39 +1815,7 @@ pub(super) fn render_instance_row(
     let add_menu = |ui: &mut egui::Ui, a: &mut RowActions| {
         ui.set_min_width(180.0);
         if recording {
-            if ui
-                .button("⏹  Stop recording")
-                .on_hover_text(
-                    "Stops the take and holds automatic restarts until this channel \
-                     goes offline and starts a NEW broadcast. ▶ Start clears the hold.",
-                )
-                .clicked()
-            {
-                a.stop = Some((m.id, None));
-                ui.close();
-            }
-            if ui
-                .button("⏹  Stop for 6 hours")
-                .on_hover_text(
-                    "Stops the take and holds automatic restarts for 6 hours, \
-                     regardless of offline/online cycles. ▶ Start clears the hold.",
-                )
-                .clicked()
-            {
-                a.stop = Some((m.id, Some(6)));
-                ui.close();
-            }
-            if ui
-                .button("⏹  Stop for 12 hours")
-                .on_hover_text(
-                    "Stops the take and holds automatic restarts for 12 hours, \
-                     regardless of offline/online cycles. ▶ Start clears the hold.",
-                )
-                .clicked()
-            {
-                a.stop = Some((m.id, Some(12)));
-                ui.close();
-            }
+            stop_recording_submenus(ui, m.id, a);
         } else if ui.button("▶  Start recording").clicked() {
             a.start = Some(m.id);
             ui.close();
@@ -1987,7 +2011,8 @@ pub(super) fn render_instance_row(
                         let b = ui.small_button("⏹").on_hover_text(
                             "Stop / abort recording — holds automatic restarts until this \
                              channel starts a NEW broadcast (▶ Start clears the hold). \
-                             Right-click the row for timed holds (6 h / 12 h).",
+                             Right-click the row for timed holds (6 h / 12 h) and a \
+                             trigger-exempt hold (Stop (allow triggers)).",
                         );
                         if b.clicked() {
                             a.stop = Some((m.id, None));

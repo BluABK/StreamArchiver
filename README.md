@@ -481,21 +481,35 @@ Start/Stop recording, **Stream in player** / **Play new instance** (see
 (browser), **Open output folder** (file manager), **Copy URL**, Edit…, Add tool
 instance, Enable/Disable, and Delete.
 
-**Stopping holds the restart.** A manual **⏹ Stop** doesn't just stop the take
-— it also suppresses every automatic restart (polls, pushes, trigger rules)
-until the channel goes offline and starts a **new** broadcast, so Auto can't
-immediately re-record the stream you just stopped. **Stop for 6 hours** /
-**Stop for 12 hours** hold for a fixed time instead, regardless of
-offline/online cycles. A held instance shows a **✋** badge in its State cell
-(hover for when the hold ends); **▶ Start** always clears the hold. Holds
-survive an app restart. Automated stops (a trigger's *only-while-matching*
-auto-stop, scheduled stops, the quality-upgrade restart) never hold. A
-stream/take row's menu offers the same **⏹ Stop recording** / **Stop for 6
-hours** / **Stop for 12 hours** options too, right on the take that's
-actually recording (or the stream currently capturing it) — not just the
-instance row — plus Open folder / Open file / Stream in player / Play new
-instance / Copy path (and Delete for a take). The inline per-row buttons
-(▶/⏹ ⏵ ▷ ✏ ➕ 🗑) do the same.
+**Stopping holds the restart.** Stop actions live in two submenus (⏹ Stop
+recording / ⏹ Stop (allow triggers)), each offering the same three durations
+so the menu doesn't grow six items tall: stop and hold **until a new
+broadcast**, or for a fixed **6 hours** / **12 hours** regardless of
+offline/online cycles.
+
+- **⏹ Stop recording** suppresses *every* automatic restart — polls, pushes,
+  **and trigger-word matches** — until the hold ends.
+- **⏹ Stop (allow triggers)** still blocks plain Auto-record, but a
+  trigger-word match can start a fresh recording during the hold — e.g. you
+  stop a stream's main content, and an impromptu karaoke segment later in
+  the same broadcast still gets captured because it matches a trigger rule.
+  The hold itself doesn't end when a trigger fires — only Start, the
+  channel going offline and live again (fresh-broadcast holds), or the
+  timer expiring (fixed-hour holds) clears it, so plain Auto-record stays
+  suppressed for the rest of that broadcast even after a triggered segment
+  ends.
+
+A held instance shows a **✋** badge in its State cell (hover for when the
+hold ends and whether triggers are exempted); **▶ Start** always clears
+either kind of hold. Holds survive an app restart. Automated stops (a
+trigger's *only-while-matching* auto-stop, scheduled stops, the
+quality-upgrade restart) never hold. A stream/take row's menu offers the
+same two Stop submenus too, right on the take that's actually recording (or
+the stream currently capturing it) — not just the instance row — plus Open
+folder / Open file / Stream in player / Play new instance / Copy path (and
+Delete for a take). The inline per-row buttons (▶/⏹ ⏵ ▷ ✏ ➕ 🗑) do the same
+(the strict Stop, since inline buttons have no room for a submenu — use the
+context menu for "allow triggers").
 
 The inline **Actions** column can be hidden via **Settings → Display → Show
 Actions column** (applies to the Streams and Videos tables) to reclaim width — the

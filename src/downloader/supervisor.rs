@@ -88,8 +88,8 @@ impl Supervisor {
                 tokio::spawn(async move { this.manual_start(id, user_initiated).await });
             }
             ManualCommand::Stop(id) => self.manual_stop(id),
-            ManualCommand::StopHoldFor { monitor_id, hours } => {
-                self.manual_stop_hold(monitor_id, hours)
+            ManualCommand::StopHoldFor { monitor_id, hours, allow_triggers } => {
+                self.manual_stop_hold(monitor_id, hours, allow_triggers)
             }
             ManualCommand::StartVideo(id) => {
                 if !self.shutdown.load(Ordering::SeqCst) {
@@ -1172,9 +1172,14 @@ progress_info: None,
         // Manual-stop hold: a user Stop means "leave this alone" — no
         // automatic restart (poll, push, or trigger rule) until a NEW
         // broadcast appears or the timed hold expires. A manual ▶ Start
-        // clears it before reaching here (`manual_start`).
-        if let Some(reason) =
-            self.stop_hold_blocks(monitor_id, stream_id.as_deref(), went_live_at)
+        // clears it before reaching here (`manual_start`). A "Stop (allow
+        // triggers)" hold (`allow_triggers`) is more lenient: a trigger-word
+        // match may still bypass it, so we can't reject it yet — trigger
+        // rules aren't evaluated until after `row`/`block_rules`/`trigger_hit`
+        // below. Enforced for real once we know whether one matched.
+        let hold_block = self.stop_hold_blocks(monitor_id, stream_id.as_deref(), went_live_at);
+        if let Some((reason, allow_triggers)) = &hold_block
+            && !allow_triggers
         {
             tracing::debug!(monitor_id, "auto start suppressed: {reason}");
             return false;
@@ -1389,6 +1394,33 @@ progress_info: None,
             );
             return false;
         }
+        // A "Stop (allow triggers)" hold still blocks plain Auto-record: only
+        // an actual trigger match (or a forced/manual start, which already
+        // cleared the hold before reaching here) may proceed past it. Same
+        // "mark live, not recording" bookkeeping as the auto_off branch above.
+        if !forced
+            && trigger_hit.is_none()
+            && let Some((reason, true)) = &hold_block
+        {
+            tracing::debug!(monitor_id, "auto start suppressed (no trigger matched): {reason}");
+            self.active.lock().unwrap().remove(&monitor_id);
+            let _ = self.store.set_monitor_check_result(monitor_id, "live", now_unix());
+            let (live_since, live_since_approx) = match went_live_at {
+                Some(t) => (Some(t), approximate),
+                None => (Some(now_unix()), true),
+            };
+            let _ = self.store.set_monitor_live_meta(
+                monitor_id,
+                stream_title.as_deref().unwrap_or(""),
+                stream_game.as_deref().unwrap_or(""),
+                thumbnail_url.as_deref().unwrap_or(""),
+                stream_viewers.unwrap_or(-1),
+                live_since,
+                live_since_approx,
+                stream_tags.as_deref().unwrap_or(""),
+            );
+            return false;
+        }
         let trigger_info = trigger_hit.as_ref().map(|h| h.describe()).unwrap_or_default();
         // The whole matched rule (not just its description), frozen at start
         // time — the stop-on-unmatch watcher and head-backfill leadtime both
@@ -1560,9 +1592,11 @@ progress_info: None,
     /// number of hours regardless of stream cycles. A manual ▶ Start clears
     /// the hold. Automated stops (trigger stop-on-unmatch, scheduled stops,
     /// the quality-upgrade restart) use plain [`manual_stop`] and never hold.
-    pub fn manual_stop_hold(&self, monitor_id: i64, hours: Option<i64>) {
+    /// `allow_triggers`: see [`StopHold::allow_triggers`] — a trigger-word
+    /// match can still start a fresh recording during the hold.
+    pub fn manual_stop_hold(&self, monitor_id: i64, hours: Option<i64>, allow_triggers: bool) {
         let hold = match hours {
-            Some(h) => StopHold::Until(now_unix() + h * 3600),
+            Some(h) => StopHold::Until { at: now_unix() + h * 3600, allow_triggers },
             None => {
                 let (stream_id, went_live_at) = self
                     .store
@@ -1570,7 +1604,7 @@ progress_info: None,
                     .ok()
                     .flatten()
                     .unwrap_or((None, None));
-                StopHold::FreshStream { stream_id, went_live_at }
+                StopHold::FreshStream { stream_id, went_live_at, allow_triggers }
             }
         };
         {
@@ -1578,7 +1612,7 @@ progress_info: None,
             holds.insert(monitor_id, hold);
             persist_stop_holds(&self.store, &holds);
         }
-        info!(monitor_id, hours, "manual stop with restart hold");
+        info!(monitor_id, hours, allow_triggers, "manual stop with restart hold");
         self.manual_stop(monitor_id);
     }
 
@@ -1591,19 +1625,22 @@ progress_info: None,
         }
     }
 
-    /// `Some(reason)` when an automatic start must be suppressed by a stop
-    /// hold; expired/superseded holds are removed here as a side effect.
+    /// `Some((reason, allow_triggers))` when a stop hold is still in effect
+    /// for this monitor; expired/superseded holds are removed here as a side
+    /// effect. `allow_triggers` tells the caller whether a trigger-word match
+    /// should be allowed to bypass this particular hold — plain Auto-record
+    /// (polls/pushes) is ALWAYS blocked by a live hold regardless.
     fn stop_hold_blocks(
         &self,
         monitor_id: i64,
         stream_id: Option<&str>,
         went_live_at: Option<i64>,
-    ) -> Option<String> {
+    ) -> Option<(String, bool)> {
         let mut holds = self.stop_holds.lock().unwrap();
         let hold = holds.get(&monitor_id)?.clone();
         let expired = match &hold {
-            StopHold::Until(t) => now_unix() >= *t,
-            StopHold::FreshStream { stream_id: held_sid, went_live_at: held_wl } => {
+            StopHold::Until { at, .. } => now_unix() >= *at,
+            StopHold::FreshStream { stream_id: held_sid, went_live_at: held_wl, .. } => {
                 // A NEW broadcast = a different stream id, or a strictly newer
                 // go-live. Unknown identities on either side keep the hold —
                 // never resume on a guess.
@@ -1620,10 +1657,14 @@ progress_info: None,
             persist_stop_holds(&self.store, &holds);
             return None;
         }
-        Some(match hold {
-            StopHold::Until(t) => format!("held until unix {t}"),
-            StopHold::FreshStream { .. } => "held until a new broadcast".to_string(),
-        })
+        let allow_triggers = hold.allow_triggers();
+        Some((
+            match hold {
+                StopHold::Until { at, .. } => format!("held until unix {at}"),
+                StopHold::FreshStream { .. } => "held until a new broadcast".to_string(),
+            },
+            allow_triggers,
+        ))
     }
 
     /// Watch a young Twitch `best`-quality capture for a better rendition
