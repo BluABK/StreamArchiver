@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::detectors::{DetectContext, DetectItem, DetectOutcome};
 use crate::events::{AppEvent, EventTx, LiveSignal, ManualCommand};
@@ -146,9 +146,11 @@ pub struct DownloadPlan {
     pub mode: String,
 }
 
+mod alerts;
 mod backfill;
 mod cache;
 mod finalize;
+mod gap_recover;
 mod lock_culprit;
 mod naming;
 mod plan;
@@ -159,7 +161,8 @@ mod tools;
 mod vod;
 
 #[allow(unused_imports)]
-use {backfill::*, supervisor::*, vod::*};
+use {alerts::*, backfill::*, gap_recover::*, supervisor::*, vod::*};
+pub use gap_recover::K_GAP_RECOVER;
 #[allow(unused_imports)]
 use lock_culprit::*;
 pub use cache::*;
@@ -304,6 +307,9 @@ pub struct Supervisor {
     /// see [`StopHold`]. Shared with the UI (state-cell badge) and persisted
     /// across restarts (`K_STOP_HOLDS`).
     stop_holds: StopHolds,
+    /// rec_ids with a lost-segment recovery job in flight (the log scanner and
+    /// the finalize sweep both spawn `gap_recover_job`; first caller wins).
+    gap_jobs: Arc<Mutex<HashSet<i64>>>,
 }
 
 /// Why automatic restarts are suppressed for a monitor after a user Stop.

@@ -34,6 +34,7 @@ impl Supervisor {
             stopping_videos: Arc::new(Mutex::new(HashSet::new())),
             stopping_monitors: Arc::new(Mutex::new(HashSet::new())),
             stall_killed: Arc::new(Mutex::new(HashSet::new())),
+            gap_jobs: Arc::new(Mutex::new(HashSet::new())),
             blocked_notified: Arc::new(Mutex::new(HashMap::new())),
             active_chats,
             stopping_chats: Arc::new(Mutex::new(HashSet::new())),
@@ -3392,6 +3393,10 @@ progress_info: None,
         });
         self.schedule_vod_check(rec_id, row.monitor.platform(), status, &row.monitor.url, went_live_at, approximate);
         self.schedule_vod_archive(rec_id, row, went_live_at, status);
+        // Final lost-segment sweep: anything the in-flight recovery didn't
+        // get (VOD lag, resolve failures) is fetchable now that the take is
+        // over. No-op without pending ranges.
+        self.maybe_spawn_gap_recover(rec_id, true);
         // Join a backfilled head with the finished capture (no-op without one).
         {
             let this = self.clone();

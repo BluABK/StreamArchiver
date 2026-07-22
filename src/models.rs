@@ -1344,6 +1344,11 @@ pub enum NotificationKind {
     VodMuted,
     /// A trigger-word rule matched the live title/game and started a recording.
     TriggerMatched,
+    /// The capture-log scanner found a problem in a tool's own log output —
+    /// lost segments (sequence gaps), failed fetches, ERROR/WARNING lines.
+    /// The aggregated live view is the 🚨 Warnings window; the feed keeps one
+    /// row per (take, kind).
+    CaptureAlert,
     /// A blacklist trigger matched the live title/game and vetoed the
     /// automatic recording.
     TriggerBlocked,
@@ -1354,12 +1359,13 @@ pub enum NotificationKind {
 
 impl NotificationKind {
     /// Every kind, in feed-filter display order.
-    pub const ALL: [NotificationKind; 11] = [
+    pub const ALL: [NotificationKind; 12] = [
         NotificationKind::WentLive,
         NotificationKind::TriggerMatched,
         NotificationKind::TriggerBlocked,
         NotificationKind::RecordingFinished,
         NotificationKind::QualityUpgrade,
+        NotificationKind::CaptureAlert,
         NotificationKind::Error,
         NotificationKind::TaskFailed,
         NotificationKind::ScheduleAdded,
@@ -1382,6 +1388,7 @@ impl NotificationKind {
             NotificationKind::TriggerMatched => "trigger_matched",
             NotificationKind::TriggerBlocked => "trigger_blocked",
             NotificationKind::QualityUpgrade => "quality_upgrade",
+            NotificationKind::CaptureAlert => "capture_alert",
         }
     }
 
@@ -1404,6 +1411,7 @@ impl NotificationKind {
             NotificationKind::TriggerMatched => "Trigger matched",
             NotificationKind::TriggerBlocked => "Blacklist blocked",
             NotificationKind::QualityUpgrade => "Quality upgrade",
+            NotificationKind::CaptureAlert => "Capture warning",
         }
     }
 
@@ -1422,6 +1430,7 @@ impl NotificationKind {
             NotificationKind::TriggerMatched => "⚡",
             NotificationKind::TriggerBlocked => "🚫",
             NotificationKind::QualityUpgrade => "⬆",
+            NotificationKind::CaptureAlert => "🚨",
         }
     }
 }

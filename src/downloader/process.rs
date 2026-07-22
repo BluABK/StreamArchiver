@@ -794,6 +794,11 @@ impl Supervisor {
         // Stall watchdog for the adopted process too — a re-attached capture
         // whose tool wedged after the stream ended would otherwise sit
         // "recording" with a growing uptime until the app is restarted.
+        // Alert scanning starts from the top of a modest log (losses from
+        // before the restart still surface and recover), tail of a huge one.
+        let scan = (row.kind != DetachedKind::Chat).then(|| {
+            LogScan::new(String::new(), row.monitor_id, row.went_live_at, SCAN_OFFSET_ADOPT)
+        });
         let stall = self.spawn_stall_watchdog(
             row.kind,
             row.ref_id,
@@ -802,6 +807,7 @@ impl Supervisor {
             PathBuf::from(&row.log_path),
             PathBuf::from(&row.capture_path),
             done.clone(),
+            scan,
         );
 
         let exited = self.wait_for_exit(row.pid).await;
@@ -861,8 +867,13 @@ impl Supervisor {
         log_path: PathBuf,
         capture_path: PathBuf,
         done: Arc<AtomicBool>,
+        // Capture-log alert scanning piggybacks on this task's 60 s cadence
+        // (it already owns the log path). `None` = chat sidecars (their logs
+        // are chat transcripts, not tool diagnostics).
+        scan: Option<LogScan>,
     ) -> tokio::task::JoinHandle<()> {
         let this = self.clone();
+        let mut scan = scan;
         tokio::spawn(async move {
             let kill = |why: String| {
                 // Last-instant guards: the process may have exited naturally
@@ -907,10 +918,19 @@ impl Supervisor {
             let mut last = (s.log_sig, s.capture_sig);
             let mut any_changed_at = Instant::now();
             let mut capture_changed_at = Instant::now();
+            // First alert scan right away — an adopted take's backlog (losses
+            // from before the restart) should surface within seconds, not a
+            // minute.
+            if let Some(sc) = scan.as_mut() {
+                this.scan_log_cycle(kind, ref_id, &log_path, &capture_path, sc).await;
+            }
             loop {
                 crate::app_core::sleep_cancellable(Duration::from_secs(60), &this.shutdown).await;
                 if done.load(Ordering::SeqCst) || this.shutdown.load(Ordering::SeqCst) {
                     return;
+                }
+                if let Some(sc) = scan.as_mut() {
+                    this.scan_log_cycle(kind, ref_id, &log_path, &capture_path, sc).await;
                 }
                 let s = stall_sample(&log_path, &capture_path).await;
                 let now = Instant::now();
@@ -1167,6 +1187,8 @@ impl Supervisor {
                     let approx = self.store.recording_went_live_approx(row.ref_id);
                     self.schedule_vod_check(row.ref_id, platform, status, &vod_url, row.went_live_at, approx);
                 }
+                // Final lost-segment sweep (no-op without pending ranges).
+                self.maybe_spawn_gap_recover(row.ref_id, true);
                 // Join a backfilled head with the adopted capture (no-op without one).
                 {
                     let this = self.clone();
@@ -1598,6 +1620,8 @@ impl Supervisor {
             status: status.into(),
         });
         self.schedule_vod_check(rec_id, row.monitor.platform(), status, &row.monitor.url, rec.went_live_at, rec.went_live_approx);
+        // Final lost-segment sweep (no-op without pending ranges).
+        self.maybe_spawn_gap_recover(rec_id, true);
         {
             let this = self.clone();
             tokio::spawn(async move { this.maybe_concat_backfill(rec_id).await });
@@ -1764,6 +1788,13 @@ impl Supervisor {
         // Stall watchdog: a wedged tool (hung live capture after stream end, a
         // stuck VOD download) never exits — kill it once output stops so this
         // wait returns and the normal finalize runs.
+        let scan = (detach.kind != DetachedKind::Chat).then(|| {
+            let source = Path::new(&plan.program)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            LogScan::new(source, detach.monitor_id, detach.went_live_at, 0)
+        });
         let stall = self.spawn_stall_watchdog(
             detach.kind,
             detach.ref_id,
@@ -1772,6 +1803,7 @@ impl Supervisor {
             log_path.clone(),
             plan.capture_path.clone(),
             done.clone(),
+            scan,
         );
 
         let status = child.wait().await;

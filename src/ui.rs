@@ -767,6 +767,9 @@ struct SettingsForm {
     /// immediately as `viewer_history_downsample_days`.
     viewer_downsample_days: i64,
     // --- Twitch VOD recovery ---
+    /// Re-fetch a live capture's lost segments (sequence gaps) from the VOD
+    /// CDN automatically, while the stream is still running. Default on.
+    gap_recover: bool,
     /// Auto-recover a Twitch VOD when the VOD checker finds it DMCA-muted.
     auto_recover_muted: bool,
     /// Auto-recover a Twitch VOD when the VOD checker finds it was never published.
@@ -936,6 +939,17 @@ pub struct StreamArchiverApp {
     notif_unread: i64,
     notif_search: String,
     notif_kind_filter: Option<crate::models::NotificationKind>,
+    /// The 🚨 Warnings window (capture alerts scraped from tool logs): open
+    /// flag, last-loaded rows, refresh throttle, cached unacked badge counts
+    /// `(errors, warnings)`, and session-only text/severity filters.
+    show_warnings: bool,
+    warnings_rows: Vec<crate::store::CaptureAlertRow>,
+    warn_refreshed: Option<std::time::Instant>,
+    warn_badge: (i64, i64),
+    warn_search: String,
+    /// `None` = both severities; `Some(true)` = errors only, `Some(false)` =
+    /// warnings only.
+    warn_sev_filter: Option<bool>,
     /// The YouTube posts feed (a top-level tab AND a pop-out window sharing one
     /// render fn): loaded rows, load throttle, session-only channel + text
     /// filters, and a lazy visible-only texture cache keyed by content hash.
@@ -1744,6 +1758,42 @@ impl eframe::App for StreamArchiverApp {
                             }
                         }
                         {
+                            // Capture warnings (🚨). Badge = unacked alerts
+                            // scraped from the capture tools' own logs; red
+                            // fill when any is an ERROR (lost data), yellow
+                            // when only warnings. Counts cached on the same
+                            // throttle style as the bell (see
+                            // `warnings_window`).
+                            let (errs, warns) = self.warn_badge;
+                            let label = match (errs, warns) {
+                                (0, 0) => "🚨 Warnings".to_string(),
+                                (0, w) => format!("🚨 Warnings ({w})"),
+                                (e, 0) => format!("🚨 Warnings ({e})"),
+                                (e, w) => format!("🚨 Warnings ({e}+{w})"),
+                            };
+                            let btn = egui::Button::new(label).small();
+                            let btn = if errs > 0 {
+                                btn.fill(egui::Color32::from_rgb(140, 30, 30))
+                            } else if warns > 0 {
+                                btn.fill(egui::Color32::from_rgb(140, 110, 10))
+                            } else {
+                                btn
+                            };
+                            if ui
+                                .add(btn)
+                                .on_hover_text(
+                                    "Problems reported by the capture tools' own logs: lost \
+                                     segments / sequence gaps (errors — data is missing from \
+                                     the capture), failed fetches, and tool warnings. Red = \
+                                     unacknowledged errors, yellow = warnings only.",
+                                )
+                                .clicked()
+                            {
+                                self.show_warnings = true;
+                                self.warn_refreshed = None; // force an immediate refresh
+                            }
+                        }
+                        {
                             // Notifications feed (bell). Mirrors the Issues button:
                             // the unread badge count is cached (refreshed on the
                             // Issues-style throttle in `notifications_window`, even
@@ -1979,6 +2029,7 @@ impl eframe::App for StreamArchiverApp {
         self.confirm_delete_scheduled_recording_window(ui.ctx());
         self.issues_window(ui.ctx());
         self.notifications_window(ui.ctx());
+        self.warnings_window(ui.ctx());
         self.pot_server_log_window(ui.ctx());
         self.posts_window(ui.ctx());
         self.format_designer_window(ui.ctx());

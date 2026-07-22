@@ -2122,6 +2122,9 @@ impl StreamArchiverApp {
                             .takes
                             .iter()
                             .any(|t| t.head_backfill_state == "queued");
+                        let gap_running = g.takes.iter().any(|t| {
+                            gap_recover_running(background_tasks, t.id)
+                        });
                         take_status_badges(
                             ui,
                             trigger_info,
@@ -2131,6 +2134,7 @@ impl StreamArchiverApp {
                             head_backfilled,
                             backfill_running,
                             backfill_queued,
+                            gap_running,
                         );
                     }
                     "game" => {
@@ -2599,6 +2603,7 @@ impl StreamArchiverApp {
                             t.backfill_path.is_some(),
                             head_backfill_running(background_tasks, t.id),
                             t.head_backfill_state == "queued",
+                            gap_recover_running(background_tasks, t.id),
                         );
                         // Published-VOD view count (from the checker's Get
                         // Videos polls — free data, refreshed while the mute

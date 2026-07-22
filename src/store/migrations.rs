@@ -1249,7 +1249,55 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 63)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 63);
+        if version < 64 {
+            // Capture alerts (the 🚨 Warnings window): problems scraped from
+            // the capture tools' own log files (streamlink sequence gaps =
+            // lost data, failed segment fetches, yt-dlp ERROR/WARNING lines).
+            // One aggregated row per (take, kind) — a take that logs 74 gap
+            // warnings is ONE alert whose count/lost_segments grow (growth
+            // also un-acks, so fresh data loss re-lights the badge).
+            // `gap_range` holds the derived lost time ranges (broadcast-start
+            // offsets, padded/coalesced) that the Twitch gap-recovery job
+            // fetches back from the VOD CDN; `out_path` is the recovered
+            // patch file once `state`='done'.
+            conn.execute_batch(
+                r#"
+                CREATE TABLE capture_alert (
+                    id            INTEGER PRIMARY KEY,
+                    first_at      INTEGER NOT NULL,
+                    last_at       INTEGER NOT NULL,
+                    kind          TEXT NOT NULL,
+                    severity      TEXT NOT NULL,
+                    source        TEXT NOT NULL DEFAULT '',
+                    take_key      TEXT NOT NULL,
+                    monitor_id    INTEGER,
+                    recording_id  INTEGER,
+                    video_id      INTEGER,
+                    channel       TEXT NOT NULL DEFAULT '',
+                    count         INTEGER NOT NULL DEFAULT 1,
+                    lost_segments INTEGER NOT NULL DEFAULT 0,
+                    ranges_total  INTEGER NOT NULL DEFAULT 0,
+                    recovered     INTEGER NOT NULL DEFAULT 0,
+                    last_line     TEXT NOT NULL DEFAULT '',
+                    acked         INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(take_key, kind)
+                );
+                CREATE INDEX idx_capture_alert_last ON capture_alert(last_at DESC);
+                CREATE TABLE gap_range (
+                    id           INTEGER PRIMARY KEY,
+                    recording_id INTEGER NOT NULL,
+                    start_secs   REAL NOT NULL,
+                    end_secs     REAL NOT NULL,
+                    state        TEXT NOT NULL DEFAULT 'pending',
+                    attempts     INTEGER NOT NULL DEFAULT 0,
+                    out_path     TEXT NOT NULL DEFAULT '',
+                    UNIQUE(recording_id, start_secs)
+                );
+                "#,
+            )?;
+            conn.pragma_update(None, "user_version", 64)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 64);
         Ok(())
     }
 }

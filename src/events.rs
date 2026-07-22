@@ -47,6 +47,10 @@ pub enum BackgroundTaskKind {
     /// backfilling…" indicator to this task (mirrors `ReorganizeTake`/
     /// `RecoverVod`).
     HeadBackfill(i64),
+    /// Re-fetching a live capture's LOST segments (streamlink sequence gaps)
+    /// from the VOD CDN into sibling patch files. Carries the recording id
+    /// (job-row matching, mirrors `HeadBackfill`).
+    GapRecover(i64),
 }
 
 impl BackgroundTaskKind {
@@ -67,6 +71,7 @@ impl BackgroundTaskKind {
             BackgroundTaskKind::RecoverVodScan => "VOD recovery scan",
             BackgroundTaskKind::RefreshCdnHosts => "Refresh CDN hosts",
             BackgroundTaskKind::HeadBackfill(_) => "Head backfill",
+            BackgroundTaskKind::GapRecover(_) => "Gap recovery",
         }
     }
 }
@@ -226,6 +231,20 @@ pub enum AppEvent {
     Error {
         context: String,
         message: String,
+    },
+    /// The capture-log scanner found a NEW alert (first matching line for a
+    /// `(take, kind)` pair): a streamlink sequence gap / failed segment fetch
+    /// (= lost data) or a tool ERROR/WARNING line. Feeds the 🔔 feed (deduped
+    /// via `ref_key`) and — for `severity == "error"` — a desktop toast; the
+    /// aggregated live view is the 🚨 Warnings window.
+    CaptureAlert {
+        severity: String,
+        title: String,
+        body: String,
+        monitor_id: Option<i64>,
+        channel: String,
+        recording_id: Option<i64>,
+        ref_key: String,
     },
     /// A background task (asset fetch, thumbnail download, etc.) has started.
     BackgroundTaskStarted(BackgroundTask),

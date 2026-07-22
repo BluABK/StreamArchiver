@@ -391,6 +391,44 @@ fn handle(store: &Store, ev: AppEvent) {
             };
             (content, meta)
         }
+        AppEvent::CaptureAlert {
+            severity,
+            title,
+            body,
+            monitor_id,
+            channel,
+            recording_id,
+            ref_key,
+        } => {
+            // Fully handled here (early return): warnings are feed-only, and
+            // only a FIRST occurrence (ref_key inserted a new row) may toast —
+            // the scanner re-emits on growth, but one take must not toast on
+            // every watchdog cycle.
+            let n = crate::store::NewNotification {
+                kind: NotificationKind::CaptureAlert.id().to_string(),
+                severity: severity.clone(),
+                title: title.clone(),
+                body: body.clone(),
+                monitor_id,
+                channel,
+                recording_id,
+                ref_key,
+                ..Default::default()
+            };
+            let inserted = store.insert_notification(&n).ok().flatten().is_some();
+            if inserted && severity == "error" && enabled(store) && !dnd_active(store) {
+                let content = match monitor_id
+                    .and_then(|mid| store.get_monitor_with_channel(mid).ok().flatten())
+                {
+                    Some(row) => content_for(&row, title, "Open channel"),
+                    None => ToastContent::text(title, String::new()),
+                };
+                let mut content = content;
+                content.lines = body.lines().map(str::to_string).collect();
+                show_toast(content);
+            }
+            return;
+        }
         _ => return,
     };
 

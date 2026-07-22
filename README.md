@@ -868,6 +868,59 @@ The Issues panel refreshes every 5 s while open and every 5 min while closed —
 
 > The active re-remux job is a background tokio task and does not survive an app restart. The source `.ts` is always preserved, so after a restart the file reappears in the Issues panel and can be re-triggered.
 
+### 🚨 Warnings & lost-segment recovery
+
+The **🚨 Warnings** button (next to ⚠ Issues) surfaces problems the capture
+tools report **in their own log files** — previously these scrolled past
+silently and the only trace was a line in the per-capture `.log`. A scanner
+tails every running capture's tool log on the stall-watchdog's 60-second
+cadence (re-attached captures are scanned from the top of the log when it's
+modest-sized, so a restart doesn't hide what happened before it) and turns
+matching lines into persistent alerts:
+
+- **Errors (red rows)** — content is actually missing from the capture:
+  - streamlink `Sequence gap of N segments at position P` — the live playlist
+    window slid past segments that were never downloaded (downloads falling
+    behind: network congestion, disk stalls). Each Twitch segment is 2 s, so
+    the row shows the real damage: *"74 occurrences · 1,125 segments (~37 min)
+    of content lost"*.
+  - streamlink `Failed to fetch segment N` — retries exhausted, segment
+    skipped.
+  - yt-dlp `Skipping fragment N` and `ERROR:` lines.
+- **Warnings (yellow rows)** — non-fatal tool complaints (yt-dlp `WARNING:`,
+  other streamlink `[error]` lines), minus known-benign retry/ad chatter.
+
+Alerts aggregate: one row per take and problem kind, whose counters grow as
+more lines appear. The toolbar button badges with the unacked counts (red
+fill when any error is unacknowledged, yellow for warnings only); **✔ Ack**
+per row or **Acknowledge all** clears the badge while keeping the row for
+reference — and *new* occurrences automatically un-acknowledge the row, so
+fresh damage always re-lights it. Each row links straight to the tool log
+(📂), shows the last matching line on hover, and the first occurrence per
+take also lands in the 🔔 feed (errors additionally raise a desktop toast,
+DND-gated as usual). Alerts idle for 60 days age out at startup.
+
+**Lost-segment auto-recovery (Twitch).** For Twitch recordings the lost
+content usually still exists: the VOD CDN keeps the broadcast (even for
+channels with VODs disabled — the same sha1-folder rails as VOD recovery,
+~60-day window). Since live media sequence numbers map exactly to broadcast
+time (position × 2 s), every sequence-gap warning yields a precise lost time
+range. The scanner pads (±10 s), coalesces (< 30 s apart) and queues those
+ranges, and a recovery job re-fetches them **while the stream is still
+live** — as soon as the trailing VOD covers a range (~4 min behind the
+edge). Fetching immediately matters: DMCA muting hits VODs *after* the
+stream, so an in-flight fetch gets the audio intact. Anything left over is
+swept at finalize and again at every startup while pending ranges remain
+(the CDN window is ~60 days, so even a long downtime doesn't forfeit the
+data). Each range lands as a **patch file next to the recording**
+(`{stem}.recovered-1h44m24s+36s.mkv`, source quality) — v1 does not splice
+patches into the main MKV; for a seamless single file use the post-stream
+**VOD download** feature. Recovery progress shows as a Background job, a
+**🩹 recovering gaps…** badge on the take row, and a *"5/7 lost ranges
+recovered ✔"* line on the Warnings row. Toggle: Settings → Downloads →
+Twitch VOD recovery → *Recover lost segments automatically* (default on);
+per-range failures retry up to 5 times and never affect the capture itself.
+
 ### Notifications, background jobs & process manager
 
 - **🔔 Notifications** — the bell button in the toolbar (badges with the unread

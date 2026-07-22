@@ -189,6 +189,13 @@ fn main() -> Result<()> {
         Ok(_) => {}
         Err(e) => tracing::warn!("notification pruning failed: {e:#}"),
     }
+    // Capture alerts (🚨 Warnings) idle for 60 days age out the same way;
+    // pending gap-recovery work is never pruned (see `prune_capture_alerts`).
+    match store.prune_capture_alerts(60) {
+        Ok(n) if n > 0 => info!("pruned {n} capture alert(s) older than 60 days"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("capture alert pruning failed: {e:#}"),
+    }
     let core = AppCore::new(Arc::new(store)).context("starting core runtime")?;
     // Runtime handle registration + the dynamic disk-gate adjuster both live
     // in AppCore::new/start now, so every entry point gets them — see the

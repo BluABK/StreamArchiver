@@ -2764,7 +2764,7 @@ impl StreamArchiverApp {
     }
 
     fn settings_vod_recovery_section(&mut self, ui: &mut egui::Ui) {
-            if self.section_shown(SettingsTab::Downloads, "Twitch VOD recovery", &["vod", "recovery", "muted", "deleted", "cdn", "recover", "unmute"]) {
+            if self.section_shown(SettingsTab::Downloads, "Twitch VOD recovery", &["vod", "recovery", "muted", "deleted", "cdn", "recover", "unmute", "gap", "lost", "segment", "warnings"]) {
             ui.add_space(12.0);
             ui.heading("Twitch VOD recovery 🛟");
             ui.label(
@@ -2777,6 +2777,18 @@ impl StreamArchiverApp {
                 .num_columns(2)
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
+                    ui.checkbox(&mut self.settings.gap_recover, "Recover lost segments automatically")
+                        .on_hover_text(
+                            "When a live Twitch capture drops segments (streamlink logs a \
+                             \"Sequence gap\" — that content is MISSING from the file), \
+                             re-fetch the lost time ranges from the VOD CDN while the stream \
+                             is still running (best chance before any post-stream DMCA \
+                             muting) and save them as patch files next to the recording. \
+                             Alerts appear under 🚨 Warnings either way.",
+                        );
+                    ui.label("Re-fetch sequence-gap losses from the VOD CDN into sibling patch files.");
+                    ui.end_row();
+
                     ui.checkbox(&mut self.settings.auto_recover_muted, "Auto-recover muted VODs");
                     ui.label("When the VOD checker finds a DMCA-muted VOD, recover it automatically.");
                     ui.end_row();

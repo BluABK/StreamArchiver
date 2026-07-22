@@ -455,6 +455,13 @@ impl AppCore {
         self.rt
             .spawn(async move { vod_sup.reconcile_vod_archives().await });
 
+        // Resume lost-segment recovery for takes that still have pending gap
+        // ranges (the CDN folder outlives the stream ~60 days, so even a long
+        // downtime doesn't forfeit the data).
+        let gap_sup = supervisor.clone();
+        self.rt
+            .spawn(async move { gap_sup.sweep_pending_gap_recoveries().await });
+
         // Periodic channel-asset refresh (keeps icons/badges/emotes current for
         // channels that rarely record).
         let asset_sup = supervisor.clone();

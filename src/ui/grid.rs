@@ -1256,6 +1256,7 @@ pub(super) fn take_status_badges(
     head_backfilled: bool,
     backfill_running: bool,
     backfill_queued: bool,
+    gap_recover_running: bool,
 ) {
     if !trigger_info.is_empty() {
         ui.colored_label(
@@ -1291,6 +1292,14 @@ pub(super) fn take_status_badges(
                 crate::downloader::HEAD_BACKFILL_SETTLE_SECS
             ));
     }
+    if gap_recover_running {
+        ui.colored_label(egui::Color32::from_rgb(220, 120, 60), "🩹 recovering gaps…")
+            .on_hover_text(
+                "This capture lost segments (see 🚨 Warnings) — re-fetching the lost time \
+                 ranges from the VOD CDN into patch files next to the recording. Progress \
+                 is in the Background tab.",
+            );
+    }
 }
 
 /// Whether a live `HeadBackfill` background task is currently working on
@@ -1298,6 +1307,13 @@ pub(super) fn take_status_badges(
 pub(super) fn head_backfill_running(tasks: &[crate::events::BackgroundTask], rec_id: i64) -> bool {
     tasks.iter().any(|t| {
         matches!(t.kind, crate::events::BackgroundTaskKind::HeadBackfill(rid) if rid == rec_id)
+    })
+}
+
+/// Whether a lost-segment recovery task is currently working on `rec_id`.
+pub(super) fn gap_recover_running(tasks: &[crate::events::BackgroundTask], rec_id: i64) -> bool {
+    tasks.iter().any(|t| {
+        matches!(t.kind, crate::events::BackgroundTaskKind::GapRecover(rid) if rid == rec_id)
     })
 }
 

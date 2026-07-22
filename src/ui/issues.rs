@@ -29,6 +29,44 @@ pub(super) struct IssuesScan {
 /// listed in Issues as stale (a live capture writes continuously).
 const STALE_RECORDING_SECS: i64 = 600;
 
+/// (icon, human label) per capture-alert kind (the 🚨 Warnings window rows).
+fn alert_kind_label(kind: &str) -> (&'static str, &'static str) {
+    match kind {
+        "sequence_gap" => ("⛔", "Lost segments"),
+        "fetch_failed" => ("⛔", "Failed segment fetches"),
+        "tool_error" => ("❌", "Tool errors"),
+        _ => ("⚠", "Tool warnings"),
+    }
+}
+
+/// One-line summary for a capture-alert row: occurrence count, lost time, and
+/// recovery progress where applicable.
+fn alert_summary(r: &crate::store::CaptureAlertRow) -> String {
+    let mut parts = vec![format!(
+        "{} occurrence{}",
+        crate::models::group_thousands(r.count),
+        if r.count == 1 { "" } else { "s" }
+    )];
+    if r.lost_segments > 0 {
+        // Twitch live segments are 2 s; for yt-dlp fragments this is still a
+        // usable order-of-magnitude estimate.
+        let secs = r.lost_segments * 2;
+        parts.push(format!(
+            "{} segments (~{}) of content lost",
+            crate::models::group_thousands(r.lost_segments),
+            fmt_duration(secs)
+        ));
+    }
+    if r.ranges_total > 0 {
+        let mark = if r.recovered == r.ranges_total { " ✔" } else { "" };
+        parts.push(format!(
+            "{}/{} lost ranges recovered from the VOD{mark}",
+            r.recovered, r.ranges_total
+        ));
+    }
+    parts.join(" · ")
+}
+
 /// A human explanation when a capture/resume died on a network/DNS failure —
 /// matched against the tool's log tail.
 pub(super) fn network_failure_hint(log: &str) -> Option<&'static str> {
@@ -309,6 +347,247 @@ impl StreamArchiverApp {
                 for r in &mut self.notifications {
                     r.read = true;
                 }
+            }
+            None => {}
+        }
+    }
+
+    /// 🚨 Warnings window: capture alerts scraped from the tools' own log
+    /// files (streamlink sequence gaps / failed fetches = lost data, yt-dlp
+    /// ERROR/WARNING lines). One aggregated row per (take, kind); red rows are
+    /// errors, yellow rows warnings; acknowledging clears the header badge but
+    /// keeps the row — new occurrences un-acknowledge automatically. The badge
+    /// counts refresh on the same open/closed throttle as the bell.
+    #[allow(deprecated)] // CentralPanel::show(ctx) inside a viewport
+    pub(super) fn warnings_window(&mut self, ctx: &egui::Context) {
+        use std::time::{Duration, Instant};
+        let interval = if self.show_warnings {
+            Duration::from_secs(3)
+        } else {
+            Duration::from_secs(60)
+        };
+        let stale = self.warn_refreshed.map(|t| t.elapsed() >= interval).unwrap_or(true);
+        if stale {
+            self.warn_badge = self.core.store.alert_badge_counts().unwrap_or((0, 0));
+            if self.show_warnings {
+                self.warnings_rows = self.core.store.list_capture_alerts(500).unwrap_or_default();
+            }
+            self.warn_refreshed = Some(Instant::now());
+        }
+        if !self.show_warnings {
+            return;
+        }
+
+        let mut open = true;
+        // Deferred actions (applied after the viewport closure releases &self).
+        enum Act {
+            Ack(i64),
+            AckAll,
+            OpenLog(String),
+        }
+        let mut act: Option<Act> = None;
+
+        let q = self.warn_search.trim().to_lowercase();
+        let sev = self.warn_sev_filter;
+        let visible: Vec<usize> = self
+            .warnings_rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                sev.map(|errs_only| (r.severity == "error") == errs_only).unwrap_or(true)
+                    && (q.is_empty()
+                        || r.channel.to_lowercase().contains(&q)
+                        || r.kind.to_lowercase().contains(&q)
+                        || r.last_line.to_lowercase().contains(&q)
+                        || r.take_key.to_lowercase().contains(&q))
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("warnings_vp"),
+            egui::ViewportBuilder::default()
+                .with_title("🚨 Capture warnings")
+                .with_inner_size([860.0, 520.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("warn_sev_filter")
+                            .selected_text(match self.warn_sev_filter {
+                                None => "All severities",
+                                Some(true) => "Errors only",
+                                Some(false) => "Warnings only",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.warn_sev_filter, None, "All severities");
+                                ui.selectable_value(&mut self.warn_sev_filter, Some(true), "Errors only");
+                                ui.selectable_value(&mut self.warn_sev_filter, Some(false), "Warnings only");
+                            })
+                            .response
+                            .on_hover_text(
+                                "Errors mean data is missing from a capture (lost segments, \
+                                 failed fetches, tool errors); warnings are non-fatal tool \
+                                 complaints.",
+                            );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.warn_search)
+                                .hint_text("Filter…")
+                                .desired_width(180.0),
+                        )
+                        .on_hover_text("Matches channel, kind, file path, and the last log line.");
+                        if !self.warn_search.is_empty()
+                            && ui.button("✕").on_hover_text("Clear filter").clicked()
+                        {
+                            self.warn_search.clear();
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .button("✔ Acknowledge all")
+                                .on_hover_text(
+                                    "Clears the header badge for every listed alert. Rows stay \
+                                     here for reference; an alert that keeps occurring will \
+                                     re-light the badge on its next occurrence.",
+                                )
+                                .clicked()
+                            {
+                                act = Some(Act::AckAll);
+                            }
+                        });
+                    });
+                    ui.separator();
+
+                    if self.warnings_rows.is_empty() {
+                        ui.add_space(24.0);
+                        ui.vertical_centered(|ui| {
+                            ui.weak("No capture warnings — the tools' logs are clean.")
+                        });
+                        return;
+                    }
+                    if visible.is_empty() {
+                        ui.add_space(24.0);
+                        ui.vertical_centered(|ui| ui.weak("No alerts match the filter."));
+                        return;
+                    }
+
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        for &i in &visible {
+                            let r = &self.warnings_rows[i];
+                            let error = r.severity == "error";
+                            // Row tint: red for errors, yellow for warnings —
+                            // dimmed once acknowledged.
+                            let tint = match (error, r.acked) {
+                                (true, false) => egui::Color32::from_rgba_unmultiplied(120, 25, 25, 70),
+                                (true, true) => egui::Color32::from_rgba_unmultiplied(120, 25, 25, 25),
+                                (false, false) => egui::Color32::from_rgba_unmultiplied(120, 95, 10, 70),
+                                (false, true) => egui::Color32::from_rgba_unmultiplied(120, 95, 10, 25),
+                            };
+                            let accent = if error {
+                                egui::Color32::from_rgb(230, 100, 100)
+                            } else {
+                                egui::Color32::from_rgb(220, 175, 60)
+                            };
+                            egui::Frame::group(ui.style()).fill(tint).show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    let (icon, kind_label) = alert_kind_label(&r.kind);
+                                    ui.label(egui::RichText::new(icon).color(accent))
+                                        .on_hover_text(if error {
+                                            "ERROR — content is missing from this capture."
+                                        } else {
+                                            "Warning — the tool complained, no data loss detected."
+                                        });
+                                    ui.vertical(|ui| {
+                                        let title = if r.channel.is_empty() {
+                                            kind_label.to_string()
+                                        } else {
+                                            format!("{kind_label} — {}", r.channel)
+                                        };
+                                        let mut rich = egui::RichText::new(title).strong();
+                                        if !r.acked {
+                                            rich = rich.color(accent);
+                                        }
+                                        ui.label(rich);
+                                        ui.label(egui::RichText::new(alert_summary(r)).weak())
+                                            .on_hover_text(format!(
+                                                "Last matching log line:\n{}",
+                                                r.last_line
+                                            ));
+                                        ui.horizontal(|ui| {
+                                            let span = if r.last_at > r.first_at {
+                                                format!(
+                                                    "{} — {}",
+                                                    fmt_datetime_short(r.first_at),
+                                                    fmt_datetime_short(r.last_at)
+                                                )
+                                            } else {
+                                                fmt_datetime_short(r.first_at)
+                                            };
+                                            ui.small(span).on_hover_text(
+                                                "First and most recent occurrence.",
+                                            );
+                                            if !r.source.is_empty() {
+                                                ui.small(format!("· {}", r.source))
+                                                    .on_hover_text("The capture tool whose log reported this.");
+                                            }
+                                        });
+                                    });
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if !r.acked
+                                                && ui
+                                                    .button("✔ Ack")
+                                                    .on_hover_text(
+                                                        "Acknowledge: clears this alert from the \
+                                                         header badge. It stays listed, and new \
+                                                         occurrences will re-light it.",
+                                                    )
+                                                    .clicked()
+                                            {
+                                                act = Some(Act::Ack(r.id));
+                                            }
+                                            if ui
+                                                .button("📂 Log")
+                                                .on_hover_text(
+                                                    "Open the capture tool's log file — every \
+                                                     matched line, in context.",
+                                                )
+                                                .clicked()
+                                            {
+                                                act = Some(Act::OpenLog(r.take_key.clone()));
+                                            }
+                                        },
+                                    );
+                                });
+                            });
+                        }
+                    });
+                });
+            },
+        );
+
+        if !open {
+            self.show_warnings = false;
+        }
+        match act {
+            Some(Act::Ack(id)) => {
+                let _ = self.core.store.ack_capture_alert(id);
+                if let Some(r) = self.warnings_rows.iter_mut().find(|r| r.id == id) {
+                    r.acked = true;
+                }
+                self.warn_badge = self.core.store.alert_badge_counts().unwrap_or((0, 0));
+            }
+            Some(Act::AckAll) => {
+                let _ = self.core.store.ack_all_capture_alerts();
+                for r in &mut self.warnings_rows {
+                    r.acked = true;
+                }
+                self.warn_badge = (0, 0);
+            }
+            Some(Act::OpenLog(path)) => {
+                crate::platform::open_path(std::path::Path::new(&path));
             }
             None => {}
         }

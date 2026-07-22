@@ -223,6 +223,7 @@ impl StreamArchiverApp {
             .trim()
             .parse()
             .unwrap_or(0),
+            gap_recover: setting_or_empty(&core, crate::downloader::K_GAP_RECOVER) != "0",
             auto_recover_muted: setting_or_empty(&core, crate::recovery::K_AUTO_RECOVER_MUTED) == "1",
             auto_recover_deleted: setting_or_empty(&core, crate::recovery::K_AUTO_RECOVER_DELETED) == "1",
             recovery_cdn_hosts: setting_or_empty(&core, crate::recovery::K_RECOVERY_CDN_HOSTS),
@@ -443,6 +444,12 @@ impl StreamArchiverApp {
             notif_unread: 0,
             notif_search: String::new(),
             notif_kind_filter: None,
+            show_warnings: false,
+            warnings_rows: Vec::new(),
+            warn_refreshed: None,
+            warn_badge: (0, 0),
+            warn_search: String::new(),
+            warn_sev_filter: None,
             show_posts_window: false,
             posts: Vec::new(),
             posts_refreshed: None,
@@ -1561,6 +1568,7 @@ impl StreamArchiverApp {
             (K_FILE_SPLIT_THUMBS, s.file_split_thumbs.trim()),
             (K_FILE_SPLIT_LOGS,   s.file_split_logs.trim()),
             (K_MEDIA_PLAYER, s.media_player_path.trim()),
+            (crate::downloader::K_GAP_RECOVER, if s.gap_recover { "1" } else { "0" }),
             (crate::recovery::K_AUTO_RECOVER_MUTED, if s.auto_recover_muted { "1" } else { "0" }),
             (crate::recovery::K_AUTO_RECOVER_DELETED, if s.auto_recover_deleted { "1" } else { "0" }),
             (crate::recovery::K_RECOVERY_CDN_HOSTS, s.recovery_cdn_hosts.trim()),
