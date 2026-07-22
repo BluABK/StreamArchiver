@@ -63,6 +63,12 @@ fn alert_summary(r: &crate::store::CaptureAlertRow) -> String {
             "{}/{} lost ranges recovered from the VOD{mark}",
             r.recovered, r.ranges_total
         ));
+        if r.recovered_muted > 0 {
+            parts.push(format!(
+                "✂ {} recovered segment(s) use DMCA-muted audio",
+                crate::models::group_thousands(r.recovered_muted)
+            ));
+        }
     }
     parts.join(" · ")
 }
@@ -501,7 +507,10 @@ impl StreamArchiverApp {
                                         .on_hover_text(if healed {
                                             "Recovered — every lost range was re-fetched from the \
                                              VOD; the content exists as patch files next to the \
-                                             recording."
+                                             recording. Ranges that only survived as DMCA-muted \
+                                             copies are fetched anyway (video intact, audio \
+                                             silenced) — a muted patch beats no patch — and are \
+                                             marked '-muted' in the filename."
                                         } else if error {
                                             "ERROR — content is missing from this capture."
                                         } else {
@@ -514,7 +523,11 @@ impl StreamArchiverApp {
                                             format!("{kind_label} — {}", r.channel)
                                         };
                                         if healed {
-                                            title.push_str(" — recovered");
+                                            title.push_str(if r.recovered_muted > 0 {
+                                                " — recovered (partly muted)"
+                                            } else {
+                                                " — recovered"
+                                            });
                                         }
                                         let mut rich = egui::RichText::new(title).strong();
                                         if !r.acked {

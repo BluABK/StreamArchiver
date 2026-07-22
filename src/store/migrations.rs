@@ -1297,7 +1297,21 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 64)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 64);
+        if version < 65 {
+            // Muted-audio bookkeeping for gap recovery: `build_playlist` falls
+            // back to DMCA-muted segment copies when the clean ones are gone
+            // (a muted patch beats no patch) — record how many per recovered
+            // range, and the rollup on the alert row, so the Warnings window
+            // can say "recovered, but N segments are muted".
+            conn.execute_batch(
+                r#"
+                ALTER TABLE gap_range ADD COLUMN muted_segs INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE capture_alert ADD COLUMN recovered_muted INTEGER NOT NULL DEFAULT 0;
+                "#,
+            )?;
+            conn.pragma_update(None, "user_version", 65)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 65);
         Ok(())
     }
 }

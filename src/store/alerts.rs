@@ -57,6 +57,9 @@ pub struct CaptureAlertRow {
     pub lost_segments: i64,
     pub ranges_total: i64,
     pub recovered: i64,
+    /// Segments in the recovered patches that had to fall back to DMCA-muted
+    /// copies (a muted patch beats no patch, but the user must know).
+    pub recovered_muted: i64,
     pub last_line: String,
     pub acked: bool,
 }
@@ -77,10 +80,14 @@ pub struct GapRangeRow {
     /// Recovered patch file once `done` (the 🩹 Patches action opens its
     /// folder).
     pub out_path: String,
+    /// Muted-fallback segments inside the recovered patch (0 = clean audio).
+    #[allow(dead_code)]
+    pub muted_segs: i64,
 }
 
 const ALERT_COLS: &str = "id, first_at, last_at, kind, severity, source, take_key, monitor_id, \
-     recording_id, video_id, channel, count, lost_segments, ranges_total, recovered, last_line, acked";
+     recording_id, video_id, channel, count, lost_segments, ranges_total, recovered, \
+     recovered_muted, last_line, acked";
 
 fn alert_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<CaptureAlertRow> {
     Ok(CaptureAlertRow {
@@ -99,8 +106,9 @@ fn alert_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<CaptureAlertRow> {
         lost_segments: r.get(12)?,
         ranges_total: r.get(13)?,
         recovered: r.get(14)?,
-        last_line: r.get(15)?,
-        acked: r.get::<_, i64>(16)? != 0,
+        recovered_muted: r.get(15)?,
+        last_line: r.get(16)?,
+        acked: r.get::<_, i64>(17)? != 0,
     })
 }
 
@@ -184,13 +192,47 @@ impl Store {
 
     /// Update a take's gap-recovery progress on its data-loss alert rows
     /// (does NOT touch `acked` — recovery progress isn't new damage).
-    pub fn set_alert_recovery(&self, recording_id: i64, ranges_total: i64, recovered: i64) -> Result<()> {
+    pub fn set_alert_recovery(
+        &self,
+        recording_id: i64,
+        ranges_total: i64,
+        recovered: i64,
+        recovered_muted: i64,
+    ) -> Result<()> {
         self.db().execute(
-            "UPDATE capture_alert SET ranges_total = ?2, recovered = ?3
+            "UPDATE capture_alert SET ranges_total = ?2, recovered = ?3, recovered_muted = ?4
              WHERE recording_id = ?1 AND kind IN ('sequence_gap', 'fetch_failed')",
-            params![recording_id, ranges_total, recovered],
+            params![recording_id, ranges_total, recovered, recovered_muted],
         )?;
         Ok(())
+    }
+
+    /// Whether any alert already exists for a tool log — the retro log sweep
+    /// skips those files (they were live-scanned, or swept before; rescanning
+    /// would double the counters and un-ack the row).
+    pub fn alert_exists_for_take(&self, take_key: &str) -> bool {
+        self.db()
+            .query_row(
+                "SELECT 1 FROM capture_alert WHERE take_key = ?1 LIMIT 1",
+                [take_key],
+                |_| Ok(()),
+            )
+            .is_ok()
+    }
+
+    /// Recordings carrying this platform stream id, newest take first —
+    /// `(id, monitor_id, started_at, status)`. The retro log sweep picks the
+    /// take whose start time matches the log filename's timestamp.
+    pub fn recordings_by_stream_id(&self, stream_id: &str) -> Result<Vec<(i64, i64, i64, String)>> {
+        let conn = self.db();
+        let mut st = conn.prepare(
+            "SELECT id, monitor_id, started_at, status FROM recording
+             WHERE stream_id = ?1 ORDER BY started_at DESC",
+        )?;
+        let rows = st
+            .query_map([stream_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Startup repair: fetches orphaned by a shutdown go back to `pending`
@@ -237,7 +279,7 @@ impl Store {
     pub fn gap_ranges_in_state(&self, recording_id: i64, state: &str) -> Result<Vec<GapRangeRow>> {
         let conn = self.db();
         let mut st = conn.prepare(
-            "SELECT id, recording_id, start_secs, end_secs, state, attempts, out_path
+            "SELECT id, recording_id, start_secs, end_secs, state, attempts, out_path, muted_segs
              FROM gap_range WHERE recording_id = ?1 AND state = ?2 ORDER BY start_secs",
         )?;
         let rows = st
@@ -250,36 +292,40 @@ impl Store {
                     state: r.get(4)?,
                     attempts: r.get(5)?,
                     out_path: r.get(6)?,
+                    muted_segs: r.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
-    /// `(total, done)` range counts for a recording — drives the alert row's
-    /// "N/M recovered" readout.
-    pub fn gap_range_progress(&self, recording_id: i64) -> Result<(i64, i64)> {
+    /// `(total, done, muted_segs)` for a recording's ranges — drives the
+    /// alert row's "N/M recovered (✂ muted)" readout.
+    pub fn gap_range_progress(&self, recording_id: i64) -> Result<(i64, i64, i64)> {
         self.db()
             .query_row(
                 "SELECT COUNT(*),
-                        COALESCE(SUM(CASE WHEN state = 'done' THEN 1 ELSE 0 END), 0)
+                        COALESCE(SUM(CASE WHEN state = 'done' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(muted_segs), 0)
                  FROM gap_range WHERE recording_id = ?1",
                 [recording_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .map_err(Into::into)
     }
 
     /// Move a range to a new state; `attempts` bumps only on `pending` (a
-    /// retry re-queue) and `out_path` is written only when non-empty.
-    pub fn set_gap_range_state(&self, id: i64, state: &str, out_path: &str) -> Result<()> {
+    /// retry re-queue), `out_path` is written only when non-empty, and
+    /// `muted_segs` records the muted-fallback count for a `done` range.
+    pub fn set_gap_range_state(&self, id: i64, state: &str, out_path: &str, muted_segs: i64) -> Result<()> {
         self.db().execute(
             "UPDATE gap_range SET
                 state = ?2,
                 attempts = attempts + (CASE WHEN ?2 = 'pending' THEN 1 ELSE 0 END),
-                out_path = CASE WHEN ?3 != '' THEN ?3 ELSE out_path END
+                out_path = CASE WHEN ?3 != '' THEN ?3 ELSE out_path END,
+                muted_segs = CASE WHEN ?2 = 'done' THEN ?4 ELSE muted_segs END
              WHERE id = ?1",
-            params![id, state, out_path],
+            params![id, state, out_path, muted_segs],
         )?;
         Ok(())
     }
@@ -362,10 +408,15 @@ mod tests {
         assert_eq!(store.alert_badge_counts().unwrap(), (0, 0));
 
         // Recovery progress lands on the sequence_gap row without un-acking.
-        store.set_alert_recovery(7, 7, 5).unwrap();
+        store.set_alert_recovery(7, 7, 5, 3).unwrap();
         let rows = store.list_capture_alerts(10).unwrap();
         let gap = rows.iter().find(|r| r.kind == "sequence_gap").unwrap();
-        assert_eq!((gap.ranges_total, gap.recovered, gap.acked), (7, 5, true));
+        assert_eq!((gap.ranges_total, gap.recovered, gap.recovered_muted), (7, 5, 3));
+        assert!(gap.acked);
+
+        // Retro-sweep guard: the take is known once ANY alert row exists.
+        assert!(store.alert_exists_for_take("A:\\x.ts.log"));
+        assert!(!store.alert_exists_for_take("A:\\other.ts.log"));
     }
 
     #[test]
@@ -375,9 +426,9 @@ mod tests {
         let pending = store.gap_ranges_in_state(7, "pending").unwrap();
         assert_eq!(pending.len(), 2);
 
-        // Start fetching the first, finish it.
-        store.set_gap_range_state(pending[0].id, "fetching", "").unwrap();
-        store.set_gap_range_state(pending[0].id, "done", "A:\\x.gap100.mkv").unwrap();
+        // Start fetching the first, finish it (2 muted-fallback segments).
+        store.set_gap_range_state(pending[0].id, "fetching", "", 0).unwrap();
+        store.set_gap_range_state(pending[0].id, "done", "A:\\x.gap100.mkv", 2).unwrap();
 
         // Scanner re-derives the full list (incl. a range overlapping the
         // done one) → pending rows replaced, done row kept, overlap dropped.
@@ -390,15 +441,16 @@ mod tests {
             pending.iter().map(|r| r.start_secs as i64).collect::<Vec<_>>(),
             vec![500, 900]
         );
-        assert_eq!(store.gap_range_progress(7).unwrap(), (3, 1));
+        assert_eq!(store.gap_range_progress(7).unwrap(), (3, 1, 2));
         assert_eq!(store.recordings_with_pending_gaps().unwrap(), vec![7]);
 
         // Retry accounting: pending re-queue bumps attempts, out_path sticks.
-        store.set_gap_range_state(pending[0].id, "pending", "").unwrap();
+        store.set_gap_range_state(pending[0].id, "pending", "", 0).unwrap();
         let re = store.gap_ranges_in_state(7, "pending").unwrap();
         assert_eq!(re.iter().find(|r| r.id == pending[0].id).unwrap().attempts, 1);
         let done = &store.gap_ranges_in_state(7, "done").unwrap()[0];
         assert_eq!(done.out_path, "A:\\x.gap100.mkv");
+        assert_eq!(done.muted_segs, 2);
     }
 
     #[test]

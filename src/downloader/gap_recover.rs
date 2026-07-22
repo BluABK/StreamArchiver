@@ -178,7 +178,7 @@ impl Supervisor {
             }
             let start = r.start_secs;
             let len = (r.end_secs - r.start_secs).max(TWITCH_SEG_SECS);
-            let _ = self.store.set_gap_range_state(r.id, "fetching", "");
+            let _ = self.store.set_gap_range_state(r.id, "fetching", "", 0);
             let _ = self.events.send(AppEvent::BackgroundTaskProgress {
                 id: task_id,
                 progress: Some(i as f32 / ranges.len() as f32),
@@ -187,7 +187,7 @@ impl Supervisor {
             let fail = |why: String| {
                 let next = if r.attempts + 1 >= GAP_MAX_ATTEMPTS { "failed" } else { "pending" };
                 warn!(rec_id, "gap recovery: range {} failed ({next}): {why}", fmt_gap_tag(start, len));
-                let _ = self.store.set_gap_range_state(r.id, next, "");
+                let _ = self.store.set_gap_range_state(r.id, next, "", 0);
             };
             let playlist = match crate::recovery::build_playlist(
                 &client,
@@ -205,7 +205,12 @@ impl Supervisor {
                     continue;
                 }
             };
-            let tag = fmt_gap_tag(start, len);
+            // A muted patch beats no patch — but say so in the filename.
+            let tag = if playlist.muted_used > 0 {
+                format!("{}-muted", fmt_gap_tag(start, len))
+            } else {
+                fmt_gap_tag(start, len)
+            };
             let pl_path = cache.join(format!("{stem}.gap-{tag}.m3u8"));
             if let Err(e) = crate::iomon::fs::write(Cat::Recovery, &pl_path, &playlist.text).await {
                 fail(format!("write playlist: {e}"));
@@ -242,9 +247,12 @@ impl Supervisor {
                         },
                         dest.display()
                     );
-                    let _ = self
-                        .store
-                        .set_gap_range_state(r.id, "done", &dest.to_string_lossy());
+                    let _ = self.store.set_gap_range_state(
+                        r.id,
+                        "done",
+                        &dest.to_string_lossy(),
+                        playlist.muted_used as i64,
+                    );
                 }
                 Err(e) => {
                     let _ = crate::iomon::fs::remove_file(Cat::Recovery, &tmp).await;
@@ -254,8 +262,8 @@ impl Supervisor {
         }
 
         // Reflect progress on the alert row + the takes table.
-        if let Ok((total, done)) = self.store.gap_range_progress(rec_id) {
-            let _ = self.store.set_alert_recovery(rec_id, total, done);
+        if let Ok((total, done, muted)) = self.store.gap_range_progress(rec_id) {
+            let _ = self.store.set_alert_recovery(rec_id, total, done, muted);
         }
         let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
         let note = if muted_total > 0 {

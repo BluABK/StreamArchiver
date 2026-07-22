@@ -915,7 +915,18 @@ swept at finalize and again at every startup while pending ranges remain
 data). Each range lands as a **patch file next to the recording**
 (`{stem}.recovered-1h44m24s+36s.mkv`, source quality) — v1 does not splice
 patches into the main MKV; for a seamless single file use the post-stream
-**VOD download** feature. Recovery progress shows as a Background job, a
+**VOD download** feature. Ranges whose clean segments are already gone fall
+back to the **DMCA-muted copies** (video intact, audio silenced — a muted
+patch beats no patch): those files carry a `-muted` filename tag and the
+Warnings row says *"✂ N recovered segments use DMCA-muted audio"*.
+
+**Past streams too.** At startup a **retro sweep** scans the existing
+capture logs (`logs\captures\`, 7-day retention) for takes that lost data
+before the scanner existed — or while the app was down — files the same
+alerts, binds each log to its recording via the `[platform stream-id]` in
+the filename plus the take timestamp, and queues recovery for finished
+Twitch takes. Idempotent: a log with an existing alert is never re-counted,
+and still-running takes are left to the live scanner. Recovery progress shows as a Background job, a
 **🩹 recovering gaps…** badge on the take row, and a *"5/7 lost ranges
 recovered ✔"* line on the Warnings row — and once **every** range is
 recovered the row flips **green** ("Lost segments — Nihmune — recovered",

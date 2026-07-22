@@ -315,8 +315,8 @@ impl Supervisor {
                 if let Err(e) = self.store.replace_pending_gap_ranges(ref_id, &ranges) {
                     warn!(ref_id, "gap ranges: queue update failed: {e:#}");
                 }
-                if let Ok((total, done)) = self.store.gap_range_progress(ref_id) {
-                    let _ = self.store.set_alert_recovery(ref_id, total, done);
+                if let Ok((total, done, muted)) = self.store.gap_range_progress(ref_id) {
+                    let _ = self.store.set_alert_recovery(ref_id, total, done, muted);
                 }
             }
         }
@@ -346,6 +346,181 @@ impl Supervisor {
             .any(|r| (r.end_secs as i64) + GAP_VOD_LAG_SECS < elapsed);
         if ready {
             self.maybe_spawn_gap_recover(ref_id, false);
+        }
+    }
+}
+
+// ---------- retro sweep over past capture logs ----------
+
+/// Retro sweep skips log files bigger than this (endless-retry spam; the live
+/// scanner's tail cap covers those takes while they run).
+const RETRO_SCAN_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// Log-filename timestamp must land within this of a recording's `started_at`
+/// to bind the log to that take.
+const RETRO_MATCH_SLOP_SECS: i64 = 300;
+
+/// Parse a capture-log filename ("Ebiko - 2026-07-22 02-50-48 - … -
+/// [twitch 320438670041].ts.log") into `(platform_tag, stream_id,
+/// local_start_epoch)`. `None` when there's no `[platform id]` bracket (chat
+/// sidecars, odd names).
+pub(super) fn parse_capture_log_name(name: &str) -> Option<(String, String, Option<i64>)> {
+    // The platform bracket is the LAST `[...]` group (titles may contain
+    // their own brackets, and `[games-tba]` precedes it).
+    let (platform, id) = name
+        .rmatch_indices('[')
+        .find_map(|(i, _)| {
+            let inner = &name[i + 1..name[i..].find(']')? + i];
+            let mut parts = inner.split_whitespace();
+            let tag = parts.next()?;
+            let id = parts.next()?;
+            (matches!(tag, "twitch" | "youtube" | "kick") && parts.next().is_none())
+                .then(|| (tag.to_string(), id.to_string()))
+        })?;
+    // Take timestamp: the first "YYYY-MM-DD HH-MM-SS" in the name, local time
+    // (that's how capture stems are built).
+    let ts = regex_lite::Regex::new(r"(\d{4})-(\d{2})-(\d{2}) (\d{2})-(\d{2})-(\d{2})")
+        .ok()
+        .and_then(|re| {
+            let c = re.captures(name)?;
+            let get = |i: usize| c.get(i).unwrap().as_str().parse::<u32>().ok();
+            let date = chrono::NaiveDate::from_ymd_opt(
+                get(1)? as i32,
+                get(2)?,
+                get(3)?,
+            )?;
+            let time = chrono::NaiveTime::from_hms_opt(get(4)?, get(5)?, get(6)?)?;
+            use chrono::TimeZone;
+            match chrono::Local.from_local_datetime(&date.and_time(time)) {
+                chrono::LocalResult::Single(dt) | chrono::LocalResult::Ambiguous(dt, _) => {
+                    Some(dt.timestamp())
+                }
+                chrono::LocalResult::None => None,
+            }
+        });
+    Some((platform, id, ts))
+}
+
+impl Supervisor {
+    /// One-shot startup sweep over past capture logs (`logs\captures\*.log`,
+    /// 7-day retention): file alerts for takes that lost data BEFORE this
+    /// feature existed (or while the app was down), and queue Twitch gap
+    /// recovery for them — the CDN keeps the content ~60 days, so past
+    /// streams are still repairable (muted fallback included). Idempotent:
+    /// any existing alert for a log skips the file, and still-running takes
+    /// are left to the live scanner.
+    pub async fn retro_scan_capture_logs(&self) {
+        use crate::iomon::Cat;
+        use tokio::io::AsyncReadExt;
+        let dir = crate::app_paths::logs_dir().join("captures");
+        let Ok(mut rd) = crate::iomon::fs::read_dir(Cat::LogRead, &dir).await else { return };
+        let (mut scanned, mut filed) = (0usize, 0usize);
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".log") || name.contains(".chat.") {
+                continue;
+            }
+            let take_key = path.to_string_lossy().into_owned();
+            if self.store.alert_exists_for_take(&take_key) {
+                continue; // live-scanned or swept before — rescanning would double counters
+            }
+            let Some((platform_tag, stream_id, ts)) = parse_capture_log_name(&name) else {
+                continue;
+            };
+            match crate::iomon::fs::metadata(Cat::LogRead, &path).await {
+                Ok(m) if m.len() <= RETRO_SCAN_MAX_BYTES => {}
+                _ => continue,
+            }
+            let Ok(mut f) = crate::iomon::fs::open(Cat::LogRead, &path).await else { continue };
+            let mut buf = Vec::new();
+            let read_start = std::time::Instant::now();
+            if f.read_to_end(&mut buf).await.is_err() {
+                continue;
+            }
+            crate::iomon::record(Cat::LogRead, &path, crate::iomon::OpKind::Read, buf.len() as u64, read_start.elapsed());
+            scanned += 1;
+            let summary = scan_lines(&String::from_utf8_lossy(&buf));
+            if summary.hits.is_empty() {
+                continue;
+            }
+
+            // Bind the log to its recording via stream id + take timestamp.
+            let rec = self
+                .store
+                .recordings_by_stream_id(&stream_id)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|(_, _, started, _)| {
+                    ts.map(|t| (started - t).abs() <= RETRO_MATCH_SLOP_SECS).unwrap_or(true)
+                });
+            if matches!(&rec, Some((_, _, _, status)) if status == "recording") {
+                continue; // an active take — the live scanner owns its log
+            }
+            let (rec_id, monitor_id) = match &rec {
+                Some((id, mid, _, _)) => (Some(*id), Some(*mid)),
+                None => (None, None),
+            };
+            let row = monitor_id.and_then(|m| self.store.get_monitor_with_channel(m).ok().flatten());
+            let twitch = row.as_ref().map(|r| r.monitor.platform() == Platform::Twitch).unwrap_or(false)
+                && platform_tag == "twitch";
+            let label = row
+                .as_ref()
+                .map(|r| r.channel.name.clone())
+                // Fallback: the channel prefix of the log filename.
+                .unwrap_or_else(|| name.split(" - ").next().unwrap_or_default().to_string());
+
+            for (hit_kind, severity, count, lost, last_line) in &summary.hits {
+                let alert = crate::store::NewCaptureAlert {
+                    kind: hit_kind.to_string(),
+                    severity: severity.to_string(),
+                    source: infer_source(last_line).to_string(),
+                    take_key: take_key.clone(),
+                    monitor_id,
+                    recording_id: rec_id,
+                    video_id: None,
+                    channel: label.clone(),
+                    count: *count,
+                    lost_segments: *lost,
+                    last_line: last_line.clone(),
+                };
+                if let Ok((alert_id, was_new)) = self.store.upsert_capture_alert(&alert) {
+                    filed += 1;
+                    if *severity == "error" {
+                        error!(
+                            "retro log sweep [{label}]: {hit_kind} ×{count} (+{lost} lost segments) — {last_line}"
+                        );
+                    }
+                    if was_new {
+                        let (title, body) = alert_message(hit_kind, &label, *lost, last_line, twitch);
+                        let _ = self.events.send(AppEvent::CaptureAlert {
+                            severity: severity.to_string(),
+                            title,
+                            body,
+                            monitor_id,
+                            channel: label.clone(),
+                            recording_id: rec_id,
+                            ref_key: format!("capalert:{alert_id}"),
+                        });
+                    }
+                }
+            }
+
+            // Queue + kick recovery for a matched, finished Twitch take.
+            if let Some(rec_id) = rec_id
+                && twitch
+                && !summary.gaps.is_empty()
+                && gap_recover_enabled(&self.store)
+            {
+                let ranges = gap_ranges_secs(&summary.gaps);
+                let _ = self.store.replace_pending_gap_ranges(rec_id, &ranges);
+                if let Ok((total, done, muted)) = self.store.gap_range_progress(rec_id) {
+                    let _ = self.store.set_alert_recovery(rec_id, total, done, muted);
+                }
+                self.maybe_spawn_gap_recover(rec_id, true);
+            }
+        }
+        if scanned > 0 {
+            info!("retro log sweep: {scanned} past capture log(s) scanned, {filed} alert(s) filed");
         }
     }
 }
@@ -473,6 +648,30 @@ mod tests {
         assert!(gap.4.contains("position 3159"));
         let ff = s.hits.iter().find(|(k, ..)| *k == "fetch_failed").unwrap();
         assert_eq!((ff.2, ff.3), (1, 1));
+    }
+
+    #[test]
+    fn parse_capture_log_names() {
+        // The real Ebiko log filename (brackets in the games slot too).
+        let (platform, id, ts) = parse_capture_log_name(
+            "Ebiko - 2026-07-22 02-50-48 - title-tba [games-tba] (1080p60 live h264 aac) - \
+             [twitch 320438670041].ts.log",
+        )
+        .unwrap();
+        assert_eq!((platform.as_str(), id.as_str()), ("twitch", "320438670041"));
+        // Local-time parse — just assert it resolved to a plausible epoch.
+        assert!(ts.is_some_and(|t| t > 1_700_000_000));
+
+        // YouTube SABR names (title may carry 【】 and its own brackets).
+        let (platform, id, _) = parse_capture_log_name(
+            "Dokibird - 2026-07-21 22-38-37 - 【PALWORLD】Making [pals] sloppy [games-tba] \
+             (p sabr  ) - [youtube VVPVScN7pR0].mkv.log",
+        )
+        .unwrap();
+        assert_eq!((platform.as_str(), id.as_str()), ("youtube", "VVPVScN7pR0"));
+
+        // No platform bracket → not a capture log we can bind.
+        assert!(parse_capture_log_name("random-notes.log").is_none());
     }
 
     #[test]
