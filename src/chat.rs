@@ -363,6 +363,12 @@ async fn session(
                                     &ev.tier,
                                     &ev.detail,
                                 ) {
+                                    // First-time-chatter events are common (every
+                                    // unique chatter, easily dozens per stream) and
+                                    // low-signal — already excluded from the events
+                                    // graph for the same reason; skip the per-event
+                                    // log line too instead of flooding the app log.
+                                    Ok(true) if ev.kind == "first_chat" => {}
                                     Ok(true) => debug!(
                                         "chat ({login}): event {} by {} (x{})",
                                         ev.kind, ev.actor, ev.amount
