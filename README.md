@@ -888,7 +888,13 @@ matching lines into persistent alerts:
     skipped.
   - yt-dlp `Skipping fragment N` and `ERROR:` lines.
 - **Warnings (yellow rows)** — non-fatal tool complaints (yt-dlp `WARNING:`,
-  other streamlink `[error]` lines), minus known-benign retry/ad chatter.
+  other streamlink `[error]` lines), minus known-benign chatter: retry/ad
+  notices, the SABR deep-rewind "experimental" banner and format-negotiation
+  fallbacks (`Requested format is not available` / `No video formats
+  found!`), normal "a new stream may have started" endings, and bgutil
+  POT-server ping blips — all of which print on routine captures and carry
+  no per-take signal. Genuinely anomalous warnings (e.g. `segment alignment
+  mismatch across downloaded formats`) still surface.
 
 Alerts aggregate: one row per take and problem kind, whose counters grow as
 more lines appear. The toolbar button badges with the unacked counts (red

@@ -80,7 +80,25 @@ pub(super) fn classify_line(line: &str) -> Option<LineHit> {
     // normal Twitch operation).
     let warnish = l.starts_with("WARNING:") || l.contains("][error]");
     if warnish {
-        let benign = ["retry", "retrying", "waiting for", "will skip ad", "ad segment"];
+        let benign = [
+            "retry",
+            "retrying",
+            "waiting for",
+            "will skip ad",
+            "ad segment",
+            // Routine SABR chatter (2026-07-22 log census): printed on every
+            // deep-rewind launch / format negotiation / normal stream end —
+            // pure noise at fleet scale, not a per-take anomaly.
+            "deep rewind",
+            "deep-rewind",
+            "requested format is not available",
+            "no video formats found",
+            "new stream may have started under the same video id",
+            // bgutil POT-server ping blips — the managed-server watchdog owns
+            // these; a POT outage that actually kills a capture surfaces as a
+            // tool ERROR anyway.
+            "[pot:bgutil",
+        ];
         let lower = l.to_lowercase();
         if benign.iter().any(|b| lower.contains(b)) {
             return None;
@@ -631,6 +649,42 @@ mod tests {
         assert_eq!(classify_line("WARNING: Retrying (1/3) after connection reset"), None);
         assert_eq!(classify_line("[download] 1.2GiB at 5MiB/s"), None);
         assert_eq!(classify_line(""), None);
+        // Routine SABR chatter (real lines from the 2026-07-22 log census —
+        // printed on every deep-rewind capture) must NOT alert…
+        assert_eq!(
+            classify_line(
+                "WARNING: Enabled live deep rewind. This feature is under development and \
+                 experimental. Unexpected behavior may occur and the integrity of the \
+                 downloaded files cannot be guaranteed."
+            ),
+            None
+        );
+        assert_eq!(classify_line("WARNING: [sabr:stream] Attempting to deep-rewind up to 12 hour(s)"), None);
+        assert_eq!(classify_line("WARNING: Requested format is not available"), None);
+        assert_eq!(classify_line("WARNING: No video formats found!"), None);
+        assert_eq!(
+            classify_line(
+                "WARNING: The current stream download is complete, however a new stream may \
+                 have started under the same video ID."
+            ),
+            None
+        );
+        assert_eq!(
+            classify_line(
+                "WARNING: [youtube] [pot:bgutil:http] Error reaching GET http://127.0.0.1:4416/ping"
+            ),
+            None
+        );
+        // …while genuinely anomalous warnings still do.
+        assert_eq!(
+            classify_line(
+                "WARNING: Detected a segment alignment mismatch across downloaded formats. \
+                 The formats may be out of sync in the merged file."
+            )
+            .unwrap()
+            .kind,
+            "tool_warning"
+        );
     }
 
     #[test]
