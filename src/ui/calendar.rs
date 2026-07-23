@@ -116,6 +116,113 @@ pub(super) fn block_safe_color(c: egui::Color32) -> egui::Color32 {
     )
 }
 
+/// Dim/desaturate an event tile's fill for a monitor that isn't set to
+/// Auto-record — blended 40% toward gray, on top of whatever alpha the
+/// caller's own hidden/hovered ladder already produced. There's no
+/// hatched/striped texture-fill anywhere in this app to reuse, and building
+/// one from scratch is riskier than extending the alpha-blend mechanism
+/// every tile painter already has.
+pub(super) fn dim_for_no_auto(c: egui::Color32) -> egui::Color32 {
+    const GRAY: u8 = 128;
+    const BLEND: f32 = 0.4;
+    let mix = |ch: u8| (ch as f32 * (1.0 - BLEND) + GRAY as f32 * BLEND) as u8;
+    egui::Color32::from_rgba_unmultiplied(mix(c.r()), mix(c.g()), mix(c.b()), c.a())
+}
+
+/// What a trigger-rule dry run against a scheduled event's own known
+/// title/game would do — mirrors `downloader::supervisor::try_begin`'s
+/// live-poll order (blacklist vetoes before whitelist is even considered).
+#[derive(Clone)]
+pub(super) enum TriggerPreview {
+    /// Neither a whitelist nor blacklist rule matches.
+    None,
+    /// A whitelist rule would force-record even with Auto off.
+    WouldFire(crate::triggers::TriggerHit),
+    /// A blacklist rule vetoes — no recording even if a whitelist rule also matched.
+    Blocked(crate::triggers::TriggerHit),
+}
+
+/// Blacklist-then-whitelist dry run against a scheduled event's KNOWN
+/// title/game. Pure — `rules`/`block_rules` are already-resolved effective
+/// rule sets (see `effective_rules`/`effective_block_rules`), so this needs
+/// no Store access and is cheap to call per event once the rule sets are
+/// resolved (once per channel/monitor, not per event — see `schedule_view`).
+pub(super) fn preview_trigger(
+    rules: &[crate::triggers::TriggerRule],
+    block_rules: &[crate::triggers::TriggerRule],
+    title: &str,
+    game: Option<&str>,
+) -> TriggerPreview {
+    let title = (!title.is_empty()).then_some(title);
+    if let Some(hit) = crate::triggers::first_match(block_rules, title, game) {
+        return TriggerPreview::Blocked(hit);
+    }
+    match crate::triggers::first_match(rules, title, game) {
+        Some(hit) => TriggerPreview::WouldFire(hit),
+        None => TriggerPreview::None,
+    }
+}
+
+/// Precomputed per-event UI signals — built once per frame in `schedule_view`
+/// (not per tile-painting call site), since resolving effective trigger
+/// rules hits the Store. Keyed by [`UpcomingStream::segment_id`].
+pub(super) struct EventSignals {
+    /// `Monitor.enabled` — the confusingly-named Auto-record flag (distinct
+    /// from `Monitor.automation_enabled`, the master on/off switch).
+    pub(super) auto: bool,
+    /// This event's own broadcast is being recorded right now.
+    pub(super) recording_now: bool,
+    pub(super) trigger: TriggerPreview,
+}
+
+impl EventSignals {
+    /// Icon prefix (with a trailing space when non-empty) for the tile's
+    /// existing icon-composition point — shared by every tile painter so
+    /// the priority order (recording-now, then trigger) stays consistent
+    /// everywhere. Reuses this app's existing icon vocabulary: ⚡ already
+    /// means "trigger" (notifications, the Streams grid's own trigger
+    /// badge). 🔴 (not ⏺) for recording-now — the month cell already uses
+    /// "⏺ rec" for a *different* signal (a Scheduled Recording rule due
+    /// that day, see `schedule_month_grid`'s day-cell badge), and reusing
+    /// the same glyph right next to it for "this broadcast is being
+    /// recorded right now" would read as the same thing when it isn't.
+    pub(super) fn icon_prefix(&self) -> String {
+        let mut s = String::new();
+        if self.recording_now {
+            s.push_str("🔴 ");
+        }
+        match &self.trigger {
+            TriggerPreview::WouldFire(_) => s.push_str("⚡ "),
+            TriggerPreview::Blocked(_) => s.push_str("🚫 "),
+            TriggerPreview::None => {}
+        }
+        s
+    }
+
+    /// Extra hover-text lines for this event's signals, appended after the
+    /// base `schedule_detail_line`/`_merged` text. Empty when nothing's
+    /// notable (Auto is on, nothing recording, no trigger rule involved).
+    pub(super) fn hover_lines(&self) -> String {
+        let mut lines = String::new();
+        if !self.auto {
+            lines.push_str("\nAuto-record: off");
+        }
+        if self.recording_now {
+            lines.push_str("\n🔴 Recording now");
+        }
+        match &self.trigger {
+            TriggerPreview::WouldFire(hit) => {
+                lines.push_str(&format!("\n⚡ Trigger would fire: {}", hit.describe()));
+            }
+            TriggerPreview::Blocked(hit) => {
+                lines.push_str(&format!("\n🚫 Blocked by blacklist: {}", hit.describe()));
+            }
+            TriggerPreview::None => {}
+        }
+        lines
+    }
+}
+
 /// Source-priority weight for auto-merge primary selection: lower = higher priority.
 /// YouTube sources beat platform (Twitch) sources because they're manually scheduled
 /// and have more accurate timing than the Twitch advance schedule.
@@ -389,6 +496,7 @@ pub(super) fn schedule_copy_menu(ui: &mut egui::Ui, s: &UpcomingStream, hidden: 
 /// One detailed schedule row (⚠ if colliding · time · platform · channel — title
 /// (category)) with a hover detail and the copy context menu. Shared by the day
 /// popup and the Day view.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn schedule_detail_row(
     ui: &mut egui::Ui,
     s: &UpcomingStream,
@@ -398,7 +506,11 @@ pub(super) fn schedule_detail_row(
     merge_label: Option<&str>,
     // The channel's shared Streams-list colour (`App::sched_color`).
     color: egui::Color32,
+    // Auto-record tint + recording-now/trigger-preview badges — see
+    // `EventSignals`. `None` when this event has no precomputed signals yet.
+    sig: Option<&EventSignals>,
 ) {
+    let stripe_color = if sig.is_some_and(|s| !s.auto) { dim_for_no_auto(color) } else { color };
     let resp = ui
         .horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 5.0;
@@ -407,12 +519,16 @@ pub(super) fn schedule_detail_row(
                 egui::vec2(3.0, ui.text_style_height(&egui::TextStyle::Body)),
                 egui::Sense::hover(),
             );
-            ui.painter().rect_filled(stripe_rect, egui::CornerRadius::same(2), color);
+            ui.painter().rect_filled(stripe_rect, egui::CornerRadius::same(2), stripe_color);
             if colliding {
                 ui.colored_label(HL_COLLISION, "⚠");
             }
             if merge_label.is_some() {
                 ui.label(egui::RichText::new("🔀").small());
+            }
+            let sig_icon = sig.map(EventSignals::icon_prefix).unwrap_or_default();
+            if !sig_icon.is_empty() {
+                ui.label(egui::RichText::new(sig_icon.trim_end()).small());
             }
             ui.label(egui::RichText::new(fmt_time_range(s.start_time, s.end_time)).monospace());
             platform_icon(ui, ptex, s.platform());
@@ -430,7 +546,8 @@ pub(super) fn schedule_detail_row(
         .response
         .interact(egui::Sense::click());
     let ml_owned = merge_label.map(str::to_string);
-    resp.on_hover_text(schedule_detail_line_merged(s, merge_label))
+    let hover_extra = sig.map(EventSignals::hover_lines).unwrap_or_default();
+    resp.on_hover_text(format!("{}{hover_extra}", schedule_detail_line_merged(s, merge_label)))
         .context_menu(|ui| schedule_copy_menu(ui, s, hidden, ml_owned.as_deref()));
 }
 
@@ -545,6 +662,9 @@ pub(super) fn schedule_time_grid(
     chan_colors: &HashMap<i64, egui::Color32>,
     // Collapse every event to a one-line chip at its start time.
     compact: bool,
+    // Auto-record tint + recording-now/trigger-preview badges — precomputed
+    // once per frame in `schedule_view`, keyed by `segment_id`.
+    signals: &HashMap<i64, EventSignals>,
 ) {
     use chrono::Timelike;
     let hour_px = SCHED_HOUR_PX * zoom;
@@ -695,6 +815,7 @@ pub(super) fn schedule_time_grid(
                     let evt_resp = ui.interact(block_rect, evt_id, egui::Sense::click());
                     let hovered = evt_resp.hovered();
 
+                    let sig = signals.get(&s.segment_id);
                     let color = chan_colors
                         .get(&s.channel_id)
                         .copied()
@@ -709,6 +830,7 @@ pub(super) fn schedule_time_grid(
                             color.r(), color.g(), color.b(), 210,
                         )
                     };
+                    let fill = if sig.is_some_and(|s| !s.auto) { dim_for_no_auto(fill) } else { fill };
                     let rounding = egui::CornerRadius::same(4);
                     painter.rect_filled(block_rect, rounding, fill);
                     // Slightly darker left edge strip for depth
@@ -768,11 +890,14 @@ pub(super) fn schedule_time_grid(
                         let badge = source_badge(&s.source).0;
                         // Prepend 🔀 if this block is a merged primary
                         let merge_icon = if merge_label.is_some() { "🔀 " } else { "" };
+                        // ⏺ recording-now / ⚡ trigger-would-fire / 🚫 blacklisted
+                        let sig_icon = sig.map(EventSignals::icon_prefix).unwrap_or_default();
                         if compact {
                             // One line, start time first: "HH:MM Channel — Title".
                             let mut line = format!(
-                                "{}{}{} {} {}",
+                                "{}{}{}{} {} {}",
                                 if is_hidden { "⊘ " } else { "" },
+                                sig_icon,
                                 merge_icon,
                                 badge,
                                 fmt_time_short(s.start_time),
@@ -791,9 +916,9 @@ pub(super) fn schedule_time_grid(
                             );
                         } else {
                         let name_str = if is_hidden {
-                            format!("⊘ {}{}{}", merge_icon, badge, s.channel_name)
+                            format!("⊘ {}{}{}{}", sig_icon, merge_icon, badge, s.channel_name)
                         } else {
-                            format!("{}{} {}", merge_icon, badge, s.channel_name)
+                            format!("{}{}{} {}", sig_icon, merge_icon, badge, s.channel_name)
                         };
                         text_painter.text(
                             egui::pos2(text_rect.left(), text_y),
@@ -826,8 +951,9 @@ pub(super) fn schedule_time_grid(
                     let block_clicked = evt_resp.clicked();
                     let ctrl_held = ui.input(|i| i.modifiers.ctrl || i.modifiers.shift);
                     let merge_label_owned = merge_label.map(str::to_string);
+                    let hover_extra = sig.map(EventSignals::hover_lines).unwrap_or_default();
                     evt_resp
-                        .on_hover_text(schedule_detail_line_merged(s, merge_label))
+                        .on_hover_text(format!("{}{hover_extra}", schedule_detail_line_merged(s, merge_label)))
                         .context_menu(|ui| schedule_copy_menu(ui, s, is_hidden, merge_label_owned.as_deref()));
                     if block_clicked {
                         if ctrl_held {
@@ -903,5 +1029,61 @@ mod tests {
         assert!(safe.g() > safe.r() && safe.g() > safe.b());
         let dark = egui::Color32::from_rgb(0x42, 0x88, 0xc4); // palette steel blue
         assert_eq!(block_safe_color(dark), dark);
+    }
+
+    fn rule(pattern: &str) -> crate::triggers::TriggerRule {
+        crate::triggers::TriggerRule { pattern: pattern.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn preview_trigger_none_when_nothing_matches() {
+        let rules = vec![rule("karaoke")];
+        assert!(matches!(
+            preview_trigger(&rules, &[], "Just chatting", None),
+            TriggerPreview::None
+        ));
+    }
+
+    #[test]
+    fn preview_trigger_would_fire_on_whitelist_match() {
+        let rules = vec![rule("karaoke")];
+        match preview_trigger(&rules, &[], "Friday Karaoke Night", None) {
+            TriggerPreview::WouldFire(hit) => assert_eq!(hit.matched, "Friday Karaoke Night"),
+            _ => panic!("expected WouldFire, got a different preview"),
+        }
+    }
+
+    #[test]
+    fn preview_trigger_blacklist_blocks_even_with_a_whitelist_match() {
+        // Same title matches BOTH lists — blacklist must win (mirrors
+        // supervisor.rs's try_begin: blacklist checked first, unconditional veto).
+        let rules = vec![rule("karaoke")];
+        let block_rules = vec![rule("rerun")];
+        match preview_trigger(&rules, &block_rules, "Karaoke rerun night", None) {
+            TriggerPreview::Blocked(hit) => assert_eq!(hit.matched, "Karaoke rerun night"),
+            _ => panic!("expected Blocked, got a different preview"),
+        }
+    }
+
+    #[test]
+    fn preview_trigger_matches_on_game_field_too() {
+        let rules = vec![crate::triggers::TriggerRule {
+            field: crate::triggers::TriggerField::Game,
+            ..rule("just chatting")
+        }];
+        match preview_trigger(&rules, &[], "unrelated title", Some("Just Chatting")) {
+            TriggerPreview::WouldFire(hit) => assert_eq!(hit.field, "game"),
+            _ => panic!("expected WouldFire on the game field, got a different preview"),
+        }
+    }
+
+    #[test]
+    fn schedule_mode_parse_defaults_to_week() {
+        assert!(ScheduleMode::parse("") == ScheduleMode::Week);
+        assert!(ScheduleMode::parse("bogus") == ScheduleMode::Week);
+        assert!(ScheduleMode::parse("month") == ScheduleMode::Month);
+        for m in ScheduleMode::ALL {
+            assert!(ScheduleMode::parse(m.as_str()) == m, "round-trip failed for {}", m.label());
+        }
     }
 }

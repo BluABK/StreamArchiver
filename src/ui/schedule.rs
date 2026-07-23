@@ -4,13 +4,54 @@
 use super::*;
 
 /// The Schedule tab's calendar granularity.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum ScheduleMode {
     Month,
+    #[default]
     Week,
     Day,
     Agenda,
 }
+
+impl ScheduleMode {
+    pub(super) const ALL: [ScheduleMode; 4] =
+        [ScheduleMode::Month, ScheduleMode::Week, ScheduleMode::Day, ScheduleMode::Agenda];
+
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            ScheduleMode::Month => "month",
+            ScheduleMode::Week => "week",
+            ScheduleMode::Day => "day",
+            ScheduleMode::Agenda => "agenda",
+        }
+    }
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            ScheduleMode::Month => "Month",
+            ScheduleMode::Week => "Week",
+            ScheduleMode::Day => "Day",
+            ScheduleMode::Agenda => "Agenda",
+        }
+    }
+
+    /// Parses a persisted value; unrecognized/empty defaults to **Week** —
+    /// the most useful "just opened the app" granularity (enough context to
+    /// see what's coming without Month's often-mostly-empty grid).
+    pub(super) fn parse(s: &str) -> ScheduleMode {
+        match s {
+            "month" => ScheduleMode::Month,
+            "day" => ScheduleMode::Day,
+            "agenda" => ScheduleMode::Agenda,
+            _ => ScheduleMode::Week,
+        }
+    }
+}
+
+/// Setting key for the default view the Schedule tab opens to (Settings →
+/// Display). Distinct from `K_SCHEDULE_COMPACT` (below) — that's a
+/// toolbar-local display toggle; this is a deliberate startup preference.
+pub(super) const K_SCHEDULE_DEFAULT_VIEW: &str = "schedule_default_view";
 
 /// Setting key for the "Compact" calendar toggle (events collapse to a
 /// one-line chip at their start time in the Week/Day views).
@@ -491,6 +532,63 @@ impl StreamArchiverApp {
         }
     }
 
+    /// Precompute [`EventSignals`] (Auto flag, "recording right now", trigger
+    /// dry-run preview) for a set of upcoming-stream entries. Trigger rules
+    /// are resolved once per distinct `(channel_id, monitor_id)` pair, not
+    /// once per event — a channel's rule set doesn't vary event to event, and
+    /// resolving it hits the Store (JSON parse). Shared by `schedule_view`
+    /// (the whole visible calendar) and the day-popup window (just that
+    /// day's handful of events) so the logic lives in exactly one place.
+    fn build_event_signals<'a>(
+        &self,
+        events: impl IntoIterator<Item = &'a UpcomingStream>,
+    ) -> HashMap<i64, EventSignals> {
+        let now = now_unix();
+        // (auto-record, automation) per monitor — automation off means
+        // detection itself never runs, so a trigger preview would be
+        // misleading; gated out below rather than shown as "would fire".
+        let auto_by_mid: HashMap<i64, (bool, bool)> = self
+            .rows
+            .iter()
+            .map(|r| (r.monitor.id, (r.monitor.enabled, r.monitor.automation_enabled)))
+            .collect();
+        let active_ids: HashSet<i64> = self.core.active.lock().unwrap().keys().copied().collect();
+        let finalizing_ids: HashSet<i64> =
+            self.core.finalizing.lock().unwrap().keys().copied().collect();
+        let mut rules_by_key: HashMap<
+            (i64, i64),
+            (Vec<crate::triggers::TriggerRule>, Vec<crate::triggers::TriggerRule>),
+        > = HashMap::new();
+        let mut out = HashMap::new();
+        for s in events {
+            let (auto, automation) =
+                auto_by_mid.get(&s.monitor_id).copied().unwrap_or((false, false));
+            let recording_now = active_ids.contains(&s.monitor_id)
+                && !finalizing_ids.contains(&s.monitor_id)
+                && now >= s.start_time
+                && s.end_time.is_none_or(|e| now < e);
+            let trigger = if automation {
+                let (rules, block_rules) =
+                    rules_by_key.entry((s.channel_id, s.monitor_id)).or_insert_with(|| {
+                        (
+                            crate::triggers::effective_rules(&self.core.store, s.channel_id, s.monitor_id),
+                            crate::triggers::effective_block_rules(
+                                &self.core.store,
+                                s.channel_id,
+                                s.monitor_id,
+                            ),
+                        )
+                    });
+                let game = (!s.category.is_empty()).then_some(s.category.as_str());
+                preview_trigger(rules, block_rules, &s.title, game)
+            } else {
+                TriggerPreview::None
+            };
+            out.insert(s.segment_id, EventSignals { auto, recording_now, trigger });
+        }
+        out
+    }
+
     /// The Schedule tab: a month/week/day calendar of all upcoming scheduled
     /// streams, with a left sidebar to filter channels and a collision highlight.
     pub(super) fn schedule_view(&mut self, ui: &mut egui::Ui) {
@@ -546,6 +644,10 @@ impl StreamArchiverApp {
         // Precompute (immutable reads of `self`) what the closures need: collisions
         // and the per-day buckets of visible streams (indices into `schedule_all`).
         let (collide, by_day, all_day_events) = self.schedule_visible_buckets();
+
+        // Auto-record tint + recording-now/trigger-preview badges for every
+        // visible event — see `build_event_signals`.
+        let signals = self.build_event_signals(self.schedule_all.iter());
 
         // Actions collected during rendering, applied after the borrowing closures.
         let mut open_day: Option<chrono::NaiveDate> = None;
@@ -610,19 +712,21 @@ impl StreamArchiverApp {
 
             match mode {
                 ScheduleMode::Month => {
-                    self.schedule_month_grid(ui, anchor, today, &by_day, &collide, &ptex, &mut open_day)
+                    self.schedule_month_grid(
+                        ui, anchor, today, &by_day, &collide, &ptex, &mut open_day, &signals,
+                    )
                 }
                 ScheduleMode::Week => {
                     self.schedule_week_grid(
                         ui, anchor, today, &by_day, &collide, &ptex, &mut open_day,
-                        &sched_rec_avatars, &all_day_events,
+                        &sched_rec_avatars, &all_day_events, &signals,
                     )
                 }
                 ScheduleMode::Day => {
-                    self.schedule_day_grid(ui, anchor, today, &by_day, &collide, &mut open_day)
+                    self.schedule_day_grid(ui, anchor, today, &by_day, &collide, &mut open_day, &signals)
                 }
                 ScheduleMode::Agenda => {
-                    self.schedule_agenda_view(ui, anchor, &by_day, &collide, &ptex, &mut open_day)
+                    self.schedule_agenda_view(ui, anchor, &by_day, &collide, &ptex, &mut open_day, &signals)
                 }
             }
         });
@@ -1371,12 +1475,15 @@ impl StreamArchiverApp {
         i: usize,
         colliding: bool,
         ptex: &PlatformTextures,
+        signals: &HashMap<i64, EventSignals>,
     ) -> egui::Response {
         let s = &self.schedule_all[i];
         let is_hidden = self.schedule_hidden_segments.contains(&s.segment_id);
         let is_selected = self.schedule_selected.contains(&s.segment_id);
         let merge_label = self.schedule_merge_labels.get(&s.segment_id).map(String::as_str);
+        let sig = signals.get(&s.segment_id);
         let color = self.sched_color(s);
+        let color = if sig.is_some_and(|s| !s.auto) { dim_for_no_auto(color) } else { color };
         let stripe_color = if is_hidden {
             egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 85)
         } else {
@@ -1399,6 +1506,10 @@ impl StreamArchiverApp {
                 }
                 if merge_label.is_some() {
                     ui.label(egui::RichText::new("🔀").small());
+                }
+                let sig_icon = sig.map(EventSignals::icon_prefix).unwrap_or_default();
+                if !sig_icon.is_empty() {
+                    ui.label(egui::RichText::new(sig_icon.trim_end()).small());
                 }
                 if colliding {
                     ui.colored_label(HL_COLLISION, "⚠");
@@ -1424,7 +1535,8 @@ impl StreamArchiverApp {
             .response
             .interact(egui::Sense::click());
         let ml_owned = merge_label.map(str::to_string);
-        let resp = resp.on_hover_text(schedule_detail_line_merged(s, merge_label));
+        let hover_extra = sig.map(EventSignals::hover_lines).unwrap_or_default();
+        let resp = resp.on_hover_text(format!("{}{hover_extra}", schedule_detail_line_merged(s, merge_label)));
         resp.context_menu(|ui| schedule_copy_menu(ui, s, is_hidden, ml_owned.as_deref()));
         resp
     }
@@ -1440,6 +1552,7 @@ impl StreamArchiverApp {
         collide: &HashSet<usize>,
         ptex: &PlatformTextures,
         open_day: &mut Option<chrono::NaiveDate>,
+        signals: &HashMap<i64, EventSignals>,
     ) {
         use chrono::Datelike;
         let month = anchor.month();
@@ -1516,6 +1629,7 @@ impl StreamArchiverApp {
                                         ptex,
                                         open_day,
                                         sched_rec_by_day.get(&day),
+                                        signals,
                                     );
                                 },
                             );
@@ -1542,6 +1656,7 @@ impl StreamArchiverApp {
         open_day: &mut Option<chrono::NaiveDate>,
         sched_rec_avatars: &HashMap<i64, egui::TextureHandle>,
         all_day_events: &[usize],
+        signals: &HashMap<i64, EventSignals>,
     ) {
         use chrono::Datelike;
         let ws = week_start(anchor);
@@ -1700,17 +1815,24 @@ impl StreamArchiverApp {
                 );
                 let evt_id = egui::Id::new("sched_allday").with(ws).with(*idx);
                 let evt_resp = ui.interact(rect, evt_id, egui::Sense::click());
+                let sig = signals.get(&s.segment_id);
                 let color = self.sched_color(s);
                 let fill = if evt_resp.hovered() {
                     color
                 } else {
                     egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 210)
                 };
+                let fill = if sig.is_some_and(|s| !s.auto) { dim_for_no_auto(fill) } else { fill };
                 painter.rect_filled(rect, egui::CornerRadius::same(4), fill);
                 let label = if s.title.is_empty() {
-                    s.channel_name.clone()
+                    format!("{}{}", sig.map(EventSignals::icon_prefix).unwrap_or_default(), s.channel_name)
                 } else {
-                    format!("{} — {}", s.channel_name, s.title)
+                    format!(
+                        "{}{} — {}",
+                        sig.map(EventSignals::icon_prefix).unwrap_or_default(),
+                        s.channel_name,
+                        s.title,
+                    )
                 };
                 painter.with_clip_rect(rect).text(
                     egui::pos2(rect.left() + 5.0 * zoom, rect.center().y),
@@ -1722,9 +1844,10 @@ impl StreamArchiverApp {
                 if evt_resp.clicked() {
                     clicked_day = Some(days[*start]);
                 }
-                evt_resp.on_hover_text(schedule_detail_line(s)).context_menu(|ui| {
-                    schedule_copy_menu(ui, s, false, None)
-                });
+                let hover_extra = sig.map(EventSignals::hover_lines).unwrap_or_default();
+                evt_resp
+                    .on_hover_text(format!("{}{hover_extra}", schedule_detail_line(s)))
+                    .context_menu(|ui| schedule_copy_menu(ui, s, false, None));
             }
             if let Some(d) = clicked_day {
                 *open_day = Some(d);
@@ -1750,6 +1873,7 @@ impl StreamArchiverApp {
             &self.schedule_merge_labels,
             &self.schedule_chan_colors,
             self.schedule_compact,
+            signals,
         );
     }
 
@@ -1763,6 +1887,7 @@ impl StreamArchiverApp {
         by_day: &HashMap<chrono::NaiveDate, Vec<usize>>,
         collide: &HashSet<usize>,
         open_day: &mut Option<chrono::NaiveDate>,
+        signals: &HashMap<i64, EventSignals>,
     ) {
         let is_today = anchor == today;
         let hdr = anchor
@@ -1795,6 +1920,7 @@ impl StreamArchiverApp {
             &self.schedule_merge_labels,
             &self.schedule_chan_colors,
             self.schedule_compact,
+            signals,
         );
     }
 
@@ -1816,6 +1942,7 @@ impl StreamArchiverApp {
         ptex: &PlatformTextures,
         open_day: &mut Option<chrono::NaiveDate>,
         sched_recs: Option<&Vec<String>>,
+        signals: &HashMap<i64, EventSignals>,
     ) {
         use chrono::Datelike;
         let in_month = day.month() == month;
@@ -1859,7 +1986,7 @@ impl StreamArchiverApp {
                 let shown = entries.len().min(max_chips);
                 for &i in &entries[..shown] {
                     let colliding = collide.contains(&i);
-                    if self.schedule_chip(ui, i, colliding, ptex).clicked() {
+                    if self.schedule_chip(ui, i, colliding, ptex, signals).clicked() {
                         *open_day = Some(day);
                     }
                 }
@@ -1891,6 +2018,7 @@ impl StreamArchiverApp {
         collide: &HashSet<usize>,
         ptex: &PlatformTextures,
         open_day: &mut Option<chrono::NaiveDate>,
+        signals: &HashMap<i64, EventSignals>,
     ) {
         let zoom = self.schedule_zoom;
         // Collect and sort the days from `anchor` forward that have visible entries.
@@ -1929,7 +2057,9 @@ impl StreamArchiverApp {
                         let s = &self.schedule_all[i];
                         let is_hidden = self.schedule_hidden_segments.contains(&s.segment_id);
                         let merge_label_agenda = self.schedule_merge_labels.get(&s.segment_id).map(String::as_str);
+                        let sig = signals.get(&s.segment_id);
                         let color = self.sched_color(s);
+                        let color = if sig.is_some_and(|s| !s.auto) { dim_for_no_auto(color) } else { color };
                         let stripe_color = if is_hidden {
                             egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 85)
                         } else {
@@ -1951,6 +2081,10 @@ impl StreamArchiverApp {
                             }
                             if merge_label_agenda.is_some() {
                                 ui.label(egui::RichText::new("🔀").small());
+                            }
+                            let sig_icon = sig.map(EventSignals::icon_prefix).unwrap_or_default();
+                            if !sig_icon.is_empty() {
+                                ui.label(egui::RichText::new(sig_icon.trim_end()).small());
                             }
 
                             // Time range
@@ -2002,7 +2136,11 @@ impl StreamArchiverApp {
                         .interact(egui::Sense::click());
 
                         let ml_agenda_owned = merge_label_agenda.map(str::to_string);
-                        let row_resp = row_resp.on_hover_text(schedule_detail_line_merged(s, merge_label_agenda));
+                        let hover_extra = sig.map(EventSignals::hover_lines).unwrap_or_default();
+                        let row_resp = row_resp.on_hover_text(format!(
+                            "{}{hover_extra}",
+                            schedule_detail_line_merged(s, merge_label_agenda)
+                        ));
                         row_resp.context_menu(|ui| schedule_copy_menu(ui, s, is_hidden, ml_agenda_owned.as_deref()));
                         if row_resp.clicked() {
                             *open_day = Some(*day);
@@ -2038,6 +2176,10 @@ impl StreamArchiverApp {
 
         let hidden_segs = self.schedule_hidden_segments.clone();
         let merge_labels = self.schedule_merge_labels.clone();
+        // Just this day's handful of entries — cheap enough to compute fresh
+        // per popup-open rather than reusing the whole-calendar `signals` map
+        // `schedule_view` builds (this window is its own render pass).
+        let signals = self.build_event_signals(entries.iter().copied());
         let mut open = true;
         let mut copy_all: Option<String> = None;
         ctx.show_viewport_immediate(
@@ -2064,7 +2206,10 @@ impl StreamArchiverApp {
                                 // surfaces ⚠ markers, so rows here are shown unmarked.
                                 let hidden = hidden_segs.contains(&s.segment_id);
                                 let ml = merge_labels.get(&s.segment_id).map(String::as_str);
-                                schedule_detail_row(ui, s, false, hidden, &ptex, ml, self.sched_color(s));
+                                schedule_detail_row(
+                                    ui, s, false, hidden, &ptex, ml, self.sched_color(s),
+                                    signals.get(&s.segment_id),
+                                );
                                 // Action button strip — writes to the same temp-data keys
                                 // that schedule_view() drains each frame.
                                 ui.horizontal(|ui| {

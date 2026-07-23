@@ -733,6 +733,8 @@ struct SettingsForm {
     date_fmt: DateFmt,
     /// chrono format string used for the compact timestamp mode (K_SHORT_TS_FMT).
     short_ts_fmt: String,
+    /// Which calendar granularity the Schedule tab opens to on launch.
+    schedule_default_view: ScheduleMode,
     /// Global extra arguments prepended to every yt-dlp invocation (all monitors).
     /// Per-monitor extra_args are appended after these, so they take precedence.
     ytdlp_default_args: String,

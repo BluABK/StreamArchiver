@@ -125,6 +125,7 @@ impl StreamArchiverApp {
                 let v = setting_or_empty(&core, K_SHORT_TS_FMT);
                 if v.is_empty() { "%d/%m %H:%M".to_string() } else { v }
             },
+            schedule_default_view: ScheduleMode::parse(&setting_or_empty(&core, K_SCHEDULE_DEFAULT_VIEW)),
             ytdlp_default_args: setting_or_empty(&core, K_YTDLP_ARGS),
             ytdlp_binary_path: setting_or_empty(&core, K_YTDLP_BINARY),
             sabr_binary_path: setting_or_empty(&core, K_SABR_BINARY),
@@ -277,6 +278,9 @@ impl StreamArchiverApp {
         // Apply the loaded date format + short-timestamp pattern before the first render.
         set_active_date_fmt(settings.date_fmt);
         set_short_ts_pattern(&settings.short_ts_fmt);
+        // `settings` is moved into the app struct below, before its own
+        // `schedule_mode:` field would otherwise be able to read it.
+        let schedule_mode = settings.schedule_default_view;
 
         let twitch_flow = Arc::new(Mutex::new(match oauth::connected_login(&core.store) {
             Some(login) => AuthFlow::Connected { login },
@@ -518,7 +522,7 @@ impl StreamArchiverApp {
             schedule_popups: Vec::new(),
             schedule_all: Vec::new(),
             schedule_loaded: false,
-            schedule_mode: ScheduleMode::Month,
+            schedule_mode,
             schedule_anchor: None,
             schedule_hidden: HashSet::new(),
             schedule_hidden_segments: HashSet::new(),
@@ -1521,6 +1525,7 @@ impl StreamArchiverApp {
             (K_FILENAME_MEDIA, s.filename_media_info.as_str()),
             (K_DATE_FORMAT, s.date_fmt.as_str()),
             (K_SHORT_TS_FMT, s.short_ts_fmt.trim()),
+            (K_SCHEDULE_DEFAULT_VIEW, s.schedule_default_view.as_str()),
             (K_YT_API_DETECT, if s.youtube_api_detect { "1" } else { "0" }),
             (K_YT_API_SCHEDULE, if s.youtube_api_schedule { "1" } else { "0" }),
             (K_YT_API_QUOTA_CUTOFF, s.youtube_api_quota_cutoff.trim()),

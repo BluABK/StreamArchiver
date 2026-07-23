@@ -1235,6 +1235,20 @@ impl StreamArchiverApp {
                     );
                     ui.text_edit_singleline(&mut self.settings.short_ts_fmt);
                     ui.end_row();
+
+                    ui.label("Default Schedule view").on_hover_text(
+                        "Which calendar granularity the Schedule tab opens to. \
+                         Applies on Save.",
+                    );
+                    let sm = &mut self.settings.schedule_default_view;
+                    egui::ComboBox::from_id_salt("schedule_default_view_cb")
+                        .selected_text(sm.label())
+                        .show_ui(ui, |ui| {
+                            for m in ScheduleMode::ALL {
+                                ui.selectable_value(sm, m, m.label());
+                            }
+                        });
+                    ui.end_row();
                 });
 
             }

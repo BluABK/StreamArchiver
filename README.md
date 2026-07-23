@@ -1767,7 +1767,9 @@ YouTube sources as the Next stream column) in a calendar, with **Month**, **Week
 
   ![Agenda view — flat date-grouped stream list](doc/screenshots/schedule-agenda-view.png)
 - **Navigation** — `◀` / `▶` step by the current view (month/week/day), **Today**
-  returns to now. Today is tinted/highlighted.
+  returns to now. Today is tinted/highlighted. Which of Month/Week/Day/Agenda
+  the tab opens to is **Settings → Display → Default Schedule view**
+  (default: Week).
 - **Right-click** any stream (chip, day list, or popup) to **copy** its URL,
   platform, title, channel, or full details, or **open it in the browser**. The
   day popup also has **Copy all**. Hover a stream for its full details.
@@ -1793,6 +1795,19 @@ YouTube sources as the Next stream column) in a calendar, with **Month**, **Week
   overlapping streams would otherwise shred the columns into slivers. Chips
   only split into side-by-side lanes when *start times* land within the same
   chip, not for the whole real duration; hover any chip for the full details.
+- **Auto-record tint**: an event whose instance isn't set to **Auto** (the
+  Streams grid's Auto column) is dimmed on every surface — Month/Week/Day
+  blocks, chips, the Agenda list, the day popup — so it's obvious at a
+  glance which upcoming streams won't actually be recorded.
+- **⚡ Trigger preview**: if a configured trigger-word rule's pattern already
+  matches the event's *known* title/game, its tile shows **⚡** (would
+  force-record even with Auto off) or **🚫** (a blacklist rule vetoes it) —
+  a way to verify a trigger rule before the stream actually goes live.
+  Hover any tile for which rule matched and why.
+- **🔴 Recording now**: a tile whose broadcast is currently being recorded
+  shows **🔴** (distinct from the month cell's own "⏺ rec" Scheduled
+  Recording badge, which means something else — a force-record rule is due
+  that day, not that a capture is in progress).
 
 Times respect the **date format** setting (12- vs 24-hour). `⟳` (or **F5** on the
 tab) **fetches the latest schedules from Twitch/YouTube right away** — it doesn't
