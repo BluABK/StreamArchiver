@@ -228,6 +228,12 @@ impl StreamArchiverApp {
                 == "branded",
             token_overrides: setting_or_empty(&core, crate::downloader::K_TOKEN_OVERRIDES),
             gap_recover: setting_or_empty(&core, crate::downloader::K_GAP_RECOVER) != "0",
+            gap_splice: setting_or_empty(&core, crate::downloader::K_GAP_SPLICE) != "0",
+            gap_splice_cleanup: crate::disposal::GapSpliceCleanup::parse(&setting_or_empty(
+                &core,
+                crate::disposal::K_GAP_SPLICE_CLEANUP,
+            ))
+            .unwrap_or_default(),
             auto_recover_muted: setting_or_empty(&core, crate::recovery::K_AUTO_RECOVER_MUTED) == "1",
             auto_recover_deleted: setting_or_empty(&core, crate::recovery::K_AUTO_RECOVER_DELETED) == "1",
             recovery_cdn_hosts: setting_or_empty(&core, crate::recovery::K_RECOVERY_CDN_HOSTS),
@@ -436,6 +442,7 @@ impl StreamArchiverApp {
             issues_errors_no_file: Vec::new(),
             issues_unmerged: Vec::new(),
             issues_head_mismatch: Vec::new(),
+            issues_gap_splice: Vec::new(),
             issues_stale_recording: Vec::new(),
             issues_stuck: Vec::new(),
             issues_muted_vod: Vec::new(),
@@ -1216,6 +1223,9 @@ impl StreamArchiverApp {
         let disposal_scope = crate::disposal::DisposalScope {
             method: form.disposal_method,
             join_cleanup: form.join_cleanup,
+            // No per-channel/instance gap-splice-cleanup override UI yet —
+            // always inherits the global setting for now.
+            gap_splice_cleanup: None,
         };
         let primary_pin = form.primary_pin;
 
@@ -1591,6 +1601,8 @@ impl StreamArchiverApp {
             (crate::downloader::K_TOKEN_STYLE, if s.token_style_branded { "branded" } else { "plain" }),
             (crate::downloader::K_TOKEN_OVERRIDES, s.token_overrides.trim()),
             (crate::downloader::K_GAP_RECOVER, if s.gap_recover { "1" } else { "0" }),
+            (crate::downloader::K_GAP_SPLICE, if s.gap_splice { "1" } else { "0" }),
+            (crate::disposal::K_GAP_SPLICE_CLEANUP, s.gap_splice_cleanup.as_str()),
             (crate::recovery::K_AUTO_RECOVER_MUTED, if s.auto_recover_muted { "1" } else { "0" }),
             (crate::recovery::K_AUTO_RECOVER_DELETED, if s.auto_recover_deleted { "1" } else { "0" }),
             (crate::recovery::K_RECOVERY_CDN_HOSTS, s.recovery_cdn_hosts.trim()),

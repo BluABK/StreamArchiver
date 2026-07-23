@@ -164,6 +164,21 @@ impl Supervisor {
             }
             return;
         };
+        // Match the live capture's own rendition, not Twitch's default
+        // `chunked`/source — a patch at a different resolution/codec than
+        // the capture can never pass gap-splice's compatibility gate (see
+        // `refetch_head_matching_live`, the exact same technique used to
+        // fix a head/live mismatch). Falls back to source (`found.url`
+        // unchanged) if the capture won't probe — recovery still proceeds
+        // either way, just without the quality match.
+        let playlist_url = match probe_media(&rec.output_path).await {
+            Some(live) => {
+                let fps: f64 = live.fps.parse().unwrap_or(0.0);
+                let quality = format!("{}p{}", live.height, fps.round() as i64);
+                crate::recovery::playlist_at_quality(&client, &found, &quality, max_conc).await
+            }
+            None => found.url.clone(),
+        };
 
         // In-flight the output dir may not exist yet (the capture lives in
         // `.sa-cache\` until promote) — create it for the patch files.
@@ -191,7 +206,7 @@ impl Supervisor {
             };
             let playlist = match crate::recovery::build_playlist(
                 &client,
-                &found.url,
+                &playlist_url,
                 max_conc,
                 false,
                 Some(len),
@@ -278,5 +293,9 @@ impl Supervisor {
         } else {
             finish(crate::events::TaskOutcome::Failed(note));
         }
+        // Every range this job could act on just settled (done or given up
+        // for good) — see if the take is now ready for a gapless splice.
+        // Cheap no-op unless every precondition actually holds.
+        self.maybe_spawn_gap_splice(rec_id);
     }
 }

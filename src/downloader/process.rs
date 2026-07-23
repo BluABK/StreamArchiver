@@ -175,6 +175,7 @@ pub(super) fn recording_from_detached(row: &DetachedRow) -> Recording {
         full_path: None,
         trigger_info: String::new(),
         head_backfill_state: String::new(),
+        gap_splice_state: String::new(),
         trigger_rule_json: String::new(),
     }
 }
@@ -1197,6 +1198,8 @@ impl Supervisor {
                 }
                 // Final lost-segment sweep (no-op without pending ranges).
                 self.maybe_spawn_gap_recover(row.ref_id, true);
+                // See the equivalent call in supervisor.rs's finalize_recording.
+                self.maybe_spawn_gap_splice(row.ref_id);
                 // Join a backfilled head with the adopted capture (no-op without one).
                 {
                     let this = self.clone();
@@ -1630,6 +1633,10 @@ impl Supervisor {
         self.schedule_vod_check(rec_id, row.monitor.platform(), status, &row.monitor.url, rec.went_live_at, rec.went_live_approx);
         // Final lost-segment sweep (no-op without pending ranges).
         self.maybe_spawn_gap_recover(rec_id, true);
+        // See the equivalent call in supervisor.rs's finalize_recording for
+        // why this needs to run here too, not just from gap_recover_job's
+        // own post-loop check.
+        self.maybe_spawn_gap_splice(rec_id);
         {
             let this = self.clone();
             tokio::spawn(async move { this.maybe_concat_backfill(rec_id).await });

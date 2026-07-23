@@ -2532,6 +2532,13 @@ pub struct Recording {
     /// `head_backfill_job`'s ~2 minute settle wait before it does anything
     /// visible (see `downloader::HEAD_BACKFILL_SETTLE_SECS`).
     pub head_backfill_state: String,
+    /// `""` (not attempted), `"queued"`, `"done"` (terminal — never
+    /// re-attempted even if a new gap range is discovered later),
+    /// `"mismatch"`/`"anchor_failed"`/`"verify_failed"` (which gap-splice
+    /// safety check blocked it), or a `"*_ack"` dismissed variant. Mirrors
+    /// `head_backfill_state`'s exact shape for the analogous gap-splice
+    /// feature — see `downloader::gap_splice`.
+    pub gap_splice_state: String,
     /// The exact [`crate::triggers::TriggerRule`] (serde JSON) that started
     /// this recording, frozen at start time — empty = not trigger-started, or
     /// started by a trigger with no `lead_secs`/`stop_on_unmatch` behavior.
@@ -3007,6 +3014,7 @@ mod tests {
             full_path: None,
             trigger_info: String::new(),
             head_backfill_state: String::new(),
+            gap_splice_state: String::new(),
             trigger_rule_json: String::new(),
         }
     }

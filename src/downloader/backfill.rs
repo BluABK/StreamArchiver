@@ -277,7 +277,7 @@ impl Supervisor {
             Some(live) => {
                 crate::recovery::first_segment_start_secs(&client, &playlist_url, max_conc, &cache)
                     .await
-                    .and_then(|seg0| pts_capture_offset(live, seg0, join_estimate as f64))
+                    .and_then(|seg0| pts_capture_offset(live, seg0, join_estimate as f64, 60.0))
             }
             None => None,
         };

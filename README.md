@@ -1094,12 +1094,44 @@ stream, so an in-flight fetch gets the audio intact. Anything left over is
 swept at finalize and again at every startup while pending ranges remain
 (the CDN window is ~60 days, so even a long downtime doesn't forfeit the
 data). Each range lands as a **patch file next to the recording**
-(`{stem}.recovered-1h44m24s+36s.mkv`, source quality) — v1 does not splice
-patches into the main MKV; for a seamless single file use the post-stream
-**VOD download** feature. Ranges whose clean segments are already gone fall
-back to the **DMCA-muted copies** (video intact, audio silenced — a muted
-patch beats no patch): those files carry a `-muted` filename tag and the
-Warnings row says *"✂ N recovered segments use DMCA-muted audio"*.
+(`{stem}.recovered-1h44m24s+36s.mkv`, source quality). Ranges whose clean
+segments are already gone fall back to the **DMCA-muted copies** (video
+intact, audio silenced — a muted patch beats no patch): those files carry a
+`-muted` filename tag and the Warnings row says *"✂ N recovered segments use
+DMCA-muted audio"*.
+
+**Gap splice (one seamless file).** Once a take is finished and every one of
+its gap ranges has settled (recovered or given up on), the app can
+automatically stitch the recovered patches back into the main recording —
+one gapless MKV instead of a base file plus sibling patches. This is
+correctness-critical (a bad splice would silently corrupt the recording), so
+every step fails safe to "leave the patches as untouched sibling files,
+exactly like before splicing existed" rather than guess:
+- Only runs once the take is fully `completed` and isn't awaiting a
+  head+live join; recordings stitched from more than one crash/reconnect
+  leg are skipped entirely (no reliable shared timeline to anchor to).
+- The exact splice point is computed from the capture's own MPEG-TS PTS
+  clock (the same anchor technique used for head+live join), not wall-clock
+  math — self-correcting across multiple earlier gaps in the same take.
+- A codec-compatibility check (resolution/fps/codecs) must pass across the
+  recording and every patch, and the gap-recovery fetch now matches the
+  live capture's own quality rendition so this actually lines up.
+- After the ffmpeg concat, **every seam is individually re-probed** to
+  confirm it landed where intended (not just an aggregate duration check —
+  a keyframe-snap error on one cut can hide behind a compensating error on
+  another), plus a total-duration sanity check.
+- The result is built at a brand-new path and verified before the
+  recording is ever re-pointed at it; the pre-splice file and consumed
+  patches are only touched afterward, and only per the **Gap splice
+  cleanup** setting (Settings → Downloads → Twitch VOD recovery), which
+  defaults to **Keep** (nothing deleted until you opt in) — same
+  Trash/Recycle-Bin disposal path as every other cleanup setting.
+- If any check fails or is uncertain, the take is left exactly as-is and
+  flagged in the **Issues** panel (🩹 *Recovered gap patches couldn't be
+  spliced in*) explaining which check blocked it, with a button to open the
+  patch folder and a Dismiss action.
+- Toggle: Settings → Downloads → Twitch VOD recovery → *Splice recovered
+  gaps into a gapless file* (default on).
 
 **Past streams too.** At startup a **retro sweep** scans the existing
 capture logs (`logs\captures\`, 7-day retention) for takes that lost data

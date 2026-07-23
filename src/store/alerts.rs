@@ -413,6 +413,28 @@ impl Store {
         Ok(())
     }
 
+    /// Recordings whose gap ranges have all settled (`done`/`failed`, none
+    /// left `pending`/`fetching`), have at least one `done` range to splice,
+    /// and haven't been resolved by gap-splice yet (`gap_splice_state = ''`)
+    /// — the startup sweep uses this to catch anything a restart interrupted
+    /// before it could kick off. `maybe_spawn_gap_splice` re-checks every
+    /// other precondition itself; this is just a candidate list.
+    pub fn recordings_needing_gap_splice_check(&self) -> Result<Vec<i64>> {
+        let conn = self.db();
+        let mut st = conn.prepare(
+            "SELECT r.id FROM recording r
+             WHERE r.gap_splice_state = ''
+               AND r.status = 'completed'
+               AND EXISTS (SELECT 1 FROM gap_range g WHERE g.recording_id = r.id AND g.state = 'done')
+               AND NOT EXISTS (
+                   SELECT 1 FROM gap_range g
+                   WHERE g.recording_id = r.id AND g.state IN ('pending', 'fetching')
+               )",
+        )?;
+        let rows = st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Recordings that still have pending gap ranges — the finalize-time and
     /// startup sweeps use this to resume unfinished recovery.
     pub fn recordings_with_pending_gaps(&self) -> Result<Vec<i64>> {

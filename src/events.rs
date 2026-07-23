@@ -51,6 +51,9 @@ pub enum BackgroundTaskKind {
     /// from the VOD CDN into sibling patch files. Carries the recording id
     /// (job-row matching, mirrors `HeadBackfill`).
     GapRecover(i64),
+    /// Splicing recovered gap patches into the take's main file so the
+    /// result is gapless. Carries the recording id (mirrors `GapRecover`).
+    GapSplice(i64),
 }
 
 impl BackgroundTaskKind {
@@ -72,6 +75,7 @@ impl BackgroundTaskKind {
             BackgroundTaskKind::RefreshCdnHosts => "Refresh CDN hosts",
             BackgroundTaskKind::HeadBackfill(_) => "Head backfill",
             BackgroundTaskKind::GapRecover(_) => "Gap recovery",
+            BackgroundTaskKind::GapSplice(_) => "Gap splice",
         }
     }
 }

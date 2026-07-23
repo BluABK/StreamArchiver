@@ -199,6 +199,39 @@ impl Store {
         Ok(())
     }
 
+    /// Set/clear a recording's gap-splice state — see
+    /// [`crate::models::Recording::gap_splice_state`].
+    pub fn set_gap_splice_state(&self, id: i64, state: &str) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE recording SET gap_splice_state=?2 WHERE id=?1",
+            params![id, state],
+        )?;
+        Ok(())
+    }
+
+    /// How many recording rows share `id`'s `take_group` (including itself)
+    /// — `1` for a solo take or one with no take_group at all. Gap-splice's
+    /// split-part exclusion: a take stitched from more than one leg
+    /// (crash/reconnect) has no guarantee `capture_start_pts` (anchored to
+    /// leg 1 only) still describes the file gap-splice would operate on.
+    pub fn recording_take_group_size(&self, id: i64) -> Result<i64> {
+        let conn = self.db();
+        let take_group: Option<String> = conn
+            .query_row("SELECT take_group FROM recording WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()?
+            .flatten();
+        let Some(tg) = take_group.filter(|s| !s.is_empty()) else {
+            return Ok(1);
+        };
+        conn.query_row(
+            "SELECT COUNT(*) FROM recording WHERE take_group = ?1",
+            params![tg],
+            |r| r.get(0),
+        )
+        .map_err(Into::into)
+    }
+
     /// Takes currently awaiting a head-backfill decision (still inside
     /// `head_backfill_job`'s settle wait / probing), oldest first — feeds the
     /// Background view's "Planned" section.
@@ -676,7 +709,8 @@ impl Store {
                     recovery_state, recovered_path,
                     vod_dl_state, vod_dl_path, vod_dl_video_id,
                     backfill_path, full_path, COALESCE(trigger_info, ''),
-                    head_backfill_state, COALESCE(trigger_rule_json, ''), vod_views
+                    head_backfill_state, COALESCE(trigger_rule_json, ''), vod_views,
+                    gap_splice_state
              FROM recording WHERE monitor_id = ?1 ORDER BY started_at, id",
         )?;
         let rows = stmt
@@ -716,6 +750,7 @@ impl Store {
                     head_backfill_state: r.get(31)?,
                     trigger_rule_json: r.get(32)?,
                     vod_views: r.get(33)?,
+                    gap_splice_state: r.get(34)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -742,7 +777,8 @@ impl Store {
             recovery_state, recovered_path,
             vod_dl_state, vod_dl_path, vod_dl_video_id,
             backfill_path, full_path, COALESCE(trigger_info, ''),
-            head_backfill_state, COALESCE(trigger_rule_json, ''), vod_views";
+            head_backfill_state, COALESCE(trigger_rule_json, ''), vod_views,
+            gap_splice_state";
 
     fn map_recording_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::models::Recording> {
         Ok(crate::models::Recording {
@@ -780,6 +816,7 @@ impl Store {
             head_backfill_state: r.get(31)?,
             trigger_rule_json: r.get(32)?,
             vod_views: r.get(33)?,
+            gap_splice_state: r.get(34)?,
         })
     }
 
@@ -849,6 +886,26 @@ impl Store {
         Ok(rows)
     }
 
+    /// Recordings whose gap-splice attempt was blocked by a safety check
+    /// (codec mismatch, an untrustworthy PTS anchor, or a failed post-splice
+    /// verification) — never a state a user needs to act on urgently (the
+    /// recording is intact either way), but surfaced in Issues so a
+    /// permanently-unspliced gap patch isn't a silent dead end. Listed
+    /// newest-first.
+    pub fn recordings_with_gap_splice_issue(&self) -> Result<Vec<crate::models::Recording>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM recording
+             WHERE gap_splice_state IN ('mismatch', 'anchor_failed', 'verify_failed')
+             ORDER BY started_at DESC",
+            Self::RECORDING_FULL_COLUMNS
+        ))?;
+        let rows = stmt
+            .query_map([], Self::map_recording_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Recordings whose output path is still a `.ts` file inside a `.cache`
     /// directory — these finished capturing but were never successfully remuxed
     /// to the final MKV container. Listed newest-first.
@@ -899,6 +956,7 @@ impl Store {
                     full_path: None,
                     trigger_info: String::new(),
                     head_backfill_state: String::new(),
+                    gap_splice_state: String::new(),
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -961,6 +1019,7 @@ impl Store {
                     full_path: None,
                     trigger_info: String::new(),
                     head_backfill_state: String::new(),
+                    gap_splice_state: String::new(),
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1046,6 +1105,7 @@ impl Store {
                     full_path: None,
                     trigger_info: String::new(),
                     head_backfill_state: String::new(),
+                    gap_splice_state: String::new(),
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1123,6 +1183,7 @@ impl Store {
                     full_path: None,
                     trigger_info: String::new(),
                     head_backfill_state: String::new(),
+                    gap_splice_state: String::new(),
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1181,6 +1242,7 @@ impl Store {
                     full_path: None,
                     trigger_info: String::new(),
                     head_backfill_state: String::new(),
+                    gap_splice_state: String::new(),
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1377,6 +1439,7 @@ impl Store {
                     full_path: None,
                     trigger_info: String::new(),
                     head_backfill_state: String::new(),
+                    gap_splice_state: String::new(),
                     trigger_rule_json: String::new(),
                 })
             })?

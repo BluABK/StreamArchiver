@@ -609,12 +609,30 @@ pub async fn first_segment_start_secs(
     max_conc: usize,
     scratch_dir: &Path,
 ) -> Option<f64> {
-    // 0.5s cap keeps exactly the first segment (the cut lands one segment over).
-    let pl = build_playlist(client, playlist_url, max_conc, false, Some(0.5), None).await.ok()?;
+    segment_start_secs_at(client, playlist_url, max_conc, scratch_dir, 0.0).await
+}
+
+/// Same technique as [`first_segment_start_secs`], generalized to the
+/// segment sitting at broadcast-relative `skip_secs` into the playlist
+/// instead of always the very first one — the gap-splice anchor: probes the
+/// broadcast-timeline PTS of the segment nearest a gap's start/end so
+/// `downloader::pts_gap_position` can locate that gap within the local
+/// capture's own timeline. `0.0` behaves exactly like
+/// [`first_segment_start_secs`].
+pub async fn segment_start_secs_at(
+    client: &reqwest::Client,
+    playlist_url: &str,
+    max_conc: usize,
+    scratch_dir: &Path,
+    skip_secs: f64,
+) -> Option<f64> {
+    // 0.5s cap keeps exactly one segment (the cut lands one segment over).
+    let skip = (skip_secs > 0.0).then_some(skip_secs);
+    let pl = build_playlist(client, playlist_url, max_conc, false, Some(0.5), skip).await.ok()?;
     if pl.present == 0 {
         return None;
     }
-    let tmp = scratch_dir.join("seg0-pts-probe.m3u8");
+    let tmp = scratch_dir.join(format!("seg-pts-probe-{}.m3u8", skip_secs.round() as i64));
     crate::iomon::fs::write(crate::iomon::Cat::Recovery, &tmp, &pl.text).await.ok()?;
     let pts = crate::downloader::media_start_time_secs(&tmp).await;
     let _ = crate::iomon::fs::remove_file(crate::iomon::Cat::Recovery, &tmp).await;

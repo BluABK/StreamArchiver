@@ -416,6 +416,9 @@ impl StreamArchiverApp {
                 let disposal_scope = crate::disposal::DisposalScope {
                     method: f.disposal_method,
                     join_cleanup: f.join_cleanup,
+                    // No per-channel/instance gap-splice-cleanup override UI
+                    // yet — always inherits the global setting for now.
+                    gap_splice_cleanup: None,
                 };
                 let res = match id_opt {
                     Some(id) => self

@@ -29,6 +29,7 @@ pub const K_DISPOSAL_METHOD: &str = "disposal_method";
 pub const K_TRASH_DIRS: &str = "disposal_trash_dirs";
 /// Global default: what happens to the head/live parts once `full.mkv` lands.
 pub const K_JOIN_CLEANUP: &str = "join_cleanup";
+pub const K_GAP_SPLICE_CLEANUP: &str = "gap_splice_cleanup";
 /// Per-channel scope-config map (`{channel_id -> DisposalScope}`).
 pub const K_CHANNEL_DISPOSAL_SCOPE: &str = "channel_disposal_scope";
 /// Per-monitor scope-config map (`{monitor_id -> DisposalScope}`).
@@ -120,6 +121,50 @@ impl JoinCleanup {
     }
 }
 
+/// What happens to the pre-splice original + consumed gap patches once a
+/// verified gapless splice lands — same 3-tier shape as [`JoinCleanup`],
+/// named for this context.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GapSpliceCleanup {
+    /// Keep the pre-splice original + patch files alongside the gapless
+    /// result (nothing auto-deleted — the default).
+    #[default]
+    Keep,
+    /// Dispose of the consumed patch files; keep the pre-splice original.
+    Patches,
+    /// Dispose of patch files AND the pre-splice original; the take's main
+    /// file becomes the gapless splice (its `output_path` is re-pointed).
+    Both,
+}
+
+impl GapSpliceCleanup {
+    pub const ALL: [GapSpliceCleanup; 3] =
+        [GapSpliceCleanup::Keep, GapSpliceCleanup::Patches, GapSpliceCleanup::Both];
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GapSpliceCleanup::Keep => "keep",
+            GapSpliceCleanup::Patches => "patches",
+            GapSpliceCleanup::Both => "both",
+        }
+    }
+    pub fn parse(s: &str) -> Option<GapSpliceCleanup> {
+        match s.trim() {
+            "keep" => Some(GapSpliceCleanup::Keep),
+            "patches" => Some(GapSpliceCleanup::Patches),
+            "both" => Some(GapSpliceCleanup::Both),
+            _ => None,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            GapSpliceCleanup::Keep => "Keep original + patches",
+            GapSpliceCleanup::Patches => "Delete consumed patches",
+            GapSpliceCleanup::Both => "Delete patches + pre-splice original",
+        }
+    }
+}
+
 // ---------- three-level scope config (clone of HeadBackfillScope) ----------
 
 /// A channel- or monitor-level override. `None` on a field means "inherit the
@@ -130,13 +175,15 @@ pub struct DisposalScope {
     pub method: Option<DisposalMethod>,
     #[serde(default)]
     pub join_cleanup: Option<JoinCleanup>,
+    #[serde(default)]
+    pub gap_splice_cleanup: Option<GapSpliceCleanup>,
 }
 
 impl DisposalScope {
     /// True when this scope overrides nothing — persisted as a removal so the
     /// map only holds real overrides.
     pub fn is_inherit(&self) -> bool {
-        self.method.is_none() && self.join_cleanup.is_none()
+        self.method.is_none() && self.join_cleanup.is_none() && self.gap_splice_cleanup.is_none()
     }
 }
 
@@ -209,6 +256,15 @@ pub fn global_join_cleanup(store: &Store) -> JoinCleanup {
         .unwrap_or_default()
 }
 
+pub fn global_gap_splice_cleanup(store: &Store) -> GapSpliceCleanup {
+    store
+        .get_setting(K_GAP_SPLICE_CLEANUP)
+        .ok()
+        .flatten()
+        .and_then(|s| GapSpliceCleanup::parse(&s))
+        .unwrap_or_default()
+}
+
 /// Monitor override over channel override over the global default.
 pub fn effective_method_from(
     global: DisposalMethod,
@@ -244,6 +300,28 @@ pub fn effective_join_cleanup(store: &Store, channel_id: i64, monitor_id: i64) -
     let ch = load_channel_disposal_scope(store, channel_id);
     let mon = load_monitor_disposal_scope(store, monitor_id);
     effective_join_cleanup_from(global_join_cleanup(store), Some(&ch), Some(&mon))
+}
+
+pub fn effective_gap_splice_cleanup_from(
+    global: GapSpliceCleanup,
+    channel_scope: Option<&DisposalScope>,
+    monitor_scope: Option<&DisposalScope>,
+) -> GapSpliceCleanup {
+    monitor_scope
+        .and_then(|s| s.gap_splice_cleanup)
+        .or_else(|| channel_scope.and_then(|s| s.gap_splice_cleanup))
+        .unwrap_or(global)
+}
+
+/// Store-hitting resolver for one channel+monitor pair.
+pub fn effective_gap_splice_cleanup(
+    store: &Store,
+    channel_id: i64,
+    monitor_id: i64,
+) -> GapSpliceCleanup {
+    let ch = load_channel_disposal_scope(store, channel_id);
+    let mon = load_monitor_disposal_scope(store, monitor_id);
+    effective_gap_splice_cleanup_from(global_gap_splice_cleanup(store), Some(&ch), Some(&mon))
 }
 
 // ---------- executing a disposal ----------
@@ -377,7 +455,11 @@ mod tests {
         assert_eq!(DisposalMethod::parse("bogus"), None);
         assert_eq!(JoinCleanup::parse(""), None);
         // Scope JSON keeps the lowercase strings (what the settings blob stores).
-        let s = DisposalScope { method: Some(DisposalMethod::Trash), join_cleanup: Some(JoinCleanup::Both) };
+        let s = DisposalScope {
+            method: Some(DisposalMethod::Trash),
+            join_cleanup: Some(JoinCleanup::Both),
+            gap_splice_cleanup: None,
+        };
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("\"trash\"") && json.contains("\"both\""), "{json}");
         assert_eq!(serde_json::from_str::<DisposalScope>(&json).unwrap(), s);
@@ -386,8 +468,16 @@ mod tests {
 
     #[test]
     fn precedence_monitor_over_channel_over_global() {
-        let ch = DisposalScope { method: Some(DisposalMethod::Delete), join_cleanup: None };
-        let mon = DisposalScope { method: Some(DisposalMethod::Trash), join_cleanup: Some(JoinCleanup::Head) };
+        let ch = DisposalScope {
+            method: Some(DisposalMethod::Delete),
+            join_cleanup: None,
+            gap_splice_cleanup: None,
+        };
+        let mon = DisposalScope {
+            method: Some(DisposalMethod::Trash),
+            join_cleanup: Some(JoinCleanup::Head),
+            gap_splice_cleanup: None,
+        };
         assert_eq!(
             effective_method_from(DisposalMethod::Recycle, Some(&ch), Some(&mon)),
             DisposalMethod::Trash
@@ -420,7 +510,7 @@ mod tests {
         save_monitor_disposal_scope(
             &store,
             1,
-            &DisposalScope { method: None, join_cleanup: Some(JoinCleanup::Keep) },
+            &DisposalScope { method: None, join_cleanup: Some(JoinCleanup::Keep), gap_splice_cleanup: None },
         )
         .unwrap();
         assert_eq!(effective_join_cleanup(&store, 1, 1), JoinCleanup::Keep);

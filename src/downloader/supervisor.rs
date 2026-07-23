@@ -35,6 +35,7 @@ impl Supervisor {
             stopping_monitors: Arc::new(Mutex::new(HashSet::new())),
             stall_killed: Arc::new(Mutex::new(HashSet::new())),
             gap_jobs: Arc::new(Mutex::new(HashSet::new())),
+            gap_splice_jobs: Arc::new(Mutex::new(HashSet::new())),
             blocked_notified: Arc::new(Mutex::new(HashMap::new())),
             active_chats,
             stopping_chats: Arc::new(Mutex::new(HashSet::new())),
@@ -3457,6 +3458,12 @@ progress_info: None,
         // get (VOD lag, resolve failures) is fetchable now that the take is
         // over. No-op without pending ranges.
         self.maybe_spawn_gap_recover(rec_id, true);
+        // Covers the ordering gap_recover_job's own post-loop call can't:
+        // every gap range may have ALREADY gone terminal while this take was
+        // still recording (fast in-flight recovery), in which case no later
+        // range-transition event fires to catch it — status just flipped to
+        // "completed" right above, so check now. Cheap no-op otherwise.
+        self.maybe_spawn_gap_splice(rec_id);
         // Join a backfilled head with the finished capture (no-op without one).
         {
             let this = self.clone();

@@ -1311,7 +1311,23 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 65)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 65);
+        if version < 66 {
+            // Gap-splice state — mirrors `head_backfill_state` (v53) exactly:
+            // "" = not attempted (also the required precondition for the
+            // splice trigger), "queued", "done" (terminal — never
+            // re-attempted even if a new gap range is discovered later),
+            // "mismatch"/"anchor_failed"/"verify_failed" (which safety check
+            // blocked it — distinct values so the Issues hover text can say
+            // which one), "*_ack" for user-dismissed variants.
+            conn.execute_batch(
+                "ALTER TABLE recording ADD COLUMN gap_splice_state TEXT NOT NULL DEFAULT '';
+                 CREATE INDEX IF NOT EXISTS idx_recording_gap_splice_issue
+                     ON recording(gap_splice_state)
+                     WHERE gap_splice_state NOT IN ('', 'done', 'queued');",
+            )?;
+            conn.pragma_update(None, "user_version", 66)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 66);
         Ok(())
     }
 }

@@ -156,6 +156,7 @@ mod backfill;
 mod cache;
 mod finalize;
 mod gap_recover;
+mod gap_splice;
 mod lock_culprit;
 mod naming;
 mod plan;
@@ -166,10 +167,11 @@ mod tools;
 mod vod;
 
 #[allow(unused_imports)]
-use {ad_probe::*, alerts::*, backfill::*, gap_recover::*, supervisor::*, vod::*};
+use {ad_probe::*, alerts::*, backfill::*, gap_recover::*, gap_splice::*, supervisor::*, vod::*};
 pub use alerts::alert_category;
 pub use ad_probe::K_AD_PROBE;
 pub use gap_recover::K_GAP_RECOVER;
+pub use gap_splice::K_GAP_SPLICE;
 #[allow(unused_imports)]
 use lock_culprit::*;
 pub use cache::*;
@@ -198,20 +200,29 @@ fn compute_missed_secs(went_live_at: i64, started_at: i64, captured: Option<i64>
 /// One MPEG-TS 33-bit PTS wrap (2^33 ticks at 90 kHz), ≈ 26.5 hours.
 const MPEGTS_PTS_WRAP_SECS: f64 = 8_589_934_592.0 / 90_000.0;
 
-/// The exact stream position (seconds since go-live) where the live capture's
-/// first frame sits, derived from PTS instead of wall-clock arithmetic:
-/// Twitch's live segments and DVR-playlist segments share the broadcast's own
-/// MPEG-TS timeline, so `capture start_time − DVR segment-0 start_time` is the
-/// precise head/live splice point. The wall-clock `estimate` (today's
-/// `compute_missed_secs` result) systematically overshoots it by the broadcast
-/// latency (~5-15s), duplicating that much media at the `full.mkv` seam.
+/// The exact stream position (seconds since go-live) of a point whose raw
+/// MPEG-TS PTS is `live_start`, derived from PTS instead of wall-clock
+/// arithmetic: Twitch's live segments and DVR-playlist segments share the
+/// broadcast's own MPEG-TS timeline, so `live_start − seg_start` (seg_start
+/// being the PTS of a DVR-playlist segment at a known broadcast position) is
+/// the precise splice point. The wall-clock `estimate` systematically
+/// overshoots by the broadcast latency (~5-15s) — for the head/live join
+/// this used to duplicate that much media at the `full.mkv` seam.
 ///
-/// `None` when the PTS delta disagrees with the estimate by more than 60s —
-/// that rejects a wrong-timeline pairing wholesale: a remuxed capture whose
-/// timestamps were reset to ~0, a non-TS container, a PTS discontinuity, or a
-/// wrap we can't attribute. A single 33-bit wrap (streams > 26.5h) is
-/// corrected for before the check.
-fn pts_capture_offset(live_start: f64, seg0_start: f64, estimate_secs: f64) -> Option<f64> {
+/// `None` when the PTS delta disagrees with the estimate by more than
+/// `tolerance_secs` — that rejects a wrong-timeline pairing wholesale: a
+/// remuxed capture whose timestamps were reset to ~0, a non-TS container, a
+/// PTS discontinuity, or a wrap we can't attribute. A single 33-bit wrap
+/// (streams > 26.5h) is corrected for before the check. Head/live join
+/// (`backfill.rs`) uses a loose 60s tolerance (a multi-minute head has
+/// plenty of slack); gap-splice needs a much tighter one — a gap is often
+/// only seconds long, so there is no slack to absorb a wrong answer.
+fn pts_capture_offset(
+    live_start: f64,
+    seg0_start: f64,
+    estimate_secs: f64,
+    tolerance_secs: f64,
+) -> Option<f64> {
     if !live_start.is_finite() || !seg0_start.is_finite() {
         return None;
     }
@@ -225,8 +236,34 @@ fn pts_capture_offset(live_start: f64, seg0_start: f64, estimate_secs: f64) -> O
     if (wrapped - estimate_secs).abs() < (delta - estimate_secs).abs() {
         delta = wrapped;
     }
-    ((delta - estimate_secs).abs() <= 60.0).then_some(delta)
+    ((delta - estimate_secs).abs() <= tolerance_secs).then_some(delta)
 }
+
+/// Position (seconds) within a capture's OWN file timeline where
+/// broadcast-relative time `target_secs` falls — the gap-splice anchor,
+/// same PTS-diffing technique as `pts_capture_offset` generalized to an
+/// arbitrary mid-stream target instead of always the capture's own start.
+/// `capture_start_pts` is the capture's own raw PTS at its t=0
+/// (`Recording::capture_start_pts`); `target_pts` is the PTS of a
+/// DVR-playlist segment sitting at the target broadcast position (see
+/// `recovery::segment_start_secs_at`). Because both values are on the
+/// broadcast's own encoder-assigned PTS clock — which reflects true elapsed
+/// broadcast time regardless of what the local capture did or didn't
+/// successfully write — this is correct across any number of EARLIER gaps
+/// in the same capture with no extra cumulative-offset bookkeeping.
+/// `estimate_secs`/`tolerance_secs`: same wall-clock cross-check as
+/// `pts_capture_offset` — callers should pass a tight tolerance here (a gap
+/// is often only seconds long, with no slack to absorb a wrong answer,
+/// unlike the head-join case).
+pub(super) fn pts_gap_position(
+    capture_start_pts: f64,
+    target_pts: f64,
+    estimate_secs: f64,
+    tolerance_secs: f64,
+) -> Option<f64> {
+    pts_capture_offset(target_pts, capture_start_pts, estimate_secs, tolerance_secs)
+}
+
 #[derive(Clone)]
 pub struct Supervisor {
     store: Arc<Store>,
@@ -317,6 +354,10 @@ pub struct Supervisor {
     /// rec_ids with a lost-segment recovery job in flight (the log scanner and
     /// the finalize sweep both spawn `gap_recover_job`; first caller wins).
     gap_jobs: Arc<Mutex<HashSet<i64>>>,
+    /// rec_ids with a gap-splice job in flight — `maybe_spawn_gap_splice` is
+    /// called speculatively from several places (see its own doc comment);
+    /// first caller wins, same shape as `gap_jobs`/`running_concats`.
+    gap_splice_jobs: Arc<Mutex<HashSet<i64>>>,
 }
 
 /// Why automatic restarts are suppressed for a monitor after a user Stop.
@@ -592,12 +633,12 @@ mod tests {
     fn pts_capture_offset_exact_within_sanity_window() {
         // The Octopimp case: wall-clock said 377s missed, PTS says the capture
         // actually joined at 371.4s -- the ~6s broadcast-latency overshoot.
-        let got = pts_capture_offset(371.433, 0.033, 377.0).unwrap();
+        let got = pts_capture_offset(371.433, 0.033, 377.0, 60.0).unwrap();
         assert!((got - 371.4).abs() < 0.01);
 
         // DVR playlists whose timeline doesn't start at ~0 still work -- only
         // the delta matters.
-        let got = pts_capture_offset(1500.0, 1128.6, 377.0).unwrap();
+        let got = pts_capture_offset(1500.0, 1128.6, 377.0, 60.0).unwrap();
         assert!((got - 371.4).abs() < 0.01);
     }
 
@@ -605,13 +646,13 @@ mod tests {
     fn pts_capture_offset_rejects_wrong_timelines() {
         // Remuxed MKV (timestamps reset to ~0) probed by mistake: delta ~0
         // vs an estimate of 377s -> rejected, caller falls back to wall-clock.
-        assert_eq!(pts_capture_offset(0.0, 0.033, 377.0), None);
+        assert_eq!(pts_capture_offset(0.0, 0.033, 377.0, 60.0), None);
         // Disagreement beyond the 60s window (PTS discontinuity, wrong file).
-        assert_eq!(pts_capture_offset(500.0, 0.0, 377.0), None);
+        assert_eq!(pts_capture_offset(500.0, 0.0, 377.0, 60.0), None);
         // Non-finite probes never pass.
-        assert_eq!(pts_capture_offset(f64::NAN, 0.0, 377.0), None);
+        assert_eq!(pts_capture_offset(f64::NAN, 0.0, 377.0, 60.0), None);
         // Just inside the window still passes (latency can be large).
-        assert!(pts_capture_offset(420.0, 0.0, 377.0).is_some());
+        assert!(pts_capture_offset(420.0, 0.0, 377.0, 60.0).is_some());
     }
 
     #[test]
@@ -620,12 +661,23 @@ mod tests {
         // delta is hugely negative; one wrap forward recovers the true offset.
         let estimate = MPEGTS_PTS_WRAP_SECS + 400.0;
         let live_start = 402.0; // wrapped back near zero
-        let got = pts_capture_offset(live_start, 0.0, estimate).unwrap();
+        let got = pts_capture_offset(live_start, 0.0, estimate, 60.0).unwrap();
         assert!((got - (MPEGTS_PTS_WRAP_SECS + 402.0)).abs() < 0.01);
 
         // Positive-but-one-wrap-short delta (seg0 sits just above the capture's
         // wrapped PTS) also lands on the wrap-corrected candidate.
-        let got = pts_capture_offset(402.0, 1.0, estimate).unwrap();
+        let got = pts_capture_offset(402.0, 1.0, estimate, 60.0).unwrap();
         assert!((got - (MPEGTS_PTS_WRAP_SECS + 401.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn pts_capture_offset_tight_tolerance_rejects_what_loose_would_accept() {
+        // Gap-splice's tight tolerance (a gap has no slack to absorb a wrong
+        // answer, unlike a multi-minute head): a 6s disagreement passes at
+        // head-join's 60s tolerance but must fail at gap-splice's ~5s one.
+        assert!(pts_capture_offset(371.433, 0.033, 377.0, 60.0).is_some());
+        assert_eq!(pts_capture_offset(371.433, 0.033, 377.0, 5.0), None);
+        // A close-enough disagreement still passes the tight tolerance.
+        assert!(pts_capture_offset(375.0, 0.0, 377.0, 5.0).is_some());
     }
 }

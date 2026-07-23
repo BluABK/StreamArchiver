@@ -839,6 +839,15 @@ struct SettingsForm {
     /// Re-fetch a live capture's lost segments (sequence gaps) from the VOD
     /// CDN automatically, while the stream is still running. Default on.
     gap_recover: bool,
+    /// Splice recovered gap patches into the take's main file once they've
+    /// settled, so the result is gapless. Default on — every individual
+    /// splice still passes its own safety-check chain regardless (codec
+    /// match, a trustworthy PTS anchor, post-splice verification); this
+    /// only gates whether the attempt happens at all.
+    gap_splice: bool,
+    /// What happens to the pre-splice original + consumed patch files after
+    /// a successful gapless splice. Default Keep — nothing auto-deleted.
+    gap_splice_cleanup: crate::disposal::GapSpliceCleanup,
     /// Auto-recover a Twitch VOD when the VOD checker finds it DMCA-muted.
     auto_recover_muted: bool,
     /// Auto-recover a Twitch VOD when the VOD checker finds it was never published.
@@ -988,6 +997,10 @@ pub struct StreamArchiverApp {
     /// (codec/resolution mismatch), with display strings: (rec, head params,
     /// live params).
     issues_head_mismatch: Vec<(crate::models::Recording, String, String)>,
+    /// Recordings whose gap-splice attempt was blocked by a safety check
+    /// (codec mismatch, an untrustworthy PTS anchor, or a failed post-splice
+    /// verification) — see [`crate::models::Recording::gap_splice_state`].
+    issues_gap_splice: Vec<crate::models::Recording>,
     /// Rows still marked `recording` whose files have gone quiet (capture died
     /// unnoticed, or the finalize is pending) + seconds since the last write
     /// (`None` = nothing on disk).
@@ -1960,6 +1973,7 @@ impl eframe::App for StreamArchiverApp {
                                 + self.issues_errors.len() + self.issues_errors_no_file.len()
                                 + self.issues_stuck.len() + self.issues_muted_vod.len()
                                 + self.issues_unmerged.len() + self.issues_head_mismatch.len()
+                                + self.issues_gap_splice.len()
                                 + quota_warnings.len();
                             let label = if n > 0 { format!("⚠ {n}") } else { "⚠".to_string() };
                             let btn = egui::Button::new(label).small();

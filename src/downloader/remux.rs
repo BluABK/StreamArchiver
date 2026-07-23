@@ -159,31 +159,82 @@ pub async fn probe_formats(tool: Tool, url: &str, auth: &AuthSource) -> Result<S
     }
 }
 
-/// Losslessly concatenate two same-encode MKVs (`head` then `tail`) into `dst`
-/// via ffmpeg's concat demuxer (`-c copy`). `-fflags +genpts` regenerates
-/// timestamps across the seam and `-avoid_negative_ts make_zero` keeps the
-/// joined timeline monotonic. The list file lives in `list_dir` (a `.cache\`
-/// dir) and is removed afterwards. Caller is responsible for verifying codec
-/// compatibility first — mismatched parameters produce a broken file, not an
-/// ffmpeg error.
+/// Losslessly concatenate two same-encode MKVs (`head` then `tail`) into
+/// `dst` — the exact 2-entry, no-trim case of [`concat_mkvs_n`].
 pub(super) async fn concat_mkvs(
     list_dir: &Path,
     head: &Path,
     tail: &Path,
     dst: &Path,
 ) -> anyhow::Result<()> {
+    concat_mkvs_n(
+        list_dir,
+        &[ConcatEntry::whole(head), ConcatEntry::whole(tail)],
+        dst,
+    )
+    .await
+}
+
+/// One ffconcat entry: a source file, optionally trimmed to `[inpoint,
+/// outpoint)` (broadcast-relative seconds within THAT file, `None` = play
+/// from the start / to the end). The same path may appear more than once in
+/// one list with different in/out points — ffmpeg's concat demuxer supports
+/// this natively, so gap-splice never needs to physically pre-cut the base
+/// file into pieces; one entry per untouched span plus one per patch.
+#[derive(Clone, Copy)]
+pub(super) struct ConcatEntry<'a> {
+    pub(super) path: &'a Path,
+    pub(super) inpoint: Option<f64>,
+    pub(super) outpoint: Option<f64>,
+}
+
+impl<'a> ConcatEntry<'a> {
+    pub(super) fn whole(path: &'a Path) -> Self {
+        Self { path, inpoint: None, outpoint: None }
+    }
+    pub(super) fn trimmed(path: &'a Path, inpoint: Option<f64>, outpoint: Option<f64>) -> Self {
+        Self { path, inpoint, outpoint }
+    }
+}
+
+/// Losslessly concatenate an ordered list of (possibly-trimmed, possibly
+/// repeated) source files into `dst` via ffmpeg's concat demuxer (`-c
+/// copy`). `-fflags +genpts` regenerates timestamps across every seam and
+/// `-avoid_negative_ts make_zero` keeps the joined timeline monotonic. The
+/// list file lives in `list_dir` (a `.cache\` dir) and is removed
+/// afterwards. Caller is responsible for verifying codec compatibility
+/// first — mismatched parameters produce a broken file, not an ffmpeg
+/// error. `-c copy` seeking via `inpoint`/`outpoint` is keyframe-bound, not
+/// frame-exact — callers relying on a precise cut position (e.g.
+/// gap-splice) must independently verify where each seam actually landed;
+/// this function only builds and runs the concat.
+pub(super) async fn concat_mkvs_n(
+    list_dir: &Path,
+    entries: &[ConcatEntry<'_>],
+    dst: &Path,
+) -> anyhow::Result<()> {
     use std::process::Stdio;
 
     // ffconcat quoting: single-quote each path, escaping embedded quotes.
-    fn entry(p: &Path) -> String {
-        format!("file '{}'", p.to_string_lossy().replace('\'', r"'\''"))
+    fn quote(p: &Path) -> String {
+        p.to_string_lossy().replace('\'', r"'\''")
     }
     let stem = dst
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "concat".into());
     let list_path = list_dir.join(format!("{stem}.concat.txt"));
-    let list = format!("ffconcat version 1.0\n{}\n{}\n", entry(head), entry(tail));
+    let mut list = String::from("ffconcat version 1.0\n");
+    for e in entries {
+        list.push_str(&format!("file '{}'\n", quote(e.path)));
+        // Order matters to ffmpeg: inpoint before outpoint, both after `file`.
+        if let Some(i) = e.inpoint {
+            list.push_str(&format!("inpoint {i:.3}\n"));
+        }
+        if let Some(o) = e.outpoint {
+            list.push_str(&format!("outpoint {o:.3}\n"));
+        }
+    }
     crate::iomon::fs::write(Cat::ConcatList, &list_path, list).await?;
 
     // One full-file pass at a time on the recordings drive (see io_gate).
@@ -705,6 +756,38 @@ pub(super) async fn media_duration_secs(path: &Path) -> Option<i64> {
     } else {
         None
     }
+}
+
+/// Per-seam landed-position check for gap-splice: the PTS (seconds) of the
+/// first video packet at or after `near_secs` in an already-produced file.
+/// `-c copy` seeking via ffconcat `inpoint`/`outpoint` is keyframe-bound,
+/// not frame-exact (see `concat_mkvs_n`'s doc comment) — a snap in either
+/// direction can leave a real seam defect (a gap, or duplicated content)
+/// that an aggregate duration check alone would miss (a snap on one seam
+/// can cancel a snap on another in the total). Comparing this against the
+/// intended splice position is that independent check. `None` on any ffprobe
+/// failure — callers must treat that as "can't verify," never as a pass.
+pub(super) async fn packet_pts_near(path: &Path, near_secs: f64) -> Option<f64> {
+    let mut cmd = Command::new("ffprobe");
+    cmd.args([
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-read_intervals", &format!("{}%+#1", near_secs.max(0.0)),
+        "-show_entries", "packet=pts_time",
+        "-of", "csv=p=0",
+    ])
+    .arg(path)
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let out = tokio::time::timeout(Duration::from_secs(20), cmd.output()).await.ok()?.ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).lines().next()?.trim().parse::<f64>().ok()
 }
 
 /// First presentation timestamp of `path` in seconds via ffprobe

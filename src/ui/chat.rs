@@ -2737,6 +2737,7 @@ mod tests {
             full_path: None,
             trigger_info: String::new(),
             head_backfill_state: String::new(),
+            gap_splice_state: String::new(),
             trigger_rule_json: String::new(),
             vod_views: None,
         }

@@ -2618,6 +2618,27 @@ impl StreamArchiverApp {
                     );
             });
             ui.horizontal(|ui| {
+                ui.label("After gap splice:");
+                let v = &mut self.settings.gap_splice_cleanup;
+                egui::ComboBox::from_id_salt("settings_gap_splice_cleanup")
+                    .selected_text(v.label())
+                    .show_ui(ui, |ui| {
+                        for c in crate::disposal::GapSpliceCleanup::ALL {
+                            ui.selectable_value(v, c, c.label());
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Once a verified gapless splice (recovered lost-segment patches muxed \
+                         into the take's main file) lands: keep the pre-splice original + \
+                         patches alongside it (safe, but costs the extra space), delete just \
+                         the consumed patches, or delete patches + the pre-splice original — \
+                         the take's main file then becomes the gapless splice. Cleanup only \
+                         runs after the splice passes its verification checks, and every \
+                         removal uses the deletion method below.",
+                    );
+            });
+            ui.horizontal(|ui| {
                 ui.label("Deleted media goes to:");
                 let v = &mut self.settings.disposal_method;
                 egui::ComboBox::from_id_salt("settings_disposal_method")
@@ -2921,6 +2942,21 @@ impl StreamArchiverApp {
                              Alerts appear under 🚨 Warnings either way.",
                         );
                     ui.label("Re-fetch sequence-gap losses from the VOD CDN into sibling patch files.");
+                    ui.end_row();
+
+                    ui.checkbox(&mut self.settings.gap_splice, "Splice recovered gaps into a gapless file")
+                        .on_hover_text(
+                            "Once a take's recovered patches have all settled, try to mux them \
+                             into the take's main file so there's one seamless, gapless \
+                             recording instead of separate sibling patches. Every individual \
+                             splice still passes its own safety checks first (matching codec \
+                             parameters, a trustworthy PTS-derived splice point, a verified \
+                             result) — this only gates whether the attempt happens at all. Any \
+                             check that fails leaves the patches exactly as they are today; \
+                             nothing is ever guessed. See \"After gap splice\" below for what \
+                             happens to the originals once a splice succeeds.",
+                        );
+                    ui.label("Mux recovered gap patches into a gapless main file (see 🗑 Automatic deletion for cleanup).");
                     ui.end_row();
 
                     ui.checkbox(&mut self.settings.auto_recover_muted, "Auto-recover muted VODs");

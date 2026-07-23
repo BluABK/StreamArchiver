@@ -124,6 +124,10 @@ enum Act {
     RefetchHeadMatchLive(usize),
     FetchVodForMismatch(usize),
     DismissMismatch(usize),
+    /// Acknowledge a blocked gap-splice — index into `issues_gap_splice`.
+    DismissGapSplice(usize),
+    /// Open the folder holding a blocked take's recovered patch file(s).
+    OpenGapSplicePatchFolder(usize),
     /// Open the error-details window: (title, full text). Same text as the
     /// status-column hover — the 🔍 button makes it readable/copyable.
     ViewError(String, String),
@@ -858,6 +862,7 @@ impl StreamArchiverApp {
                             self.issues_muted_vod_section(ui, &mut act);
                             self.issues_unmerged_section(ui, has_active_remux, &mut act);
                             self.issues_head_mismatch_section(ui, &mut act);
+                            self.issues_gap_splice_section(ui, &mut act);
                         });
                     self.issues_toolbar(
                         ui,
@@ -877,6 +882,7 @@ impl StreamArchiverApp {
                     {
                         if self.issues_unmerged.is_empty()
                             && self.issues_head_mismatch.is_empty()
+                            && self.issues_gap_splice.is_empty()
                             && self.issues_stale_recording.is_empty()
                         {
                             ui.weak("No recording issues found — all recordings are in their final format.");
@@ -962,6 +968,7 @@ impl StreamArchiverApp {
             self.issues_recs = self.core.store.recordings_needing_remux().unwrap_or_default();
             self.issues_stuck = self.core.store.recordings_stuck_in_cache().unwrap_or_default();
             self.issues_muted_vod = self.core.store.recordings_muted_vod_unresolved().unwrap_or_default();
+            self.issues_gap_splice = self.core.store.recordings_with_gap_splice_issue().unwrap_or_default();
             // Everything that stats the recordings drive — the up-to-500-path
             // missing-file sweep AND the error partition — runs off-thread
             // (one exists() there can block the frame for seconds under load).
@@ -1464,6 +1471,67 @@ impl StreamArchiverApp {
                             .clicked()
                         {
                             *act = Some(Act::DismissMismatch(i));
+                        }
+                        ui.end_row();
+                    }
+                });
+            ui.separator();
+        }
+    }
+
+    /// Human reason text for a blocked `gap_splice_state` value.
+    fn gap_splice_reason(state: &str) -> &'static str {
+        match state {
+            "mismatch" => "a recovered patch's codec/resolution doesn't match the capture",
+            "anchor_failed" => "couldn't locate the gap precisely enough in the capture's own timeline",
+            "verify_failed" => "the spliced result failed its post-splice verification",
+            _ => "a safety check blocked it",
+        }
+    }
+
+    /// ── Recovered gap patches that couldn't be spliced in ──
+    fn issues_gap_splice_section(&self, ui: &mut egui::Ui, act: &mut Option<Act>) {
+        if !self.issues_gap_splice.is_empty() {
+            ui.label(
+                egui::RichText::new("🩹 Recovered gap patches couldn't be spliced in").strong(),
+            );
+            ui.weak(
+                "A recovered lost-segment patch exists, but gap-splice's safety checks \
+                 wouldn't trust the result — nothing was touched; the recording and its \
+                 patch(es) are exactly as they were. The recording is complete either way — \
+                 this only means the patch stays a separate sibling file instead of being \
+                 muxed into one gapless recording.",
+            );
+            egui::Grid::new("issues_gap_splice_grid")
+                .num_columns(3)
+                .spacing([10.0, 4.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    for (i, rec) in self.issues_gap_splice.iter().enumerate() {
+                        let name = std::path::Path::new(&rec.output_path)
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| rec.output_path.clone());
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 160, 30),
+                            format!("{name} — {}", Self::gap_splice_reason(&rec.gap_splice_state)),
+                        );
+                        if ui
+                            .button("🩹 Patches")
+                            .on_hover_text("Open the folder holding the recovered patch file(s).")
+                            .clicked()
+                        {
+                            *act = Some(Act::OpenGapSplicePatchFolder(i));
+                        }
+                        if ui
+                            .button("✓ Dismiss")
+                            .on_hover_text(
+                                "Acknowledge — the patch stays a separate file; splicing is \
+                                 never re-attempted for this recording.",
+                            )
+                            .clicked()
+                        {
+                            *act = Some(Act::DismissGapSplice(i));
                         }
                         ui.end_row();
                     }
@@ -2326,6 +2394,22 @@ impl StreamArchiverApp {
             // state does) but no longer lists in Issues.
             let _ = self.core.store.set_head_backfill_state(rec.id, "mismatch_ack");
             self.issues_refreshed = None;
+        }
+        if let Some(Act::DismissGapSplice(i)) = act
+            && let Some(rec) = self.issues_gap_splice.get(i)
+        {
+            // Non-empty forever after — the precondition check requires
+            // `gap_splice_state == ""`, so this permanently skips
+            // re-attempts for this recording (the patch(es) stay as
+            // sibling files, unaffected).
+            let _ = self.core.store.set_gap_splice_state(rec.id, "dismissed");
+            self.issues_refreshed = None;
+        }
+        if let Some(Act::OpenGapSplicePatchFolder(i)) = act
+            && let Some(rec) = self.issues_gap_splice.get(i)
+            && let Some(dir) = std::path::Path::new(&rec.output_path).parent()
+        {
+            crate::platform::open_path(dir);
         }
         if let Some(Act::RemuxError(k)) = act {
             if let Some(rec) = self.issues_errors.get(k) {

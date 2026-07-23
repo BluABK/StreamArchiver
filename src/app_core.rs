@@ -468,6 +468,9 @@ impl AppCore {
         self.rt.spawn(async move {
             gap_sup.retro_scan_capture_logs().await;
             gap_sup.sweep_pending_gap_recoveries().await;
+            // Anything left over after a restart interrupted a gap-splice
+            // before it could run.
+            gap_sup.sweep_pending_gap_splices().await;
         });
 
         // Periodic channel-asset refresh (keeps icons/badges/emotes current for
