@@ -1605,13 +1605,22 @@ impl Supervisor {
             .unwrap()
             .remove(&(DetachedKind::Recording, rec_id));
         let shutting_down = self.shutdown.load(Ordering::SeqCst);
+        // This resume is itself a SABR from-start continuation, so a "not
+        // near live head" DVR-window stall here is the same class the fresh-
+        // capture path tracks via `note_sabr_stall` — must count toward the
+        // same live-edge fallback threshold (see its own doc comment), and
+        // the take should read as "ended" (a known limitation), not a red
+        // "failed", same as that path.
+        let sabr_key = (monitor_id, rec.stream_id.clone());
+        let sabr_stall =
+            self.note_sabr_stall(sabr_key, monitor_id, ok, manually_stopped, shutting_down, &outcome);
         let status = if manually_stopped {
             if ok { "completed" } else { "stopped" }
         } else if shutting_down {
             "aborted"
         } else if ok {
             "completed"
-        } else if stall_killed || stream_ended_or_unavailable(&outcome.log) {
+        } else if stall_killed || sabr_stall || stream_ended_or_unavailable(&outcome.log) {
             "ended"
         } else {
             "failed"

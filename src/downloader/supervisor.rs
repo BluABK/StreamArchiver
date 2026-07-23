@@ -3333,7 +3333,15 @@ progress_info: None,
 
     /// Track SABR from-start stalls (and the live-edge fallback flag) for this
     /// take's outcome. Returns whether this outcome was a SABR from-start stall.
-    fn note_sabr_stall(
+    ///
+    /// `pub(super)`, not private: `process.rs`'s `resume_recording` (a SABR
+    /// resume of an interrupted from-start capture, not a fresh one) calls
+    /// this too — its stalls are exactly the same "not near live head" DVR-
+    /// window class and must count toward the same live-edge fallback
+    /// threshold, or a persistently-stalling broadcast that keeps dying via
+    /// the resume path (rather than a fresh capture) never trips the
+    /// fallback and retries from-start forever.
+    pub(super) fn note_sabr_stall(
         &self,
         sabr_key: (i64, Option<String>),
         monitor_id: i64,
