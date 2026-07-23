@@ -723,7 +723,9 @@ impl StreamArchiverApp {
                     )
                 }
                 ScheduleMode::Day => {
-                    self.schedule_day_grid(ui, anchor, today, &by_day, &collide, &mut open_day, &signals)
+                    self.schedule_day_grid(
+                        ui, anchor, today, &by_day, &collide, &mut open_day, &all_day_events, &signals,
+                    )
                 }
                 ScheduleMode::Agenda => {
                     self.schedule_agenda_view(ui, anchor, &by_day, &collide, &ptex, &mut open_day, &signals)
@@ -1639,6 +1641,117 @@ impl StreamArchiverApp {
             });
     }
 
+    /// Google-Calendar-style all-day event bar strip — shared by Week (7
+    /// `days`) and Day (1 `day`) views. Each qualifying stream
+    /// (`is_all_day`) draws as one continuous rounded bar spanning its
+    /// start-to-end day columns, clipped to `days`; bars whose date range
+    /// overlaps stack into additional lanes. Draws nothing (and reserves no
+    /// space) when no all-day event overlaps `days` — callers still own
+    /// their own separator/spacing around the call.
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_all_day_bar(
+        &self,
+        ui: &mut egui::Ui,
+        days: &[chrono::NaiveDate],
+        time_col_w: f32,
+        col_w: f32,
+        col_gap: f32,
+        zoom: f32,
+        all_day_events: &[usize],
+        open_day: &mut Option<chrono::NaiveDate>,
+        signals: &HashMap<i64, EventSignals>,
+    ) {
+        let ds = days[0];
+        let de = *days.last().unwrap_or(&ds);
+        let last_col = days.len().saturating_sub(1);
+
+        let mut bars: Vec<(usize, usize, usize)> = Vec::new(); // (stream_idx, start_col, end_col)
+        for &i in all_day_events {
+            let s = &self.schedule_all[i];
+            let s_date = local_date(s.start_time).unwrap_or(ds);
+            let e_date = local_date(effective_end(s)).unwrap_or(s_date);
+            if e_date < ds || s_date > de {
+                continue; // doesn't overlap the visible range
+            }
+            let start_col = if s_date <= ds { 0usize } else { (s_date - ds).num_days().max(0) as usize };
+            let end_col = if e_date >= de { last_col } else { (e_date - ds).num_days().max(0) as usize };
+            bars.push((i, start_col.min(last_col), end_col.min(last_col).max(start_col.min(last_col))));
+        }
+        if bars.is_empty() {
+            return;
+        }
+        bars.sort_by_key(|&(_, start, end)| (start, end));
+        let mut lane_end: Vec<i32> = Vec::new();
+        let mut placed: Vec<(usize, usize, usize, usize)> = Vec::new(); // (idx, start, end, lane)
+        for (idx, start, end) in bars {
+            let lane = lane_end
+                .iter()
+                .position(|&le| le < start as i32)
+                .unwrap_or_else(|| {
+                    lane_end.push(-1);
+                    lane_end.len() - 1
+                });
+            lane_end[lane] = end as i32;
+            placed.push((idx, start, end, lane));
+        }
+
+        let bar_h = SCHED_ALL_DAY_BAR_H * zoom;
+        let bar_gap = SCHED_ALL_DAY_BAR_GAP * zoom;
+        let strip_w = time_col_w + days.len() as f32 * (col_w + col_gap);
+        let strip_h = lane_end.len() as f32 * (bar_h + bar_gap);
+        let (resp, painter) = ui.allocate_painter(egui::vec2(strip_w, strip_h), egui::Sense::hover());
+        let origin = resp.rect.min;
+        let mut clicked_day: Option<chrono::NaiveDate> = None;
+        for (idx, start, end, lane) in &placed {
+            let s = &self.schedule_all[*idx];
+            let x0 = origin.x + time_col_w + *start as f32 * (col_w + col_gap);
+            let x1 = origin.x + time_col_w + (*end as f32 + 1.0) * (col_w + col_gap) - col_gap;
+            let y = origin.y + *lane as f32 * (bar_h + bar_gap);
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(x0, y),
+                egui::vec2((x1 - x0).max(4.0), bar_h),
+            );
+            let evt_id = egui::Id::new("sched_allday").with(ds).with(*idx);
+            let evt_resp = ui.interact(rect, evt_id, egui::Sense::click());
+            let sig = signals.get(&s.segment_id);
+            let color = self.sched_color(s);
+            let fill = if evt_resp.hovered() {
+                color
+            } else {
+                egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 210)
+            };
+            let fill = if sig.is_some_and(|s| !s.auto) { dim_for_no_auto(fill) } else { fill };
+            painter.rect_filled(rect, egui::CornerRadius::same(4), fill);
+            let label = if s.title.is_empty() {
+                format!("{}{}", sig.map(EventSignals::icon_prefix).unwrap_or_default(), s.channel_name)
+            } else {
+                format!(
+                    "{}{} — {}",
+                    sig.map(EventSignals::icon_prefix).unwrap_or_default(),
+                    s.channel_name,
+                    s.title,
+                )
+            };
+            painter.with_clip_rect(rect).text(
+                egui::pos2(rect.left() + 5.0 * zoom, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                label,
+                egui::FontId::proportional(11.0 * zoom),
+                egui::Color32::WHITE,
+            );
+            if evt_resp.clicked() {
+                clicked_day = Some(days[*start]);
+            }
+            let hover_extra = sig.map(EventSignals::hover_lines).unwrap_or_default();
+            evt_resp
+                .on_hover_text(format!("{}{hover_extra}", schedule_detail_line(s)))
+                .context_menu(|ui| schedule_copy_menu(ui, s, false, None));
+        }
+        if let Some(d) = clicked_day {
+            *open_day = Some(d);
+        }
+    }
+
     /// Week view: 7-column time-grid with a 24-hour vertical axis, plus a
     /// day-header row that shows the avatars of channels with a scheduled
     /// recording due that day, and a Google-Calendar-style all-day event bar
@@ -1660,7 +1773,6 @@ impl StreamArchiverApp {
     ) {
         use chrono::Datelike;
         let ws = week_start(anchor);
-        let we = add_days(ws, 6);
         let days: Vec<chrono::NaiveDate> = (0..7).map(|d| add_days(ws, d)).collect();
         let zoom = self.schedule_zoom;
 
@@ -1764,95 +1876,9 @@ impl StreamArchiverApp {
             }
         });
 
-        // All-day event bar strip (Google-Calendar style): each qualifying
-        // stream (`is_all_day`) draws as one continuous rounded bar spanning
-        // its start-to-end day columns, clipped to the visible week. Bars
-        // that overlap in date range stack into additional lanes.
-        let mut bars: Vec<(usize, usize, usize)> = Vec::new(); // (stream_idx, start_col, end_col)
-        for &i in all_day_events {
-            let s = &self.schedule_all[i];
-            let s_date = local_date(s.start_time).unwrap_or(ws);
-            let e_date = local_date(effective_end(s)).unwrap_or(s_date);
-            if e_date < ws || s_date > we {
-                continue; // doesn't overlap the visible week
-            }
-            let start_col = if s_date <= ws { 0usize } else { (s_date - ws).num_days().max(0) as usize };
-            let end_col = if e_date >= we { 6usize } else { (e_date - ws).num_days().max(0) as usize };
-            bars.push((i, start_col.min(6), end_col.min(6).max(start_col.min(6))));
-        }
-        if !bars.is_empty() {
-            bars.sort_by_key(|&(_, start, end)| (start, end));
-            let mut lane_end: Vec<i32> = Vec::new();
-            let mut placed: Vec<(usize, usize, usize, usize)> = Vec::new(); // (idx, start, end, lane)
-            for (idx, start, end) in bars {
-                let lane = lane_end
-                    .iter()
-                    .position(|&le| le < start as i32)
-                    .unwrap_or_else(|| {
-                        lane_end.push(-1);
-                        lane_end.len() - 1
-                    });
-                lane_end[lane] = end as i32;
-                placed.push((idx, start, end, lane));
-            }
-
-            let bar_h = SCHED_ALL_DAY_BAR_H * zoom;
-            let bar_gap = SCHED_ALL_DAY_BAR_GAP * zoom;
-            let strip_w = time_col_w + days.len() as f32 * (col_w + col_gap);
-            let strip_h = lane_end.len() as f32 * (bar_h + bar_gap);
-            let (resp, painter) =
-                ui.allocate_painter(egui::vec2(strip_w, strip_h), egui::Sense::hover());
-            let origin = resp.rect.min;
-            let mut clicked_day: Option<chrono::NaiveDate> = None;
-            for (idx, start, end, lane) in &placed {
-                let s = &self.schedule_all[*idx];
-                let x0 = origin.x + time_col_w + *start as f32 * (col_w + col_gap);
-                let x1 = origin.x + time_col_w + (*end as f32 + 1.0) * (col_w + col_gap) - col_gap;
-                let y = origin.y + *lane as f32 * (bar_h + bar_gap);
-                let rect = egui::Rect::from_min_size(
-                    egui::pos2(x0, y),
-                    egui::vec2((x1 - x0).max(4.0), bar_h),
-                );
-                let evt_id = egui::Id::new("sched_allday").with(ws).with(*idx);
-                let evt_resp = ui.interact(rect, evt_id, egui::Sense::click());
-                let sig = signals.get(&s.segment_id);
-                let color = self.sched_color(s);
-                let fill = if evt_resp.hovered() {
-                    color
-                } else {
-                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 210)
-                };
-                let fill = if sig.is_some_and(|s| !s.auto) { dim_for_no_auto(fill) } else { fill };
-                painter.rect_filled(rect, egui::CornerRadius::same(4), fill);
-                let label = if s.title.is_empty() {
-                    format!("{}{}", sig.map(EventSignals::icon_prefix).unwrap_or_default(), s.channel_name)
-                } else {
-                    format!(
-                        "{}{} — {}",
-                        sig.map(EventSignals::icon_prefix).unwrap_or_default(),
-                        s.channel_name,
-                        s.title,
-                    )
-                };
-                painter.with_clip_rect(rect).text(
-                    egui::pos2(rect.left() + 5.0 * zoom, rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    label,
-                    egui::FontId::proportional(11.0 * zoom),
-                    egui::Color32::WHITE,
-                );
-                if evt_resp.clicked() {
-                    clicked_day = Some(days[*start]);
-                }
-                let hover_extra = sig.map(EventSignals::hover_lines).unwrap_or_default();
-                evt_resp
-                    .on_hover_text(format!("{}{hover_extra}", schedule_detail_line(s)))
-                    .context_menu(|ui| schedule_copy_menu(ui, s, false, None));
-            }
-            if let Some(d) = clicked_day {
-                *open_day = Some(d);
-            }
-        }
+        // All-day event bar strip (Google-Calendar style) — shared with Day
+        // view, see `schedule_all_day_bar`.
+        self.schedule_all_day_bar(ui, &days, time_col_w, col_w, col_gap, zoom, all_day_events, open_day, signals);
 
         ui.separator();
 
@@ -1877,7 +1903,11 @@ impl StreamArchiverApp {
         );
     }
 
-    /// Day view: single-column time-grid with full-width event blocks.
+    /// Day view: single-column time-grid with full-width event blocks, plus
+    /// the same all-day event bar strip the week view shows (see
+    /// [`Self::schedule_all_day_bar`]) — an event long enough to count as
+    /// "all-day" ([`is_all_day`]) is excluded from the timed grid below and
+    /// shown as a bar instead, exactly like Month/Week already do.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn schedule_day_grid(
         &self,
@@ -1887,6 +1917,7 @@ impl StreamArchiverApp {
         by_day: &HashMap<chrono::NaiveDate, Vec<usize>>,
         collide: &HashSet<usize>,
         open_day: &mut Option<chrono::NaiveDate>,
+        all_day_events: &[usize],
         signals: &HashMap<i64, EventSignals>,
     ) {
         let is_today = anchor == today;
@@ -1902,8 +1933,14 @@ impl StreamArchiverApp {
         ui.separator();
 
         let zoom = self.schedule_zoom;
+        let time_col_w = SCHED_TIME_COL_W * zoom;
         let avail_w = ui.available_width();
-        let col_w = (avail_w - SCHED_TIME_COL_W * zoom - 2.0).max(80.0);
+        let col_w = (avail_w - time_col_w - 2.0).max(80.0);
+
+        self.schedule_all_day_bar(ui, &[anchor], time_col_w, col_w, 0.0, zoom, all_day_events, open_day, signals);
+        ui.separator();
+
+        let exclude_all_day: HashSet<usize> = all_day_events.iter().copied().collect();
         schedule_time_grid(
             ui,
             "sched_day",
@@ -1913,7 +1950,7 @@ impl StreamArchiverApp {
             &self.schedule_all,
             by_day,
             collide,
-            &HashSet::new(),
+            &exclude_all_day,
             open_day,
             &self.schedule_hidden_segments,
             &self.schedule_selected,
