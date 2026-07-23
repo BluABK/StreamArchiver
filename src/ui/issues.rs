@@ -843,11 +843,22 @@ impl StreamArchiverApp {
                     ctx.request_repaint_after(Duration::from_secs(1));
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    self.issues_quota_section(ui, &quota_warnings, &mut act);
-                    self.issues_stale_recording_section(ui, &mut act);
-                    self.issues_muted_vod_section(ui, &mut act);
-                    self.issues_unmerged_section(ui, has_active_remux, &mut act);
-                    self.issues_head_mismatch_section(ui, &mut act);
+                    // These lists grow unboundedly (e.g. a long backlog of
+                    // unmerged split captures) — cap them in their own
+                    // scroll region so they can never push the toolbar and
+                    // main table off the bottom of the window with no way
+                    // to reach them.
+                    egui::ScrollArea::vertical()
+                        .id_salt("issues_top_sections")
+                        .max_height(300.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            self.issues_quota_section(ui, &quota_warnings, &mut act);
+                            self.issues_stale_recording_section(ui, &mut act);
+                            self.issues_muted_vod_section(ui, &mut act);
+                            self.issues_unmerged_section(ui, has_active_remux, &mut act);
+                            self.issues_head_mismatch_section(ui, &mut act);
+                        });
                     self.issues_toolbar(
                         ui,
                         n_empty,
@@ -1106,45 +1117,53 @@ impl StreamArchiverApp {
             ui.label(
                 egui::RichText::new("✂ DMCA-muted VODs (live recording kept)").strong(),
             );
-            for (i, m) in self.issues_muted_vod.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    let mins = (m.muted_secs / 60).max(1);
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 120, 30),
-                        format!("{} — ~{mins} min muted", m.channel),
-                    );
-                    let live_ok = !m.output_path.is_empty()
-                        && self.fs_probes.is_file(std::path::Path::new(&m.output_path));
-                    if ui
-                        .add_enabled(live_ok, egui::Button::new("▶ Open live recording"))
-                        .clicked()
-                    {
-                        *act = Some(Act::OpenMutedLive(i));
-                    }
-                    let rec = m.recovered_path.as_deref().unwrap_or("");
-                    let rec_ok = !rec.is_empty()
-                        && self.fs_probes.is_file(std::path::Path::new(rec));
-                    if ui
-                        .add_enabled(rec_ok, egui::Button::new("📼 Open recovered VOD"))
-                        .clicked()
-                    {
-                        *act = Some(Act::OpenMutedRecovered(i));
-                    }
-                    if ui.button("♻ Re-run recovery").clicked() {
-                        *act = Some(Act::RerunMuted(i));
-                    }
-                    if ui
-                        .button("✓ Keep live / dismiss")
-                        .on_hover_text("Acknowledge — the live recording has the full audio.")
-                        .clicked()
-                    {
-                        *act = Some(Act::DismissMuted(i));
-                    }
-                    if let Some(state) = m.recovery_state.as_deref() {
-                        ui.weak(format!("recovery: {state}"));
+            egui::Grid::new("issues_muted_vod_grid")
+                .num_columns(6)
+                .spacing([10.0, 4.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    for (i, m) in self.issues_muted_vod.iter().enumerate() {
+                        let mins = (m.muted_secs / 60).max(1);
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 120, 30),
+                            format!("{} — ~{mins} min muted", m.channel),
+                        );
+                        let live_ok = !m.output_path.is_empty()
+                            && self.fs_probes.is_file(std::path::Path::new(&m.output_path));
+                        if ui
+                            .add_enabled(live_ok, egui::Button::new("▶ Open live recording"))
+                            .clicked()
+                        {
+                            *act = Some(Act::OpenMutedLive(i));
+                        }
+                        let rec = m.recovered_path.as_deref().unwrap_or("");
+                        let rec_ok = !rec.is_empty()
+                            && self.fs_probes.is_file(std::path::Path::new(rec));
+                        if ui
+                            .add_enabled(rec_ok, egui::Button::new("📼 Open recovered VOD"))
+                            .clicked()
+                        {
+                            *act = Some(Act::OpenMutedRecovered(i));
+                        }
+                        if ui.button("♻ Re-run recovery").clicked() {
+                            *act = Some(Act::RerunMuted(i));
+                        }
+                        if ui
+                            .button("✓ Keep live / dismiss")
+                            .on_hover_text("Acknowledge — the live recording has the full audio.")
+                            .clicked()
+                        {
+                            *act = Some(Act::DismissMuted(i));
+                        }
+                        ui.weak(
+                            m.recovery_state
+                                .as_deref()
+                                .map(|s| format!("recovery: {s}"))
+                                .unwrap_or_default(),
+                        );
+                        ui.end_row();
                     }
                 });
-            }
             ui.separator();
         }
     }
@@ -1166,76 +1185,83 @@ impl StreamArchiverApp {
              promotes whatever was captured and settles the row.",
         );
         let now = crate::models::now_unix();
-        for (i, (rec, age)) in self.issues_stale_recording.iter().enumerate() {
-            ui.horizontal(|ui| {
-                let name = std::path::Path::new(&rec.output_path)
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| format!("recording {}", rec.id));
-                let age_s = match age {
-                    Some(a) => format!("last write {} ago", fmt_duration(*a)),
-                    None => "no capture file found on disk".to_string(),
-                };
-                ui.colored_label(
-                    egui::Color32::from_rgb(220, 160, 30),
-                    format!("{name} — {age_s}"),
-                );
-                // An in-flight finalize/remux for this take (startup re-drive
-                // or a manual action) is a Remux background task keyed by the
-                // recording id.
-                let task = self.background_tasks.iter().find(|bt| {
-                    bt.kind == crate::events::BackgroundTaskKind::Remux
-                        && bt.id == rec.id as u64
-                });
-                if let Some(bt) = task {
-                    let elapsed = (now - bt.started_at).max(0);
-                    if let Some(p) = bt.progress {
-                        ui.add(
-                            egui::ProgressBar::new(p)
-                                .show_percentage()
-                                .desired_width(110.0),
-                        );
-                    }
+        egui::Grid::new("issues_stale_recording_grid")
+            .num_columns(3)
+            .spacing([10.0, 4.0])
+            .striped(true)
+            .show(ui, |ui| {
+                for (i, (rec, age)) in self.issues_stale_recording.iter().enumerate() {
+                    let name = std::path::Path::new(&rec.output_path)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| format!("recording {}", rec.id));
+                    let age_s = match age {
+                        Some(a) => format!("last write {} ago", fmt_duration(*a)),
+                        None => "no capture file found on disk".to_string(),
+                    };
                     ui.colored_label(
-                        egui::Color32::from_rgb(80, 160, 220),
-                        format!("⏳ finalizing… {}", fmt_duration(elapsed)),
-                    )
-                    .on_hover_text(
-                        "The finalize is queued/running — remuxes take turns on \
-                         the recordings drive, so a backlog can hold this for a \
-                         while. Progress shows once ffmpeg starts.",
+                        egui::Color32::from_rgb(220, 160, 30),
+                        format!("{name} — {age_s}"),
                     );
-                } else if ui
-                    .button("🛠 Finalize now")
-                    .on_hover_text(
-                        "Promote whatever was captured (remux/move it out of \
-                         the working folder) and settle this row.",
-                    )
-                    .clicked()
-                {
-                    *act = Some(Act::FinalizeStale(i));
-                }
-                if ui.button("🔍")
-                    .on_hover_text("View details in a window.")
-                    .clicked()
-                {
-                    let mut text = format!(
-                        "Status: recording (stale)\n{age_s}\nStarted: {}\nPath: {}",
-                        fmt_datetime_short(rec.started_at),
-                        rec.output_path
-                    );
-                    if let Some(hint) = network_failure_hint(&rec.log_excerpt) {
-                        text.push_str("\n\n");
-                        text.push_str(hint);
+                    // An in-flight finalize/remux for this take (startup re-drive
+                    // or a manual action) is a Remux background task keyed by the
+                    // recording id.
+                    let task = self.background_tasks.iter().find(|bt| {
+                        bt.kind == crate::events::BackgroundTaskKind::Remux
+                            && bt.id == rec.id as u64
+                    });
+                    ui.horizontal(|ui| {
+                        if let Some(bt) = task {
+                            let elapsed = (now - bt.started_at).max(0);
+                            if let Some(p) = bt.progress {
+                                ui.add(
+                                    egui::ProgressBar::new(p)
+                                        .show_percentage()
+                                        .desired_width(110.0),
+                                );
+                            }
+                            ui.colored_label(
+                                egui::Color32::from_rgb(80, 160, 220),
+                                format!("⏳ finalizing… {}", fmt_duration(elapsed)),
+                            )
+                            .on_hover_text(
+                                "The finalize is queued/running — remuxes take turns on \
+                                 the recordings drive, so a backlog can hold this for a \
+                                 while. Progress shows once ffmpeg starts.",
+                            );
+                        } else if ui
+                            .button("🛠 Finalize now")
+                            .on_hover_text(
+                                "Promote whatever was captured (remux/move it out of \
+                                 the working folder) and settle this row.",
+                            )
+                            .clicked()
+                        {
+                            *act = Some(Act::FinalizeStale(i));
+                        }
+                    });
+                    if ui.button("🔍")
+                        .on_hover_text("View details in a window.")
+                        .clicked()
+                    {
+                        let mut text = format!(
+                            "Status: recording (stale)\n{age_s}\nStarted: {}\nPath: {}",
+                            fmt_datetime_short(rec.started_at),
+                            rec.output_path
+                        );
+                        if let Some(hint) = network_failure_hint(&rec.log_excerpt) {
+                            text.push_str("\n\n");
+                            text.push_str(hint);
+                        }
+                        if !rec.log_excerpt.is_empty() {
+                            text.push_str("\n\n");
+                            text.push_str(rec.log_excerpt.trim());
+                        }
+                        *act = Some(Act::ViewError(name.clone(), text));
                     }
-                    if !rec.log_excerpt.is_empty() {
-                        text.push_str("\n\n");
-                        text.push_str(rec.log_excerpt.trim());
-                    }
-                    *act = Some(Act::ViewError(name.clone(), text));
+                    ui.end_row();
                 }
             });
-        }
         ui.separator();
     }
 
@@ -1261,109 +1287,116 @@ impl StreamArchiverApp {
                  Merge is lossless and runs throttled like any finalize pass.",
             );
             let now = crate::models::now_unix();
-            for (i, (rec, parts)) in self.issues_unmerged.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    let name = std::path::Path::new(&rec.output_path)
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| rec.output_path.clone());
-                    let total: u64 = parts
-                        .iter()
-                        .map(|p| self.fs_probes.len(p))
-                        .sum();
-                    let partial = parts
-                        .iter()
-                        .any(|p| p.to_string_lossy().ends_with(".part"));
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 160, 30),
-                        format!(
-                            "{name} — {} part(s), {}{}",
-                            parts.len(),
-                            fmt_bytes(total as i64),
-                            if partial { " (interrupted)" } else { "" },
-                        ),
-                    );
-                    // This take's own merge (running or queued for the disk
-                    // gate) — keyed by the recording id. Show its live state
-                    // instead of the button.
-                    let merge_task = self.background_tasks.iter().find(|bt| {
-                        bt.kind == crate::events::BackgroundTaskKind::Remux
-                            && bt.id == rec.id as u64
-                    });
-                    if let Some(bt) = merge_task {
-                        let elapsed = (now - bt.started_at).max(0);
-                        if let Some(p) = bt.progress {
-                            ui.add(
-                                egui::ProgressBar::new(p)
-                                    .show_percentage()
-                                    .desired_width(110.0),
-                            );
-                        }
+            egui::Grid::new("issues_unmerged_grid")
+                .num_columns(4)
+                .spacing([10.0, 4.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    for (i, (rec, parts)) in self.issues_unmerged.iter().enumerate() {
+                        let name = std::path::Path::new(&rec.output_path)
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| rec.output_path.clone());
+                        let total: u64 = parts
+                            .iter()
+                            .map(|p| self.fs_probes.len(p))
+                            .sum();
+                        let partial = parts
+                            .iter()
+                            .any(|p| p.to_string_lossy().ends_with(".part"));
                         ui.colored_label(
-                            egui::Color32::from_rgb(80, 160, 220),
-                            bt.progress_info
-                                .clone()
-                                .unwrap_or_else(|| "⏳ merging…".into()),
-                        )
-                        .on_hover_text(format!(
-                            "Elapsed: {} — a queued merge shows what currently \
-                             holds the disk gate; speed/position appear once \
-                             its own ffmpeg starts.",
-                            fmt_duration(elapsed)
-                        ));
-                    } else if ui
-                        .add_enabled(!has_active_remux, egui::Button::new("🧩 Merge into MKV"))
-                        .on_hover_text(
-                            "Losslessly mux the parts into the final MKV, promote it, \
-                             and mark the recording completed. Parts are deleted only \
-                             on success.",
-                        )
-                        .on_disabled_hover_text(
-                            "Another remux/merge is running — this one starts after \
-                             it (see Background jobs for the live queue).",
-                        )
-                        .clicked()
-                    {
-                        *act = Some(Act::MergeSplit(i));
-                    }
-                    if ui
-                        .button("📼 Download VOD")
-                        .on_hover_text(
-                            "Archive the published VOD instead / as well — the only \
-                             way to get the part of the stream after the capture \
-                             died.",
-                        )
-                        .clicked()
-                    {
-                        *act = Some(Act::DownloadVodUnmerged(i));
-                    }
-                    if ui.button("🔍")
-                        .on_hover_text("View details in a window.")
-                        .clicked()
-                    {
-                        let mut text = format!(
-                            "Status: {}\nPath: {}\n\nSurviving parts:",
-                            rec.status, rec.output_path
+                            egui::Color32::from_rgb(220, 160, 30),
+                            format!(
+                                "{name} — {} part(s), {}{}",
+                                parts.len(),
+                                fmt_bytes(total as i64),
+                                if partial { " (interrupted)" } else { "" },
+                            ),
                         );
-                        for p in parts {
-                            text.push_str(&format!(
-                                "\n  {} ({})",
-                                p.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(),
-                                fmt_bytes(self.fs_probes.len(p) as i64),
-                            ));
+                        // This take's own merge (running or queued for the disk
+                        // gate) — keyed by the recording id. Show its live state
+                        // instead of the button.
+                        let merge_task = self.background_tasks.iter().find(|bt| {
+                            bt.kind == crate::events::BackgroundTaskKind::Remux
+                                && bt.id == rec.id as u64
+                        });
+                        ui.horizontal(|ui| {
+                            if let Some(bt) = merge_task {
+                                let elapsed = (now - bt.started_at).max(0);
+                                if let Some(p) = bt.progress {
+                                    ui.add(
+                                        egui::ProgressBar::new(p)
+                                            .show_percentage()
+                                            .desired_width(110.0),
+                                    );
+                                }
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(80, 160, 220),
+                                    bt.progress_info
+                                        .clone()
+                                        .unwrap_or_else(|| "⏳ merging…".into()),
+                                )
+                                .on_hover_text(format!(
+                                    "Elapsed: {} — a queued merge shows what currently \
+                                     holds the disk gate; speed/position appear once \
+                                     its own ffmpeg starts.",
+                                    fmt_duration(elapsed)
+                                ));
+                            } else if ui
+                                .add_enabled(!has_active_remux, egui::Button::new("🧩 Merge into MKV"))
+                                .on_hover_text(
+                                    "Losslessly mux the parts into the final MKV, promote it, \
+                                     and mark the recording completed. Parts are deleted only \
+                                     on success.",
+                                )
+                                .on_disabled_hover_text(
+                                    "Another remux/merge is running — this one starts after \
+                                     it (see Background jobs for the live queue).",
+                                )
+                                .clicked()
+                            {
+                                *act = Some(Act::MergeSplit(i));
+                            }
+                        });
+                        if ui
+                            .button("📼 Download VOD")
+                            .on_hover_text(
+                                "Archive the published VOD instead / as well — the only \
+                                 way to get the part of the stream after the capture \
+                                 died.",
+                            )
+                            .clicked()
+                        {
+                            *act = Some(Act::DownloadVodUnmerged(i));
                         }
-                        if let Some(hint) = network_failure_hint(&rec.log_excerpt) {
-                            text.push_str("\n\n");
-                            text.push_str(hint);
+                        if ui.button("🔍")
+                            .on_hover_text("View details in a window.")
+                            .clicked()
+                        {
+                            let mut text = format!(
+                                "Status: {}\nPath: {}\n\nSurviving parts:",
+                                rec.status, rec.output_path
+                            );
+                            for p in parts {
+                                text.push_str(&format!(
+                                    "\n  {} ({})",
+                                    p.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(),
+                                    fmt_bytes(self.fs_probes.len(p) as i64),
+                                ));
+                            }
+                            if let Some(hint) = network_failure_hint(&rec.log_excerpt) {
+                                text.push_str("\n\n");
+                                text.push_str(hint);
+                            }
+                            if !rec.log_excerpt.is_empty() {
+                                text.push_str("\n\n");
+                                text.push_str(rec.log_excerpt.trim());
+                            }
+                            *act = Some(Act::ViewError(name.clone(), text));
                         }
-                        if !rec.log_excerpt.is_empty() {
-                            text.push_str("\n\n");
-                            text.push_str(rec.log_excerpt.trim());
-                        }
-                        *act = Some(Act::ViewError(name.clone(), text));
+                        ui.end_row();
                     }
                 });
-            }
             ui.separator();
         }
     }
@@ -1381,55 +1414,60 @@ impl StreamArchiverApp {
                  source rendition — the take recorded a transcode while the head \
                  fetched at source. Both files are kept and playable; pick a fix:",
             );
-            for (i, (rec, head, live)) in self.issues_head_mismatch.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    let name = std::path::Path::new(&rec.output_path)
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| rec.output_path.clone());
-                    let (head_d, live_d) = (
-                        if head.is_empty() { "?" } else { head.as_str() },
-                        if live.is_empty() { "?" } else { live.as_str() },
-                    );
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 160, 30),
-                        format!("{name} — head {head_d} vs live {live_d}"),
-                    );
-                    if ui
-                        .button("🧩 Re-fetch head @ live quality")
-                        .on_hover_text(
-                            "Fetch the head again at the live capture's own rendition \
-                             so the lossless join can succeed. Full quality is then \
-                             available via the VOD instead. (Post-stream: any \
-                             DMCA-muted section fetches muted.)",
-                        )
-                        .clicked()
-                    {
-                        *act = Some(Act::RefetchHeadMatchLive(i));
-                    }
-                    if ui
-                        .button("📼 Download VOD (source quality)")
-                        .on_hover_text(
-                            "Grab the published VOD at source quality instead — the \
-                             full stream, including the head, at the better \
-                             resolution the live capture missed.",
-                        )
-                        .clicked()
-                    {
-                        *act = Some(Act::FetchVodForMismatch(i));
-                    }
-                    if ui
-                        .button("✓ Keep parts / dismiss")
-                        .on_hover_text(
-                            "Acknowledge — keep the head and live capture as separate \
-                             playable files.",
-                        )
-                        .clicked()
-                    {
-                        *act = Some(Act::DismissMismatch(i));
+            egui::Grid::new("issues_head_mismatch_grid")
+                .num_columns(4)
+                .spacing([10.0, 4.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    for (i, (rec, head, live)) in self.issues_head_mismatch.iter().enumerate() {
+                        let name = std::path::Path::new(&rec.output_path)
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| rec.output_path.clone());
+                        let (head_d, live_d) = (
+                            if head.is_empty() { "?" } else { head.as_str() },
+                            if live.is_empty() { "?" } else { live.as_str() },
+                        );
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 160, 30),
+                            format!("{name} — head {head_d} vs live {live_d}"),
+                        );
+                        if ui
+                            .button("🧩 Re-fetch head @ live quality")
+                            .on_hover_text(
+                                "Fetch the head again at the live capture's own rendition \
+                                 so the lossless join can succeed. Full quality is then \
+                                 available via the VOD instead. (Post-stream: any \
+                                 DMCA-muted section fetches muted.)",
+                            )
+                            .clicked()
+                        {
+                            *act = Some(Act::RefetchHeadMatchLive(i));
+                        }
+                        if ui
+                            .button("📼 Download VOD (source quality)")
+                            .on_hover_text(
+                                "Grab the published VOD at source quality instead — the \
+                                 full stream, including the head, at the better \
+                                 resolution the live capture missed.",
+                            )
+                            .clicked()
+                        {
+                            *act = Some(Act::FetchVodForMismatch(i));
+                        }
+                        if ui
+                            .button("✓ Keep parts / dismiss")
+                            .on_hover_text(
+                                "Acknowledge — keep the head and live capture as separate \
+                                 playable files.",
+                            )
+                            .clicked()
+                        {
+                            *act = Some(Act::DismissMismatch(i));
+                        }
+                        ui.end_row();
                     }
                 });
-            }
             ui.separator();
         }
     }

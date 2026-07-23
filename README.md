@@ -902,7 +902,7 @@ dirs are still swept).
 
 ![Issues panel listing a recording that needs a re-remux](doc/screenshots/issues-panel.png)
 
-The **⚠ Issues** button in the toolbar (turns amber with a count when issues exist) opens a panel listing recordings that need attention:
+The **⚠ Issues** button in the toolbar (turns amber with a count when issues exist) opens a panel listing recordings that need attention. The row-list sections (stale recordings, unmerged split captures, muted VODs, head mismatches) sit in their own scrollable region capped at a fixed height, so a long backlog (e.g. dozens of unmerged split captures) scrolls in place instead of pushing the toolbar and the main table off the bottom of the window; each section's rows are column-aligned (name, action, details) instead of packing left-to-right, so buttons line up regardless of how long each row's name/status text is.
 
 - **Needs re-remux** — a recording whose capture finished as `.ts` but was never successfully remuxed to MKV (e.g. after a crash, a detached process, or an automatic remux failure at finalization). The **🔄 Re-remux** button triggers a background ffmpeg remux; the status cell shows a live progress bar with fps / speed / position once ffmpeg is running. The source `.ts` is deleted only on success.
 
