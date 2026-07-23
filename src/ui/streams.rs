@@ -3782,8 +3782,9 @@ impl StreamArchiverApp {
                 if ctx.input(|i| i.viewport().close_requested()) {
                     open = false;
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    if !dialog.loaded {
+
+                if !dialog.loaded {
+                    egui::CentralPanel::default().show(ctx, |ui| {
                         match &*dialog.load.lock().unwrap() {
                             ImportLoadState::Loading => {
                                 ui.horizontal(|ui| {
@@ -3807,9 +3808,54 @@ impl StreamArchiverApp {
                         if ui.button("Close").clicked() {
                             do_close = true;
                         }
-                        return;
-                    }
+                    });
+                    return;
+                }
 
+                // Row-filter/selection stats, shared by the bottom bar (declared
+                // FIRST so it reserves its own fixed-height strip) and the
+                // CentralPanel below (gets whatever's left) — this split is what
+                // lets the row list actually grow when the window is resized
+                // taller, instead of the list staying pinned to a fixed height
+                // and all the extra space landing below the buttons.
+                let q = dialog.search.to_lowercase();
+                let visible: Vec<usize> = (0..dialog.rows.len())
+                    .filter(|&i| import_row_matches(&dialog.rows[i], &q))
+                    .collect();
+                let selectable: Vec<usize> =
+                    visible.iter().copied().filter(|&i| !dialog.rows[i].already).collect();
+                let n = dialog
+                    .rows
+                    .iter()
+                    .filter(|r| r.selected && !r.already && !r.guess_pending)
+                    .count();
+                let pending = dialog.rows.iter().filter(|r| r.guess_pending).count();
+
+                egui::TopBottomPanel::bottom("import_bottom_bar").show(ctx, |ui| {
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(n > 0, egui::Button::new(format!("Import {n} selected")))
+                            .clicked()
+                        {
+                            do_import = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_close = true;
+                        }
+                        if pending > 0 {
+                            ui.weak(format!(
+                                "{pending} unconfirmed guess(es) held back — see \"Import into\"."
+                            ));
+                        }
+                        if !dialog.status.is_empty() {
+                            ui.label(&dialog.status);
+                        }
+                    });
+                    ui.add_space(6.0);
+                });
+
+                egui::CentralPanel::default().show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(format!("{} channels found.", dialog.rows.len()));
                         ui.with_layout(
@@ -3838,13 +3884,6 @@ impl StreamArchiverApp {
                         .weak(),
                     );
                     ui.separator();
-
-                    let q = dialog.search.to_lowercase();
-                    let visible: Vec<usize> = (0..dialog.rows.len())
-                        .filter(|&i| import_row_matches(&dialog.rows[i], &q))
-                        .collect();
-                    let selectable: Vec<usize> =
-                        visible.iter().copied().filter(|&i| !dialog.rows[i].already).collect();
 
                     // Master controls.
                     ui.horizontal(|ui| {
@@ -3931,7 +3970,6 @@ impl StreamArchiverApp {
 
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
-                        .max_height(380.0)
                         .show(ui, |ui| {
                             egui::Grid::new("import_grid")
                                 .num_columns(7)
@@ -4060,36 +4098,6 @@ impl StreamArchiverApp {
                                     }
                                 });
                         });
-
-                    ui.separator();
-                    let n = dialog
-                        .rows
-                        .iter()
-                        .filter(|r| r.selected && !r.already && !r.guess_pending)
-                        .count();
-                    let pending = dialog.rows.iter().filter(|r| r.guess_pending).count();
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(
-                                n > 0,
-                                egui::Button::new(format!("Import {n} selected")),
-                            )
-                            .clicked()
-                        {
-                            do_import = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            do_close = true;
-                        }
-                        if pending > 0 {
-                            ui.weak(format!(
-                                "{pending} unconfirmed guess(es) held back — see \"Import into\"."
-                            ));
-                        }
-                        if !dialog.status.is_empty() {
-                            ui.label(&dialog.status);
-                        }
-                    });
                 });
             },
         );
