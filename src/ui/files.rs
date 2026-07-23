@@ -7,14 +7,26 @@ use super::*;
 /// ⟳ / after an edit — never on the render path (dir stats + drive queries
 /// can spin up a sleeping USB drive).
 pub(super) struct FilesScan {
-    /// Per drive letter: (letter, online free/total, DB recordings bytes, count).
-    pub(super) drives: Vec<(char, Option<(u64, u64)>, i64, i64)>,
+    /// Per drive letter.
+    pub(super) drives: Vec<FilesDriveRow>,
     /// Per instance: monitor id, channel, platform, tool label, output dir,
     /// recording count, total DB bytes, resolved current cache dir.
     pub(super) instances: Vec<FilesInstanceRow>,
     /// Per distinct recording location: dir, on-disk?, count, DB bytes, and
     /// the instances currently mapped there (empty = history only).
     pub(super) dirs: Vec<FilesDirRow>,
+}
+
+#[derive(Clone)]
+pub(super) struct FilesDriveRow {
+    pub(super) letter: char,
+    /// Online free/total bytes, or `None` when offline/unmapped.
+    pub(super) space: Option<(u64, u64)>,
+    pub(super) rec_bytes: i64,
+    pub(super) rec_count: i64,
+    /// Connection type + Device Manager "Policies" tab info — `None` when
+    /// the drive is offline or the hardware query failed.
+    pub(super) hw: Option<crate::platform::DiskHwInfo>,
 }
 
 pub(super) struct FilesInstanceRow {
@@ -163,11 +175,17 @@ impl StreamArchiverApp {
                         per_drive.entry(l.to_ascii_uppercase()).or_insert((0, 0));
                     }
                 }
-                let mut drives: Vec<(char, Option<(u64, u64)>, i64, i64)> = per_drive
+                let mut drives: Vec<FilesDriveRow> = per_drive
                     .into_iter()
-                    .map(|(l, (b, n))| (l, crate::platform::disk_space(l), b, n))
+                    .map(|(l, (b, n))| FilesDriveRow {
+                        letter: l,
+                        space: crate::platform::disk_space(l),
+                        rec_bytes: b,
+                        rec_count: n,
+                        hw: crate::platform::disk_hw_info(l),
+                    })
                     .collect();
-                drives.sort_by_key(|d| d.0);
+                drives.sort_by_key(|d| d.letter);
                 let _ = tx.send(FilesScan { drives, instances, dirs });
             })
             .ok();
@@ -237,25 +255,43 @@ impl StreamArchiverApp {
             ui.strong("Drives");
             egui::Grid::new("files_drives").striped(true).min_col_width(70.0).show(ui, |ui| {
                 ui.weak("drive");
+                ui.weak("connection").on_hover_text(
+                    "Physical connection and Device Manager 'Policies' tab info — SATA/NVMe/SAS \
+                     are wired internally and far more reliable than a USB enclosure (cable/hub/\
+                     bridge quality, shared bandwidth with anything else on the same USB \
+                     controller). Hover a value for make/model, write-cache state, and removal \
+                     policy.",
+                );
                 ui.weak("status");
                 ui.weak("recordings (DB)");
                 ui.weak("free / total");
                 ui.end_row();
-                for (letter, space, bytes, count) in &drives {
-                    ui.label(format!("{letter}:"));
-                    match space {
+                for d in &drives {
+                    ui.label(format!("{}:", d.letter));
+                    match &d.hw {
+                        Some(hw) => {
+                            let resp = if hw.bus.is_removable_bus() {
+                                ui.colored_label(ui.visuals().warn_fg_color, hw.bus.label())
+                            } else {
+                                ui.label(hw.bus.label())
+                            };
+                            resp.on_hover_text(hw.hover_text());
+                        }
+                        None => { ui.weak("?"); }
+                    }
+                    match d.space {
                         Some(_) => { ui.label("online"); }
                         None => { ui.colored_label(ui.visuals().error_fg_color, "offline"); }
                     }
-                    ui.label(format!("{} in {} recording(s)", fmt_bytes(*bytes), count));
-                    match space {
+                    ui.label(format!("{} in {} recording(s)", fmt_bytes(d.rec_bytes), d.rec_count));
+                    match d.space {
                         Some((free, total)) => {
                             let resp = ui.label(format!(
                                 "{} / {}",
-                                fmt_bytes(*free as i64),
-                                fmt_bytes(*total as i64)
+                                fmt_bytes(free as i64),
+                                fmt_bytes(total as i64)
                             ));
-                            if *free < total / 20 {
+                            if free < total / 20 {
                                 resp.on_hover_text(
                                     "Under 5% free — consider retargeting instances to \
                                      another drive (the old recordings stay where they \
@@ -373,11 +409,11 @@ impl StreamArchiverApp {
                         format!("{}:", self.files_redirect_from)
                     })
                     .show_ui(ui, |ui| {
-                        for (letter, ..) in &drives {
+                        for d in &drives {
                             ui.selectable_value(
                                 &mut self.files_redirect_from,
-                                letter.to_string(),
-                                format!("{letter}:"),
+                                d.letter.to_string(),
+                                format!("{}:", d.letter),
                             );
                         }
                     });

@@ -606,40 +606,41 @@ pub struct DiskPerf {
 /// stacks) or the drive doesn't exist — callers must degrade to "n/a".
 /// Counters are disk-wide: other volumes on the same spindle are included
 /// (that's the point — it's the spindle that saturates).
+/// Open a device/volume path with access 0 (attribute query only, no admin
+/// required) — shared by every raw disk IOCTL below.
 #[cfg(windows)]
-pub fn disk_performance(letter: char) -> Option<DiskPerf> {
-    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+fn open_raw(path: &str) -> Option<windows::Win32::Foundation::HANDLE> {
     use windows::Win32::Storage::FileSystem::{
-        FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
-    use windows::Win32::System::IO::DeviceIoControl;
-    use windows::Win32::System::Ioctl::{
-        DISK_PERFORMANCE, IOCTL_DISK_PERFORMANCE, IOCTL_STORAGE_GET_DEVICE_NUMBER,
-        STORAGE_DEVICE_NUMBER,
-    };
-
-    fn open_raw(path: &str) -> Option<HANDLE> {
-        use windows::Win32::Storage::FileSystem::CreateFileW;
-        let wide = to_wide(path);
-        unsafe {
-            CreateFileW(
-                windows::core::PCWSTR(wide.as_ptr()),
-                0, // access 0: query attributes only — no admin required
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                None,
-                OPEN_EXISTING,
-                FILE_FLAGS_AND_ATTRIBUTES(0),
-                None,
-            )
-            .ok()
-        }
+    let wide = to_wide(path);
+    unsafe {
+        CreateFileW(
+            windows::core::PCWSTR(wide.as_ptr()),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            None,
+        )
+        .ok()
     }
+}
+
+/// Resolve drive `letter` to its backing `\\.\PhysicalDriveN` handle (open)
+/// and device number — shared by every per-physical-disk query below (perf
+/// counters, bus type, write-cache property, removal policy).
+#[cfg(windows)]
+fn physical_drive_handle(letter: char) -> Option<(windows::Win32::Foundation::HANDLE, u32)> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::IO::DeviceIoControl;
+    use windows::Win32::System::Ioctl::{IOCTL_STORAGE_GET_DEVICE_NUMBER, STORAGE_DEVICE_NUMBER};
 
     if !letter.is_ascii_alphabetic() {
         return None;
     }
     unsafe {
-        // Volume → physical device number.
         let vol = open_raw(&format!("\\\\.\\{}:", letter.to_ascii_uppercase()))?;
         let mut devnum = STORAGE_DEVICE_NUMBER::default();
         let mut returned = 0u32;
@@ -655,10 +656,21 @@ pub fn disk_performance(letter: char) -> Option<DiskPerf> {
         );
         let _ = CloseHandle(vol);
         res.ok()?;
-
-        // Physical drive → performance counters.
         let disk = open_raw(&format!("\\\\.\\PhysicalDrive{}", devnum.DeviceNumber))?;
+        Some((disk, devnum.DeviceNumber))
+    }
+}
+
+#[cfg(windows)]
+pub fn disk_performance(letter: char) -> Option<DiskPerf> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::IO::DeviceIoControl;
+    use windows::Win32::System::Ioctl::{DISK_PERFORMANCE, IOCTL_DISK_PERFORMANCE};
+
+    unsafe {
+        let (disk, _) = physical_drive_handle(letter)?;
         let mut perf = DISK_PERFORMANCE::default();
+        let mut returned = 0u32;
         let res = DeviceIoControl(
             disk,
             IOCTL_DISK_PERFORMANCE,
@@ -683,6 +695,397 @@ pub fn disk_performance(letter: char) -> Option<DiskPerf> {
 #[cfg(not(windows))]
 pub fn disk_performance(_letter: char) -> Option<DiskPerf> {
     None
+}
+
+/// Physical bus a disk is attached over — the main signal for "what
+/// tolerances can this drive letter actually handle": SATA/NVMe/SAS are
+/// internally wired and don't share bandwidth with anything else, while USB
+/// (and SD/MMC) run over a hub/enclosure/cable chain that can be shared,
+/// flaky, or bandwidth-starved depending on what else is plugged in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DiskBus {
+    Usb,
+    Sata,
+    Nvme,
+    Sas,
+    Ata,
+    Scsi,
+    Raid,
+    Sd,
+    Mmc,
+    Virtual,
+    Ufs,
+    #[default]
+    Unknown,
+}
+
+impl DiskBus {
+    /// Short label for table cells ("USB", "SATA", "NVMe", …).
+    pub fn label(self) -> &'static str {
+        match self {
+            DiskBus::Usb => "USB",
+            DiskBus::Sata => "SATA",
+            DiskBus::Nvme => "NVMe",
+            DiskBus::Sas => "SAS",
+            DiskBus::Ata => "ATA",
+            DiskBus::Scsi => "SCSI",
+            DiskBus::Raid => "RAID",
+            DiskBus::Sd => "SD",
+            DiskBus::Mmc => "MMC",
+            DiskBus::Virtual => "Virtual",
+            DiskBus::Ufs => "UFS",
+            DiskBus::Unknown => "?",
+        }
+    }
+
+    /// Hot-pluggable external media (USB/SD/MMC) — the tier where enclosure,
+    /// cable, and hub quality (and what else shares that hub) matter, as
+    /// opposed to an internally wired SATA/SAS/NVMe/RAID connection.
+    pub fn is_removable_bus(self) -> bool {
+        matches!(self, DiskBus::Usb | DiskBus::Sd | DiskBus::Mmc)
+    }
+}
+
+#[cfg(windows)]
+#[allow(non_upper_case_globals)] // matching windows-rs's PascalCase BusType* constants
+fn disk_bus_from(bt: windows::Win32::Storage::FileSystem::STORAGE_BUS_TYPE) -> DiskBus {
+    use windows::Win32::Storage::FileSystem::*;
+    match bt {
+        BusTypeUsb => DiskBus::Usb,
+        BusTypeSata => DiskBus::Sata,
+        BusTypeNvme => DiskBus::Nvme,
+        BusTypeSas => DiskBus::Sas,
+        BusTypeAta => DiskBus::Ata,
+        BusTypeScsi | BusTypeAtapi => DiskBus::Scsi,
+        BusTypeRAID => DiskBus::Raid,
+        BusTypeSd => DiskBus::Sd,
+        BusTypeMmc => DiskBus::Mmc,
+        BusTypeVirtual | BusTypeFileBackedVirtual | BusTypeSpaces => DiskBus::Virtual,
+        BusTypeUfs => DiskBus::Ufs,
+        _ => DiskBus::Unknown,
+    }
+}
+
+/// The two options on a disk's Device Manager "Policies" tab: removal
+/// policy (top) and write-cache policy (bottom half — see [`DiskHwInfo`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemovalPolicy {
+    /// "Quick removal" — no Windows-side write caching, safe to unplug any
+    /// time without Safely Remove Hardware.
+    QuickRemoval,
+    /// "Better performance" — Windows caches writes to it; unplugging
+    /// without Safely Remove Hardware first risks losing cached writes.
+    BetterPerformance,
+}
+
+/// Physical connection + Device Manager "Policies" tab info for the disk
+/// backing a drive letter.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DiskHwInfo {
+    pub bus: DiskBus,
+    pub vendor: String,
+    pub product: String,
+    pub serial: String,
+    /// `None` when the device doesn't report a write-cache property at all
+    /// (some USB bridge chipsets don't).
+    pub write_cache_enabled: Option<bool>,
+    /// The device has its own power protection, so Windows can safely skip
+    /// flushing its write cache on every write — Device Manager's "Turn off
+    /// Windows write-cache buffer flushing" option.
+    pub power_protected: bool,
+    /// `None` when the policy was never explicitly changed from its
+    /// bus-type default (Windows doesn't write the registry value until
+    /// someone picks a policy in Device Manager).
+    pub removal_policy: Option<RemovalPolicy>,
+}
+
+impl DiskHwInfo {
+    /// Short "make/model (serial)" line for a table cell — empty pieces
+    /// (common over some buses/bridges) are simply omitted.
+    pub fn model_line(&self) -> String {
+        let model = [&self.vendor, &self.product].into_iter().filter(|s| !s.is_empty())
+            .cloned().collect::<Vec<_>>().join(" ");
+        if self.serial.is_empty() {
+            model
+        } else if model.is_empty() {
+            format!("serial {}", self.serial)
+        } else {
+            format!("{model} (serial {})", self.serial)
+        }
+    }
+
+    /// Full multi-line hover text: what it's plugged into, why that bus's
+    /// tolerances differ, and its Device Manager "Policies" tab state.
+    pub fn hover_text(&self) -> String {
+        let mut lines = vec![format!("Connection: {}", self.bus.label())];
+        let model = self.model_line();
+        if !model.is_empty() {
+            lines.push(model);
+        }
+        lines.push(if self.bus.is_removable_bus() {
+            "External/removable media — cable, hub, and enclosure bridge quality all matter, \
+             and it can share bandwidth with anything else on the same USB controller/hub. \
+             (Whether THIS drive happens to be on its own dedicated port isn't detected here — \
+             check Device Manager's USB tree if that matters.)"
+                .to_string()
+        } else {
+            "Internally wired — not subject to USB/enclosure/cable reliability concerns.".to_string()
+        });
+        lines.push(match self.write_cache_enabled {
+            Some(true) if self.power_protected => {
+                "Write caching: on, power-protected (safe — the device can flush its own cache \
+                 on power loss)".to_string()
+            }
+            Some(true) => "Write caching: on (a power loss before it flushes can lose recent \
+                 writes)"
+                .to_string(),
+            Some(false) => "Write caching: off".to_string(),
+            None => "Write caching: not reported".to_string(),
+        });
+        lines.push(match self.removal_policy {
+            Some(RemovalPolicy::QuickRemoval) => {
+                "Removal policy: Quick removal (safe to unplug any time)".to_string()
+            }
+            Some(RemovalPolicy::BetterPerformance) => {
+                "Removal policy: Better performance (use Safely Remove Hardware before unplugging)"
+                    .to_string()
+            }
+            None => "Removal policy: not set (Windows applies its bus-type default)".to_string(),
+        });
+        lines.join("\n")
+    }
+}
+
+/// Read a NUL-terminated string out of a `STORAGE_DEVICE_DESCRIPTOR` result
+/// buffer at a byte offset — an offset of 0 means the field isn't reported.
+#[cfg(windows)]
+fn read_cstr(buf: &[u8], offset: u32) -> String {
+    let start = offset as usize;
+    if offset == 0 || start >= buf.len() {
+        return String::new();
+    }
+    let end = buf[start..].iter().position(|&b| b == 0).map_or(buf.len(), |p| start + p);
+    String::from_utf8_lossy(&buf[start..end]).trim().to_string()
+}
+
+/// Query connection type, vendor/product/serial, and cache/removal policy
+/// for the disk backing drive `letter`. Every query here uses access-0
+/// handles or a registry read — no admin rights required.
+#[cfg(windows)]
+pub fn disk_hw_info(letter: char) -> Option<DiskHwInfo> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::IO::DeviceIoControl;
+    use windows::Win32::System::Ioctl::{
+        IOCTL_STORAGE_QUERY_PROPERTY, PropertyStandardQuery, STORAGE_DEVICE_DESCRIPTOR,
+        STORAGE_PROPERTY_QUERY, STORAGE_WRITE_CACHE_PROPERTY, StorageDeviceProperty,
+        StorageDeviceWriteCacheProperty, WriteCacheDisabled, WriteCacheEnabled,
+    };
+
+    unsafe {
+        let (disk, devnum) = physical_drive_handle(letter)?;
+
+        let query = STORAGE_PROPERTY_QUERY {
+            PropertyId: StorageDeviceProperty,
+            QueryType: PropertyStandardQuery,
+            ..Default::default()
+        };
+        let mut buf = [0u8; 1024];
+        let mut returned = 0u32;
+        let res = DeviceIoControl(
+            disk,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            Some(&query as *const _ as *const _),
+            std::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            Some(buf.as_mut_ptr() as *mut _),
+            buf.len() as u32,
+            Some(&mut returned),
+            None,
+        );
+        if res.is_err() {
+            let _ = CloseHandle(disk);
+            return None;
+        }
+        let desc = &*(buf.as_ptr() as *const STORAGE_DEVICE_DESCRIPTOR);
+        let bus = disk_bus_from(desc.BusType);
+        let vendor = read_cstr(&buf, desc.VendorIdOffset);
+        let product = read_cstr(&buf, desc.ProductIdOffset);
+        let serial = read_cstr(&buf, desc.SerialNumberOffset);
+
+        let wc_query = STORAGE_PROPERTY_QUERY {
+            PropertyId: StorageDeviceWriteCacheProperty,
+            QueryType: PropertyStandardQuery,
+            ..Default::default()
+        };
+        let mut wc = STORAGE_WRITE_CACHE_PROPERTY::default();
+        let wc_res = DeviceIoControl(
+            disk,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            Some(&wc_query as *const _ as *const _),
+            std::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            Some(&mut wc as *mut _ as *mut _),
+            std::mem::size_of::<STORAGE_WRITE_CACHE_PROPERTY>() as u32,
+            Some(&mut returned),
+            None,
+        );
+        let (write_cache_enabled, power_protected) = if wc_res.is_ok() {
+            let enabled = if wc.WriteCacheEnabled == WriteCacheEnabled {
+                Some(true)
+            } else if wc.WriteCacheEnabled == WriteCacheDisabled {
+                Some(false)
+            } else {
+                None
+            };
+            (enabled, wc.UserDefinedPowerProtection)
+        } else {
+            (None, false)
+        };
+
+        let removal_policy = removal_policy_for(devnum);
+        let _ = CloseHandle(disk);
+
+        Some(DiskHwInfo {
+            bus,
+            vendor,
+            product,
+            serial,
+            write_cache_enabled,
+            power_protected,
+            removal_policy,
+        })
+    }
+}
+
+#[cfg(not(windows))]
+pub fn disk_hw_info(_letter: char) -> Option<DiskHwInfo> {
+    None
+}
+
+/// Read a NUL-terminated wide string starting at `ptr`.
+#[cfg(windows)]
+unsafe fn wide_cstr(ptr: *const u16) -> String {
+    let mut len = 0usize;
+    unsafe {
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
+    }
+}
+
+/// Device Manager's "Policies" tab removal policy for the physical disk with
+/// device number `devnum` (from [`physical_drive_handle`]).
+///
+/// There's no IOCTL for this — it's a registry value under the disk's own
+/// device-instance key. Getting there means walking the disk device
+/// interfaces via SetupAPI to find the one whose device number matches,
+/// reading its instance ID, then reading
+/// `HKLM\SYSTEM\CurrentControlSet\Enum\<instance id>\Device Parameters\Classpnp\UserRemovalPolicy`
+/// (3 = Quick removal, 2 = Better performance; missing = never changed from
+/// the bus-type default).
+#[cfg(windows)]
+fn removal_policy_for(devnum: u32) -> Option<RemovalPolicy> {
+    use windows::Win32::Devices::DeviceAndDriverInstallation::{
+        DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, SetupDiDestroyDeviceInfoList,
+        SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW,
+        SetupDiGetDeviceInterfaceDetailW, SP_DEVICE_INTERFACE_DATA,
+        SP_DEVICE_INTERFACE_DETAIL_DATA_W, SP_DEVINFO_DATA,
+    };
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::IO::DeviceIoControl;
+    use windows::Win32::System::Ioctl::{
+        GUID_DEVINTERFACE_DISK, IOCTL_STORAGE_GET_DEVICE_NUMBER, STORAGE_DEVICE_NUMBER,
+    };
+
+    let instance_id = unsafe {
+        let set = SetupDiGetClassDevsW(
+            Some(&GUID_DEVINTERFACE_DISK),
+            windows::core::PCWSTR::null(),
+            None,
+            DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
+        )
+        .ok()?;
+
+        let mut idx = 0u32;
+        let found = loop {
+            let mut iface = SP_DEVICE_INTERFACE_DATA {
+                cbSize: std::mem::size_of::<SP_DEVICE_INTERFACE_DATA>() as u32,
+                ..Default::default()
+            };
+            if SetupDiEnumDeviceInterfaces(set, None, &GUID_DEVINTERFACE_DISK, idx, &mut iface)
+                .is_err()
+            {
+                break None;
+            }
+            idx += 1;
+
+            let mut needed = 0u32;
+            // Expected to "fail" here — this call is only a size probe.
+            let _ =
+                SetupDiGetDeviceInterfaceDetailW(set, &iface, None, 0, Some(&mut needed), None);
+            if needed == 0 {
+                continue;
+            }
+            let mut raw = vec![0u8; needed as usize];
+            let header = raw.as_mut_ptr() as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
+            (*header).cbSize = std::mem::size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
+            let mut devinfo = SP_DEVINFO_DATA {
+                cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
+                ..Default::default()
+            };
+            if SetupDiGetDeviceInterfaceDetailW(
+                set,
+                &iface,
+                Some(header),
+                needed,
+                None,
+                Some(&mut devinfo),
+            )
+            .is_err()
+            {
+                continue;
+            }
+            // DevicePath is the struct's trailing flexible u16 array, right
+            // after the leading `cbSize: u32`.
+            let path = wide_cstr((header as *const u8).add(4) as *const u16);
+
+            let Some(vol) = open_raw(&path) else { continue };
+            let mut num = STORAGE_DEVICE_NUMBER::default();
+            let mut returned = 0u32;
+            let matched = DeviceIoControl(
+                vol,
+                IOCTL_STORAGE_GET_DEVICE_NUMBER,
+                None,
+                0,
+                Some(&mut num as *mut _ as *mut _),
+                std::mem::size_of::<STORAGE_DEVICE_NUMBER>() as u32,
+                Some(&mut returned),
+                None,
+            )
+            .is_ok()
+                && num.DeviceNumber == devnum;
+            let _ = CloseHandle(vol);
+            if !matched {
+                continue;
+            }
+
+            let mut id_buf = [0u16; 512];
+            if SetupDiGetDeviceInstanceIdW(set, &devinfo, Some(&mut id_buf), None).is_err() {
+                break None;
+            }
+            let end = id_buf.iter().position(|&c| c == 0).unwrap_or(id_buf.len());
+            break Some(String::from_utf16_lossy(&id_buf[..end]));
+        };
+        let _ = SetupDiDestroyDeviceInfoList(set);
+        found
+    }?;
+
+    let key_path = format!(r"SYSTEM\CurrentControlSet\Enum\{instance_id}\Device Parameters\Classpnp");
+    let key = windows_registry::LOCAL_MACHINE.open(key_path).ok()?;
+    match key.get_u32("UserRemovalPolicy").ok()? {
+        3 => Some(RemovalPolicy::QuickRemoval),
+        2 => Some(RemovalPolicy::BetterPerformance),
+        _ => None,
+    }
 }
 
 /// Free / total bytes of a drive (e.g. 'A'), or `None` when the drive is
@@ -879,6 +1282,40 @@ mod tests {
             assert!(p.bytes_read > 0 || p.bytes_written > 0);
         }
         assert!(disk_performance('!').is_none());
+    }
+
+    #[test]
+    fn disk_hw_info_smoke() {
+        // Must not panic; a booted system drive is never on an unresolved
+        // bus, and a bogus letter must not resolve to anything.
+        if let Some(hw) = disk_hw_info('C') {
+            assert_ne!(hw.bus, DiskBus::Unknown);
+        }
+        assert!(disk_hw_info('!').is_none());
+    }
+
+    #[test]
+    #[ignore = "prints real hardware info for every present drive letter — run with --ignored --nocapture"]
+    fn print_disk_hw_info_all_drives() {
+        for letter in 'A'..='Z' {
+            if disk_space(letter).is_none() {
+                continue;
+            }
+            match disk_hw_info(letter) {
+                Some(hw) => println!(
+                    "{letter}: bus={} vendor={:?} product={:?} serial={:?} \
+                     write_cache_enabled={:?} power_protected={} removal_policy={:?}",
+                    hw.bus.label(),
+                    hw.vendor,
+                    hw.product,
+                    hw.serial,
+                    hw.write_cache_enabled,
+                    hw.power_protected,
+                    hw.removal_policy
+                ),
+                None => println!("{letter}: disk_hw_info returned None"),
+            }
+        }
     }
 
     #[test]

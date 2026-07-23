@@ -1149,6 +1149,7 @@ fn sample_disks(prev: &mut HashMap<char, (u64, u64)>, interval_secs: f64) -> Vec
     let at_ms = chrono::Utc::now().timestamp_millis();
     for letter in letters {
         let Some(perf) = crate::platform::disk_performance(letter) else { continue };
+        note_hw_info_once(letter);
         note_queue_depth(letter, perf.queue_depth, at_ms);
         let (pr, pw) = prev
             .insert(letter, (perf.bytes_read, perf.bytes_written))
@@ -1161,6 +1162,29 @@ fn sample_disks(prev: &mut HashMap<char, (u64, u64)>, interval_secs: f64) -> Vec
         });
     }
     out
+}
+
+/// Connection-type/policy info per drive letter (bus, vendor/product/serial,
+/// write-cache + removal policy) — unlike disk space/performance this never
+/// changes at runtime, so it's queried once per letter (from this background
+/// sampler thread, never the render path) and cached for the session.
+static DISK_HW_CACHE: RwLock<Option<HashMap<char, crate::platform::DiskHwInfo>>> =
+    RwLock::new(None);
+
+fn note_hw_info_once(letter: char) {
+    if DISK_HW_CACHE.read().as_ref().is_some_and(|m| m.contains_key(&letter)) {
+        return;
+    }
+    if let Some(hw) = crate::platform::disk_hw_info(letter) {
+        DISK_HW_CACHE.write().get_or_insert_with(HashMap::new).insert(letter, hw);
+    }
+}
+
+/// Cached connection-type/policy info for a drive letter, populated by the
+/// background sampler the first time it sees that letter. `None` until then
+/// (or if the query failed) — safe to call every frame, does no I/O itself.
+pub fn disk_hw_info_cached(letter: char) -> Option<crate::platform::DiskHwInfo> {
+    DISK_HW_CACHE.read().as_ref()?.get(&letter).cloned()
 }
 
 fn flush_sample_log(path: &Path, buf: &mut Vec<String>) {

@@ -827,7 +827,10 @@ rather than reconstructed after a crash:
   spindle traffic *not* accounted for by this app or its tools — a backup
   client, antivirus scan, or search indexer hammering the recordings drive
   shows up here (highlighted when it dominates), instead of the queue-depth
-  spike being blamed on a capture or remux.
+  spike being blamed on a capture or remux. A **conn** column (USB flagged,
+  since that's the tier where enclosure/cable/hub quality and shared
+  bandwidth matter) shows each drive's physical bus — same data and hover
+  detail as the Files tab's Drives table, see [File management](#file-management-the-files-tab).
 
 The **I/O** tab shows live totals, a 30-minute rate graph (write/read/queue
 series per drive, hover for values), per-region and per-category tables
@@ -877,7 +880,21 @@ have ever landed on:
 - **Drives** — each drive letter in use (online/offline, free/total space, and
   how much recorded material the database places there). Low free space is
   flagged: retarget instances to another drive and the old recordings stay
-  where they are, fully tracked.
+  where they are, fully tracked. A **connection** column shows the physical
+  bus (USB/SATA/NVMe/SAS/…, queried once per drive and cached — never on the
+  render path) — USB is flagged, since it's the tier where enclosure/cable/
+  hub quality and shared bandwidth with other USB devices are real factors,
+  unlike an internally wired SATA/NVMe/SAS/RAID connection. Hover a value for
+  the make/model/serial plus Device Manager's own "Policies" tab state:
+  write-caching (and whether the device is power-protected, so Windows can
+  skip flushing it on every write) and removal policy (Quick removal vs
+  Better performance — whichever was last set in Device Manager, or "not set"
+  if it never was). The same connection info, keyed to whichever drive is
+  actually busy, also appears in the I/O tab's physical-disks table. Not
+  detected: whether two USB drives share a physical port/hub/controller —
+  Windows only reports that via a much deeper device-topology walk, so two
+  drives both flagged USB may or may not actually contend with each other;
+  check Device Manager's USB tree if that distinction matters.
 - **Instances** — every instance with its **output folder**, editable inline
   (💾 applies; affects future takes only) and in **batch**: select rows and
   apply one folder to all of them (`{channel}` expands per instance). The

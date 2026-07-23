@@ -353,6 +353,12 @@ impl StreamArchiverApp {
                         };
                         egui::Grid::new("io_disks").striped(true).min_col_width(60.0).show(&mut cols[1], |ui| {
                             ui.weak("disk");
+                            ui.weak("conn").on_hover_text(
+                                "Physical connection — SATA/NVMe/SAS are wired internally and \
+                                 far more reliable than a USB enclosure (cable/hub/bridge \
+                                 quality, shared bandwidth). Hover a value for the make/model, \
+                                 write-cache state, and Device Manager removal policy.",
+                            );
                             ui.weak("read");
                             ui.weak("write");
                             ui.weak("other").on_hover_text(
@@ -371,6 +377,23 @@ impl StreamArchiverApp {
                             ui.end_row();
                             for d in &s.disks {
                                 ui.label(format!("{}:", d.letter));
+                                match iomon::disk_hw_info_cached(d.letter) {
+                                    Some(hw) => {
+                                        let resp = if hw.bus.is_removable_bus() {
+                                            ui.colored_label(ui.visuals().warn_fg_color, hw.bus.label())
+                                        } else {
+                                            ui.label(hw.bus.label())
+                                        };
+                                        resp.on_hover_text(hw.hover_text());
+                                    }
+                                    None => {
+                                        ui.weak("…").on_hover_text(
+                                            "Not probed yet — connection info is read once per \
+                                             drive by the background sampler, shortly after it \
+                                             first sees this drive.",
+                                        );
+                                    }
+                                }
                                 ui.label(bps(d.read_bps));
                                 ui.label(bps(d.write_bps));
                                 let spindle = d.read_bps + d.write_bps;
