@@ -87,6 +87,20 @@ impl Supervisor {
         // `None` = source (today's behavior).
         quality: Option<String>,
     ) {
+        // The "⛔ Abort backfill" context-menu action's cancellation flag —
+        // registered for the whole job's lifetime (RAII-removed on every
+        // exit path below), polled by the wait loops here and, via
+        // `mux_playlist_to_mkv`'s `abort` param, by the ffmpeg mux itself.
+        // Presence in `head_backfill_aborts` IS "a backfill is running for
+        // this rec_id" for the UI (`Supervisor::abort_head_backfill`).
+        let abort_flag = Arc::new(AtomicBool::new(false));
+        self.head_backfill_aborts.lock().unwrap().insert(rec_id, abort_flag.clone());
+        let _abort_guard = HeadBackfillAbortGuard {
+            map: self.head_backfill_aborts.clone(),
+            id: rec_id,
+            flag: abort_flag.clone(),
+        };
+
         // Let the CDN folder appear and streamlink's own rewind (if any) settle
         // — this is a fixed grace period, not proportional to how late the
         // recording joined; even an instant join needs it. `Recording.
@@ -96,6 +110,12 @@ impl Supervisor {
         for _ in 0..(HEAD_BACKFILL_SETTLE_SECS * 4) {
             if self.shutdown.load(Ordering::SeqCst) {
                 let _ = self.store.set_head_backfill_state(rec_id, "");
+                return;
+            }
+            if abort_flag.load(Ordering::SeqCst) {
+                info!(rec_id, "head backfill: aborted by user during settle wait");
+                let _ = self.store.set_head_backfill_state(rec_id, "");
+                let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
                 return;
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -145,6 +165,13 @@ impl Supervisor {
                 for _ in 0..(30 * 4) {
                     if self.shutdown.load(Ordering::SeqCst) {
                         let _ = self.store.set_head_backfill_state(rec_id, "");
+                        return;
+                    }
+                    if abort_flag.load(Ordering::SeqCst) {
+                        info!(rec_id, "head backfill: aborted by user");
+                        let _ = self.store.set_head_backfill_state(rec_id, "");
+                        let _ =
+                            self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
                         return;
                     }
                     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -230,6 +257,13 @@ impl Supervisor {
             if attempt > 0 {
                 for _ in 0..(60 * 4) {
                     if self.shutdown.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if abort_flag.load(Ordering::SeqCst) {
+                        info!(rec_id, "head backfill: aborted by user");
+                        finish(crate::events::TaskOutcome::Failed("aborted by user".into()));
+                        let _ =
+                            self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
                         return;
                     }
                     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -338,13 +372,20 @@ impl Supervisor {
             Some((self.events.clone(), task_id)),
             Some(head_secs),
             "head backfill",
+            Some(&abort_flag),
         )
         .await
         {
-            warn!(rec_id, "head backfill: mux failed: {e:#}");
-            finish(crate::events::TaskOutcome::Failed(format!("mux: {e:#}")));
+            if abort_flag.load(Ordering::SeqCst) {
+                info!(rec_id, "head backfill: aborted by user during mux");
+                finish(crate::events::TaskOutcome::Failed("aborted by user".into()));
+            } else {
+                warn!(rec_id, "head backfill: mux failed: {e:#}");
+                finish(crate::events::TaskOutcome::Failed(format!("mux: {e:#}")));
+            }
             let _ = crate::iomon::fs::remove_file(Cat::Recovery, &tmp_head).await;
             let _ = crate::iomon::fs::remove_file(Cat::Recovery, &pl_path).await;
+            let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
             return;
         }
         let _ = crate::iomon::fs::remove_file(Cat::Recovery, &pl_path).await;
@@ -511,6 +552,24 @@ impl Supervisor {
             quality,
         )
         .await;
+    }
+
+    /// Abort an in-flight head-backfill job for `rec_id` — the "⛔ Abort
+    /// backfill" context-menu action. Sets the running job's cancellation
+    /// flag (polled by `head_backfill_job`'s wait loops and, via
+    /// `mux_playlist_to_mkv`'s `abort` param, checked mid-mux so a long
+    /// ffmpeg pass gets killed rather than run to completion); the job
+    /// itself does the actual cleanup and state reset once it notices.
+    /// Returns whether a job was actually found running — a no-op (not an
+    /// error) if it already finished or was never running, since the UI's
+    /// enablement check and this call aren't atomic with each other.
+    pub fn abort_head_backfill(&self, rec_id: i64) -> bool {
+        if let Some(flag) = self.head_backfill_aborts.lock().unwrap().get(&rec_id) {
+            flag.store(true, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
     }
 
     /// Re-fetch a mismatched head at the LIVE capture's own rendition (the

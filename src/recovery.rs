@@ -30,6 +30,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use sha1::{Digest, Sha1};
@@ -768,6 +769,11 @@ pub async fn mux_playlist_to_mkv(
     // What this mux is for ("head backfill" / "VOD recovery") — shown as the
     // purpose in the I/O monitor's per-process table.
     purpose: &str,
+    // Checked each time ffmpeg reports progress; `Some(true)` kills the mux
+    // early and returns an error distinguishable from an ffmpeg failure (see
+    // the `aborted` check below). `None` = no cancellation (VOD recovery/gap
+    // recovery don't wire one up yet — only head backfill does).
+    abort: Option<&Arc<AtomicBool>>,
 ) -> anyhow::Result<()> {
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -825,6 +831,7 @@ pub async fn mux_playlist_to_mkv(
         lines
     });
 
+    let mut aborted = false;
     {
         let mut reader = BufReader::new(stdout).lines();
         let mut blk_speed = String::new();
@@ -854,6 +861,15 @@ pub async fn mux_playlist_to_mkv(
                         blk_speed.clear();
                         blk_pos.clear();
                         blk_us = None;
+                        // Checked once per progress tick (ffmpeg reports
+                        // roughly once a second) rather than every stdout
+                        // line — frequent enough for a responsive abort
+                        // without adding an atomic load per line.
+                        if abort.is_some_and(|a| a.load(Ordering::SeqCst)) {
+                            aborted = true;
+                            let _ = child.start_kill();
+                            break;
+                        }
                     }
                     _ => {}
                 }
@@ -863,6 +879,9 @@ pub async fn mux_playlist_to_mkv(
 
     let status = child.wait().await?;
     let stderr_lines = stderr_task.await.unwrap_or_default();
+    if aborted {
+        anyhow::bail!("aborted");
+    }
     if status.success() {
         Ok(())
     } else {
@@ -1108,6 +1127,7 @@ pub async fn run_recovery(
         Some((events.clone(), task_id)),
         None,
         "VOD recovery",
+        None,
     )
     .await;
     let _ = crate::iomon::fs::remove_file(Cat::Recovery, &temp_playlist).await;

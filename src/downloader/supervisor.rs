@@ -36,6 +36,7 @@ impl Supervisor {
             stall_killed: Arc::new(Mutex::new(HashSet::new())),
             gap_jobs: Arc::new(Mutex::new(HashSet::new())),
             gap_splice_jobs: Arc::new(Mutex::new(HashSet::new())),
+            head_backfill_aborts: Arc::new(Mutex::new(HashMap::new())),
             blocked_notified: Arc::new(Mutex::new(HashMap::new())),
             active_chats,
             stopping_chats: Arc::new(Mutex::new(HashSet::new())),
@@ -138,6 +139,9 @@ impl Supervisor {
                 tokio::spawn(async move {
                     this.refetch_head_matching_live(rec_id).await;
                 });
+            }
+            ManualCommand::AbortHeadBackfill(rec_id) => {
+                self.abort_head_backfill(rec_id);
             }
             ManualCommand::MergeSplitCapture(rec_id) => {
                 let this = self.clone();

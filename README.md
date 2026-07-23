@@ -516,6 +516,15 @@ fetch regardless of the *fetch new head backfill on new take* setting — it's
 user-initiated, so there's no reason to gate it. The *replace old head*
 setting still applies as configured.
 
+**Aborting a backfill.** A **⛔ Abort backfill** entry appears on a stream's or
+take's right-click menu whenever that take actually has one in flight
+(automatic or manual) — matching the **⏳ backfilling…** badge shown on the row
+(hover it for the same shortcut). It cancels the fetch as soon as possible: an
+already-running ffmpeg mux is killed rather than left to finish, any partial
+`{stem}.head.mkv`/playlist scratch file is discarded, and the take's normal
+capture is left completely untouched. A later stream restart or manual retry
+can always start a fresh backfill.
+
 ### Row actions & shortcuts
 
 ![Right-click context menu on an instance row](doc/screenshots/row-context-menu.png)

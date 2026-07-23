@@ -1288,7 +1288,7 @@ pub(super) fn take_status_badges(
             .on_hover_text("Missed start was backfilled from the live VOD ({stem}.head.mkv) — the joined file lands after the recording finishes.");
     } else if backfill_running {
         ui.colored_label(egui::Color32::from_rgb(80, 160, 220), "⏳ backfilling…")
-            .on_hover_text("Fetching the missed start from the live VOD — check the Background tab for progress.");
+            .on_hover_text("Fetching the missed start from the live VOD — check the Background tab for progress, or right-click this take → \"Abort backfill\" to stop it.");
     } else if backfill_queued {
         ui.colored_label(egui::Color32::from_gray(0xa0), "⏳ backfill queued")
             .on_hover_text(format!(

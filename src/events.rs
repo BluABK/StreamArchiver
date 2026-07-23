@@ -478,6 +478,10 @@ pub enum ManualCommand {
     /// joined before Twitch listed the source rendition, so the source-quality
     /// head can't be losslessly concatenated with it.
     BackfillHeadMatchLive(i64),
+    /// Abort an in-flight head-backfill job for a recording — the "⛔ Abort
+    /// backfill" context-menu action, shown only while one is actually
+    /// running. A no-op if the job already finished on its own.
+    AbortHeadBackfill(i64),
     /// Merge a stranded split capture (bare per-format `.fN.*` files left in
     /// `.cache\` when the tool died before its own merge) into the final MKV
     /// and promote it — the Issues fix for a take that finalized 0-byte while

@@ -358,6 +358,14 @@ pub struct Supervisor {
     /// called speculatively from several places (see its own doc comment);
     /// first caller wins, same shape as `gap_jobs`/`running_concats`.
     gap_splice_jobs: Arc<Mutex<HashSet<i64>>>,
+    /// rec_ids with a head-backfill job currently in flight, each holding the
+    /// flag that job's wait loops (and its ffmpeg mux, via
+    /// `mux_playlist_to_mkv`'s `abort` param) poll to cut short early — the
+    /// "⛔ Abort backfill" context-menu action. Registered by
+    /// `head_backfill_job` itself (RAII-removed on every exit path), so
+    /// presence in this map IS "a backfill is running for this rec_id",
+    /// shared with the UI via `Supervisor::abort_head_backfill`.
+    head_backfill_aborts: Arc<Mutex<HashMap<i64, Arc<AtomicBool>>>>,
 }
 
 /// Why automatic restarts are suppressed for a monitor after a user Stop.
@@ -430,6 +438,31 @@ struct ConcatGuard {
 impl Drop for ConcatGuard {
     fn drop(&mut self) {
         self.set.lock().unwrap().remove(&self.id);
+    }
+}
+
+/// RAII guard removing a rec_id from [`Supervisor::head_backfill_aborts`] on
+/// drop, so every exit path of `head_backfill_job` — normal completion,
+/// error, or abort itself — releases the slot (mirrors [`ConcatGuard`]).
+///
+/// `head_backfill_job` has no "one at a time per rec_id" guard of its own
+/// (unlike `maybe_concat_backfill`'s `running_concats`) — a fast manual
+/// re-trigger could in principle start a second job for the same rec_id
+/// before the first's guard drops. Compares by flag identity (not just the
+/// map key) before removing, so an outliving first job never evicts a
+/// still-running second job's entry out from under it.
+struct HeadBackfillAbortGuard {
+    map: Arc<Mutex<HashMap<i64, Arc<AtomicBool>>>>,
+    id: i64,
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for HeadBackfillAbortGuard {
+    fn drop(&mut self) {
+        let mut map = self.map.lock().unwrap();
+        if map.get(&self.id).is_some_and(|current| Arc::ptr_eq(current, &self.flag)) {
+            map.remove(&self.id);
+        }
     }
 }
 

@@ -110,6 +110,7 @@ struct StreamsOut {
     open_recover_take: Option<i64>,
     archive_vod_now: Option<i64>,
     backfill_head_now: Option<i64>,
+    abort_backfill: Option<i64>,
     /// (monitor id, recording id) — "View chat" on a stream/take row.
     view_chat_rec: Option<(i64, i64)>,
     // Container-level actions.
@@ -1029,6 +1030,7 @@ impl StreamArchiverApp {
             open_recover_take,
             archive_vod_now,
             backfill_head_now,
+            abort_backfill,
             view_chat_rec,
             toggle_channel_enabled,
             toggle_channel_automation,
@@ -1090,6 +1092,10 @@ impl StreamArchiverApp {
         if let Some(rec_id) = backfill_head_now.or_else(|| acts.backfill_head.take()) {
             self.core.manual(ManualCommand::BackfillHeadNow(rec_id));
             self.status = "Backfilling head…".into();
+        }
+        if let Some(rec_id) = abort_backfill {
+            self.core.manual(ManualCommand::AbortHeadBackfill(rec_id));
+            self.status = "Aborting backfill…".into();
         }
         // Next stream double-click: a channel/stream/take row sets the local; an
         // instance row routes through RowActions.
@@ -2705,6 +2711,20 @@ impl StreamArchiverApp {
                         out.backfill_head_now = Some(t.id);
                         ui.close();
                     }
+                    if head_backfill_running(background_tasks, t.id)
+                        && ui
+                            .button("⛔  Abort backfill")
+                            .on_hover_text(
+                                "Stop this stream's latest take's in-progress head \
+                                 backfill now. The head fetched so far is discarded — \
+                                 the take keeps its normal capture untouched, just \
+                                 without the missed intro.",
+                            )
+                            .clicked()
+                    {
+                        out.abort_backfill = Some(t.id);
+                        ui.close();
+                    }
                 }
                 if ui
                     .add_enabled(
@@ -3253,6 +3273,19 @@ impl StreamArchiverApp {
                         .clicked()
                 {
                     out.backfill_head_now = Some(t.id);
+                    ui.close();
+                }
+                if head_backfill_running(background_tasks, t.id)
+                    && ui
+                        .button("⛔  Abort backfill")
+                        .on_hover_text(
+                            "Stop this take's in-progress head backfill now. The head \
+                             fetched so far is discarded — the take keeps its normal \
+                             capture untouched, just without the missed intro.",
+                        )
+                        .clicked()
+                {
+                    out.abort_backfill = Some(t.id);
                     ui.close();
                 }
                 if ui

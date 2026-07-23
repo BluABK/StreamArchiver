@@ -238,6 +238,7 @@ impl Supervisor {
                 Some((self.events.clone(), task_id)),
                 Some(len),
                 "gap recovery",
+                None,
             )
             .await;
             let _ = crate::iomon::fs::remove_file(Cat::Recovery, &pl_path).await;
