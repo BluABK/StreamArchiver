@@ -51,24 +51,23 @@ The window has three tabs: **Streams** (monitor channels for live broadcasts),
 
 ### The top bar
 
-The most-used views — **📺 Streams, 🎬 Videos, 🗓 Schedule, 📣 Posts** — are
-always-visible tabs, shown as icons only (hover any tab for its name) so four
-tabs cost roughly what one word used to. Everything else lives in two dropdown
-menus plus one icon:
+Every view is an always-visible tab, shown as an icon only (hover any tab for
+its name, plus a description for the less-obvious ones) — **📺 Streams, 🎬
+Videos, 🗓 Schedule, 📣 Posts, 🔄 Background, 📁 Files, 📈 Channel Stats, 📊
+App Stats, 💾 I/O**, and **🐞 Debug** when enabled — so ten tabs cost roughly
+what a handful of words used to. Only a few things live off to the side:
 
-- **Views ▾** — the secondary views (🔄 Background, 📁 Files, *Ch. Stats*,
-  *App Stats*, 💾 I/O, and 🐞 Debug when enabled — each hovers to its full
-  name) and the two display toggles (*Status bgcolor*, *Short timestamps* —
+- **⋯** — the two display toggles (*Status bgcolor*, *Short timestamps* —
   the menu stays open while toggling).
 - **Help ▾** — **📖 Help** (this manual, rendered in-app; see below) and
   **ℹ About** (version/build/commit info and the app's data locations, with
   open-folder and copy buttons — the info that used to sit in the top bar).
 - **⚙** — Settings (also `Ctrl+,`).
 
-At narrow window widths the primary tabs collapse (right-to-left) into a
-**»** overflow menu instead of overlapping the status buttons on the right —
-those (Issues, Warnings, the bell, Scheduled rec, Posts, Process manager)
-always stay visible and clickable.
+At narrow window widths the tabs collapse (right-to-left) into a **»**
+overflow menu instead of overlapping the status buttons on the right — those
+(Issues, Warnings, the bell, Scheduled rec, Posts, Process manager) always
+stay visible and clickable.
 
 **📖 Help** renders this README inside the app — table of contents on the
 left (with a filter box), one section at a time, screenshots included, and

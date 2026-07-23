@@ -1717,17 +1717,55 @@ impl eframe::App for StreamArchiverApp {
                     ui.heading("StreamArchiver");
                     ui.separator();
 
-                    // ── Primary tabs, collapsing into » before they can ever
+                    // ── All view tabs, collapsing into » before they can ever
                     // reach the right-aligned status buttons. Icon-only —
-                    // hover shows the full name — so four tabs cost roughly
-                    // what one word used to. ──
-                    const PRIMARY: [(View, &str, &str); 4] = [
-                        (View::Streams, "📺", "Streams"),
-                        (View::Videos, "🎬", "Videos"),
-                        (View::Schedule, "🗓", "Schedule"),
-                        (View::Posts, "📣", "Posts"),
+                    // hover shows the full name (plus a description for the
+                    // less-obvious ones) — so ten tabs cost roughly what a
+                    // handful of words used to. ──
+                    let mut all_tabs: Vec<(View, &str, &str, &str)> = vec![
+                        (View::Streams, "📺", "Streams", ""),
+                        (View::Videos, "🎬", "Videos", ""),
+                        (View::Schedule, "🗓", "Schedule", ""),
+                        (View::Posts, "📣", "Posts", ""),
+                        (
+                            View::Background,
+                            "🔄",
+                            "Background",
+                            "Background jobs and periodic fetcher toggles.",
+                        ),
+                        (
+                            View::Files,
+                            "📁",
+                            "Files",
+                            "Recording file paths: drive mapping, batch output-directory \
+                             edits, DB path relocation.",
+                        ),
+                        (
+                            View::ChannelStats,
+                            "📈",
+                            "Channel Stats",
+                            "Per-channel viewer/follower history graphs, sub/bits/raid \
+                             events, and collab overview.",
+                        ),
+                        (
+                            View::Stats,
+                            "📊",
+                            "App Stats",
+                            "App/system health: OCR usage, API quota, detection/poll \
+                             health, recording totals, capture health. Per-channel stats \
+                             live in Channel Stats.",
+                        ),
+                        (
+                            View::IoMonitor,
+                            "💾",
+                            "I/O monitor",
+                            "Live disk & network I/O monitor (per-category attribution, \
+                             gate queues).",
+                        ),
                     ];
-                    const VIEWS_MENU: &str = "Views ⏷";
+                    if debug_view_enabled() {
+                        all_tabs.push((View::Debug, "🐞", "Debug", "Internal debug view."));
+                    }
                     const HELP_MENU: &str = "Help ⏷";
                     // Approximate on-screen width of a button-like widget with
                     // `label` (galley + button padding + item spacing) — egui
@@ -1742,9 +1780,9 @@ impl eframe::App for StreamArchiverApp {
                             + ui.spacing().item_spacing.x
                     };
                     let widths: Vec<f32> =
-                        PRIMARY.iter().map(|(_, icon, _)| item_w(ui, icon)).collect();
+                        all_tabs.iter().map(|(_, icon, ..)| item_w(ui, icon)).collect();
                     let fixed_w: f32 =
-                        [VIEWS_MENU, HELP_MENU, "⚙"].iter().map(|l| item_w(ui, l)).sum();
+                        [HELP_MENU, "⚙", "⋯"].iter().map(|l| item_w(ui, l)).sum();
                     // The right cluster's width is only known from last frame
                     // (it renders after us); first frame reserves generously.
                     let right_reserved = if self.topbar.right_w > 0.0 {
@@ -1764,8 +1802,10 @@ impl eframe::App for StreamArchiverApp {
                     self.topbar.visible = visible;
 
                     let mut switch: Option<View> = None;
-                    for (v, icon, name) in PRIMARY.iter().take(visible) {
-                        let resp = ui.selectable_label(self.view == *v, *icon).on_hover_text(*name);
+                    for (v, icon, name, hover) in all_tabs.iter().take(visible) {
+                        let hover_text =
+                            if hover.is_empty() { name.to_string() } else { format!("{name}\n{hover}") };
+                        let resp = ui.selectable_label(self.view == *v, *icon).on_hover_text(hover_text);
                         let resp = if *v == View::Streams {
                             resp.inspect("View tab: Streams", &[])
                         } else {
@@ -1775,9 +1815,9 @@ impl eframe::App for StreamArchiverApp {
                             switch = Some(*v);
                         }
                     }
-                    if visible < PRIMARY.len() {
+                    if visible < all_tabs.len() {
                         ui.menu_button("»", |ui| {
-                            for (v, icon, name) in PRIMARY.iter().skip(visible) {
+                            for (v, icon, name, _) in all_tabs.iter().skip(visible) {
                                 if ui
                                     .selectable_label(self.view == *v, format!("{icon} {name}"))
                                     .clicked()
@@ -1791,106 +1831,43 @@ impl eframe::App for StreamArchiverApp {
                         .on_hover_text("Tabs that don't fit at this window width.");
                     }
 
-                    // ── Views ▾: secondary views + display toggles. Stays
-                    // open on toggle clicks (CloseOnClickOutside); view
-                    // entries close it explicitly. Each entry is either an
-                    // icon (when one reads unambiguously on its own) or a
-                    // shortened name (when it doesn't) — full name always in
-                    // the hover text alongside the existing description. ──
-                    let secondary: &[(View, &str, &str, &str)] = &[
-                        (
-                            View::Background,
-                            "🔄 Background",
-                            "Background",
-                            "Background jobs and periodic fetcher toggles.",
-                        ),
-                        (
-                            View::Files,
-                            "📁 Files",
-                            "Files",
-                            "Recording file paths: drive mapping, batch output-directory \
-                             edits, DB path relocation.",
-                        ),
-                        (
-                            View::ChannelStats,
-                            "Ch. Stats",
-                            "Channel Stats",
-                            "Per-channel viewer/follower history graphs, sub/bits/raid \
-                             events, and collab overview.",
-                        ),
-                        (
-                            View::Stats,
-                            "App Stats",
-                            "App Stats",
-                            "App/system health: OCR usage, API quota, detection/poll \
-                             health, recording totals, capture health. Per-channel stats \
-                             live in Channel Stats.",
-                        ),
-                        (
-                            View::IoMonitor,
-                            "💾 I/O",
-                            "I/O monitor",
-                            "Live disk & network I/O monitor (per-category attribution, \
-                             gate queues).",
-                        ),
-                        (View::Debug, "🐞 Debug", "Debug", "Internal debug view."),
-                    ];
-                    let secondary_active =
-                        secondary.iter().any(|(v, ..)| *v == self.view);
-                    let views_btn =
-                        egui::Button::new(VIEWS_MENU).selected(secondary_active);
-                    egui::containers::menu::MenuButton::from_button(views_btn)
-                        .config(egui::containers::menu::MenuConfig::new().close_behavior(
-                            egui::PopupCloseBehavior::CloseOnClickOutside,
-                        ))
-                        .ui(ui, |ui| {
-                            for (v, label, name, hover) in secondary {
-                                if *v == View::Debug && !debug_view_enabled() {
-                                    continue;
-                                }
-                                if ui
-                                    .selectable_label(self.view == *v, *label)
-                                    .on_hover_text(format!("{name}\n{hover}"))
-                                    .clicked()
-                                {
-                                    switch = Some(*v);
-                                    ui.close();
-                                }
-                            }
-                            ui.separator();
-                            if ui
-                                .checkbox(&mut self.status_bgcolor, "Status bgcolor")
-                                .on_hover_text(
-                                    "Tint Streams rows by status (recording / ad playing / \
-                                     failed). Row selection is still highlighted when this \
-                                     is off.",
-                                )
-                                .changed()
-                            {
-                                let _ = self.core.store.set_setting(
-                                    K_STATUS_BGCOLOR,
-                                    if self.status_bgcolor { "1" } else { "0" },
-                                );
-                            }
-                            if ui
-                                .checkbox(&mut self.shorten_timestamps, "Short timestamps")
-                                .on_hover_text(
-                                    "Show timestamps in a compact short format (e.g. \
-                                     21/06 14:02) instead of the full datetime. Hover any \
-                                     timestamp for the full value. The short format is \
-                                     configurable in Settings → Display.",
-                                )
-                                .changed()
-                            {
-                                set_short_ts(self.shorten_timestamps);
-                                let _ = self.core.store.set_setting(
-                                    K_SHORT_TIMESTAMPS,
-                                    if self.shorten_timestamps { "1" } else { "0" },
-                                );
-                            }
-                        })
-                        .0
-                        .on_hover_text("Secondary views and display toggles.");
+                    // ── ⋯ Display: the two display toggles that used to share
+                    // the Views ▾ menu with the view links above (now icon-only
+                    // tabs in the main row). Stays open on toggle clicks. ──
+                    ui.menu_button("⋯", |ui| {
+                        if ui
+                            .checkbox(&mut self.status_bgcolor, "Status bgcolor")
+                            .on_hover_text(
+                                "Tint Streams rows by status (recording / ad playing / \
+                                 failed). Row selection is still highlighted when this \
+                                 is off.",
+                            )
+                            .changed()
+                        {
+                            let _ = self.core.store.set_setting(
+                                K_STATUS_BGCOLOR,
+                                if self.status_bgcolor { "1" } else { "0" },
+                            );
+                        }
+                        if ui
+                            .checkbox(&mut self.shorten_timestamps, "Short timestamps")
+                            .on_hover_text(
+                                "Show timestamps in a compact short format (e.g. \
+                                 21/06 14:02) instead of the full datetime. Hover any \
+                                 timestamp for the full value. The short format is \
+                                 configurable in Settings → Display.",
+                            )
+                            .changed()
+                        {
+                            set_short_ts(self.shorten_timestamps);
+                            let _ = self.core.store.set_setting(
+                                K_SHORT_TIMESTAMPS,
+                                if self.shorten_timestamps { "1" } else { "0" },
+                            );
+                        }
+                    })
+                    .response
+                    .on_hover_text("Display options: row status coloring, timestamp format.");
 
                     // ── Help ▾ ──
                     ui.menu_button(HELP_MENU, |ui| {
