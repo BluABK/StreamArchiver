@@ -1767,13 +1767,21 @@ impl eframe::App for StreamArchiverApp {
                         all_tabs.push((View::Debug, "🐞", "Debug", "Internal debug view."));
                     }
                     const HELP_MENU: &str = "Help ⏷";
+                    // Everything on this left-hand side (tabs, », Help ▾, ⚙,
+                    // ⋯) renders at 2x the normal button font — the right-hand
+                    // status cluster stays at its usual size, rendered further
+                    // below in its own `with_layout`. `big_font` is what every
+                    // `RichText` on this side uses; `item_w`'s galley
+                    // measurement uses the SAME font so the overflow budget
+                    // below matches what's actually painted.
+                    let base_font = egui::TextStyle::Button.resolve(ui.style());
+                    let big_font = egui::FontId::new(base_font.size * 2.0, base_font.family.clone());
                     // Approximate on-screen width of a button-like widget with
                     // `label` (galley + button padding + item spacing) — egui
                     // caches galleys, so this is cheap per frame.
                     let item_w = |ui: &egui::Ui, label: &str| -> f32 {
-                        let font = egui::TextStyle::Button.resolve(ui.style());
                         ui.painter()
-                            .layout_no_wrap(label.to_string(), font, egui::Color32::WHITE)
+                            .layout_no_wrap(label.to_string(), big_font.clone(), egui::Color32::WHITE)
                             .rect
                             .width()
                             + 2.0 * ui.spacing().button_padding.x
@@ -1805,7 +1813,12 @@ impl eframe::App for StreamArchiverApp {
                     for (v, icon, name, hover) in all_tabs.iter().take(visible) {
                         let hover_text =
                             if hover.is_empty() { name.to_string() } else { format!("{name}\n{hover}") };
-                        let resp = ui.selectable_label(self.view == *v, *icon).on_hover_text(hover_text);
+                        let resp = ui
+                            .selectable_label(
+                                self.view == *v,
+                                egui::RichText::new(*icon).font(big_font.clone()),
+                            )
+                            .on_hover_text(hover_text);
                         let resp = if *v == View::Streams {
                             resp.inspect("View tab: Streams", &[])
                         } else {
@@ -1816,7 +1829,7 @@ impl eframe::App for StreamArchiverApp {
                         }
                     }
                     if visible < all_tabs.len() {
-                        ui.menu_button("»", |ui| {
+                        ui.menu_button(egui::RichText::new("»").font(big_font.clone()), |ui| {
                             for (v, icon, name, _) in all_tabs.iter().skip(visible) {
                                 if ui
                                     .selectable_label(self.view == *v, format!("{icon} {name}"))
@@ -1834,7 +1847,7 @@ impl eframe::App for StreamArchiverApp {
                     // ── ⋯ Display: the two display toggles that used to share
                     // the Views ▾ menu with the view links above (now icon-only
                     // tabs in the main row). Stays open on toggle clicks. ──
-                    ui.menu_button("⋯", |ui| {
+                    ui.menu_button(egui::RichText::new("⋯").font(big_font.clone()), |ui| {
                         if ui
                             .checkbox(&mut self.status_bgcolor, "Status bgcolor")
                             .on_hover_text(
@@ -1870,7 +1883,7 @@ impl eframe::App for StreamArchiverApp {
                     .on_hover_text("Display options: row status coloring, timestamp format.");
 
                     // ── Help ▾ ──
-                    ui.menu_button(HELP_MENU, |ui| {
+                    ui.menu_button(egui::RichText::new(HELP_MENU).font(big_font.clone()), |ui| {
                         if ui
                             .button("📖 Help")
                             .on_hover_text(
@@ -1900,7 +1913,10 @@ impl eframe::App for StreamArchiverApp {
 
                     // ── ⚙ Settings ──
                     if ui
-                        .selectable_label(self.view == View::Settings, "⚙")
+                        .selectable_label(
+                            self.view == View::Settings,
+                            egui::RichText::new("⚙").font(big_font.clone()),
+                        )
                         .on_hover_text("Settings (Ctrl+,)")
                         .clicked()
                     {
@@ -1915,10 +1931,11 @@ impl eframe::App for StreamArchiverApp {
                         // Pinned far-right and shown on every view — the process
                         // manager is a global utility, not Background-specific.
                         if ui
-                            .button("🖥 Process manager")
+                            .button("🖥")
                             .on_hover_text(
-                                "All spawned download tool processes (recordings, videos, \
-                                 chat) — PIDs, status, and manual Stop / Kill.",
+                                "Process manager\nAll spawned download tool processes \
+                                 (recordings, videos, chat) — PIDs, status, and manual \
+                                 Stop / Kill.",
                             )
                             .clicked()
                         {
@@ -1932,11 +1949,7 @@ impl eframe::App for StreamArchiverApp {
                                 + self.issues_stuck.len() + self.issues_muted_vod.len()
                                 + self.issues_unmerged.len() + self.issues_head_mismatch.len()
                                 + quota_warnings.len();
-                            let label = if n > 0 {
-                                format!("⚠ Issues ({})", n)
-                            } else {
-                                "⚠ Issues".to_string()
-                            };
+                            let label = if n > 0 { format!("⚠ {n}") } else { "⚠".to_string() };
                             let btn = egui::Button::new(label).small();
                             let btn = if n > 0 {
                                 btn.fill(egui::Color32::from_rgb(160, 90, 10))
@@ -1945,7 +1958,9 @@ impl eframe::App for StreamArchiverApp {
                             };
                             if ui
                                 .add(btn)
-                                .on_hover_text("Recordings and quota warnings that need attention")
+                                .on_hover_text(
+                                    "Issues\nRecordings and quota warnings that need attention",
+                                )
                                 .clicked()
                             {
                                 self.show_issues = true;
@@ -1961,10 +1976,10 @@ impl eframe::App for StreamArchiverApp {
                             // `warnings_window`).
                             let (errs, warns) = self.warn_badge;
                             let label = match (errs, warns) {
-                                (0, 0) => "🚨 Warnings".to_string(),
-                                (0, w) => format!("🚨 Warnings ({w})"),
-                                (e, 0) => format!("🚨 Warnings ({e})"),
-                                (e, w) => format!("🚨 Warnings ({e}+{w})"),
+                                (0, 0) => "🚨".to_string(),
+                                (0, w) => format!("🚨 {w}"),
+                                (e, 0) => format!("🚨 {e}"),
+                                (e, w) => format!("🚨 {e}+{w}"),
                             };
                             let btn = egui::Button::new(label).small();
                             let btn = if errs > 0 {
@@ -1977,10 +1992,11 @@ impl eframe::App for StreamArchiverApp {
                             if ui
                                 .add(btn)
                                 .on_hover_text(
-                                    "Problems reported by the capture tools' own logs: lost \
-                                     segments / sequence gaps (errors — data is missing from \
-                                     the capture), failed fetches, and tool warnings. Red = \
-                                     unacknowledged errors, yellow = warnings only.",
+                                    "Warnings\nProblems reported by the capture tools' own \
+                                     logs: lost segments / sequence gaps (errors — data is \
+                                     missing from the capture), failed fetches, and tool \
+                                     warnings. Red = unacknowledged errors, yellow = warnings \
+                                     only.",
                                 )
                                 .clicked()
                             {
@@ -2023,26 +2039,25 @@ impl eframe::App for StreamArchiverApp {
                         }
                         {
                             let n = self.scheduled_recordings.iter().filter(|r| r.rec.enabled).count();
-                            let label = if n > 0 {
-                                format!("📅 Scheduled rec ({n})")
-                            } else {
-                                "📅 Scheduled rec".to_string()
-                            };
+                            let label = if n > 0 { format!("📅 {n}") } else { "📅".to_string() };
                             if ui
                                 .button(label)
                                 .on_hover_text(
-                                    "Recordings scheduled to force-start at a specific time or on \
-                                     a weekly repeat, bypassing Auto — for channels you don't want \
-                                     kept on Auto.",
+                                    "Scheduled rec\nRecordings scheduled to force-start at a \
+                                     specific time or on a weekly repeat, bypassing Auto — for \
+                                     channels you don't want kept on Auto.",
                                 )
                                 .clicked()
                             {
                                 self.show_scheduled_recordings = true;
                             }
                         }
+                        // "📣🗗" (not bare 📣) — the left-hand Posts TAB already
+                        // owns plain 📣; the trailing pop-out glyph is what
+                        // keeps this a visually distinct button.
                         if ui
-                            .button("📣 Posts")
-                            .on_hover_text("Pop out the YouTube posts feed in its own window")
+                            .button("📣🗗")
+                            .on_hover_text("Pop out Posts\nOpens the YouTube posts feed in its own window")
                             .clicked()
                         {
                             self.show_posts_window = true;
@@ -2050,8 +2065,11 @@ impl eframe::App for StreamArchiverApp {
                         }
                         if self.view == View::Streams {
                             if ui
-                                .button("➕ Add stream")
-                                .on_hover_text("Create a channel with its first instance (a URL to record)")
+                                .button("➕ Stream")
+                                .on_hover_text(
+                                    "Add stream\nCreate a channel with its first instance \
+                                     (a URL to record)",
+                                )
                                 .clicked()
                             {
                                 self.form = Some(MonitorForm::new_channel(
@@ -2060,8 +2078,11 @@ impl eframe::App for StreamArchiverApp {
                                 ));
                             }
                             if ui
-                                .button("➕ Add channel")
-                                .on_hover_text("Create an empty channel container; add instances to it afterwards")
+                                .button("➕ Channel")
+                                .on_hover_text(
+                                    "Add channel\nCreate an empty channel container; add \
+                                     instances to it afterwards",
+                                )
                                 .clicked()
                             {
                                 self.channel_form = Some(ChannelForm {

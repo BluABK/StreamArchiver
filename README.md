@@ -51,11 +51,13 @@ The window has three tabs: **Streams** (monitor channels for live broadcasts),
 
 ### The top bar
 
-Every view is an always-visible tab, shown as an icon only (hover any tab for
-its name, plus a description for the less-obvious ones) — **📺 Streams, 🎬
+Every view is an always-visible tab, shown as an icon only at 2x the normal
+button size — big enough to hit without hunting — (hover any tab for its
+name, plus a description for the less-obvious ones): **📺 Streams, 🎬
 Videos, 🗓 Schedule, 📣 Posts, 🔄 Background, 📁 Files, 📈 Channel Stats, 📊
-App Stats, 💾 I/O**, and **🐞 Debug** when enabled — so ten tabs cost roughly
-what a handful of words used to. Only a few things live off to the side:
+App Stats, 💾 I/O**, and **🐞 Debug** when enabled. The rest of the left-hand
+side — **»**, **⋯**, **Help ▾**, and **⚙** — renders at that same doubled
+size:
 
 - **⋯** — the two display toggles (*Status bgcolor*, *Short timestamps* —
   the menu stays open while toggling).
@@ -65,9 +67,14 @@ what a handful of words used to. Only a few things live off to the side:
 - **⚙** — Settings (also `Ctrl+,`).
 
 At narrow window widths the tabs collapse (right-to-left) into a **»**
-overflow menu instead of overlapping the status buttons on the right — those
-(Issues, Warnings, the bell, Scheduled rec, Posts, Process manager) always
-stay visible and clickable.
+overflow menu instead of overlapping the status buttons on the right. Those
+status buttons stay at their normal (non-doubled) size and are icon-only
+where a duplicate icon wouldn't be ambiguous: **🖥** Process manager, **⚠**
+Issues, **🚨** Warnings, **🔔** notifications, **📅** Scheduled rec, and
+**📣🗗** to pop the Posts feed into its own window (the trailing 🗗
+distinguishes it from the plain 📣 Posts tab). All keep a hover tooltip
+explaining what they do, and stay visible and clickable regardless of window
+width.
 
 **📖 Help** renders this README inside the app — table of contents on the
 left (with a filter box), one section at a time, screenshots included, and
