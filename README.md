@@ -333,14 +333,20 @@ the channel was added). Timestamps follow the **Date format** chosen in Settings
 
 **Recording history (collapsible).** Each channel row is a tree you can expand
 (the ▶ triangle) to see its **past streams**, and each stream that took more than
-one attempt expands again to its individual **takes**:
+one attempt expands again to its individual **takes**. Both the stream row and
+each take show a file size in parens: the stream row sums every take (hover it,
+or the Duration column, for an average bitrate — a quick way to notice a take
+that captured at the wrong quality); a still-recording take shows its *live*
+size, not the stale 0 B a plain directory listing would give a file another
+process still has open for writing — it's read from the file handle directly
+and updates every couple of seconds:
 
 ```
 ▼ Layna            twitch  streamlink  recording
-   ▼ 🎬 2026-06-20 18:00   recording   · 2 takes
-        Take 1   18:00–18:12   failed       (crashed)
-        Take 2   18:13–…       recording
-   ▶ 🎬 2026-06-19 21:30   completed
+   ▼ 🎬 2026-06-20 18:00   recording   · 2 takes (7.4 GB)
+        Take 1   18:00–18:12   failed       (crashed)  (1.1 GB)
+        Take 2   18:13–…       recording               (6.3 GB)
+   ▶ 🎬 2026-06-19 21:30   completed                    (5.8 GB)
 ```
 
 A channel with **multiple capture instances** (e.g. streamlink *and* yt-dlp on the

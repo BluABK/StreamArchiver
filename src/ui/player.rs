@@ -82,6 +82,10 @@ pub(super) enum ProbeJob {
     File(std::path::PathBuf),
     Dir(std::path::PathBuf),
     Len(std::path::PathBuf),
+    /// Handle-based size via [`live_file_len`] — unlike `Len`, current even
+    /// while another process still holds the file open for writing. For the
+    /// Streams grid's take-row/stream-row size display on an active take.
+    LiveLen(std::path::PathBuf),
     Target(String),
 }
 
@@ -90,6 +94,7 @@ pub(super) enum ProbeResult {
     File(std::path::PathBuf, bool),
     Dir(std::path::PathBuf, bool),
     Len(std::path::PathBuf, u64),
+    LiveLen(std::path::PathBuf, u64),
     Target(String, Option<StreamTarget>),
 }
 
@@ -124,6 +129,7 @@ pub(super) struct FsProbes {
     pub(super) files: HashMap<std::path::PathBuf, ProbeSlot<bool>>,
     pub(super) dirs: HashMap<std::path::PathBuf, ProbeSlot<bool>>,
     pub(super) sizes: HashMap<std::path::PathBuf, ProbeSlot<u64>>,
+    pub(super) live_sizes: HashMap<std::path::PathBuf, ProbeSlot<u64>>,
     pub(super) targets: HashMap<String, ProbeSlot<Option<StreamTarget>>>,
     pub(super) tx: std::sync::mpsc::Sender<ProbeJob>,
     pub(super) rx: std::sync::mpsc::Receiver<ProbeResult>,
@@ -189,6 +195,10 @@ impl FsProbes {
                                 .unwrap_or(0);
                             ProbeResult::Len(p, v)
                         }
+                        ProbeJob::LiveLen(p) => {
+                            let v = live_file_len(&p).unwrap_or(0);
+                            ProbeResult::LiveLen(p, v)
+                        }
                         // stream_target_for_active's own read_dir/open calls
                         // are accounted individually (Cat::FsProbe) inside.
                         ProbeJob::Target(s) => {
@@ -209,6 +219,7 @@ impl FsProbes {
             files: HashMap::new(),
             dirs: HashMap::new(),
             sizes: HashMap::new(),
+            live_sizes: HashMap::new(),
             targets: HashMap::new(),
             tx: job_tx,
             rx: res_rx,
@@ -228,6 +239,13 @@ impl FsProbes {
     /// Last-known directory-entry size (0 while missing/unprobed).
     pub(super) fn len(&mut self, p: &std::path::Path) -> u64 {
         probe_lookup(&self.tx, &mut self.sizes, p, 0, ProbeJob::Len)
+    }
+
+    /// Last-known [`live_file_len`] (0 while missing/unprobed) — current size
+    /// of a still-growing capture, unlike [`FsProbes::len`]'s directory-entry
+    /// read. For an active take's size in the Streams grid.
+    pub(super) fn live_len(&mut self, p: &std::path::Path) -> u64 {
+        probe_lookup(&self.tx, &mut self.live_sizes, p, 0, ProbeJob::LiveLen)
     }
 
     /// Last-known [`stream_target_for_active`] (a `.cache` dir scan plus a
@@ -257,6 +275,7 @@ impl FsProbes {
                 ProbeResult::File(p, v) => install(&mut self.files, &p, v, now),
                 ProbeResult::Dir(p, v) => install(&mut self.dirs, &p, v, now),
                 ProbeResult::Len(p, v) => install(&mut self.sizes, &p, v, now),
+                ProbeResult::LiveLen(p, v) => install(&mut self.live_sizes, &p, v, now),
                 ProbeResult::Target(s, t) => install(&mut self.targets, &s, t, now),
             }
         }
@@ -269,6 +288,7 @@ impl FsProbes {
         self.files.retain(|_, s| now.duration_since(s.used) < FS_PROBE_EVICT);
         self.dirs.retain(|_, s| now.duration_since(s.used) < FS_PROBE_EVICT);
         self.sizes.retain(|_, s| now.duration_since(s.used) < FS_PROBE_EVICT);
+        self.live_sizes.retain(|_, s| now.duration_since(s.used) < FS_PROBE_EVICT);
         self.targets.retain(|_, s| now.duration_since(s.used) < FS_PROBE_EVICT);
     }
 }

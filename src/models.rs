@@ -2612,9 +2612,6 @@ impl StreamGroup {
         }
         self.takes.iter().filter_map(|t| t.ended_at).max()
     }
-    pub fn total_bytes(&self) -> i64 {
-        self.takes.iter().map(|t| t.bytes).sum()
-    }
     /// Total captured time summed across takes.
     pub fn captured_secs(&self, now: i64) -> i64 {
         self.takes.iter().map(|t| t.duration_secs(now)).sum()

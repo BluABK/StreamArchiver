@@ -2111,6 +2111,16 @@ impl StreamArchiverApp {
                         if has_takes {
                             ui.weak(format!("· {} takes", g.takes.len()));
                         }
+                        // Per-take live probe: `t.bytes` alone reads 0 for an
+                        // active take (that column is only written at
+                        // finalize), which would make the group's running
+                        // total vanish for the entire duration of a capture.
+                        let total: u64 =
+                            g.takes.iter().map(|t| take_size_bytes(fs_probes, t)).sum();
+                        if total > 0 {
+                            ui.weak(format!("({})", fmt_bytes(total as i64)))
+                                .on_hover_text(stream_size_hover(total, g.captured_secs(now)));
+                        }
                     }
                     "state" => {
                         let finalizing = g.status() == "recording"
@@ -2263,10 +2273,15 @@ impl StreamArchiverApp {
                         }
                     }
                     "duration" => {
+                        // Same live per-take probe as the "name" cell (see
+                        // its comment) so this hover doesn't go stale for the
+                        // entire length of an in-progress recording.
+                        let total: u64 =
+                            g.takes.iter().map(|t| take_size_bytes(fs_probes, t)).sum();
                         ui.label(fmt_duration(g.captured_secs(now))).on_hover_text(
                             format!(
                                 "{} captured across {} take(s) · span {}",
-                                fmt_bytes(g.total_bytes()),
+                                fmt_bytes(total as i64),
                                 g.takes.len(),
                                 fmt_duration(span),
                             ),
@@ -2646,6 +2661,18 @@ impl StreamArchiverApp {
                             ui, depth, false, false, None,
                             egui::RichText::new(label).weak(),
                         );
+                        let size = take_size_bytes(fs_probes, t);
+                        if size > 0 {
+                            let hover = if t.is_active() {
+                                "Live size — the capture is still growing (probed \
+                                 directly from the file handle; updates every \
+                                 couple of seconds)."
+                            } else {
+                                "Final file size."
+                            };
+                            ui.weak(format!("({})", fmt_bytes(size as i64)))
+                                .on_hover_text(hover);
+                        }
                     }
                     "state" => {
                         let finalizing =

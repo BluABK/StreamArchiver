@@ -162,6 +162,33 @@ pub(super) fn dual_take_variant(g: &StreamGroup, t: &Recording) -> Option<&'stat
     }
 }
 
+/// Current size of one take, for the Streams grid's size display. A finished
+/// take's `bytes` is already the final, free-to-read value (set once at
+/// finalize — see `finish_recording`); a still-`is_active()` take hasn't
+/// written that column yet, so it needs a live probe instead (a plain
+/// directory-entry read stays near-zero for the whole session while ffmpeg/
+/// streamlink holds the file open — see `live_file_len`'s doc comment).
+pub(super) fn take_size_bytes(fs_probes: &mut FsProbes, t: &Recording) -> u64 {
+    if t.is_active() {
+        fs_probes.live_len(std::path::Path::new(&t.output_path))
+    } else {
+        t.bytes.max(0) as u64
+    }
+}
+
+/// Hover text for a stream group's total-size label: the byte total plus an
+/// average bitrate (a quick way to eyeball whether a take actually captured
+/// at the expected quality — a stream that should be 1080p60 but averages
+/// 2 Mbps is worth a second look).
+pub(super) fn stream_size_hover(total_bytes: u64, captured_secs: i64) -> String {
+    let base = format!("{} captured across all takes", fmt_bytes(total_bytes as i64));
+    if captured_secs <= 0 {
+        return base;
+    }
+    let mbps = (total_bytes as f64 * 8.0) / (captured_secs as f64 * 1_000_000.0);
+    format!("{base}\n≈{mbps:.1} Mbps average")
+}
+
 /// Split a stored `--cookies-from-browser` value into `(browser, profile)`.
 /// `profile` is everything after the first `:` — a profile/session name or an
 /// absolute path (which may itself contain a `:` drive letter, hence split-once).
@@ -519,6 +546,23 @@ mod tests {
         assert!(s.ends_with(" (45s)"), "got {s:?}");
         assert!(s.len() > " (45s)".len());
     }
+    #[test]
+    fn stream_size_hover_includes_bitrate_when_timed() {
+        // 1,000,000,000 bytes / 8s = 8 billion bits / 8s = 1000 Mbps — fmt_bytes
+        // is binary (base-1024), so the byte count reads as "953.7 MB", not "1 GB".
+        let s = stream_size_hover(1_000_000_000, 8);
+        assert!(s.contains("1000.0 Mbps average"), "got {s:?}");
+        assert!(s.starts_with("953.7 MB captured across all takes"), "got {s:?}");
+    }
+
+    #[test]
+    fn stream_size_hover_omits_bitrate_without_a_duration() {
+        // No captured time yet (e.g. a probe landed before duration_secs did)
+        // — nothing to divide by, so just the byte count, no "average" line.
+        let s = stream_size_hover(500, 0);
+        assert!(!s.contains("average"), "got {s:?}");
+    }
+
     #[test]
     fn browser_profile_roundtrip() {
         // No profile.
