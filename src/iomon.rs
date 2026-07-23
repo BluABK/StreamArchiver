@@ -282,7 +282,7 @@ static RECORDINGS_ROOTS: RwLock<Vec<PathBuf>> = RwLock::new(Vec::new());
 /// for paths on the same physical drive but outside any configured root).
 static RECORDINGS_DRIVES: RwLock<Vec<char>> = RwLock::new(Vec::new());
 
-fn drive_letter(p: &Path) -> Option<char> {
+pub(crate) fn drive_letter(p: &Path) -> Option<char> {
     match p.components().next() {
         Some(std::path::Component::Prefix(pre)) => match pre.kind() {
             std::path::Prefix::Disk(b) | std::path::Prefix::VerbatimDisk(b) => {
@@ -820,6 +820,14 @@ static FINISHED: Mutex<FinishedChildTotals> = Mutex::new(FinishedChildTotals {
 /// this and refresh ~1×/s rather than cloning every frame.
 pub fn history() -> Vec<Sample> {
     HISTORY.lock().iter().cloned().collect()
+}
+
+/// The single most recent sample, if the sampler has produced one yet — O(1),
+/// unlike [`history`]. For callers that only need current per-process rates
+/// (e.g. the Process manager window) and shouldn't pay to clone the whole
+/// ~30 min ring just to read its tail.
+pub fn latest() -> Option<Sample> {
+    HISTORY.lock().back().cloned()
 }
 
 pub fn finished_child_totals() -> FinishedChildTotals {

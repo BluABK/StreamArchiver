@@ -1729,7 +1729,7 @@ impl eframe::App for StreamArchiverApp {
                         (View::Posts, "📣", "Posts", ""),
                         (
                             View::Background,
-                            "🔄",
+                            "🎛",
                             "Background",
                             "Background jobs and periodic fetcher toggles.",
                         ),
@@ -1757,7 +1757,7 @@ impl eframe::App for StreamArchiverApp {
                         ),
                         (
                             View::IoMonitor,
-                            "💾",
+                            "🖴",
                             "I/O monitor",
                             "Live disk & network I/O monitor (per-category attribution, \
                              gate queues).",
@@ -1766,8 +1766,7 @@ impl eframe::App for StreamArchiverApp {
                     if debug_view_enabled() {
                         all_tabs.push((View::Debug, "🐞", "Debug", "Internal debug view."));
                     }
-                    const HELP_MENU: &str = "Help ⏷";
-                    // Everything on this left-hand side (tabs, », Help ▾, ⚙,
+                    // Everything on this left-hand side (tabs, », 📖, ⚙,
                     // ⋯) renders at 2x the normal button font — the right-hand
                     // status cluster stays at its usual size, rendered further
                     // below in its own `with_layout`. `big_font` is what every
@@ -1789,8 +1788,7 @@ impl eframe::App for StreamArchiverApp {
                     };
                     let widths: Vec<f32> =
                         all_tabs.iter().map(|(_, icon, ..)| item_w(ui, icon)).collect();
-                    let fixed_w: f32 =
-                        [HELP_MENU, "⚙", "⋯"].iter().map(|l| item_w(ui, l)).sum();
+                    let fixed_w: f32 = ["📖", "⚙", "⋯"].iter().map(|l| item_w(ui, l)).sum();
                     // The right cluster's width is only known from last frame
                     // (it renders after us); first frame reserves generously.
                     let right_reserved = if self.topbar.right_w > 0.0 {
@@ -1882,34 +1880,24 @@ impl eframe::App for StreamArchiverApp {
                     .response
                     .on_hover_text("Display options: row status coloring, timestamp format.");
 
-                    // ── Help ▾ ──
-                    ui.menu_button(egui::RichText::new(HELP_MENU).font(big_font.clone()), |ui| {
-                        if ui
-                            .button("📖 Help")
-                            .on_hover_text(
-                                "The full manual, in-app (works offline — it's embedded \
-                                 in the binary).",
-                            )
-                            .clicked()
-                        {
-                            switch = Some(View::Help);
-                            ui.close();
-                        }
-                        if ui
-                            .button("ℹ About")
-                            .on_hover_text(
-                                "Version, build and commit info, and where this app keeps \
-                                 its data.",
-                            )
-                            .clicked()
-                        {
-                            self.help.get_or_insert_default().selected = 0;
-                            switch = Some(View::Help);
-                            ui.close();
-                        }
-                    })
-                    .response
-                    .on_hover_text("Manual and version info.");
+                    // ── 📖 Help — About used to be a separate dropdown entry,
+                    // but it's just the first page of the Help view's own
+                    // sidebar (`selected == 0`), not a distinct destination —
+                    // one icon button for both. ──
+                    if ui
+                        .selectable_label(
+                            self.view == View::Help,
+                            egui::RichText::new("📖").font(big_font.clone()),
+                        )
+                        .on_hover_text(
+                            "Help\nThe full manual, in-app (works offline — it's embedded \
+                             in the binary). Version/build info and data locations are the \
+                             \"About\" page inside it.",
+                        )
+                        .clicked()
+                    {
+                        switch = Some(View::Help);
+                    }
 
                     // ── ⚙ Settings ──
                     if ui
@@ -1930,17 +1918,24 @@ impl eframe::App for StreamArchiverApp {
                     let right_w = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Pinned far-right and shown on every view — the process
                         // manager is a global utility, not Background-specific.
-                        if ui
-                            .button("🖥")
-                            .on_hover_text(
-                                "Process manager\nAll spawned download tool processes \
-                                 (recordings, videos, chat) — PIDs, status, and manual \
-                                 Stop / Kill.",
-                            )
-                            .clicked()
                         {
-                            self.show_processes = true;
-                            self.processes_refreshed = None; // force an immediate refresh
+                            // Count stays live even while the window is closed —
+                            // `processes_window` refreshes it on a slower
+                            // throttle regardless (see there).
+                            let n = self.processes.len();
+                            let label = if n > 0 { format!("🖥 {n}") } else { "🖥".to_string() };
+                            if ui
+                                .button(label)
+                                .on_hover_text(
+                                    "Process manager\nAll spawned download tool processes \
+                                     (recordings, videos, chat) — PIDs, status, and manual \
+                                     Stop / Kill.",
+                                )
+                                .clicked()
+                            {
+                                self.show_processes = true;
+                                self.processes_refreshed = None; // force an immediate refresh
+                            }
                         }
                         {
                             let quota_warnings = self.active_quota_warnings();

@@ -54,16 +54,16 @@ The window has three tabs: **Streams** (monitor channels for live broadcasts),
 Every view is an always-visible tab, shown as an icon only at 2x the normal
 button size — big enough to hit without hunting — (hover any tab for its
 name, plus a description for the less-obvious ones): **📺 Streams, 🎬
-Videos, 🗓 Schedule, 📣 Posts, 🔄 Background, 📁 Files, 📈 Channel Stats, 📊
-App Stats, 💾 I/O**, and **🐞 Debug** when enabled. The rest of the left-hand
-side — **»**, **⋯**, **Help ▾**, and **⚙** — renders at that same doubled
-size:
+Videos, 🗓 Schedule, 📣 Posts, 🎛 Background, 📁 Files, 📈 Channel Stats, 📊
+App Stats, 🖴 I/O** (same HDD glyph as the Background tab's disk gate), and
+**🐞 Debug** when enabled. The rest of the left-hand side — **»**, **⋯**,
+**📖**, and **⚙** — renders at that same doubled size:
 
 - **⋯** — the two display toggles (*Status bgcolor*, *Short timestamps* —
   the menu stays open while toggling).
-- **Help ▾** — **📖 Help** (this manual, rendered in-app; see below) and
-  **ℹ About** (version/build/commit info and the app's data locations, with
-  open-folder and copy buttons — the info that used to sit in the top bar).
+- **📖** — this manual, rendered in-app (see below). Version/build/commit
+  info and the app's data locations are the "About" page inside it (the
+  sidebar's first entry) rather than a separate top-bar button.
 - **⚙** — Settings (also `Ctrl+,`).
 
 At narrow window widths the tabs collapse (right-to-left) into a **»**
@@ -1116,11 +1116,15 @@ independent detectors feeding the same table:
   backfills, re-remuxes, asset fetches) with live progress and outcome.
 
   ![Background tab: job schedule plus active/recent task tables](doc/screenshots/background-jobs.png)
-- **🖥 Process manager** — lists every spawned external process (streamlink /
-  yt-dlp / ffmpeg) with its PID, tool, status, and uptime, plus per-process
-  **Stop** (graceful), **Kill** (force-terminate the tree), **Log**, and
-  **Folder** actions — useful for diagnosing a stuck capture without leaving
-  the app.
+- **🖥 Process manager** (top-bar button shows the live count, e.g. `🖥 3`) —
+  lists every spawned external process (streamlink / yt-dlp / ffmpeg) with
+  its PID, tool, status, and uptime, plus which **drive** it's writing to and
+  a live **I/O** column (`↓ read/s ↑ write/s`, hover for lifetime totals and
+  which descendant processes are rolled in — e.g. yt-dlp's own ffmpeg mux)
+  so you can spot which process is actually hammering a drive at a glance.
+  Per-process **Stop** (graceful), **Kill** (force-terminate the tree),
+  **Log**, and **Folder** actions — useful for diagnosing a stuck capture
+  without leaving the app.
 
   ![Process manager listing a running streamlink capture](doc/screenshots/process-manager.png)
 

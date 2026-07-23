@@ -1652,9 +1652,6 @@ impl StreamArchiverApp {
         use crate::models::{ContentType, DetachedKind};
         use egui_extras::{Column, TableBuilder};
         use std::time::{Duration, Instant};
-        if !self.show_processes {
-            return;
-        }
         // Drain a completed background load first.
         if let Some(rx) = &self.processes_load {
             match rx.try_recv() {
@@ -1673,10 +1670,13 @@ impl StreamArchiverApp {
         }
         // Throttle the snapshot (each row does a pid_alive + a couple DB reads).
         // Spawn off the UI thread so the store-mutex wait can't freeze the UI.
-        let stale = self
-            .processes_refreshed
-            .map(|t| t.elapsed() >= Duration::from_millis(1500))
-            .unwrap_or(true);
+        // Refreshed on this same throttle even while the window is closed —
+        // just on a much longer interval — so the top-bar count badge stays
+        // live without paying the open-window 1.5s cadence for it (mirrors
+        // the Warnings/notifications bell badges' open/closed throttle).
+        let interval =
+            if self.show_processes { Duration::from_millis(1500) } else { Duration::from_secs(5) };
+        let stale = self.processes_refreshed.map(|t| t.elapsed() >= interval).unwrap_or(true);
         if stale && self.processes_load.is_none() {
             let core = self.core.clone();
             let (tx, rx) = std::sync::mpsc::channel();
@@ -1691,13 +1691,27 @@ impl StreamArchiverApp {
                 })
                 .ok();
             self.processes_load = Some(rx);
-            // Keep repainting until the load arrives.
-            ctx.request_repaint_after(Duration::from_millis(50));
-        } else {
+            if self.show_processes {
+                // Keep repainting until the load arrives.
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
+        } else if self.show_processes {
             ctx.request_repaint_after(Duration::from_millis(1500));
         }
 
+        if !self.show_processes {
+            return;
+        }
+
         let now = now_unix();
+        // Latest per-process I/O sample, keyed by PID — O(1) fetch (unlike
+        // `iomon::history()`, which clones the whole ~30 min ring). The
+        // sampler ticks every 1s regardless of this window, so this is
+        // always fresh to within a second.
+        let io_by_pid: std::collections::HashMap<u32, crate::iomon::ProcSample> =
+            crate::iomon::latest()
+                .map(|s| s.procs.into_iter().map(|p| (p.pid, p)).collect())
+                .unwrap_or_default();
         let mut open = true;
         enum Act {
             Refresh,
@@ -1796,6 +1810,48 @@ impl StreamArchiverApp {
                                             ui.label(&p.name).on_hover_text(&p.capture_path);
                                         }
                                         "tool" => { ui.label(&p.tool); }
+                                        "drive" => {
+                                            match crate::iomon::drive_letter(std::path::Path::new(&p.capture_path)) {
+                                                Some(d) => { ui.monospace(format!("{d}:")); }
+                                                None => { ui.weak("—"); }
+                                            }
+                                        }
+                                        "io" => {
+                                            match io_by_pid.get(&p.pid) {
+                                                Some(s) => {
+                                                    let tree = if s.tree.is_empty() {
+                                                        s.tool.clone()
+                                                    } else {
+                                                        s.tree.clone()
+                                                    };
+                                                    ui.label(format!(
+                                                        "↓{}/s ↑{}/s",
+                                                        fmt_bytes(s.read_bps as i64),
+                                                        fmt_bytes(s.write_bps as i64),
+                                                    ))
+                                                    .on_hover_text(format!(
+                                                        "{tree}\nTotal since start: ↓{} read, ↑{} written\
+                                                         {}",
+                                                        fmt_bytes(s.total_read as i64),
+                                                        fmt_bytes(s.total_write as i64),
+                                                        if s.descendants > 0 {
+                                                            format!(
+                                                                "\n{} live descendant process(es) rolled in",
+                                                                s.descendants
+                                                            )
+                                                        } else {
+                                                            String::new()
+                                                        }
+                                                    ));
+                                                }
+                                                None => {
+                                                    ui.weak("—").on_hover_text(
+                                                        "No I/O sample yet for this PID (the sampler \
+                                                         ticks once a second).",
+                                                    );
+                                                }
+                                            }
+                                        }
                                         "status" => {
                                             if p.reattached {
                                                 ui.colored_label(
