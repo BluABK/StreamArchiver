@@ -189,7 +189,17 @@ impl StreamArchiverApp {
 
         ui.horizontal(|ui| {
             ui.heading("File management");
-            if ui.button("⟳ Rescan").clicked() {
+            if ui
+                .button("⟳ Rescan")
+                .on_hover_text(
+                    "Refresh drive free/total space, per-folder recording counts/sizes, \
+                     and each instance's resolved cache dir. This tab doesn't stat drives \
+                     on every frame (it can wake a sleeping USB drive), so changes made \
+                     outside the app — freed disk space, a drive coming back online — \
+                     aren't picked up until you rescan or make an edit here.",
+                )
+                .clicked()
+            {
                 self.files_scan = None;
                 self.files_scan_rx = None;
             }
