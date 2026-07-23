@@ -675,17 +675,42 @@ captures are writing to:
   finished take just sits as a playable `.ts` in `.sa-cache\` a few minutes
   longer. The same applies to the leftover finalizes an app restart picks up.
   The current gate holder and queue are shown live at the top of **Background
-  jobs**: the line names the longest-running pass, and **(+N more)** collapses
-  any passes running *concurrently* alongside it (another drive's gate, or a
+  jobs**, **one line per drive**: the line names the longest-running pass, and
+  **(+N more)** collapses any passes running *concurrently* alongside it (this
   drive allowing more than one permit — hover it for the full list; this is
-  distinct from the queue). **▶ View queue** expands the full line-up (every
-  waiting pass with its file, drive, and wait time — including passes that
-  have no task row of their own, like batch re-remux items, embeds, and head
-  joins), and each queued pass with a task row also reports the wait there.
+  distinct from the queue). **▶ View queue** expands the full line-up for that
+  drive (every waiting pass with its file and wait time — including passes
+  that have no task row of their own, like batch re-remux items, embeds, and
+  head joins), and each queued pass with a task row also reports the wait
+  there.
+- **Emergency pause + kill** (next to each drive's line on the Background
+  tab, and a persisted **Paused** checkbox per drive in the Disk I/O limits
+  table): for exactly the moment a drive gets into real trouble — a giant
+  head+live join eating the disk for hours while gap-recovery/head-backfill
+  fetches for OTHER channels starve on the same physical spindle. **⏸
+  Pause** blocks *new* concat/remux/embed passes on that one drive so every
+  byte of I/O goes to CDN-fed muxes (gap recovery, head-backfill fetches, VOD
+  recovery — see below, always racing a CDN window or a post-stream DMCA
+  mute) and to live captures themselves, which are never gated at all.
+  Pausing can't stop a pass that's *already* running — nothing preempts an
+  in-flight ffmpeg pass — so **🗑 Kill current** is the separate, explicit
+  action for that: force-terminates whatever the drive's local-pass gate is
+  currently holding. Safe by construction for concat/embeds/split-merges
+  (they write to a temp file and only replace the real one on success — a
+  kill just discards the temp and the source files are untouched); a
+  finalize/manual remux killed mid-pass can leave a partial `.mkv` next to
+  the original `.ts` — harmless (the app already falls back to the `.ts` on
+  any remux failure, kill or otherwise) but not auto-deleted, so a stray
+  partial file might sit there until the next remux attempt overwrites it.
+  Either way, the killed pass is just treated as an ordinary ffmpeg failure
+  and retried later (the next finalize sweep, or manually). Resume with
+  **▶ Resume** once the drive has caught its breath.
 - CDN-fed muxes (head backfills, VOD recoveries) are capped at **two at a
   time per disk** (default) — DMCA mutes tend to land for several channels
   minutes after a shared stream end, and each recovery writes a full stream to
-  the drive.
+  the drive. **Never affected by the pause above** — it's a completely
+  separate gate, by design: this is exactly the traffic the emergency pause
+  exists to protect.
 - **Per-disk I/O limits** (Settings → Recording → Disk I/O limits): all four
   knobs — local-pass permits, CDN-mux permits, the read throttle, and the
   download rate limit — are configurable as a **default plus per-drive-letter

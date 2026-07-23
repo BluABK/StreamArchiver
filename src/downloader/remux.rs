@@ -187,7 +187,7 @@ pub(super) async fn concat_mkvs(
     crate::iomon::fs::write(Cat::ConcatList, &list_path, list).await?;
 
     // One full-file pass at a time on the recordings drive (see io_gate).
-    let _gate = crate::io_gate::local_pass(&crate::io_gate::gate_label("concat", dst), dst).await;
+    let gate = crate::io_gate::local_pass(&crate::io_gate::gate_label("concat", dst), dst).await;
     let out = loop {
         let readrate = crate::io_gate::readrate_for(dst);
         let mut cmd = Command::new("ffmpeg");
@@ -223,6 +223,9 @@ pub(super) async fn concat_mkvs(
         let out = match cmd.spawn() {
             Ok(child) => {
                 let _io_guard = crate::iomon::track_tool(child.id(), "ffmpeg", "concat", dst);
+                if let Some(pid) = child.id() {
+                    gate.set_pid(pid);
+                }
                 child.wait_with_output().await
             }
             Err(e) => Err(e),
@@ -285,12 +288,13 @@ pub(super) async fn remux_ts_to_mkv_impl(
     let gate = match &progress_tx {
         Some((tx, id)) => {
             let (tx, id) = (tx.clone(), *id);
-            crate::io_gate::local_pass_with_progress(&label, dst, move |waited, holders, waiting| {
-                let _ = tx.send(AppEvent::BackgroundTaskProgress {
-                    id,
-                    progress: None,
-                    info: crate::io_gate::wait_info(waited, holders, waiting),
-                });
+            crate::io_gate::local_pass_with_progress(&label, dst, move |waited, holders, waiting, paused| {
+                let info = if paused {
+                    crate::io_gate::paused_wait_info(waited)
+                } else {
+                    crate::io_gate::wait_info(waited, holders, waiting)
+                };
+                let _ = tx.send(AppEvent::BackgroundTaskProgress { id, progress: None, info });
             })
             .await
         }
@@ -407,6 +411,9 @@ async fn remux_ts_to_mkv_gated(
 
     let mut child = cmd.spawn()?;
     let _io_guard = crate::iomon::track_tool(child.id(), "ffmpeg", "remux", dst);
+    if let Some(pid) = child.id() {
+        gate.set_pid(pid);
+    }
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
 
@@ -762,7 +769,7 @@ pub async fn embed_thumbnail_into_mkv(mkv: &Path, thumb: &Path) -> anyhow::Resul
     };
     let cover_name = format!("cover.{ext}");
     // One full-file pass at a time on the recordings drive (see io_gate).
-    let _gate =
+    let gate =
         crate::io_gate::local_pass(&crate::io_gate::gate_label("embed-thumbnail", mkv), mkv).await;
     let out = loop {
         let readrate = crate::io_gate::readrate_for(mkv);
@@ -788,6 +795,9 @@ pub async fn embed_thumbnail_into_mkv(mkv: &Path, thumb: &Path) -> anyhow::Resul
         // spawn + wait_with_output (≡ output()) so the PID is sampleable.
         let child = cmd.spawn()?;
         let _io_guard = crate::iomon::track_tool(child.id(), "ffmpeg", "embed-thumbnail", mkv);
+        if let Some(pid) = child.id() {
+            gate.set_pid(pid);
+        }
         let out = child.wait_with_output().await?;
         if !out.status.success()
             && readrate.is_some()
@@ -823,7 +833,7 @@ pub async fn embed_subtitles_into_mkv(mkv: &Path) -> anyhow::Result<bool> {
     }
     let tmp = mkv.with_extension("tmp.mkv");
     // One full-file pass at a time on the recordings drive (see io_gate).
-    let _gate =
+    let gate =
         crate::io_gate::local_pass(&crate::io_gate::gate_label("embed-subs", mkv), mkv).await;
     let out = loop {
         let readrate = crate::io_gate::readrate_for(mkv);
@@ -856,6 +866,9 @@ pub async fn embed_subtitles_into_mkv(mkv: &Path) -> anyhow::Result<bool> {
         // spawn + wait_with_output (≡ output()) so the PID is sampleable.
         let child = cmd.spawn()?;
         let _io_guard = crate::iomon::track_tool(child.id(), "ffmpeg", "embed-subs", mkv);
+        if let Some(pid) = child.id() {
+            gate.set_pid(pid);
+        }
         let out = child.wait_with_output().await?;
         if !out.status.success()
             && readrate.is_some()

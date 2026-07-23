@@ -2709,7 +2709,7 @@ impl StreamArchiverApp {
         ui.add_space(6.0);
         let mut remove: Option<usize> = None;
         egui::Grid::new("disk_io_grid")
-            .num_columns(7)
+            .num_columns(8)
             .striped(true)
             .spacing([14.0, 6.0])
             .show(ui, |ui| {
@@ -2719,6 +2719,15 @@ impl StreamArchiverApp {
                 ui.strong("Read throttle").on_hover_text("ffmpeg -readrate multiplier for local passes; 0 = unthrottled.");
                 ui.strong("Download limit").on_hover_text("yt-dlp --limit-rate for VOD/video downloads landing on this disk (e.g. 4M, 500K); empty = unlimited. Never applied to live captures.");
                 ui.strong("Dynamic").on_hover_text("Adapt the live permit count to actual disk activity instead of holding it fixed. See the note above.");
+                ui.strong("Paused").on_hover_text(
+                    "Emergency measure: block new local passes (concat/remux/embeds) on this \
+                     drive so gap recovery, head-backfill fetches, VOD recovery, and live \
+                     captures get the whole drive to themselves — those use a SEPARATE gate \
+                     and are never paused by this. Doesn't touch a pass already running; only \
+                     stops new ones from starting. Quicker to flip from the Background tab \
+                     during an actual emergency — this checkbox is for a deliberate, \
+                     restart-surviving pause.",
+                );
                 ui.label("");
                 ui.end_row();
 
@@ -2778,6 +2787,7 @@ impl StreamArchiverApp {
                         }
                     }
                 });
+                ui.checkbox(&mut self.settings.disk_default_paused, "");
                 ui.label("");
                 ui.end_row();
 
@@ -2809,6 +2819,7 @@ impl StreamArchiverApp {
                             dynamic_live_cell(ui, letter, lim.local_permits, lim.cdn_permits);
                         }
                     });
+                    ui.checkbox(&mut lim.paused, "");
                     if ui.small_button("🗑").on_hover_text("Remove this drive's override").clicked() {
                         remove = Some(i);
                     }

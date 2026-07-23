@@ -896,6 +896,13 @@ struct SettingsForm {
     /// instead of holding a fixed count. Per-drive overrides carry their own
     /// `dynamic` bit on `DiskLimits` directly.
     disk_default_dynamic: bool,
+    /// Default disk-gate emergency pause: block new `local_pass` admissions
+    /// (concat/remux/embeds) on every drive without its own override row.
+    /// Per-drive overrides carry their own `paused` bit on `DiskLimits`
+    /// directly. Usually flipped from the Background tab's quick toggle,
+    /// not here — this field exists so a deliberate, persisted pause
+    /// survives a restart too.
+    disk_default_paused: bool,
     /// Per-drive I/O limit overrides: (drive letter, limits). The default
     /// readrate/rate-limit live in `postproc_readrate`/`download_rate_limit`.
     disk_overrides: Vec<(String, crate::io_gate::DiskLimits)>,

@@ -617,12 +617,13 @@ impl Supervisor {
         let gate = {
             let tx = self.events.clone();
             let label = crate::io_gate::gate_label("merge-split", &final_path);
-            crate::io_gate::local_pass_with_progress(&label, &final_path, move |waited, holders, waiting| {
-                let _ = tx.send(AppEvent::BackgroundTaskProgress {
-                    id: task_id,
-                    progress: None,
-                    info: crate::io_gate::wait_info(waited, holders, waiting),
-                });
+            crate::io_gate::local_pass_with_progress(&label, &final_path, move |waited, holders, waiting, paused| {
+                let info = if paused {
+                    crate::io_gate::paused_wait_info(waited)
+                } else {
+                    crate::io_gate::wait_info(waited, holders, waiting)
+                };
+                let _ = tx.send(AppEvent::BackgroundTaskProgress { id: task_id, progress: None, info });
             })
             .await
         };
@@ -666,6 +667,9 @@ impl Supervisor {
                 "merge split capture",
                 &final_path,
             );
+            if let Some(pid) = child.id() {
+                gate.set_pid(pid);
+            }
             let stdout = child.stdout.take().expect("stdout piped");
             let stderr = child.stderr.take().expect("stderr piped");
             let stderr_task = tokio::spawn(async move {

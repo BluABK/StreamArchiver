@@ -87,6 +87,17 @@ pub struct DiskLimits {
     /// off immediately. Default false preserves every existing config.
     #[serde(default)]
     pub dynamic: bool,
+    /// Emergency measure: block new `local_pass` admissions on this drive
+    /// (concat/remux/embeds — all deferrable, a finished take sitting a few
+    /// minutes longer as `.ts` is harmless) so a disk crisis leaves every
+    /// byte of I/O to the URGENT `cdn_mux` gate (gap recovery, head-backfill
+    /// fetch, VOD recovery — all racing a CDN window or DMCA mute) and to
+    /// live captures themselves. Never touches `cdn_mux`, and never touches
+    /// a `local_pass` job already running — see `local_pass`'s doc comment
+    /// for why this can only be admission control, not preemption. Default
+    /// false preserves every existing config.
+    #[serde(default)]
+    pub paused: bool,
 }
 
 impl Default for DiskLimits {
@@ -97,6 +108,7 @@ impl Default for DiskLimits {
             readrate: d_readrate(),
             rate_limit: String::new(),
             dynamic: false,
+            paused: false,
         }
     }
 }
@@ -212,6 +224,14 @@ fn drive_key(path: &std::path::Path) -> String {
 /// The effective limits for the disk `path` lives on.
 pub fn limits_for(path: &std::path::Path) -> DiskLimits {
     limits_for_key(&drive_key(path))
+}
+
+/// Whether new `local_pass` admissions are currently blocked on the drive
+/// `path` lives on — read fresh on every check (same as `limits_for`), so a
+/// pause flip via Settings or the Background tab takes effect on the very
+/// next poll, no separate push/wake path needed.
+fn is_local_paused(path: &std::path::Path) -> bool {
+    limits_for(path).paused
 }
 
 /// The effective limits for a drive-letter key (`"A"`, or `"*"` for
@@ -544,24 +564,60 @@ fn dynamic_tick_for(
     }
 }
 
+/// `(token, label, drive key, started, PID once known)` — one entry per
+/// local-gate permit currently held.
+type HolderEntry = (u64, String, String, Instant, Option<u32>);
+
 /// Live status of the local gates, for progress messages: every pass holding
-/// a permit right now (label + seconds held, longest first) and every pass
-/// queued (label + drive + seconds waiting, in arrival order).
-static LOCAL_HOLDERS: parking_lot::Mutex<Vec<(u64, String, Instant)>> =
-    parking_lot::Mutex::new(Vec::new());
+/// a permit right now (label + drive key + seconds held + PID once its
+/// caller has spawned a child, longest-held first) and every pass queued
+/// (label + drive + seconds waiting, in arrival order). The PID is `None`
+/// until the caller (which acquires the gate BEFORE spawning its ffmpeg
+/// child) calls back in via [`LocalPass::set_pid`] — see [`kill_local_holder`].
+static LOCAL_HOLDERS: parking_lot::Mutex<Vec<HolderEntry>> = parking_lot::Mutex::new(Vec::new());
 static LOCAL_WAITERS: parking_lot::Mutex<Vec<(u64, String, String, Instant)>> =
     parking_lot::Mutex::new(Vec::new());
 static NEXT_GATE_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-/// `(holders (label, seconds held) longest-first, queue length)`.
+/// `(holders (label, seconds held) longest-first, queue length)` — global
+/// across every drive, for the general-purpose progress message
+/// ([`wait_info`]). See [`local_gate_status_by_drive`] for a per-drive
+/// breakdown (what the Background tab's emergency controls need).
 pub fn local_gate_status() -> (Vec<(String, u64)>, usize) {
     let mut holders: Vec<(String, u64)> = LOCAL_HOLDERS
         .lock()
         .iter()
-        .map(|(_, l, t)| (l.clone(), t.elapsed().as_secs()))
+        .map(|(_, l, _, t, _)| (l.clone(), t.elapsed().as_secs()))
         .collect();
     holders.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
     (holders, LOCAL_WAITERS.lock().len())
+}
+
+/// `(drive key, holders (label, seconds held) longest-held first, queue
+/// length for that drive)`.
+pub type DriveGateStatus = (String, Vec<(String, u64)>, usize);
+
+/// Every drive that currently has local-gate activity (a holder or a
+/// waiter), each with its own holders/queue-length breakdown — drives
+/// sorted alphabetically. Powers the Background tab's per-drive emergency
+/// pause/kill controls: a global-only view can't tell you which drive to
+/// pause.
+pub fn local_gate_status_by_drive() -> Vec<DriveGateStatus> {
+    let mut by_drive: std::collections::BTreeMap<String, (Vec<(String, u64)>, usize)> =
+        Default::default();
+    for (_, label, drive, t, _) in LOCAL_HOLDERS.lock().iter() {
+        by_drive.entry(drive.clone()).or_default().0.push((label.clone(), t.elapsed().as_secs()));
+    }
+    for (_, _, drive, _) in LOCAL_WAITERS.lock().iter() {
+        by_drive.entry(drive.clone()).or_default().1 += 1;
+    }
+    by_drive
+        .into_iter()
+        .map(|(drive, (mut holders, queued))| {
+            holders.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
+            (drive, holders, queued)
+        })
+        .collect()
 }
 
 /// Every pass currently queued on a local gate — `(label, drive key,
@@ -582,10 +638,51 @@ pub struct LocalPass {
     _permit: OwnedSemaphorePermit,
 }
 
+impl LocalPass {
+    /// Record the PID of the child process this pass is guarding, once the
+    /// caller has spawned it (the gate is always acquired first) — lets
+    /// [`kill_local_holder`] find and terminate it. A no-op if the holder
+    /// entry is somehow already gone (dropped before the caller got around
+    /// to calling this — shouldn't happen in practice, but this must never
+    /// panic on a UI-adjacent path).
+    pub fn set_pid(&self, pid: u32) {
+        if let Some(entry) = LOCAL_HOLDERS.lock().iter_mut().find(|(t, ..)| *t == self.token) {
+            entry.4 = Some(pid);
+        }
+    }
+}
+
 impl Drop for LocalPass {
     fn drop(&mut self) {
         LOCAL_HOLDERS.lock().retain(|(t, ..)| *t != self.token);
     }
+}
+
+/// Force-terminate every `local_pass` job currently holding a permit on
+/// `drive` (uppercase drive-letter key, or `"*"`) — the "Kill current"
+/// emergency action. Returns how many process trees were signalled.
+/// Admission-control-only pause can't free a drive that's ALREADY busy when
+/// you hit the emergency button; this is the deliberate, explicit
+/// complement to that — see `DiskLimits::paused`'s doc comment. Doesn't
+/// touch the holder-tracking entries itself: those clear the normal way
+/// (via `LocalPass::drop`) once the killed process's `child.wait()`
+/// resolves and the owning function's existing ffmpeg-failure handling
+/// runs — a kill looks exactly like any other ffmpeg crash to that code, no
+/// new error path needed. A holder with no known PID yet (killed in the
+/// brief window between acquiring the gate and finishing its own spawn) is
+/// silently skipped — nothing to kill yet, and it'll show up on a later
+/// call once it has spawned.
+pub fn kill_local_holder(drive: &str) -> usize {
+    let pids: Vec<u32> = LOCAL_HOLDERS
+        .lock()
+        .iter()
+        .filter(|(_, _, d, _, _)| d == drive)
+        .filter_map(|(.., pid)| *pid)
+        .collect();
+    for &pid in &pids {
+        crate::platform::kill_process_tree(pid);
+    }
+    pids.len()
 }
 
 /// Removes the waiter entry even when the acquiring future is dropped
@@ -597,10 +694,27 @@ impl Drop for WaitingGuard {
     }
 }
 
+/// How often a paused drive re-checks whether it's been unpaused. Short
+/// enough that an emergency toggle feels immediate; a plain boolean read is
+/// essentially free at this cadence.
+const PAUSE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Acquire the local-passes gate of the disk `path` lives on (permit count
 /// per Settings → per-disk I/O limits; default 1). Hold the returned guard
 /// for the duration of the ffmpeg run; drop to release.
+///
+/// While the drive is paused (`DiskLimits::paused`), blocks BEFORE even
+/// entering the waiter list — an emergency pause is meant to give the
+/// `cdn_mux` gate (and live captures) the whole drive, so a deferred pass
+/// must not sit inside the semaphore's own FIFO wait queue where a pause
+/// can no longer un-queue it; it must never get that far to begin with.
+/// This can only ever be admission control: a pass that already holds the
+/// gate before pause was flipped on keeps running to completion (see
+/// `kill_local_holder` for the deliberate, separate way to interrupt one).
 pub async fn local_pass(label: &str, path: &std::path::Path) -> LocalPass {
+    while is_local_paused(path) {
+        tokio::time::sleep(PAUSE_POLL_INTERVAL).await;
+    }
     let key = drive_key(path);
     let limits = limits_for(path);
     let sem = gate_sem(&LOCAL_GATES, &key, limits.local_permits as usize, limits.dynamic);
@@ -616,17 +730,18 @@ pub async fn local_pass(label: &str, path: &std::path::Path) -> LocalPass {
             waited.as_secs()
         );
     }
-    LOCAL_HOLDERS.lock().push((token, label.to_string(), Instant::now()));
+    LOCAL_HOLDERS.lock().push((token, label.to_string(), key, Instant::now(), None));
     LocalPass { token, _permit: permit }
 }
 
-/// [`local_pass`], but invokes `on_wait(waited_secs, holders, queue_len)`
-/// every 5 s while queued — callers surface it as task progress so a queued
-/// pass is visibly waiting (and on what) instead of looking stale.
+/// [`local_pass`], but invokes `on_wait(waited_secs, holders, queue_len,
+/// paused)` every 5 s while queued — callers surface it as task progress so
+/// a queued pass is visibly waiting (and on what — or that it's parked on
+/// an emergency pause, not genuine contention) instead of looking stale.
 pub async fn local_pass_with_progress(
     label: &str,
     path: &std::path::Path,
-    mut on_wait: impl FnMut(u64, Vec<(String, u64)>, usize),
+    mut on_wait: impl FnMut(u64, Vec<(String, u64)>, usize, bool),
 ) -> LocalPass {
     let fut = local_pass(label, path);
     tokio::pin!(fut);
@@ -636,7 +751,7 @@ pub async fn local_pass_with_progress(
             p = &mut fut => return p,
             _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
                 let (holders, waiting) = local_gate_status();
-                on_wait(started.elapsed().as_secs(), holders, waiting);
+                on_wait(started.elapsed().as_secs(), holders, waiting, is_local_paused(path));
             }
         }
     }
@@ -674,6 +789,13 @@ pub fn wait_info(waited_secs: u64, holders: Vec<(String, u64)>, waiting: usize) 
         s.push_str(&format!(" · {waiting} in queue"));
     }
     s
+}
+
+/// Progress-info line while parked on an emergency pause, not genuine
+/// contention — distinct from [`wait_info`] so a paused drive doesn't read
+/// as "stuck" when it's deliberately held.
+pub fn paused_wait_info(waited_secs: u64) -> String {
+    format!("⏸ paused on this drive ({waited_secs}s) — will resume once unpaused")
 }
 
 /// Acquire the CDN-mux gate of the disk `path` lives on (permit count per
@@ -830,6 +952,7 @@ mod tests {
                     readrate: 0.0,
                     rate_limit: "4M".into(),
                     dynamic: false,
+                    paused: false,
                 },
             );
         });
@@ -878,6 +1001,7 @@ mod tests {
                     readrate: 0.0,
                     rate_limit: String::new(),
                     dynamic: false,
+                    paused: false,
                 },
             );
         });
@@ -991,6 +1115,7 @@ mod tests {
                     readrate: 0.0,
                     rate_limit: String::new(),
                     dynamic: true,
+                    paused: false,
                 },
             );
         });
@@ -1030,6 +1155,7 @@ mod tests {
                     readrate: 0.0,
                     rate_limit: String::new(),
                     dynamic: true,
+                    paused: false,
                 },
             );
         });
@@ -1066,6 +1192,7 @@ mod tests {
                     readrate: 0.0,
                     rate_limit: String::new(),
                     dynamic: true,
+                    paused: false,
                 },
             );
         });
@@ -1088,5 +1215,81 @@ mod tests {
         // Clearing both removes the entry entirely, not just zeroes it.
         pin_dynamic_permits("Z", None, None);
         assert_eq!(dynamic_pin_for("Z"), (None, None));
+    }
+
+    // ── Emergency pause / kill (2026-07-23) ──────────────────────────────
+
+    #[test]
+    fn disk_limits_paused_field_defaults_and_round_trips() {
+        // Old JSON predating this field deserializes to false, same pattern
+        // as every other bool field here (`drive_keys_and_serde` above).
+        let old: DiskLimits = serde_json::from_str(r#"{"local_permits":2}"#).unwrap();
+        assert!(!old.paused);
+        let cfg = DiskLimitsConfig {
+            default: DiskLimits::default(),
+            drives: std::collections::HashMap::from([(
+                "M".into(),
+                DiskLimits { paused: true, ..Default::default() },
+            )]),
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: DiskLimitsConfig = serde_json::from_str(&json).unwrap();
+        assert!(back.drives["M"].paused);
+        assert!(!back.default.paused);
+    }
+
+    #[tokio::test]
+    async fn pause_blocks_new_local_pass_until_unpaused() {
+        let _guard = lock_shared_state();
+        let n = Path::new(r"N:\rec\file.ts");
+        modify_disk_limits(|cfg| {
+            cfg.drives.insert("N".into(), DiskLimits { paused: true, ..Default::default() });
+        });
+        let waiting = tokio::spawn(async move { local_pass("paused-job", n).await });
+        // Give it several scheduler turns to reach (and park inside) the
+        // pause poll loop, then confirm it's genuinely still blocked — not
+        // just not-yet-polled.
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!waiting.is_finished(), "must stay blocked while the drive is paused");
+        // A paused-but-blocked pass must not even be visible as a waiter —
+        // it hasn't reached the semaphore yet (distinct from genuine
+        // contention, which the Background tab needs to tell apart).
+        assert!(local_gate_queue().iter().all(|(_, d, _)| d != "N"));
+
+        modify_disk_limits(|cfg| cfg.drives.get_mut("N").unwrap().paused = false);
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("must resolve promptly once unpaused")
+            .expect("task panicked");
+        drop(got);
+    }
+
+    #[tokio::test]
+    async fn local_gate_status_by_drive_groups_by_drive() {
+        let _guard = lock_shared_state();
+        let o = local_pass("o-job", Path::new(r"O:\x.mkv")).await;
+        let p1 = local_pass("p-job-1", Path::new(r"P:\x.mkv")).await;
+        // P allows only 1 permit by default, so a second acquisition queues.
+        let p_waiting = tokio::spawn(async { local_pass("p-job-2", Path::new(r"P:\y.mkv")).await });
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        let by_drive = local_gate_status_by_drive();
+        let o_entry = by_drive.iter().find(|(d, ..)| d == "O").expect("O must be listed");
+        assert_eq!(o_entry.1.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(), vec!["o-job"]);
+        assert_eq!(o_entry.2, 0, "O has no queue");
+        let p_entry = by_drive.iter().find(|(d, ..)| d == "P").expect("P must be listed");
+        assert_eq!(p_entry.1.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(), vec!["p-job-1"]);
+        assert_eq!(p_entry.2, 1, "P's second acquisition is queued");
+        drop(o);
+        drop(p1);
+        let _ = p_waiting.await;
+    }
+
+    #[test]
+    fn kill_local_holder_on_idle_drive_kills_nothing() {
+        assert_eq!(kill_local_holder("nonexistent-drive-letter"), 0);
     }
 }

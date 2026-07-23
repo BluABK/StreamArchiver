@@ -165,16 +165,44 @@ impl StreamArchiverApp {
 
             // ── Active tasks ─────────────────────────────────────────────
             ui.strong("Active");
-            // Live disk-gate status: bulk passes (remux/merge/concat/embed)
-            // run one at a time against the recordings drive — this is the
-            // authoritative "what is actually running right now, and how many
-            // are queued behind it" line for those jobs.
+            // Live disk-gate status, ONE LINE PER DRIVE: bulk passes
+            // (remux/merge/concat/embed) run one at a time per disk — this is
+            // the authoritative "what is actually running right now, and how
+            // many are queued behind it" line for those jobs. Per-drive (not
+            // one global summary) so the emergency Pause/Kill controls below
+            // apply to the right disk during an actual crisis.
             {
-                let (holders, waiting) = crate::io_gate::local_gate_status();
-                if !holders.is_empty() || waiting > 0 {
+                let disk_cfg = crate::io_gate::disk_limits_config();
+                let effective_paused = |drive: &str| {
+                    disk_cfg.drives.get(drive).map(|d| d.paused).unwrap_or(disk_cfg.default.paused)
+                };
+                let active_drives = crate::io_gate::local_gate_status_by_drive();
+                // A paused drive with nothing left to show (I/O has fully
+                // drained) stays in the list anyway — a pause with no visible
+                // activity left is exactly the state you could otherwise
+                // forget about and never un-pause; it must stay reachable
+                // from here. Covers both an explicit per-drive override AND
+                // a paused Default row (checked against every drive that's
+                // done bulk I/O this session, same set Settings' Default row
+                // itself uses for its live readout).
+                let mut drives: Vec<String> = active_drives.iter().map(|(d, ..)| d.clone()).collect();
+                for letter in crate::io_gate::active_gate_letters() {
+                    if effective_paused(&letter) {
+                        drives.push(letter);
+                    }
+                }
+                drives.sort();
+                drives.dedup();
+                for drive in drives {
+                    let (holders, waiting) = active_drives
+                        .iter()
+                        .find(|(d, ..)| *d == drive)
+                        .map(|(_, h, w)| (h.clone(), *w))
+                        .unwrap_or_default();
+                    let paused = effective_paused(&drive);
                     let resp = ui
                         .horizontal(|ui| {
-                            ui.label("🖴 Disk gate:");
+                            ui.label(format!("🖴 Disk gate [{drive}:]:"));
                             match holders.first() {
                                 Some((label, held)) => {
                                     ui.colored_label(
@@ -191,15 +219,14 @@ impl StreamArchiverApp {
                                             .join("\n");
                                         ui.weak(format!("(+{} more)", holders.len() - 1))
                                             .on_hover_text(format!(
-                                                "Other passes ALSO running right now (each holds \
-                                                 its own disk-gate permit — another drive, or \
-                                                 this drive allows more than one). Only the \
-                                                 longest-running one is shown on the line.\n\n{others}"
+                                                "Other passes ALSO running right now (this drive \
+                                                 allows more than one). Only the longest-running \
+                                                 one is shown on the line.\n\n{others}"
                                             ));
                                     }
                                 }
                                 None => {
-                                    ui.weak("turning over…");
+                                    ui.weak(if paused { "paused" } else { "turning over…" });
                                 }
                             }
                             if waiting > 0 {
@@ -209,6 +236,52 @@ impl StreamArchiverApp {
                                 if ui.small_button(toggle).clicked() {
                                     self.bg_show_gate_queue = !self.bg_show_gate_queue;
                                 }
+                            }
+                            // Emergency controls. Pause blocks new concat/
+                            // remux/embed passes on THIS drive only — gap
+                            // recovery, head-backfill fetch, VOD recovery, and
+                            // live captures use a separate gate and are never
+                            // affected. Kill force-terminates whatever's
+                            // running right now (pause alone can't — nothing
+                            // preempts an in-flight pass).
+                            let pause_label = if paused { "▶ Resume" } else { "⏸ Pause" };
+                            if ui
+                                .small_button(pause_label)
+                                .on_hover_text(if paused {
+                                    "Let new concat/remux/embed passes start on this drive again."
+                                } else {
+                                    "Block new concat/remux/embed passes on this drive — gap \
+                                     recovery/head-backfill fetch/VOD recovery/live captures are \
+                                     unaffected (separate gate). Doesn't stop anything already \
+                                     running; use Kill current for that."
+                                })
+                                .clicked()
+                            {
+                                let drive = drive.clone();
+                                crate::io_gate::modify_disk_limits(|cfg| {
+                                    let default = cfg.default.clone();
+                                    let entry = cfg.drives.entry(drive.clone()).or_insert(default);
+                                    entry.paused = !paused;
+                                });
+                                self.status = format!(
+                                    "{} local passes (concat/remux/embeds) on drive {drive}:",
+                                    if paused { "Resumed" } else { "Paused" }
+                                );
+                            }
+                            if !holders.is_empty()
+                                && ui
+                                    .small_button("🗑 Kill current")
+                                    .on_hover_text(
+                                        "Force-terminate whatever's running on this drive's \
+                                         local-pass gate right now (discards its progress — the \
+                                         source files are untouched, it just restarts from \
+                                         scratch later).",
+                                    )
+                                    .clicked()
+                            {
+                                let n = crate::io_gate::kill_local_holder(&drive);
+                                self.status =
+                                    format!("Killed {n} pass(es) on drive {drive}: — they'll retry later.");
                             }
                         })
                         .response;
@@ -222,17 +295,21 @@ impl StreamArchiverApp {
                          Recording → Disk I/O limits). Queued passes list their wait in \
                          their own task row.\n\n{all}"
                     ));
-                    // The queue itself: every pass waiting for a gate, in line
-                    // order (per drive) — includes passes that have no task row
-                    // of their own (batch re-remux items, embeds, head joins).
+                    // The queue itself: every pass waiting for a gate on THIS
+                    // drive, in line order — includes passes that have no
+                    // task row of their own (batch re-remux items, embeds,
+                    // head joins).
                     if self.bg_show_gate_queue && waiting > 0 {
-                        for (i, (label, drive, secs)) in
-                            crate::io_gate::local_gate_queue().into_iter().enumerate()
+                        for (i, (label, secs)) in crate::io_gate::local_gate_queue()
+                            .into_iter()
+                            .filter(|(_, d, _)| *d == drive)
+                            .map(|(l, _, s)| (l, s))
+                            .enumerate()
                         {
                             ui.horizontal(|ui| {
                                 ui.add_space(24.0);
                                 ui.weak(format!(
-                                    "{}. {label} [{drive}:] — waiting {}",
+                                    "{}. {label} — waiting {}",
                                     i + 1,
                                     fmt_duration(secs as i64)
                                 ));

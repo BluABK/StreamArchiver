@@ -266,6 +266,7 @@ impl StreamArchiverApp {
             disk_default_local: crate::io_gate::disk_limits_config().default.local_permits,
             disk_default_cdn: crate::io_gate::disk_limits_config().default.cdn_permits,
             disk_default_dynamic: crate::io_gate::disk_limits_config().default.dynamic,
+            disk_default_paused: crate::io_gate::disk_limits_config().default.paused,
             disk_overrides: {
                 let mut v: Vec<_> =
                     crate::io_gate::disk_limits_config().drives.into_iter().collect();
@@ -1649,6 +1650,7 @@ impl StreamArchiverApp {
                 readrate: self.settings.postproc_readrate,
                 rate_limit: self.settings.download_rate_limit.trim().to_string(),
                 dynamic: self.settings.disk_default_dynamic,
+                paused: self.settings.disk_default_paused,
             },
             drives: self
                 .settings
