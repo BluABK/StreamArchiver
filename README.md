@@ -218,6 +218,21 @@ does the fallback name match kick in: a candidate whose *name* equals an
 existing channel's is flagged "(maybe added)" and left unticked, but can still
 be imported deliberately.
 
+**Import into an existing channel**: a per-row **"Import into"** dropdown
+adds the candidate as a *new instance* of an existing channel instead of
+creating a new one — for the common case where you're followed/subscribed to
+the same person on a platform you don't track them on yet. **🔗 Guess
+existing channels** fills this in automatically for every not-yet-decided
+row, checking (in order) whether an existing channel's own archived **About
+page** links out to the candidate's URL (the strongest signal available
+short of a live cross-check), then falling back to a loose name match (e.g.
+followed as "Tenma" on Twitch, already tracked as "Tenma Maemi" via YouTube —
+agency/group bracket tags like "【Phase Connect】" are stripped before
+comparing). Neither signal is treated as certain: a guessed row is marked
+**"auto-assumed"** with a confirm checkbox and is held back from the import
+batch entirely until you tick it — reviewing and confirming (or leaving
+unticked to skip) is always a manual step.
+
 **Overrides for this import** (collapsed section in the dialog): optionally
 set a **quality** and/or **output directory** applied to every channel this
 batch creates, instead of the per-platform defaults — e.g. point a hundred

@@ -668,6 +668,88 @@ pub(super) fn import_row_matches(row: &ImportRow, q: &str) -> bool {
         || row.cand.identity.contains(q)
         || row.cand.id.to_lowercase().contains(q)
 }
+
+/// Normalize a channel/candidate display name for loose cross-platform name
+/// matching: lowercase, drop bracketed decorations (agency/group tags like
+/// "【Phase Connect】" or "[VTuber]"), collapse whitespace.
+pub(super) fn normalize_channel_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut depth = 0u32;
+    for c in name.chars() {
+        match c {
+            '【' | '[' | '(' | '〔' => depth += 1,
+            '】' | ']' | ')' | '〕' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.extend(c.to_lowercase()),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Loose "is this candidate probably the same person as this existing
+/// channel" name guess — NOT a confident identity match (there's no shared
+/// platform id to check across Twitch/YouTube), so any hit here is meant to
+/// be surfaced for manual confirmation, never auto-accepted. Matches when the
+/// normalized names are identical, or the shorter one appears as a whole word
+/// in the longer one (e.g. "Tenma" inside "Tenma Maemi") — a raw substring
+/// check alone would false-positive on short names far too often.
+pub(super) fn names_loosely_match(a: &str, b: &str) -> bool {
+    let na = normalize_channel_name(a);
+    let nb = normalize_channel_name(b);
+    if na.is_empty() || nb.is_empty() {
+        return false;
+    }
+    if na == nb {
+        return true;
+    }
+    let (shorter, longer) =
+        if na.chars().count() <= nb.chars().count() { (&na, &nb) } else { (&nb, &na) };
+    shorter.chars().count() >= 3 && longer.split_whitespace().any(|w| w == shorter)
+}
+
+/// Whether any of an existing channel's stored About-page links (across all
+/// its instances/accounts — `links_json` blobs from
+/// `Store::about_latest_per_account`) points at the same identity as an
+/// import candidate's own URL. The strongest signal available for a
+/// cross-platform match short of a live cross-check (e.g. a streamer's
+/// YouTube About page linking out to their Twitch) — still surfaced for
+/// manual confirmation like the name guess, never auto-accepted.
+fn about_links_confirm(links_json_blobs: &[String], cand_url: &str) -> bool {
+    let cand_identity = monitor_import_identity(cand_url);
+    if cand_identity.is_empty() {
+        return false;
+    }
+    links_json_blobs.iter().any(|json| {
+        serde_json::from_str::<Vec<crate::assets::AboutLink>>(json)
+            .unwrap_or_default()
+            .iter()
+            .any(|l| !l.url.is_empty() && monitor_import_identity(&l.url) == cand_identity)
+    })
+}
+
+/// Best guess at an existing channel this import candidate is probably the
+/// same person as, checked most-confident first: (1) a stored About-page
+/// link on any of the channel's own instances points back at the
+/// candidate's URL, then (2) a loose name match. Both tiers are guesses —
+/// callers must gate the result behind manual confirmation before using it
+/// (see `ImportRow::guess_pending`). `about_links` maps existing channel id →
+/// that channel's `links_json` blobs (one call per existing channel is
+/// enough; this fn is called once per import candidate).
+pub(super) fn guess_existing_channel(
+    cand: &ImportCandidate,
+    existing: &[(i64, String)],
+    about_links: &HashMap<i64, Vec<String>>,
+) -> Option<(i64, &'static str)> {
+    for (id, links) in about_links {
+        if about_links_confirm(links, &cand.url) {
+            return Some((*id, "linked from an existing channel's About page"));
+        }
+    }
+    existing
+        .iter()
+        .find(|(_, name)| names_loosely_match(&cand.name, name))
+        .map(|(id, _)| (*id, "similar channel name"))
+}
 /// Decode encoded image `bytes` to RGBA8 under hard resource limits. A corrupt or
 /// hostile image (absurd dimensions / a decompression bomb) would otherwise tie up the
 /// UI thread for many seconds inside a synchronous decode — exactly the kind of single
@@ -1279,6 +1361,84 @@ mod tests {
     use super::*;
     #[allow(unused_imports)]
     use std::path::PathBuf;
+
+    #[test]
+    fn normalize_channel_name_strips_brackets_and_case() {
+        assert_eq!(normalize_channel_name("Nitya Ch. 【Phase Connect】"), "nitya ch.");
+        assert_eq!(normalize_channel_name("Cool [VTuber] Streamer"), "cool streamer");
+        assert_eq!(normalize_channel_name("  Extra   Spaces  "), "extra spaces");
+    }
+
+    #[test]
+    fn names_loosely_match_catches_a_shortened_first_name() {
+        // The exact motivating case: followed as "Tenma" on Twitch, already
+        // tracked as "Tenma Maemi" via YouTube.
+        assert!(names_loosely_match("Tenma", "Tenma Maemi"));
+        assert!(names_loosely_match("tenma maemi", "Tenma Maemi")); // exact after normalize
+        // A short name must not match as a bare substring of an unrelated one.
+        assert!(!names_loosely_match("Ray", "Raynor"));
+        assert!(!names_loosely_match("Ai", "Air Man")); // below the 3-char floor
+        assert!(!names_loosely_match("Momo", "Kokonuts"));
+    }
+
+    #[test]
+    fn guess_existing_channel_prefers_about_link_over_name_similarity() {
+        let cand = ImportCandidate {
+            platform: Platform::Twitch,
+            name: "Totally Different Name".into(),
+            identity: "tenma".into(),
+            id: "123".into(),
+            url: "https://twitch.tv/tenma".into(),
+            detail: String::new(),
+        };
+        let existing = vec![(1i64, "Unrelated Name".to_string())];
+        let mut about_links = HashMap::new();
+        about_links.insert(
+            1i64,
+            vec![
+                serde_json::to_string(&[crate::assets::AboutLink {
+                    title: "Twitch".into(),
+                    url: "https://twitch.tv/tenma".into(),
+                }])
+                .unwrap(),
+            ],
+        );
+        let (id, reason) = guess_existing_channel(&cand, &existing, &about_links).unwrap();
+        assert_eq!(id, 1);
+        assert!(reason.contains("About page"));
+    }
+
+    #[test]
+    fn guess_existing_channel_falls_back_to_name_when_no_link_matches() {
+        let cand = ImportCandidate {
+            platform: Platform::Twitch,
+            name: "Tenma".into(),
+            identity: "tenma".into(),
+            id: "123".into(),
+            url: "https://twitch.tv/tenma".into(),
+            detail: String::new(),
+        };
+        let existing = vec![(1i64, "Tenma Maemi".to_string())];
+        let about_links = HashMap::new();
+        let (id, reason) = guess_existing_channel(&cand, &existing, &about_links).unwrap();
+        assert_eq!(id, 1);
+        assert!(reason.contains("name"));
+    }
+
+    #[test]
+    fn guess_existing_channel_none_when_nothing_matches() {
+        let cand = ImportCandidate {
+            platform: Platform::Twitch,
+            name: "Totally Unrelated".into(),
+            identity: "unrelated".into(),
+            id: "999".into(),
+            url: "https://twitch.tv/unrelated".into(),
+            detail: String::new(),
+        };
+        let existing = vec![(1i64, "Tenma Maemi".to_string())];
+        let about_links = HashMap::new();
+        assert!(guess_existing_channel(&cand, &existing, &about_links).is_none());
+    }
 
     /// The rec-653 hover: the real `ERROR:` line must win over the traceback
     /// frames that follow it, and a DNS failure gets the likely-cause hint.

@@ -270,22 +270,30 @@ pub async fn resolve_yt_identities(
         .collect()
 }
 
-/// Create one channel container + its first monitor for an imported URL, reusing
-/// the same per-platform defaults a manual "Add stream" would (max-archival
-/// booleans on). `monitor_enabled` is the "Auto" choice (whether the scheduler
-/// auto-records it); `channel_enabled` is the container on/off (a "Disabled"
-/// import sets it false — the master automation switch, so the channel sits
-/// fully dormant until re-enabled, exactly like flipping Enabled off in the
-/// grid). Container flags are seeded from the instance's, like a manual Add
-/// stream (`create_container_with_flags`), so a fresh import never starts with
-/// a channel/instance flag mismatch. `quality`/`out_dir` override the
-/// per-platform defaults for this one creation when non-empty (the dialog's
-/// "Overrides for this import" section). Returns the new channel id.
+/// Create one monitor for an imported URL, reusing the same per-platform
+/// defaults a manual "Add stream" would (max-archival booleans on).
+/// `monitor_enabled` is the "Auto" choice (whether the scheduler auto-records
+/// it); `channel_enabled` is the container on/off (a "Disabled" import sets it
+/// false — the master automation switch, so the channel sits fully dormant
+/// until re-enabled, exactly like flipping Enabled off in the grid).
+///
+/// `target_channel`: `None` creates a brand-new channel container, seeding
+/// its flags from the instance's (`create_container_with_flags`) like a
+/// manual Add stream, so a fresh import never starts with a channel/instance
+/// flag mismatch. `Some(id)` instead adds this as a new instance under an
+/// ALREADY-EXISTING channel (the Import dialog's "import into an existing
+/// channel" match) — that channel's own flags are left exactly as they are;
+/// only this new instance's flags come from `monitor_enabled`/`channel_enabled`.
+///
+/// `quality`/`out_dir` override the per-platform defaults for this one
+/// creation when non-empty (the dialog's "Overrides for this import"
+/// section). Returns the channel id (new or reused).
 #[allow(clippy::too_many_arguments)]
 pub fn create_monitor(
     store: &Store,
     defaults: &MonitorDefaults,
     default_out: &str,
+    target_channel: Option<i64>,
     name: &str,
     url: &str,
     monitor_enabled: bool,
@@ -294,8 +302,10 @@ pub fn create_monitor(
     out_dir: Option<&str>,
 ) -> Result<i64> {
     let platform = Platform::detect(url);
-    let channel_id =
-        store.create_container_with_flags(name, monitor_enabled, channel_enabled)?;
+    let channel_id = match target_channel {
+        Some(id) => id,
+        None => store.create_container_with_flags(name, monitor_enabled, channel_enabled)?,
+    };
     let monitor = Monitor {
         id: 0,
         channel_id,
@@ -384,6 +394,7 @@ mod tests {
                 &store,
                 &defaults,
                 "C:/out",
+                None,
                 &format!("Cool-{auto}-{disabled}"),
                 &format!("https://twitch.tv/cool_{auto}_{disabled}"),
                 auto,
@@ -410,6 +421,46 @@ mod tests {
     }
 
     #[test]
+    fn create_monitor_reuses_an_existing_channel_without_touching_its_flags() {
+        let store = Store::open_in_memory().unwrap();
+        let defaults = MonitorDefaults::default();
+
+        // An existing channel, already Auto-on / Enabled — e.g. tracked via
+        // YouTube already.
+        let existing_id =
+            create_monitor(&store, &defaults, "C:/out", None, "Tenma Maemi",
+                "https://www.youtube.com/channel/UCabc", true, true, None, None)
+                .unwrap();
+
+        // Importing a Twitch follow "into" that existing channel must add a
+        // SECOND instance under the SAME channel id — not a new container —
+        // and must not touch the existing channel's own flags, even when this
+        // new instance's own Auto/Disabled choice differs.
+        let cid = create_monitor(
+            &store,
+            &defaults,
+            "C:/out",
+            Some(existing_id),
+            "Tenma",
+            "https://twitch.tv/tenma",
+            false, // Auto off for this new instance
+            false, // Disabled for this new instance
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(cid, existing_id, "reuses the given channel id, creates no new container");
+
+        let rows = store.list_monitors_with_channels().unwrap();
+        let monitors: Vec<_> = rows.iter().filter(|r| r.channel.id == existing_id).collect();
+        assert_eq!(monitors.len(), 2, "both instances live under the one channel");
+        let yt = monitors.iter().find(|r| r.monitor.platform() == Platform::YouTube).unwrap();
+        let tw = monitors.iter().find(|r| r.monitor.platform() == Platform::Twitch).unwrap();
+        assert!(yt.channel.enabled && yt.channel.automation_enabled, "existing channel flags untouched");
+        assert!(!tw.monitor.enabled && !tw.monitor.automation_enabled, "new instance gets its OWN flags");
+    }
+
+    #[test]
     fn create_monitor_applies_import_overrides() {
         let store = Store::open_in_memory().unwrap();
         let defaults = MonitorDefaults::default();
@@ -419,6 +470,7 @@ mod tests {
             &store,
             &defaults,
             "C:/out",
+            None,
             "Tuber",
             "https://www.youtube.com/channel/UCabc",
             true,
@@ -438,6 +490,7 @@ mod tests {
             &store,
             &defaults,
             "C:/out",
+            None,
             "Cool",
             "https://twitch.tv/cool",
             true,

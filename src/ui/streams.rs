@@ -55,6 +55,18 @@ pub(super) struct ImportRow {
     /// matched (e.g. an existing YouTube monitor added by @handle vs. a candidate's
     /// channel id). Flagged + left unselected, but still selectable to override.
     pub(super) maybe_dup: bool,
+    /// Import this candidate as a NEW INSTANCE under an existing channel
+    /// instead of creating a new one — `None` = new channel (the default).
+    pub(super) target_channel: Option<i64>,
+    /// `target_channel` was set by the "Guess existing channels" bulk action
+    /// and hasn't been manually confirmed yet. While true, the guess is
+    /// treated as unresolved (the row is excluded from import entirely, not
+    /// silently downgraded to "new channel") — ticking the confirm checkbox,
+    /// or manually touching the dropdown, clears this.
+    pub(super) guess_pending: bool,
+    /// Why `target_channel` was guessed, shown in the "auto-assumed" hover
+    /// text. Empty when `target_channel` was picked manually (or unset).
+    pub(super) guess_reason: &'static str,
 }
 
 /// The "Import followed/subscriptions" confirmation dialog.
@@ -3731,11 +3743,27 @@ impl StreamArchiverApp {
                         disabled: false,
                         already,
                         maybe_dup,
+                        target_channel: None,
+                        guess_pending: false,
+                        guess_reason: "",
                     }
                 })
                 .collect();
             d.loaded = true;
         }
+
+        // Existing channels this import can target instead of creating a new
+        // one — computed here (not inside the viewport closure, which only
+        // captures `dialog`, not `self`) so it's a plain owned local the
+        // closure can read freely.
+        let mut existing_channels: Vec<(i64, String)> = self
+            .rows
+            .iter()
+            .map(|r| (r.channel.id, r.channel.name.clone()))
+            .collect::<HashMap<_, _>>()
+            .into_iter()
+            .collect();
+        existing_channels.sort_by(|a, b| a.1.cmp(&b.1));
 
         let Some(dialog) = &mut self.import_dialog else {
             return;
@@ -3743,6 +3771,7 @@ impl StreamArchiverApp {
         let mut open = true;
         let mut do_import = false;
         let mut do_close = false;
+        let mut do_guess = false;
 
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("import_vp"),
@@ -3800,7 +3829,10 @@ impl StreamArchiverApp {
                             "Tick the channels to import. \"Auto\" lets the scheduler \
                              auto-record (off = monitor only); \"Disabled\" imports the \
                              channel fully turned off (no polling until you enable it). \
-                             Already-added channels are greyed out.",
+                             Already-added channels are greyed out. \"Import into\" adds a \
+                             candidate as a new instance of an existing channel instead of \
+                             creating a new one — a guessed match needs its checkbox ticked \
+                             before it's used; until then that row is held back from import.",
                         )
                         .small()
                         .weak(),
@@ -3839,6 +3871,20 @@ impl StreamArchiverApp {
                             for &i in &selectable {
                                 dialog.rows[i].auto = false;
                             }
+                        }
+                        ui.separator();
+                        if ui
+                            .small_button("🔗 Guess existing channels")
+                            .on_hover_text(
+                                "For every row without a target picked yet, look for an \
+                                 existing channel that's probably the same person (a linked \
+                                 About page, or a similar name) and fill in \"Import into\" — \
+                                 marked \"auto-assumed\" and held back from import until you \
+                                 tick its confirm box.",
+                            )
+                            .clicked()
+                        {
+                            do_guess = true;
                         }
                     });
                     egui::CollapsingHeader::new("Overrides for this import")
@@ -3888,7 +3934,7 @@ impl StreamArchiverApp {
                         .max_height(380.0)
                         .show(ui, |ui| {
                             egui::Grid::new("import_grid")
-                                .num_columns(6)
+                                .num_columns(7)
                                 .striped(true)
                                 .spacing([10.0, 4.0])
                                 .show(ui, |ui| {
@@ -3904,22 +3950,27 @@ impl StreamArchiverApp {
                                          you enable it in the grid",
                                     );
                                     ui.strong("Channel");
+                                    ui.strong("Import into").on_hover_text(
+                                        "Add this candidate as a new instance of an existing \
+                                         channel instead of creating a new one. \"(new \
+                                         channel)\" is the default.",
+                                    );
                                     ui.strong("ID");
                                     ui.strong("Info");
                                     ui.end_row();
                                     for &i in &visible {
                                         let row = &mut dialog.rows[i];
-                                        let on = row.selected && !row.already;
+                                        let ready = row.selected && !row.already && !row.guess_pending;
                                         ui.add_enabled(
                                             !row.already,
                                             egui::Checkbox::new(&mut row.selected, ""),
                                         );
                                         ui.add_enabled(
-                                            on,
+                                            ready,
                                             egui::Checkbox::new(&mut row.auto, ""),
                                         );
                                         ui.add_enabled(
-                                            on,
+                                            ready,
                                             egui::Checkbox::new(&mut row.disabled, ""),
                                         );
                                         if row.already {
@@ -3935,6 +3986,69 @@ impl StreamArchiverApp {
                                         } else {
                                             ui.label(&row.cand.name);
                                         }
+                                        ui.add_enabled_ui(!row.already, |ui| {
+                                            ui.horizontal(|ui| {
+                                                egui::ComboBox::from_id_salt(("import_target", i))
+                                                    .width(150.0)
+                                                    .selected_text(
+                                                        row.target_channel
+                                                            .and_then(|id| {
+                                                                existing_channels
+                                                                    .iter()
+                                                                    .find(|(cid, _)| *cid == id)
+                                                                    .map(|(_, n)| n.clone())
+                                                            })
+                                                            .unwrap_or_else(|| "(new channel)".into()),
+                                                    )
+                                                    .show_ui(ui, |ui| {
+                                                        if ui
+                                                            .selectable_value(
+                                                                &mut row.target_channel,
+                                                                None,
+                                                                "(new channel)",
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            row.guess_pending = false;
+                                                        }
+                                                        for (cid, name) in &existing_channels {
+                                                            if ui
+                                                                .selectable_value(
+                                                                    &mut row.target_channel,
+                                                                    Some(*cid),
+                                                                    name,
+                                                                )
+                                                                .clicked()
+                                                            {
+                                                                row.guess_pending = false;
+                                                            }
+                                                        }
+                                                    });
+                                                if row.guess_pending {
+                                                    // A one-shot "confirm" action, not a
+                                                    // persisted toggle — the checkbox and its
+                                                    // "auto-assumed" label both disappear once
+                                                    // ticked (guess_pending flips to false).
+                                                    let mut confirmed = false;
+                                                    if ui
+                                                        .checkbox(&mut confirmed, "")
+                                                        .on_hover_text(
+                                                            "Confirm this guessed match — until \
+                                                             ticked, this row is held back from \
+                                                             import.",
+                                                        )
+                                                        .changed()
+                                                        && confirmed
+                                                    {
+                                                        row.guess_pending = false;
+                                                    }
+                                                    ui.weak("auto-assumed").on_hover_text(format!(
+                                                        "Guessed: {}. Not used until confirmed.",
+                                                        row.guess_reason
+                                                    ));
+                                                }
+                                            });
+                                        });
                                         ui.add(
                                             egui::Label::new(
                                                 egui::RichText::new(&row.cand.id).monospace().small(),
@@ -3951,8 +4065,9 @@ impl StreamArchiverApp {
                     let n = dialog
                         .rows
                         .iter()
-                        .filter(|r| r.selected && !r.already)
+                        .filter(|r| r.selected && !r.already && !r.guess_pending)
                         .count();
+                    let pending = dialog.rows.iter().filter(|r| r.guess_pending).count();
                     ui.horizontal(|ui| {
                         if ui
                             .add_enabled(
@@ -3966,6 +4081,11 @@ impl StreamArchiverApp {
                         if ui.button("Cancel").clicked() {
                             do_close = true;
                         }
+                        if pending > 0 {
+                            ui.weak(format!(
+                                "{pending} unconfirmed guess(es) held back — see \"Import into\"."
+                            ));
+                        }
                         if !dialog.status.is_empty() {
                             ui.label(&dialog.status);
                         }
@@ -3976,12 +4096,14 @@ impl StreamArchiverApp {
 
         // Collect the chosen rows before the dialog borrow ends (the create + reload
         // below need `&mut self`).
-        let to_create: Vec<(String, String, bool, bool)> = if do_import {
+        let to_create: Vec<(String, String, bool, bool, Option<i64>)> = if do_import {
             dialog
                 .rows
                 .iter()
-                .filter(|r| r.selected && !r.already)
-                .map(|r| (r.cand.name.clone(), r.cand.url.clone(), r.auto, r.disabled))
+                .filter(|r| r.selected && !r.already && !r.guess_pending)
+                .map(|r| {
+                    (r.cand.name.clone(), r.cand.url.clone(), r.auto, r.disabled, r.target_channel)
+                })
                 .collect()
         } else {
             Vec::new()
@@ -3990,6 +4112,40 @@ impl StreamArchiverApp {
         let out_dir_override = dialog.out_dir_override.clone();
         let close = do_close || !open;
 
+        if do_guess {
+            // Off the render path (button-triggered, not per-frame): one
+            // `about_latest_per_account` call per distinct existing channel,
+            // then a pure name/link guess per not-yet-targeted candidate row.
+            let about_links: HashMap<i64, Vec<String>> = existing_channels
+                .iter()
+                .map(|(id, _)| {
+                    let links = self
+                        .core
+                        .store
+                        .about_latest_per_account(*id)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(row, _versions)| row.links_json)
+                        .collect();
+                    (*id, links)
+                })
+                .collect();
+            let dialog = self.import_dialog.as_mut().unwrap();
+            for row in &mut dialog.rows {
+                if row.already || row.target_channel.is_some() {
+                    continue;
+                }
+                if let Some((id, reason)) =
+                    guess_existing_channel(&row.cand, &existing_channels, &about_links)
+                {
+                    row.target_channel = Some(id);
+                    row.guess_pending = true;
+                    row.guess_reason = reason;
+                    row.selected = true;
+                }
+            }
+        }
+
         if do_import {
             let out = self.settings.default_output_dir.clone();
             let mut ok = 0usize;
@@ -3997,11 +4153,12 @@ impl StreamArchiverApp {
             let mut last_err: Option<String> = None;
             // Continue past a per-row failure so one bad channel can't drop the rest
             // of the batch.
-            for (name, url, auto, disabled) in &to_create {
+            for (name, url, auto, disabled, target_channel) in &to_create {
                 match imports::create_monitor(
                     &self.core.store,
                     &self.monitor_defaults,
                     &out,
+                    *target_channel,
                     name,
                     url,
                     *auto,
