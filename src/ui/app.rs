@@ -506,6 +506,7 @@ impl StreamArchiverApp {
             expanded_channels: HashSet::new(),
             expanded_instances: HashSet::new(),
             expanded_streams: HashSet::new(),
+            period_toggles: HashSet::new(),
             rec_cache: HashMap::new(),
             ad_break_cache: HashMap::new(),
             ad_popups: Vec::new(),

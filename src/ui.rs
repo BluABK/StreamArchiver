@@ -1120,6 +1120,11 @@ pub struct StreamArchiverApp {
     expanded_channels: HashSet<i64>,
     expanded_instances: HashSet<i64>,
     expanded_streams: HashSet<String>,
+    /// Year/Month/Week grouping-header toggles — deviations from the
+    /// computed default (open for the single newest bucket at each shown
+    /// level, closed otherwise), not the open state itself. See
+    /// `streams::period_open`.
+    period_toggles: HashSet<String>,
     rec_cache: HashMap<i64, Vec<Recording>>,
     /// Lazy per-recording ad-break detail (cut list), keyed by recording id;
     /// cleared on reload. Avoids a per-frame DB query for tooltips/the popup.

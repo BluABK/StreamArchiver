@@ -83,6 +83,8 @@ struct StreamsOut {
     toggle_channel: Option<i64>,
     toggle_instance: Option<i64>,
     toggle_stream: Option<String>,
+    /// A Year/Month/Week header's triangle was clicked — see `period_toggles`.
+    toggle_period: Option<String>,
     open_path: Option<std::path::PathBuf>,
     open_in_player: Option<StreamTarget>,
     play_new_instance_mid: Option<i64>,
@@ -127,10 +129,34 @@ enum VodJobKind {
     Recovery,
     Backfill,
 }
+/// A Year/Month/Week grouping header over a contiguous run of a monitor's
+/// streams — see [`period_levels_needed`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PeriodKind {
+    Year,
+    Month,
+    Week,
+}
 #[derive(Clone, Copy)]
 enum Vis {
     Channel(usize),
     Instance { row: usize, depth: usize },
+    /// `gi_start..gi_end` is the absolute index range into `groups[&mid]`
+    /// this header covers — the same indexing `Stream`/`Take` already use,
+    /// so no separate lookup table is needed; the render fn re-derives the
+    /// label/summary from `groups[&mid][gi_start..gi_end]` directly.
+    /// `expanded` is `build_vis_rows`'s own `period_open(...)` result,
+    /// carried along rather than recomputed at render time (recomputing
+    /// would need `year_idx == 0`-style ancestor-chain state this row no
+    /// longer has once flattened).
+    Period {
+        mid: i64,
+        kind: PeriodKind,
+        gi_start: usize,
+        gi_end: usize,
+        depth: usize,
+        expanded: bool,
+    },
     Stream { mid: i64, gi: usize, depth: usize },
     Take { mid: i64, gi: usize, ti: usize, depth: usize },
     VodJob { mid: i64, gi: usize, ti: usize, kind: VodJobKind, depth: usize },
@@ -145,6 +171,58 @@ fn stream_has_children(g: &crate::models::StreamGroup) -> bool {
         || g.takes
             .iter()
             .any(|t| t.recovery_state.is_some() || t.vod_dl_state.is_some())
+}
+
+/// The calendar date a stream is bucketed by: went-live time when known,
+/// else the earliest take's own start (mirrors `stream_row`'s own
+/// go-live-or-fallback convention for this exact "when did this broadcast
+/// happen" question).
+fn period_anchor_date(g: &crate::models::StreamGroup) -> chrono::NaiveDate {
+    local_date(g.went_live_at.unwrap_or_else(|| g.started_at())).unwrap_or(chrono::NaiveDate::MIN)
+}
+
+/// Whether Year/Month/Week header rows are worth showing for a set of
+/// stream dates (order doesn't matter — sorted internally): a level only
+/// earns a header row when it would actually group more than one bucket,
+/// otherwise it's a single always-open wrapper adding a row for nothing.
+/// This is why a channel with only recent history renders identically to
+/// before this feature — its one bucket chain never crosses a boundary.
+fn period_levels_needed(dates: &[chrono::NaiveDate]) -> (bool, bool, bool) {
+    use chrono::Datelike;
+    if dates.len() < 2 {
+        return (false, false, false);
+    }
+    let mut sorted = dates.to_vec();
+    sorted.sort();
+    let years = sorted.chunk_by(|a, b| a.year() == b.year()).count();
+    let months = sorted
+        .chunk_by(|a, b| (a.year(), a.month()) == (b.year(), b.month()))
+        .count();
+    let weeks = sorted.chunk_by(|a, b| week_start(*a) == week_start(*b)).count();
+    (years > 1, months > 1, weeks > 1)
+}
+
+/// Stable identity for a period bucket, shared by `build_vis_rows` (checking
+/// whether it's open) and `period_row` (setting the toggle on click) so the
+/// two can never drift out of sync on key format. `date` is any date inside
+/// the bucket — normalized to the bucket's own start before formatting.
+fn period_key(mid: i64, kind: PeriodKind, date: chrono::NaiveDate) -> String {
+    use chrono::Datelike;
+    match kind {
+        PeriodKind::Year => format!("{mid}|Y|{}", date.year()),
+        PeriodKind::Month => format!("{mid}|M|{}-{:02}", date.year(), date.month()),
+        PeriodKind::Week => format!("{mid}|W|{}", week_start(date).format("%Y-%m-%d")),
+    }
+}
+
+/// Effective open/closed state for a period bucket: `default_open` (true
+/// only for the single most-recent bucket at each shown level) XOR'd
+/// against whether the user has ever clicked it — unlike
+/// `expanded_channels`/`_instances`/`_streams` (plain "presence = open"),
+/// the default here varies per bucket, so `period_toggles` records
+/// *deviations from default* rather than the open state itself.
+fn period_open(default_open: bool, toggles: &HashSet<String>, key: &str) -> bool {
+    default_open ^ toggles.contains(key)
 }
 
 impl StreamArchiverApp {
@@ -651,6 +729,7 @@ impl StreamArchiverApp {
         let exp_channels = self.expanded_channels.clone();
         let exp_instances = self.expanded_instances.clone();
         let exp_streams = self.expanded_streams.clone();
+        let period_toggles = self.period_toggles.clone();
         // Snapshot live VOD-backfill download progress (video_id -> 0.0..=1.0),
         // same map the Videos tab reads (`core.video_progress`) — joined via
         // `Recording.vod_dl_video_id` for the VodJob backfill row's progress bar.
@@ -785,7 +864,7 @@ impl StreamArchiverApp {
                 // clicked this frame — corrected on the immediate repaint).
                 let vis = Self::build_vis_rows(
                     model, &sort, &filters, chan_entries, &self.rows, groups,
-                    &exp_channels, &exp_instances, &exp_streams,
+                    &exp_channels, &exp_instances, &exp_streams, &period_toggles,
                 );
                 // Scroll a newly-added channel into view (rows are virtualized,
                 // so the in-cell scroll_to_cursor approach can't work — the
@@ -845,6 +924,12 @@ impl StreamArchiverApp {
                                     &stop_holds_snapshot, &ad_running, sel_color,
                                     status_bgcolor, &col_order, &self.spark_data,
                                     &mut out,
+                                );
+                            }
+                            Vis::Period { mid, kind, gi_start, gi_end, depth, expanded } => {
+                                Self::period_row(
+                                    &mut tr, mid, kind, &groups[&mid][gi_start..gi_end], depth,
+                                    expanded, &mut self.fs_probes, now, &col_order, &mut out,
                                 );
                             }
                             Vis::Stream { mid, gi, depth } => {
@@ -915,6 +1000,7 @@ impl StreamArchiverApp {
             toggle_channel,
             toggle_instance,
             toggle_stream,
+            toggle_period,
             open_path,
             open_in_player,
             play_new_instance_mid,
@@ -1000,7 +1086,11 @@ impl StreamArchiverApp {
                 .request_repaint_after(std::time::Duration::from_secs(1));
         }
 
-        if toggle_channel.is_some() || toggle_instance.is_some() || toggle_stream.is_some() {
+        if toggle_channel.is_some()
+            || toggle_instance.is_some()
+            || toggle_stream.is_some()
+            || toggle_period.is_some()
+        {
             // Expansion feeds the cached view data — rebuild it right away.
             self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
         }
@@ -1017,6 +1107,14 @@ impl StreamArchiverApp {
         if let Some(k) = toggle_stream {
             if !self.expanded_streams.remove(&k) {
                 self.expanded_streams.insert(k);
+            }
+        }
+        if let Some(k) = toggle_period {
+            // `period_toggles` records DEVIATIONS from the computed default
+            // (see `period_open`), not the open state itself — same flip,
+            // opposite meaning of presence.
+            if !self.period_toggles.remove(&k) {
+                self.period_toggles.insert(k);
             }
         }
         if let Some(mid) = acts.edit {
@@ -1242,8 +1340,11 @@ impl StreamArchiverApp {
         }
     }
 
-    /// Flatten the channel -> (instance) -> stream -> take tree into the rows
-    /// currently visible (respecting sort/filter order and expansion state).
+    /// Flatten the channel -> (instance) -> [year -> month -> week ->]
+    /// stream -> take tree into the rows currently visible (respecting
+    /// sort/filter order and expansion state). The year/month/week levels
+    /// are inserted only where they'd actually group something — see
+    /// [`period_levels_needed`].
     #[allow(clippy::too_many_arguments)]
     fn build_vis_rows(
         model: &[Vec<Cell>],
@@ -1255,7 +1356,9 @@ impl StreamArchiverApp {
         exp_channels: &HashSet<i64>,
         exp_instances: &HashSet<i64>,
         exp_streams: &HashSet<String>,
+        period_toggles: &HashSet<String>,
     ) -> Vec<Vis> {
+        use chrono::Datelike;
         let order = ordered_rows(model, sort, filters);
         let mut vis: Vec<Vis> = Vec::new();
         for &ci in &order {
@@ -1272,27 +1375,106 @@ impl StreamArchiverApp {
                 if !exp_instances.contains(&mid) {
                     continue;
                 }
-                if let Some(grps) = groups.get(&mid) {
-                    for (gi, g) in grps.iter().enumerate() {
-                        vis.push(Vis::Stream { mid, gi, depth: 2 });
-                        if stream_has_children(g) && exp_streams.contains(&g.key) {
-                            for (ti, t) in g.takes.iter().enumerate() {
-                                if g.takes.len() > 1 {
-                                    vis.push(Vis::Take { mid, gi, ti, depth: 3 });
-                                }
-                                if t.recovery_state.is_some() {
-                                    vis.push(Vis::VodJob {
-                                        mid, gi, ti, kind: VodJobKind::Recovery, depth: 3,
-                                    });
-                                }
-                                if t.vod_dl_state.is_some() {
-                                    vis.push(Vis::VodJob {
-                                        mid, gi, ti, kind: VodJobKind::Backfill, depth: 3,
-                                    });
-                                }
-                            }
+                let Some(grps) = groups.get(&mid) else { continue };
+                let dates: Vec<chrono::NaiveDate> = grps.iter().map(period_anchor_date).collect();
+                let (show_years, show_months, show_weeks) = period_levels_needed(&dates);
+                // Fixed for this instance — doesn't depend on which bucket,
+                // only on which levels are shown at all (verified to match
+                // today's Stream=2/Take=3 depths when none are shown).
+                let year_depth = 2;
+                let month_depth = if show_years { 3 } else { 2 };
+                let week_depth = month_depth + usize::from(show_months);
+                let stream_depth = week_depth + usize::from(show_weeks);
+                let take_depth = stream_depth + 1;
+
+                let mut yi = 0usize;
+                for (year_idx, year_chunk) in grps
+                    .chunk_by(|a, b| period_anchor_date(a).year() == period_anchor_date(b).year())
+                    .enumerate()
+                {
+                    let year_newest = year_idx == 0;
+                    if show_years {
+                        let key = period_key(mid, PeriodKind::Year, period_anchor_date(&year_chunk[0]));
+                        let open = period_open(year_newest, period_toggles, &key);
+                        vis.push(Vis::Period {
+                            mid, kind: PeriodKind::Year, gi_start: yi, gi_end: yi + year_chunk.len(),
+                            depth: year_depth, expanded: open,
+                        });
+                        if !open {
+                            yi += year_chunk.len();
+                            continue;
                         }
                     }
+
+                    let mut mi = yi;
+                    for (month_idx, month_chunk) in year_chunk
+                        .chunk_by(|a, b| {
+                            let (da, db) = (period_anchor_date(a), period_anchor_date(b));
+                            (da.year(), da.month()) == (db.year(), db.month())
+                        })
+                        .enumerate()
+                    {
+                        let month_newest = year_newest && month_idx == 0;
+                        if show_months {
+                            let key = period_key(mid, PeriodKind::Month, period_anchor_date(&month_chunk[0]));
+                            let open = period_open(month_newest, period_toggles, &key);
+                            vis.push(Vis::Period {
+                                mid, kind: PeriodKind::Month, gi_start: mi, gi_end: mi + month_chunk.len(),
+                                depth: month_depth, expanded: open,
+                            });
+                            if !open {
+                                mi += month_chunk.len();
+                                continue;
+                            }
+                        }
+
+                        let mut wi = mi;
+                        for (week_idx, week_chunk) in month_chunk
+                            .chunk_by(|a, b| {
+                                week_start(period_anchor_date(a)) == week_start(period_anchor_date(b))
+                            })
+                            .enumerate()
+                        {
+                            let week_newest = month_newest && week_idx == 0;
+                            if show_weeks {
+                                let key = period_key(mid, PeriodKind::Week, period_anchor_date(&week_chunk[0]));
+                                let open = period_open(week_newest, period_toggles, &key);
+                                vis.push(Vis::Period {
+                                    mid, kind: PeriodKind::Week, gi_start: wi, gi_end: wi + week_chunk.len(),
+                                    depth: week_depth, expanded: open,
+                                });
+                                if !open {
+                                    wi += week_chunk.len();
+                                    continue;
+                                }
+                            }
+
+                            for (local_i, g) in week_chunk.iter().enumerate() {
+                                let gi = wi + local_i;
+                                vis.push(Vis::Stream { mid, gi, depth: stream_depth });
+                                if stream_has_children(g) && exp_streams.contains(&g.key) {
+                                    for (ti, t) in g.takes.iter().enumerate() {
+                                        if g.takes.len() > 1 {
+                                            vis.push(Vis::Take { mid, gi, ti, depth: take_depth });
+                                        }
+                                        if t.recovery_state.is_some() {
+                                            vis.push(Vis::VodJob {
+                                                mid, gi, ti, kind: VodJobKind::Recovery, depth: take_depth,
+                                            });
+                                        }
+                                        if t.vod_dl_state.is_some() {
+                                            vis.push(Vis::VodJob {
+                                                mid, gi, ti, kind: VodJobKind::Backfill, depth: take_depth,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            wi += week_chunk.len();
+                        }
+                        mi += month_chunk.len();
+                    }
+                    yi += year_chunk.len();
                 }
             }
         }
@@ -1942,6 +2124,66 @@ impl StreamArchiverApp {
             col_order, &mut out.acts,
         ) {
             out.toggle_instance = Some(mid);
+        }
+    }
+
+    /// Render one Year/Month/Week grouping header (see [`Vis::Period`]) —
+    /// pure navigation/summary, so only the "name" column is populated;
+    /// every other `STREAM_COLUMNS` id falls through blank.
+    #[allow(clippy::too_many_arguments)]
+    fn period_row(
+        tr: &mut egui_extras::TableRow<'_, '_>,
+        mid: i64,
+        kind: PeriodKind,
+        streams: &[StreamGroup],
+        depth: usize,
+        expanded: bool,
+        fs_probes: &mut FsProbes,
+        now: i64,
+        col_order: &[usize],
+        out: &mut StreamsOut,
+    ) {
+        let anchor = period_anchor_date(&streams[0]);
+        let label = match kind {
+            PeriodKind::Year => {
+                use chrono::Datelike;
+                anchor.year().to_string()
+            }
+            PeriodKind::Month => {
+                use chrono::Datelike;
+                month_title(anchor.year(), anchor.month())
+            }
+            PeriodKind::Week => {
+                let ws = week_start(anchor);
+                let we = add_days(ws, 6);
+                let pat = active_date_fmt().date_pattern();
+                format!("{} – {}", ws.format(pat), we.format(pat))
+            }
+        };
+        let n = streams.len();
+        let total: u64 = streams
+            .iter()
+            .flat_map(|g| g.takes.iter())
+            .map(|t| take_size_bytes(fs_probes, t))
+            .sum();
+        let captured_secs: i64 = streams.iter().map(|g| g.captured_secs(now)).sum();
+        let key = period_key(mid, kind, anchor);
+        let mut disc = false;
+        for &ci in col_order {
+            tr.col(|ui| {
+                if STREAM_COLUMNS[ci].id == "name" {
+                    disc = tree_name(ui, depth, true, expanded, None, egui::RichText::new(label.clone()));
+                    let noun = if n == 1 { "stream" } else { "streams" };
+                    ui.weak(format!("· {n} {noun}"));
+                    if total > 0 {
+                        ui.weak(format!("({})", fmt_bytes(total as i64)))
+                            .on_hover_text(stream_size_hover(total, captured_secs));
+                    }
+                }
+            });
+        }
+        if disc {
+            out.toggle_period = Some(key);
         }
     }
 
@@ -3787,5 +4029,98 @@ impl StreamArchiverApp {
         } else if close {
             self.import_dialog = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ymd(y: i32, m: u32, d: u32) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    #[test]
+    fn period_levels_needed_single_date_shows_nothing() {
+        assert_eq!(period_levels_needed(&[]), (false, false, false));
+        assert_eq!(period_levels_needed(&[ymd(2026, 7, 20)]), (false, false, false));
+    }
+
+    #[test]
+    fn period_levels_needed_within_one_week_shows_nothing() {
+        // Mon..Sun of the same ISO week — a channel with only this week's
+        // history should render exactly as it did before this feature.
+        let dates = [ymd(2026, 7, 20), ymd(2026, 7, 21), ymd(2026, 7, 26)];
+        assert_eq!(period_levels_needed(&dates), (false, false, false));
+    }
+
+    #[test]
+    fn period_levels_needed_multi_week_same_month_shows_weeks_only() {
+        let dates = [ymd(2026, 7, 6), ymd(2026, 7, 20)];
+        assert_eq!(period_levels_needed(&dates), (false, false, true));
+    }
+
+    #[test]
+    fn period_levels_needed_multi_month_same_year_shows_month_and_week() {
+        let dates = [ymd(2026, 3, 1), ymd(2026, 7, 20)];
+        assert_eq!(period_levels_needed(&dates), (false, true, true));
+    }
+
+    #[test]
+    fn period_levels_needed_multi_year_shows_everything() {
+        let dates = [ymd(2024, 12, 30), ymd(2026, 7, 20)];
+        assert_eq!(period_levels_needed(&dates), (true, true, true));
+    }
+
+    #[test]
+    fn period_levels_needed_ignores_input_order() {
+        // build_vis_rows always calls this with a newest-first slice, but
+        // the function's own contract shouldn't depend on that.
+        let newest_first = [ymd(2026, 7, 20), ymd(2026, 3, 1)];
+        let oldest_first = [ymd(2026, 3, 1), ymd(2026, 7, 20)];
+        assert_eq!(
+            period_levels_needed(&newest_first),
+            period_levels_needed(&oldest_first)
+        );
+    }
+
+    #[test]
+    fn period_key_normalizes_to_bucket_start() {
+        // Any date inside a bucket must key identically to the bucket's
+        // own start — otherwise a StreamGroup could look up a Year/Month
+        // key that its own header row never pushed.
+        let mid = 7;
+        assert_eq!(
+            period_key(mid, PeriodKind::Year, ymd(2026, 1, 1)),
+            period_key(mid, PeriodKind::Year, ymd(2026, 12, 31)),
+        );
+        assert_eq!(
+            period_key(mid, PeriodKind::Month, ymd(2026, 7, 1)),
+            period_key(mid, PeriodKind::Month, ymd(2026, 7, 31)),
+        );
+        // A week spanning a month boundary still keys identically for
+        // every day in it (Mon 2026-06-29 .. Sun 2026-07-05).
+        assert_eq!(
+            period_key(mid, PeriodKind::Week, ymd(2026, 6, 29)),
+            period_key(mid, PeriodKind::Week, ymd(2026, 7, 5)),
+        );
+        // Different monitors never collide even for the same date.
+        assert_ne!(
+            period_key(1, PeriodKind::Year, ymd(2026, 7, 20)),
+            period_key(2, PeriodKind::Year, ymd(2026, 7, 20)),
+        );
+    }
+
+    #[test]
+    fn period_open_defaults_and_flips() {
+        let mut toggles = HashSet::new();
+        // Default-open bucket stays open until explicitly toggled.
+        assert!(period_open(true, &toggles, "k"));
+        toggles.insert("k".to_string());
+        assert!(!period_open(true, &toggles, "k"));
+        // Default-closed bucket stays closed until explicitly toggled.
+        assert!(!period_open(false, &toggles, "other"));
+        toggles.insert("other".to_string());
+        assert!(period_open(false, &toggles, "other"));
     }
 }

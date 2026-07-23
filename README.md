@@ -339,14 +339,28 @@ or the Duration column, for an average bitrate — a quick way to notice a take
 that captured at the wrong quality); a still-recording take shows its *live*
 size, not the stale 0 B a plain directory listing would give a file another
 process still has open for writing — it's read from the file handle directly
-and updates every couple of seconds:
+and updates every couple of seconds.
+
+Once a channel has been recording long enough, its streams also subgroup into
+collapsible **Week → Month → Year** headers so the list doesn't turn into a
+wall of text — each header shows its own stream count + total size. A level
+only appears once it would actually group more than one bucket (a channel
+whose whole history is still within one week shows no headers at all, exactly
+as before); only the single most recent bucket at each level starts expanded,
+so a channel you've been recording for years still opens straight to its
+newest streams, with everything older one click away:
 
 ```
 ▼ Layna            twitch  streamlink  recording
-   ▼ 🎬 2026-06-20 18:00   recording   · 2 takes (7.4 GB)
-        Take 1   18:00–18:12   failed       (crashed)  (1.1 GB)
-        Take 2   18:13–…       recording               (6.3 GB)
-   ▶ 🎬 2026-06-19 21:30   completed                    (5.8 GB)
+   ▼ 2026                                          · 41 streams (312 GB)
+      ▶ Jan 2026                                    · 4 streams (28 GB)
+      ...
+      ▼ Jun 29 – Jul 5                               · 3 streams (22 GB)
+         ▼ 🎬 2026-07-02 18:00   recording   · 2 takes (7.4 GB)
+              Take 1   18:00–18:12   failed       (crashed)  (1.1 GB)
+              Take 2   18:13–…       recording               (6.3 GB)
+         ▶ 🎬 2026-06-30 21:30   completed                    (5.8 GB)
+   ▶ 2025                                          · 187 streams (1.4 TB)
 ```
 
 A channel with **multiple capture instances** (e.g. streamlink *and* yt-dlp on the
