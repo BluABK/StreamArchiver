@@ -544,13 +544,18 @@ impl StreamArchiverApp {
         events: impl IntoIterator<Item = &'a UpcomingStream>,
     ) -> HashMap<i64, EventSignals> {
         let now = now_unix();
-        // (auto-record, automation) per monitor — automation off means
-        // detection itself never runs, so a trigger preview would be
-        // misleading; gated out below rather than shown as "would fire".
+        // (effective auto-record, effective automation) per monitor — BOTH
+        // are channel-level-AND-instance-level gates (`auto_record_on`/
+        // `automation_on`), not just the instance's own flag; checking
+        // `monitor.enabled` alone missed a channel-level Auto-off entirely,
+        // so a monitor with Auto off only at the channel level never showed
+        // dimmed. Automation off means detection itself never runs, so a
+        // trigger preview would be misleading; gated out below rather than
+        // shown as "would fire".
         let auto_by_mid: HashMap<i64, (bool, bool)> = self
             .rows
             .iter()
-            .map(|r| (r.monitor.id, (r.monitor.enabled, r.monitor.automation_enabled)))
+            .map(|r| (r.monitor.id, (r.auto_record_on(), r.automation_on())))
             .collect();
         let active_ids: HashSet<i64> = self.core.active.lock().unwrap().keys().copied().collect();
         let finalizing_ids: HashSet<i64> =

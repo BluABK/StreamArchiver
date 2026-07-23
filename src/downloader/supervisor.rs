@@ -1511,7 +1511,7 @@ progress_info: None,
             }
             return;
         }
-        let auto = row.channel.enabled && row.monitor.enabled;
+        let auto = row.auto_record_on();
         let name = row.channel.name.clone();
         let outcome = self.check_one(&row).await;
         if outcome.live {

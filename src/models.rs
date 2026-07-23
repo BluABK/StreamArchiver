@@ -1044,6 +1044,16 @@ impl MonitorWithChannel {
     pub fn automation_on(&self) -> bool {
         self.channel.automation_enabled && self.monitor.automation_enabled
     }
+
+    /// Whether a live stream on this instance actually gets auto-recorded:
+    /// the Auto-record flag on both the channel and the instance. Gates disk
+    /// recording ONLY — not detection/metadata/fetches (see
+    /// [`Self::automation_on`] for that). Checking `monitor.enabled` alone
+    /// is a common mistake — a channel-level Auto-off still blocks
+    /// recording even when the instance's own flag is on.
+    pub fn auto_record_on(&self) -> bool {
+        self.channel.enabled && self.monitor.enabled
+    }
 }
 
 /// One collaborator in a live Twitch "Stream Together" session (or a
@@ -2764,6 +2774,25 @@ pub fn group_recordings(recordings: &[Recording]) -> Vec<StreamGroup> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_record_on_requires_both_channel_and_monitor_enabled() {
+        // Regression: the Schedule view's tint once checked `monitor.enabled`
+        // alone and missed a channel-level Auto-off entirely.
+        let mut row = crate::downloader::test_util::row(
+            Tool::Streamlink,
+            Container::Mkv,
+            Platform::Twitch,
+        );
+        assert!(row.auto_record_on(), "both on by default");
+        row.channel.enabled = false;
+        assert!(!row.auto_record_on(), "channel-level Auto-off must gate it");
+        row.channel.enabled = true;
+        row.monitor.enabled = false;
+        assert!(!row.auto_record_on(), "instance-level Auto-off must gate it");
+        row.channel.enabled = false;
+        assert!(!row.auto_record_on(), "both off");
+    }
 
     #[test]
     fn title_mentions_parses_twitch_handles() {
