@@ -500,6 +500,7 @@ impl StreamArchiverApp {
             scheduled_recordings: Vec::new(),
             scheduled_recording_form: None,
             confirm_delete_scheduled_recording: None,
+            sched_rec_add_monitor: 0,
             streams_sort: SortState {
                 keys: grid_columns::resolve_sort(&STREAM_COLUMNS, &streams_sort_persisted)
                     .into_iter()

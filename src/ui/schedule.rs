@@ -3051,8 +3051,12 @@ impl StreamArchiverApp {
             AddNew(i64),
         }
         let mut act: Option<Act> = None;
-        // "+ Add new" instance picker, session-only (not persisted).
-        let mut add_new_monitor = self.rows.first().map(|r| r.monitor.id).unwrap_or(0);
+        // "+ Add new" instance picker selection lives on `self` (see field
+        // doc) — reconcile it once per frame: fall back to the first row
+        // when unset, or when the previous selection's instance is gone.
+        if !self.rows.iter().any(|r| r.monitor.id == self.sched_rec_add_monitor) {
+            self.sched_rec_add_monitor = self.rows.first().map(|r| r.monitor.id).unwrap_or(0);
+        }
 
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("sched_recs_vp"),
@@ -3071,14 +3075,14 @@ impl StreamArchiverApp {
                                 .selected_text(
                                     self.rows
                                         .iter()
-                                        .find(|r| r.monitor.id == add_new_monitor)
+                                        .find(|r| r.monitor.id == self.sched_rec_add_monitor)
                                         .map(|r| format!("{} — {}", r.channel.name, r.monitor.url))
                                         .unwrap_or_else(|| "(no instances yet)".to_string()),
                                 )
                                 .show_ui(ui, |ui| {
                                     for r in &self.rows {
                                         ui.selectable_value(
-                                            &mut add_new_monitor,
+                                            &mut self.sched_rec_add_monitor,
                                             r.monitor.id,
                                             format!("{} — {}", r.channel.name, r.monitor.url),
                                         );
@@ -3088,7 +3092,7 @@ impl StreamArchiverApp {
                                 .add_enabled(!self.rows.is_empty(), egui::Button::new("➕ Add new"))
                                 .clicked()
                             {
-                                act = Some(Act::AddNew(add_new_monitor));
+                                act = Some(Act::AddNew(self.sched_rec_add_monitor));
                             }
                         });
                     });

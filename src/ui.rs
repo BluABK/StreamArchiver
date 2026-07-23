@@ -1114,6 +1114,12 @@ pub struct StreamArchiverApp {
     scheduled_recordings: Vec<crate::models::ScheduledRecordingWithNames>,
     scheduled_recording_form: Option<ScheduledRecordingForm>,
     confirm_delete_scheduled_recording: Option<(i64, String)>,
+    /// Scheduled recordings window: the "+ Add new" instance-picker
+    /// dropdown's selection (session-only, not persisted to the DB). Must
+    /// live on `self`, not a per-frame local — a local re-initialized to
+    /// the first row every frame would silently discard every click.
+    /// 0 = unset (falls back to the first row).
+    sched_rec_add_monitor: i64,
     /// Sort + per-column filters for the Streams table.
     streams_sort: SortState,
     streams_filters: Vec<String>,
