@@ -1524,6 +1524,10 @@ pub struct StreamArchiverApp {
     files_selected: std::collections::HashSet<i64>,
     /// Files tab: batch "set folder for selected" draft.
     files_batch_dir: String,
+    /// Files tab: "Redirect all instances on drive" bar drafts (single
+    /// letters, e.g. "A" / "G" — not full paths).
+    files_redirect_from: String,
+    files_redirect_to: String,
     /// Files tab: relocate-paths dialog drafts.
     files_reloc_from: String,
     files_reloc_to: String,

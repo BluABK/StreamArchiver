@@ -882,6 +882,12 @@ have ever landed on:
   (💾 applies; affects future takes only) and in **batch**: select rows and
   apply one folder to all of them (`{channel}` expands per instance). The
   resolved cache dir for the current cache layout is shown per row.
+  **Redirect all instances on drive** does the same thing keyed by drive
+  letter instead of manual selection — pick the full drive from a dropdown,
+  type the destination letter, and every instance currently outputting there
+  gets retargeted in one click (only the drive letter changes; the rest of
+  each path is kept as-is). The drive-full case: point everything away from
+  a nearly-full drive without touching a single existing file.
 - **Recording locations** — every folder recordings actually sit in per the
   database, including *history-only* folders no instance points at anymore
   (e.g. the old drive after a move), with existence checks and per-folder

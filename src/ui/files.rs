@@ -36,6 +36,28 @@ pub(super) struct FilesDirRow {
     pub(super) mapped: Vec<String>,
 }
 
+/// The drive letter a Windows path starts with (`"A:\foo"` → `Some('A')`),
+/// or `None` for anything else (relative path, UNC, no drive prefix). Used
+/// to gate the drive-letter swap in "Redirect all instances on drive" —
+/// deliberately stricter than a bare first-char check (requires the `:`)
+/// since a match here gets `dir[1..]` sliced to build a new path.
+fn drive_letter_of(path: &str) -> Option<char> {
+    let mut chars = path.chars();
+    let letter = chars.next()?;
+    (letter.is_ascii_alphabetic() && chars.next() == Some(':')).then(|| letter.to_ascii_uppercase())
+}
+
+/// Parse a user-typed drive letter, tolerating a trailing colon and
+/// surrounding whitespace (`"g"`, `"G:"`, `" G "` all parse to `Some('G')`).
+fn parse_drive_letter(s: &str) -> Option<char> {
+    s.trim()
+        .trim_end_matches(':')
+        .chars()
+        .next()
+        .filter(|c| c.is_ascii_alphabetic())
+        .map(|c| c.to_ascii_uppercase())
+}
+
 impl StreamArchiverApp {
     /// Kick off the off-thread Files scan (dir existence + drive space can
     /// spin up a sleeping USB drive — never on the render path).
@@ -327,6 +349,69 @@ impl StreamArchiverApp {
                     }
                 }
             });
+            // Redirect-by-drive bar: bulk version of the row/selection edits
+            // above, matched by current drive letter instead — the "this
+            // drive is full, send future takes to a different one" case. Only
+            // the drive letter changes; the rest of each instance's path (and
+            // every existing recording) is untouched.
+            ui.horizontal(|ui| {
+                ui.label("Redirect all instances on drive:");
+                egui::ComboBox::from_id_salt("files_redirect_from")
+                    .selected_text(if self.files_redirect_from.is_empty() {
+                        "— pick —".to_string()
+                    } else {
+                        format!("{}:", self.files_redirect_from)
+                    })
+                    .show_ui(ui, |ui| {
+                        for (letter, ..) in &drives {
+                            ui.selectable_value(
+                                &mut self.files_redirect_from,
+                                letter.to_string(),
+                                format!("{letter}:"),
+                            );
+                        }
+                    });
+                ui.label("→");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.files_redirect_to)
+                        .hint_text("G")
+                        .desired_width(30.0),
+                );
+                let from_letter = parse_drive_letter(&self.files_redirect_from);
+                let to_letter = parse_drive_letter(&self.files_redirect_to);
+                let matched: Vec<(i64, String)> = match from_letter {
+                    Some(fl) => instances
+                        .iter()
+                        .filter(|r| drive_letter_of(&r.4) == Some(fl))
+                        .map(|r| (r.0, r.4.clone()))
+                        .collect(),
+                    None => Vec::new(),
+                };
+                if let Some(fl) = from_letter {
+                    ui.weak(format!("{} instance(s) on {fl}:", matched.len()));
+                }
+                if ui
+                    .add_enabled(
+                        from_letter.is_some()
+                            && to_letter.is_some()
+                            && from_letter != to_letter
+                            && !matched.is_empty(),
+                        egui::Button::new("Redirect"),
+                    )
+                    .on_hover_text(
+                        "Sets a new output folder (same sub-path, new drive letter) on \
+                         every instance currently on the 'from' drive. Only affects \
+                         future takes — existing recordings keep their location and \
+                         stay tracked.",
+                    )
+                    .clicked()
+                    && let Some(tl) = to_letter
+                {
+                    for (mid, dir) in &matched {
+                        set_dir.push((*mid, format!("{tl}{}", &dir[1..])));
+                    }
+                }
+            });
             if !set_dir.is_empty() {
                 let mut last_err: Option<String> = None;
                 let mut updated = 0usize;
@@ -476,5 +561,28 @@ impl StreamArchiverApp {
             self.files_scan = None;
             self.files_scan_rx = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drive_letter_of_requires_letter_colon_prefix() {
+        assert_eq!(drive_letter_of(r"A:\streams\channel"), Some('A'));
+        assert_eq!(drive_letter_of(r"g:\streams"), Some('G'));
+        assert_eq!(drive_letter_of(r"\\server\share\streams"), None);
+        assert_eq!(drive_letter_of("streams"), None);
+        assert_eq!(drive_letter_of(""), None);
+    }
+
+    #[test]
+    fn parse_drive_letter_tolerates_colon_and_whitespace() {
+        assert_eq!(parse_drive_letter("g"), Some('G'));
+        assert_eq!(parse_drive_letter("G:"), Some('G'));
+        assert_eq!(parse_drive_letter(" G "), Some('G'));
+        assert_eq!(parse_drive_letter(""), None);
+        assert_eq!(parse_drive_letter("1"), None);
     }
 }

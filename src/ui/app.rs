@@ -661,6 +661,8 @@ impl StreamArchiverApp {
             files_edit: std::collections::HashMap::new(),
             files_selected: std::collections::HashSet::new(),
             files_batch_dir: String::new(),
+            files_redirect_from: String::new(),
+            files_redirect_to: String::new(),
             files_reloc_from: String::new(),
             files_reloc_to: String::new(),
             files_reloc_monitors: false,
