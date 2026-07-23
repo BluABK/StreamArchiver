@@ -1075,7 +1075,13 @@ impl Supervisor {
         } else {
             None
         };
-        if let Some(mrow) = &mrow {
+        // An adopted process that produced no output (died before writing
+        // anything, or `promote_capture` bailed on a 0-byte capture — see
+        // its "leave the partial for the sweep" comment) has nothing to
+        // enrich or rename; skip straight to the empty/failed finalize below
+        // instead of probing/renaming a file that may no longer even exist.
+        let has_media = file_len(&final_path).await > 0;
+        if has_media && let Some(mrow) = &mrow {
             let want_games = template_wants_games(&mrow.monitor.filename_template);
             let want_title = template_wants_title(&mrow.monitor.filename_template);
             let want_went_live = template_wants_went_live(&mrow.monitor.filename_template);
