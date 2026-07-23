@@ -2368,36 +2368,69 @@ impl StreamArchiverApp {
                          (needs ffmpeg 5.0+). Empty = unthrottled.",
                     );
                     ui.end_row();
-                    ui.horizontal(|ui| {
+                    // The underlying setting stays the ';'-joined string
+                    // (that's the save/load and set_cache_root format) — this
+                    // block only changes how it's EDITED: as one row per
+                    // location instead of one cramped semicolon-packed field,
+                    // parsed fresh each frame and rejoined on any change.
+                    // Wrapped in one `ui.vertical` so it stays a single Grid
+                    // cell (this Grid is 2 columns: control | description).
+                    ui.vertical(|ui| {
                         ui.label("Capture cache location(s):");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.settings.capture_cache_root)
-                                .hint_text(r"A:\streams\.sa-cache; G:\streams\.sa-cache")
-                                .desired_width(240.0),
-                        );
+                        let mut cache_rows: Vec<String> = self
+                            .settings
+                            .capture_cache_root
+                            .split(';')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        if cache_rows.is_empty() {
+                            ui.weak("No dedicated cache root set — each output folder gets its own .sa-cache subfolder.");
+                        }
+                        let mut rows_changed = false;
+                        let mut remove_row: Option<usize> = None;
+                        for (i, row) in cache_rows.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.weak(format!("{}.", i + 1));
+                                if ui.add(egui::TextEdit::singleline(row).desired_width(400.0)).changed()
+                                {
+                                    rows_changed = true;
+                                }
+                                if ui
+                                    .small_button("🗑")
+                                    .on_hover_text("Remove this cache location.")
+                                    .clicked()
+                                {
+                                    remove_row = Some(i);
+                                }
+                            });
+                        }
+                        if let Some(i) = remove_row {
+                            cache_rows.remove(i);
+                            rows_changed = true;
+                        }
+                        if rows_changed {
+                            self.settings.capture_cache_root = cache_rows.join("; ");
+                        }
                         if ui
-                            .button("Browse…")
+                            .button("➕ Add folder…")
                             .on_hover_text(
-                                "Pick a folder — appended to the list (one location per \
-                                 drive, ';'-separated).",
+                                "Pick a folder and add it as a new cache location — appended \
+                                 to the list above, not a replacement for it.",
                             )
                             .clicked()
                         {
-                            let first = self
-                                .settings
-                                .capture_cache_root
-                                .split(';')
-                                .next()
-                                .unwrap_or("")
-                                .trim()
-                                .to_string();
+                            let first = cache_rows.first().cloned().unwrap_or_default();
                             self.pending_browse = Some(spawn_browse_folder(&first, |app, p| {
-                                let s = &mut app.settings.capture_cache_root;
-                                if s.trim().is_empty() {
-                                    *s = p;
-                                } else {
-                                    *s = format!("{}; {}", s.trim().trim_end_matches(';'), p);
-                                }
+                                let mut rows: Vec<String> = app
+                                    .settings
+                                    .capture_cache_root
+                                    .split(';')
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty())
+                                    .collect();
+                                rows.push(p);
+                                app.settings.capture_cache_root = rows.join("; ");
                             }));
                         }
                     });
@@ -2406,12 +2439,12 @@ impl StreamArchiverApp {
                         "Central folder(s) for ALL in-progress capture files, one subfolder \
                          per channel — a single subtree per drive that backup tools can \
                          exclude by path (Backblaze has no wildcard rules). Recordings can \
-                         span drives: list one location per drive, separated by ';'. Each \
-                         only applies to output folders on ITS drive (finalizing must stay \
-                         a same-volume rename); drives without one keep a per-folder \
-                         .sa-cache. Empty = a .sa-cache subfolder inside each output \
-                         folder. Existing files are found either way; takes started before \
-                         a change finish under the old layout.",
+                         span drives: one location per drive. Each only applies to output \
+                         folders on ITS drive (finalizing must stay a same-volume rename); \
+                         drives without one keep a per-folder .sa-cache. No locations at all \
+                         = a .sa-cache subfolder inside each output folder. Existing files \
+                         are found either way; takes started before a change finish under \
+                         the old layout.",
                     );
                     ui.end_row();
                     ui.checkbox(&mut self.settings.iomon_sample_log, "I/O sample log");
