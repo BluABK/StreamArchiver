@@ -210,7 +210,12 @@ master checkbox, and per-row choices:
   enable it in the grid. Useful for "archive the list now, activate later".
 
 **Dedup**: channels you already monitor are greyed out ("added") — matched by
-Twitch login / Kick slug / YouTube channel id. YouTube monitors that were
+Twitch login / Kick slug / YouTube channel id. **Hide already added** clears
+them from the list entirely — useful for working through a large
+follow/subscription list a batch at a time across several sessions (each
+newly-added channel fetches its icon/About/posts immediately, so importing
+a few dozen at once instead of all 300+ in one go is gentler on the
+platform) without the already-imported ones cluttering the view each time. YouTube monitors that were
 added by **@handle** URL (where the `UC…` id isn't in the URL) are resolved to
 their channel id in the background (a one-time channel-page scrape per URL,
 cached persistently), so they also match exactly. Only when resolution fails

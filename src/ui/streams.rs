@@ -78,6 +78,10 @@ pub(super) struct ImportDialog {
     pub(super) rows: Vec<ImportRow>,
     pub(super) loaded: bool,
     pub(super) search: String,
+    /// Hide already-added rows from the list — for importing in batches over
+    /// time without re-scrolling past everything already added on a
+    /// previous pass.
+    pub(super) hide_already: bool,
     pub(super) status: String,
     /// Batch quality override for this import ("Overrides for this import"
     /// section). Empty = each monitor gets its per-platform default quality.
@@ -3678,6 +3682,7 @@ impl StreamArchiverApp {
             rows: Vec::new(),
             loaded: false,
             search: String::new(),
+            hide_already: false,
             status: String::new(),
             quality_override: String::new(),
             out_dir_override: String::new(),
@@ -3821,6 +3826,7 @@ impl StreamArchiverApp {
                 let q = dialog.search.to_lowercase();
                 let visible: Vec<usize> = (0..dialog.rows.len())
                     .filter(|&i| import_row_matches(&dialog.rows[i], &q))
+                    .filter(|&i| !dialog.hide_already || !dialog.rows[i].already)
                     .collect();
                 let selectable: Vec<usize> =
                     visible.iter().copied().filter(|&i| !dialog.rows[i].already).collect();
@@ -3857,7 +3863,16 @@ impl StreamArchiverApp {
 
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.horizontal(|ui| {
+                        let already_count = dialog.rows.iter().filter(|r| r.already).count();
                         ui.label(format!("{} channels found.", dialog.rows.len()));
+                        if already_count > 0 {
+                            ui.checkbox(&mut dialog.hide_already, "Hide already added")
+                                .on_hover_text(
+                                    "Importing in batches (to avoid hammering the platform's \
+                                     asset fetches with one huge import)? Hide the channels \
+                                     you've already added on a previous pass.",
+                                );
+                        }
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
