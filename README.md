@@ -1735,6 +1735,16 @@ live, and archived:
   (shared-chat partners first, then `@mentions`). Hover for the host,
   session start, and source; **double-click** the cell for the history.
   Stream/take rows show which collab a **past broadcast** was.
+- **Watch every angle** — while a collab is live, an instance's right-click
+  menu gains **"👥⏵ Play all collab instances (current downloads)"** and
+  **"👥▷ Play all collab instances (live edge)"**, each opening one media-
+  player window per collab angle that's also a locally-tracked Twitch
+  instance (matched by login; partners you don't archive are silently
+  skipped, never duplicated). "Current downloads" reuses whatever's already
+  actively capturing for each angle; "live edge" tunes in fresh without
+  recording, same as **▷ Play new instance**. For just one specific angle
+  instead of all of them, the **"👥 Play collab instance…"** submenu lists
+  each partner with its own Current download / Live edge pair.
 - **History** — every session is stored (who, host, when, how long, source)
   and linked to its broadcast. Right-click a stream row → **🤝 Collab
   history** for the channel's full list; the **Channel Stats** tab has a

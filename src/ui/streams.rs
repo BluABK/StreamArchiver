@@ -709,6 +709,17 @@ impl StreamArchiverApp {
                 active_recordings.entry(r.monitor_id).or_default().push(r);
             }
 
+            // Lowercase Twitch login -> monitor id, for resolving a collab
+            // partner (known only by login) to a locally-tracked monitor.
+            let mut twitch_login_to_mid: HashMap<String, i64> = HashMap::new();
+            for r in &self.rows {
+                if r.monitor.platform() == Platform::Twitch
+                    && let Some(login) = crate::detectors::twitch_login(&r.monitor.url)
+                {
+                    twitch_login_to_mid.insert(login, r.monitor.id);
+                }
+            }
+
             // Per-recording ad-break detail (offsets) for the cut-list tooltips on
             // expanded history rows. Cached (cleared on reload) so we issue the SELECT
             // once per take with ads, not every rebuild; bounded by what's expanded.
@@ -774,6 +785,7 @@ impl StreamArchiverApp {
                 channel_name_colors,
                 groups,
                 active_recordings,
+                twitch_login_to_mid,
                 model,
                 platform_pref,
             });
@@ -829,6 +841,7 @@ impl StreamArchiverApp {
         let channel_name_colors = &cache.channel_name_colors;
         let groups = &cache.groups;
         let active_recordings = &cache.active_recordings;
+        let twitch_login_to_mid = &cache.twitch_login_to_mid;
         let model = &cache.model;
         let ad_breaks = &self.ad_break_cache;
         let meta_logs = &self.meta_change_cache;
@@ -989,7 +1002,7 @@ impl StreamArchiverApp {
                             Vis::Instance { row: ri, depth } => {
                                 Self::instance_row(
                                     &mut tr, &self.rows[ri], depth, groups,
-                                    active_recordings,
+                                    active_recordings, twitch_login_to_mid,
                                     &mut self.fs_probes, &self.settings,
                                     &self.scheduled_recordings, &ptex, now, active_ids,
                                     &finalizing_ids, &active_chat_ids, selected_monitor,
@@ -1394,6 +1407,31 @@ impl StreamArchiverApp {
                     spawn_play_new_instance(row, &player, &self.settings, &self.core.store)
             {
                 self.status = msg;
+            }
+        }
+        if let Some(targets) = acts.play_collab_all_current.take() {
+            let player = self.settings.media_player_path.trim().to_string();
+            if !player.is_empty() {
+                for t in targets {
+                    if let Some(msg) =
+                        spawn_logged(build_player_command(&player, &t), "stream in player")
+                    {
+                        self.status = msg;
+                    }
+                }
+            }
+        }
+        if let Some(mids) = acts.play_collab_all_live_edge.take() {
+            let player = self.settings.media_player_path.trim().to_string();
+            if !player.is_empty() {
+                for mid in mids {
+                    if let Some(row) = self.rows.iter().find(|r| r.monitor.id == mid)
+                        && let Some(msg) =
+                            spawn_play_new_instance(row, &player, &self.settings, &self.core.store)
+                    {
+                        self.status = msg;
+                    }
+                }
             }
         }
         if let Some(t) = copy_text {
@@ -2100,6 +2138,53 @@ impl StreamArchiverApp {
         }
     }
 
+    /// Best target to open in the media player for a monitor: prefer an
+    /// active take's live capture the configured player can actually play
+    /// (a dual-capture monitor falls through to the DASH companion under
+    /// non-mpv players), falling back to the most recent finished
+    /// recording's output file. `groups` only has data for expanded
+    /// monitors — `active_recordings` (the cheap global "currently
+    /// recording" list) covers a collapsed row's live capture too. Shared
+    /// between the row's own target and each resolved collab partner's.
+    fn resolve_stream_target(
+        mid: i64,
+        groups: &HashMap<i64, Vec<StreamGroup>>,
+        active_recordings: &HashMap<i64, Vec<crate::models::Recording>>,
+        fs: &mut FsProbes,
+        media_player: &str,
+    ) -> Option<StreamTarget> {
+        let group_takes = groups.get(&mid);
+        let active: Vec<StreamTarget> = match group_takes {
+            Some(gs) => gs
+                .iter()
+                .flat_map(|g| g.takes.iter())
+                .filter(|t| t.is_active())
+                .filter_map(|t| fs.target(&t.output_path))
+                .collect(),
+            None => active_recordings
+                .get(&mid)
+                .into_iter()
+                .flatten()
+                .filter_map(|t| fs.target(&t.output_path))
+                .collect(),
+        };
+        if let Some(t) = active
+            .iter()
+            .find(|t| playable_with(t, media_player))
+            .or_else(|| active.first())
+        {
+            return Some(t.clone());
+        }
+        // Most recent finished take (only known once the row's been
+        // expanded at least once — `groups` isn't populated otherwise).
+        group_takes
+            .into_iter()
+            .flatten()
+            .flat_map(|g| g.takes.iter())
+            .find(|t| !t.output_path.is_empty() && fs.is_file(std::path::Path::new(&t.output_path)))
+            .map(|t| StreamTarget::Finished(std::path::PathBuf::from(&t.output_path)))
+    }
+
     /// Render one capture-instance row (the cells live in
     /// `render_instance_row`), computing the per-row probe/target context
     /// first. Self-mutating picks land in `out`.
@@ -2110,6 +2195,7 @@ impl StreamArchiverApp {
         depth: usize,
         groups: &HashMap<i64, Vec<StreamGroup>>,
         active_recordings: &HashMap<i64, Vec<crate::models::Recording>>,
+        login_to_mid: &HashMap<String, i64>,
         fs_probes: &mut FsProbes,
         settings: &SettingsForm,
         scheduled_recordings: &[ScheduledRecordingWithNames],
@@ -2161,57 +2247,41 @@ impl StreamArchiverApp {
             })
             .unwrap_or(0);
         let media_player = settings.media_player_path.trim().to_string();
-        // Best target to open in the media player for this monitor:
-        // prefer an active take's live capture the configured player
-        // can actually play (a dual-capture monitor falls through to
-        // the DASH companion under non-mpv players); fall back to the
-        // most recent finished recording's output file.
-        // Probes go through the TTL cache (`fs_probes`) —
-        // this runs per row per frame.
-        let inst_stream_target: Option<StreamTarget> = {
-            let fs = &mut *fs_probes;
-            // Active takes first: prefer a target the configured player can
-            // play (dual capture falls through to the DASH companion under
-            // non-mpv players); with nothing playable, keep an unplayable
-            // one so the button can explain itself. `groups` only has data
-            // for expanded monitors — fall back to the cheap global
-            // `active_recordings` list so a collapsed row's live capture is
-            // still findable (it's not gated on expansion).
-            let group_takes = groups.get(&mid);
-            let active: Vec<StreamTarget> = match group_takes {
-                Some(gs) => gs
+        // Best target to open in the media player for this monitor: prefer
+        // an active take's live capture the configured player can actually
+        // play (a dual-capture monitor falls through to the DASH companion
+        // under non-mpv players); fall back to the most recent finished
+        // recording's output file. Probes go through the TTL cache
+        // (`fs_probes`) — this runs per row per frame.
+        let inst_stream_target: Option<StreamTarget> =
+            Self::resolve_stream_target(mid, groups, active_recordings, fs_probes, &media_player);
+        // Collab partners resolved to a locally-tracked monitor (by Twitch
+        // login), each with its own "current download" target — feeds the
+        // "Play all collab instances" / "Play collab instance…" menu. Only
+        // computed when this row actually has a live collab (rare), so the
+        // per-partner resolve_stream_target calls don't run on every row.
+        let collab_plays: Vec<(crate::models::CollabPartner, Option<StreamTarget>, Option<i64>)> =
+            match row.live_collab.as_ref() {
+                Some(c) => c
+                    .partners
                     .iter()
-                    .flat_map(|g| g.takes.iter())
-                    .filter(|t| t.is_active())
-                    .filter_map(|t| fs.target(&t.output_path))
-                    .collect(),
-                None => active_recordings
-                    .get(&mid)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|t| fs.target(&t.output_path))
-                    .collect(),
-            };
-            if let Some(t) = active
-                .iter()
-                .find(|t| playable_with(t, &media_player))
-                .or_else(|| active.first())
-            {
-                Some(t.clone())
-            } else {
-                // Most recent finished take (only known once the row's been
-                // expanded at least once — `groups` isn't populated otherwise).
-                group_takes
-                    .into_iter()
-                    .flatten()
-                    .flat_map(|g| g.takes.iter())
-                    .find(|t| {
-                        !t.output_path.is_empty()
-                            && fs.is_file(std::path::Path::new(&t.output_path))
+                    .map(|p| {
+                        let pmid =
+                            login_to_mid.get(&p.login).copied().filter(|&pmid| pmid != mid);
+                        let target = pmid.and_then(|pmid| {
+                            Self::resolve_stream_target(
+                                pmid,
+                                groups,
+                                active_recordings,
+                                fs_probes,
+                                &media_player,
+                            )
+                        });
+                        (p.clone(), target, pmid)
                     })
-                    .map(|t| StreamTarget::Finished(std::path::PathBuf::from(&t.output_path)))
-            }
-        };
+                    .collect(),
+                None => Vec::new(),
+            };
         let output_dir_ok = fs_probes
             .is_dir(std::path::Path::new(&row.monitor.output_dir));
         // The most recently started take for this instance (any
@@ -2254,6 +2324,7 @@ impl StreamArchiverApp {
             scheduled_recordings,
             stop_hold_desc,
             spark.get(&mid),
+            &collab_plays,
             col_order, &mut out.acts,
         ) {
             out.toggle_instance = Some(mid);

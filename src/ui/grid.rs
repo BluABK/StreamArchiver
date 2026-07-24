@@ -799,6 +799,11 @@ pub(super) struct StreamsViewCache {
     /// so a live capture's "Stream in player"/"Backfill head" stay usable on
     /// a collapsed instance row instead of reading as "nothing to play".
     pub(super) active_recordings: HashMap<i64, Vec<crate::models::Recording>>,
+    /// Lowercase Twitch login → monitor id, one entry per locally-tracked
+    /// Twitch instance — lets a collab partner (known only by login) be
+    /// resolved to a local monitor for "Play collab instance"/"Play all
+    /// collab instances" without an O(partners × rows) scan per row.
+    pub(super) twitch_login_to_mid: HashMap<String, i64>,
     pub(super) model: Vec<Vec<Cell>>,
     /// Snapshot of the preferred-platform-when-multiple-live config, loaded
     /// once per rebuild rather than per channel row per frame.
@@ -1814,6 +1819,14 @@ pub(super) struct RowActions {
     pub(super) play_new_instance: Option<i64>,
     /// Recording id to manually (re)trigger head backfill for (set by "Backfill head").
     pub(super) backfill_head: Option<i64>,
+    /// Targets to open in the player — this instance plus every collab
+    /// partner that resolves to a locally-tracked monitor with a currently-
+    /// downloading capture (set by "Play all collab instances (current downloads)").
+    pub(super) play_collab_all_current: Option<Vec<StreamTarget>>,
+    /// Monitor ids to open live-edge previews for — this instance plus every
+    /// collab partner that resolves to a locally-tracked monitor (set by
+    /// "Play all collab instances (live edge)").
+    pub(super) play_collab_all_live_edge: Option<Vec<i64>>,
 }
 
 /// Render one capture-instance (monitor) row across all columns, with the Name
@@ -1854,6 +1867,11 @@ pub(super) fn render_instance_row(
     // This monitor's recent viewer samples (last hour) for the 👁 sparkline;
     // `None` = no samples cached (offline or history disabled).
     spark: Option<&Vec<(i64, i64)>>,
+    // Per collab partner (only non-empty when `row.live_collab` is set): the
+    // partner, its resolved "current download" target (if it's a locally-
+    // tracked monitor with something actively downloading), and its resolved
+    // monitor id (if locally tracked at all, for the live-edge action).
+    collab_plays: &[(crate::models::CollabPartner, Option<StreamTarget>, Option<i64>)],
     order: &[usize],
     a: &mut RowActions,
 ) -> bool {
@@ -1925,6 +1943,102 @@ pub(super) fn render_instance_row(
         {
             a.play_new_instance = Some(m.id);
             ui.close();
+        }
+        if row.live_collab.is_some() {
+            // "All angles": this instance plus every collab partner that
+            // resolves to a locally-tracked monitor — one player window per
+            // angle. Partners that aren't locally tracked (most collabs,
+            // realistically) are silently skipped rather than blocking the
+            // whole action.
+            let all_current: Vec<StreamTarget> = stream_target
+                .cloned()
+                .into_iter()
+                .chain(collab_plays.iter().filter_map(|(_, t, _)| t.clone()))
+                // Same playability gate as the single-target "Stream in
+                // player" button — an unplayable SplitAv target (SABR mid-
+                // download under a non-mpv player) would otherwise still get
+                // handed a built mpv-flavored command.
+                .filter(|t| playable_with(t, media_player))
+                .collect();
+            let all_live_edge: Vec<i64> = std::iter::once(m.id)
+                .chain(collab_plays.iter().filter_map(|(_, _, mid)| *mid))
+                .collect();
+            if ui
+                .add_enabled(
+                    !media_player.is_empty() && !all_current.is_empty(),
+                    egui::Button::new("👥⏵  Play all collab instances (current downloads)"),
+                )
+                .on_hover_text(
+                    "Open every collab angle's currently-downloading capture in the \
+                     media player at once — one window per angle that has one, \
+                     including this instance.",
+                )
+                .on_disabled_hover_text(if media_player.is_empty() {
+                    "Set a media player in Settings → Defaults first"
+                } else {
+                    "No playable capture found for this instance or any collab partner"
+                })
+                .clicked()
+            {
+                a.play_collab_all_current = Some(all_current);
+                ui.close();
+            }
+            if ui
+                .add_enabled(
+                    !media_player.is_empty(),
+                    egui::Button::new("👥▷  Play all collab instances (live edge)"),
+                )
+                .on_hover_text(
+                    "Tune into every collab angle at the live edge in the media player \
+                     at once (does not record) — one window per angle that's a \
+                     locally-tracked channel, including this instance.",
+                )
+                .on_disabled_hover_text("Set a media player in Settings → Defaults first")
+                .clicked()
+            {
+                a.play_collab_all_live_edge = Some(all_live_edge);
+                ui.close();
+            }
+            if !collab_plays.is_empty() {
+                ui.menu_button("👥  Play collab instance…", |ui| {
+                    ui.set_min_width(170.0);
+                    for (partner, target, pmid) in collab_plays {
+                        let playable = target
+                            .as_ref()
+                            .map(|t| playable_with(t, media_player))
+                            .unwrap_or(false);
+                        ui.menu_button(partner.name.clone(), |ui| {
+                            if ui
+                                .add_enabled(
+                                    !media_player.is_empty() && playable,
+                                    egui::Button::new("⏵  Current download"),
+                                )
+                                .on_disabled_hover_text(if target.is_some() {
+                                    "In-progress SABR capture needs mpv (separate audio/video files)"
+                                } else {
+                                    "Not a locally-tracked channel, or nothing is \
+                                     currently downloading for it"
+                                })
+                                .clicked()
+                            {
+                                a.stream_in_player = target.clone();
+                                ui.close();
+                            }
+                            if ui
+                                .add_enabled(
+                                    !media_player.is_empty() && pmid.is_some(),
+                                    egui::Button::new("▷  Live edge"),
+                                )
+                                .on_disabled_hover_text("Not a locally-tracked channel")
+                                .clicked()
+                            {
+                                a.play_new_instance = *pmid;
+                                ui.close();
+                            }
+                        });
+                    }
+                });
+            }
         }
         if ui.button("📋  Copy URL").clicked() {
             ui.ctx().copy_text(row.monitor.url.clone());
