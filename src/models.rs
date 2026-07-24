@@ -961,6 +961,12 @@ pub struct MonitorWithChannel {
     pub last_recording_started: Option<i64>,
     pub last_recording_ended: Option<i64>,
     pub last_recording_status: Option<String>,
+    /// Whether the latest recording's `failed`/`aborted`/`orphaned` status has
+    /// been acknowledged (see [`Recording::err_ack`]) — `false` (default) for
+    /// a monitor with no recordings, or a non-error status where the flag is
+    /// irrelevant. Gates the instance/channel-row ⚠ rollup: an acked take's
+    /// status stays whatever it is, but stops bubbling up here.
+    pub last_recording_err_ack: bool,
     /// Platform-reported (or approximated) go-live time of the latest recording.
     pub last_recording_went_live: Option<i64>,
     pub last_recording_went_live_approx: bool,
@@ -2559,6 +2565,14 @@ pub struct Recording {
     /// stop-on-unmatch watcher (and its re-attach-after-restart path) reads.
     /// `trigger_info` is the human-readable sibling of this column.
     pub trigger_rule_json: String,
+    /// User acknowledged this take's `failed`/`aborted`/`orphaned` status —
+    /// stops it bubbling its ⚠ up to the instance/channel row rollup (which
+    /// otherwise shows the take's status forever, even once superseded by
+    /// many later successful takes) and drops it out of the Issues panel's
+    /// error list. The take/stream row itself keeps showing ⚠ regardless —
+    /// tinted muted instead of red — so the failure history stays visible
+    /// at its own row (see `state_icon`/`fail_hover` call sites).
+    pub err_ack: bool,
 }
 
 /// A take awaiting a head-backfill decision — the Background view's "Planned"
@@ -3068,6 +3082,7 @@ mod tests {
             head_backfill_state: String::new(),
             gap_splice_state: String::new(),
             trigger_rule_json: String::new(),
+            err_ack: false,
         }
     }
 

@@ -210,6 +210,17 @@ impl Store {
         Ok(())
     }
 
+    /// Set/clear a failed/aborted/orphaned take's acknowledged flag — see
+    /// [`crate::models::Recording::err_ack`].
+    pub fn set_recording_err_ack(&self, id: i64, ack: bool) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE recording SET err_ack=?2 WHERE id=?1",
+            params![id, ack as i64],
+        )?;
+        Ok(())
+    }
+
     /// How many recording rows share `id`'s `take_group` (including itself)
     /// — `1` for a solo take or one with no take_group at all. Gap-splice's
     /// split-part exclusion: a take stitched from more than one leg
@@ -597,7 +608,7 @@ impl Store {
                 m.automation_enabled, c.automation_enabled,
                 m.last_title, m.last_game, m.last_thumbnail_url, m.last_viewers,
                 m.last_live_since, m.last_live_since_approx, m.last_collab,
-                m.capture_offline, m.last_tags, m.last_language
+                m.capture_offline, m.last_tags, m.last_language, r.err_ack
              FROM monitor m
              JOIN channel c ON c.id = m.channel_id
              LEFT JOIN recording r
@@ -678,6 +689,8 @@ impl Store {
                     capture_offline: r.get::<_, i64>(60)? != 0,
                     last_tags: r.get(61)?,
                     last_language: r.get(62)?,
+                    // NULL when the monitor has no recordings yet (the LEFT JOIN).
+                    last_recording_err_ack: r.get::<_, Option<i64>>(63)?.unwrap_or(0) != 0,
                     // Filled by the UI from next_scheduled_streams(), not this query.
                     next_stream_at: None,
                     next_stream_title: String::new(),
@@ -710,7 +723,7 @@ impl Store {
                     vod_dl_state, vod_dl_path, vod_dl_video_id,
                     backfill_path, full_path, COALESCE(trigger_info, ''),
                     head_backfill_state, COALESCE(trigger_rule_json, ''), vod_views,
-                    gap_splice_state
+                    gap_splice_state, err_ack
              FROM recording WHERE monitor_id = ?1 ORDER BY started_at, id",
         )?;
         let rows = stmt
@@ -751,6 +764,7 @@ impl Store {
                     trigger_rule_json: r.get(32)?,
                     vod_views: r.get(33)?,
                     gap_splice_state: r.get(34)?,
+                    err_ack: r.get::<_, i64>(35)? != 0,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -778,7 +792,7 @@ impl Store {
             vod_dl_state, vod_dl_path, vod_dl_video_id,
             backfill_path, full_path, COALESCE(trigger_info, ''),
             head_backfill_state, COALESCE(trigger_rule_json, ''), vod_views,
-            gap_splice_state";
+            gap_splice_state, err_ack";
 
     fn map_recording_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::models::Recording> {
         Ok(crate::models::Recording {
@@ -817,6 +831,7 @@ impl Store {
             trigger_rule_json: r.get(32)?,
             vod_views: r.get(33)?,
             gap_splice_state: r.get(34)?,
+            err_ack: r.get::<_, i64>(35)? != 0,
         })
     }
 
@@ -957,6 +972,7 @@ impl Store {
                     trigger_info: String::new(),
                     head_backfill_state: String::new(),
                     gap_splice_state: String::new(),
+                    err_ack: false,
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1020,6 +1036,7 @@ impl Store {
                     trigger_info: String::new(),
                     head_backfill_state: String::new(),
                     gap_splice_state: String::new(),
+                    err_ack: false,
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1106,6 +1123,7 @@ impl Store {
                     trigger_info: String::new(),
                     head_backfill_state: String::new(),
                     gap_splice_state: String::new(),
+                    err_ack: false,
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1137,6 +1155,7 @@ impl Store {
                     take_group, COALESCE(log_excerpt, ''), exit_code
              FROM recording
              WHERE status IN ('failed', 'aborted', 'orphaned')
+               AND err_ack = 0
                AND NOT (output_path LIKE '%.ts'
                         AND (output_path LIKE '%.cache%' OR output_path LIKE '%.sa-cache%'))
                AND NOT (status = 'orphaned'
@@ -1184,6 +1203,7 @@ impl Store {
                     trigger_info: String::new(),
                     head_backfill_state: String::new(),
                     gap_splice_state: String::new(),
+                    err_ack: false,
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1243,6 +1263,7 @@ impl Store {
                     trigger_info: String::new(),
                     head_backfill_state: String::new(),
                     gap_splice_state: String::new(),
+                    err_ack: false,
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1440,6 +1461,7 @@ impl Store {
                     trigger_info: String::new(),
                     head_backfill_state: String::new(),
                     gap_splice_state: String::new(),
+                    err_ack: false,
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1489,6 +1511,39 @@ impl Store {
 mod tests {
     use super::*;
     use crate::store::test_util::*;
+
+    #[test]
+    fn err_ack_excludes_from_issues_but_survives_in_db() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        let failed = store
+            .insert_recording(mid, 1_000, "C:/rec/dead.mkv", Some(1_000), false, None, None, "", "")
+            .unwrap();
+        store
+            .finish_recording(failed, 2_000, 0, Some(1), "failed", "C:/rec/dead.mkv", "boom")
+            .unwrap();
+        assert_eq!(store.recordings_with_errors().unwrap().len(), 1);
+
+        // Acking pulls it out of the Issues list...
+        store.set_recording_err_ack(failed, true).unwrap();
+        assert!(store.recordings_with_errors().unwrap().is_empty());
+        // ...and the instance/channel rollup, but the row (and its ack flag)
+        // still exists for the take's own row to show.
+        let rows = store.list_monitors_with_channels().unwrap();
+        let row = rows.iter().find(|r| r.monitor.id == mid).unwrap();
+        assert_eq!(row.last_recording_status.as_deref(), Some("failed"));
+        assert!(row.last_recording_err_ack);
+
+        // Un-acking restores both.
+        store.set_recording_err_ack(failed, false).unwrap();
+        assert_eq!(store.recordings_with_errors().unwrap().len(), 1);
+        let rows = store.list_monitors_with_channels().unwrap();
+        assert!(!rows.iter().find(|r| r.monitor.id == mid).unwrap().last_recording_err_ack);
+    }
 
     #[test]
     fn stuck_in_cache_detection_and_sweep_protection() {

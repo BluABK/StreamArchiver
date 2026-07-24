@@ -1243,6 +1243,18 @@ pub(super) fn state_icon(state: &str) -> (&'static str, egui::Color32) {
     }
 }
 
+/// [`state_icon`], but an acknowledged `failed` status (see
+/// `Recording::err_ack`) keeps its ⚠ glyph — so the failure stays visible at
+/// its own row/rollup — rendered muted gray instead of red, rather than the
+/// normal alarming red. Everything else is unchanged.
+pub(super) fn state_icon_ack(state: &str, err_ack: bool) -> (&'static str, egui::Color32) {
+    if err_ack && state == "failed" {
+        ("⚠", egui::Color32::from_gray(0x70))
+    } else {
+        state_icon(state)
+    }
+}
+
 /// Trigger-word / VOD-state / live-DVR-backfill status badges for the
 /// Streams-tree "state" cell. Shared by the Stream row (rolled up across all
 /// its takes — the only place these are visible for the common single-take
@@ -1625,7 +1637,9 @@ pub(super) fn channel_cells(
                 (3.0, "recording")
             } else if live_count > 0 {
                 (2.0, "live")
-            } else if primary.last_recording_status.as_deref() == Some("failed") {
+            } else if primary.last_recording_status.as_deref() == Some("failed")
+                && !primary.last_recording_err_ack
+            {
                 (1.0, "failed")
             } else {
                 (0.0, "")
@@ -2161,13 +2175,18 @@ pub(super) fn render_instance_row(
                         return;
                     }
                     let shown_state = if finalizing { "finalizing" } else { &m.last_state };
-                    let (icon, color) = state_icon(shown_state);
+                    let (icon, color) = state_icon_ack(shown_state, row.last_recording_err_ack);
                     let resp = ui.colored_label(color, icon);
                     let is_failed = !finalizing
                         && (m.last_state == "failed"
                             || row.last_recording_status.as_deref() == Some("failed"));
                     if finalizing {
                         resp.on_hover_text(FINALIZING_HOVER);
+                    } else if is_failed && row.last_recording_err_ack {
+                        resp.on_hover_text(format!(
+                            "Acknowledged — {}",
+                            fail_hover(&row.last_recording_log)
+                        ));
                     } else if is_failed {
                         resp.on_hover_text(fail_hover(&row.last_recording_log));
                     } else if recording && row.capture_offline {
@@ -2372,6 +2391,7 @@ mod tests {
             last_recording_started,
             last_recording_ended: None,
             last_recording_status: last_recording_status.map(str::to_string),
+            last_recording_err_ack: false,
             last_recording_went_live: last_recording_started,
             last_recording_went_live_approx: false,
             last_recording_lost_secs: None,
@@ -2596,6 +2616,24 @@ mod tests {
         assert!(recording_p > live_p, "recording must outrank live");
         assert!(live_p > failed_p, "live must outrank failed");
         assert!(failed_p > offline_p, "failed must outrank offline");
+    }
+
+    #[test]
+    fn state_icon_ack_mutes_only_acknowledged_failed() {
+        // Acked failed keeps the ⚠ glyph but loses the alarming red — same
+        // glyph as unacked, different color, so it's still recognizable as
+        // "there was a problem" without demanding attention.
+        let (unacked_icon, unacked_color) = state_icon_ack("failed", false);
+        let (acked_icon, acked_color) = state_icon_ack("failed", true);
+        assert_eq!(unacked_icon, acked_icon);
+        assert_ne!(unacked_color, acked_color);
+        assert_eq!(unacked_color, state_icon("failed").1, "unacked must match state_icon exactly");
+        // err_ack only means something for "failed" — every other state is
+        // completely unaffected regardless of the flag.
+        for state in ["recording", "live", "completed", "ended", "aborted", "idle"] {
+            assert_eq!(state_icon_ack(state, true), state_icon(state));
+            assert_eq!(state_icon_ack(state, false), state_icon(state));
+        }
     }
 
     // ----- multi-level table sort (ordered_rows) -----

@@ -103,6 +103,13 @@ enum Act {
     DeleteError(usize),
     ClearError(usize),
     ClearMissingError(usize),
+    /// Acknowledge a failed/aborted/orphaned take (index into `issues_errors`)
+    /// — non-destructive alternative to Clear: drops out of this list and
+    /// stops bubbling its ⚠ up to the instance/channel row, but the DB row
+    /// (and the take-row's own muted ⚠) survives. See `Recording::err_ack`.
+    AckError(usize),
+    /// Same, for the file-gone list (`issues_errors_no_file`).
+    AckMissingError(usize),
     ClearEmpties,
     ClearAllMissing,
     ClearAllErrors,
@@ -2080,6 +2087,16 @@ impl StreamArchiverApp {
                             ).on_hover_text(&details);
                         }
                         "actions" => {
+                            if ui.button("✓ Ack")
+                                .on_hover_text(
+                                    "Acknowledge: stop this take's ⚠ bubbling up to the \
+                                     instance/channel row (it stays visible, muted, on the \
+                                     take's own row) without deleting anything.",
+                                )
+                                .clicked()
+                            {
+                                *act = Some(Act::AckMissingError(j2));
+                            }
                             if ui.button("✕ Clear")
                                 .on_hover_text("Permanently remove this failed recording from the database.")
                                 .clicked()
@@ -2208,6 +2225,16 @@ impl StreamArchiverApp {
                                 {
                                     *act = Some(Act::DeleteError(k));
                                 }
+                            }
+                            if ui.button("✓ Ack")
+                                .on_hover_text(
+                                    "Acknowledge: stop this take's ⚠ bubbling up to the \
+                                     instance/channel row (it stays visible, muted, on the \
+                                     take's own row) without deleting anything.",
+                                )
+                                .clicked()
+                            {
+                                *act = Some(Act::AckError(k));
                             }
                             // Remove DB record entirely.
                             if ui.button("✕ Clear")
@@ -2450,6 +2477,18 @@ impl StreamArchiverApp {
                 let _ = self.core.store.delete_recording(rec.id);
                 self.issues_errors.retain(|r| r.id != rec.id);
             }
+        }
+        if let Some(Act::AckError(k)) = act
+            && let Some(rec) = self.issues_errors.get(k).cloned()
+        {
+            let _ = self.core.store.set_recording_err_ack(rec.id, true);
+            self.issues_errors.retain(|r| r.id != rec.id);
+        }
+        if let Some(Act::AckMissingError(j2)) = act
+            && let Some(rec) = self.issues_errors_no_file.get(j2).cloned()
+        {
+            let _ = self.core.store.set_recording_err_ack(rec.id, true);
+            self.issues_errors_no_file.retain(|r| r.id != rec.id);
         }
         if let Some(Act::ClearAllErrors) = act {
             let all: Vec<_> = self.issues_errors.drain(..).collect();

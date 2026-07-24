@@ -511,6 +511,7 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
         last_recording_started: None,
         last_recording_ended: None,
         last_recording_status: None,
+        last_recording_err_ack: false,
         last_recording_went_live: None,
         last_recording_went_live_approx: false,
         last_recording_lost_secs: None,

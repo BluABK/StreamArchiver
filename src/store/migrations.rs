@@ -1327,7 +1327,21 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 66)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 66);
+        if version < 67 {
+            // Acknowledge a failed/aborted/orphaned take: stops it bubbling
+            // its ⚠ up to the instance/channel row rollup (which otherwise
+            // shows the LATEST take's status forever, even if it was 10
+            // takes ago and every subsequent one succeeded) and drops it out
+            // of the Issues panel's error list — but the take row itself
+            // keeps its ⚠, just tinted muted instead of red, so the failure
+            // history stays visible at its own row. A plain bool, not a
+            // "*_ack" status-suffix (unlike head_backfill_state/
+            // gap_splice_state) since `recording.status` itself drives too
+            // much other logic (is_active(), queries, …) to overload.
+            conn.execute_batch("ALTER TABLE recording ADD COLUMN err_ack INTEGER NOT NULL DEFAULT 0;")?;
+            conn.pragma_update(None, "user_version", 67)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 67);
         Ok(())
     }
 }

@@ -2740,6 +2740,7 @@ mod tests {
             gap_splice_state: String::new(),
             trigger_rule_json: String::new(),
             vod_views: None,
+            err_ack: false,
         }
     }
 

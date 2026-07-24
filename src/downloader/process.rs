@@ -177,6 +177,7 @@ pub(super) fn recording_from_detached(row: &DetachedRow) -> Recording {
         head_backfill_state: String::new(),
         gap_splice_state: String::new(),
         trigger_rule_json: String::new(),
+        err_ack: false,
     }
 }
 

@@ -111,6 +111,9 @@ struct StreamsOut {
     archive_vod_now: Option<i64>,
     backfill_head_now: Option<i64>,
     abort_backfill: Option<i64>,
+    /// (recording id, new err_ack value) — "Acknowledge failure" /
+    /// "Un-acknowledge" on a failed take/stream row.
+    set_err_ack: Option<(i64, bool)>,
     /// (monitor id, recording id) — "View chat" on a stream/take row.
     view_chat_rec: Option<(i64, i64)>,
     // Container-level actions.
@@ -1031,6 +1034,7 @@ impl StreamArchiverApp {
             archive_vod_now,
             backfill_head_now,
             abort_backfill,
+            set_err_ack,
             view_chat_rec,
             toggle_channel_enabled,
             toggle_channel_automation,
@@ -1096,6 +1100,13 @@ impl StreamArchiverApp {
         if let Some(rec_id) = abort_backfill {
             self.core.manual(ManualCommand::AbortHeadBackfill(rec_id));
             self.status = "Aborting backfill…".into();
+        }
+        if let Some((rec_id, ack)) = set_err_ack {
+            if let Err(e) = self.core.store.set_recording_err_ack(rec_id, ack) {
+                self.status = format!("Error: {e}");
+            } else {
+                self.reload_rows();
+            }
         }
         // Next stream double-click: a channel/stream/take row sets the local; an
         // instance row routes through RowActions.
@@ -1778,12 +1789,16 @@ impl StreamArchiverApp {
                                 "live".to_string()
                             };
                             ui.colored_label(color, label).on_hover_text(hover);
-                        } else if let Some(p) = primary {
-                            if p.last_recording_status.as_deref() == Some("failed") {
-                                let (icon, color) = state_icon("failed");
-                                ui.colored_label(color, icon)
-                                    .on_hover_text(fail_hover(&p.last_recording_log));
-                            }
+                        } else if let Some(p) = primary
+                            && p.last_recording_status.as_deref() == Some("failed")
+                        {
+                            let (icon, color) = state_icon_ack("failed", p.last_recording_err_ack);
+                            let hover = if p.last_recording_err_ack {
+                                format!("Acknowledged — {}", fail_hover(&p.last_recording_log))
+                            } else {
+                                fail_hover(&p.last_recording_log)
+                            };
+                            ui.colored_label(color, icon).on_hover_text(hover);
                         }
                         // Bubble the instances' live badges up while
                         // they're active — a collapsed channel otherwise
@@ -2392,8 +2407,9 @@ impl StreamArchiverApp {
                     "state" => {
                         let finalizing = g.status() == "recording"
                             && g.takes.iter().any(|t| finalizing_recs.contains(&t.id));
+                        let last_err_ack = g.takes.last().is_some_and(|t| t.err_ack);
                         let shown = if finalizing { "finalizing" } else { g.status() };
-                        let (icon, color) = state_icon(shown);
+                        let (icon, color) = state_icon_ack(shown, last_err_ack);
                         let resp = ui.colored_label(color, icon);
                         if finalizing {
                             resp.on_hover_text(FINALIZING_HOVER);
@@ -2403,7 +2419,12 @@ impl StreamArchiverApp {
                                 .last()
                                 .map(|t| t.log_excerpt.as_str())
                                 .unwrap_or("");
-                            resp.on_hover_text(fail_hover(log));
+                            let msg = if last_err_ack {
+                                format!("Acknowledged — {}", fail_hover(log))
+                            } else {
+                                fail_hover(log)
+                            };
+                            resp.on_hover_text(msg);
                         } else {
                             resp.on_hover_text(g.status());
                         }
@@ -2563,6 +2584,35 @@ impl StreamArchiverApp {
                 ui.set_min_width(180.0);
                 if recording {
                     stop_recording_submenus(ui, mid, &mut out.acts);
+                    ui.separator();
+                }
+                if g.status() == "failed"
+                    && let Some(last) = g.takes.last()
+                {
+                    if last.err_ack {
+                        if ui
+                            .button("↺  Un-acknowledge failure")
+                            .on_hover_text(
+                                "Restore this stream's ⚠ as a normal (red) unacknowledged \
+                                 failure — it'll bubble back up to the instance/channel row.",
+                            )
+                            .clicked()
+                        {
+                            out.set_err_ack = Some((last.id, false));
+                            ui.close();
+                        }
+                    } else if ui
+                        .button("✓  Acknowledge failure")
+                        .on_hover_text(
+                            "Mark this failed stream as handled: its ⚠ stops bubbling up to \
+                             the instance/channel row, but stays visible here (muted) so \
+                             the failure history isn't hidden.",
+                        )
+                        .clicked()
+                    {
+                        out.set_err_ack = Some((last.id, true));
+                        ui.close();
+                    }
                     ui.separator();
                 }
                 let dir_ok =
@@ -2959,7 +3009,7 @@ impl StreamArchiverApp {
                         let finalizing =
                             t.status == "recording" && finalizing_recs.contains(&t.id);
                         let shown = if finalizing { "finalizing" } else { t.status.as_str() };
-                        let (icon, color) = state_icon(shown);
+                        let (icon, color) = state_icon_ack(shown, t.err_ack);
                         let resp = ui.colored_label(color, icon);
                         if finalizing {
                             resp.on_hover_text(FINALIZING_HOVER);
@@ -2967,6 +3017,9 @@ impl StreamArchiverApp {
                             let mut msg = fail_hover(&t.log_excerpt);
                             if let Some(code) = t.exit_code {
                                 msg = format!("{msg}\n(exit code {code})");
+                            }
+                            if t.err_ack {
+                                msg = format!("Acknowledged — {msg}");
                             }
                             resp.on_hover_text(msg);
                         } else if t.status == "ended" {
@@ -3094,6 +3147,33 @@ impl StreamArchiverApp {
                 ui.set_min_width(180.0);
                 if recording {
                     stop_recording_submenus(ui, mid, &mut out.acts);
+                    ui.separator();
+                }
+                if t.status == "failed" {
+                    if t.err_ack {
+                        if ui
+                            .button("↺  Un-acknowledge failure")
+                            .on_hover_text(
+                                "Restore this take's ⚠ as a normal (red) unacknowledged \
+                                 failure — it'll bubble back up to the instance/channel row.",
+                            )
+                            .clicked()
+                        {
+                            out.set_err_ack = Some((t.id, false));
+                            ui.close();
+                        }
+                    } else if ui
+                        .button("✓  Acknowledge failure")
+                        .on_hover_text(
+                            "Mark this failed take as handled: its ⚠ stops bubbling up to \
+                             the instance/channel row, but stays visible here (muted) so \
+                             the failure history isn't hidden.",
+                        )
+                        .clicked()
+                    {
+                        out.set_err_ack = Some((t.id, true));
+                        ui.close();
+                    }
                     ui.separator();
                 }
                 // Offer re-remux when the finalized file is still a .ts
