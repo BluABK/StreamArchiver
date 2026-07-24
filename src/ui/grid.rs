@@ -794,6 +794,11 @@ pub(super) struct StreamsViewCache {
     pub(super) instance_avatars: HashMap<i64, egui::TextureHandle>,
     pub(super) channel_name_colors: HashMap<i64, (egui::Color32, bool)>,
     pub(super) groups: HashMap<i64, Vec<StreamGroup>>,
+    /// Every currently-`"recording"` take, by monitor id — a cheap global
+    /// query (unlike `groups`, which only holds data for expanded monitors)
+    /// so a live capture's "Stream in player"/"Backfill head" stay usable on
+    /// a collapsed instance row instead of reading as "nothing to play".
+    pub(super) active_recordings: HashMap<i64, Vec<crate::models::Recording>>,
     pub(super) model: Vec<Vec<Cell>>,
     /// Snapshot of the preferred-platform-when-multiple-live config, loaded
     /// once per rebuild rather than per channel row per frame.

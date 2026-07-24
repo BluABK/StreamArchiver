@@ -594,7 +594,8 @@ gains two playback actions, as inline buttons and context-menu entries:
   the growing capture straight out of `.sa-cache\`, so you can watch a recording
   **from the start while it is still being captured**. On the instance and
   stream rows it prefers the active capture and falls back to the most recent
-  finished file.
+  finished file — this works whether or not the instance row is expanded to
+  show its take history.
 - **▷ Play new instance** — tune into the channel **at the live edge**, like
   opening the stream in a browser, without touching the recording (and without
   needing one to be running).

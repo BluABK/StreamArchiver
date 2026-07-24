@@ -701,6 +701,14 @@ impl StreamArchiverApp {
                 })
                 .collect();
 
+            // Cheap global fallback for the active-take lookups above: unlike
+            // `groups`, not gated on expansion, so a collapsed instance row's
+            // live capture is still findable.
+            let mut active_recordings: HashMap<i64, Vec<crate::models::Recording>> = HashMap::new();
+            for r in self.core.store.recordings_marked_recording().unwrap_or_default() {
+                active_recordings.entry(r.monitor_id).or_default().push(r);
+            }
+
             // Per-recording ad-break detail (offsets) for the cut-list tooltips on
             // expanded history rows. Cached (cleared on reload) so we issue the SELECT
             // once per take with ads, not every rebuild; bounded by what's expanded.
@@ -765,6 +773,7 @@ impl StreamArchiverApp {
                 instance_avatars,
                 channel_name_colors,
                 groups,
+                active_recordings,
                 model,
                 platform_pref,
             });
@@ -819,6 +828,7 @@ impl StreamArchiverApp {
         let instance_avatars = &cache.instance_avatars;
         let channel_name_colors = &cache.channel_name_colors;
         let groups = &cache.groups;
+        let active_recordings = &cache.active_recordings;
         let model = &cache.model;
         let ad_breaks = &self.ad_break_cache;
         let meta_logs = &self.meta_change_cache;
@@ -979,6 +989,7 @@ impl StreamArchiverApp {
                             Vis::Instance { row: ri, depth } => {
                                 Self::instance_row(
                                     &mut tr, &self.rows[ri], depth, groups,
+                                    active_recordings,
                                     &mut self.fs_probes, &self.settings,
                                     &self.scheduled_recordings, &ptex, now, active_ids,
                                     &finalizing_ids, &active_chat_ids, selected_monitor,
@@ -2098,6 +2109,7 @@ impl StreamArchiverApp {
         row: &MonitorWithChannel,
         depth: usize,
         groups: &HashMap<i64, Vec<StreamGroup>>,
+        active_recordings: &HashMap<i64, Vec<crate::models::Recording>>,
         fs_probes: &mut FsProbes,
         settings: &SettingsForm,
         scheduled_recordings: &[ScheduledRecordingWithNames],
@@ -2158,50 +2170,66 @@ impl StreamArchiverApp {
         // this runs per row per frame.
         let inst_stream_target: Option<StreamTarget> = {
             let fs = &mut *fs_probes;
-            groups.get(&mid).and_then(|gs| {
-                // Active takes first: prefer a target the
-                // configured player can play (dual capture falls
-                // through to the DASH companion under non-mpv
-                // players); with nothing playable, keep an
-                // unplayable one so the button can explain itself.
-                let active: Vec<StreamTarget> = gs
+            // Active takes first: prefer a target the configured player can
+            // play (dual capture falls through to the DASH companion under
+            // non-mpv players); with nothing playable, keep an unplayable
+            // one so the button can explain itself. `groups` only has data
+            // for expanded monitors — fall back to the cheap global
+            // `active_recordings` list so a collapsed row's live capture is
+            // still findable (it's not gated on expansion).
+            let group_takes = groups.get(&mid);
+            let active: Vec<StreamTarget> = match group_takes {
+                Some(gs) => gs
                     .iter()
                     .flat_map(|g| g.takes.iter())
                     .filter(|t| t.is_active())
                     .filter_map(|t| fs.target(&t.output_path))
-                    .collect();
-                if let Some(t) = active
-                    .iter()
-                    .find(|t| playable_with(t, &media_player))
-                    .or_else(|| active.first())
-                {
-                    return Some(t.clone());
-                }
-                // Most recent finished take.
-                for g in gs {
-                    for t in &g.takes {
-                        if !t.output_path.is_empty()
+                    .collect(),
+                None => active_recordings
+                    .get(&mid)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|t| fs.target(&t.output_path))
+                    .collect(),
+            };
+            if let Some(t) = active
+                .iter()
+                .find(|t| playable_with(t, &media_player))
+                .or_else(|| active.first())
+            {
+                Some(t.clone())
+            } else {
+                // Most recent finished take (only known once the row's been
+                // expanded at least once — `groups` isn't populated otherwise).
+                group_takes
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|g| g.takes.iter())
+                    .find(|t| {
+                        !t.output_path.is_empty()
                             && fs.is_file(std::path::Path::new(&t.output_path))
-                        {
-                            return Some(StreamTarget::Finished(
-                                std::path::PathBuf::from(&t.output_path),
-                            ));
-                        }
-                    }
-                }
-                None
-            })
+                    })
+                    .map(|t| StreamTarget::Finished(std::path::PathBuf::from(&t.output_path)))
+            }
         };
         let output_dir_ok = fs_probes
             .is_dir(std::path::Path::new(&row.monitor.output_dir));
         // The most recently started take for this instance (any
         // stream) — the "Backfill head" manual action's target.
-        let inst_latest_rec_id = groups.get(&mid).and_then(|gs| {
-            gs.iter()
-                .flat_map(|g| g.takes.iter())
-                .max_by_key(|t| t.started_at)
-                .map(|t| t.id)
-        });
+        // Same `groups`-empty-when-collapsed fallback as `inst_stream_target`.
+        let inst_latest_rec_id = groups
+            .get(&mid)
+            .and_then(|gs| {
+                gs.iter()
+                    .flat_map(|g| g.takes.iter())
+                    .max_by_key(|t| t.started_at)
+                    .map(|t| t.id)
+            })
+            .or_else(|| {
+                active_recordings
+                    .get(&mid)
+                    .and_then(|v| v.iter().max_by_key(|t| t.started_at).map(|t| t.id))
+            });
         let stop_hold_desc = stop_holds_snapshot.get(&mid).map(|h| {
             let mut s = match h {
                 crate::downloader::StopHold::Until { at, .. } => {
