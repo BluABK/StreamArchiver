@@ -1104,11 +1104,11 @@ impl StreamArchiverApp {
                     egui::Color32::from_rgb(200, 150, 60),
                 ),
                 "youtube_search_exceeded" => (
-                    format!("YouTube search.list daily limit reached ({} / 100 queries). Search-based detection paused until tomorrow.", self.yt_search_today, ),
+                    format!("YouTube search.list daily limit reached ({} / {} queries). Search-based detection paused until tomorrow.", self.yt_search_today, self.yt_search_cutoff),
                     egui::Color32::from_rgb(200, 80, 80),
                 ),
                 "youtube_search_near_cutoff" => (
-                    format!("YouTube search.list queries near limit ({} / 100 today, cutoff at {}).", self.yt_search_today, self.yt_search_cutoff),
+                    format!("YouTube search.list queries near limit ({} / {} today).", self.yt_search_today, self.yt_search_cutoff),
                     egui::Color32::from_rgb(200, 150, 60),
                 ),
                 _ => continue,

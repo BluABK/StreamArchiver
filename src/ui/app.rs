@@ -611,6 +611,9 @@ impl StreamArchiverApp {
             yt_quota_cutoff: 9000,
             yt_search_today: 0,
             yt_search_cutoff: 90,
+            yt_ep_search_today: 0,
+            yt_ep_videos_today: 0,
+            yt_ep_channels_today: 0,
             dismissed_quota_warnings: HashSet::new(),
             pending_schedule: None,
             emote_viewers: Vec::new(),
@@ -723,6 +726,9 @@ impl StreamArchiverApp {
             .flatten()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(90);
+        app.yt_ep_search_today = app.core.store.get_quota_today("youtube_ep_search").unwrap_or(0);
+        app.yt_ep_videos_today = app.core.store.get_quota_today("youtube_ep_videos").unwrap_or(0);
+        app.yt_ep_channels_today = app.core.store.get_quota_today("youtube_ep_channels").unwrap_or(0);
         app
     }
 
@@ -1328,7 +1334,10 @@ impl StreamArchiverApp {
                         .flatten()
                         .and_then(|s| s.trim().parse().ok())
                         .unwrap_or(90);
-                    Ok(SaveRows { rows, channels, next_streams, yt_quota_today, yt_quota_cutoff, yt_search_today, yt_search_cutoff, new_monitor_id })
+                    let yt_ep_search_today = store.get_quota_today("youtube_ep_search").unwrap_or(0);
+                    let yt_ep_videos_today = store.get_quota_today("youtube_ep_videos").unwrap_or(0);
+                    let yt_ep_channels_today = store.get_quota_today("youtube_ep_channels").unwrap_or(0);
+                    Ok(SaveRows { rows, channels, next_streams, yt_quota_today, yt_quota_cutoff, yt_search_today, yt_search_cutoff, yt_ep_search_today, yt_ep_videos_today, yt_ep_channels_today, new_monitor_id })
                 })();
                 debug!(elapsed_ms = t.elapsed().as_millis(), ok = result.is_ok(), "save-monitor done");
                 let _ = tx.send(result);
@@ -1424,7 +1433,10 @@ impl StreamArchiverApp {
                         .flatten()
                         .and_then(|s| s.trim().parse().ok())
                         .unwrap_or(90);
-                    Some(SaveRows { rows, channels, next_streams, yt_quota_today, yt_quota_cutoff, yt_search_today, yt_search_cutoff, new_monitor_id: None })
+                    let yt_ep_search_today = store.get_quota_today("youtube_ep_search").unwrap_or(0);
+                    let yt_ep_videos_today = store.get_quota_today("youtube_ep_videos").unwrap_or(0);
+                    let yt_ep_channels_today = store.get_quota_today("youtube_ep_channels").unwrap_or(0);
+                    Some(SaveRows { rows, channels, next_streams, yt_quota_today, yt_quota_cutoff, yt_search_today, yt_search_cutoff, yt_ep_search_today, yt_ep_videos_today, yt_ep_channels_today, new_monitor_id: None })
                 })();
                 tracing::trace!(
                     elapsed_ms = t.elapsed().as_millis(),
@@ -1514,6 +1526,9 @@ impl StreamArchiverApp {
         self.yt_quota_cutoff = save.yt_quota_cutoff;
         self.yt_search_today = save.yt_search_today;
         self.yt_search_cutoff = save.yt_search_cutoff;
+        self.yt_ep_search_today = save.yt_ep_search_today;
+        self.yt_ep_videos_today = save.yt_ep_videos_today;
+        self.yt_ep_channels_today = save.yt_ep_channels_today;
         // Scroll to the newly-added channel on the next render so it's visible
         // regardless of where it lands in the alphabetically-sorted list.
         if let Some(new_ch) = self.channels.iter().find(|c| !old_channel_ids.contains(&c.id)) {

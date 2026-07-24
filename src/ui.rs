@@ -1418,6 +1418,12 @@ pub struct StreamArchiverApp {
     /// Daily search.list query count and its cutoff (separate from unit quota).
     yt_search_today: i64,
     yt_search_cutoff: i64,
+    /// Per-endpoint unit breakdown of `yt_quota_today` — where the daily spend
+    /// actually goes (search.list is 100u/call, videos.list and channels.list
+    /// are 1u/call), so a spike is traceable instead of just an opaque total.
+    yt_ep_search_today: i64,
+    yt_ep_videos_today: i64,
+    yt_ep_channels_today: i64,
     /// Keys of quota warning issues the user has dismissed this session.
     dismissed_quota_warnings: HashSet<String>,
     /// In-flight schedule calendar reload (background thread). `all_upcoming_schedule`
@@ -1670,6 +1676,9 @@ struct SaveRows {
     yt_quota_cutoff: i64,
     yt_search_today: i64,
     yt_search_cutoff: i64,
+    yt_ep_search_today: i64,
+    yt_ep_videos_today: i64,
+    yt_ep_channels_today: i64,
     /// Id of a newly-INSERTED monitor (a fresh add, not an edit) — the UI fires
     /// an immediate asset/About fetch for it so a new channel isn't blank until
     /// the hourly sweep. `None` for an edit.

@@ -1852,6 +1852,7 @@ impl DetectContext {
         }
         let _ = self.store.record_quota_usage("youtube", 100);
         let _ = self.store.record_quota_usage("youtube_search", 1);
+        let _ = self.store.record_quota_usage("youtube_ep_search", 100);
         let v: Value = resp.json().await.ok()?;
         let ids: Vec<String> = v["items"]
             .as_array()
@@ -1913,6 +1914,7 @@ impl DetectContext {
                 return None;
             }
             let _ = self.store.record_quota_usage("youtube", 1);
+            let _ = self.store.record_quota_usage("youtube_ep_videos", 1);
             let v: Value = resp.json().await.ok()?;
             for item in v["items"].as_array().into_iter().flatten() {
                 if let (Some(id), Some(title)) =
@@ -2957,6 +2959,7 @@ impl DetectContext {
             Ok(r) if r.status().is_success() => {
                 let _ = self.store.record_quota_usage("youtube", 100);
                 let _ = self.store.record_quota_usage("youtube_search", 1);
+                let _ = self.store.record_quota_usage("youtube_ep_search", 100);
                 let v: Value = r.json().await.unwrap_or_default();
                 match v["items"][0]["id"]["videoId"].as_str() {
                     Some(vid) => {
@@ -2993,6 +2996,8 @@ impl DetectContext {
                 .query(&[("part", "id"), ("forHandle", handle.as_str()), ("key", key)])
                 .send()
                 .await?;
+            let _ = self.store.record_quota_usage("youtube", 1);
+            let _ = self.store.record_quota_usage("youtube_ep_channels", 1);
             let v: Value = resp.json().await?;
             if let Some(id) = v["items"][0]["id"].as_str() {
                 return Ok(id.to_string());
@@ -3014,6 +3019,8 @@ impl DetectContext {
             .send()
             .await
             .ok()?;
+        let _ = self.store.record_quota_usage("youtube", 1);
+        let _ = self.store.record_quota_usage("youtube_ep_videos", 1);
         let v: Value = resp.json().await.ok()?;
         let s = v["items"][0]["liveStreamingDetails"]["actualStartTime"].as_str()?;
         parse_rfc3339(s)
@@ -3061,6 +3068,7 @@ impl DetectContext {
                 return None;
             }
             let _ = self.store.record_quota_usage("youtube", 1);
+            let _ = self.store.record_quota_usage("youtube_ep_videos", 1);
             let v: Value = resp.json().await.ok()?;
             for item in v["items"].as_array().into_iter().flatten() {
                 if let (Some(id), Some(ts)) = (

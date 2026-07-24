@@ -1088,9 +1088,10 @@ re-fetched, **🔁 superseded** (green) when a later completed take covers a
 failed one, or **⚠ tool warnings** for warning-only takes. Recovery progress
 updates the N/M counter live, after every recovered range. **App Stats**
 gains a *Capture health* section: lifetime totals (error/warning alerts,
-segments lost, ranges recovered, ✂ muted) plus a per-day trend table — a
-rising "lost" column across days points at a systemic cause (saturated
-disk/uplink, failing enclosure) rather than one bad stream.
+segments lost, ranges recovered, ✂ muted) plus a per-day trend table
+(Errors / Warnings / Lost / Recovered / Muted) — a rising "lost" column
+across days points at a systemic cause (saturated disk/uplink, failing
+enclosure) rather than one bad stream.
 
 **Lost-segment auto-recovery (Twitch).** For Twitch recordings the lost
 content usually still exists: the VOD CDN keeps the broadcast (even for
@@ -2039,6 +2040,15 @@ hits, parse failures, tokens and cost per model) alongside **YouTube Data API**
 quota usage (units and search calls against the daily cutoff), so you can see
 what these features are actually costing you. (Per-channel numbers live in the
 separate **Channel Stats** tab — App Stats is app/system health only.)
+
+Underneath the daily unit total, a **"Units spent by call type today"**
+breakdown splits the day's units across `search.list` (100 units/call —
+live-detection polls and the upcoming-schedule refresh), `videos.list` (1
+unit/call — title/scheduled-start/actual-start lookups), and `channels.list`
+(1 unit/call — resolving an `@handle` URL to its channel id; a monitor added
+via `/channel/UC…` never needs this call). This is the same total shown above
+it, just split out so a sudden jump is traceable to a specific cause instead
+of an opaque number.
 
 **Detection / API requests** (same tab) tracks cumulative poll/detect request
 counts **per platform** (Twitch, YouTube, Kick, NRK, Nebula, Generic) across every
