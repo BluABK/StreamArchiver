@@ -1952,14 +1952,20 @@ impl MonitorDefaults {
             .unwrap_or(true)
     }
 
-    /// Resolve output dir: platform override → global → `fallback`.
-    pub fn resolve_output_dir(&self, platform: Platform, fallback: &str) -> String {
-        self.get(platform)
+    /// Resolve output dir: platform override → global → `fallback`, then
+    /// expand any `{name}`/`{platform}`/`{platform_short}` tokens in
+    /// whichever one won (see [`crate::downloader::expand_dir_template`]) —
+    /// so a template can live in any tier of the override chain, not just
+    /// the outermost default.
+    pub fn resolve_output_dir(&self, platform: Platform, name: &str, fallback: &str) -> String {
+        let raw = self
+            .get(platform)
             .output_dir
             .clone()
             .filter(|s| !s.is_empty())
             .or_else(|| self.global.output_dir.clone().filter(|s| !s.is_empty()))
-            .unwrap_or_else(|| fallback.to_string())
+            .unwrap_or_else(|| fallback.to_string());
+        crate::downloader::expand_dir_template(&raw, name, platform.as_str())
     }
 }
 
@@ -2799,6 +2805,33 @@ mod tests {
         assert!(!row.auto_record_on(), "instance-level Auto-off must gate it");
         row.channel.enabled = false;
         assert!(!row.auto_record_on(), "both off");
+    }
+
+    #[test]
+    fn resolve_output_dir_expands_whichever_tier_wins() {
+        let mut defaults = MonitorDefaults::default();
+        // No override anywhere: expands the passed-in fallback.
+        assert_eq!(
+            defaults.resolve_output_dir(Platform::Twitch, "Zentreya", r"G:\{platform}\{name}"),
+            r"G:\twitch\Zentreya"
+        );
+        // Global override wins over the fallback, and is itself expanded.
+        defaults.global.output_dir = Some(r"D:\{name}".to_string());
+        assert_eq!(
+            defaults.resolve_output_dir(Platform::Twitch, "Zentreya", "unused"),
+            r"D:\Zentreya"
+        );
+        // A per-platform override wins over the global override.
+        defaults.get_mut(Platform::Twitch).output_dir = Some(r"E:\{platform_short}\{name}".to_string());
+        assert_eq!(
+            defaults.resolve_output_dir(Platform::Twitch, "Zentreya", "unused"),
+            r"E:\ttv\Zentreya"
+        );
+        // A different platform still falls through to the global override.
+        assert_eq!(
+            defaults.resolve_output_dir(Platform::YouTube, "DougDoug", "unused"),
+            r"D:\DougDoug"
+        );
     }
 
     #[test]

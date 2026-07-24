@@ -1993,8 +1993,23 @@ impl StreamArchiverApp {
                     form.quality = md.resolve_quality(platform);
                     form.poll_interval_secs = md.resolve_poll_interval(platform);
                     form.filename_template = md.resolve_filename_template(platform);
-                    form.output_dir = md.resolve_output_dir(platform, &self.settings.default_output_dir);
                     form.last_platform = Some(platform);
+                }
+                // Output dir depends on the channel name too (via a possible
+                // `{name}` token — see `expand_dir_template`), which isn't
+                // known yet when a brand-new channel's URL is pasted before
+                // its name is typed. Re-resolve on either changing, not just
+                // platform, so the folder catches up once the name lands —
+                // tracked separately from `last_platform` above since this is
+                // the only field with a second trigger.
+                if form.output_dir_platform != Some(platform) || form.output_dir_name != form.name {
+                    form.output_dir = self.monitor_defaults.resolve_output_dir(
+                        platform,
+                        &form.name,
+                        &self.settings.default_output_dir,
+                    );
+                    form.output_dir_platform = Some(platform);
+                    form.output_dir_name = form.name.clone();
                 }
                 // The name belongs to the channel container; it's editable only
                 // when creating a new channel. For an instance it's the container's
@@ -2318,7 +2333,12 @@ impl StreamArchiverApp {
                             AuthKind::Inherit | AuthKind::Disabled => {}
                         }
 
-                        ui.label("Output folder");
+                        ui.label("Output folder").on_hover_text(
+                            "Pre-filled by the resolved default; {name}/{platform}/\
+                             {platform_short} typed in here directly are also expanded \
+                             (once, on Save) if you'd rather template this instance's own \
+                             folder than accept the default's.",
+                        );
                         ui.horizontal(|ui| {
                             ui.text_edit_singleline(&mut form.output_dir);
                             if ui.button("Browse…").clicked() {

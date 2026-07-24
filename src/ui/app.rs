@@ -1188,7 +1188,16 @@ impl StreamArchiverApp {
             detection_method: form.detection_method,
             poll_interval_secs: form.poll_interval_secs.max(5),
             quality: form.quality.clone(),
-            output_dir: form.output_dir.clone(),
+            // A no-op for the normal case (the field already holds the
+            // resolved-default's literal value) — only actually re-expands
+            // if the user hand-typed `{name}`/`{platform}` tokens straight
+            // into the Output folder field themselves, so those never land
+            // in the DB unexpanded.
+            output_dir: crate::downloader::expand_dir_template(
+                &form.output_dir,
+                form.name.trim(),
+                Platform::detect(&form.url).as_str(),
+            ),
             filename_template: form.filename_template.clone(),
             container: form.container,
             capture_from_start: form.capture_from_start,

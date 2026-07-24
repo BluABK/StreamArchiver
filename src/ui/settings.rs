@@ -1105,7 +1105,17 @@ impl StreamArchiverApp {
                 .num_columns(2)
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
-                    ui.label("Default output folder");
+                    ui.label("Default output folder").on_hover_text(
+                        "Seeds new instances' Output folder. Supports {name} (channel name) \
+                         and {platform}/{platform_short} as path segments, e.g. \
+                         G:\\streams\\{platform}\\{name} — expanded once when the channel/\
+                         instance is created (or its URL's platform changes), then stored as \
+                         a fixed literal path; it does not re-expand later if you rename the \
+                         channel. Only these two identity tokens are supported — no \
+                         {date}/{title}/etc., since a folder that silently changed meaning \
+                         every time it was read would be far more surprising than a filename \
+                         token that does.",
+                    );
                     ui.horizontal(|ui| {
                         ui.text_edit_singleline(&mut self.settings.default_output_dir);
                         if ui.button("Browse…").clicked() {
@@ -2088,6 +2098,11 @@ impl StreamArchiverApp {
                                     egui::TextEdit::singleline(od_ref)
                                         .hint_text(od_hint)
                                         .desired_width(200.0),
+                                ).on_hover_text(
+                                    "Tokens: {name} {platform} {platform_short} — expanded once \
+                                     when the channel/instance is created, then stored as a \
+                                     fixed literal path (see the global Default output folder's \
+                                     tooltip for the full explanation of why only these two).",
                                 );
                                 ui.label("");
                                 ui.label("");

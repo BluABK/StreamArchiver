@@ -2305,6 +2305,30 @@ Notes:
   Python tools. Both caps apply to live recordings and on-demand downloads
   alike; you shouldn't ever see a recording fail to start over a long title.
 
+#### Output folder tokens
+
+The separate **Output folder** field (Settings → Defaults → *Default output
+folder*, the per-platform/global rows under *Monitor defaults*, and an
+instance's own Output folder in the Add/Edit form) supports its own small
+token set — `{name}` (channel name) and `{platform}`/`{platform_short}` —
+as real path segments, e.g. `G:\streams\{platform}\{name}`. Unlike the
+filename template, `/`/`\` in an output-folder template **do** create real
+subfolders; a token's expanded value that happens to contain `/`/`\`
+instead gets sanitized within its own segment, so it can never inject an
+extra directory level of its own.
+
+Only these two identity tokens are supported — no `{date}`/`{title}`/
+`{quality}`/etc. That's a deliberate, permanent limit, not a missing
+feature: an instance's `output_dir` is resolved **once**, when the channel/
+instance is created (or its URL's platform changes) or you Save the
+Add/Edit form, and then stored as a fixed literal path for every future
+recording (see `build_plan`) — it does not re-expand if you later rename
+the channel. A folder whose meaning silently changed every time it was
+read (`{date}` always meaning "today", not "when this channel was added")
+would be far more surprising than a per-recording filename token that
+does. If a template segment expands to nothing, that folder level is
+dropped rather than backfilled with a placeholder.
+
 #### Filename media info ({resolution}/{fps}/…)
 
 Actual resolution/fps/codec aren't known when the filename is first chosen (it's

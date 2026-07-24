@@ -587,6 +587,53 @@ pub(super) fn expand_template(template: &str, v: &TemplateVars) -> String {
     }
 }
 
+/// Expand `{name}`/`{platform}`/`{platform_short}` in an output-**folder**
+/// template, preserving `/`/`\` as real directory levels — unlike
+/// [`expand_template`] (filenames), which sanitizes separators away as
+/// junk. Walks `template` as actual path [`std::path::Component`]s so a
+/// drive letter (`G:`) or UNC prefix is passed through untouched instead of
+/// being mangled by [`sanitize_filename`]; only `Normal` segments (the real
+/// directory names) get tokens expanded and are then sanitized
+/// independently, so a token's value (e.g. a channel name containing `/`)
+/// can never inject an extra directory level of its own. A segment that
+/// expands to nothing is dropped rather than backfilled with a placeholder
+/// — an empty folder level should just not exist, unlike a filename, which
+/// must never be empty.
+///
+/// Deliberately supports only these two identity tokens — not
+/// `{date}`/`{time}`/`{title}`/`{quality}`/etc. A monitor's `output_dir` is
+/// resolved once, when the channel/instance is created (or its URL's
+/// platform changes), and then stays a fixed literal path for that
+/// instance's whole lifetime (every recording just reads the stored
+/// string — see `build_plan`); a folder whose *meaning* silently changed
+/// every time it was read (e.g. `{date}` always meaning "today", not
+/// "when this channel was added") would be far more surprising than a
+/// per-recording filename token that does.
+pub fn expand_dir_template(template: &str, name: &str, platform: &str) -> String {
+    if !template.contains('{') {
+        return template.to_string();
+    }
+    let style = global_token_style();
+    let mut out = PathBuf::new();
+    for comp in Path::new(template).components() {
+        match comp {
+            std::path::Component::Normal(seg) => {
+                let seg = seg.to_string_lossy();
+                let expanded = seg
+                    .replace("{name}", name)
+                    .replace("{platform_short}", &styled_token("platform_short", platform, &style))
+                    .replace("{platform}", &styled_token("platform", platform, &style));
+                let cleaned = sanitize_filename(&expanded);
+                if !cleaned.is_empty() {
+                    out.push(cleaned);
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out.to_string_lossy().into_owned()
+}
+
 /// A stem (filename without extension) that doesn't collide with an existing
 /// `<stem>.<ext>` in `dir`: returns `stem`, else `stem (2)`, `stem (3)`, … —
 /// matching the file-manager convention. A missing `dir` can't collide. `ignore`
@@ -1508,5 +1555,65 @@ mod tests {
         assert_eq!(stem_capped_for_child_path(dir, "short.vod"), "short.vod");
         // Deterministic.
         assert_eq!(capped, stem_capped_for_child_path(dir, &long_stem));
+    }
+
+    #[test]
+    fn dir_template_expands_name_and_platform_as_segments() {
+        assert_eq!(
+            expand_dir_template(r"G:\streams\{platform}\{name}", "Zentreya", "twitch"),
+            r"G:\streams\twitch\Zentreya"
+        );
+    }
+
+    #[test]
+    fn dir_template_preserves_drive_letter_and_unc_prefix_untouched() {
+        // A literal ':' in a plain path must never be sanitized away.
+        assert_eq!(
+            expand_dir_template(r"G:\streams\{name}", "Foo", "twitch"),
+            r"G:\streams\Foo"
+        );
+        assert_eq!(
+            expand_dir_template(r"\\nas\streams\{name}", "Foo", "twitch"),
+            r"\\nas\streams\Foo"
+        );
+    }
+
+    #[test]
+    fn dir_template_sanitizes_a_slash_inside_an_expanded_value_instead_of_nesting() {
+        // A channel name containing '/' must not inject an extra directory
+        // level of its own — it's sanitized within its own segment.
+        assert_eq!(
+            expand_dir_template(r"G:\streams\{name}", "A/B", "twitch"),
+            r"G:\streams\A_B"
+        );
+    }
+
+    #[test]
+    fn dir_template_drops_a_segment_that_expands_to_nothing() {
+        // No fallback placeholder — unlike a filename, an empty folder LEVEL
+        // should just not exist.
+        assert_eq!(
+            expand_dir_template(r"G:\streams\{name}\clips", "", "twitch"),
+            r"G:\streams\clips"
+        );
+    }
+
+    #[test]
+    fn dir_template_without_braces_is_returned_unchanged() {
+        assert_eq!(
+            expand_dir_template(r"G:\streams\Zentreya", "ignored", "twitch"),
+            r"G:\streams\Zentreya"
+        );
+    }
+
+    #[test]
+    fn dir_template_unsupported_per_recording_tokens_are_left_literal() {
+        // Only {name}/{platform}/{platform_short} are supported here — a
+        // stray {date}/{title} in a folder template isn't expanded (and
+        // isn't sanitized away either, since braces aren't forbidden chars).
+        assert_eq!(
+            expand_dir_template(r"G:\streams\{name}\{date}", "Foo", "twitch"),
+            r"G:\streams\Foo\{date}"
+        );
     }
 }

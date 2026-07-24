@@ -402,6 +402,12 @@ struct MonitorForm {
     /// Platform the tool/detection defaults were last set for; a URL change to a
     /// different platform re-applies that platform's defaults.
     last_platform: Option<Platform>,
+    /// Platform/name `output_dir` was last resolved for — tracked separately
+    /// from `last_platform` because a `{name}`-templated output dir also
+    /// needs re-resolving when the name changes (typed after a brand-new
+    /// channel's URL is pasted), which none of the other platform defaults do.
+    output_dir_platform: Option<Platform>,
+    output_dir_name: String,
     /// Post-stream VOD-download overrides for this instance (`None` = inherit the
     /// channel/global default). Loaded from / saved to the monitor scope map.
     vod_download: Option<bool>,
@@ -439,7 +445,11 @@ impl MonitorForm {
             detection_method: defaults.resolve_detection(p),
             poll_interval_secs: defaults.resolve_poll_interval(p),
             quality: defaults.resolve_quality(p),
-            output_dir: defaults.resolve_output_dir(p, default_output_dir),
+            // Name is still blank at this point (not yet typed) — a
+            // `{name}`-templated output dir starts empty and is re-resolved
+            // once the user types it (see `output_dir_platform`/`output_dir_name`
+            // and the dialog's live re-resolve block).
+            output_dir: defaults.resolve_output_dir(p, "", default_output_dir),
             filename_template: defaults.resolve_filename_template(p),
             container: defaults.resolve_container(p),
             capture_from_start: defaults.resolve_from_start(p),
@@ -461,6 +471,8 @@ impl MonitorForm {
             sabr_codec_pref: SabrCodecPref::Inherit,
             sabr_codec_custom: String::new(),
             last_platform: None,
+            output_dir_platform: Some(p),
+            output_dir_name: String::new(),
             vod_download: None,
             vod_replace: None,
             head_backfill_fetch: None,
@@ -502,6 +514,11 @@ impl MonitorForm {
             sabr_codec_custom: m.sabr_codec_custom.clone(),
             // Don't override the saved tool/detection just because the form opened.
             last_platform: Some(m.platform()),
+            // `output_dir` above is already the stored literal — these two
+            // match its "already resolved for" state so the live re-resolve
+            // block doesn't immediately overwrite it just because the form opened.
+            output_dir_platform: Some(m.platform()),
+            output_dir_name: row.channel.name.clone(),
             // Overridden by the caller from the monitor scope map (needs the store).
             vod_download: None,
             vod_replace: None,
@@ -527,7 +544,7 @@ impl MonitorForm {
             detection_method: defaults.resolve_detection(p),
             poll_interval_secs: defaults.resolve_poll_interval(p),
             quality: defaults.resolve_quality(p),
-            output_dir: defaults.resolve_output_dir(p, default_output_dir),
+            output_dir: defaults.resolve_output_dir(p, &channel.name, default_output_dir),
             filename_template: defaults.resolve_filename_template(p),
             container: defaults.resolve_container(p),
             capture_from_start: defaults.resolve_from_start(p),
@@ -549,6 +566,8 @@ impl MonitorForm {
             sabr_codec_pref: SabrCodecPref::Inherit,
             sabr_codec_custom: String::new(),
             last_platform: None,
+            output_dir_platform: Some(p),
+            output_dir_name: channel.name.clone(),
             vod_download: None,
             vod_replace: None,
             head_backfill_fetch: None,

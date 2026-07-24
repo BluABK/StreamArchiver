@@ -321,7 +321,7 @@ pub fn create_monitor(
         },
         output_dir: match out_dir.map(str::trim).filter(|s| !s.is_empty()) {
             Some(o) => o.to_string(),
-            None => defaults.resolve_output_dir(platform, default_out),
+            None => defaults.resolve_output_dir(platform, name, default_out),
         },
         filename_template: defaults.resolve_filename_template(platform),
         container: defaults.resolve_container(platform),
@@ -504,7 +504,7 @@ mod tests {
         assert_eq!(row2.monitor.quality, defaults.resolve_quality(Platform::Twitch));
         assert_eq!(
             row2.monitor.output_dir,
-            defaults.resolve_output_dir(Platform::Twitch, "C:/out")
+            defaults.resolve_output_dir(Platform::Twitch, "Cool", "C:/out")
         );
     }
 }
