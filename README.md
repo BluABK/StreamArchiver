@@ -2041,6 +2041,19 @@ quota usage (units and search calls against the daily cutoff), so you can see
 what these features are actually costing you. (Per-channel numbers live in the
 separate **Channel Stats** tab — App Stats is app/system health only.)
 
+The **Recordings** section's lifetime totals are followed by a **Breakdown**
+period selector (**Day / Week / Month / Year**):
+
+- **Day** lists the 7 days of the current calendar week (Monday–Sunday), each
+  with its own recording count and bytes archived; days later in the week
+  that haven't happened yet show `—`.
+- **Week / Month / Year** each show two rows instead of a long trend table:
+  the current, still-elapsing period and the last fully-elapsed one (e.g.
+  "This week" / "Last week"), with a recordings-per-day and archived-per-day
+  average alongside the totals. The current period's average divides by the
+  days elapsed so far (not a flat week/month/year), so it isn't dragged down
+  by days that haven't happened yet.
+
 Underneath the daily unit total, a **"Units spent by call type today"**
 breakdown splits the day's units across `search.list` (100 units/call —
 live-detection polls and the upcoming-schedule refresh), `videos.list` (1

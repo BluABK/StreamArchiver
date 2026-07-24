@@ -659,6 +659,8 @@ impl StreamArchiverApp {
             debug_test_game: "Just Chatting".into(),
             stats_snapshot: None,
             stats_capture_health: None,
+            stats_recordings_daily: None,
+            recordings_period: super::RecordingsPeriod::Day,
             stats_collabs: Vec::new(),
             stats_poll_span: super::PollSpan::Day,
             stats_history: None,

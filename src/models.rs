@@ -2437,6 +2437,17 @@ pub struct GlobalStats {
     pub total_channels: i64,
 }
 
+/// One UTC day's recording volume (count + bytes archived) — the raw source
+/// for the Stats view's Day/Week/Month/Year recordings breakdown, bucketed
+/// in-memory from this single per-day series rather than one query per period.
+#[derive(Clone, Debug)]
+pub struct DailyRecordingStat {
+    /// UTC date (`YYYY-MM-DD`) the recording started.
+    pub day: String,
+    pub count: i64,
+    pub bytes: i64,
+}
+
 /// Current unix timestamp in seconds.
 pub fn now_unix() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};

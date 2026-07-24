@@ -27,10 +27,10 @@ fn quota_date_today() -> String {
 }
 
 use crate::models::{
-    AdBreak, AuthKind, Channel, Container, DetachedKind, DetachedRow, DetectionMethod, GlobalStats,
-    Monitor, MonitorStreamChange, MonitorWithChannel, Platform, PollBucket, RecurrenceKind,
-    SabrCodecPref, ScheduleSegment, ScheduledRecording, ScheduledRecordingWithNames,
-    StreamMetaChange, Tool, UpcomingStream, Video, now_unix,
+    AdBreak, AuthKind, Channel, Container, DailyRecordingStat, DetachedKind, DetachedRow,
+    DetectionMethod, GlobalStats, Monitor, MonitorStreamChange, MonitorWithChannel, Platform,
+    PollBucket, RecurrenceKind, SabrCodecPref, ScheduleSegment, ScheduledRecording,
+    ScheduledRecordingWithNames, StreamMetaChange, Tool, UpcomingStream, Video, now_unix,
 };
 
 /// Latest schema version understood by this build.

@@ -534,6 +534,8 @@ impl StreamArchiverApp {
                 self.core.store.alert_daily_stats(30).unwrap_or_default(),
                 self.core.store.alert_health_totals().unwrap_or_default(),
             ));
+            self.stats_recordings_daily =
+                Some(self.core.store.recordings_daily_stats().unwrap_or_default());
         }
         let (ocr, global, poll) = match self.stats_snapshot.clone() {
             Some(s) => s,
@@ -1041,6 +1043,73 @@ impl StreamArchiverApp {
                     ui.end_row();
                 });
 
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label("Breakdown:").on_hover_text(
+                    "New recordings started + bytes archived, broken down by period.",
+                );
+                for p in super::RecordingsPeriod::ALL {
+                    if ui.selectable_label(self.recordings_period == p, p.label()).clicked() {
+                        self.recordings_period = p;
+                    }
+                }
+            });
+            let daily_rec = self.stats_recordings_daily.clone().unwrap_or_default();
+            let today = chrono::Utc::now().date_naive();
+            match self.recordings_period {
+                super::RecordingsPeriod::Day => {
+                    egui::Grid::new("recordings_breakdown_day")
+                        .num_columns(3)
+                        .striped(true)
+                        .spacing([24.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.strong("Day");
+                            ui.strong("Recordings");
+                            ui.strong("Archived");
+                            ui.end_row();
+                            for (d, count, bytes) in recordings_week_days(&daily_rec, today) {
+                                let future = d > today;
+                                ui.label(d.format("%a %Y-%m-%d").to_string());
+                                if future {
+                                    ui.weak("—");
+                                    ui.weak("—");
+                                } else {
+                                    ui.label(count.to_string());
+                                    ui.label(fmt_bytes(bytes));
+                                }
+                                ui.end_row();
+                            }
+                        });
+                }
+                super::RecordingsPeriod::Week | super::RecordingsPeriod::Month | super::RecordingsPeriod::Year => {
+                    let summaries = match self.recordings_period {
+                        super::RecordingsPeriod::Week => recordings_week_summaries(&daily_rec, today),
+                        super::RecordingsPeriod::Month => recordings_month_summaries(&daily_rec, today),
+                        _ => recordings_year_summaries(&daily_rec, today),
+                    };
+                    egui::Grid::new("recordings_breakdown_summary")
+                        .num_columns(5)
+                        .striped(true)
+                        .spacing([24.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.strong("");
+                            ui.strong("Recordings");
+                            ui.strong("Archived");
+                            ui.strong("Avg/day (rec.)");
+                            ui.strong("Avg/day (archived)");
+                            ui.end_row();
+                            for s in &summaries {
+                                ui.label(s.label);
+                                ui.label(s.count.to_string());
+                                ui.label(fmt_bytes(s.bytes));
+                                ui.label(format!("{:.1}", s.avg_count_per_day));
+                                ui.label(fmt_bytes(s.avg_bytes_per_day.round() as i64));
+                                ui.end_row();
+                            }
+                        });
+                }
+            }
+
             ui.add_space(16.0);
 
             // ── Capture health (🚨 Warnings rollup + trend) ──────────────────
@@ -1155,5 +1224,223 @@ impl StreamArchiverApp {
             // (The 🤝 Collabs partner table lives in the Channel Stats tab —
             // this view is app/system health only.)
         });
+    }
+}
+
+/// One Recordings-breakdown summary row (e.g. "This week" / "Last month").
+struct RecordingsPeriodSummary {
+    label: &'static str,
+    count: i64,
+    bytes: i64,
+    avg_count_per_day: f64,
+    avg_bytes_per_day: f64,
+}
+
+/// Sum of `count`/`bytes` for days in `daily` whose date falls within the
+/// inclusive `[start, end]` range. ISO `YYYY-MM-DD` strings sort
+/// lexicographically the same as the dates they represent, so no per-row
+/// parsing is needed.
+fn sum_recording_days(
+    daily: &[crate::models::DailyRecordingStat],
+    start: chrono::NaiveDate,
+    end: chrono::NaiveDate,
+) -> (i64, i64) {
+    let s = start.format("%Y-%m-%d").to_string();
+    let e = end.format("%Y-%m-%d").to_string();
+    daily
+        .iter()
+        .filter(|d| d.day.as_str() >= s.as_str() && d.day.as_str() <= e.as_str())
+        .fold((0i64, 0i64), |(c, b), d| (c + d.count, b + d.bytes))
+}
+
+fn recording_period_summary(
+    label: &'static str,
+    (count, bytes): (i64, i64),
+    days: i64,
+) -> RecordingsPeriodSummary {
+    let days = days.max(1) as f64;
+    RecordingsPeriodSummary {
+        label,
+        count,
+        bytes,
+        avg_count_per_day: count as f64 / days,
+        avg_bytes_per_day: bytes as f64 / days,
+    }
+}
+
+fn recording_month_start(d: chrono::NaiveDate) -> chrono::NaiveDate {
+    use chrono::Datelike;
+    chrono::NaiveDate::from_ymd_opt(d.year(), d.month(), 1).unwrap_or(d)
+}
+
+fn recording_year_start(d: chrono::NaiveDate) -> chrono::NaiveDate {
+    use chrono::Datelike;
+    chrono::NaiveDate::from_ymd_opt(d.year(), 1, 1).unwrap_or(d)
+}
+
+/// "This week"/"Last week" (Monday-start). "This week" averages over the
+/// days elapsed so far, not a flat 7 — a Tuesday's daily average shouldn't be
+/// dragged down by 5 days that haven't happened yet.
+fn recordings_week_summaries(
+    daily: &[crate::models::DailyRecordingStat],
+    today: chrono::NaiveDate,
+) -> [RecordingsPeriodSummary; 2] {
+    let this_start = super::calendar::week_start(today);
+    let elapsed = (today - this_start).num_days() + 1;
+    let last_start = this_start - chrono::Duration::days(7);
+    let last_end = this_start - chrono::Duration::days(1);
+    [
+        recording_period_summary("This week", sum_recording_days(daily, this_start, today), elapsed),
+        recording_period_summary("Last week", sum_recording_days(daily, last_start, last_end), 7),
+    ]
+}
+
+/// "This month"/"Last month", same partial-period averaging as the week version.
+fn recordings_month_summaries(
+    daily: &[crate::models::DailyRecordingStat],
+    today: chrono::NaiveDate,
+) -> [RecordingsPeriodSummary; 2] {
+    let this_start = recording_month_start(today);
+    let elapsed = (today - this_start).num_days() + 1;
+    let last_end = this_start - chrono::Duration::days(1);
+    let last_start = recording_month_start(last_end);
+    let last_days = (last_end - last_start).num_days() + 1;
+    [
+        recording_period_summary("This month", sum_recording_days(daily, this_start, today), elapsed),
+        recording_period_summary("Last month", sum_recording_days(daily, last_start, last_end), last_days),
+    ]
+}
+
+/// "This year"/"Last year", same partial-period averaging as week/month.
+fn recordings_year_summaries(
+    daily: &[crate::models::DailyRecordingStat],
+    today: chrono::NaiveDate,
+) -> [RecordingsPeriodSummary; 2] {
+    use chrono::Datelike;
+    let this_start = recording_year_start(today);
+    let elapsed = (today - this_start).num_days() + 1;
+    let last_start = chrono::NaiveDate::from_ymd_opt(today.year() - 1, 1, 1).unwrap_or(this_start);
+    let last_end = this_start - chrono::Duration::days(1);
+    let last_days = (last_end - last_start).num_days() + 1;
+    [
+        recording_period_summary("This year", sum_recording_days(daily, this_start, today), elapsed),
+        recording_period_summary("Last year", sum_recording_days(daily, last_start, last_end), last_days),
+    ]
+}
+
+/// The 7 days (Monday..Sunday) of the calendar week containing `today`, each
+/// paired with that day's recording count/bytes (0 for days with none,
+/// including days later in the week that haven't happened yet).
+fn recordings_week_days(
+    daily: &[crate::models::DailyRecordingStat],
+    today: chrono::NaiveDate,
+) -> Vec<(chrono::NaiveDate, i64, i64)> {
+    let start = super::calendar::week_start(today);
+    (0..7)
+        .map(|i| {
+            let d = start + chrono::Duration::days(i);
+            let ds = d.format("%Y-%m-%d").to_string();
+            let (count, bytes) = daily
+                .iter()
+                .find(|r| r.day == ds)
+                .map(|r| (r.count, r.bytes))
+                .unwrap_or((0, 0));
+            (d, count, bytes)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::DailyRecordingStat;
+
+    fn day(day: &str, count: i64, bytes: i64) -> DailyRecordingStat {
+        DailyRecordingStat { day: day.into(), count, bytes }
+    }
+    fn ymd(y: i32, m: u32, d: u32) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    #[test]
+    fn week_days_covers_monday_to_sunday_and_fills_gaps() {
+        // Wednesday 2026-07-22 anchors the week of Mon 2026-07-20..Sun 2026-07-26.
+        let daily = vec![day("2026-07-20", 2, 200), day("2026-07-22", 1, 100)];
+        let rows = recordings_week_days(&daily, ymd(2026, 7, 22));
+        assert_eq!(rows.len(), 7);
+        assert_eq!(rows[0].0, ymd(2026, 7, 20));
+        assert_eq!((rows[0].1, rows[0].2), (2, 200));
+        assert_eq!((rows[1].1, rows[1].2), (0, 0)); // Tue: no data
+        assert_eq!((rows[2].1, rows[2].2), (1, 100)); // Wed
+        assert_eq!(rows[6].0, ymd(2026, 7, 26));
+    }
+
+    #[test]
+    fn week_summaries_split_this_vs_last_and_average_partial_week() {
+        // Today = Wed 2026-07-22 → this week started Mon 2026-07-20, 3 days elapsed.
+        let daily = vec![
+            day("2026-07-13", 1, 100), // last week (Mon)
+            day("2026-07-19", 1, 100), // last week (Sun)
+            day("2026-07-20", 2, 200), // this week (Mon)
+            day("2026-07-22", 2, 200), // this week (Wed, today)
+        ];
+        let [this_week, last_week] = recordings_week_summaries(&daily, ymd(2026, 7, 22));
+        assert_eq!(this_week.label, "This week");
+        assert_eq!(this_week.count, 4);
+        assert_eq!(this_week.bytes, 400);
+        assert!((this_week.avg_count_per_day - 4.0 / 3.0).abs() < 1e-9);
+        assert_eq!(last_week.label, "Last week");
+        assert_eq!(last_week.count, 2);
+        assert!((last_week.avg_count_per_day - 2.0 / 7.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn week_summaries_exclude_days_outside_either_week() {
+        let daily = vec![day("2026-07-06", 9, 900)]; // two weeks before
+        let [this_week, last_week] = recordings_week_summaries(&daily, ymd(2026, 7, 22));
+        assert_eq!(this_week.count, 0);
+        assert_eq!(last_week.count, 0);
+    }
+
+    #[test]
+    fn month_summaries_split_this_vs_last_calendar_month() {
+        // Today = 2026-07-22 → this month started 2026-07-01 (22 days elapsed).
+        let daily = vec![
+            day("2026-06-15", 3, 300),
+            day("2026-07-01", 1, 100),
+            day("2026-07-22", 1, 100),
+        ];
+        let [this_month, last_month] = recordings_month_summaries(&daily, ymd(2026, 7, 22));
+        assert_eq!(this_month.count, 2);
+        assert_eq!(last_month.count, 3);
+        assert!((this_month.avg_count_per_day - 2.0 / 22.0).abs() < 1e-9);
+        // June 2026 has 30 days.
+        assert!((last_month.avg_count_per_day - 3.0 / 30.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn month_summaries_handle_january_rollover_to_prior_december() {
+        let daily = vec![day("2025-12-31", 5, 500), day("2026-01-01", 2, 200)];
+        let [this_month, last_month] = recordings_month_summaries(&daily, ymd(2026, 1, 1));
+        assert_eq!(this_month.count, 2);
+        assert_eq!(last_month.count, 5);
+        // December has 31 days.
+        assert!((last_month.avg_count_per_day - 5.0 / 31.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn year_summaries_split_this_vs_last_calendar_year() {
+        let daily = vec![
+            day("2025-03-01", 4, 400),
+            day("2026-01-01", 1, 100),
+            day("2026-07-22", 1, 100),
+        ];
+        let [this_year, last_year] = recordings_year_summaries(&daily, ymd(2026, 7, 22));
+        assert_eq!(this_year.count, 2);
+        assert_eq!(last_year.count, 4);
+        // 2026-01-01 through 2026-07-22 inclusive = 203 days.
+        assert!((this_year.avg_count_per_day - 2.0 / 203.0).abs() < 1e-9);
+        // 2025 is not a leap year → 365 days.
+        assert!((last_year.avg_count_per_day - 4.0 / 365.0).abs() < 1e-9);
     }
 }

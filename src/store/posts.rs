@@ -567,6 +567,28 @@ impl Store {
         Ok(r)
     }
 
+    /// One row per UTC day that has at least one recording, with its count
+    /// and total archived bytes — the raw series the Stats view buckets
+    /// in-memory into the Day/Week/Month/Year recordings breakdown (one
+    /// query covers every period; no per-period SQL needed).
+    pub fn recordings_daily_stats(&self) -> Result<Vec<DailyRecordingStat>> {
+        let conn = self.db();
+        let mut st = conn.prepare(
+            "SELECT date(started_at, 'unixepoch') AS d, COUNT(*), COALESCE(SUM(bytes), 0)
+             FROM recording GROUP BY d ORDER BY d ASC",
+        )?;
+        let rows = st
+            .query_map([], |r| {
+                Ok(DailyRecordingStat {
+                    day: r.get(0)?,
+                    count: r.get(1)?,
+                    bytes: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     // ----- poll/detect request history (schema v56) -----
 
     /// Fold one scheduler tick's poll/detect outcomes into the minute-bucket

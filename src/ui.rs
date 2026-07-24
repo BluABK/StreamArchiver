@@ -18,7 +18,8 @@ use tray_icon::TrayIcon;
 use crate::app_core::AppCore;
 use crate::events::{ManualCommand, UiCommand};
 use crate::models::{
-    AdBreak, AuthKind, Channel, Container, DetectionMethod, DownloadDefaults, GlobalStats,
+    AdBreak, AuthKind, Channel, Container, DailyRecordingStat, DetectionMethod, DownloadDefaults,
+    GlobalStats,
     K_DIALOG_ICON, K_DISCORD_SCHEDULE, K_DISCORD_TOKEN, K_FILENAME_MEDIA, K_MONITOR_DEFAULTS,
     K_OCR_COMMAND, K_OCR_EFFORT, K_OCR_FALLBACK_MODEL, K_OCR_MAX_BUDGET, K_OCR_MODEL,
     K_OCR_OFFSET, K_OCR_STATS, K_OCR_TIMEOUT_SECS, K_OCR_TIMEZONE, K_SCHEDULE_TITLE_FILL,
@@ -328,6 +329,36 @@ impl PollSpan {
                 | PollSpan::Year
                 | PollSpan::All
         )
+    }
+}
+
+/// Period selector for the Stats view's Recordings breakdown. `Day` lists the
+/// 7 individual days of the current calendar week; `Week`/`Month`/`Year` each
+/// show two summary rows (the current, still-elapsing period and the last
+/// fully-elapsed one) rather than a long trend table.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecordingsPeriod {
+    Day,
+    Week,
+    Month,
+    Year,
+}
+
+impl RecordingsPeriod {
+    const ALL: [RecordingsPeriod; 4] = [
+        RecordingsPeriod::Day,
+        RecordingsPeriod::Week,
+        RecordingsPeriod::Month,
+        RecordingsPeriod::Year,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            RecordingsPeriod::Day => "Day",
+            RecordingsPeriod::Week => "Week",
+            RecordingsPeriod::Month => "Month",
+            RecordingsPeriod::Year => "Year",
+        }
     }
 }
 
@@ -1528,6 +1559,11 @@ pub struct StreamArchiverApp {
     /// with (and refreshed by) the same snapshot cycle as `stats_snapshot`.
     stats_capture_health:
         Option<(Vec<crate::store::AlertDailyStat>, crate::store::AlertHealthTotals)>,
+    /// Per-day recording count/bytes series backing the Recordings
+    /// Day/Week/Month/Year breakdown — loaded/refreshed with `stats_snapshot`.
+    stats_recordings_daily: Option<Vec<DailyRecordingStat>>,
+    /// Selected period for the Recordings breakdown (session-only).
+    recordings_period: RecordingsPeriod,
     /// Cached 🤝 collab-partner overview (name, sessions, last seen) for the
     /// Stats view — loaded/refreshed together with `stats_snapshot`.
     stats_collabs: Vec<(String, i64, i64)>,
