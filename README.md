@@ -1724,9 +1724,11 @@ live, and archived:
   (the site's "with A, B, C" line) is also fetched via the web client's own
   anonymous GQL query and unioned in; if that unofficial query ever breaks,
   detection silently falls back to Shared Chat alone. Streams that collab
-  without either are still caught heuristically: **@mentions in the live
+  without either are still caught heuristically (**default on**, toggle under
+  *Settings → Accounts → Detection credentials*): **@mentions in the live
   title** count as collaborators too, shown as `@name` and marked
-  "unconfirmed".
+  "unconfirmed" — a handle already confirmed via Shared Chat or the
+  collaboration group is never added a second time as a title mention.
 - **Live display** — the channel/instance name gains a weak
   `nihmune × Shylily`-style suffix while a shared-chat session is live
   (confirmed partners only), and a **🤝 Collab** column lists everyone

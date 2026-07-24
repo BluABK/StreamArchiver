@@ -1027,6 +1027,12 @@ pub struct StreamArchiverApp {
     /// mode only, same cost-cap reasoning. Persisted as `raid_eventsub`;
     /// default on. Chat still captures incoming raids while recording.
     raid_eventsub: bool,
+    /// Parse the stream title for `@handle` mentions as a lower-confidence
+    /// collab signal alongside confirmed Shared Chat/group partners (never
+    /// duplicating one already found there). Persisted as
+    /// `collab_title_mentions`; default on. See
+    /// [`crate::detectors::DetectContext::refresh_twitch_collab`].
+    collab_title_mentions: bool,
     /// Do Not Disturb: manually suppress toasts right now. Persisted as
     /// `dnd_enabled`; default off. See [`crate::notifications::dnd_active`].
     dnd_enabled: bool,

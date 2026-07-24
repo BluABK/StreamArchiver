@@ -555,7 +555,7 @@ impl StreamArchiverApp {
     }
 
     fn settings_detection_credentials_section(&mut self, ui: &mut egui::Ui) {
-            if self.section_shown(SettingsTab::Accounts, "Detection credentials", &["twitch", "youtube", "kick", "client id", "secret", "api key", "credentials", "detection", "collab", "stream together", "shared chat", "eventsub"]) {
+            if self.section_shown(SettingsTab::Accounts, "Detection credentials", &["twitch", "youtube", "kick", "client id", "secret", "api key", "credentials", "detection", "collab", "stream together", "shared chat", "eventsub", "mention"]) {
             ui.add_space(8.0);
             ui.heading("Detection credentials (optional)");
             ui.label("Used only by monitors set to an API detection method.");
@@ -630,6 +630,25 @@ impl StreamArchiverApp {
                     .core
                     .store
                     .set_setting("raid_eventsub", if raid_es { "1" } else { "0" });
+            }
+            let mut collab_titles = self.collab_title_mentions;
+            if ui
+                .checkbox(&mut collab_titles, "@ Title-mention collabs")
+                .on_hover_text(
+                    "Also treat a `@handle` in the stream title as a (lower-confidence) \
+                     collab partner, alongside confirmed Shared Chat/Stream Together \
+                     partners. Never adds a channel that's already confirmed via Shared \
+                     Chat or the collab group — this only fills in partners those two \
+                     can't see (e.g. a collab announced in the title before Shared Chat \
+                     starts). Default on.",
+                )
+                .changed()
+            {
+                self.collab_title_mentions = collab_titles;
+                let _ = self.core.store.set_setting(
+                    "collab_title_mentions",
+                    if collab_titles { "1" } else { "0" },
+                );
             }
 
             }

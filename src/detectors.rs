@@ -1164,6 +1164,18 @@ impl DetectContext {
             .collect()
     }
 
+    /// Whether the title `@mention` collab heuristic is on (default: on).
+    /// Shared-chat/group partners are always confirmed regardless of this
+    /// setting — it only gates the lower-confidence title-parsing fallback.
+    fn collab_title_mentions_enabled(store: &Store) -> bool {
+        store
+            .get_setting("collab_title_mentions")
+            .ok()
+            .flatten()
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    }
+
     /// One live Twitch monitor's full collab refresh — the single routine both
     /// feeds share (scheduler poll for live-not-recording, `meta_watcher` while
     /// recording, EventSub pokes indirectly by forcing a poll): fetch the
@@ -1320,7 +1332,11 @@ impl DetectContext {
             Err(e) => debug!("collab: group fetch for {login} failed: {e:#}"),
         }
 
-        let mentions = crate::models::title_mentions(title, login);
+        let mentions = if Self::collab_title_mentions_enabled(&self.store) {
+            crate::models::title_mentions(title, login)
+        } else {
+            Vec::new()
+        };
         let title_ps: Vec<crate::models::CollabPartner> = mentions
             .iter()
             .filter(|m| {

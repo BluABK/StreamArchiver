@@ -46,6 +46,14 @@ impl StreamArchiverApp {
             .flatten()
             .as_deref()
             != Some("0");
+        // Title @mention collab heuristic defaults on likewise.
+        let collab_title_mentions = core
+            .store
+            .get_setting("collab_title_mentions")
+            .ok()
+            .flatten()
+            .as_deref()
+            != Some("0");
         // Channel Stats auto refresh defaults on likewise.
         let chstats_auto = core
             .store
@@ -445,6 +453,7 @@ impl StreamArchiverApp {
             notifications_enabled,
             collab_eventsub,
             raid_eventsub,
+            collab_title_mentions,
             dnd_enabled,
             dnd_schedule_enabled,
             dnd_start,
