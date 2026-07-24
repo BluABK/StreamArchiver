@@ -232,16 +232,24 @@ impl Store {
         Ok(rows)
     }
 
-    /// Unacked `(errors, warnings)` — the 🚨 button badge. Superseded errors
-    /// with no lost ranges (a completed sibling take covers the broadcast)
-    /// are excluded: the failure healed itself, no red badge needed.
+    /// Unacked `(errors, warnings)` — the 🚨 button badge. Excludes two ways
+    /// an error can have healed itself, matching the Warnings window's own
+    /// row-tint logic (`healed`/`superseded` in `ui/issues.rs`) exactly, so
+    /// a row that reads green in the list never leaves the button red:
+    /// fully **recovered** (every lost range re-fetched from the VOD —
+    /// `ranges_total > 0 && recovered == ranges_total`), or **superseded**
+    /// with no lost ranges at all (a completed sibling take covers the
+    /// broadcast, so recovery was never even attempted).
     pub fn alert_badge_counts(&self) -> Result<(i64, i64)> {
         let conn = self.db();
         conn.query_row(
             &format!(
                 "SELECT
                     COALESCE(SUM(CASE WHEN severity = 'error'
-                        AND NOT (ranges_total = 0 AND {ALERT_SUPERSEDED_SQL})
+                        AND NOT (
+                            (ranges_total > 0 AND recovered = ranges_total)
+                            OR (ranges_total = 0 AND {ALERT_SUPERSEDED_SQL})
+                        )
                         THEN 1 ELSE 0 END), 0),
                     COALESCE(SUM(CASE WHEN severity != 'error' THEN 1 ELSE 0 END), 0)
                  FROM capture_alert WHERE acked = 0"
@@ -615,6 +623,31 @@ mod tests {
         // Retro-sweep guard: the take is known once ANY alert row exists.
         assert!(store.alert_exists_for_take("A:\\x.ts.log"));
         assert!(!store.alert_exists_for_take("A:\\other.ts.log"));
+    }
+
+    #[test]
+    fn fully_recovered_error_leaves_the_badge_but_stays_listed() {
+        // The Zentreya incident: a fetch_failed error whose one lost range
+        // got fully re-fetched from the VOD reads green (✔ "1/1 lost ranges
+        // recovered") in the Warnings list, but the 🚨 button stayed red —
+        // alert_badge_counts wasn't recognizing the same "healed" condition
+        // the row's own tint logic (ui/issues.rs) already used.
+        let store = Store::open_in_memory().unwrap();
+        let (id, _) = store.upsert_capture_alert(&gap_alert("A:\\zen.ts.log")).unwrap();
+        assert_eq!(store.alert_badge_counts().unwrap(), (1, 0));
+
+        // Partial recovery: still counts red — only fully recovered heals.
+        store.set_alert_recovery(7, 2, 1, 0).unwrap();
+        assert_eq!(store.alert_badge_counts().unwrap(), (1, 0));
+
+        // Every lost range recovered, alert never explicitly acked (matches
+        // set_alert_recovery's own contract) — badge clears, row stays listed.
+        store.set_alert_recovery(7, 2, 2, 0).unwrap();
+        assert_eq!(store.alert_badge_counts().unwrap(), (0, 0));
+        let row = &store.list_capture_alerts(10).unwrap()[0];
+        assert_eq!(row.id, id);
+        assert!(!row.acked, "healing clears the badge without acking the row");
+        assert_eq!((row.ranges_total, row.recovered), (2, 2));
     }
 
     #[test]
