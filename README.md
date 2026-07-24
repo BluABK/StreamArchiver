@@ -1223,6 +1223,20 @@ override (Inherit / On / Off, same chain as every other feature toggle).
 The four/five event kinds and the raid viewer threshold are global-only
 settings in the same section.
 
+**If the app closes mid-embed** (crash, forced quit, power loss): the
+recording itself is never at risk — embedding writes to a `{stem}.tmp.mkv`
+sidecar and only atomically renames over the original on full success, so
+an interrupted pass leaves the original completely untouched. `chapters_state`
+also stays unset the whole time embedding is in progress, so the next
+startup's sweep just retries that take from scratch. Any leftover
+`{stem}.tmp.mkv`/`{stem}.chapters.ffmeta.txt` sidecar (from chapters,
+thumbnail, or subtitle embedding) is cleaned up automatically by the
+startup capture-cache sweep once it's over 24h old. Every step of the
+embed pipeline (start, success with timing, failure, and the bulk
+re-embed-all run) logs to the app's own log
+(`%APPDATA%\StreamArchiver\data\logs\`), so progress is visible without
+needing the Background view open.
+
 ### Twitch ad-break detection
 
 Streamlink already cuts Twitch ads out of the recording on its own (each

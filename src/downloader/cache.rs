@@ -246,8 +246,14 @@ pub(super) fn sabr_state_exists(output_path: &str) -> bool {
 
 impl Supervisor {
     /// Delete stale working files from every output dir's `.cache\` (older than
-    /// [`CACHE_MAX_AGE_SECS`]), skipping any stem currently being resumed. Removes a
-    /// `.cache\` dir that ends up empty. Best-effort; runs once at startup.
+    /// [`CACHE_MAX_AGE_SECS`]), skipping any stem currently being resumed, PLUS
+    /// any orphaned `{stem}.tmp.mkv`/`{stem}.chapters.ffmeta.txt` left directly
+    /// in the output dir itself by an embed-thumbnail/embed-subs/embed-chapters
+    /// pass killed mid-flight (app crash, forced quit, power loss) — those
+    /// never get renamed over the real file (only on success) and live
+    /// OUTSIDE `.cache\`, so nothing else ever notices or removes them.
+    /// Removes a `.cache\` dir that ends up empty. Best-effort; runs once at
+    /// startup.
     pub async fn sweep_caches(&self, skip_stems: std::collections::HashSet<String>) {
         // Current instance output dirs PLUS every dir past recordings live in
         // — retargeting an instance to another drive must not strand stale
@@ -261,11 +267,35 @@ impl Supervisor {
         dirs.sort_unstable();
         dirs.dedup();
         let now = std::time::SystemTime::now();
+        let mut orphan_tmp_removed = 0u32;
         for d in dirs {
+            let out_dir = Path::new(&d);
+            if let Ok(mut rd) = crate::iomon::fs::read_dir(Cat::CacheSweep, out_dir).await {
+                while let Ok(Some(entry)) = rd.next_entry().await {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if !(name.ends_with(".tmp.mkv") || name.ends_with(".chapters.ffmeta.txt")) {
+                        continue;
+                    }
+                    let Ok(meta) = entry.metadata().await else { continue };
+                    let stale = meta
+                        .modified()
+                        .ok()
+                        .and_then(|m| now.duration_since(m).ok())
+                        .map(|age| age.as_secs() >= CACHE_MAX_AGE_SECS)
+                        .unwrap_or(false);
+                    if stale
+                        && meta.is_file()
+                        && crate::iomon::fs::remove_file(Cat::CacheSweep, entry.path()).await.is_ok()
+                    {
+                        orphan_tmp_removed += 1;
+                    }
+                }
+            }
+
             // Both the current working dir and the legacy `.cache\` — the
             // legacy one only drains (nothing writes there anymore) and its
             // empty husk is removed below, ending backup-tool churn on it.
-            for cache in cache_dir_candidates(Path::new(&d)) {
+            for cache in cache_dir_candidates(out_dir) {
                 let Ok(mut rd) = crate::iomon::fs::read_dir(Cat::CacheSweep, &cache).await else {
                     continue;
                 };
@@ -302,6 +332,15 @@ impl Supervisor {
                 }
                 let _ = crate::iomon::fs::remove_dir(Cat::CacheSweep, &cache).await; // only if now empty
             }
+        }
+        if orphan_tmp_removed > 0 {
+            info!(
+                "capture-cache sweep: deleted {orphan_tmp_removed} orphaned embed-pass temp \
+                 file(s) from output dirs (interrupted thumbnail/subtitle/chapters embed, \
+                 older than {}h; the real recording is never touched by these — only its own \
+                 rename-on-success sidecar)",
+                CACHE_MAX_AGE_SECS / 3600,
+            );
         }
     }
 }

@@ -95,6 +95,8 @@ impl Supervisor {
         }));
         let recs = self.store.recordings_eligible_for_chapters_reembed().unwrap_or_default();
         let total = recs.len();
+        let started = std::time::Instant::now();
+        info!("chapters: re-embed-all starting — {total} eligible recording(s)");
         let mut done = 0usize;
         for rec_id in recs {
             // Respect an already-in-flight job for this rec_id (a manual
@@ -112,6 +114,10 @@ impl Supervisor {
                 info: format!("{done}/{total}"),
             });
         }
+        info!(
+            "chapters: re-embed-all finished — {total} recording(s) checked in {:.1}s",
+            started.elapsed().as_secs_f64(),
+        );
         let _ = self.events.send(AppEvent::BackgroundTaskFinished {
             id: task_id,
             outcome: crate::events::TaskOutcome::CompletedWithNote(format!("{total} recording(s) checked")),
@@ -138,12 +144,14 @@ impl Supervisor {
             return;
         };
         if !ch::effective_chapters_enabled(&self.store, row.channel.id, row.monitor.id) {
+            debug!(rec_id, channel = %row.channel.name, "chapters: disabled for this instance/channel — skipping");
             let _ = self.store.set_chapters_state(rec_id, "skipped");
             return;
         }
 
         let output = PathBuf::from(&rec.output_path);
         if !crate::iomon::fs::is_file_sync(Cat::Promote, &output) {
+            debug!(rec_id, "chapters: output file not found on disk — deferring");
             return;
         }
 
@@ -163,12 +171,20 @@ impl Supervisor {
         let events = collect_chapter_events(&self.store, &rec, &kinds, &gap_meta);
         let chapters = ch::merge_close_events(events);
         if chapters.is_empty() {
+            debug!(rec_id, "chapters: no chapter-worthy events found — skipping");
             let _ = self.store.set_chapters_state(rec_id, "skipped");
             return;
         }
 
         let task_id = crate::events::next_task_id();
         let channel = archive_channel_name(&self.store, rec_id).unwrap_or_default();
+        info!(
+            rec_id,
+            channel = %channel,
+            "chapters: starting embed — {} marker(s) into {}",
+            chapters.len(),
+            output.display(),
+        );
         let _ = self.events.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
             id: task_id,
             kind: crate::events::BackgroundTaskKind::Chapters(rec_id),
@@ -182,6 +198,7 @@ impl Supervisor {
             let _ = self.events.send(AppEvent::BackgroundTaskFinished { id: task_id, outcome });
         };
 
+        let started = std::time::Instant::now();
         let total_duration = media_duration_secs(&output).await.map(|d| d as f64);
         let ffmetadata = ch::build_ffmetadata(&chapters, total_duration);
         match embed_chapters_into_mkv(&output, &ffmetadata).await {
@@ -191,14 +208,23 @@ impl Supervisor {
                     let _ = self.store.set_chapters_json(rec_id, &json);
                 }
                 let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
-                info!(rec_id, "chapters: embedded {} marker(s)", chapters.len());
+                info!(
+                    rec_id,
+                    "chapters: embedded {} marker(s) in {:.1}s",
+                    chapters.len(),
+                    started.elapsed().as_secs_f64(),
+                );
                 finish(crate::events::TaskOutcome::CompletedWithNote(format!(
                     "{} chapter(s) embedded",
                     chapters.len()
                 )));
             }
             Err(e) => {
-                warn!(rec_id, "chapters: embed failed: {e:#}");
+                warn!(
+                    rec_id,
+                    "chapters: embed failed after {:.1}s: {e:#}",
+                    started.elapsed().as_secs_f64(),
+                );
                 let _ = self.store.set_chapters_state(rec_id, "failed");
                 finish(crate::events::TaskOutcome::Failed(format!("{e:#}")));
             }
