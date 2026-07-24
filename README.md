@@ -1185,16 +1185,33 @@ The last two kinds only apply to takes where [gap splice](#-warnings--lost-segme
 actually completed — for un-spliced takes there's no reliable position to
 anchor them to, so they're silently skipped for that take rather than
 guessed. Timeline positions are computed from wall-clock/offset arithmetic
-(head-backfill duration + gap-splice's own already-computed patch
-positions), not a PTS anchor — deliberately simpler than gap-splice's own
-splice-point math, since a chapter landing a few seconds off its real
-position is a minor cosmetic miss, not a risk to the recording itself.
-Embedding is a separate, non-destructive ffmpeg pass (`-c copy`, chapters
-only — never touches audio/video/subtitle streams or existing metadata
-tags); a take that already got chapters, or was excluded (a recording
-stitched from more than one crash/reconnect leg has no reliable shared
-timeline), shows no badge and is never retried. A **📑 chapters** badge
-appears on the take/stream row once embedding succeeds.
+(head-backfill duration + each spliced patch's position, ffprobed on the
+spot when it isn't already known from the splice that just happened), not a
+PTS anchor — deliberately simpler than gap-splice's own splice-point math,
+since a chapter landing a few seconds off its real position is a minor
+cosmetic miss, not a risk to the recording itself. Embedding is a separate,
+non-destructive ffmpeg pass (`-c copy`, chapters only — never touches
+audio/video/subtitle streams or existing metadata tags); a take that already
+got chapters, or was excluded (a recording stitched from more than one
+crash/reconnect leg has no reliable shared timeline), shows no badge and is
+never retried automatically. A **📑 chapters** badge appears on the
+take/stream row once embedding succeeds.
+
+**Existing recordings, and manual control.** A startup sweep retroactively
+embeds chapters into every already-finalized recording the first time it
+runs after this feature is enabled — no action needed for old recordings.
+For more direct control: right-click a stream/take row → **📑 Embed
+chapters** (or **🔁 Re-embed chapters** once it already has some) to run it
+immediately instead of waiting for a restart, which also works as a retry
+after a `"failed"`/`"skipped"` outcome; and Settings → Downloads → Chapters
+→ **Re-embed chapters** re-runs embedding across every eligible recording in
+one go, including ones that already have chapters — useful after changing
+which kinds are enabled. Both reconstruct "Recovered"/"Muted" gap markers
+from what's still on disk (the pre-splice gap positions plus each patch's
+duration) when they weren't already known from a splice that just
+happened — if a patch was since deleted by a cleanup policy, that
+reconstruction is skipped rather than guessed (title/category/raid chapters
+still embed normally either way).
 
 Toggle: Settings → Downloads → Chapters → *Embed chapters* (default on),
 which the channel Properties dialog and per-instance edit dialog can both

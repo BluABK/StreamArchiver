@@ -173,6 +173,8 @@ impl Supervisor {
             ManualCommand::RenameRecording { rec_id, new_stem } => {
                 self.cmd_rename_recording(rec_id, new_stem)
             }
+            ManualCommand::RetriggerChapters(rec_id) => self.cmd_retrigger_chapters(rec_id),
+            ManualCommand::ReembedChaptersAll => self.cmd_reembed_chapters_all(),
         }
     }
 

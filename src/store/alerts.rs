@@ -467,6 +467,28 @@ impl Store {
         Ok(rows)
     }
 
+    /// Same stability conditions as [`Self::recordings_needing_chapters_check`]
+    /// but WITHOUT the `chapters_state = ''` filter — every recording stable
+    /// enough for chapters to run, regardless of whether it already has
+    /// them. Backs the "Re-embed chapters (all)" bulk action, which resets
+    /// each row's `chapters_state` itself before processing it (e.g. after
+    /// the user changes which chapter kinds are enabled and wants already-
+    /// embedded takes redone too).
+    pub fn recordings_eligible_for_chapters_reembed(&self) -> Result<Vec<i64>> {
+        let conn = self.db();
+        let mut st = conn.prepare(
+            "SELECT r.id FROM recording r
+             WHERE r.status = 'completed'
+               AND r.head_backfill_state != 'queued'
+               AND NOT EXISTS (
+                   SELECT 1 FROM gap_range g
+                   WHERE g.recording_id = r.id AND g.state IN ('pending', 'fetching')
+               )",
+        )?;
+        let rows = st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Recordings that still have pending gap ranges — the finalize-time and
     /// startup sweeps use this to resume unfinished recovery.
     pub fn recordings_with_pending_gaps(&self) -> Result<Vec<i64>> {

@@ -58,6 +58,9 @@ pub enum BackgroundTaskKind {
     /// muted gap-splice segments) into the take's finalized file. Carries
     /// the recording id (mirrors `GapSplice`).
     Chapters(i64),
+    /// Bulk re-embed of chapters across every eligible recording (Settings →
+    /// Downloads → Chapters → "Re-embed chapters"), mirrors `ReRemuxAll`.
+    ReembedChaptersAll,
 }
 
 impl BackgroundTaskKind {
@@ -81,6 +84,7 @@ impl BackgroundTaskKind {
             BackgroundTaskKind::GapRecover(_) => "Gap recovery",
             BackgroundTaskKind::GapSplice(_) => "Gap splice",
             BackgroundTaskKind::Chapters(_) => "Chapters",
+            BackgroundTaskKind::ReembedChaptersAll => "Re-embed chapters (all)",
         }
     }
 }
@@ -492,4 +496,14 @@ pub enum ManualCommand {
     /// and promote it — the Issues fix for a take that finalized 0-byte while
     /// its media survived as parts.
     MergeSplitCapture(i64),
+    /// Manually (re)trigger chapter embedding for one recording now, by
+    /// recording id — the "📑 Embed chapters"/"🔁 Re-embed chapters"
+    /// context-menu action. Resets `chapters_state` back to `""` first, so
+    /// it also works as a retry after a `"failed"`/`"skipped"` outcome or a
+    /// straight re-run after changing which chapter kinds are enabled.
+    RetriggerChapters(i64),
+    /// Bulk re-embed of chapters across every eligible recording (Settings →
+    /// Downloads → Chapters → "Re-embed chapters"), regardless of each
+    /// take's current `chapters_state` — mirrors `ReRemuxAll`.
+    ReembedChaptersAll,
 }

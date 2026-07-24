@@ -3152,6 +3152,28 @@ impl StreamArchiverApp {
                         );
                     ui.label("\"Muted segment start/end\" around patches with silenced audio.");
                     ui.end_row();
+
+                    let chapters_all_running = self
+                        .background_tasks
+                        .iter()
+                        .any(|t| t.kind == crate::events::BackgroundTaskKind::ReembedChaptersAll);
+                    if ui
+                        .add_enabled(!chapters_all_running, egui::Button::new("Re-embed chapters"))
+                        .on_hover_text(
+                            "Re-run chapter embedding across every eligible recording, \
+                             regardless of whether it already has chapters — useful after \
+                             changing which kinds are enabled, or to pick up recordings \
+                             from before this feature existed without waiting for the next \
+                             app restart's automatic sweep. Skips takes still resolving a \
+                             gap-splice or still recording; safe to run any time.",
+                        )
+                        .clicked()
+                    {
+                        self.core.manual(ManualCommand::ReembedChaptersAll);
+                        self.status = "Re-embedding chapters…".into();
+                    }
+                    ui.label("Re-embed chapters for every eligible recording, even ones that already have them.");
+                    ui.end_row();
                 });
         }
     }

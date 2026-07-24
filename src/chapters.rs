@@ -323,6 +323,47 @@ pub fn rebase_to_final_secs(at_secs: f64, head_shift_secs: f64, gaps: &[SplicedG
     (shift + at_secs).max(0.0)
 }
 
+/// Rebuild each gap's `SplicedGap` (including `local_start`/`local_end`) from
+/// data that's always available after the fact — `orig_start`/`orig_end`/
+/// `muted_segs` (persisted `gap_range` rows, never cleared) plus each patch's
+/// ffprobed duration — using the same approximate shift math as
+/// [`rebase_to_final_secs`] itself, since a completed gap-splice's own
+/// transient `local_start`/`local_end` (computed once, PTS-anchored, inside
+/// `gap_splice_job`) are never persisted anywhere.
+///
+/// This is what lets chapters be embedded for a take *after* the fact — a
+/// restart-triggered sweep, a manual retry, or a bulk re-embed — and still
+/// get "Recovered"/"Muted" segment markers, not just title/category/raid.
+///
+/// `gaps` is `(orig_start, orig_end, muted_segs, patch_duration_secs)` per
+/// `"done"` gap range, in any order (sorted internally by `orig_start`).
+/// Deliberately **all-or-nothing**: if any patch's duration is unknown (the
+/// file was disposed by a cleanup policy, or ffprobe failed), the whole
+/// reconstruction is abandoned — a missing duration breaks the cumulative
+/// shift for every later gap too, not just that one, so guessing would
+/// silently mis-place every subsequent chapter in the take. Callers fall
+/// back to an empty `SplicedGap` list (title/category/raid chapters still
+/// work fine without it; only the two gap-derived kinds are lost for this
+/// run).
+pub fn reconstruct_spliced_gaps(
+    gaps: &[(f64, f64, i64, Option<f64>)],
+    head_shift_secs: f64,
+) -> Option<Vec<SplicedGap>> {
+    let mut sorted = gaps.to_vec();
+    sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut shift = head_shift_secs;
+    let mut out = Vec::with_capacity(sorted.len());
+    for (orig_start, orig_end, muted_segs, dur) in sorted {
+        let patch_dur = dur?;
+        let local_start = shift + orig_start;
+        let local_end = local_start + patch_dur;
+        out.push(SplicedGap { local_start, local_end, orig_start, orig_end, muted_segs });
+        shift += patch_dur - (orig_end - orig_start);
+    }
+    Some(out)
+}
+
 // ---------- chapter list construction + ffmetadata ----------
 
 /// One embedded chapter marker: starts at `at_secs`, runs until the next
@@ -543,6 +584,35 @@ mod tests {
         // No head backfill (head_shift=0) vs. a completed one (head_shift=J).
         assert_eq!(rebase_to_final_secs(10.0, 0.0, &[]), 10.0);
         assert_eq!(rebase_to_final_secs(10.0, 45.0, &[]), 55.0);
+    }
+
+    #[test]
+    fn reconstruct_matches_hand_computed_positions_for_two_gaps() {
+        // Gap 1: 100-102 (2s), patch is 3s -> +1s shift after it.
+        // Gap 2: 200-203 (3s), patch is 3s -> +0s shift after it.
+        let gaps = [(200.0, 203.0, 1, Some(3.0)), (100.0, 102.0, 0, Some(3.0))]; // unsorted input
+        let out = reconstruct_spliced_gaps(&gaps, 0.0).unwrap();
+        assert_eq!(
+            out,
+            vec![
+                SplicedGap { local_start: 100.0, local_end: 103.0, orig_start: 100.0, orig_end: 102.0, muted_segs: 0 },
+                SplicedGap { local_start: 201.0, local_end: 204.0, orig_start: 200.0, orig_end: 203.0, muted_segs: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn reconstruct_applies_head_shift() {
+        let gaps = [(100.0, 102.0, 0, Some(2.0))]; // patch same length as gap -> no extra shift
+        let out = reconstruct_spliced_gaps(&gaps, 45.0).unwrap();
+        assert_eq!(out[0].local_start, 145.0);
+        assert_eq!(out[0].local_end, 147.0);
+    }
+
+    #[test]
+    fn reconstruct_is_all_or_nothing_on_a_missing_duration() {
+        let gaps = [(100.0, 102.0, 0, Some(3.0)), (200.0, 203.0, 0, None)];
+        assert_eq!(reconstruct_spliced_gaps(&gaps, 0.0), None);
     }
 
     #[test]

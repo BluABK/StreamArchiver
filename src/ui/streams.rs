@@ -114,6 +114,8 @@ struct StreamsOut {
     archive_vod_now: Option<i64>,
     backfill_head_now: Option<i64>,
     abort_backfill: Option<i64>,
+    /// "📑 Embed chapters"/"🔁 Re-embed chapters" on a take/stream row.
+    retrigger_chapters: Option<i64>,
     /// (recording id, new err_ack value) — "Acknowledge failure" /
     /// "Un-acknowledge" on a failed take/stream row.
     set_err_ack: Option<(i64, bool)>,
@@ -1054,6 +1056,7 @@ impl StreamArchiverApp {
             archive_vod_now,
             backfill_head_now,
             abort_backfill,
+            retrigger_chapters,
             set_err_ack,
             view_chat_rec,
             toggle_channel_enabled,
@@ -1120,6 +1123,10 @@ impl StreamArchiverApp {
         if let Some(rec_id) = abort_backfill {
             self.core.manual(ManualCommand::AbortHeadBackfill(rec_id));
             self.status = "Aborting backfill…".into();
+        }
+        if let Some(rec_id) = retrigger_chapters {
+            self.core.manual(ManualCommand::RetriggerChapters(rec_id));
+            self.status = "Embedding chapters…".into();
         }
         if let Some((rec_id, ack)) = set_err_ack {
             if let Err(e) = self.core.store.set_recording_err_ack(rec_id, ack) {
@@ -2804,6 +2811,27 @@ impl StreamArchiverApp {
                         ui.close();
                     }
                 }
+                if let Some(t) = g.takes.iter().max_by_key(|t| t.started_at)
+                    && t.status == "completed"
+                    && !chapters_running(background_tasks, t.id)
+                {
+                    let label = if t.chapters_state == "done" { "🔁  Re-embed chapters" } else { "📑  Embed chapters" };
+                    if ui
+                        .button(label)
+                        .on_hover_text(
+                            "Embed/refresh chapter markers for this stream's latest take \
+                             now, instead of waiting for the next app restart's automatic \
+                             sweep — also works as a retry after a failed/skipped attempt, \
+                             or to pick up a change to which chapter kinds are enabled. \
+                             No-ops quietly if this take isn't actually eligible (still \
+                             resolving a gap-splice, or a multi-part merged capture).",
+                        )
+                        .clicked()
+                    {
+                        out.retrigger_chapters = Some(t.id);
+                        ui.close();
+                    }
+                }
                 if ui
                     .add_enabled(
                         dir.is_some(),
@@ -3397,6 +3425,24 @@ impl StreamArchiverApp {
                 {
                     out.abort_backfill = Some(t.id);
                     ui.close();
+                }
+                if t.status == "completed" && !chapters_running(background_tasks, t.id) {
+                    let label = if t.chapters_state == "done" { "🔁  Re-embed chapters" } else { "📑  Embed chapters" };
+                    if ui
+                        .button(label)
+                        .on_hover_text(
+                            "Embed/refresh chapter markers for this take now, instead of \
+                             waiting for the next app restart's automatic sweep — also \
+                             works as a retry after a failed/skipped attempt, or to pick up \
+                             a change to which chapter kinds are enabled. No-ops quietly if \
+                             this take isn't actually eligible (still resolving a \
+                             gap-splice, or a multi-part merged capture).",
+                        )
+                        .clicked()
+                    {
+                        out.retrigger_chapters = Some(t.id);
+                        ui.close();
+                    }
                 }
                 if ui
                     .add_enabled(

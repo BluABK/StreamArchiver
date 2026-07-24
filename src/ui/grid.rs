@@ -1411,6 +1411,15 @@ pub(super) fn head_backfill_running(tasks: &[crate::events::BackgroundTask], rec
     })
 }
 
+/// Whether a chapters-embed task is currently working on `rec_id` (either
+/// its own trigger or as part of a "Re-embed chapters (all)" bulk run).
+pub(super) fn chapters_running(tasks: &[crate::events::BackgroundTask], rec_id: i64) -> bool {
+    tasks.iter().any(|t| {
+        matches!(t.kind, crate::events::BackgroundTaskKind::Chapters(rid) if rid == rec_id)
+            || t.kind == crate::events::BackgroundTaskKind::ReembedChaptersAll
+    })
+}
+
 /// Whether a lost-segment recovery task is currently working on `rec_id`.
 pub(super) fn gap_recover_running(tasks: &[crate::events::BackgroundTask], rec_id: i64) -> bool {
     tasks.iter().any(|t| {
