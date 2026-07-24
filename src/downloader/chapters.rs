@@ -49,13 +49,23 @@ impl Supervisor {
     }
 
     /// Startup sweep: anything left over after a restart interrupted
-    /// chapter embedding before it could run (`maybe_spawn_chapters`
-    /// re-checks every precondition itself; this just supplies candidates —
-    /// always with no gap-splice data, matching the "settled" DB read it
-    /// already did).
+    /// chapter embedding before it could run, PLUS — the first time this
+    /// feature runs against an existing library — every pre-existing
+    /// recording, since the new `chapters_state` column defaults to `''`
+    /// for all of them at once. Unlike `sweep_pending_gap_splices` (whose
+    /// candidate list is naturally tiny — it requires an actual `done` gap
+    /// range, rare in practice), this sweep's candidate list can be the
+    /// entire historical library, so it awaits each take's embed pass in
+    /// turn instead of fanning out via `maybe_spawn_chapters` — the same
+    /// "sequential, not fan-out" reasoning `cmd_reembed_chapters_all`
+    /// already applies, to avoid flooding the shared disk-gate with a
+    /// pile of concurrent full-file ffmpeg passes on top of live captures.
     pub async fn sweep_pending_chapters(&self) {
         for rec_id in self.store.recordings_needing_chapters_check().unwrap_or_default() {
-            self.maybe_spawn_chapters(rec_id, Vec::new());
+            if self.chapter_jobs.lock().unwrap().insert(rec_id) {
+                self.chapters_job(rec_id, Vec::new()).await;
+                self.chapter_jobs.lock().unwrap().remove(&rec_id);
+            }
         }
     }
 
