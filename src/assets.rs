@@ -147,6 +147,32 @@ pub fn asset_read_dirs(
     ]
 }
 
+/// Follow a channel container rename: `channel_asset_dir`/`legacy_platform_dir`
+/// key their ENTIRE tree off the channel's display name (`…/channel_assets/
+/// {name}/…` — avatar, banner, emotes, badges, and the cached Twitch chat
+/// name-color all live under it), so without this a rename silently orphans
+/// every cached asset. It doesn't disappear from the UI immediately (this
+/// session's in-memory caches are keyed by channel id, not name), but the next
+/// cold start reads under the new name, finds nothing, and quietly falls back
+/// to defaults — e.g. a manually-observed Twitch name colour reverting to the
+/// generic palette. No-op if the sanitized names match (cosmetic-only change)
+/// or a directory already sits at the destination (another channel's cache;
+/// left alone rather than risk clobbering it — self-heals on the next fetch).
+pub fn rename_channel_asset_dir(old_name: &str, new_name: &str) {
+    let root = crate::app_paths::asset_cache_dir().join("channel_assets");
+    let old_dir = root.join(crate::downloader::sanitize_filename(old_name));
+    let new_dir = root.join(crate::downloader::sanitize_filename(new_name));
+    if old_dir == new_dir
+        || crate::iomon::fs::exists_sync(Cat::AssetCache, &new_dir)
+        || !crate::iomon::fs::is_dir_sync(Cat::AssetCache, &old_dir)
+    {
+        return;
+    }
+    if let Err(e) = crate::iomon::fs::rename_sync(Cat::AssetCache, &old_dir, &new_dir) {
+        warn!("rename_channel_asset_dir: {} -> {}: {e}", old_dir.display(), new_dir.display());
+    }
+}
+
 /// Entries the startup migration moves from a legacy `{name}/{platform}/` dir
 /// into its `{account}/` subdir. STRICTLY allow-listed: `posts/` and
 /// `schedule_src/` hold files whose ABSOLUTE paths are persisted in the DB

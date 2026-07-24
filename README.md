@@ -2211,6 +2211,14 @@ matching instance's account subfolder (a `.accounts_migrated` stamp marks it
 done; already-downloaded community-post and schedule images stay where their
 database records point and re-home on their next fetch).
 
+Because the whole tree is keyed off the channel's **display name**, renaming a
+channel (Properties → Name) moves its `channel_assets/{old name}/` folder to
+`{new name}/` automatically, so the avatar, banner, emotes, and cached Twitch
+name colour follow the rename instead of silently orphaning (previously a
+rename could make a channel look freshly-uncached after the next restart — a
+custom-observed Twitch chat colour, for example, would fall back to the
+generic palette).
+
 **What's fetched, per platform:**
 
 - **Twitch** (needs Twitch credentials — the same app/user token as detection):

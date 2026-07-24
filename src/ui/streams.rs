@@ -446,12 +446,25 @@ impl StreamArchiverApp {
                 };
                 let chapters_scope = crate::chapters::ChaptersScope { enabled: f.chapters_enabled };
                 let res = match id_opt {
-                    Some(id) => self
-                        .core
-                        .store
-                        .rename_channel(id, &name)
-                        .and_then(|()| self.core.store.set_channel_color(id, &color))
-                        .map(|()| id),
+                    Some(id) => {
+                        let old_name = self.channels.iter().find(|c| c.id == id).map(|c| c.name.clone());
+                        let r = self
+                            .core
+                            .store
+                            .rename_channel(id, &name)
+                            .and_then(|()| self.core.store.set_channel_color(id, &color))
+                            .map(|()| id);
+                        // The asset cache tree is keyed by display name, not id —
+                        // follow the rename so avatar/banner/emotes/Twitch name-colour
+                        // don't silently orphan under the old name.
+                        if r.is_ok()
+                            && let Some(old_name) = old_name
+                            && old_name != name
+                        {
+                            crate::assets::rename_channel_asset_dir(&old_name, &name);
+                        }
+                        r
+                    }
                     None => self.core.store.create_container(&name),
                 };
                 match res {
