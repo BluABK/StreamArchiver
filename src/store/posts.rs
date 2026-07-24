@@ -549,7 +549,7 @@ impl Store {
                (SELECT COUNT(*) FROM recording)                                            AS total_recordings,
                (SELECT COALESCE(SUM(bytes), 0) FROM recording)                            AS total_bytes,
                (SELECT COUNT(*) FROM monitor)                                              AS total_monitors,
-               (SELECT COUNT(*) FROM monitor WHERE active = 1)                             AS active_monitors,
+               (SELECT COUNT(*) FROM monitor WHERE enabled = 1)                            AS active_monitors,
                (SELECT COUNT(*) FROM channel)                                              AS total_channels,
                (SELECT COUNT(*) FROM schedule_segment WHERE canceled = 0 AND start_time > ?1) AS upcoming_segments",
             params![now],
