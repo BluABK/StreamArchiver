@@ -135,13 +135,6 @@ impl AppCore {
             })
             .build()?;
         let rt_handle = rt.handle().clone();
-        // Registered here (not the interactive-only main.rs GUI path) so
-        // EVERY entry point — GUI, `--run-for` headless, `--manual-test` —
-        // gets it before anything could reach a settings save or the
-        // dynamic disk-gate adjuster's shrink-reclaim spawn, both of which
-        // need it to spawn safely from a non-runtime thread (egui's UI
-        // thread, or the adjuster's own dedicated std::thread).
-        crate::io_gate::set_runtime_handle(rt_handle.clone());
         let (events, _rx) = bus();
         Ok(Arc::new(AppCore {
             store,

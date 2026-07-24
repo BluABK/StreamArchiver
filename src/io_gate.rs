@@ -255,58 +255,91 @@ struct GateEntry {
     /// cached stale, so it can't drift out of sync with the persisted
     /// config's own flag.
     dynamic: bool,
+    /// Permits still owed back from a shrink that couldn't be reclaimed
+    /// immediately (see `apply_target`) — collected one at a time by
+    /// [`release_permit`] as each currently-outstanding pass actually
+    /// finishes, instead of a background task racing every other waiter
+    /// for the same permits.
+    pending_shrink: u32,
 }
 
 type GateMap = parking_lot::Mutex<std::collections::HashMap<String, GateEntry>>;
 static LOCAL_GATES: OnceLock<GateMap> = OnceLock::new();
 static CDN_GATES: OnceLock<GateMap> = OnceLock::new();
 
-/// The app's Tokio runtime handle, registered once by `AppCore::new` right
-/// after it builds the runtime. Lets the shrink path below spawn its permit-
-/// reclaim task from ANY calling thread — notably the egui/UI thread, which
-/// runs outside the runtime and would panic on a bare `tokio::spawn` (no
-/// reactor entered there). `local_pass`/`cdn_mux` themselves always run as
-/// spawned async tasks already inside the runtime, so this is only load-
-/// bearing for [`set_disk_limits`]'s existing-gate resize on a settings save.
-static RT_HANDLE: OnceLock<tokio::runtime::Handle> = OnceLock::new();
-
-/// Register the runtime handle (see [`RT_HANDLE`]). Call once, right after
-/// building the runtime and before the UI can reach a settings save.
-pub fn set_runtime_handle(handle: tokio::runtime::Handle) {
-    let _ = RT_HANDLE.set(handle);
-}
-
 /// Growth (immediate `add_permits`, waking any pass already parked in
-/// `Semaphore::acquire` in FIFO order) / shrink (background reclaim, takes
-/// effect as running passes finish) to `want` permits on an existing entry —
-/// the mutation core shared by the static config's resize path and the
-/// dynamic adjuster's [`set_dynamic_permits`].
+/// `Semaphore::acquire` in FIFO order) toward `want` permits, or shrink,
+/// on an existing entry — the mutation core shared by the static config's
+/// resize path and the dynamic adjuster's [`set_dynamic_permits`].
+///
+/// Shrinking never blocks and never joins the semaphore's own FIFO wait
+/// queue. Permits sitting idle right now are reclaimed (`forget`)
+/// immediately via a non-blocking `try_acquire_owned`; whatever's still
+/// checked out becomes `pending_shrink` debt, collected one permit at a
+/// time by [`release_permit`] as each already-running pass actually
+/// finishes.
+///
+/// An earlier version of this instead spawned a task that called
+/// `acquire_many_owned` on the excess directly — but that request joins
+/// the SAME FIFO queue every ordinary `local_pass`/`cdn_mux` caller waits
+/// on, at the back of it. A released permit always goes to whoever's been
+/// waiting longest, never to a reclaim task that only just joined the
+/// line — so with a deep pre-existing backlog (dozens of already-queued
+/// passes), the reclaim could starve indefinitely: the live gate would
+/// silently keep running at its old, higher capacity no matter how far the
+/// ceiling was lowered afterward, right when shrinking it mattered most
+/// (a drive already overloaded enough to have built that backlog).
 fn apply_target(e: &mut GateEntry, want: usize) {
     match want.cmp(&e.permits) {
         std::cmp::Ordering::Greater => {
-            e.sem.add_permits(want - e.permits);
+            let mut increase = want - e.permits;
+            // Uncollected shrink debt is still physically in circulation —
+            // growing again just means we no longer want it back, not that
+            // brand new permits are needed on top of it.
+            let cancel = increase.min(e.pending_shrink as usize);
+            e.pending_shrink -= cancel as u32;
+            increase -= cancel;
+            if increase > 0 {
+                e.sem.add_permits(increase);
+            }
             e.permits = want;
         }
         std::cmp::Ordering::Less => {
-            let take = (e.permits - want) as u32;
-            let sem = e.sem.clone();
+            let mut remaining = (e.permits - want) as u32;
             e.permits = want;
-            let reclaim = async move {
-                if let Ok(p) = sem.acquire_many_owned(take).await {
-                    p.forget();
-                }
-            };
-            match RT_HANDLE.get() {
-                Some(h) => {
-                    h.spawn(reclaim);
-                }
-                None => {
-                    tokio::spawn(reclaim);
+            while remaining > 0 {
+                match e.sem.clone().try_acquire_owned() {
+                    Ok(p) => {
+                        p.forget();
+                        remaining -= 1;
+                    }
+                    Err(_) => break,
                 }
             }
+            e.pending_shrink += remaining;
         }
         std::cmp::Ordering::Equal => {}
     }
+}
+
+/// Return a checked-out permit to `key`'s gate on `map` — or, if a shrink
+/// is still owed (see [`apply_target`]), silently `forget` it instead so
+/// the live capacity actually reaches the configured ceiling as the
+/// currently-outstanding excess finishes, one permit per release, without
+/// ever having to out-wait a backlog of ordinary waiters in the
+/// semaphore's own FIFO queue.
+fn release_permit(map: &'static OnceLock<GateMap>, key: &str, permit: OwnedSemaphorePermit) {
+    if let Some(m) = map.get() {
+        let mut g = m.lock();
+        if let Some(e) = g.get_mut(key)
+            && e.pending_shrink > 0
+        {
+            e.pending_shrink -= 1;
+            permit.forget();
+            return;
+        }
+    }
+    drop(permit);
 }
 
 /// Get (or create) the semaphore for `key`. For a STATIC drive
@@ -334,6 +367,7 @@ fn gate_sem(map: &'static OnceLock<GateMap>, key: &str, want: usize, dynamic: bo
         sem: Arc::new(Semaphore::new(if dynamic { 1 } else { want })),
         permits: if dynamic { 1 } else { want },
         dynamic,
+        pending_shrink: 0,
     });
     e.dynamic = dynamic;
     if e.dynamic {
@@ -632,10 +666,13 @@ pub fn local_gate_queue() -> Vec<(String, String, u64)> {
     v
 }
 
-/// Held permit of a local gate; removes its holder entry on drop.
+/// Held permit of a local gate; removes its holder entry on drop and
+/// releases the permit through [`release_permit`] (so a pending shrink can
+/// collect it instead of it just going back to the pool).
 pub struct LocalPass {
     token: u64,
-    _permit: OwnedSemaphorePermit,
+    key: String,
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl LocalPass {
@@ -655,6 +692,9 @@ impl LocalPass {
 impl Drop for LocalPass {
     fn drop(&mut self) {
         LOCAL_HOLDERS.lock().retain(|(t, ..)| *t != self.token);
+        if let Some(permit) = self.permit.take() {
+            release_permit(&LOCAL_GATES, &self.key, permit);
+        }
     }
 }
 
@@ -730,8 +770,8 @@ pub async fn local_pass(label: &str, path: &std::path::Path) -> LocalPass {
             waited.as_secs()
         );
     }
-    LOCAL_HOLDERS.lock().push((token, label.to_string(), key, Instant::now(), None));
-    LocalPass { token, _permit: permit }
+    LOCAL_HOLDERS.lock().push((token, label.to_string(), key.clone(), Instant::now(), None));
+    LocalPass { token, key, permit: Some(permit) }
 }
 
 /// [`local_pass`], but invokes `on_wait(waited_secs, holders, queue_len,
@@ -798,11 +838,28 @@ pub fn paused_wait_info(waited_secs: u64) -> String {
     format!("⏸ paused on this drive ({waited_secs}s) — will resume once unpaused")
 }
 
+/// Held permit of a CDN-mux gate; releases through [`release_permit`] on
+/// drop, same as [`LocalPass`] — so a lowered `cdn_permits` ceiling can
+/// actually shrink the live gate instead of being starved by a backlog
+/// (see `apply_target`'s doc comment).
+pub struct CdnMux {
+    key: String,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl Drop for CdnMux {
+    fn drop(&mut self) {
+        if let Some(permit) = self.permit.take() {
+            release_permit(&CDN_GATES, &self.key, permit);
+        }
+    }
+}
+
 /// Acquire the CDN-mux gate of the disk `path` lives on (permit count per
 /// Settings → per-disk I/O limits; default 2). Head backfills and VOD
 /// recoveries write at network speed — gentler than a local pass, but
 /// unbounded stacking still saturates a drive.
-pub async fn cdn_mux(label: &str, path: &std::path::Path) -> OwnedSemaphorePermit {
+pub async fn cdn_mux(label: &str, path: &std::path::Path) -> CdnMux {
     let key = drive_key(path);
     let limits = limits_for(path);
     let sem = gate_sem(&CDN_GATES, &key, limits.cdn_permits as usize, limits.dynamic);
@@ -815,7 +872,7 @@ pub async fn cdn_mux(label: &str, path: &std::path::Path) -> OwnedSemaphorePermi
             waited.as_secs()
         );
     }
-    permit
+    CdnMux { key, permit: Some(permit) }
 }
 
 /// Set once if the installed ffmpeg rejects `-readrate` (pre-5.0).
@@ -972,10 +1029,10 @@ mod tests {
         assert!(sem.try_acquire_owned().is_err());
         drop(p1);
         drop(p2);
-        // Shrink to 1: gate_sem spawns the reducer; next config read wants 1.
+        // Shrink to 1: both permits are idle right now, so `apply_target`
+        // reclaims one synchronously — no reducer task or yield needed.
         modify_disk_limits(|cfg| cfg.drives.get_mut("S").unwrap().local_permits = 1);
         let _p = local_pass("s3", s).await;
-        tokio::task::yield_now().await; // let the reducer task grab the excess
         let sem = gate_sem(&LOCAL_GATES, "S", 1, false);
         assert!(sem.try_acquire_owned().is_err());
     }
@@ -1139,10 +1196,9 @@ mod tests {
     }
 
     // `#[tokio::test]`, not plain `#[test]`: `modify_disk_limits` resizes
-    // EVERY key in the shared gate maps, not just this test's own — if a
-    // concurrently-running test's drive needs a shrink at that moment, the
-    // reclaim task's spawn needs a runtime on this thread (no RT_HANDLE is
-    // registered in test context, only in AppCore::new for the real app).
+    // EVERY key in the shared gate maps, not just this test's own, and a
+    // concurrently-running sibling test may itself be inside an `.await`
+    // at that moment — sharing a runtime context avoids cross-test panics.
     #[tokio::test]
     async fn resize_existing_gates_skips_dynamic_and_clears_pin_on_exit() {
         let _guard = lock_shared_state();
