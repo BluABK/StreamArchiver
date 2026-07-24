@@ -37,6 +37,7 @@ impl Supervisor {
             gap_jobs: Arc::new(Mutex::new(HashSet::new())),
             gap_splice_jobs: Arc::new(Mutex::new(HashSet::new())),
             head_backfill_aborts: Arc::new(Mutex::new(HashMap::new())),
+            chapter_jobs: Arc::new(Mutex::new(HashSet::new())),
             blocked_notified: Arc::new(Mutex::new(HashMap::new())),
             active_chats,
             stopping_chats: Arc::new(Mutex::new(HashSet::new())),

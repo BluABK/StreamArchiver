@@ -106,15 +106,26 @@ impl Supervisor {
     /// startup sweep for anything missed across a restart.
     pub(super) fn maybe_spawn_gap_splice(&self, rec_id: i64) {
         if !gap_splice_enabled(&self.store) {
+            // Gap-splice itself never runs, so its own completion can never
+            // trigger chapters below — but chapters doesn't need gap-splice
+            // to run, only to be SETTLED one way or another (see
+            // `chapters_job`'s own unsettled-ranges check), so it's safe to
+            // poke it directly here.
+            self.maybe_spawn_chapters(rec_id, Vec::new());
             return;
         }
         if !self.gap_splice_jobs.lock().unwrap().insert(rec_id) {
-            return;
+            return; // already in flight — that call's own completion will trigger chapters
         }
         let this = self.clone();
         tokio::spawn(async move {
-            this.gap_splice_job(rec_id).await;
+            let gap_meta = this.gap_splice_job(rec_id).await;
             this.gap_splice_jobs.lock().unwrap().remove(&rec_id);
+            // Sequenced strictly after the splice attempt (success, failure,
+            // or "nothing to do") so chapter embedding never races
+            // gap-splice's own file rewrite, and reuses its already-computed
+            // gap positions instead of re-deriving them.
+            this.maybe_spawn_chapters(rec_id, gap_meta);
         });
     }
 
@@ -127,8 +138,17 @@ impl Supervisor {
         }
     }
 
-    async fn gap_splice_job(&self, rec_id: i64) {
-        let Some(rec) = self.store.get_recording(rec_id).ok().flatten() else { return };
+    /// Returns the completed splice's per-gap `(local_start, local_end,
+    /// orig_start, orig_end, muted_segs)` data on a successful `"done"`
+    /// outcome (`orig_*` in the raw, broadcast-relative frame `gap_range`
+    /// itself stores) — empty on every other exit path (deferred, blocked,
+    /// or failed). The `maybe_spawn_gap_splice` wrapper feeds this straight
+    /// into `maybe_spawn_chapters` so chapters' "recovered"/"muted" markers
+    /// never have to re-derive gap-splice's own PTS-anchored positions, and
+    /// so chapter embedding is always sequenced strictly after this job
+    /// finishes (never racing its file rewrite).
+    async fn gap_splice_job(&self, rec_id: i64) -> Vec<crate::chapters::SplicedGap> {
+        let Some(rec) = self.store.get_recording(rec_id).ok().flatten() else { return Vec::new() };
         let take_group_size = self.store.recording_take_group_size(rec_id).unwrap_or(1);
         if !gap_splice_precondition_met(
             &rec.status,
@@ -136,12 +156,12 @@ impl Supervisor {
             &rec.gap_splice_state,
             take_group_size,
         ) {
-            return;
+            return Vec::new();
         }
 
         let done = self.store.gap_ranges_in_state(rec_id, "done").unwrap_or_default();
         if done.is_empty() {
-            return; // nothing recovered to splice
+            return Vec::new(); // nothing recovered to splice
         }
         // Belt-and-suspenders: the startup sweep's SQL already filters this,
         // but in-flight trigger sites call this speculatively without that
@@ -149,19 +169,19 @@ impl Supervisor {
         let unsettled = self.store.gap_ranges_in_state(rec_id, "pending").map(|v| !v.is_empty()).unwrap_or(true)
             || self.store.gap_ranges_in_state(rec_id, "fetching").map(|v| !v.is_empty()).unwrap_or(true);
         if unsettled {
-            return;
+            return Vec::new();
         }
 
         let output = PathBuf::from(&rec.output_path);
         if !crate::iomon::fs::is_file_sync(Cat::Promote, &output) {
-            return;
+            return Vec::new();
         }
 
         // ---- PTS anchor: no trustworthy anchor means no splice, full stop ----
         let Some(capture_start_pts) = self.store.recording_capture_start_pts(rec_id).ok().flatten()
         else {
             let _ = self.store.set_gap_splice_state(rec_id, "anchor_failed");
-            return;
+            return Vec::new();
         };
         // Re-verify the anchor still describes THIS file before trusting it
         // for anything — e.g. a head+live join could have re-pointed
@@ -170,27 +190,27 @@ impl Supervisor {
         // captured.
         let Some(fresh_start) = media_start_time_secs(&output).await else {
             let _ = self.store.set_gap_splice_state(rec_id, "anchor_failed");
-            return;
+            return Vec::new();
         };
         if (fresh_start - capture_start_pts).abs() > GAP_SPLICE_ANCHOR_REVALIDATE_TOLERANCE_SECS {
             let _ = self.store.set_gap_splice_state(rec_id, "anchor_failed");
-            return;
+            return Vec::new();
         }
 
         let Some(row) = self.store.get_monitor_with_channel(rec.monitor_id).ok().flatten() else {
-            return;
+            return Vec::new();
         };
         if row.monitor.platform() != Platform::Twitch {
             let _ = self.store.set_gap_splice_state(rec_id, "anchor_failed");
-            return;
+            return Vec::new();
         }
         let Some(login) = crate::detectors::twitch_login(&row.monitor.url) else {
             let _ = self.store.set_gap_splice_state(rec_id, "anchor_failed");
-            return;
+            return Vec::new();
         };
         let (Some(stream_id), Some(went_live)) = (rec.stream_id.clone(), rec.went_live_at) else {
             let _ = self.store.set_gap_splice_state(rec_id, "anchor_failed");
-            return;
+            return Vec::new();
         };
 
         let client = self.ctx.http_client();
@@ -208,10 +228,10 @@ impl Supervisor {
             // VOD gone from the CDN by now — the anchor can't be
             // cross-checked. Leave patches as siblings; nothing lost.
             let _ = self.store.set_gap_splice_state(rec_id, "anchor_failed");
-            return;
+            return Vec::new();
         };
 
-        let Some(out_dir) = output.parent().map(Path::to_path_buf) else { return };
+        let Some(out_dir) = output.parent().map(Path::to_path_buf) else { return Vec::new() };
         let cache = cache_dir(&out_dir);
         let _ = crate::iomon::fs::create_dir_all(Cat::Promote, &cache).await;
         set_cache_hidden(&cache);
@@ -228,14 +248,14 @@ impl Supervisor {
                 || !crate::iomon::fs::is_file_sync(Cat::Promote, Path::new(&g.out_path))
             {
                 let _ = self.store.set_gap_splice_state(rec_id, "anchor_failed");
-                return;
+                return Vec::new();
             }
             let (Some(seg_start_pts), Some(seg_end_pts)) = (
                 crate::recovery::segment_start_secs_at(&client, &found.url, max_conc, &cache, g.start_secs).await,
                 crate::recovery::segment_start_secs_at(&client, &found.url, max_conc, &cache, g.end_secs).await,
             ) else {
                 let _ = self.store.set_gap_splice_state(rec_id, "anchor_failed");
-                return;
+                return Vec::new();
             };
             let (Some(local_start), Some(local_end)) = (
                 pts_gap_position(
@@ -252,11 +272,11 @@ impl Supervisor {
                 ),
             ) else {
                 let _ = self.store.set_gap_splice_state(rec_id, "anchor_failed");
-                return;
+                return Vec::new();
             };
             if local_end <= local_start {
                 let _ = self.store.set_gap_splice_state(rec_id, "anchor_failed");
-                return;
+                return Vec::new();
             }
             local_gaps.push((local_start, local_end, PathBuf::from(&g.out_path)));
         }
@@ -264,7 +284,7 @@ impl Supervisor {
         // ---- codec compatibility gate ----
         let Some(base_info) = probe_media(&rec.output_path).await else {
             let _ = self.store.set_gap_splice_state(rec_id, "mismatch");
-            return;
+            return Vec::new();
         };
         let mut patch_durations = Vec::with_capacity(local_gaps.len());
         for (_, _, patch) in &local_gaps {
@@ -288,7 +308,7 @@ impl Supervisor {
                 );
                 let _ = self.store.set_gap_splice_state(rec_id, "mismatch");
                 let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
-                return;
+                return Vec::new();
             }
             let dur = match patch_info.as_ref().and_then(|i| i.duration_secs) {
                 Some(d) => d as f64,
@@ -296,7 +316,7 @@ impl Supervisor {
                     Some(d) => d as f64,
                     None => {
                         let _ = self.store.set_gap_splice_state(rec_id, "verify_failed");
-                        return;
+                        return Vec::new();
                     }
                 },
             };
@@ -304,7 +324,7 @@ impl Supervisor {
         }
 
         let Some(stem) = output.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
-            return;
+            return Vec::new();
         };
 
         let task_id = crate::events::next_task_id();
@@ -336,7 +356,7 @@ impl Supervisor {
             let _ = self.store.set_gap_splice_state(rec_id, "verify_failed");
             finish(crate::events::TaskOutcome::Failed(format!("{e:#}")));
             let _ = crate::iomon::fs::remove_file(Cat::Promote, &tmp).await;
-            return;
+            return Vec::new();
         }
 
         // ---- verification: per-seam landed position, then aggregate duration ----
@@ -371,7 +391,7 @@ impl Supervisor {
             let _ = self.store.set_gap_splice_state(rec_id, "verify_failed");
             finish(crate::events::TaskOutcome::Failed("verification failed".into()));
             let _ = crate::iomon::fs::remove_file(Cat::Promote, &tmp).await;
-            return;
+            return Vec::new();
         }
 
         // Idempotency: another trigger may have already spliced while we
@@ -387,7 +407,7 @@ impl Supervisor {
         {
             let _ = crate::iomon::fs::remove_file(Cat::Promote, &tmp).await;
             finish(crate::events::TaskOutcome::Completed);
-            return;
+            return Vec::new();
         }
 
         match rename_or_shorten(&tmp, &out_dir, &stem, "gapless.mkv").await {
@@ -399,9 +419,23 @@ impl Supervisor {
                     warn!(rec_id, "gap splice: could not re-point output_path: {e:#}");
                     let _ = self.store.set_gap_splice_state(rec_id, "verify_failed");
                     finish(crate::events::TaskOutcome::Failed(format!("{e:#}")));
-                    return;
+                    return Vec::new();
                 }
                 let _ = self.store.set_gap_splice_state(rec_id, "done");
+                // For chapters' "recovered"/"muted" markers — `local_gaps`
+                // and `sorted` were built in lockstep (one entry each per
+                // "done" gap range, same order), so zipping them is safe.
+                let gap_meta: Vec<crate::chapters::SplicedGap> = sorted
+                    .iter()
+                    .zip(local_gaps.iter())
+                    .map(|(g, (local_start, local_end, _))| crate::chapters::SplicedGap {
+                        local_start: *local_start,
+                        local_end: *local_end,
+                        orig_start: g.start_secs,
+                        orig_end: g.end_secs,
+                        muted_segs: g.muted_segs,
+                    })
+                    .collect();
                 let note = self.post_gap_splice_cleanup(rec_id, &output, &sorted, &dest).await;
                 let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
                 info!(rec_id, "gap splice: gapless file ready at {} ({note})", dest.display());
@@ -409,11 +443,13 @@ impl Supervisor {
                     "{} gap(s) spliced in ({note})",
                     local_gaps.len()
                 )));
+                gap_meta
             }
             Err(e) => {
                 warn!(rec_id, "gap splice: promote failed: {e:#}");
                 let _ = self.store.set_gap_splice_state(rec_id, "verify_failed");
                 finish(crate::events::TaskOutcome::Failed(format!("promote: {e}")));
+                Vec::new()
             }
         }
     }

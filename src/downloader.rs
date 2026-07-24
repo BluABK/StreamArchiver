@@ -154,6 +154,7 @@ mod ad_probe;
 mod alerts;
 mod backfill;
 mod cache;
+mod chapters;
 mod finalize;
 mod gap_recover;
 mod gap_splice;
@@ -366,6 +367,10 @@ pub struct Supervisor {
     /// presence in this map IS "a backfill is running for this rec_id",
     /// shared with the UI via `Supervisor::abort_head_backfill`.
     head_backfill_aborts: Arc<Mutex<HashMap<i64, Arc<AtomicBool>>>>,
+    /// rec_ids with a chapters-embed job in flight — `maybe_spawn_chapters`
+    /// is called speculatively from several places, same shape as
+    /// `gap_jobs`/`gap_splice_jobs`.
+    chapter_jobs: Arc<Mutex<HashSet<i64>>>,
 }
 
 /// Why automatic restarts are suppressed for a monitor after a user Stop.

@@ -179,6 +179,7 @@ pub(super) fn recording_from_detached(row: &DetachedRow) -> Recording {
         trigger_rule_json: String::new(),
         err_ack: false,
         sabr_live_edge_fallback: false,
+        chapters_state: String::new(),
     }
 }
 

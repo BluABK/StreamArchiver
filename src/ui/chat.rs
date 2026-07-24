@@ -2742,6 +2742,7 @@ mod tests {
             vod_views: None,
             err_ack: false,
             sabr_live_edge_fallback: false,
+            chapters_state: String::new(),
         }
     }
 

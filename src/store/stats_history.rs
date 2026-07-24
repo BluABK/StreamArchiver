@@ -229,6 +229,42 @@ impl Store {
         Ok(rows)
     }
 
+    /// All stream events for one monitor in `[since, until]`, chronological —
+    /// the chapters feature's raid lookup (unlike `stream_events_range`,
+    /// scoped by monitor rather than by channel, since a chapters run is
+    /// always for one specific take).
+    pub fn stream_events_for_monitor_range(
+        &self,
+        monitor_id: i64,
+        since: i64,
+        until: i64,
+    ) -> Result<Vec<StreamEventRow>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT monitor_id, at, stream_id, kind, actor, target, amount, tier, detail, id
+             FROM stream_event
+             WHERE monitor_id = ?1 AND at >= ?2 AND at <= ?3
+             ORDER BY at",
+        )?;
+        let rows = stmt
+            .query_map(params![monitor_id, since, until], |r| {
+                Ok(StreamEventRow {
+                    monitor_id: r.get(0)?,
+                    at: r.get(1)?,
+                    stream_id: r.get(2)?,
+                    kind: r.get(3)?,
+                    actor: r.get(4)?,
+                    target: r.get(5)?,
+                    amount: r.get(6)?,
+                    tier: r.get(7)?,
+                    detail: r.get(8)?,
+                    id: r.get(9)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// The hype-scoreable contributions for one monitor in `[since, until)`:
     /// `(kind, actor, amount, tier)`, oldest first. Feeds
     /// `hype::observed_burst` (retro-analysis of a train's run-up).

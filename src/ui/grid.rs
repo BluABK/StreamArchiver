@@ -1271,6 +1271,7 @@ pub(super) fn take_status_badges(
     backfill_running: bool,
     backfill_queued: bool,
     sabr_live_edge_fallback: bool,
+    chapters_state: &str,
     gap_recover_running: bool,
     // Capture-alert rollup for this take (or summed over a stream's takes).
     alert: Option<&crate::store::RecAlertBadge>,
@@ -1317,6 +1318,14 @@ pub(super) fn take_status_badges(
                  start stalled immediately — captured from the live edge instead. There is \
                  no missed-intro head for this take and there never will be; this isn't a \
                  failure, just a limitation of how far back SABR can rewind.",
+            );
+    }
+    if chapters_state == "done" {
+        ui.colored_label(egui::Color32::from_rgb(140, 160, 220), "📑 chapters")
+            .on_hover_text(
+                "Chapter markers (title/category changes, raids, recovered/muted gap-splice \
+                 segments) are embedded in this file — open it in a player that shows \
+                 chapters (e.g. mpv, VLC) to scrub through them.",
             );
     }
     if gap_recover_running {

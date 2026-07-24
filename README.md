@@ -1159,6 +1159,49 @@ button opens the folder with the recovered files. Toggle: Settings → Downloads
 Twitch VOD recovery → *Recover lost segments automatically* (default on);
 per-range failures retry up to 5 times and never affect the capture itself.
 
+### Chapters 📑
+
+Once a take's file is stable — finished, no head backfill pending, and any
+gap-splice attempt for it resolved one way or another — the app can embed
+chapter markers into the finalized MKV so it's easy to scrub through in a
+player (mpv, VLC, …). Five independently-toggleable kinds:
+- **Title changes** and **category/game changes** — one chapter per change,
+  from the same title/category history the 📝 popup already shows. A title
+  and category change landing within 30s of each other merge into one
+  *"{category} — {title}"* chapter instead of two.
+- **Raids** — one chapter per raid at or above a configurable minimum
+  viewer count (default 50), so a string of 1-2-viewer raids doesn't spam
+  the chapter list.
+- **Recovered gap-splice segments** — brackets every successfully spliced
+  lost-segment patch with *"Recovered segment start"*/*"Recovered segment
+  end"* chapters, regardless of mute status, so a recovery fix is easy to
+  spot-check later.
+- **Muted gap-splice segments** — independently brackets only the spliced
+  patches whose recovery needed Twitch's muted-fallback copy, with *"Muted
+  segment start"*/*"Muted segment end"* chapters (can coexist with
+  "Recovered segment" markers on the same patch).
+
+The last two kinds only apply to takes where [gap splice](#-warnings--lost-segment-recovery)
+actually completed — for un-spliced takes there's no reliable position to
+anchor them to, so they're silently skipped for that take rather than
+guessed. Timeline positions are computed from wall-clock/offset arithmetic
+(head-backfill duration + gap-splice's own already-computed patch
+positions), not a PTS anchor — deliberately simpler than gap-splice's own
+splice-point math, since a chapter landing a few seconds off its real
+position is a minor cosmetic miss, not a risk to the recording itself.
+Embedding is a separate, non-destructive ffmpeg pass (`-c copy`, chapters
+only — never touches audio/video/subtitle streams or existing metadata
+tags); a take that already got chapters, or was excluded (a recording
+stitched from more than one crash/reconnect leg has no reliable shared
+timeline), shows no badge and is never retried. A **📑 chapters** badge
+appears on the take/stream row once embedding succeeds.
+
+Toggle: Settings → Downloads → Chapters → *Embed chapters* (default on),
+which the channel Properties dialog and per-instance edit dialog can both
+override (Inherit / On / Off, same chain as every other feature toggle).
+The four/five event kinds and the raid viewer threshold are global-only
+settings in the same section.
+
 ### Twitch ad-break detection
 
 Streamlink already cuts Twitch ads out of the recording on its own (each

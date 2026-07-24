@@ -2581,6 +2581,14 @@ pub struct Recording {
     /// missed-intro head even though the monitor is configured
     /// capture-from-start.
     pub sabr_live_edge_fallback: bool,
+    /// `""` (not attempted — also the required precondition for the
+    /// chapters trigger), `"queued"`, `"done"` (terminal), `"skipped"`
+    /// (feature disabled or take excluded, e.g. multi-part merged), or
+    /// `"failed"` (the embed pass itself errored; file left untouched).
+    /// Unlike `gap_splice_state`/`head_backfill_state` this is purely
+    /// additive metadata, not a media-integrity concern — no Issues-panel
+    /// section needed. See `crate::chapters`.
+    pub chapters_state: String,
 }
 
 /// A take awaiting a head-backfill decision — the Background view's "Planned"
@@ -3092,6 +3100,7 @@ mod tests {
             trigger_rule_json: String::new(),
             err_ack: false,
             sabr_live_edge_fallback: false,
+            chapters_state: String::new(),
         }
     }
 

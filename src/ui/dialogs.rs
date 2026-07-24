@@ -2260,6 +2260,16 @@ impl StreamArchiverApp {
                             );
                         ui.end_row();
 
+                        ui.label("Embed chapters");
+                        tristate_combo(ui, "form_chapters_enabled", &mut form.chapters_enabled)
+                            .on_hover_text(
+                                "Embed chapter markers (title/category changes, raids, \
+                                 recovered/muted gap-splice segments) into finalized recordings \
+                                 for this instance. Inherit follows the channel, then the global \
+                                 default (Settings → Downloads → Chapters).",
+                            );
+                        ui.end_row();
+
                         ui.label("Pin as preferred platform");
                         ui.checkbox(&mut form.primary_pin, "").on_hover_text(
                             "Always show THIS instance's info on the channel row while it's \

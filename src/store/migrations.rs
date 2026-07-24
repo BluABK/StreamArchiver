@@ -1357,7 +1357,21 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 68)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 68);
+        if version < 69 {
+            // Chapters state — same shape as `gap_splice_state`/
+            // `head_backfill_state`: "" = not attempted (also the required
+            // precondition for the chapters trigger), "queued", "done"
+            // (terminal), "skipped" (feature off or take excluded, e.g.
+            // multi-part merged), "failed" (embed pass itself errored, file
+            // untouched). Unlike gap_splice_state/head_backfill_state this
+            // is purely additive metadata, not a media-integrity concern —
+            // no Issues-panel section needed, so no partial-index either.
+            conn.execute_batch(
+                "ALTER TABLE recording ADD COLUMN chapters_state TEXT NOT NULL DEFAULT '';",
+            )?;
+            conn.pragma_update(None, "user_version", 69)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 69);
         Ok(())
     }
 }

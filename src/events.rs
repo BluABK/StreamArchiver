@@ -54,6 +54,10 @@ pub enum BackgroundTaskKind {
     /// Splicing recovered gap patches into the take's main file so the
     /// result is gapless. Carries the recording id (mirrors `GapRecover`).
     GapSplice(i64),
+    /// Embedding chapter markers (title/category changes, raids, recovered/
+    /// muted gap-splice segments) into the take's finalized file. Carries
+    /// the recording id (mirrors `GapSplice`).
+    Chapters(i64),
 }
 
 impl BackgroundTaskKind {
@@ -76,6 +80,7 @@ impl BackgroundTaskKind {
             BackgroundTaskKind::HeadBackfill(_) => "Head backfill",
             BackgroundTaskKind::GapRecover(_) => "Gap recovery",
             BackgroundTaskKind::GapSplice(_) => "Gap splice",
+            BackgroundTaskKind::Chapters(_) => "Chapters",
         }
     }
 }

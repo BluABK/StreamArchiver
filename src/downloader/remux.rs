@@ -974,6 +974,66 @@ pub async fn embed_subtitles_into_mkv(mkv: &Path) -> anyhow::Result<bool> {
     Ok(true)
 }
 
+/// Embed chapter markers into an existing MKV file in-place (same temp-file,
+/// atomic-replace idiom as [`embed_thumbnail_into_mkv`] and
+/// [`embed_subtitles_into_mkv`]). `ffmetadata` is an already-built
+/// `;FFMETADATA1` chapters body (see `crate::chapters::build_ffmetadata`).
+/// `-map_metadata 0` keeps the container's own existing global metadata
+/// (e.g. the title tag `promote_capture` already set) untouched — chapters
+/// are pulled from the new input via `-map_chapters 1` only.
+pub async fn embed_chapters_into_mkv(mkv: &Path, ffmetadata: &str) -> anyhow::Result<()> {
+    let chapters_txt = mkv.with_extension("chapters.ffmeta.txt");
+    crate::iomon::fs::write(Cat::ConcatList, &chapters_txt, ffmetadata).await?;
+    let tmp = mkv.with_extension("tmp.mkv");
+    // One full-file pass at a time on the recordings drive (see io_gate).
+    let gate =
+        crate::io_gate::local_pass(&crate::io_gate::gate_label("embed-chapters", mkv), mkv).await;
+    let out = loop {
+        let readrate = crate::io_gate::readrate_for(mkv);
+        let mut cmd = Command::new("ffmpeg");
+        cmd.arg("-y");
+        if let Some(rate) = readrate {
+            cmd.arg("-readrate").arg(format!("{rate}"));
+        }
+        cmd.arg("-i").arg(mkv)
+            .arg("-i").arg(&chapters_txt)
+            .arg("-map").arg("0")
+            .arg("-map_metadata").arg("0")
+            .arg("-map_chapters").arg("1")
+            .arg("-c").arg("copy")
+            .arg(&tmp)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        // spawn + wait_with_output (≡ output()) so the PID is sampleable.
+        let child = cmd.spawn()?;
+        let _io_guard = crate::iomon::track_tool(child.id(), "ffmpeg", "embed-chapters", mkv);
+        if let Some(pid) = child.id() {
+            gate.set_pid(pid);
+        }
+        let out = child.wait_with_output().await?;
+        if !out.status.success()
+            && readrate.is_some()
+            && crate::io_gate::is_readrate_error(&String::from_utf8_lossy(&out.stderr))
+        {
+            crate::io_gate::mark_readrate_unsupported();
+            continue; // retry without the throttle
+        }
+        break out;
+    };
+    let _ = crate::iomon::fs::remove_file(Cat::ConcatList, &chapters_txt).await;
+    if !out.status.success() {
+        let _ = crate::iomon::fs::remove_file(Cat::Thumbnail, &tmp).await;
+        let tail = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("ffmpeg embed-chapters failed: {}", tail.trim().lines().last().unwrap_or(""));
+    }
+    crate::iomon::fs::rename(Cat::Thumbnail, &tmp, mkv).await?;
+    Ok(())
+}
+
 /// Extract the language code from a subtitle sidecar's name relative to `mkv`'s
 /// stem (`{stem}.en.vtt` -> `Some("en")`; `{stem}.vtt` -> `None`, no code present).
 pub(super) fn subtitle_lang_from_name(mkv: &Path, sub: &Path) -> Option<String> {

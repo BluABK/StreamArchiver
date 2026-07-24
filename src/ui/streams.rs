@@ -22,6 +22,9 @@ pub(super) struct ChannelForm {
     /// Preferred platform when this channel has multiple instances
     /// simultaneously live (`None` = inherit the global default).
     pub(super) primary_platform_pref: Option<Platform>,
+    /// Chapter-embedding master toggle override for this channel (`None` =
+    /// inherit global).
+    pub(super) chapters_enabled: Option<bool>,
 }
 /// Background load state of an import fetch (followed/subscriptions).
 pub(super) enum ImportLoadState {
@@ -377,6 +380,17 @@ impl StreamArchiverApp {
                                      (Settings → Interface → Display).",
                                 );
                             ui.end_row();
+
+                            ui.label("Embed chapters");
+                            tristate_combo(ui, "chform_chapters_enabled", &mut f.chapters_enabled)
+                                .on_hover_text(
+                                    "Embed chapter markers (title/category changes, raids, \
+                                     recovered/muted gap-splice segments) into finalized \
+                                     recordings for every instance in this channel. Inherit \
+                                     follows the global default (Settings → Downloads → \
+                                     Chapters).",
+                                );
+                            ui.end_row();
                         });
                     if !renaming {
                         ui.label(
@@ -424,6 +438,7 @@ impl StreamArchiverApp {
                     // yet — always inherits the global setting for now.
                     gap_splice_cleanup: None,
                 };
+                let chapters_scope = crate::chapters::ChaptersScope { enabled: f.chapters_enabled };
                 let res = match id_opt {
                     Some(id) => self
                         .core
@@ -449,6 +464,11 @@ impl StreamArchiverApp {
                             &self.core.store,
                             cid,
                             &disposal_scope,
+                        );
+                        let _ = crate::chapters::save_channel_chapters_scope(
+                            &self.core.store,
+                            cid,
+                            &chapters_scope,
                         );
                         let _ = crate::platform_pref::save_channel_primary_platform(
                             &self.core.store,
@@ -1166,6 +1186,7 @@ impl StreamArchiverApp {
                 mf.join_cleanup = dsc.join_cleanup;
                 mf.disposal_method = dsc.method;
                 mf.primary_pin = crate::platform_pref::monitor_is_pinned(&self.core.store, r.monitor.id);
+                mf.chapters_enabled = crate::chapters::load_monitor_chapters_scope(&self.core.store, r.monitor.id).enabled;
                 self.form = Some(mf);
             }
         }
@@ -1232,6 +1253,7 @@ impl StreamArchiverApp {
                 let hbsc = crate::head_backfill::load_channel_head_backfill_scope(&self.core.store, cid);
                 let dsc = crate::disposal::load_channel_disposal_scope(&self.core.store, cid);
                 let platform_pref = crate::platform_pref::channel_primary_platform(&self.core.store, cid);
+                let chsc = crate::chapters::load_channel_chapters_scope(&self.core.store, cid);
                 self.channel_form = Some(ChannelForm {
                     id: Some(cid),
                     name: c.name.clone(),
@@ -1243,6 +1265,7 @@ impl StreamArchiverApp {
                     join_cleanup: dsc.join_cleanup,
                     disposal_method: dsc.method,
                     primary_platform_pref: platform_pref,
+                    chapters_enabled: chsc.enabled,
                 });
             }
         }
@@ -2473,6 +2496,7 @@ impl StreamArchiverApp {
                         });
                         let sabr_live_edge_fallback =
                             g.takes.iter().any(|t| t.sabr_live_edge_fallback);
+                        let chapters_done = g.takes.iter().any(|t| t.chapters_state == "done");
                         // Alert rollup over this stream's takes (a dual
                         // capture's legs and retakes sum into one badge).
                         let alert_agg = {
@@ -2502,6 +2526,7 @@ impl StreamArchiverApp {
                             backfill_running,
                             backfill_queued,
                             sabr_live_edge_fallback,
+                            if chapters_done { "done" } else { "" },
                             gap_running,
                             alert_agg.as_ref(),
                         ) {
@@ -3053,6 +3078,7 @@ impl StreamArchiverApp {
                             head_backfill_running(background_tasks, t.id),
                             t.head_backfill_state == "queued",
                             t.sabr_live_edge_fallback,
+                            &t.chapters_state,
                             gap_recover_running(background_tasks, t.id),
                             rec_alerts.get(&t.id),
                         ) {

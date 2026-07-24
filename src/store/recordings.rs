@@ -234,6 +234,17 @@ impl Store {
         Ok(())
     }
 
+    /// Set/clear a recording's chapters-embed state — see
+    /// [`crate::models::Recording::chapters_state`].
+    pub fn set_chapters_state(&self, id: i64, state: &str) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE recording SET chapters_state=?2 WHERE id=?1",
+            params![id, state],
+        )?;
+        Ok(())
+    }
+
     /// How many recording rows share `id`'s `take_group` (including itself)
     /// — `1` for a solo take or one with no take_group at all. Gap-splice's
     /// split-part exclusion: a take stitched from more than one leg
@@ -736,7 +747,7 @@ impl Store {
                     vod_dl_state, vod_dl_path, vod_dl_video_id,
                     backfill_path, full_path, COALESCE(trigger_info, ''),
                     head_backfill_state, COALESCE(trigger_rule_json, ''), vod_views,
-                    gap_splice_state, err_ack, sabr_live_edge_fallback
+                    gap_splice_state, err_ack, sabr_live_edge_fallback, chapters_state
              FROM recording WHERE monitor_id = ?1 ORDER BY started_at, id",
         )?;
         let rows = stmt
@@ -779,6 +790,7 @@ impl Store {
                     gap_splice_state: r.get(34)?,
                     err_ack: r.get::<_, i64>(35)? != 0,
                     sabr_live_edge_fallback: r.get::<_, i64>(36)? != 0,
+                    chapters_state: r.get(37)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -806,7 +818,7 @@ impl Store {
             vod_dl_state, vod_dl_path, vod_dl_video_id,
             backfill_path, full_path, COALESCE(trigger_info, ''),
             head_backfill_state, COALESCE(trigger_rule_json, ''), vod_views,
-            gap_splice_state, err_ack, sabr_live_edge_fallback";
+            gap_splice_state, err_ack, sabr_live_edge_fallback, chapters_state";
 
     fn map_recording_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::models::Recording> {
         Ok(crate::models::Recording {
@@ -847,6 +859,7 @@ impl Store {
             gap_splice_state: r.get(34)?,
             err_ack: r.get::<_, i64>(35)? != 0,
             sabr_live_edge_fallback: r.get::<_, i64>(36)? != 0,
+            chapters_state: r.get(37)?,
         })
     }
 
@@ -989,6 +1002,7 @@ impl Store {
                     gap_splice_state: String::new(),
                     err_ack: false,
                     sabr_live_edge_fallback: false,
+                    chapters_state: String::new(),
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1054,6 +1068,7 @@ impl Store {
                     gap_splice_state: String::new(),
                     err_ack: false,
                     sabr_live_edge_fallback: false,
+                    chapters_state: String::new(),
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1142,6 +1157,7 @@ impl Store {
                     gap_splice_state: String::new(),
                     err_ack: false,
                     sabr_live_edge_fallback: false,
+                    chapters_state: String::new(),
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1223,6 +1239,7 @@ impl Store {
                     gap_splice_state: String::new(),
                     err_ack: false,
                     sabr_live_edge_fallback: false,
+                    chapters_state: String::new(),
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1284,6 +1301,7 @@ impl Store {
                     gap_splice_state: String::new(),
                     err_ack: false,
                     sabr_live_edge_fallback: false,
+                    chapters_state: String::new(),
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1483,6 +1501,7 @@ impl Store {
                     gap_splice_state: String::new(),
                     err_ack: false,
                     sabr_live_edge_fallback: false,
+                    chapters_state: String::new(),
                     trigger_rule_json: String::new(),
                 })
             })?

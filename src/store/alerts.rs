@@ -133,7 +133,6 @@ pub struct GapRangeRow {
     /// folder).
     pub out_path: String,
     /// Muted-fallback segments inside the recovered patch (0 = clean audio).
-    #[allow(dead_code)]
     pub muted_segs: i64,
 }
 
@@ -434,6 +433,31 @@ impl Store {
              WHERE r.gap_splice_state = ''
                AND r.status = 'completed'
                AND EXISTS (SELECT 1 FROM gap_range g WHERE g.recording_id = r.id AND g.state = 'done')
+               AND NOT EXISTS (
+                   SELECT 1 FROM gap_range g
+                   WHERE g.recording_id = r.id AND g.state IN ('pending', 'fetching')
+               )",
+        )?;
+        let rows = st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Recordings that are stable enough for chapter embedding to run
+    /// (finished, no pending head-backfill, no gap ranges still resolving —
+    /// deliberately NOT gated on `gap_splice_state` itself: an empty state
+    /// there can mean "nothing to splice, permanently" just as easily as
+    /// "gap-splice is disabled", and both are fine for chapters to proceed
+    /// against, treating any patches as un-spliced siblings) and haven't had
+    /// chapters embedded yet (`chapters_state = ''`) — the startup sweep's
+    /// candidate list; `maybe_spawn_chapters` re-checks every other
+    /// precondition itself.
+    pub fn recordings_needing_chapters_check(&self) -> Result<Vec<i64>> {
+        let conn = self.db();
+        let mut st = conn.prepare(
+            "SELECT r.id FROM recording r
+             WHERE r.chapters_state = ''
+               AND r.status = 'completed'
+               AND r.head_backfill_state != 'queued'
                AND NOT EXISTS (
                    SELECT 1 FROM gap_range g
                    WHERE g.recording_id = r.id AND g.state IN ('pending', 'fetching')

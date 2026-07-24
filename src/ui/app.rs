@@ -245,6 +245,13 @@ impl StreamArchiverApp {
                 crate::disposal::K_GAP_SPLICE_CLEANUP,
             ))
             .unwrap_or_default(),
+            chapters_enabled: crate::chapters::global_chapters_enabled(&core.store),
+            chapters_title: core.store.get_setting(crate::chapters::K_CHAPTERS_TITLE).ok().flatten().is_none_or(|v| v != "0"),
+            chapters_category: core.store.get_setting(crate::chapters::K_CHAPTERS_CATEGORY).ok().flatten().is_none_or(|v| v != "0"),
+            chapters_raid: core.store.get_setting(crate::chapters::K_CHAPTERS_RAID).ok().flatten().is_none_or(|v| v != "0"),
+            chapters_recovered_segments: core.store.get_setting(crate::chapters::K_CHAPTERS_RECOVERED).ok().flatten().is_none_or(|v| v != "0"),
+            chapters_muted_segments: core.store.get_setting(crate::chapters::K_CHAPTERS_MUTED).ok().flatten().is_none_or(|v| v != "0"),
+            chapters_raid_min_viewers: setting_or_empty(&core, crate::chapters::K_CHAPTERS_RAID_MIN_VIEWERS),
             auto_recover_muted: setting_or_empty(&core, crate::recovery::K_AUTO_RECOVER_MUTED) == "1",
             auto_recover_deleted: setting_or_empty(&core, crate::recovery::K_AUTO_RECOVER_DELETED) == "1",
             recovery_cdn_hosts: setting_or_empty(&core, crate::recovery::K_RECOVERY_CDN_HOSTS),
@@ -1249,6 +1256,7 @@ impl StreamArchiverApp {
             gap_splice_cleanup: None,
         };
         let primary_pin = form.primary_pin;
+        let chapters_scope = crate::chapters::ChaptersScope { enabled: form.chapters_enabled };
 
         // Close the form immediately so the UI stays responsive while the DB
         // work runs. On a background-thread error the status bar shows the error;
@@ -1298,6 +1306,7 @@ impl StreamArchiverApp {
                         &head_backfill_scope,
                     );
                     let _ = crate::disposal::save_monitor_disposal_scope(&store, mid, &disposal_scope);
+                    let _ = crate::chapters::save_monitor_chapters_scope(&store, mid, &chapters_scope);
                     let _ = crate::platform_pref::save_monitor_pin(&store, mid, primary_pin);
                     let rows = store.list_monitors_with_channels().map_err(|e| e.to_string())?;
                     let next_streams =
@@ -1625,6 +1634,13 @@ impl StreamArchiverApp {
             (crate::downloader::K_GAP_RECOVER, if s.gap_recover { "1" } else { "0" }),
             (crate::downloader::K_GAP_SPLICE, if s.gap_splice { "1" } else { "0" }),
             (crate::disposal::K_GAP_SPLICE_CLEANUP, s.gap_splice_cleanup.as_str()),
+            (crate::chapters::K_CHAPTERS_ENABLED, if s.chapters_enabled { "1" } else { "0" }),
+            (crate::chapters::K_CHAPTERS_TITLE, if s.chapters_title { "1" } else { "0" }),
+            (crate::chapters::K_CHAPTERS_CATEGORY, if s.chapters_category { "1" } else { "0" }),
+            (crate::chapters::K_CHAPTERS_RAID, if s.chapters_raid { "1" } else { "0" }),
+            (crate::chapters::K_CHAPTERS_RECOVERED, if s.chapters_recovered_segments { "1" } else { "0" }),
+            (crate::chapters::K_CHAPTERS_MUTED, if s.chapters_muted_segments { "1" } else { "0" }),
+            (crate::chapters::K_CHAPTERS_RAID_MIN_VIEWERS, s.chapters_raid_min_viewers.trim()),
             (crate::recovery::K_AUTO_RECOVER_MUTED, if s.auto_recover_muted { "1" } else { "0" }),
             (crate::recovery::K_AUTO_RECOVER_DELETED, if s.auto_recover_deleted { "1" } else { "0" }),
             (crate::recovery::K_RECOVERY_CDN_HOSTS, s.recovery_cdn_hosts.trim()),
@@ -1867,6 +1883,7 @@ impl StreamArchiverApp {
                         mf.join_cleanup = dsc.join_cleanup;
                         mf.disposal_method = dsc.method;
                         mf.primary_pin = crate::platform_pref::monitor_is_pinned(&self.core.store, self.rows[idx].monitor.id);
+                        mf.chapters_enabled = crate::chapters::load_monitor_chapters_scope(&self.core.store, self.rows[idx].monitor.id).enabled;
                         self.form = Some(mf);
                     }
                 }

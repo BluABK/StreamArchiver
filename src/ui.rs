@@ -433,6 +433,10 @@ struct MonitorForm {
     /// and global platform preference). Loaded from / saved to the monitor
     /// pin map.
     primary_pin: bool,
+    /// Chapter-embedding master toggle override for this instance (`None` =
+    /// inherit the channel/global default). Loaded from / saved to the
+    /// monitor chapters scope map (`crate::chapters`).
+    chapters_enabled: Option<bool>,
 }
 
 impl MonitorForm {
@@ -485,6 +489,7 @@ impl MonitorForm {
             head_backfill_replace: None,
             join_cleanup: None,
             disposal_method: None,
+            chapters_enabled: None,
         }
     }
 
@@ -533,6 +538,7 @@ impl MonitorForm {
             join_cleanup: None,
             disposal_method: None,
             primary_pin: false,
+            chapters_enabled: None,
         }
     }
 
@@ -580,6 +586,7 @@ impl MonitorForm {
             head_backfill_replace: None,
             join_cleanup: None,
             disposal_method: None,
+            chapters_enabled: None,
         }
     }
 }
@@ -877,6 +884,20 @@ struct SettingsForm {
     /// What happens to the pre-splice original + consumed patch files after
     /// a successful gapless splice. Default Keep — nothing auto-deleted.
     gap_splice_cleanup: crate::disposal::GapSpliceCleanup,
+    /// Embed chapter markers into finalized recordings (title/category
+    /// changes, raids, recovered/muted gap-splice segments). Default on —
+    /// global default for the 3-level chain (channel/instance override via
+    /// [`crate::chapters::ChaptersScope`]).
+    chapters_enabled: bool,
+    /// Which event kinds currently produce chapters — flat, global-only
+    /// (see [`crate::chapters::chapter_kinds`]). All default on.
+    chapters_title: bool,
+    chapters_category: bool,
+    chapters_raid: bool,
+    chapters_recovered_segments: bool,
+    chapters_muted_segments: bool,
+    /// Minimum raid party size to get its own chapter (default 50).
+    chapters_raid_min_viewers: String,
     /// Auto-recover a Twitch VOD when the VOD checker finds it DMCA-muted.
     auto_recover_muted: bool,
     /// Auto-recover a Twitch VOD when the VOD checker finds it was never published.
@@ -2151,6 +2172,7 @@ impl eframe::App for StreamArchiverApp {
                                     join_cleanup: None,
                                     disposal_method: None,
                                     primary_platform_pref: None,
+                                    chapters_enabled: None,
                                 });
                             }
                             if ui
@@ -2256,6 +2278,7 @@ impl eframe::App for StreamArchiverApp {
                 join_cleanup: None,
                 disposal_method: None,
                 primary_platform_pref: None,
+                chapters_enabled: None,
             });
         }
         if ctx_refresh_schedule {

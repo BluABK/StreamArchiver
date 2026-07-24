@@ -543,6 +543,7 @@ impl StreamArchiverApp {
             self.settings_trigger_words_section(ui);
             self.settings_blacklist_triggers_section(ui);
             self.settings_vod_recovery_section(ui);
+            self.settings_chapters_section(ui);
             self.settings_ad_probe_section(ui);
             self.settings_stats_history_section(ui);
             self.settings_hype_trains_section(ui);
@@ -3074,6 +3075,85 @@ impl StreamArchiverApp {
 
             // ── Maintenance ────────────────────────────────────────────────────
             }
+    }
+
+    fn settings_chapters_section(&mut self, ui: &mut egui::Ui) {
+        if self.section_shown(
+            SettingsTab::Downloads,
+            "Chapters",
+            &["chapters", "chapter", "title", "category", "game", "raid", "muted", "recovered", "bookmark"],
+        ) {
+            ui.add_space(12.0);
+            ui.heading("Chapters 📑");
+            ui.label(
+                "Embed chapter markers into a finalized recording once its file is stable \
+                 (finished, head backfill settled, any gap-splice attempt resolved): one per \
+                 title change, one per category/game change (merged into one chapter when both \
+                 change together within 30s), one per raid past the viewer threshold below, and \
+                 a bracketing pair around any gap-splice patch. These are the GLOBAL defaults; \
+                 override per-channel (channel Properties) or per-instance (edit instance).",
+            );
+            ui.add_space(6.0);
+            egui::Grid::new("chapters_grid")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.checkbox(&mut self.settings.chapters_enabled, "Embed chapters")
+                        .on_hover_text(
+                            "Master on/off for chapter embedding. Every individual kind below \
+                             can still be turned off independently; this only gates whether the \
+                             feature runs at all. Purely additive metadata — a wrong chapter \
+                             position is a minor cosmetic miss, never a risk to the recording \
+                             itself.",
+                        );
+                    ui.label("Master on/off (default on).");
+                    ui.end_row();
+
+                    ui.checkbox(&mut self.settings.chapters_title, "Title changes");
+                    ui.label("One chapter per title change (per stream_meta_change history).");
+                    ui.end_row();
+
+                    ui.checkbox(&mut self.settings.chapters_category, "Category/game changes");
+                    ui.label("One chapter per category/game change.");
+                    ui.end_row();
+
+                    ui.checkbox(&mut self.settings.chapters_raid, "Raids");
+                    ui.label("One chapter per raid at or above the viewer threshold.");
+                    ui.end_row();
+
+                    ui.label("Minimum raid viewers for a chapter");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.chapters_raid_min_viewers)
+                            .desired_width(80.0)
+                            .hint_text("50"),
+                    )
+                    .on_hover_text(
+                        "Raids below this party size don't get their own chapter — keeps a \
+                         string of 1-2-viewer raids from spamming the chapter list.",
+                    );
+                    ui.end_row();
+
+                    ui.checkbox(&mut self.settings.chapters_recovered_segments, "Recovered gap-splice segments")
+                        .on_hover_text(
+                            "Brackets every successfully spliced lost-segment patch with \
+                             \"Recovered segment start\"/\"Recovered segment end\" chapters, \
+                             regardless of mute status — useful for spot-checking a recovery fix \
+                             later. Only produced for takes where gap-splice actually completed.",
+                        );
+                    ui.label("\"Recovered segment start/end\" around every spliced patch.");
+                    ui.end_row();
+
+                    ui.checkbox(&mut self.settings.chapters_muted_segments, "Muted gap-splice segments")
+                        .on_hover_text(
+                            "Independently brackets only the spliced patches whose recovery \
+                             needed Twitch's muted-fallback copy, with \"Muted segment \
+                             start\"/\"Muted segment end\" chapters — can coexist with \
+                             \"Recovered segment\" markers on the same patch.",
+                        );
+                    ui.label("\"Muted segment start/end\" around patches with silenced audio.");
+                    ui.end_row();
+                });
+        }
     }
 
     fn settings_ad_probe_section(&mut self, ui: &mut egui::Ui) {

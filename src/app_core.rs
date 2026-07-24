@@ -480,6 +480,12 @@ impl AppCore {
             // Anything left over after a restart interrupted a gap-splice
             // before it could run.
             gap_sup.sweep_pending_gap_splices().await;
+            // Chapters: catches takes whose gap-splice state was already
+            // terminal before this feature shipped (so `maybe_spawn_gap_splice`'s
+            // own piggybacked trigger never fires for them again), plus
+            // anything a restart interrupted before chapter embedding could
+            // run.
+            gap_sup.sweep_pending_chapters().await;
         });
 
         // Periodic channel-asset refresh (keeps icons/badges/emotes current for
