@@ -221,6 +221,19 @@ impl Store {
         Ok(())
     }
 
+    /// Stamp a take as having been silently downgraded to live-edge-only
+    /// (SABR DVR-window exceeded) — see
+    /// [`crate::models::Recording::sabr_live_edge_fallback`]. Set once,
+    /// right after the row is inserted; never cleared.
+    pub fn set_sabr_live_edge_fallback(&self, id: i64) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE recording SET sabr_live_edge_fallback=1 WHERE id=?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
     /// How many recording rows share `id`'s `take_group` (including itself)
     /// — `1` for a solo take or one with no take_group at all. Gap-splice's
     /// split-part exclusion: a take stitched from more than one leg
@@ -723,7 +736,7 @@ impl Store {
                     vod_dl_state, vod_dl_path, vod_dl_video_id,
                     backfill_path, full_path, COALESCE(trigger_info, ''),
                     head_backfill_state, COALESCE(trigger_rule_json, ''), vod_views,
-                    gap_splice_state, err_ack
+                    gap_splice_state, err_ack, sabr_live_edge_fallback
              FROM recording WHERE monitor_id = ?1 ORDER BY started_at, id",
         )?;
         let rows = stmt
@@ -765,6 +778,7 @@ impl Store {
                     vod_views: r.get(33)?,
                     gap_splice_state: r.get(34)?,
                     err_ack: r.get::<_, i64>(35)? != 0,
+                    sabr_live_edge_fallback: r.get::<_, i64>(36)? != 0,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -792,7 +806,7 @@ impl Store {
             vod_dl_state, vod_dl_path, vod_dl_video_id,
             backfill_path, full_path, COALESCE(trigger_info, ''),
             head_backfill_state, COALESCE(trigger_rule_json, ''), vod_views,
-            gap_splice_state, err_ack";
+            gap_splice_state, err_ack, sabr_live_edge_fallback";
 
     fn map_recording_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::models::Recording> {
         Ok(crate::models::Recording {
@@ -832,6 +846,7 @@ impl Store {
             vod_views: r.get(33)?,
             gap_splice_state: r.get(34)?,
             err_ack: r.get::<_, i64>(35)? != 0,
+            sabr_live_edge_fallback: r.get::<_, i64>(36)? != 0,
         })
     }
 
@@ -973,6 +988,7 @@ impl Store {
                     head_backfill_state: String::new(),
                     gap_splice_state: String::new(),
                     err_ack: false,
+                    sabr_live_edge_fallback: false,
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1037,6 +1053,7 @@ impl Store {
                     head_backfill_state: String::new(),
                     gap_splice_state: String::new(),
                     err_ack: false,
+                    sabr_live_edge_fallback: false,
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1124,6 +1141,7 @@ impl Store {
                     head_backfill_state: String::new(),
                     gap_splice_state: String::new(),
                     err_ack: false,
+                    sabr_live_edge_fallback: false,
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1204,6 +1222,7 @@ impl Store {
                     head_backfill_state: String::new(),
                     gap_splice_state: String::new(),
                     err_ack: false,
+                    sabr_live_edge_fallback: false,
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1264,6 +1283,7 @@ impl Store {
                     head_backfill_state: String::new(),
                     gap_splice_state: String::new(),
                     err_ack: false,
+                    sabr_live_edge_fallback: false,
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1462,6 +1482,7 @@ impl Store {
                     head_backfill_state: String::new(),
                     gap_splice_state: String::new(),
                     err_ack: false,
+                    sabr_live_edge_fallback: false,
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1543,6 +1564,33 @@ mod tests {
         assert_eq!(store.recordings_with_errors().unwrap().len(), 1);
         let rows = store.list_monitors_with_channels().unwrap();
         assert!(!rows.iter().find(|r| r.monitor.id == mid).unwrap().last_recording_err_ack);
+    }
+
+    #[test]
+    fn sabr_live_edge_fallback_defaults_off_and_sticks_once_set() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        let rec = store
+            .insert_recording(mid, 1_000, "C:/rec/live-edge.mkv", Some(1_000), false, Some("v1"), None, "", "")
+            .unwrap();
+        // Never set for a normal, from-start-successful take.
+        assert!(!store.get_recording(rec).unwrap().unwrap().sabr_live_edge_fallback);
+
+        store.set_sabr_live_edge_fallback(rec).unwrap();
+        assert!(store.get_recording(rec).unwrap().unwrap().sabr_live_edge_fallback);
+        // Both other listing paths (recordings_for_monitor's own duplicated
+        // column list, and the row still being "the latest" for the monitor)
+        // must agree with get_recording's RECORDING_FULL_COLUMNS path.
+        assert!(store.recordings_for_monitor(mid).unwrap()[0].sabr_live_edge_fallback);
+
+        // Finishing the take (the real lifecycle) doesn't clear it — it's a
+        // fact about how the take was captured, not a live/transient state.
+        store.finish_recording(rec, 2_000, 500, Some(0), "completed", "C:/rec/live-edge.mkv", "").unwrap();
+        assert!(store.get_recording(rec).unwrap().unwrap().sabr_live_edge_fallback);
     }
 
     #[test]

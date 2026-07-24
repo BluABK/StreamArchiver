@@ -1341,7 +1341,23 @@ impl Store {
             conn.execute_batch("ALTER TABLE recording ADD COLUMN err_ack INTEGER NOT NULL DEFAULT 0;")?;
             conn.pragma_update(None, "user_version", 67)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 67);
+        if version < 68 {
+            // Stamped when a from-start-configured YouTube SABR take got
+            // silently downgraded to live-edge-only for this one attempt
+            // (see `Supervisor::sabr_dvr_exceeded`) — the broadcast is
+            // already older than SABR's DVR rewind window (~4h), so every
+            // from-start fetch stalls immediately with "not near live
+            // head"; capturing from the live edge is strictly better than
+            // retrying a doomed fetch forever, but without this flag the
+            // take just silently has no head/missed-intro with no visible
+            // reason why. Set once at insert time, never cleared — it's a
+            // fact about how THIS take was captured, not a live state.
+            conn.execute_batch(
+                "ALTER TABLE recording ADD COLUMN sabr_live_edge_fallback INTEGER NOT NULL DEFAULT 0;",
+            )?;
+            conn.pragma_update(None, "user_version", 68)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 68);
         Ok(())
     }
 }

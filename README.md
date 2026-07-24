@@ -2468,6 +2468,19 @@ but nothing switches to it automatically. SABR captures write the final
 **MKV directly** (SABR merges separate audio+video, which the `.ts`
 intermediate can't hold).
 
+**When the DVR window is exceeded.** SABR can only rewind so far into a
+live broadcast — roughly 4 hours (**Deep rewind**, Settings → Downloads,
+experimental, extends this a bit further but doesn't remove the limit). A
+`--live-from-start` attempt on a broadcast already older than that stalls
+immediately with `not near live head`, every single time, no matter how
+many times it's retried. After a couple of consecutive stalls the app
+stops trying and captures that one take from the **live edge** instead —
+strictly better than retrying a doomed fetch forever, but it means no
+missed-intro head for that take. This shows as a **🕘 live edge only**
+badge on the take/stream row (right where the 🧩 head/full backfill badges
+would otherwise be) so it reads as a known limitation rather than a silent
+gap or a failure — hover it for the explanation.
+
 #### Installing the bgutil PO-token provider
 
 bgutil has two parts — a **token server** and a **yt-dlp plugin** — and *both* must

@@ -2375,9 +2375,9 @@ progress_info: None,
         // of stalling from the beginning again. Cleared when a capture succeeds
         // (bytes > 0).
         let mut row = row;
-        if row.monitor.capture_from_start
-            && self.sabr_dvr_exceeded.lock().unwrap().contains(&sabr_key)
-        {
+        let sabr_live_edge_fallback = row.monitor.capture_from_start
+            && self.sabr_dvr_exceeded.lock().unwrap().contains(&sabr_key);
+        if sabr_live_edge_fallback {
             row.monitor.capture_from_start = false;
             info!(
                 monitor_id,
@@ -2410,6 +2410,9 @@ progress_info: None,
             &trigger_info,
             &trigger_rule_json,
         );
+        if sabr_live_edge_fallback {
+            let _ = self.store.set_sabr_live_edge_fallback(rec_id);
+        }
 
         self.spawn_dash_companion(
             &row,

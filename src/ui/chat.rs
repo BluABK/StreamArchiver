@@ -2741,6 +2741,7 @@ mod tests {
             trigger_rule_json: String::new(),
             vod_views: None,
             err_ack: false,
+            sabr_live_edge_fallback: false,
         }
     }
 

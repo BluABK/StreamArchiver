@@ -2573,6 +2573,14 @@ pub struct Recording {
     /// tinted muted instead of red — so the failure history stays visible
     /// at its own row (see `state_icon`/`fail_hover` call sites).
     pub err_ack: bool,
+    /// This take's `capture_from_start` was silently overridden to
+    /// live-edge-only because YouTube SABR's DVR rewind window (~4h) was
+    /// already exceeded for this broadcast — see
+    /// `Supervisor::sabr_dvr_exceeded`/`note_sabr_stall`. Set once at
+    /// insert time, never cleared; explains why this take has no
+    /// missed-intro head even though the monitor is configured
+    /// capture-from-start.
+    pub sabr_live_edge_fallback: bool,
 }
 
 /// A take awaiting a head-backfill decision — the Background view's "Planned"
@@ -3083,6 +3091,7 @@ mod tests {
             gap_splice_state: String::new(),
             trigger_rule_json: String::new(),
             err_ack: false,
+            sabr_live_edge_fallback: false,
         }
     }
 

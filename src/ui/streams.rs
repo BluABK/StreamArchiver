@@ -2471,6 +2471,8 @@ impl StreamArchiverApp {
                         let gap_running = g.takes.iter().any(|t| {
                             gap_recover_running(background_tasks, t.id)
                         });
+                        let sabr_live_edge_fallback =
+                            g.takes.iter().any(|t| t.sabr_live_edge_fallback);
                         // Alert rollup over this stream's takes (a dual
                         // capture's legs and retakes sum into one badge).
                         let alert_agg = {
@@ -2499,6 +2501,7 @@ impl StreamArchiverApp {
                             head_backfilled,
                             backfill_running,
                             backfill_queued,
+                            sabr_live_edge_fallback,
                             gap_running,
                             alert_agg.as_ref(),
                         ) {
@@ -3049,6 +3052,7 @@ impl StreamArchiverApp {
                             t.backfill_path.is_some(),
                             head_backfill_running(background_tasks, t.id),
                             t.head_backfill_state == "queued",
+                            t.sabr_live_edge_fallback,
                             gap_recover_running(background_tasks, t.id),
                             rec_alerts.get(&t.id),
                         ) {

@@ -1270,6 +1270,7 @@ pub(super) fn take_status_badges(
     head_backfilled: bool,
     backfill_running: bool,
     backfill_queued: bool,
+    sabr_live_edge_fallback: bool,
     gap_recover_running: bool,
     // Capture-alert rollup for this take (or summed over a stream's takes).
     alert: Option<&crate::store::RecAlertBadge>,
@@ -1308,6 +1309,15 @@ pub(super) fn take_status_badges(
                  (waiting ~{}s for the CDN/stream to settle).",
                 crate::downloader::HEAD_BACKFILL_SETTLE_SECS
             ));
+    } else if sabr_live_edge_fallback {
+        ui.colored_label(egui::Color32::from_rgb(220, 175, 60), "🕘 live edge only")
+            .on_hover_text(
+                "This broadcast was already older than YouTube SABR's DVR rewind window \
+                 (~4h) when this take started, so every attempt to capture from the true \
+                 start stalled immediately — captured from the live edge instead. There is \
+                 no missed-intro head for this take and there never will be; this isn't a \
+                 failure, just a limitation of how far back SABR can rewind.",
+            );
     }
     if gap_recover_running {
         ui.colored_label(egui::Color32::from_rgb(220, 120, 60), "🩹 recovering gaps…")
