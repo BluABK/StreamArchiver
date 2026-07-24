@@ -658,6 +658,17 @@ pub(super) const STALL_KILL_SECS: u64 = 15 * 60;
 /// (format probing, waiting) are exempt via `has_capture`.
 pub(super) const CAPTURE_STALL_KILL_SECS: u64 = 60 * 60;
 
+/// How long `try_begin` refuses a new AUTOMATIC start for a monitor right
+/// after the stall watchdog force-killed a Recording for it. Our own kill and
+/// the platform's offline propagation (EventSub's `stream.offline` push, or
+/// the next Helix poll) are two independent signals — this is enough slack
+/// for the platform side to catch up in the common case, so a still-stale
+/// "channel is live" reading in the very same tick doesn't start a phantom
+/// take. A genuinely still-live (or freshly restarted) broadcast just starts
+/// one poll interval later instead — a small, one-time delay, not a missed
+/// recording.
+pub(super) const STALL_RESTART_COOLDOWN_SECS: u64 = 90;
+
 /// Handle-based (size, modified-unix-secs) — `fs::metadata` reads the
 /// directory entry, which NTFS updates lazily while a writer holds the file
 /// open; opening the file queries the handle, which is always current.

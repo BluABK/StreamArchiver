@@ -812,6 +812,7 @@ impl Supervisor {
         let stall = self.spawn_stall_watchdog(
             row.kind,
             row.ref_id,
+            row.monitor_id,
             row.pid,
             row.proc_start,
             PathBuf::from(&row.log_path),
@@ -875,6 +876,7 @@ impl Supervisor {
         &self,
         kind: DetachedKind,
         ref_id: i64,
+        monitor_id: Option<i64>,
         pid: u32,
         proc_start: u64,
         log_path: PathBuf,
@@ -901,6 +903,13 @@ impl Supervisor {
                 warn!(?kind, ref_id, pid, "{why} — killing stalled process tree");
                 if kind != DetachedKind::Chat {
                     this.stall_killed.lock().unwrap().insert((kind, ref_id));
+                }
+                // Recording only: a killed chat sidecar has no "channel is
+                // live" race to guard against (see `stall_ended_at`'s doc).
+                if kind == DetachedKind::Recording
+                    && let Some(mid) = monitor_id
+                {
+                    this.stall_ended_at.lock().unwrap().insert(mid, Instant::now());
                 }
                 let _ = this.events.send(AppEvent::Error {
                     context: "Stall watchdog".into(),
@@ -1840,6 +1849,7 @@ impl Supervisor {
         let stall = self.spawn_stall_watchdog(
             detach.kind,
             detach.ref_id,
+            detach.monitor_id,
             pid,
             proc_start,
             log_path.clone(),

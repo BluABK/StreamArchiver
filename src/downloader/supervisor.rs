@@ -34,6 +34,7 @@ impl Supervisor {
             stopping_videos: Arc::new(Mutex::new(HashSet::new())),
             stopping_monitors: Arc::new(Mutex::new(HashSet::new())),
             stall_killed: Arc::new(Mutex::new(HashSet::new())),
+            stall_ended_at: Arc::new(Mutex::new(HashMap::new())),
             gap_jobs: Arc::new(Mutex::new(HashSet::new())),
             gap_splice_jobs: Arc::new(Mutex::new(HashSet::new())),
             head_backfill_aborts: Arc::new(Mutex::new(HashMap::new())),
@@ -1156,6 +1157,14 @@ progress_info: None,
         }
     }
 
+    /// Whether `try_begin` should suppress an AUTOMATIC start due to a recent
+    /// stall-kill for this monitor (`killed_secs_ago` = seconds since
+    /// `stall_ended_at`'s timestamp, or `None` if never/not recently killed).
+    /// Pure so it's unit-testable without a real clock.
+    fn stall_cooldown_blocks(killed_secs_ago: Option<u64>) -> bool {
+        killed_secs_ago.is_some_and(|secs| secs < STALL_RESTART_COOLDOWN_SECS)
+    }
+
     /// Reserve the monitor and spawn its recording task. Returns false if it was
     /// skipped (already active, or in backoff when not bypassing). `forced`
     /// marks a user-initiated start: it additionally bypasses the Auto gate —
@@ -1191,6 +1200,23 @@ progress_info: None,
         {
             tracing::debug!(monitor_id, "auto start suppressed: {reason}");
             return false;
+        }
+        // Stall-kill cooldown (see `stall_ended_at`'s doc comment): a forced/
+        // manual start always bypasses it, same as a manual-stop hold above —
+        // only an AUTOMATIC start needs a moment for the platform's own
+        // offline propagation to catch up with our own stall watchdog.
+        if !forced {
+            let killed_secs_ago =
+                self.stall_ended_at.lock().unwrap().get(&monitor_id).map(Instant::elapsed).map(|d| d.as_secs());
+            if Self::stall_cooldown_blocks(killed_secs_ago) {
+                tracing::debug!(
+                    monitor_id,
+                    "auto start suppressed: stall-killed {}s ago — waiting for the platform's own \
+                     offline signal to catch up before trying again",
+                    killed_secs_ago.unwrap_or(0)
+                );
+                return false;
+            }
         }
         {
             let mut active = self.active.lock().unwrap();
@@ -3634,6 +3660,28 @@ progress_info: None,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fix for the DyaRikku incident (2026-07-24): a stall-killed
+    /// recording must refuse a new AUTOMATIC start for a short cooldown
+    /// (giving the platform's own offline propagation time to catch up),
+    /// but never one that's old or absent.
+    #[test]
+    fn stall_cooldown_blocks_only_within_the_window() {
+        assert!(!Supervisor::stall_cooldown_blocks(None), "never killed — must not block");
+        assert!(Supervisor::stall_cooldown_blocks(Some(0)), "just killed — must block");
+        assert!(
+            Supervisor::stall_cooldown_blocks(Some(STALL_RESTART_COOLDOWN_SECS - 1)),
+            "still inside the window — must block"
+        );
+        assert!(
+            !Supervisor::stall_cooldown_blocks(Some(STALL_RESTART_COOLDOWN_SECS)),
+            "window elapsed — must not block"
+        );
+        assert!(
+            !Supervisor::stall_cooldown_blocks(Some(STALL_RESTART_COOLDOWN_SECS + 60)),
+            "long past the window — must not block"
+        );
+    }
 
     /// Regression test for the girl_dm_/Nihmune incident (2026-07-23): a chat
     /// task that never notices its `done` flag (simulating a `ws.send()` hung

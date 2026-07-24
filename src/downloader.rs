@@ -291,6 +291,16 @@ pub struct Supervisor {
     /// secondary finalize's `contains`) could leave a permanent tombstone that
     /// silently skipped the channel's next take.
     stall_killed: Arc<Mutex<HashSet<(DetachedKind, i64)>>>,
+    /// monitor_id -> when the stall watchdog last force-killed a Recording for
+    /// it. `try_begin` briefly refuses a new AUTOMATIC start for that monitor
+    /// (see `STALL_RESTART_COOLDOWN_SECS`) — a wedged tool's own kill and the
+    /// platform's offline propagation (EventSub/Helix) are two independent
+    /// signals racing each other; without this, a still-stale "channel is
+    /// live" reading in the very same tick we free the slot starts a phantom
+    /// take (and fires its went-live notification) moments before a fresh
+    /// check would have found the channel already offline. A forced/manual
+    /// start always bypasses this, same as it bypasses a manual-stop hold.
+    stall_ended_at: Arc<Mutex<HashMap<i64, Instant>>>,
     /// monitor_id -> broadcast key of the last blacklist-veto notification, so
     /// the "recording suppressed" event fires once per broadcast rather than on
     /// every poll while the stream stays live.
