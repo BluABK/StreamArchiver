@@ -1200,7 +1200,10 @@ take/stream row once embedding succeeds, and a matching **ℹ** button on any
 "Chapters" row in the Background view's Active/Recent tables opens a popup
 with the stream, the file path, and the full embedded chapter list with
 timestamps (survives in the Recent table's 100-entry history, so it's
-available long after the embed itself finished).
+available long after the embed itself finished). The embed pass itself
+reports live progress via ffmpeg's `-progress pipe:1` (position/speed against
+the recording's known duration), so its Active-table row shows a real
+percentage bar rather than just an elapsed timer while it runs.
 
 **Existing recordings, and manual control.** A startup sweep retroactively
 embeds chapters into every already-finalized recording the first time it

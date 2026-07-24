@@ -992,10 +992,24 @@ pub async fn embed_subtitles_into_mkv(mkv: &Path) -> anyhow::Result<bool> {
 /// `-map_metadata 0` keeps the container's own existing global metadata
 /// (e.g. the title tag `promote_capture` already set) untouched — chapters
 /// are pulled from the new input via `-map_chapters 1` only.
-pub async fn embed_chapters_into_mkv(mkv: &Path, ffmetadata: &str) -> anyhow::Result<()> {
+///
+/// `total_duration_secs` (when known) and `progress_tx` let this report live
+/// position via ffmpeg's own `-progress pipe:1` — same key=value stream and
+/// `out_time_ms`-vs-duration fraction as [`remux_ts_to_mkv_gated`], since
+/// this is a whole-file `-c copy` pass too and can take a while on a large
+/// recording.
+pub async fn embed_chapters_into_mkv(
+    mkv: &Path,
+    ffmetadata: &str,
+    total_duration_secs: Option<f64>,
+    progress_tx: Option<(EventTx, u64)>,
+) -> anyhow::Result<()> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
     let chapters_txt = mkv.with_extension("chapters.ffmeta.txt");
     crate::iomon::fs::write(Cat::ConcatList, &chapters_txt, ffmetadata).await?;
     let tmp = mkv.with_extension("tmp.mkv");
+    let total_us: Option<i64> = total_duration_secs.map(|s| (s * 1_000_000.0) as i64);
     // One full-file pass at a time on the recordings drive (see io_gate).
     let gate =
         crate::io_gate::local_pass(&crate::io_gate::gate_label("embed-chapters", mkv), mkv).await;
@@ -1012,20 +1026,70 @@ pub async fn embed_chapters_into_mkv(mkv: &Path, ffmetadata: &str) -> anyhow::Re
             .arg("-map_metadata").arg("0")
             .arg("-map_chapters").arg("1")
             .arg("-c").arg("copy")
+            // Write structured key=value progress lines to stdout.
+            .arg("-progress").arg("pipe:1")
+            .arg("-nostats")
             .arg(&tmp)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
-        // spawn + wait_with_output (≡ output()) so the PID is sampleable.
-        let child = cmd.spawn()?;
+        let mut child = cmd.spawn()?;
         let _io_guard = crate::iomon::track_tool(child.id(), "ffmpeg", "embed-chapters", mkv);
         if let Some(pid) = child.id() {
             gate.set_pid(pid);
         }
-        let out = child.wait_with_output().await?;
+        let stdout = child.stdout.take().expect("stdout piped");
+        let stderr = child.stderr.take().expect("stderr piped");
+        let stderr_task = tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr).lines();
+            let mut lines: Vec<String> = Vec::new();
+            while let Ok(Some(line)) = reader.next_line().await {
+                lines.push(line);
+            }
+            lines
+        });
+        // Read stdout for progress events — same block format as
+        // `remux_ts_to_mkv_gated`: one key=value per line, block ends at
+        // `progress=continue`/`progress=end`, `out_time_ms` is microseconds.
+        {
+            let mut reader = BufReader::new(stdout).lines();
+            let mut blk_speed = String::new();
+            let mut blk_pos = String::new();
+            let mut blk_us: Option<i64> = None;
+            while let Ok(Some(line)) = reader.next_line().await {
+                if let Some((k, v)) = line.split_once('=') {
+                    let (k, v) = (k.trim(), v.trim());
+                    match k {
+                        "speed"       => blk_speed = v.to_string(),
+                        "out_time"    => blk_pos   = v.to_string(),
+                        "out_time_ms" => blk_us    = v.parse::<i64>().ok(),
+                        "progress"    => {
+                            if let Some((ref tx, task_id)) = progress_tx {
+                                let progress = blk_us.and_then(|us| {
+                                    total_us.filter(|&t| t > 0).map(|t| {
+                                        (us as f64 / t as f64).clamp(0.0, 1.0) as f32
+                                    })
+                                });
+                                let pos_short = blk_pos.split('.').next().unwrap_or(&blk_pos);
+                                let _ = tx.send(AppEvent::BackgroundTaskProgress {
+                                    id: task_id,
+                                    progress,
+                                    info: format!("speed={blk_speed} pos={pos_short}"),
+                                });
+                            }
+                            blk_speed.clear(); blk_pos.clear(); blk_us = None;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let status = child.wait().await?;
+        let stderr_bytes = stderr_task.await.unwrap_or_default().join("\n").into_bytes();
+        let out = std::process::Output { status, stdout: Vec::new(), stderr: stderr_bytes };
         if !out.status.success()
             && readrate.is_some()
             && crate::io_gate::is_readrate_error(&String::from_utf8_lossy(&out.stderr))
