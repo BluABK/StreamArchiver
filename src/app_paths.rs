@@ -107,3 +107,34 @@ pub fn logs_dir() -> PathBuf {
     ensure_dir(&dir);
     dir
 }
+
+/// Settings key: last time the logs-directory retention sweep ran (unix
+/// secs) — throttles [`maybe_prune_old_logs`] to at most once/day.
+pub const K_LOGS_PRUNE_LAST: &str = "logs_prune_last_run";
+
+/// Re-run the logs-directory retention sweep (app log / captures / iomon,
+/// same 7/7/14-day windows as the one-shot prune in `main::init_tracing`)
+/// if it hasn't run in the last day — cheap no-op (one settings read) the
+/// rest of the time. Mirrors `Store::maybe_auto_downsample_viewer_history`'s
+/// self-throttle shape.
+///
+/// `init_tracing`'s prune only ever runs once, at process launch — for an
+/// app meant to run 24/7 for weeks, that means retention silently stops
+/// being enforced the moment the session outlives its own startup sweep.
+/// Called from the scheduler tick so a long-running session keeps pruning.
+pub fn maybe_prune_old_logs(store: &crate::store::Store, now: i64) {
+    let last: i64 = store
+        .get_setting(K_LOGS_PRUNE_LAST)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if now - last < 86_400 {
+        return;
+    }
+    let _ = store.set_setting(K_LOGS_PRUNE_LAST, &now.to_string());
+    let log_dir = logs_dir();
+    crate::prune_old_logs(&log_dir, 7);
+    crate::prune_old_logs(&log_dir.join("captures"), 7);
+    crate::prune_old_logs(&log_dir.join("iomon"), crate::iomon::SAMPLE_LOG_KEEP_DAYS);
+}

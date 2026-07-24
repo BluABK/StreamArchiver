@@ -2696,9 +2696,14 @@ Both SABR paths are **mpv-only**; other players get the DASH companion's `.ts`
   recordings disk; same 7-day retention (previously these were deleted at
   finalize, so surviving a week is a debugging upgrade). The I/O monitor's 1 s
   sample log (see *I/O monitor*) lands in `logs\iomon\session-*.jsonl`, 14-day
-  retention. The managed PO token server writes `logs\pot_server.log`
+  retention — this is normally the largest contributor by far (several MB/hour
+  with multiple concurrent captures, not the few MB/day a quiet session
+  produces). The managed PO token server writes `logs\pot_server.log`
   (truncated per app run, appended across in-run restarts — see *Managed GVS
-  PO token server*).
+  PO token server*). Retention is enforced at startup **and** re-checked at
+  most once a day while running — the app is meant to stay up for weeks at a
+  stretch, and a startup-only sweep would otherwise let `logs\` grow
+  unbounded for the whole life of a long session.
 - Asset cache: `%APPDATA%\StreamArchiver\data\asset-cache\` (see *Channel assets &
   change history*):
   - `channel_assets\{name}\{platform}\{account}\` — per channel + platform +

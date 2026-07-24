@@ -428,6 +428,9 @@ async fn tick(
     if let Err(e) = ctx.store.maybe_auto_downsample_viewer_history(checked_at) {
         warn!("scheduler: viewer-history downsample failed: {e:#}");
     }
+    // Logs-directory retention sweep (runs at most daily; see its own doc
+    // comment for why this can't just be the one-shot startup prune).
+    crate::app_paths::maybe_prune_old_logs(&ctx.store, checked_at);
 
     // ── Twitch "Stream Together" collab refresh ──
     // Piggybacks each monitor's own poll cadence (only monitors polled this

@@ -748,8 +748,14 @@ fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
     guard
 }
 
-/// Delete log files older than `keep_days` days from `dir`.
-fn prune_old_logs(dir: &std::path::Path, keep_days: u64) {
+/// Delete log files older than `keep_days` days from `dir`. `pub(crate)`:
+/// besides the one-shot call at startup here, `app_paths::maybe_prune_old_logs`
+/// also calls this from the scheduler tick — a long-running session (this
+/// app's normal 24/7 use case) would otherwise never re-enforce retention
+/// between restarts, letting `logs\` grow unbounded (the actual cause of a
+/// 3.4GB `logs\` dir with a 7/14-day retention "policy" — the policy only
+/// ever ran once, at the process launch that started the still-running session).
+pub(crate) fn prune_old_logs(dir: &std::path::Path, keep_days: u64) {
     let cutoff = std::time::SystemTime::now()
         .checked_sub(std::time::Duration::from_secs(keep_days * 86_400))
         .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
@@ -770,5 +776,54 @@ fn prune_old_logs(dir: &std::path::Path, keep_days: u64) {
         {
             let _ = crate::iomon::fs::remove_file_sync(Cat::AppLog, &path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Test-only: exercises prune_old_logs (which itself correctly uses the
+    // iomon::fs facade) via a throwaway tempdir — direct std calls here are
+    // fine, this never touches anything iomon needs to classify/attribute.
+    #![allow(clippy::disallowed_methods)]
+
+    use super::*;
+
+    #[test]
+    fn prune_old_logs_deletes_only_old_log_files() {
+        let dir = std::env::temp_dir().join(format!("sa_prune_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let old_log = dir.join("old.log");
+        let new_log = dir.join("new.log");
+        // The daily-rolled app log's "extension" is the DATE, not "log" —
+        // must match via the ".log." substring check, not a suffix check.
+        let old_rolled = dir.join("streamarchiver.log.2020-01-01");
+        let old_jsonl = dir.join("session-old.jsonl");
+        // Never touched regardless of age — the sweep must not become a
+        // general old-file cleaner for whatever else lives in the dir.
+        let old_other = dir.join("notes.txt");
+        for f in [&old_log, &new_log, &old_rolled, &old_jsonl, &old_other] {
+            std::fs::write(f, b"x").unwrap();
+        }
+        let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 86_400);
+        for f in [&old_log, &old_rolled, &old_jsonl, &old_other] {
+            std::fs::File::options()
+                .write(true)
+                .open(f)
+                .unwrap()
+                .set_modified(old_time)
+                .unwrap();
+        }
+
+        prune_old_logs(&dir, 7);
+
+        assert!(!old_log.exists(), "old .log must be pruned");
+        assert!(new_log.exists(), "recent .log must survive");
+        assert!(!old_rolled.exists(), "old rolled streamarchiver.log.DATE must be pruned");
+        assert!(!old_jsonl.exists(), "old .jsonl must be pruned");
+        assert!(old_other.exists(), "non-log file must never be touched regardless of age");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -2486,7 +2486,11 @@ impl StreamArchiverApp {
                         ui,
                         "Write the I/O monitor's 1s samples to a JSONL under the appdata \
                          logs folder (system drive) so drive stalls and disconnects can be \
-                         analyzed after the fact. ~2-5 MB/day, pruned after 14 days.",
+                         analyzed after the fact. One file per session; a quiet idle session \
+                         is small, but several concurrent captures can easily push it past \
+                         5-10 MB/hour. Pruned after 14 days — checked at startup and at most \
+                         once/day while running, so a long-lived session doesn't grow the \
+                         logs folder unbounded between restarts.",
                     );
                     ui.end_row();
                 });
