@@ -267,142 +267,12 @@ impl StreamArchiverApp {
             egui::ViewportId::from_hash_of("channel_form_vp"),
             egui::ViewportBuilder::default()
                 .with_title(title.to_string())
-                .with_inner_size([380.0, 220.0])
-                .with_resizable(false),
+                .with_inner_size([420.0, 480.0]),
             |ctx, _class| {
                 if ctx.input(|i| i.viewport().close_requested()) {
                     open = false;
                 }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let f = self.channel_form.as_mut().unwrap();
-                    egui::Grid::new("channel_form_grid")
-                        .num_columns(2)
-                        .spacing([8.0, 6.0])
-                        .show(ui, |ui| {
-                            ui.label("Name");
-                            ui.text_edit_singleline(&mut f.name);
-                            ui.end_row();
-
-                            ui.label("Color");
-                            ui.horizontal(|ui| {
-                                // Colored swatch preview
-                                let swatch_color = if f.color.is_empty() {
-                                    egui::Color32::from_gray(0x60)
-                                } else {
-                                    parse_hex_color(&f.color)
-                                        .unwrap_or(egui::Color32::from_gray(0x60))
-                                };
-                                let (rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(20.0, 20.0),
-                                    egui::Sense::hover(),
-                                );
-                                ui.painter().rect_filled(rect, 4.0, swatch_color);
-                                ui.painter().rect_stroke(
-                                    rect,
-                                    4.0,
-                                    egui::Stroke::new(1.0, egui::Color32::from_gray(0x80)),
-                                    egui::StrokeKind::Inside,
-                                );
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut f.color)
-                                        .hint_text("#rrggbb")
-                                        .desired_width(80.0),
-                                );
-                                if !f.color.is_empty() && ui.small_button("✕").clicked() {
-                                    f.color.clear();
-                                }
-                            });
-                            ui.end_row();
-
-                            ui.label("Download VOD after end");
-                            tristate_combo(ui, "chform_vod_download", &mut f.vod_download)
-                                .on_hover_text(
-                                    "Post-stream VOD download for every instance in this channel. \
-                                     Inherit follows the global default (Settings).",
-                                );
-                            ui.end_row();
-
-                            ui.label("Replace with VOD");
-                            tristate_combo(ui, "chform_vod_replace", &mut f.vod_replace)
-                                .on_hover_text(
-                                    "Replace the live recording with the VOD on success (never for \
-                                     a muted Twitch VOD). Inherit follows the global default.",
-                                );
-                            ui.end_row();
-
-                            ui.label("Fetch new head backfill on new take");
-                            tristate_combo(ui, "chform_head_backfill_fetch", &mut f.head_backfill_fetch)
-                                .on_hover_text(
-                                    "Capture-from-start only: fetch a fresh head backfill for a \
-                                     retake (reconnect mid-broadcast), not just the stream's first \
-                                     take. Inherit follows the global default (Settings).",
-                                );
-                            ui.end_row();
-
-                            ui.label("Replace old head (if new is undamaged)");
-                            tristate_combo(ui, "chform_head_backfill_replace", &mut f.head_backfill_replace)
-                                .on_hover_text(
-                                    "Once a fresh head backfill passes its integrity checks, delete \
-                                     older takes' now-redundant head files for the same stream. Only \
-                                     takes effect when fetching a new head is also on. Inherit \
-                                     follows the global default.",
-                                );
-                            ui.end_row();
-
-                            ui.label("After full.mkv join");
-                            join_cleanup_combo(ui, "chform_join_cleanup", &mut f.join_cleanup)
-                                .on_hover_text(
-                                    "Once a verified full.mkv (head + live capture joined) lands \
-                                     for a take in this channel: keep both parts (safe, doubles \
-                                     the stream's disk cost), delete just the head, or delete \
-                                     both parts (the take then points at the full). Deletions \
-                                     follow the deletion method below. Inherit follows the \
-                                     global default (Settings → Downloads → Automatic deletion).",
-                                );
-                            ui.end_row();
-
-                            ui.label("Automatic deletes go to");
-                            disposal_method_combo(ui, "chform_disposal_method", &mut f.disposal_method)
-                                .on_hover_text(
-                                    "How automatic media deletions for this channel are executed \
-                                     (post-join cleanup, superseded heads, a live capture \
-                                     replaced by its VOD): moved to the configured trash folder, \
-                                     sent to the Recycle Bin, or deleted permanently. Inherit \
-                                     follows the global default.",
-                                );
-                            ui.end_row();
-
-                            ui.label("Preferred platform when multiple live");
-                            platform_pref_combo(ui, "chform_platform_pref", &mut f.primary_platform_pref)
-                                .on_hover_text(
-                                    "When this channel has more than one instance simultaneously \
-                                     live, show this platform's info on the channel row instead of \
-                                     whichever went live earliest. An instance-level pin (per \
-                                     instance) overrides this. Inherit follows the global default \
-                                     (Settings → Interface → Display).",
-                                );
-                            ui.end_row();
-
-                            ui.label("Embed chapters");
-                            tristate_combo(ui, "chform_chapters_enabled", &mut f.chapters_enabled)
-                                .on_hover_text(
-                                    "Embed chapter markers (title/category changes, raids, \
-                                     recovered/muted gap-splice segments) into finalized \
-                                     recordings for every instance in this channel. Inherit \
-                                     follows the global default (Settings → Downloads → \
-                                     Chapters).",
-                                );
-                            ui.end_row();
-                        });
-                    if !renaming {
-                        ui.label(
-                            egui::RichText::new(
-                                "A channel is a container — add instances (URLs to record) to it with ➕.",
-                            )
-                            .small()
-                            .color(egui::Color32::from_gray(0x90)),
-                        );
-                    }
+                egui::TopBottomPanel::bottom("channel_form_bottom_bar").show(ctx, |ui| {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button("Save").clicked() {
@@ -410,6 +280,140 @@ impl StreamArchiverApp {
                         }
                         if ui.button("Cancel").clicked() {
                             do_cancel = true;
+                        }
+                    });
+                    ui.add_space(4.0);
+                });
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        let f = self.channel_form.as_mut().unwrap();
+                        egui::Grid::new("channel_form_grid")
+                            .num_columns(2)
+                            .spacing([8.0, 6.0])
+                            .show(ui, |ui| {
+                                ui.label("Name");
+                                ui.text_edit_singleline(&mut f.name);
+                                ui.end_row();
+
+                                ui.label("Color");
+                                ui.horizontal(|ui| {
+                                    // Colored swatch preview
+                                    let swatch_color = if f.color.is_empty() {
+                                        egui::Color32::from_gray(0x60)
+                                    } else {
+                                        parse_hex_color(&f.color)
+                                            .unwrap_or(egui::Color32::from_gray(0x60))
+                                    };
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(20.0, 20.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().rect_filled(rect, 4.0, swatch_color);
+                                    ui.painter().rect_stroke(
+                                        rect,
+                                        4.0,
+                                        egui::Stroke::new(1.0, egui::Color32::from_gray(0x80)),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut f.color)
+                                            .hint_text("#rrggbb")
+                                            .desired_width(80.0),
+                                    );
+                                    if !f.color.is_empty() && ui.small_button("✕").clicked() {
+                                        f.color.clear();
+                                    }
+                                });
+                                ui.end_row();
+
+                                ui.label("Download VOD after end");
+                                tristate_combo(ui, "chform_vod_download", &mut f.vod_download)
+                                    .on_hover_text(
+                                        "Post-stream VOD download for every instance in this channel. \
+                                         Inherit follows the global default (Settings).",
+                                    );
+                                ui.end_row();
+
+                                ui.label("Replace with VOD");
+                                tristate_combo(ui, "chform_vod_replace", &mut f.vod_replace)
+                                    .on_hover_text(
+                                        "Replace the live recording with the VOD on success (never for \
+                                         a muted Twitch VOD). Inherit follows the global default.",
+                                    );
+                                ui.end_row();
+
+                                ui.label("Fetch new head backfill on new take");
+                                tristate_combo(ui, "chform_head_backfill_fetch", &mut f.head_backfill_fetch)
+                                    .on_hover_text(
+                                        "Capture-from-start only: fetch a fresh head backfill for a \
+                                         retake (reconnect mid-broadcast), not just the stream's first \
+                                         take. Inherit follows the global default (Settings).",
+                                    );
+                                ui.end_row();
+
+                                ui.label("Replace old head (if new is undamaged)");
+                                tristate_combo(ui, "chform_head_backfill_replace", &mut f.head_backfill_replace)
+                                    .on_hover_text(
+                                        "Once a fresh head backfill passes its integrity checks, delete \
+                                         older takes' now-redundant head files for the same stream. Only \
+                                         takes effect when fetching a new head is also on. Inherit \
+                                         follows the global default.",
+                                    );
+                                ui.end_row();
+
+                                ui.label("After full.mkv join");
+                                join_cleanup_combo(ui, "chform_join_cleanup", &mut f.join_cleanup)
+                                    .on_hover_text(
+                                        "Once a verified full.mkv (head + live capture joined) lands \
+                                         for a take in this channel: keep both parts (safe, doubles \
+                                         the stream's disk cost), delete just the head, or delete \
+                                         both parts (the take then points at the full). Deletions \
+                                         follow the deletion method below. Inherit follows the \
+                                         global default (Settings → Downloads → Automatic deletion).",
+                                    );
+                                ui.end_row();
+
+                                ui.label("Automatic deletes go to");
+                                disposal_method_combo(ui, "chform_disposal_method", &mut f.disposal_method)
+                                    .on_hover_text(
+                                        "How automatic media deletions for this channel are executed \
+                                         (post-join cleanup, superseded heads, a live capture \
+                                         replaced by its VOD): moved to the configured trash folder, \
+                                         sent to the Recycle Bin, or deleted permanently. Inherit \
+                                         follows the global default.",
+                                    );
+                                ui.end_row();
+
+                                ui.label("Preferred platform when multiple live");
+                                platform_pref_combo(ui, "chform_platform_pref", &mut f.primary_platform_pref)
+                                    .on_hover_text(
+                                        "When this channel has more than one instance simultaneously \
+                                         live, show this platform's info on the channel row instead of \
+                                         whichever went live earliest. An instance-level pin (per \
+                                         instance) overrides this. Inherit follows the global default \
+                                         (Settings → Interface → Display).",
+                                    );
+                                ui.end_row();
+
+                                ui.label("Embed chapters");
+                                tristate_combo(ui, "chform_chapters_enabled", &mut f.chapters_enabled)
+                                    .on_hover_text(
+                                        "Embed chapter markers (title/category changes, raids, \
+                                         recovered/muted gap-splice segments) into finalized \
+                                         recordings for every instance in this channel. Inherit \
+                                         follows the global default (Settings → Downloads → \
+                                         Chapters).",
+                                    );
+                                ui.end_row();
+                            });
+                        if !renaming {
+                            ui.label(
+                                egui::RichText::new(
+                                    "A channel is a container — add instances (URLs to record) to it with ➕.",
+                                )
+                                .small()
+                                .color(egui::Color32::from_gray(0x90)),
+                            );
                         }
                     });
                 });
