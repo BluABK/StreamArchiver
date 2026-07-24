@@ -2589,6 +2589,10 @@ pub struct Recording {
     /// additive metadata, not a media-integrity concern — no Issues-panel
     /// section needed. See `crate::chapters`.
     pub chapters_state: String,
+    /// The actual embedded chapter list (JSON `Vec<crate::chapters::Chapter>`)
+    /// from the most recent successful embed, `""` otherwise — backs the
+    /// Background view's chapters detail popup. See `chapters_state`.
+    pub chapters_json: String,
 }
 
 /// A take awaiting a head-backfill decision — the Background view's "Planned"
@@ -3101,6 +3105,7 @@ mod tests {
             err_ack: false,
             sabr_live_edge_fallback: false,
             chapters_state: String::new(),
+            chapters_json: String::new(),
         }
     }
 

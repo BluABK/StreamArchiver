@@ -545,6 +545,8 @@ impl StreamArchiverApp {
             meta_popups: Vec::new(),
             history_change_cache: HashMap::new(),
             history_popups: Vec::new(),
+            chapters_popups: Vec::new(),
+            chapters_popup_cache: HashMap::new(),
             schedule_cache: HashMap::new(),
             schedule_popups: Vec::new(),
             schedule_all: Vec::new(),
@@ -1834,6 +1836,7 @@ impl StreamArchiverApp {
             self.ad_break_cache.clear();
             self.meta_change_cache.clear();
             self.schedule_cache.clear();
+            self.chapters_popup_cache.clear();
             self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
             self.spawn_pending_reload();
             if self.view == View::Schedule {

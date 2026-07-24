@@ -1371,7 +1371,20 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 69)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 69);
+        if version < 70 {
+            // The actual chapter list (JSON `[{"at_secs":f64,"title":str}, …]`)
+            // from the most recent successful embed — set alongside
+            // `chapters_state = "done"`, never otherwise. Backs the
+            // Background view's chapters detail popup ("which stream, which
+            // file, which chapters at which timestamp"); a DB copy rather
+            // than re-probing the MKV on demand, since it's a handful of
+            // small strings and stays correct even if the file later moves.
+            conn.execute_batch(
+                "ALTER TABLE recording ADD COLUMN chapters_json TEXT NOT NULL DEFAULT '';",
+            )?;
+            conn.pragma_update(None, "user_version", 70)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 70);
         Ok(())
     }
 }

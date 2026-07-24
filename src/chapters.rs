@@ -367,8 +367,10 @@ pub fn reconstruct_spliced_gaps(
 // ---------- chapter list construction + ffmetadata ----------
 
 /// One embedded chapter marker: starts at `at_secs`, runs until the next
-/// chapter's `at_secs` (or the file's end for the last one).
-#[derive(Clone, Debug, PartialEq)]
+/// chapter's `at_secs` (or the file's end for the last one). `Serialize`/
+/// `Deserialize` back `Recording.chapters_json` (the Background view's
+/// chapters detail popup).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Chapter {
     pub at_secs: f64,
     pub title: String,

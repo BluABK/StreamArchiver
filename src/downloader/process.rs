@@ -180,6 +180,7 @@ pub(super) fn recording_from_detached(row: &DetachedRow) -> Recording {
         err_ack: false,
         sabr_live_edge_fallback: false,
         chapters_state: String::new(),
+        chapters_json: String::new(),
     }
 }
 

@@ -1195,7 +1195,11 @@ audio/video/subtitle streams or existing metadata tags); a take that already
 got chapters, or was excluded (a recording stitched from more than one
 crash/reconnect leg has no reliable shared timeline), shows no badge and is
 never retried automatically. A **📑 chapters** badge appears on the
-take/stream row once embedding succeeds.
+take/stream row once embedding succeeds, and a matching **ℹ** button on any
+"Chapters" row in the Background view's Active/Recent tables opens a popup
+with the stream, the file path, and the full embedded chapter list with
+timestamps (survives in the Recent table's 100-entry history, so it's
+available long after the embed itself finished).
 
 **Existing recordings, and manual control.** A startup sweep retroactively
 embeds chapters into every already-finalized recording the first time it

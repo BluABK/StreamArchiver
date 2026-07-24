@@ -567,6 +567,99 @@ impl StreamArchiverApp {
         !open
     }
 
+    /// Load one recording's (channel name, file path, parsed chapter list)
+    /// into the cache if absent — the actually-embedded list from
+    /// `Recording.chapters_json`, not a live re-derivation.
+    pub(super) fn ensure_chapters_popup_cached(&mut self, rec_id: i64) {
+        if self.chapters_popup_cache.contains_key(&rec_id) {
+            return;
+        }
+        let Some(rec) = self.core.store.get_recording(rec_id).ok().flatten() else { return };
+        let channel_name = self
+            .core
+            .store
+            .get_monitor_with_channel(rec.monitor_id)
+            .ok()
+            .flatten()
+            .map(|r| r.channel.name)
+            .unwrap_or_default();
+        let chapters: Vec<crate::chapters::Chapter> =
+            serde_json::from_str(&rec.chapters_json).unwrap_or_default();
+        self.chapters_popup_cache.insert(rec_id, (channel_name, rec.output_path, chapters));
+    }
+
+    /// Render every open chapters-detail window (one per recording) — the
+    /// Background view's ℹ button on a Chapters task row.
+    pub(super) fn chapters_popup_windows(&mut self, ctx: &egui::Context) {
+        let mut closed: Vec<i64> = Vec::new();
+        for i in 0..self.chapters_popups.len() {
+            let rid = self.chapters_popups[i];
+            if self.chapters_popup_window(ctx, rid) {
+                closed.push(rid);
+            }
+        }
+        if !closed.is_empty() {
+            self.chapters_popups.retain(|r| !closed.contains(r));
+        }
+    }
+
+    /// Window showing which stream, which file, and the embedded chapter
+    /// list (title + timestamp) for one recording; returns true on close.
+    #[allow(deprecated)]
+    pub(super) fn chapters_popup_window(&mut self, ctx: &egui::Context, rid: i64) -> bool {
+        self.ensure_chapters_popup_cached(rid);
+        let (channel_name, output_path, chapters) =
+            self.chapters_popup_cache.get(&rid).cloned().unwrap_or_default();
+        let mut open = true;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of(("chapters_detail_vp", rid)),
+            egui::ViewportBuilder::default()
+                .with_title(format!("{channel_name} — chapters (take #{rid})"))
+                .with_inner_size([460.0, 320.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label(egui::RichText::new(&channel_name).strong());
+                    ui.horizontal(|ui| {
+                        ui.label("File:");
+                        ui.label(egui::RichText::new(&output_path).monospace().small());
+                        if ui.small_button("📋").on_hover_text("Copy file path").clicked() {
+                            ui.ctx().copy_text(output_path.clone());
+                        }
+                    });
+                    ui.add_space(6.0);
+                    if chapters.is_empty() {
+                        ui.label(
+                            "No chapters recorded for this take yet (embedding may still be \
+                             in progress, or none of the enabled kinds found anything to mark).",
+                        );
+                        return;
+                    }
+                    ui.label(format!("{} chapter(s):", chapters.len()));
+                    ui.add_space(4.0);
+                    let lines: Vec<String> = chapters
+                        .iter()
+                        .map(|c| format!("{}  {}", fmt_duration(c.at_secs.round() as i64), c.title))
+                        .collect();
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for line in &lines {
+                                ui.label(egui::RichText::new(line).monospace());
+                            }
+                        });
+                    ui.add_space(6.0);
+                    if ui.button("📋  Copy").clicked() {
+                        ui.ctx().copy_text(lines.join("\n"));
+                    }
+                });
+            },
+        );
+        !open
+    }
+
     // (collab history helpers below; state struct + line formatter at the
     // bottom of this file)
 

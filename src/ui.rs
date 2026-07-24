@@ -1214,6 +1214,13 @@ pub struct StreamArchiverApp {
     history_change_cache: HashMap<i64, Vec<MonitorStreamChange>>,
     /// Monitor id whose all-time change history is shown in a popup.
     history_popups: Vec<i64>,
+    /// Recording id whose embedded chapter list (stream, file path, chapter
+    /// timestamps) is shown in a popup — the Background view's ℹ button on a
+    /// Chapters task row.
+    chapters_popups: Vec<i64>,
+    /// Lazy per-recording (channel name, file path, parsed chapter list) for
+    /// the chapters detail popup, keyed by recording id; cleared on reload.
+    chapters_popup_cache: HashMap<i64, (String, String, Vec<crate::chapters::Chapter>)>,
     /// Lazy per-monitor upcoming-schedule detail, keyed by monitor id; cleared on
     /// reload. Backs the Next stream popup.
     schedule_cache: HashMap<i64, Vec<ScheduleSegment>>,
@@ -2307,6 +2314,7 @@ impl eframe::App for StreamArchiverApp {
         self.ad_popup_windows(ui.ctx());
         self.meta_popup_windows(ui.ctx());
         self.history_popup_windows(ui.ctx());
+        self.chapters_popup_windows(ui.ctx());
         self.collab_history_window(ui.ctx());
         self.partner_sessions_window(ui.ctx());
         self.viewer_stats_window(ui.ctx());

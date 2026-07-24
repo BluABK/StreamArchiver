@@ -365,6 +365,18 @@ impl StreamArchiverApp {
                                             } else {
                                                 ui.label(text);
                                             }
+                                            if let crate::events::BackgroundTaskKind::Chapters(rec_id) = task.kind
+                                                && ui
+                                                    .small_button("ℹ")
+                                                    .on_hover_text(
+                                                        "Which stream, which file, and which \
+                                                         chapters at which timestamp.",
+                                                    )
+                                                    .clicked()
+                                                && !self.chapters_popups.contains(&rec_id)
+                                            {
+                                                self.chapters_popups.push(rec_id);
+                                            }
                                         }
                                         "elapsed" => {
                                             ui.label(format!(
@@ -424,7 +436,21 @@ impl StreamArchiverApp {
                                     row.col(|ui| match BG_RECENT_COLUMNS[i].id {
                                         "channel" => { ui.label(&task.label); }
                                         "task" => { ui.label(task.kind.label()); }
-                                        "detail" => { ui.label(&task.detail); }
+                                        "detail" => {
+                                            ui.label(&task.detail);
+                                            if let crate::events::BackgroundTaskKind::Chapters(rec_id) = task.kind
+                                                && ui
+                                                    .small_button("ℹ")
+                                                    .on_hover_text(
+                                                        "Which stream, which file, and which \
+                                                         chapters at which timestamp.",
+                                                    )
+                                                    .clicked()
+                                                && !self.chapters_popups.contains(&rec_id)
+                                            {
+                                                self.chapters_popups.push(rec_id);
+                                            }
+                                        }
                                         "outcome" => {
                                             match outcome {
                                                 crate::events::TaskOutcome::Completed => {

@@ -187,6 +187,9 @@ impl Supervisor {
         match embed_chapters_into_mkv(&output, &ffmetadata).await {
             Ok(()) => {
                 let _ = self.store.set_chapters_state(rec_id, "done");
+                if let Ok(json) = serde_json::to_string(&chapters) {
+                    let _ = self.store.set_chapters_json(rec_id, &json);
+                }
                 let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
                 info!(rec_id, "chapters: embedded {} marker(s)", chapters.len());
                 finish(crate::events::TaskOutcome::CompletedWithNote(format!(
