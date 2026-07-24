@@ -169,7 +169,15 @@ pub(super) fn describe_recurrence(r: &ScheduledRecording) -> String {
 /// Build a filename preview for the Format Designer using real monitor/recording
 /// data. Media info is synthetic (1920×1080/60fps/h264/aac) since probing requires
 /// async work the UI thread doesn't do. Extension is NOT included.
+///
+/// `{games}` is rebuilt from the recording's FULL category history (every
+/// distinct `stream_meta_change` category, same as the real finalize-time
+/// value) rather than `Recording.category` alone — that field only holds
+/// the take's current/last-known category, so a preview that read it
+/// directly showed just "Dave the Diver" instead of the real filename's
+/// "Just Chatting, Dave the Diver".
 pub(super) fn build_preview_filename(
+    store: &crate::store::Store,
     monitor: &MonitorWithChannel,
     recording: Option<&Recording>,
     template: &str,
@@ -195,13 +203,11 @@ pub(super) fn build_preview_filename(
         }
     };
     let (started_at, went_live, stream_id_s, title_s, games_s) = match recording {
-        Some(r) => (
-            r.started_at,
-            r.went_live_at.unwrap_or(0),
-            r.stream_id.clone().unwrap_or_default(),
-            r.title.clone(),
-            r.category.clone(),
-        ),
+        Some(r) => {
+            let games = crate::downloader::games_for_recording(store, r.id);
+            let games = if games.is_empty() { r.category.clone() } else { games };
+            (r.started_at, r.went_live_at.unwrap_or(0), r.stream_id.clone().unwrap_or_default(), r.title.clone(), games)
+        }
         None => (now_unix(), 0i64, String::new(), "Stream Title".to_string(), "Sample Game".to_string()),
     };
     let vars = crate::downloader::TemplateVars {

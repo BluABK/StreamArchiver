@@ -1827,15 +1827,17 @@ impl StreamArchiverApp {
         let recordings = self.format_designer.as_ref().unwrap().recordings.clone();
         let target = self.format_designer.as_ref().unwrap().target.clone();
 
+        // Channels with the same name across platforms are otherwise
+        // indistinguishable in the dropdown — tag each with its platform.
         let monitor_names: Vec<String> = self.rows.iter()
-            .map(|r| r.channel.name.clone())
+            .map(|r| format!("{} [{}]", r.channel.name, r.monitor.platform().label()))
             .collect();
         let selected_monitor = self.rows.get(selected_monitor_idx).cloned();
         let selected_recording = recordings.get(selected_recording_idx).cloned();
 
         // Pre-compute preview (stale by one frame on fast typing — acceptable).
         let preview = selected_monitor.as_ref()
-            .map(|m| build_preview_filename(m, selected_recording.as_ref(), &template))
+            .map(|m| build_preview_filename(&self.core.store, m, selected_recording.as_ref(), &template))
             .unwrap_or_default();
 
         // ── Mutable locals for the closure to write into ─────────────────────

@@ -162,7 +162,7 @@ pub(super) fn remux_opts_for_recording(store: &Store, rec_id: i64) -> crate::mod
     opts
 }
 
-pub(super) fn games_for_recording(store: &Store, rec_id: i64) -> String {
+pub fn games_for_recording(store: &Store, rec_id: i64) -> String {
     let cats: Vec<String> = store
         .meta_changes_for_recording(rec_id)
         .unwrap_or_default()
