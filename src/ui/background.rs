@@ -203,31 +203,8 @@ impl StreamArchiverApp {
                     let resp = ui
                         .horizontal(|ui| {
                             ui.label(format!("🖴 Disk gate [{drive}:]:"));
-                            match holders.first() {
-                                Some((label, held)) => {
-                                    ui.colored_label(
-                                        egui::Color32::from_rgb(80, 160, 220),
-                                        format!("{label} — running {}", fmt_duration(*held as i64)),
-                                    );
-                                    if holders.len() > 1 {
-                                        let others: String = holders[1..]
-                                            .iter()
-                                            .map(|(l, h)| {
-                                                format!("{l} — running {}", fmt_duration(*h as i64))
-                                            })
-                                            .collect::<Vec<_>>()
-                                            .join("\n");
-                                        ui.weak(format!("(+{} more)", holders.len() - 1))
-                                            .on_hover_text(format!(
-                                                "Other passes ALSO running right now (this drive \
-                                                 allows more than one). Only the longest-running \
-                                                 one is shown on the line.\n\n{others}"
-                                            ));
-                                    }
-                                }
-                                None => {
-                                    ui.weak(if paused { "paused" } else { "turning over…" });
-                                }
+                            if holders.is_empty() {
+                                ui.weak(if paused { "paused" } else { "turning over…" });
                             }
                             if waiting > 0 {
                                 ui.weak(format!("· {waiting} queued"));
@@ -295,6 +272,21 @@ impl StreamArchiverApp {
                          Recording → Disk I/O limits). Queued passes list their wait in \
                          their own task row.\n\n{all}"
                     ));
+                    // Every pass CURRENTLY holding a permit on this drive, one
+                    // indented line each — this drive allows more than one
+                    // concurrent pass whenever its permit count is above 1
+                    // (Settings → Recording → Disk I/O limits, static or
+                    // Dynamic), so all of them can be genuinely running at
+                    // once, not just the longest-running one.
+                    for (label, held) in &holders {
+                        ui.horizontal(|ui| {
+                            ui.add_space(24.0);
+                            ui.colored_label(
+                                egui::Color32::from_rgb(80, 160, 220),
+                                format!("{label} — running {}", fmt_duration(*held as i64)),
+                            );
+                        });
+                    }
                     // The queue itself: every pass waiting for a gate on THIS
                     // drive, in line order — includes passes that have no
                     // task row of their own (batch re-remux items, embeds,
