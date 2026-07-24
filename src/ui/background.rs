@@ -702,11 +702,43 @@ impl StreamArchiverApp {
                     egui::ProgressBar::new(frac)
                         .text(format!("{quota_today} / {cutoff} units")),
                 );
-                let search_frac = (search_today as f32 / 100.0_f32).clamp(0.0, 1.0);
+                let search_frac = (search_today as f32 / search_cutoff.max(1) as f32).clamp(0.0, 1.0);
                 ui.add(
                     egui::ProgressBar::new(search_frac)
-                        .text(format!("{search_today} / 100 search queries")),
+                        .text(format!("{search_today} / {search_cutoff} search queries")),
                 );
+
+                ui.add_space(6.0);
+                let ep_search = self.yt_ep_search_today;
+                let ep_videos = self.yt_ep_videos_today;
+                let ep_channels = self.yt_ep_channels_today;
+                ui.label(egui::RichText::new("Units spent by call type today").strong())
+                    .on_hover_text(
+                        "Where the total above is actually going. search.list costs 100 \
+                         units/call (by far the most expensive) — videos.list and \
+                         channels.list cost 1 unit/call each. A monitor added by @handle \
+                         (rather than a /channel/UC… URL) pays an extra channels.list call \
+                         on every poll to resolve the handle, on top of the poll's own \
+                         search.list/videos.list calls.",
+                    );
+                egui::Grid::new("quota_breakdown_grid")
+                    .num_columns(6)
+                    .spacing([24.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("search.list");
+                        ui.strong(format!("{ep_search}")).on_hover_text(
+                            "Live-detection polls and the upcoming-schedule refresh — 100 units/call.",
+                        );
+                        ui.label("videos.list");
+                        ui.strong(format!("{ep_videos}")).on_hover_text(
+                            "Title/scheduled-start/actual-start lookups by video id — 1 unit/call.",
+                        );
+                        ui.label("channels.list");
+                        ui.strong(format!("{ep_channels}")).on_hover_text(
+                            "Handle-to-channel-id resolution for @handle URLs — 1 unit/call.",
+                        );
+                        ui.end_row();
+                    });
             }
 
             ui.add_space(16.0);
@@ -1077,7 +1109,7 @@ impl StreamArchiverApp {
                              stream hiccup.",
                         );
                     egui::Grid::new("capture_health_daily")
-                        .num_columns(5)
+                        .num_columns(6)
                         .striped(true)
                         .spacing([24.0, 4.0])
                         .show(ui, |ui| {
@@ -1086,6 +1118,9 @@ impl StreamArchiverApp {
                             ui.strong("Warnings");
                             ui.strong("Lost");
                             ui.strong("Recovered");
+                            ui.strong("Muted").on_hover_text(
+                                "Recovered segments that only survived as DMCA-muted copies.",
+                            );
                             ui.end_row();
                             for d in &daily {
                                 ui.label(&d.day);
@@ -1102,6 +1137,11 @@ impl StreamArchiverApp {
                                 });
                                 ui.label(if d.ranges_total > 0 {
                                     format!("{}/{}", d.recovered, d.ranges_total)
+                                } else {
+                                    "—".into()
+                                });
+                                ui.label(if d.muted > 0 {
+                                    crate::models::group_thousands(d.muted)
                                 } else {
                                     "—".into()
                                 });

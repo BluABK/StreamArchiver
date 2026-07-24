@@ -114,6 +114,8 @@ pub struct AlertDailyStat {
     pub lost_segments: i64,
     pub ranges_total: i64,
     pub recovered: i64,
+    /// Muted-fallback segments inside the day's recovered patches.
+    pub muted: i64,
 }
 
 /// One lost time range queued for VOD recovery (broadcast-start offsets,
@@ -574,7 +576,7 @@ impl Store {
             "SELECT date(first_at, 'unixepoch') AS d,
                     SUM(CASE WHEN severity = 'error' THEN 1 ELSE 0 END),
                     SUM(CASE WHEN severity != 'error' THEN 1 ELSE 0 END),
-                    SUM(lost_segments), SUM(ranges_total), SUM(recovered)
+                    SUM(lost_segments), SUM(ranges_total), SUM(recovered), SUM(recovered_muted)
              FROM capture_alert WHERE first_at >= ?1
              GROUP BY d ORDER BY d DESC",
         )?;
@@ -587,6 +589,7 @@ impl Store {
                     lost_segments: r.get(3)?,
                     ranges_total: r.get(4)?,
                     recovered: r.get(5)?,
+                    muted: r.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
