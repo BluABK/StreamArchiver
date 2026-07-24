@@ -205,6 +205,15 @@ impl AppCore {
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(crate::app_paths::default_output_dir),
             );
+            roots.push(
+                self.store
+                    .get_setting("default_video_output_dir") // ui.rs K_VIDEO_DEFAULT_OUT
+                    .ok()
+                    .flatten()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(crate::app_paths::default_video_output_dir),
+            );
             // …plus every dir PAST recordings live in: an instance retargeted
             // from A:\ to D:\ leaves its old takes on A:, and that drive must
             // stay classified/sampled as a recordings drive too.

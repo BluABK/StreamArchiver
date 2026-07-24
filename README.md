@@ -2329,6 +2329,20 @@ would be far more surprising than a per-recording filename token that
 does. If a template segment expands to nothing, that folder level is
 dropped rather than backfilled with a placeholder.
 
+**Video downloads use a separate default.** *Default video download folder*
+(Settings → Defaults) is a distinct setting from *Default output folder* —
+on-demand video downloads (the Videos tab, and manually recovering a VOD the
+app never tracked) aren't stream recordings, so they don't inherit that
+default. It seeds the Videos tab's per-platform *Download defaults* (only
+filling in a platform's output folder while it's still empty — each
+platform can still be pointed elsewhere independently) and supports the
+same `{platform}`/`{platform_short}` tokens (no `{name}`: a platform-wide
+download bucket has no single channel), e.g.
+`G:\downloads\{platform}` seeds Twitch downloads to `G:\downloads\twitch`,
+YouTube to `G:\downloads\youtube`, and so on. Unset, it defaults to a
+`Downloads` subfolder alongside the recordings default rather than
+silently reusing it.
+
 #### Filename media info ({resolution}/{fps}/…)
 
 Actual resolution/fps/codec aren't known when the filename is first chosen (it's

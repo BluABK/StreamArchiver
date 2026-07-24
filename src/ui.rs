@@ -49,6 +49,12 @@ const K_YT_KEY: &str = "youtube_api_key";
 const K_KICK_ID: &str = "kick_client_id";
 const K_KICK_SECRET: &str = "kick_client_secret";
 const K_DEFAULT_OUT: &str = "default_output_dir";
+/// Default output folder for on-demand **video downloads** (Videos tab /
+/// Recover VOD) — separate from [`K_DEFAULT_OUT`] (live stream recordings);
+/// seeds `DownloadDefaults`' per-platform output dirs instead of the
+/// recording default. `pub(crate)`: `app_core.rs`'s headless I/O-monitor-root
+/// init reads it too (same reason `K_SABR_POT_ARGS` is `pub(crate)`).
+pub(crate) const K_VIDEO_DEFAULT_OUT: &str = "default_video_output_dir";
 const K_MAX_CONCURRENT: &str = "max_concurrent_downloads";
 const K_DOWNLOAD_AUTH: &str = "download_auth_method";
 const K_COOKIES_BROWSER: &str = "cookies_browser";
@@ -728,6 +734,10 @@ struct SettingsForm {
     kick_client_id: String,
     kick_client_secret: String,
     default_output_dir: String,
+    /// Default output folder for on-demand video downloads (Videos tab /
+    /// Recover VOD) — seeds `DownloadDefaults`' per-platform output dirs,
+    /// separate from `default_output_dir` (live stream recordings).
+    default_video_output_dir: String,
     max_concurrent_downloads: String,
     /// VOD/video download rate limit (yt-dlp `--limit-rate` syntax, e.g. `4M`);
     /// empty = unlimited (the default). Never applied to live captures.

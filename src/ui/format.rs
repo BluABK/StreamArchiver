@@ -13,19 +13,26 @@ pub(super) fn setting_desc(ui: &mut egui::Ui, text: &str) {
     });
 }
 
-/// Re-register the I/O monitor's recordings roots: current instance output
-/// dirs + the default output dir + every dir PAST recordings live in (a drive
-/// an instance moved away from must stay classified and disk-sampled).
-pub(super) fn refresh_iomon_roots(store: &crate::store::Store, default_dir: &str) {
+/// Re-register the I/O monitor's recordings roots: current instance/video
+/// output dirs + the default output dir + the default video-download dir +
+/// every dir PAST recordings live in (a drive an instance moved away from
+/// must stay classified and disk-sampled).
+pub(super) fn refresh_iomon_roots(
+    store: &crate::store::Store,
+    default_dir: &str,
+    default_video_dir: &str,
+) {
     let mut roots: Vec<std::path::PathBuf> = store
         .all_output_dirs()
         .unwrap_or_default()
         .into_iter()
         .map(std::path::PathBuf::from)
         .collect();
-    let d = default_dir.trim();
-    if !d.is_empty() {
-        roots.push(std::path::PathBuf::from(d));
+    for d in [default_dir, default_video_dir] {
+        let d = d.trim();
+        if !d.is_empty() {
+            roots.push(std::path::PathBuf::from(d));
+        }
     }
     roots.extend(crate::downloader::historical_recording_dirs(store));
     crate::iomon::set_recordings_roots(roots);

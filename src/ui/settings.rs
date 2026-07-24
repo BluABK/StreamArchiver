@@ -1126,6 +1126,25 @@ impl StreamArchiverApp {
                         }
                     });
                     ui.end_row();
+                    ui.label("Default video download folder").on_hover_text(
+                        "Seeds the Videos tab's per-platform Download defaults (and the manual \
+                         Recover VOD form) — separate from Default output folder above, since \
+                         on-demand video downloads aren't stream recordings. Only used to fill \
+                         in a platform's output folder when it's still empty; each platform \
+                         under Videos → Download defaults can be pointed elsewhere \
+                         independently. Supports the same {name}/{platform}/{platform_short} \
+                         tokens as Default output folder.",
+                    );
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut self.settings.default_video_output_dir);
+                        if ui.button("Browse…").clicked() {
+                            self.pending_browse = Some(spawn_browse_folder(
+                                &self.settings.default_video_output_dir,
+                                |app, p| app.settings.default_video_output_dir = p,
+                            ));
+                        }
+                    });
+                    ui.end_row();
                     ui.label("Media player path").on_hover_text(
                         "Path to the media player used by \"Stream in player\" on recording rows. \
                          Passed the file path as the only argument (e.g. mpv.exe, vlc.exe). \

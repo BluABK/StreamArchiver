@@ -77,6 +77,14 @@ pub fn default_output_dir() -> PathBuf {
     dir
 }
 
+/// Default output directory for on-demand **video downloads** (Videos tab /
+/// Recover VOD) — distinct from [`default_output_dir`] (live stream
+/// recordings): a `Downloads` subfolder alongside it, so the two are never
+/// silently the same folder even before either setting is configured.
+pub fn default_video_output_dir() -> PathBuf {
+    default_output_dir().join("Downloads")
+}
+
 /// Root of the centralised asset cache (alongside the DB, under the data dir).
 /// e.g. `%APPDATA%\StreamArchiver\data\asset-cache\` on Windows.
 pub fn asset_cache_dir() -> PathBuf {

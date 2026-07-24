@@ -1302,7 +1302,13 @@ impl StreamArchiverApp {
             url_paste: String::new(),
             quality: setting_or_empty(&self.core, crate::recovery::K_RECOVERY_QUALITY),
             rec_id: None,
-            output_dir: self.settings.default_output_dir.clone(),
+            // A video download, not a stream recording — and Twitch-only
+            // (login/broadcast_id CDN recovery), so {platform} expands fixed.
+            output_dir: crate::downloader::expand_dir_template(
+                &self.settings.default_video_output_dir,
+                "",
+                Platform::Twitch.as_str(),
+            ),
             deleted: true,
             vod_id: None,
         });

@@ -1712,14 +1712,19 @@ pub struct PlatformDownloadDefault {
 
 impl PlatformDownloadDefault {
     /// Built-in starting values for a platform (best quality, platform's
-    /// preferred tool, global auth, the app's default output folder).
+    /// preferred tool, global auth, the app's default video-download
+    /// folder). `default_output_dir` may itself be a `{platform}`/
+    /// `{platform_short}` template (see
+    /// [`crate::downloader::expand_dir_template`]) — expanded here per
+    /// platform (no `{name}`: there's no single channel for a platform-wide
+    /// download bucket).
     pub fn seeded(platform: Platform, default_output_dir: &str) -> PlatformDownloadDefault {
         PlatformDownloadDefault {
             tool: platform.default_download_tool(),
             quality: "best".into(),
             auth_kind: AuthKind::Inherit,
             auth_value: String::new(),
-            output_dir: default_output_dir.to_string(),
+            output_dir: crate::downloader::expand_dir_template(default_output_dir, "", platform.as_str()),
             filename_template: "{name}_{date}_{time}".into(),
             extra_args: String::new(),
             auto_title: false,
@@ -1797,7 +1802,8 @@ impl DownloadDefaults {
         for platform in Platform::ALL {
             let d = self.get_mut(platform);
             if d.output_dir.trim().is_empty() {
-                d.output_dir = default_output_dir.to_string();
+                d.output_dir =
+                    crate::downloader::expand_dir_template(default_output_dir, "", platform.as_str());
             }
         }
     }
@@ -2956,6 +2962,19 @@ mod tests {
         stats.record(20_000, Platform::Twitch, "Helix API", "ch", true, "later");
         assert_eq!(stats.by_platform["twitch"].polls, 101);
         assert_eq!(stats.by_platform["twitch"].recent_errors.len(), 1);
+    }
+
+    #[test]
+    fn download_defaults_seed_expands_platform_token_per_platform() {
+        let d = DownloadDefaults::seeded(r"G:\downloads\{platform}");
+        assert_eq!(d.twitch.output_dir, r"G:\downloads\twitch");
+        assert_eq!(d.youtube.output_dir, r"G:\downloads\youtube");
+        assert_eq!(d.kick.output_dir, r"G:\downloads\kick");
+        // fill_empty_output_dirs (the backcompat-heal path) expands the same way.
+        let mut d2 = DownloadDefaults::seeded("");
+        d2.fill_empty_output_dirs(r"G:\downloads\{platform_short}");
+        assert_eq!(d2.twitch.output_dir, r"G:\downloads\ttv");
+        assert_eq!(d2.youtube.output_dir, r"G:\downloads\yt");
     }
 
     #[test]

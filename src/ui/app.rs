@@ -80,6 +80,16 @@ impl StreamArchiverApp {
                     .to_string_lossy()
                     .to_string()
             });
+        let default_video_out = core
+            .store
+            .get_setting(K_VIDEO_DEFAULT_OUT)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| {
+                crate::app_paths::default_video_output_dir()
+                    .to_string_lossy()
+                    .to_string()
+            });
 
         let settings = SettingsForm {
             twitch_client_id: setting_or_empty(&core, K_TWITCH_ID),
@@ -94,6 +104,7 @@ impl StreamArchiverApp {
             kick_client_id: setting_or_empty(&core, K_KICK_ID),
             kick_client_secret: setting_or_empty(&core, K_KICK_SECRET),
             default_output_dir: default_out,
+            default_video_output_dir: default_video_out,
             max_concurrent_downloads: core
                 .store
                 .get_setting(K_MAX_CONCURRENT)
@@ -349,7 +360,7 @@ impl StreamArchiverApp {
             .ok()
             .flatten()
             .and_then(|s| serde_json::from_str::<DownloadDefaults>(&s).ok())
-            .unwrap_or_else(|| DownloadDefaults::seeded(&settings.default_output_dir));
+            .unwrap_or_else(|| DownloadDefaults::seeded(&settings.default_video_output_dir));
         // One-shot heal (marker-guarded, so re-choosing streamlink later
         // sticks): defaults persisted under the old seed gave Generic
         // downloads streamlink, which fails on plain video pages that yt-dlp
@@ -369,9 +380,10 @@ impl StreamArchiverApp {
             let _ = core.store.set_setting(K_GENERIC_TOOL_HEALED, "1");
         }
         // Platforms added after the struct was first persisted (NRK/Nebula)
-        // deserialize with an empty output dir — complete them from the app
-        // default before the Videos form ever sees them.
-        download_defaults.fill_empty_output_dirs(&settings.default_output_dir);
+        // deserialize with an empty output dir — complete them from the
+        // video-download default (not the recording default — these are
+        // downloads, not recordings) before the Videos form ever sees them.
+        download_defaults.fill_empty_output_dirs(&settings.default_video_output_dir);
 
         let monitor_defaults = core
             .store
@@ -1535,6 +1547,7 @@ impl StreamArchiverApp {
             (K_KICK_ID, s.kick_client_id.trim()),
             (K_KICK_SECRET, s.kick_client_secret.trim()),
             (K_DEFAULT_OUT, s.default_output_dir.trim()),
+            (K_VIDEO_DEFAULT_OUT, s.default_video_output_dir.trim()),
             (K_MAX_CONCURRENT, s.max_concurrent_downloads.trim()),
             (crate::io_gate::K_DOWNLOAD_RATE_LIMIT, s.download_rate_limit.trim()),
             (crate::downloader::K_CACHE_ROOT, s.capture_cache_root.trim()),
@@ -1714,7 +1727,11 @@ impl StreamArchiverApp {
         // I/O monitor: apply the sample-log toggle and re-register the
         // recordings roots (the default output dir may have changed).
         crate::iomon::set_sample_logging(self.settings.iomon_sample_log);
-        refresh_iomon_roots(&self.core.store, &self.settings.default_output_dir);
+        refresh_iomon_roots(
+            &self.core.store,
+            &self.settings.default_output_dir,
+            &self.settings.default_video_output_dir,
+        );
         self.persist_monitor_defaults();
         self.status = "Settings saved.".into();
     }

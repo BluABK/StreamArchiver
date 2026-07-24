@@ -476,7 +476,11 @@ impl StreamArchiverApp {
                         set_dir.len()
                     ),
                 };
-                refresh_iomon_roots(&self.core.store, &self.settings.default_output_dir);
+                refresh_iomon_roots(
+                    &self.core.store,
+                    &self.settings.default_output_dir,
+                    &self.settings.default_video_output_dir,
+                );
                 rescan = true;
             }
             ui.add_space(8.0);
@@ -594,6 +598,7 @@ impl StreamArchiverApp {
                             refresh_iomon_roots(
                                 &self.core.store,
                                 &self.settings.default_output_dir,
+                                &self.settings.default_video_output_dir,
                             );
                             rescan = true;
                         }
