@@ -154,12 +154,13 @@ pub fn set_disk_limits(cfg: DiskLimitsConfig) {
 /// write finally lands). Also resizes existing gates, same as
 /// `set_disk_limits` — see its doc comment for why.
 pub fn modify_disk_limits(f: impl FnOnce(&mut DiskLimitsConfig)) {
-    let cfg = {
+    let (old_cfg, cfg) = {
         let mut guard = DISK_CFG.write();
+        let old_cfg = guard.clone().unwrap_or_default();
         let mut cfg = guard.take().unwrap_or_default();
         f(&mut cfg);
         *guard = Some(cfg.clone());
-        cfg
+        (old_cfg, cfg)
     };
     // Resize using THIS call's own just-committed snapshot, not a fresh
     // re-read per key — two `modify_disk_limits` calls from different
@@ -174,34 +175,72 @@ pub fn modify_disk_limits(f: impl FnOnce(&mut DiskLimitsConfig)) {
     // one fixed snapshot for the whole sweep avoids that: since commits are
     // ordered, this call's snapshot is always at least as fresh as anything
     // already applied, so it can never regress a value another call set.
-    resize_existing_gates(&LOCAL_GATES, &cfg, |l| l.local_permits);
-    resize_existing_gates(&CDN_GATES, &cfg, |l| l.cdn_permits);
+    resize_existing_gates(&LOCAL_GATES, &old_cfg, &cfg, |l| l.local_permits, |p| p.0);
+    resize_existing_gates(&CDN_GATES, &old_cfg, &cfg, |l| l.cdn_permits, |p| p.1);
 }
 
 /// Re-run the growth/shrink logic in [`gate_sem`] for every drive key that
-/// already has a gate, against the just-installed [`DISK_CFG`]. A no-op
-/// until the first pass on a given map ever runs (nothing to resize yet).
+/// already has a gate, against the just-installed [`DISK_CFG`] (`old_cfg`
+/// is the snapshot from immediately before this save, needed to tell a
+/// genuine ceiling raise apart from an unrelated field changing on a save
+/// that happens to sweep every key regardless). A no-op until the first
+/// pass on a given map ever runs (nothing to resize yet).
 ///
-/// Needs no special-casing for dynamic-mode drives: `gate_sem` itself is a
-/// no-op (resize-wise) on an entry already flagged dynamic, so a save that
-/// leaves a drive in dynamic mode can't fight the background adjuster for
-/// control of its live permit count. A save that flips a drive OUT of
-/// dynamic mode DOES resize it here, back to the static ceiling — handing
-/// control back — and any leftover manual pin for that drive is cleared so
-/// it doesn't silently reappear if dynamic mode is re-enabled later.
+/// A static drive resizes here exactly as before (grow or shrink, both
+/// through `gate_sem`/`apply_target`). A drive already in dynamic mode
+/// never shrinks here — that stays the adjuster's own job, backing off
+/// toward a lower ceiling at its own pace — but a RAISE is always safe and
+/// instant (no different from a static drive's, see `apply_target`'s doc
+/// comment on why only shrinking needs care), so it's applied immediately
+/// via [`grow_dynamic_gate_on_save`] instead of leaving a higher ceiling
+/// unused until the adjuster's own slow-start pace happens to catch up.
+///
+/// Only fires when THIS save actually raised the ceiling (`want(&limits) >
+/// want(&old_limits)`) — every save re-sweeps every key regardless of what
+/// changed, so without this comparison, saving some unrelated field (e.g.
+/// the OTHER gate kind's permits, or a readrate) would just as eagerly
+/// grow a currently-contended gate the adjuster had deliberately backed
+/// off, undoing that backoff for no reason tied to this save at all.
+/// Skipped while a manual pin is active for that drive — same precedence
+/// rule the adjuster itself already follows in `dynamic_tick_for` (a pin
+/// always wins). A save that flips a drive OUT of dynamic mode DOES
+/// resize it here, back to the static ceiling — handing control back —
+/// and any leftover manual pin for that drive is cleared so it doesn't
+/// silently reappear if dynamic mode is re-enabled later.
 fn resize_existing_gates(
     map: &'static OnceLock<GateMap>,
+    old_cfg: &DiskLimitsConfig,
     cfg: &DiskLimitsConfig,
     want: impl Fn(&DiskLimits) -> u32,
+    pin_of: impl Fn(&(Option<u32>, Option<u32>)) -> Option<u32>,
 ) {
     let Some(m) = map.get() else { return };
     let keys: Vec<String> = m.lock().keys().cloned().collect();
     for key in keys {
         let limits = cfg.drives.get(&key).cloned().unwrap_or_else(|| cfg.default.clone());
-        gate_sem(map, &key, want(&limits) as usize, limits.dynamic);
-        if !limits.dynamic {
+        if limits.dynamic {
+            let old_limits = old_cfg.drives.get(&key).cloned().unwrap_or_else(|| old_cfg.default.clone());
+            if want(&limits) > want(&old_limits) {
+                let pinned = pin_of(&dynamic_pin_for(&key)).is_some();
+                grow_dynamic_gate_on_save(map, &key, want(&limits) as usize, pinned);
+            }
+        } else {
+            gate_sem(map, &key, want(&limits) as usize, false);
             clear_dynamic_pin(&key);
         }
+    }
+}
+
+/// Apply an immediate, grow-only resize to an already-dynamic gate on a
+/// settings save (see [`resize_existing_gates`]) — a no-op if `want` isn't
+/// actually higher than the live permit count, or if `pinned`.
+fn grow_dynamic_gate_on_save(map: &'static OnceLock<GateMap>, key: &str, want: usize, pinned: bool) {
+    let Some(m) = map.get() else { return };
+    let mut g = m.lock();
+    let Some(e) = g.get_mut(key) else { return };
+    e.dynamic = true;
+    if !pinned && want > e.permits {
+        apply_target(e, want);
     }
 }
 
@@ -1193,6 +1232,50 @@ mod tests {
         // or a concurrent sibling's gets there first — both converge on 5.
         modify_disk_limits(|cfg| cfg.drives.get_mut("W").unwrap().dynamic = false);
         assert_eq!(local_dyn_status('W').map(|s| s.current), Some(5));
+    }
+
+    /// The fix for "I raised the ceiling and nothing happened": a save that
+    /// actually raises a still-dynamic drive's ceiling must grow the live
+    /// gate right away, not leave it to the adjuster's own slow-start pace.
+    /// But it must stay narrow: a save that sweeps every key regardless of
+    /// what changed (see `modify_disk_limits`'s own doc comment) must NOT
+    /// grow a gate whose ceiling didn't actually move in THIS save, and a
+    /// manual pin must still win over even a genuine raise.
+    #[tokio::test]
+    async fn dynamic_gate_grows_immediately_on_ceiling_raise_but_not_other_saves() {
+        let _guard = lock_shared_state();
+        modify_disk_limits(|cfg| {
+            cfg.drives.insert(
+                "R".into(),
+                DiskLimits {
+                    local_permits: 1,
+                    cdn_permits: 1,
+                    readrate: 0.0,
+                    rate_limit: String::new(),
+                    dynamic: true,
+                    paused: false,
+                },
+            );
+        });
+        let sem = gate_sem(&LOCAL_GATES, "R", 1, true);
+        assert_eq!(sem.available_permits(), 1, "dynamic gates slow-start at 1");
+
+        // Saving an unrelated field (CDN's own permits) must not touch the
+        // local gate — its own ceiling never moved in this save.
+        modify_disk_limits(|cfg| cfg.drives.get_mut("R").unwrap().cdn_permits = 4);
+        assert_eq!(sem.available_permits(), 1, "unrelated save must not grow the gate");
+
+        // Raising local_permits itself must apply immediately even though
+        // the drive stays dynamic the whole time.
+        modify_disk_limits(|cfg| cfg.drives.get_mut("R").unwrap().local_permits = 3);
+        assert_eq!(sem.available_permits(), 3, "a genuine ceiling raise must apply immediately");
+
+        // A manual pin still wins over a genuine raise, same precedence
+        // the adjuster itself already gives it.
+        pin_dynamic_permits("R", Some(3), None);
+        modify_disk_limits(|cfg| cfg.drives.get_mut("R").unwrap().local_permits = 6);
+        assert_eq!(sem.available_permits(), 3, "a pin blocks the immediate raise too");
+        pin_dynamic_permits("R", None, None);
     }
 
     // `#[tokio::test]`, not plain `#[test]`: `modify_disk_limits` resizes
