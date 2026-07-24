@@ -1643,8 +1643,6 @@ impl StreamArchiverApp {
             .map(|m| m.next_stream_title.clone())
             .unwrap_or_default();
         let next_stream_mid = next_mon.map(|m| m.monitor.id);
-        let ad_free =
-            ad_free_summary(channel_ad_free_count(&mons), ninst);
         // Tint the container row by the rolled-up state of
         // its instances (ad playing / recording / errored).
         let any_ad = mons.iter().any(|m| ad_running(m.monitor.id));
@@ -1978,8 +1976,28 @@ impl StreamArchiverApp {
                         }
                     }
                     "ad_free" => {
-                        if !ad_free.0.is_empty() {
-                            ui.colored_label(SUCCESS_GREEN, ad_free.0);
+                        let free: Vec<&&MonitorWithChannel> = mons
+                            .iter()
+                            .filter(|m| ad_free_status(m.monitor.ad_free, m.ad_free_sub).is_some())
+                            .collect();
+                        if !free.is_empty() {
+                            let resp = ui
+                                .horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 2.0;
+                                    for _ in &free {
+                                        ui.colored_label(SUCCESS_GREEN, "🛡");
+                                    }
+                                })
+                                .response;
+                            let lines: String = free
+                                .iter()
+                                .map(|m| instance_label(&m.monitor.url))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            resp.on_hover_text(format!(
+                                "{}/{ninst} instance(s) marked or detected ad-free:\n{lines}",
+                                free.len()
+                            ));
                         }
                     }
                     "added" => {
