@@ -138,6 +138,7 @@ mod migrations;
 mod monitors;
 mod posts;
 mod recordings;
+pub use recordings::EarlierTakeRow;
 mod scheduled;
 mod stats_history;
 pub use stats_history::K_VH_DOWNSAMPLE_DAYS;

@@ -471,7 +471,15 @@ fresh, **full** head backfill (go-live through *that* take's start, not just
 the incremental gap since the previous take), not only the stream's first.
 Global default in Settings → Downloads → *Head backfill on new takes*;
 override per-channel or per-instance like the other 3-level toggles. Turning
-it off restores the original behavior (first take only).
+it off restores the original behavior (first take only). Before doing that
+full fetch, it checks whether an earlier take of the same broadcast is
+already recording (or already recorded) that same span — if so, it skips
+entirely rather than re-downloading footage another take already has. A
+second, independent safety net also refuses to ever start a new recording
+for a monitor while an earlier take's own capture file is still being
+actively written to, so the two mechanisms can't produce a duplicate
+recording between them even if something else briefly loses track of an
+in-progress take.
 
 **Replace old head (if new is undamaged).** A sub-setting (**default on**):
 once a fresh head backfill passes its integrity checks — no CDN segment had to

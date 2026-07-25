@@ -166,6 +166,40 @@ pub fn effective_replace_old(store: &Store, channel_id: i64, monitor_id: i64) ->
     effective_replace_old_from(global_replace_old(store), Some(&ch), Some(&mon))
 }
 
+/// Whether a non-first take's head-backfill would be pure duplication of
+/// what an earlier take of the same broadcast already has — either an
+/// earlier take is still `status='recording'` right now, or the latest
+/// earlier `completed`/`stopped` take's `ended_at` already covers at least
+/// 95% of the span `[went_live_at, this_take_started_at)` this backfill
+/// would otherwise re-fetch. 95%, not 100%, tolerates the ordinary few-
+/// seconds gap between one take ending and the next starting.
+///
+/// `earlier` is `Store::earlier_takes_for_stream`'s own row shape —
+/// `id`/`started_at` aren't read here, kept only so callers can pass the
+/// query's result straight through.
+pub fn earlier_take_already_covers(
+    earlier: &[crate::store::EarlierTakeRow],
+    went_live_at: i64,
+    this_take_started_at: i64,
+) -> bool {
+    if earlier.iter().any(|(_, _, _, status)| status == "recording") {
+        return true;
+    }
+    let span = (this_take_started_at - went_live_at).max(0);
+    if span == 0 {
+        return false;
+    }
+    let covered_until = earlier
+        .iter()
+        .filter(|(_, _, _, status)| matches!(status.as_str(), "completed" | "stopped"))
+        .filter_map(|(_, _, ended, _)| *ended)
+        .max();
+    match covered_until {
+        Some(end) => (end - went_live_at).clamp(0, span) as f64 / span as f64 >= 0.95,
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +255,60 @@ mod tests {
         save_monitor_head_backfill_scope(&store, 1, &scope(Some(false), None)).unwrap();
         assert!(!effective_fetch_new_take(&store, 1, 1));
         assert!(effective_replace_old(&store, 1, 1)); // untouched field still inherits
+    }
+
+    fn take(id: i64, started_at: i64, ended_at: Option<i64>, status: &str) -> (i64, i64, Option<i64>, String) {
+        (id, started_at, ended_at, status.to_string())
+    }
+
+    #[test]
+    fn no_earlier_takes_never_covers() {
+        assert!(!earlier_take_already_covers(&[], 1000, 5000));
+    }
+
+    #[test]
+    fn earlier_take_still_recording_always_covers() {
+        let earlier = vec![take(1, 1000, None, "recording")];
+        assert!(earlier_take_already_covers(&earlier, 1000, 5000));
+    }
+
+    #[test]
+    fn earlier_completed_take_spanning_the_whole_gap_covers() {
+        // Take 1 ran [1000, 5000) — this take starts at 5000: full coverage.
+        let earlier = vec![take(1, 1000, Some(5000), "completed")];
+        assert!(earlier_take_already_covers(&earlier, 1000, 5000));
+    }
+
+    #[test]
+    fn earlier_completed_take_within_the_95_percent_tolerance_covers() {
+        // Span is 4000s; take 1 ended 4800 (120s short of this take's start,
+        // i.e. covers 97%) — still counts as covered.
+        let earlier = vec![take(1, 1000, Some(4880), "completed")];
+        assert!(earlier_take_already_covers(&earlier, 1000, 5000));
+    }
+
+    #[test]
+    fn earlier_completed_take_ending_well_short_does_not_cover() {
+        // Take 1 ended at 3000 — only half the [1000,5000) span; a real gap
+        // remains, so this must NOT skip the backfill.
+        let earlier = vec![take(1, 1000, Some(3000), "completed")];
+        assert!(!earlier_take_already_covers(&earlier, 1000, 5000));
+    }
+
+    #[test]
+    fn only_failed_zero_byte_takes_does_not_cover() {
+        // Matches the Layna incident's inverse: an earlier take that never
+        // captured anything shouldn't be treated as coverage.
+        let earlier = vec![take(1, 1000, Some(1005), "failed")];
+        assert!(!earlier_take_already_covers(&earlier, 1000, 5000));
+    }
+
+    #[test]
+    fn picks_the_latest_ended_at_among_several_earlier_takes() {
+        let earlier = vec![
+            take(1, 1000, Some(2000), "completed"),
+            take(2, 2000, Some(4950), "completed"),
+        ];
+        assert!(earlier_take_already_covers(&earlier, 1000, 5000));
     }
 }

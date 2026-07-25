@@ -143,6 +143,27 @@ impl Supervisor {
             let _ = self.store.set_head_backfill_state(rec_id, "");
             return;
         }
+        // Don't re-download the whole missed span from the live VOD if an
+        // earlier take of this same broadcast is still recording it, or
+        // already captured it live — the naive "always go-live through THIS
+        // take's start" fetch below has no visibility into that otherwise,
+        // and can end up re-fetching content another take is simultaneously
+        // (or already) holding, producing a near-total duplicate head file.
+        if !is_first_take {
+            let earlier = self
+                .store
+                .earlier_takes_for_stream(monitor_id, &stream_id, started_at)
+                .unwrap_or_default();
+            if crate::head_backfill::earlier_take_already_covers(&earlier, went_live_at, started_at) {
+                info!(
+                    rec_id,
+                    "head backfill: an earlier take of this stream already covers (or is \
+                     still recording) the missed span — skipping the full re-fetch"
+                );
+                let _ = self.store.set_head_backfill_state(rec_id, "");
+                return;
+            }
+        }
         let Some(login) = crate::detectors::twitch_login(&monitor_url) else {
             let _ = self.store.set_head_backfill_state(rec_id, "");
             return;

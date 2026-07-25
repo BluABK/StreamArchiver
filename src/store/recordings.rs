@@ -3,6 +3,9 @@
 
 use super::*;
 
+/// `(id, started_at, ended_at, status)` — see `Store::earlier_takes_for_stream`.
+pub type EarlierTakeRow = (i64, i64, Option<i64>, String);
+
 impl Store {
     // ----- recordings -----
 
@@ -371,6 +374,31 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(earlier == 0)
+    }
+
+    /// Earlier takes of the same broadcast — `(id, started_at, ended_at,
+    /// status)`, oldest first — for the head-backfill "don't re-fetch what's
+    /// already covered" guard: a non-first take shouldn't re-download the
+    /// whole missed span from the live VOD if an earlier take is still
+    /// recording it, or already captured it live.
+    pub fn earlier_takes_for_stream(
+        &self,
+        monitor_id: i64,
+        stream_id: &str,
+        before_started_at: i64,
+    ) -> Result<Vec<EarlierTakeRow>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id, started_at, ended_at, status FROM recording
+             WHERE monitor_id = ?1 AND stream_id = ?2 AND started_at < ?3
+             ORDER BY started_at",
+        )?;
+        let rows = stmt
+            .query_map(params![monitor_id, stream_id, before_started_at], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Recordings with a backfilled head that still lacks the final concat
@@ -906,6 +934,32 @@ impl Store {
                 &format!(
                     "SELECT {} FROM recording WHERE monitor_id = ?1 AND status = 'recording' \
                      ORDER BY id DESC LIMIT 1",
+                    Self::RECORDING_FULL_COLUMNS
+                ),
+                params![monitor_id],
+                Self::map_recording_row,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// This monitor's most recent still-open take (`ended_at IS NULL`), if
+    /// any — unlike `current_recording_for_monitor` (which trusts
+    /// `status='recording'` alone), this is read by the duplicate-recording
+    /// safety net in `Supervisor::record`, which additionally verifies the
+    /// take's own capture file is still being written to before trusting
+    /// that it's genuinely still alive (a real crash also leaves `ended_at`
+    /// null until finalize runs, so this alone can't distinguish the two).
+    pub fn open_recording_for_monitor(
+        &self,
+        monitor_id: i64,
+    ) -> Result<Option<crate::models::Recording>> {
+        let conn = self.db();
+        let row = conn
+            .query_row(
+                &format!(
+                    "SELECT {} FROM recording WHERE monitor_id = ?1 AND ended_at IS NULL \
+                     ORDER BY started_at DESC LIMIT 1",
                     Self::RECORDING_FULL_COLUMNS
                 ),
                 params![monitor_id],
@@ -1643,6 +1697,54 @@ mod tests {
         assert_eq!(store.recordings_with_errors().unwrap().len(), 1);
         let rows = store.list_monitors_with_channels().unwrap();
         assert!(!rows.iter().find(|r| r.monitor.id == mid).unwrap().last_recording_err_ack);
+    }
+
+    #[test]
+    fn open_recording_for_monitor_finds_only_the_unfinished_row() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        assert!(store.open_recording_for_monitor(mid).unwrap().is_none());
+
+        let closed = store
+            .insert_recording(mid, 1_000, "C:/rec/take1.mkv", Some(1_000), false, Some("s1"), None, "", "")
+            .unwrap();
+        store.finish_recording(closed, 2_000, 500, Some(0), "completed", "C:/rec/take1.mkv", "").unwrap();
+        // Finished takes never count as "open".
+        assert!(store.open_recording_for_monitor(mid).unwrap().is_none());
+
+        let open = store
+            .insert_recording(mid, 3_000, "C:/rec/.cache/take2.ts", Some(1_000), false, Some("s1"), None, "", "")
+            .unwrap();
+        let found = store.open_recording_for_monitor(mid).unwrap().unwrap();
+        assert_eq!(found.id, open);
+    }
+
+    #[test]
+    fn earlier_takes_for_stream_orders_oldest_first_and_excludes_later_ones() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        let take1 = store
+            .insert_recording(mid, 1_000, "C:/rec/take1.mkv", Some(1_000), false, Some("s1"), None, "", "")
+            .unwrap();
+        store.finish_recording(take1, 5_000, 500, Some(0), "completed", "C:/rec/take1.mkv", "").unwrap();
+        let take2 = store
+            .insert_recording(mid, 5_100, "C:/rec/take2.mkv", Some(1_000), false, Some("s1"), None, "", "")
+            .unwrap();
+
+        let earlier = store.earlier_takes_for_stream(mid, "s1", 5_100).unwrap();
+        assert_eq!(earlier, vec![(take1, 1_000, Some(5_000), "completed".to_string())]);
+        // Nothing is "earlier" than the stream's own first take.
+        assert!(store.earlier_takes_for_stream(mid, "s1", 1_000).unwrap().is_empty());
+        // take2 itself isn't included when querying strictly before its own start.
+        assert!(!earlier.iter().any(|(id, ..)| *id == take2));
     }
 
     #[test]

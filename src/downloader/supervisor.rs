@@ -2372,6 +2372,22 @@ progress_info: None,
         }
     }
 
+    /// Whether `path`'s mtime is within `fresh_secs` of now — an independent
+    /// liveness signal for the duplicate-recording safety net in `record`,
+    /// the same "trust the file, not just our own bookkeeping" technique the
+    /// stall watchdog already relies on (see `stall_sample`). `false` on any
+    /// read error (missing file, clock skew) — the conservative direction,
+    /// since callers treat `true` as "definitely still alive, refuse".
+    async fn file_written_within(path: &str, fresh_secs: u64) -> bool {
+        let Ok(meta) = crate::iomon::fs::metadata(Cat::FsProbe, Path::new(path)).await else {
+            return false;
+        };
+        meta.modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|elapsed| elapsed.as_secs() < fresh_secs)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn record(
         &self,
@@ -2392,6 +2408,33 @@ progress_info: None,
         trigger_rule: Option<crate::triggers::TriggerRule>,
     ) {
         let monitor_id = row.monitor.id;
+        // Duplicate-recording safety net: `try_begin`'s `self.active` check a
+        // moment ago found this monitor free, but `self.active` has been
+        // observed to desync from reality (a confirmed incident: a monitor's
+        // recording process stayed alive and healthy for hours while
+        // `self.active` briefly lacked its entry, letting a second process
+        // start for the same monitor — root cause not fully pinned down).
+        // Cross-check against the DB independently of `self.active`: if this
+        // monitor's last take is still open (no `ended_at`) AND its own
+        // capture file was written to within the last few seconds, something
+        // is still actively writing it right now — refuse rather than
+        // silently doubling up. A merely *open* row with a STALE file (the
+        // ordinary "crashed, not yet finalized" case) falls through
+        // unchanged — this never blocks legitimate crash-recovery.
+        const DUPLICATE_GUARD_FRESH_SECS: u64 = 60;
+        if let Ok(Some(open)) = self.store.open_recording_for_monitor(monitor_id)
+            && !open.output_path.is_empty()
+            && Self::file_written_within(&open.output_path, DUPLICATE_GUARD_FRESH_SECS).await
+        {
+            warn!(
+                monitor_id,
+                open_rec_id = open.id,
+                "record: an earlier take for this monitor is still actively writing (fresh \
+                 capture file) — refusing to start a duplicate recording"
+            );
+            self.active.lock().unwrap().remove(&monitor_id);
+            return;
+        }
         let trigger_rule_json = trigger_rule
             .as_ref()
             .map(|r| serde_json::to_string(r).unwrap_or_default())
@@ -3749,5 +3792,35 @@ mod tests {
         .await;
 
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// The duplicate-recording safety net's independent liveness signal
+    /// (Layna incident, 2026-07-24): a just-written file reads as fresh, one
+    /// backdated past the threshold reads as stale, and a missing path never
+    /// panics — it just isn't fresh.
+    #[tokio::test]
+    async fn file_written_within_detects_fresh_vs_stale_vs_missing() {
+        let dir = std::env::temp_dir().join(format!("sa_test_fwiw_{}", std::process::id()));
+        crate::iomon::fs::create_dir_all_sync(Cat::FsProbe, &dir).unwrap();
+
+        let fresh = dir.join("fresh.ts");
+        crate::iomon::fs::write_sync(Cat::FsProbe, &fresh, b"x").unwrap();
+        assert!(Supervisor::file_written_within(fresh.to_str().unwrap(), 60).await);
+
+        let stale = dir.join("stale.ts");
+        crate::iomon::fs::write_sync(Cat::FsProbe, &stale, b"x").unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(300);
+        crate::iomon::fs::open_with_sync(Cat::FsProbe, &stale, |o| {
+            o.write(true);
+        })
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+        assert!(!Supervisor::file_written_within(stale.to_str().unwrap(), 60).await);
+
+        let missing = dir.join("missing.ts");
+        assert!(!Supervisor::file_written_within(missing.to_str().unwrap(), 60).await);
+
+        let _ = crate::iomon::fs::remove_dir_all_sync(Cat::FsProbe, &dir);
     }
 }
