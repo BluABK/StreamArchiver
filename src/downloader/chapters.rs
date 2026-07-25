@@ -198,7 +198,7 @@ impl Supervisor {
         let _ = self.events.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
             id: task_id,
             kind: crate::events::BackgroundTaskKind::Chapters(rec_id),
-            label: channel,
+            label: channel.clone(),
             detail: format!("embedding {} chapter marker(s)", chapters.len()),
             started_at: now_unix(),
             progress: None,
@@ -221,9 +221,11 @@ impl Supervisor {
                 let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
                 info!(
                     rec_id,
-                    "chapters: embedded {} marker(s) in {:.1}s",
+                    channel = %channel,
+                    "chapters: embedded {} marker(s) in {:.1}s — {}",
                     chapters.len(),
                     started.elapsed().as_secs_f64(),
+                    output.display(),
                 );
                 finish(crate::events::TaskOutcome::CompletedWithNote(format!(
                     "{} chapter(s) embedded",
@@ -233,8 +235,10 @@ impl Supervisor {
             Err(e) => {
                 warn!(
                     rec_id,
-                    "chapters: embed failed after {:.1}s: {e:#}",
+                    channel = %channel,
+                    "chapters: embed failed after {:.1}s: {e:#} — {}",
                     started.elapsed().as_secs_f64(),
+                    output.display(),
                 );
                 let _ = self.store.set_chapters_state(rec_id, "failed");
                 finish(crate::events::TaskOutcome::Failed(format!("{e:#}")));
