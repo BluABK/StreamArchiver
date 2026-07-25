@@ -1345,7 +1345,9 @@ independent detectors feeding the same table:
   so you can spot which process is actually hammering a drive at a glance.
   Per-process **Stop** (graceful), **Kill** (force-terminate the tree),
   **Log**, and **Folder** actions — useful for diagnosing a stuck capture
-  without leaving the app.
+  without leaving the app. A post-processing pass re-attached after a
+  restart (see [Chapters](#chapters-)) shows up here too, tagged
+  `(re-attached)`, for the rest of its run.
 
   ![Process manager listing a running streamlink capture](doc/screenshots/process-manager.png)
 

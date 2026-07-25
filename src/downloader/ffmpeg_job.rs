@@ -147,6 +147,22 @@ pub(super) async fn adopt_or_clear_prior_ffmpeg_job(
             "ffmpeg job: re-attaching to a still-running pass from before a restart \
              instead of starting a duplicate"
         );
+        // Register with the I/O monitor for the whole wait, exactly like a
+        // fresh spawn's own `track_tool` call would (which never runs here —
+        // we never call `Command::spawn` ourselves for an adopted process) —
+        // otherwise it's invisible in the Process Manager for the entire
+        // remainder of a long pass, same fix `adopt_detached` already needed
+        // for re-attached capture/download tools.
+        let _io_guard = crate::iomon::track_child(
+            row.pid,
+            crate::iomon::ChildInfo {
+                label: tmp_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+                tool: "ffmpeg".to_string(),
+                purpose: format!("{} (re-attached)", kind.as_str()),
+                region: crate::iomon::classify(tmp_path),
+                proc_start: row.proc_start,
+            },
+        );
         let done = Arc::new(AtomicBool::new(false));
         let tail = (!row.progress_log.is_empty()).then(|| {
             let events = progress.clone().map(|(tx, _)| tx);
