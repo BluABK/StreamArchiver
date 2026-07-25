@@ -189,9 +189,13 @@ pub(super) async fn adopt_or_clear_prior_ffmpeg_job(
     }
     let dur = media_duration_secs(tmp_path).await;
     let complete = ffmpeg_job_tmp_is_complete(total_secs, dur);
-    if !complete {
-        let _ = store.clear_ffmpeg_job(kind, ref_id);
-    }
+    // Either way, this row has served its purpose: a complete tmp is about to
+    // be used as-is by the caller (no later fresh-spawn `finish_ffmpeg_job`
+    // will run to clear it — that only fires on the fresh-spawn success
+    // path), and an incomplete one is stale. Leaving it behind would sit
+    // there forever (harmless — a future lookup just re-derives the same
+    // "complete" answer — but pure clutter).
+    let _ = store.clear_ffmpeg_job(kind, ref_id);
     complete
 }
 
