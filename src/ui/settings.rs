@@ -3101,7 +3101,7 @@ impl StreamArchiverApp {
         if self.section_shown(
             SettingsTab::Downloads,
             "Chapters",
-            &["chapters", "chapter", "title", "category", "game", "raid", "muted", "recovered", "bookmark"],
+            &["chapters", "chapter", "title", "category", "game", "raid", "muted", "recovered", "bookmark", "coalesce", "window", "interval", "sync"],
         ) {
             ui.add_space(12.0);
             ui.heading("Chapters 📑");
@@ -3109,9 +3109,10 @@ impl StreamArchiverApp {
                 "Embed chapter markers into a finalized recording once its file is stable \
                  (finished, head backfill settled, any gap-splice attempt resolved): one per \
                  title change, one per category/game change (merged into one chapter when both \
-                 change together within 30s), one per raid past the viewer threshold below, and \
-                 a bracketing pair around any gap-splice patch. These are the GLOBAL defaults; \
-                 override per-channel (channel Properties) or per-instance (edit instance).",
+                 change together within the coalesce window below), one per raid past the \
+                 viewer threshold below, and a bracketing pair around any gap-splice patch. \
+                 These are the GLOBAL defaults; override per-channel (channel Properties) or \
+                 per-instance (edit instance).",
             );
             ui.add_space(6.0);
             egui::Grid::new("chapters_grid")
@@ -3135,6 +3136,22 @@ impl StreamArchiverApp {
 
                     ui.checkbox(&mut self.settings.chapters_category, "Category/game changes");
                     ui.label("One chapter per category/game change.");
+                    ui.end_row();
+
+                    ui.label("Title/game coalesce window (s)");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.chapters_coalesce_secs)
+                            .desired_width(80.0)
+                            .hint_text("30"),
+                    )
+                    .on_hover_text(
+                        "How many seconds apart a title change and a category/game change may \
+                         land and still merge into one combined chapter instead of two separate \
+                         ones. Some streamers update both together instantly (a small window is \
+                         fine); others update them minutes apart (raise this so they still merge). \
+                         Overridable per channel (channel Properties) or per instance (edit \
+                         instance).",
+                    );
                     ui.end_row();
 
                     ui.checkbox(&mut self.settings.chapters_raid, "Raids");

@@ -25,6 +25,9 @@ pub(super) struct ChannelForm {
     /// Chapter-embedding master toggle override for this channel (`None` =
     /// inherit global).
     pub(super) chapters_enabled: Option<bool>,
+    /// Title/category coalesce-window override for this channel, seconds
+    /// (empty = inherit the global default).
+    pub(super) chapters_coalesce_secs: String,
     /// Follow-raid overrides for this channel (`None` = inherit global):
     /// whether raiding out from this channel triggers follow-raid, and
     /// whether this channel itself is ever auto-recorded as a raid target.
@@ -416,6 +419,20 @@ impl StreamArchiverApp {
                                     );
                                 ui.end_row();
 
+                                ui.label("Title/game coalesce window (s)");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut f.chapters_coalesce_secs)
+                                        .desired_width(80.0)
+                                        .hint_text("Inherit"),
+                                )
+                                .on_hover_text(
+                                    "How many seconds apart a title change and a category/game \
+                                     change may land and still merge into one chapter, for every \
+                                     instance in this channel. Blank inherits the global default \
+                                     (Settings → Downloads → Chapters).",
+                                );
+                                ui.end_row();
+
                                 ui.label("Follow my raids");
                                 tristate_combo(ui, "chform_follow_my_raids", &mut f.follow_my_raids)
                                     .on_hover_text(
@@ -480,7 +497,10 @@ impl StreamArchiverApp {
                     // yet — always inherits the global setting for now.
                     gap_splice_cleanup: None,
                 };
-                let chapters_scope = crate::chapters::ChaptersScope { enabled: f.chapters_enabled };
+                let chapters_scope = crate::chapters::ChaptersScope {
+                    enabled: f.chapters_enabled,
+                    coalesce_secs: f.chapters_coalesce_secs.trim().parse().ok(),
+                };
                 let res = match id_opt {
                     Some(id) => {
                         let old_name = self.channels.iter().find(|c| c.id == id).map(|c| c.name.clone());
@@ -1287,7 +1307,9 @@ impl StreamArchiverApp {
                 mf.join_cleanup = dsc.join_cleanup;
                 mf.disposal_method = dsc.method;
                 mf.primary_pin = crate::platform_pref::monitor_is_pinned(&self.core.store, r.monitor.id);
-                mf.chapters_enabled = crate::chapters::load_monitor_chapters_scope(&self.core.store, r.monitor.id).enabled;
+                let mchsc = crate::chapters::load_monitor_chapters_scope(&self.core.store, r.monitor.id);
+                mf.chapters_enabled = mchsc.enabled;
+                mf.chapters_coalesce_secs = mchsc.coalesce_secs.map(|v| v.to_string()).unwrap_or_default();
                 mf.follow_my_raids = crate::raid_follow::load_bool_scope(
                     &self.core.store,
                     crate::raid_follow::K_MONITOR_RAID_FOLLOW_SCOPE,
@@ -1365,6 +1387,8 @@ impl StreamArchiverApp {
                 let dsc = crate::disposal::load_channel_disposal_scope(&self.core.store, cid);
                 let platform_pref = crate::platform_pref::channel_primary_platform(&self.core.store, cid);
                 let chsc = crate::chapters::load_channel_chapters_scope(&self.core.store, cid);
+                let chapters_coalesce_secs =
+                    chsc.coalesce_secs.map(|v| v.to_string()).unwrap_or_default();
                 let follow_my_raids = crate::raid_follow::load_bool_scope(
                     &self.core.store,
                     crate::raid_follow::K_CHANNEL_RAID_FOLLOW_SCOPE,
@@ -1387,6 +1411,7 @@ impl StreamArchiverApp {
                     disposal_method: dsc.method,
                     primary_platform_pref: platform_pref,
                     chapters_enabled: chsc.enabled,
+                    chapters_coalesce_secs,
                     follow_my_raids,
                     record_me_as_raid_target,
                 });

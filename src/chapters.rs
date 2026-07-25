@@ -47,22 +47,33 @@ pub const K_CHAPTERS_MUTED: &str = "chapters_muted_segments";
 /// Minimum raid party size to get its own chapter (string-encoded i64).
 pub const K_CHAPTERS_RAID_MIN_VIEWERS: &str = "chapters_raid_min_viewers";
 const DEFAULT_RAID_MIN_VIEWERS: i64 = 50;
+/// Global default for the title/category coalesce window (string-encoded
+/// i64 seconds) — see [`DEFAULT_CHAPTER_COALESCE_SECS`]. Overridable per
+/// channel/instance via [`ChaptersScope::coalesce_secs`], since some
+/// streamers update title and game announcements together within a second
+/// or two while others update them minutes apart.
+pub const K_CHAPTERS_COALESCE_SECS: &str = "chapters_coalesce_secs";
 
 // ---------- three-level scope config (clone of HeadBackfillScope, one field) ----------
 
-/// A channel- or monitor-level override of the chapters master toggle.
-/// `None` means "inherit the level above"; `Some(true/false)` forces it.
+/// A channel- or monitor-level override of the chapters master toggle and/or
+/// the title/category coalesce window. `None` means "inherit the level
+/// above"; `Some(..)` forces it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChaptersScope {
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// Override of [`K_CHAPTERS_COALESCE_SECS`] — see
+    /// [`effective_chapters_coalesce_secs`].
+    #[serde(default)]
+    pub coalesce_secs: Option<i64>,
 }
 
 impl ChaptersScope {
     /// True when this scope overrides nothing — persisted as a removal so
     /// the map only holds real overrides.
     pub fn is_inherit(&self) -> bool {
-        self.enabled.is_none()
+        self.enabled.is_none() && self.coalesce_secs.is_none()
     }
 }
 
@@ -148,6 +159,37 @@ pub fn effective_chapters_enabled(store: &Store, channel_id: i64, monitor_id: i6
     effective_chapters_enabled_from(global_chapters_enabled(store), Some(&ch), Some(&mon))
 }
 
+pub fn global_chapters_coalesce_secs(store: &Store) -> i64 {
+    store
+        .get_setting(K_CHAPTERS_COALESCE_SECS)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_CHAPTER_COALESCE_SECS)
+}
+
+/// Monitor override over channel override over the global default.
+pub fn effective_chapters_coalesce_secs_from(
+    global: i64,
+    channel_scope: Option<&ChaptersScope>,
+    monitor_scope: Option<&ChaptersScope>,
+) -> i64 {
+    if let Some(v) = monitor_scope.and_then(|s| s.coalesce_secs) {
+        return v;
+    }
+    if let Some(v) = channel_scope.and_then(|s| s.coalesce_secs) {
+        return v;
+    }
+    global
+}
+
+/// Store-hitting resolver for one channel+monitor pair.
+pub fn effective_chapters_coalesce_secs(store: &Store, channel_id: i64, monitor_id: i64) -> i64 {
+    let ch = load_channel_chapters_scope(store, channel_id);
+    let mon = load_monitor_chapters_scope(store, monitor_id);
+    effective_chapters_coalesce_secs_from(global_chapters_coalesce_secs(store), Some(&ch), Some(&mon))
+}
+
 // ---------- flat "which kinds" settings (Remux-section shape, global only) ----------
 
 /// Which event kinds currently produce chapters, resolved from settings.
@@ -179,20 +221,25 @@ pub fn chapter_kinds(store: &Store) -> ChapterKinds {
 
 // ---------- event collection (pure) ----------
 
-/// How close together (in `at_secs`) a title change and a category change
-/// have to land to be merged into one "{category} — {title}" chapter instead
-/// of two separate ones.
-const CHAPTER_COALESCE_SECS: i64 = 30;
+/// Default seconds a title change and a category change may land apart and
+/// still be merged into one "{category} — {title}" chapter instead of two
+/// separate ones — see [`K_CHAPTERS_COALESCE_SECS`] for the override chain.
+const DEFAULT_CHAPTER_COALESCE_SECS: i64 = 30;
 
 /// Merge `stream_meta_change` rows (already loaded for one take) into
 /// `(at_secs, label)` chapter events — `at_secs` relative to the take's
 /// `started_at`, same frame [`rebase_to_final_secs`] expects. Baseline rows
 /// (`old_value` empty — the "this is what it started as" row every take
 /// gets) are dropped, matching `monitor_change_lines`' existing filter.
-/// Title+category changes landing within [`CHAPTER_COALESCE_SECS`] of each
-/// other merge into one chapter, preferring the more informative combined
-/// label over picking just one.
-pub fn coalesce_meta_events(changes: &[crate::models::StreamMetaChange]) -> Vec<(f64, String)> {
+/// Title+category changes landing within `coalesce_secs` of each other merge
+/// into one chapter, preferring the more informative combined label over
+/// picking just one — callers resolve `coalesce_secs` via
+/// [`effective_chapters_coalesce_secs`], since some streamers update title
+/// and category together instantly while others do it minutes apart.
+pub fn coalesce_meta_events(
+    changes: &[crate::models::StreamMetaChange],
+    coalesce_secs: i64,
+) -> Vec<(f64, String)> {
     let mut relevant: Vec<&crate::models::StreamMetaChange> = changes
         .iter()
         .filter(|c| (c.kind == "title" || c.kind == "category") && !c.old_value.is_empty())
@@ -206,7 +253,7 @@ pub fn coalesce_meta_events(changes: &[crate::models::StreamMetaChange]) -> Vec<
         let mut title = None;
         let mut category = None;
         let mut j = i;
-        while j < relevant.len() && relevant[j].at_secs - group_start <= CHAPTER_COALESCE_SECS {
+        while j < relevant.len() && relevant[j].at_secs - group_start <= coalesce_secs {
             match relevant[j].kind.as_str() {
                 "title" => title = Some(relevant[j].new_value.clone()),
                 "category" => category = Some(relevant[j].new_value.clone()),
@@ -454,13 +501,31 @@ mod tests {
 
     #[test]
     fn scope_precedence_monitor_over_channel_over_global() {
-        let ch = ChaptersScope { enabled: Some(false) };
-        let mon = ChaptersScope { enabled: Some(true) };
+        let ch = ChaptersScope { enabled: Some(false), coalesce_secs: None };
+        let mon = ChaptersScope { enabled: Some(true), coalesce_secs: None };
         assert!(effective_chapters_enabled_from(false, Some(&ch), Some(&mon)));
         assert!(!effective_chapters_enabled_from(true, Some(&ch), Some(&ChaptersScope::default())));
         assert!(effective_chapters_enabled_from(true, None, None));
         assert!(ChaptersScope::default().is_inherit());
         assert!(!ch.is_inherit());
+    }
+
+    #[test]
+    fn coalesce_secs_precedence_monitor_over_channel_over_global() {
+        let ch = ChaptersScope { enabled: None, coalesce_secs: Some(60) };
+        let mon = ChaptersScope { enabled: None, coalesce_secs: Some(300) };
+        assert_eq!(effective_chapters_coalesce_secs_from(30, Some(&ch), Some(&mon)), 300);
+        assert_eq!(effective_chapters_coalesce_secs_from(30, Some(&ch), Some(&ChaptersScope::default())), 60);
+        assert_eq!(effective_chapters_coalesce_secs_from(30, None, None), 30);
+        assert!(!ch.is_inherit());
+    }
+
+    #[test]
+    fn global_coalesce_secs_default_and_override() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(global_chapters_coalesce_secs(&store), DEFAULT_CHAPTER_COALESCE_SECS);
+        store.set_setting(K_CHAPTERS_COALESCE_SECS, "300").unwrap();
+        assert_eq!(global_chapters_coalesce_secs(&store), 300);
     }
 
     #[test]
@@ -486,7 +551,7 @@ mod tests {
             meta(100, "category", "Just Chatting", "Elden Ring"),
             meta(105, "title", "afk", "let's ring"),
         ];
-        let events = coalesce_meta_events(&changes);
+        let events = coalesce_meta_events(&changes, DEFAULT_CHAPTER_COALESCE_SECS);
         assert_eq!(events, vec![(100.0, "Elden Ring — let's ring".to_string())]);
     }
 
@@ -497,11 +562,25 @@ mod tests {
             meta(100, "category", "Just Chatting", "Elden Ring"),
             meta(500, "title", "let's ring", "goodnight"),
         ];
-        let events = coalesce_meta_events(&changes);
+        let events = coalesce_meta_events(&changes, DEFAULT_CHAPTER_COALESCE_SECS);
         assert_eq!(
             events,
             vec![(100.0, "Elden Ring".to_string()), (500.0, "goodnight".to_string())]
         );
+    }
+
+    #[test]
+    fn coalesce_window_is_configurable() {
+        // Same shape as the "far apart" case above (400s gap), but with a
+        // wider window (for a streamer who updates title/game minutes apart)
+        // the two now merge into one chapter instead of staying separate.
+        let changes = vec![
+            meta(0, "category", "", "Just Chatting"),
+            meta(100, "category", "Just Chatting", "Elden Ring"),
+            meta(500, "title", "let's ring", "goodnight"),
+        ];
+        let events = coalesce_meta_events(&changes, 600);
+        assert_eq!(events, vec![(100.0, "Elden Ring — goodnight".to_string())]);
     }
 
     #[test]

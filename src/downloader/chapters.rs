@@ -178,7 +178,8 @@ impl Supervisor {
         };
 
         let kinds = ch::chapter_kinds(&self.store);
-        let events = collect_chapter_events(&self.store, &rec, &kinds, &gap_meta);
+        let coalesce_secs = ch::effective_chapters_coalesce_secs(&self.store, row.channel.id, row.monitor.id);
+        let events = collect_chapter_events(&self.store, &rec, &kinds, &gap_meta, coalesce_secs);
         let chapters = ch::merge_close_events(events);
         if chapters.is_empty() {
             debug!(rec_id, "chapters: no chapter-worthy events found — skipping");
@@ -291,6 +292,7 @@ fn collect_chapter_events(
     rec: &crate::models::Recording,
     kinds: &ChapterKinds,
     gap_meta: &[SplicedGap],
+    coalesce_secs: i64,
 ) -> Vec<(f64, String)> {
     // `gap_meta`'s `orig_start`/`orig_end` arrive in gap_splice's own raw,
     // broadcast-relative frame (relative to `went_live_at`) — every other
@@ -318,7 +320,7 @@ fn collect_chapter_events(
                 _ => false,
             })
             .collect();
-        for (at_secs, label) in ch::coalesce_meta_events(&filtered) {
+        for (at_secs, label) in ch::coalesce_meta_events(&filtered, coalesce_secs) {
             events.push((ch::rebase_to_final_secs(at_secs, head_shift, &rebase_gaps), label));
         }
     }

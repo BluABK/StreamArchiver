@@ -1169,8 +1169,14 @@ chapter markers into the finalized MKV so it's easy to scrub through in a
 player (mpv, VLC, …). Five independently-toggleable kinds:
 - **Title changes** and **category/game changes** — one chapter per change,
   from the same title/category history the 📝 popup already shows. A title
-  and category change landing within 30s of each other merge into one
-  *"{category} — {title}"* chapter instead of two.
+  and category change landing within a configurable **coalesce window**
+  (default 30s) of each other merge into one *"{category} — {title}"*
+  chapter instead of two — some streamers update both together instantly, so
+  a short window is enough; others update them minutes apart, so raise it
+  per channel/instance (the usual global → channel → instance override,
+  Settings → Downloads → Chapters / channel Properties / edit instance) if a
+  particular streamer's title and game changes are landing as separate
+  chapters when they shouldn't.
 - **Raids** — one chapter per raid at or above a configurable minimum
   viewer count (default 50), so a string of 1-2-viewer raids doesn't spam
   the chapter list.

@@ -263,6 +263,7 @@ impl StreamArchiverApp {
             chapters_recovered_segments: core.store.get_setting(crate::chapters::K_CHAPTERS_RECOVERED).ok().flatten().is_none_or(|v| v != "0"),
             chapters_muted_segments: core.store.get_setting(crate::chapters::K_CHAPTERS_MUTED).ok().flatten().is_none_or(|v| v != "0"),
             chapters_raid_min_viewers: setting_or_empty(&core, crate::chapters::K_CHAPTERS_RAID_MIN_VIEWERS),
+            chapters_coalesce_secs: setting_or_empty(&core, crate::chapters::K_CHAPTERS_COALESCE_SECS),
             auto_recover_muted: setting_or_empty(&core, crate::recovery::K_AUTO_RECOVER_MUTED) == "1",
             auto_recover_deleted: setting_or_empty(&core, crate::recovery::K_AUTO_RECOVER_DELETED) == "1",
             recovery_cdn_hosts: setting_or_empty(&core, crate::recovery::K_RECOVERY_CDN_HOSTS),
@@ -1292,7 +1293,10 @@ impl StreamArchiverApp {
             gap_splice_cleanup: None,
         };
         let primary_pin = form.primary_pin;
-        let chapters_scope = crate::chapters::ChaptersScope { enabled: form.chapters_enabled };
+        let chapters_scope = crate::chapters::ChaptersScope {
+            enabled: form.chapters_enabled,
+            coalesce_secs: form.chapters_coalesce_secs.trim().parse().ok(),
+        };
         let follow_my_raids = form.follow_my_raids;
         let record_me_as_raid_target = form.record_me_as_raid_target;
 
@@ -1700,6 +1704,7 @@ impl StreamArchiverApp {
             (crate::chapters::K_CHAPTERS_RECOVERED, if s.chapters_recovered_segments { "1" } else { "0" }),
             (crate::chapters::K_CHAPTERS_MUTED, if s.chapters_muted_segments { "1" } else { "0" }),
             (crate::chapters::K_CHAPTERS_RAID_MIN_VIEWERS, s.chapters_raid_min_viewers.trim()),
+            (crate::chapters::K_CHAPTERS_COALESCE_SECS, s.chapters_coalesce_secs.trim()),
             (crate::raid_follow::K_RAID_FOLLOW_RECORD, if s.raid_follow_record { "1" } else { "0" }),
             (crate::raid_follow::K_RAID_FOLLOW_OUTPUT_DIR, s.raid_follow_output_dir.trim()),
             (crate::raid_follow::K_RAID_SKIP_DISABLED_TARGETS, if s.raid_skip_disabled_targets { "1" } else { "0" }),
@@ -1946,7 +1951,9 @@ impl StreamArchiverApp {
                         mf.join_cleanup = dsc.join_cleanup;
                         mf.disposal_method = dsc.method;
                         mf.primary_pin = crate::platform_pref::monitor_is_pinned(&self.core.store, self.rows[idx].monitor.id);
-                        mf.chapters_enabled = crate::chapters::load_monitor_chapters_scope(&self.core.store, self.rows[idx].monitor.id).enabled;
+                        let mchsc = crate::chapters::load_monitor_chapters_scope(&self.core.store, self.rows[idx].monitor.id);
+                        mf.chapters_enabled = mchsc.enabled;
+                        mf.chapters_coalesce_secs = mchsc.coalesce_secs.map(|v| v.to_string()).unwrap_or_default();
                         mf.follow_my_raids = crate::raid_follow::load_bool_scope(
                             &self.core.store,
                             crate::raid_follow::K_MONITOR_RAID_FOLLOW_SCOPE,

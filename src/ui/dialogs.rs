@@ -2516,6 +2516,20 @@ impl StreamArchiverApp {
                             );
                         ui.end_row();
 
+                        ui.label("Title/game coalesce window (s)");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut form.chapters_coalesce_secs)
+                                .desired_width(80.0)
+                                .hint_text("Inherit"),
+                        )
+                        .on_hover_text(
+                            "How many seconds apart a title change and a category/game change \
+                             may land and still merge into one chapter, for this instance. Blank \
+                             inherits the channel, then the global default (Settings → Downloads \
+                             → Chapters).",
+                        );
+                        ui.end_row();
+
                         ui.label("Follow my raids");
                         tristate_combo(ui, "form_follow_my_raids", &mut form.follow_my_raids)
                             .on_hover_text(

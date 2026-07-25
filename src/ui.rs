@@ -475,6 +475,9 @@ struct MonitorForm {
     /// inherit the channel/global default). Loaded from / saved to the
     /// monitor chapters scope map (`crate::chapters`).
     chapters_enabled: Option<bool>,
+    /// Title/category coalesce-window override for this instance, seconds
+    /// (empty = inherit the channel/global default).
+    chapters_coalesce_secs: String,
     /// Follow-raid overrides for this instance (`None` = inherit the
     /// channel/global default). Loaded from / saved to the monitor raid-
     /// follow scope maps (`crate::raid_follow`).
@@ -533,6 +536,7 @@ impl MonitorForm {
             join_cleanup: None,
             disposal_method: None,
             chapters_enabled: None,
+            chapters_coalesce_secs: String::new(),
             follow_my_raids: None,
             record_me_as_raid_target: None,
         }
@@ -584,6 +588,7 @@ impl MonitorForm {
             disposal_method: None,
             primary_pin: false,
             chapters_enabled: None,
+            chapters_coalesce_secs: String::new(),
             follow_my_raids: None,
             record_me_as_raid_target: None,
         }
@@ -634,6 +639,7 @@ impl MonitorForm {
             join_cleanup: None,
             disposal_method: None,
             chapters_enabled: None,
+            chapters_coalesce_secs: String::new(),
             follow_my_raids: None,
             record_me_as_raid_target: None,
         }
@@ -947,6 +953,10 @@ struct SettingsForm {
     chapters_muted_segments: bool,
     /// Minimum raid party size to get its own chapter (default 50).
     chapters_raid_min_viewers: String,
+    /// Global default seconds a title change and a category change may land
+    /// apart and still merge into one chapter (default 30). Overridable per
+    /// channel/instance — see [`crate::chapters::ChaptersScope::coalesce_secs`].
+    chapters_coalesce_secs: String,
     /// Auto-recover a Twitch VOD when the VOD checker finds it DMCA-muted.
     auto_recover_muted: bool,
     /// Auto-recover a Twitch VOD when the VOD checker finds it was never published.
@@ -2303,6 +2313,7 @@ impl eframe::App for StreamArchiverApp {
                                     disposal_method: None,
                                     primary_platform_pref: None,
                                     chapters_enabled: None,
+                                    chapters_coalesce_secs: String::new(),
                                     follow_my_raids: None,
                                     record_me_as_raid_target: None,
                                 });
@@ -2414,6 +2425,7 @@ impl eframe::App for StreamArchiverApp {
                 disposal_method: None,
                 primary_platform_pref: None,
                 chapters_enabled: None,
+                chapters_coalesce_secs: String::new(),
                 follow_my_raids: None,
                 record_me_as_raid_target: None,
             });
