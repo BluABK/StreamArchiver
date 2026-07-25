@@ -162,6 +162,7 @@ mod lock_culprit;
 mod naming;
 mod plan;
 mod process;
+mod raid_follow;
 mod remux;
 mod supervisor;
 mod tools;
@@ -381,6 +382,10 @@ pub struct Supervisor {
     /// is called speculatively from several places, same shape as
     /// `gap_jobs`/`gap_splice_jobs`.
     chapter_jobs: Arc<Mutex<HashSet<i64>>>,
+    /// Lowercase Twitch logins with an ad-hoc "Follow raid" capture
+    /// currently in flight — dedups overlapping raid-outs into the same
+    /// untracked channel (see `raid_follow.rs`).
+    raid_follow_ad_hoc: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Why automatic restarts are suppressed for a monitor after a user Stop.

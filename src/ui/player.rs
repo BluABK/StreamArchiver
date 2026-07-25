@@ -919,6 +919,31 @@ pub(super) fn spawn_play_new_instance(
     }
 }
 
+/// "Follow raid": tune into `source_row`'s most recent raid-out target at
+/// the live edge, no recording — built from a synthetic, never-persisted
+/// `MonitorWithChannel` (id 0, url = the target's resolved
+/// `twitch.tv/<login>`, tool/quality/extra_args copied from the raiding
+/// monitor's own settings) handed to the existing [`spawn_play_new_instance`]
+/// unmodified, the same way the collab-instance play actions reuse it for
+/// partner rows that aren't the clicked-on row.
+pub(super) fn spawn_follow_raid(
+    source_row: &crate::models::MonitorWithChannel,
+    raid: &crate::models::StreamEventRow,
+    player: &str,
+    settings: &SettingsForm,
+    store: &crate::store::Store,
+) -> Option<String> {
+    if raid.detail.is_empty() {
+        return Some(format!(
+            "Raid target login unknown for {} — Twitch didn't report it",
+            raid.target
+        ));
+    }
+    let mut row = source_row.clone();
+    row.monitor.id = 0;
+    row.monitor.url = format!("https://twitch.tv/{}", raid.detail);
+    spawn_play_new_instance(&row, player, settings, store)
+}
 
 #[cfg(test)]
 mod tests {

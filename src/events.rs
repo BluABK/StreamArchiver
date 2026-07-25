@@ -61,6 +61,10 @@ pub enum BackgroundTaskKind {
     /// Bulk re-embed of chapters across every eligible recording (Settings →
     /// Downloads → Chapters → "Re-embed chapters"), mirrors `ReRemuxAll`.
     ReembedChaptersAll,
+    /// An ad-hoc "Follow raid" capture of an untracked (not one of the
+    /// user's own channels) raid target — the only UI surface it gets, since
+    /// it has no `Channel`/`Monitor`/`Recording` row (see `raid_follow.rs`).
+    RaidFollow,
 }
 
 impl BackgroundTaskKind {
@@ -85,6 +89,7 @@ impl BackgroundTaskKind {
             BackgroundTaskKind::GapSplice(_) => "Gap splice",
             BackgroundTaskKind::Chapters(_) => "Chapters",
             BackgroundTaskKind::ReembedChaptersAll => "Re-embed chapters (all)",
+            BackgroundTaskKind::RaidFollow => "Follow raid",
         }
     }
 }
@@ -370,6 +375,25 @@ impl LiveSignal {
 /// writing anything (a push racing an in-progress capture must never clobber
 /// "recording").
 pub type OfflineSignal = i64;
+
+/// A "this monitor just raided out to another channel" push (EventSub
+/// `channel.raid`, `from_broadcaster_user_id` side — see `eventsub.rs`). Fans
+/// out to the [Follow raid](crate::raid_follow) feature; unrelated to
+/// `raid_in` (which only feeds the Channel Stats event history).
+#[derive(Clone, Debug)]
+pub struct RaidOutSignal {
+    /// The monitor that did the raiding (one of ours).
+    pub from_monitor_id: i64,
+    /// The raid target's Twitch login, lowercase — empty if Twitch's push
+    /// omitted `to_broadcaster_user_login` (rare, but not guaranteed present).
+    pub to_login: String,
+    /// The raid target's display name, for UI/filenames.
+    pub to_display_name: String,
+    /// The raid target's Twitch broadcaster id.
+    pub to_broadcaster_id: String,
+    pub viewers: i64,
+    pub at: i64,
+}
 
 /// Commands delivered from the tray thread to the UI/app.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

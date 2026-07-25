@@ -804,6 +804,9 @@ pub(super) struct StreamsViewCache {
     /// resolved to a local monitor for "Play collab instance"/"Play all
     /// collab instances" without an O(partners × rows) scan per row.
     pub(super) twitch_login_to_mid: HashMap<String, i64>,
+    /// Each monitor's most recent `raid_out` event, if any — powers the
+    /// "Follow raid" play action's enabled state and target.
+    pub(super) latest_raid_out: HashMap<i64, crate::models::StreamEventRow>,
     pub(super) model: Vec<Vec<Cell>>,
     /// Snapshot of the preferred-platform-when-multiple-live config, loaded
     /// once per rebuild rather than per channel row per frame.
@@ -1827,6 +1830,9 @@ pub(super) struct RowActions {
     /// collab partner that resolves to a locally-tracked monitor (set by
     /// "Play all collab instances (live edge)").
     pub(super) play_collab_all_live_edge: Option<Vec<i64>>,
+    /// Monitor id whose most recent raid-out target should open live-edge in
+    /// the player, no recording (set by "Follow raid").
+    pub(super) follow_raid: Option<i64>,
 }
 
 /// Render one capture-instance (monitor) row across all columns, with the Name
@@ -1872,6 +1878,10 @@ pub(super) fn render_instance_row(
     // tracked monitor with something actively downloading), and its resolved
     // monitor id (if locally tracked at all, for the live-edge action).
     collab_plays: &[(crate::models::CollabPartner, Option<StreamTarget>, Option<i64>)],
+    // This monitor's most recent `raid_out` event, if any — "Follow raid"'s
+    // enabled state and target (re-resolved at click time in dispatch, not
+    // read from this snapshot, to avoid acting on a stale target).
+    raid_out: Option<&crate::models::StreamEventRow>,
     order: &[usize],
     a: &mut RowActions,
 ) -> bool {
@@ -1943,6 +1953,36 @@ pub(super) fn render_instance_row(
         {
             a.play_new_instance = Some(m.id);
             ui.close();
+        }
+        if m.platform() == Platform::Twitch {
+            let target_login = raid_out.map(|r| r.detail.as_str()).filter(|l| !l.is_empty());
+            let target_name = raid_out.map(|r| r.target.as_str()).unwrap_or("");
+            if ui
+                .add_enabled(
+                    !media_player.is_empty() && target_login.is_some(),
+                    egui::Button::new("▷🏃  Follow raid"),
+                )
+                .on_hover_text(if target_login.is_some() {
+                    format!("Tune into this channel's raid-out target ({target_name}) at the live \
+                             edge in the media player (does not record)")
+                } else {
+                    "Tune into this channel's most recent raid-out target in the media player \
+                     (does not record)"
+                        .to_string()
+                })
+                .on_disabled_hover_text(if media_player.is_empty() {
+                    "Set a media player in Settings → Defaults first"
+                } else if raid_out.is_some() {
+                    "Raid target login unknown (Twitch didn't report it) — can't build a URL for it"
+                } else {
+                    "No recent raid-out target known for this channel (needs conduit mode + \
+                     \"Raids via EventSub\" on, in Settings → Accounts)"
+                })
+                .clicked()
+            {
+                a.follow_raid = Some(m.id);
+                ui.close();
+            }
         }
         if row.live_collab.is_some() {
             // "All angles": this instance plus every collab partner that

@@ -265,6 +265,68 @@ impl Store {
         Ok(rows)
     }
 
+    /// The most recent `raid_out` event for a monitor, if any — powers the
+    /// "Follow raid" play action and the auto-record orchestration. `target`
+    /// is the raid target's display name; `detail` carries its resolved
+    /// Twitch login (may be empty if Twitch's push omitted it — see
+    /// `eventsub.rs`'s `channel.raid` handling).
+    pub fn latest_raid_out(&self, monitor_id: i64) -> Result<Option<StreamEventRow>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT monitor_id, at, stream_id, kind, actor, target, amount, tier, detail, id
+             FROM stream_event
+             WHERE monitor_id = ?1 AND kind = 'raid_out'
+             ORDER BY at DESC LIMIT 1",
+        )?;
+        let row = stmt
+            .query_row(params![monitor_id], |r| {
+                Ok(StreamEventRow {
+                    monitor_id: r.get(0)?,
+                    at: r.get(1)?,
+                    stream_id: r.get(2)?,
+                    kind: r.get(3)?,
+                    actor: r.get(4)?,
+                    target: r.get(5)?,
+                    amount: r.get(6)?,
+                    tier: r.get(7)?,
+                    detail: r.get(8)?,
+                    id: r.get(9)?,
+                })
+            })
+            .optional()?;
+        Ok(row)
+    }
+
+    /// `latest_raid_out` for every monitor at once, by monitor id — one bulk
+    /// query for the Streams grid's per-frame-cached "Follow raid" button
+    /// state, instead of one query per instance row per cache rebuild.
+    pub fn latest_raid_outs_all(&self) -> Result<HashMap<i64, StreamEventRow>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT monitor_id, at, stream_id, kind, actor, target, amount, tier, detail, id
+             FROM stream_event
+             WHERE kind = 'raid_out'
+               AND id IN (SELECT MAX(id) FROM stream_event WHERE kind = 'raid_out' GROUP BY monitor_id)",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(StreamEventRow {
+                    monitor_id: r.get(0)?,
+                    at: r.get(1)?,
+                    stream_id: r.get(2)?,
+                    kind: r.get(3)?,
+                    actor: r.get(4)?,
+                    target: r.get(5)?,
+                    amount: r.get(6)?,
+                    tier: r.get(7)?,
+                    detail: r.get(8)?,
+                    id: r.get(9)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows.into_iter().map(|r| (r.monitor_id, r)).collect())
+    }
+
     /// The hype-scoreable contributions for one monitor in `[since, until)`:
     /// `(kind, actor, amount, tier)`, oldest first. Feeds
     /// `hype::observed_burst` (retro-analysis of a train's run-up).

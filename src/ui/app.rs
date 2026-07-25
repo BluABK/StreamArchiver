@@ -254,6 +254,9 @@ impl StreamArchiverApp {
             ))
             .unwrap_or_default(),
             chapters_enabled: crate::chapters::global_chapters_enabled(&core.store),
+            raid_follow_record: crate::raid_follow::global_raid_follow_record(&core.store),
+            raid_follow_output_dir: crate::raid_follow::raid_follow_output_dir(&core.store),
+            raid_skip_disabled_targets: crate::raid_follow::raid_skip_disabled_targets_enabled(&core.store),
             chapters_title: core.store.get_setting(crate::chapters::K_CHAPTERS_TITLE).ok().flatten().is_none_or(|v| v != "0"),
             chapters_category: core.store.get_setting(crate::chapters::K_CHAPTERS_CATEGORY).ok().flatten().is_none_or(|v| v != "0"),
             chapters_raid: core.store.get_setting(crate::chapters::K_CHAPTERS_RAID).ok().flatten().is_none_or(|v| v != "0"),
@@ -1276,6 +1279,8 @@ impl StreamArchiverApp {
         };
         let primary_pin = form.primary_pin;
         let chapters_scope = crate::chapters::ChaptersScope { enabled: form.chapters_enabled };
+        let follow_my_raids = form.follow_my_raids;
+        let record_me_as_raid_target = form.record_me_as_raid_target;
 
         // Close the form immediately so the UI stays responsive while the DB
         // work runs. On a background-thread error the status bar shows the error;
@@ -1326,6 +1331,18 @@ impl StreamArchiverApp {
                     );
                     let _ = crate::disposal::save_monitor_disposal_scope(&store, mid, &disposal_scope);
                     let _ = crate::chapters::save_monitor_chapters_scope(&store, mid, &chapters_scope);
+                    let _ = crate::raid_follow::save_bool_scope(
+                        &store,
+                        crate::raid_follow::K_MONITOR_RAID_FOLLOW_SCOPE,
+                        mid,
+                        follow_my_raids,
+                    );
+                    let _ = crate::raid_follow::save_bool_scope(
+                        &store,
+                        crate::raid_follow::K_MONITOR_RAID_TARGET_SCOPE,
+                        mid,
+                        record_me_as_raid_target,
+                    );
                     let _ = crate::platform_pref::save_monitor_pin(&store, mid, primary_pin);
                     let rows = store.list_monitors_with_channels().map_err(|e| e.to_string())?;
                     let next_streams =
@@ -1669,6 +1686,9 @@ impl StreamArchiverApp {
             (crate::chapters::K_CHAPTERS_RECOVERED, if s.chapters_recovered_segments { "1" } else { "0" }),
             (crate::chapters::K_CHAPTERS_MUTED, if s.chapters_muted_segments { "1" } else { "0" }),
             (crate::chapters::K_CHAPTERS_RAID_MIN_VIEWERS, s.chapters_raid_min_viewers.trim()),
+            (crate::raid_follow::K_RAID_FOLLOW_RECORD, if s.raid_follow_record { "1" } else { "0" }),
+            (crate::raid_follow::K_RAID_FOLLOW_OUTPUT_DIR, s.raid_follow_output_dir.trim()),
+            (crate::raid_follow::K_RAID_SKIP_DISABLED_TARGETS, if s.raid_skip_disabled_targets { "1" } else { "0" }),
             (crate::recovery::K_AUTO_RECOVER_MUTED, if s.auto_recover_muted { "1" } else { "0" }),
             (crate::recovery::K_AUTO_RECOVER_DELETED, if s.auto_recover_deleted { "1" } else { "0" }),
             (crate::recovery::K_RECOVERY_CDN_HOSTS, s.recovery_cdn_hosts.trim()),
@@ -1913,6 +1933,16 @@ impl StreamArchiverApp {
                         mf.disposal_method = dsc.method;
                         mf.primary_pin = crate::platform_pref::monitor_is_pinned(&self.core.store, self.rows[idx].monitor.id);
                         mf.chapters_enabled = crate::chapters::load_monitor_chapters_scope(&self.core.store, self.rows[idx].monitor.id).enabled;
+                        mf.follow_my_raids = crate::raid_follow::load_bool_scope(
+                            &self.core.store,
+                            crate::raid_follow::K_MONITOR_RAID_FOLLOW_SCOPE,
+                            self.rows[idx].monitor.id,
+                        );
+                        mf.record_me_as_raid_target = crate::raid_follow::load_bool_scope(
+                            &self.core.store,
+                            crate::raid_follow::K_MONITOR_RAID_TARGET_SCOPE,
+                            self.rows[idx].monitor.id,
+                        );
                         self.form = Some(mf);
                     }
                 }

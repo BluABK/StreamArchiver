@@ -2363,6 +2363,31 @@ impl StreamArchiverApp {
                             );
                         ui.end_row();
 
+                        ui.label("Follow my raids");
+                        tristate_combo(ui, "form_follow_my_raids", &mut form.follow_my_raids)
+                            .on_hover_text(
+                                "When this instance raids out to another Twitch channel, follow \
+                                 it (tune in / auto-record per Settings → Follow raid). Inherit \
+                                 follows the channel, then the global default there — off unless \
+                                 you've turned Follow raid on.",
+                            );
+                        ui.end_row();
+
+                        ui.label("Record me when I'm a raid target");
+                        tristate_combo(
+                            ui,
+                            "form_raid_target_record",
+                            &mut form.record_me_as_raid_target,
+                        )
+                        .on_hover_text(
+                            "Whether Follow raid may auto-record this instance when a followed \
+                             raid lands on it. Always/Never override the \"skip disabled raid \
+                             targets\" default too — set this to Always if you want this \
+                             instance recorded via a raid even while disabled. Inherit follows \
+                             the channel, then the global default (Settings → Follow raid).",
+                        );
+                        ui.end_row();
+
                         ui.label("Pin as preferred platform");
                         ui.checkbox(&mut form.primary_pin, "").on_hover_text(
                             "Always show THIS instance's info on the channel row while it's \

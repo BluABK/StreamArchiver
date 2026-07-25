@@ -53,7 +53,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::app_core::sleep_cancellable;
-use crate::events::{LiveSignal, OfflineSignal};
+use crate::events::{LiveSignal, OfflineSignal, RaidOutSignal};
 use crate::models::{DetectionMethod, Platform};
 use crate::oauth;
 use crate::store::Store;
@@ -69,12 +69,13 @@ pub async fn run(
     store: Arc<Store>,
     live_tx: UnboundedSender<LiveSignal>,
     offline_tx: UnboundedSender<OfflineSignal>,
+    raid_out_tx: UnboundedSender<RaidOutSignal>,
     shutdown: Arc<AtomicBool>,
 ) {
     // Log the "have monitors but no creds" idle reason once, not every retry.
     let mut warned_no_creds = false;
     while !shutdown.load(Ordering::SeqCst) {
-        match run_session(&store, &live_tx, &offline_tx, &shutdown, &mut warned_no_creds).await {
+        match run_session(&store, &live_tx, &offline_tx, &raid_out_tx, &shutdown, &mut warned_no_creds).await {
             Ok(true) => warned_no_creds = false, // session ran; reset the one-shot warning
             Ok(false) => sleep_cancellable(IDLE_RETRY, &shutdown).await, // nothing to do
             Err(e) => {
@@ -91,6 +92,7 @@ async fn run_session(
     store: &Arc<Store>,
     live_tx: &UnboundedSender<LiveSignal>,
     offline_tx: &UnboundedSender<OfflineSignal>,
+    raid_out_tx: &UnboundedSender<RaidOutSignal>,
     shutdown: &Arc<AtomicBool>,
     warned_no_creds: &mut bool,
 ) -> Result<bool> {
@@ -257,7 +259,7 @@ async fn run_session(
         use tokio_tungstenite::tungstenite::Message;
         match msg {
             Message::Text(text) => {
-                if handle_message(&text, &uid_to_monitors, live_tx, offline_tx, store) {
+                if handle_message(&text, &uid_to_monitors, live_tx, offline_tx, raid_out_tx, store) {
                     // session_reconnect — drop out and reconnect fresh.
                     return Ok(true);
                 }
@@ -277,6 +279,7 @@ fn handle_message(
     uid_to_monitors: &HashMap<String, Vec<i64>>,
     live_tx: &UnboundedSender<LiveSignal>,
     offline_tx: &UnboundedSender<OfflineSignal>,
+    raid_out_tx: &UnboundedSender<RaidOutSignal>,
     store: &Store,
 ) -> bool {
     let Ok(v) = serde_json::from_str::<Value>(text) else {
@@ -333,11 +336,14 @@ fn handle_message(
                         .as_str()
                         .or_else(|| event["to_broadcaster_user_login"].as_str())
                         .unwrap_or("");
+                    // The login (distinct from the display name above) — needed to
+                    // build a playable `twitch.tv/<login>` URL for Follow raid.
+                    // Twitch usually sends it, but it's not guaranteed.
+                    let to_login = event["to_broadcaster_user_login"].as_str().unwrap_or("");
+                    let to_id = event["to_broadcaster_user_id"].as_str().unwrap_or("");
                     let viewers = event["viewers"].as_i64().unwrap_or(0);
                     let at = crate::models::now_unix();
-                    if let Some(to_id) = event["to_broadcaster_user_id"].as_str()
-                        && let Some(mons) = uid_to_monitors.get(to_id)
-                    {
+                    if let Some(mons) = uid_to_monitors.get(to_id) {
                         for &mid in mons {
                             info!(
                                 "eventsub {}: {from} raided {to} ({viewers} viewers) -> monitor {mid}",
@@ -356,9 +362,19 @@ fn handle_message(
                                 "eventsub {}: {from} raided out to {to} ({viewers} viewers) -> monitor {mid}",
                                 crate::models::Platform::Twitch.tag()
                             );
+                            // The resolved login rides in `detail` (unused for raid
+                            // rows otherwise) — see Follow raid's `latest_raid_out`.
                             let _ = store.record_stream_event(
-                                mid, at, "", "raid_out", from, to, viewers, "", "",
+                                mid, at, "", "raid_out", from, to, viewers, "", to_login,
                             );
+                            let _ = raid_out_tx.send(RaidOutSignal {
+                                from_monitor_id: mid,
+                                to_login: to_login.to_string(),
+                                to_display_name: to.to_string(),
+                                to_broadcaster_id: to_id.to_string(),
+                                viewers,
+                                at,
+                            });
                         }
                     }
                 }

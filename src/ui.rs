@@ -468,6 +468,11 @@ struct MonitorForm {
     /// inherit the channel/global default). Loaded from / saved to the
     /// monitor chapters scope map (`crate::chapters`).
     chapters_enabled: Option<bool>,
+    /// Follow-raid overrides for this instance (`None` = inherit the
+    /// channel/global default). Loaded from / saved to the monitor raid-
+    /// follow scope maps (`crate::raid_follow`).
+    follow_my_raids: Option<bool>,
+    record_me_as_raid_target: Option<bool>,
 }
 
 impl MonitorForm {
@@ -521,6 +526,8 @@ impl MonitorForm {
             join_cleanup: None,
             disposal_method: None,
             chapters_enabled: None,
+            follow_my_raids: None,
+            record_me_as_raid_target: None,
         }
     }
 
@@ -570,6 +577,8 @@ impl MonitorForm {
             disposal_method: None,
             primary_pin: false,
             chapters_enabled: None,
+            follow_my_raids: None,
+            record_me_as_raid_target: None,
         }
     }
 
@@ -618,6 +627,8 @@ impl MonitorForm {
             join_cleanup: None,
             disposal_method: None,
             chapters_enabled: None,
+            follow_my_raids: None,
+            record_me_as_raid_target: None,
         }
     }
 }
@@ -968,6 +979,20 @@ struct SettingsForm {
     disposal_method: crate::disposal::DisposalMethod,
     /// `;`-separated trash folder list, one per drive (same-drive moves only).
     disposal_trash_dirs: String,
+    // --- Follow raid (global defaults for the 3-level chain) ---
+    /// Does raiding out from a monitored channel ever trigger a follow
+    /// (play/auto-record)? Default OFF — opt-in, unlike most toggles here,
+    /// since it creates new recordings of channels the user didn't curate.
+    /// Single-hop only — records until the raid target's own stream ends;
+    /// chain-following (the target itself raiding out further) isn't
+    /// implemented yet.
+    raid_follow_record: bool,
+    /// Output directory for an UNTRACKED raid target's ad-hoc capture
+    /// (supports the `{name}` token).
+    raid_follow_output_dir: String,
+    /// Skip auto-recording a tracked raid target that's currently disabled.
+    /// Default on.
+    raid_skip_disabled_targets: bool,
     /// Global trigger-word rules (start recording on title/game match even with
     /// Auto off). Channel/instance Properties can extend/replace/disable them.
     trigger_rules: Vec<crate::triggers::TriggerRule>,
@@ -2231,6 +2256,8 @@ impl eframe::App for StreamArchiverApp {
                                     disposal_method: None,
                                     primary_platform_pref: None,
                                     chapters_enabled: None,
+                                    follow_my_raids: None,
+                                    record_me_as_raid_target: None,
                                 });
                             }
                             if ui
@@ -2337,6 +2364,8 @@ impl eframe::App for StreamArchiverApp {
                 disposal_method: None,
                 primary_platform_pref: None,
                 chapters_enabled: None,
+                follow_my_raids: None,
+                record_me_as_raid_target: None,
             });
         }
         if ctx_refresh_schedule {

@@ -55,6 +55,7 @@ impl Supervisor {
             quality_upgraded: Arc::new(Mutex::new(HashSet::new())),
             stop_holds,
             finalizing,
+            raid_follow_ad_hoc: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -1516,7 +1517,7 @@ progress_info: None,
     /// automatic trigger (WebSub push) honors the Auto gate and just keeps
     /// the stream state fresh. `Disabled` detection skips the check entirely
     /// (see below).
-    async fn manual_start(&self, monitor_id: i64, user_initiated: bool) {
+    pub(super) async fn manual_start(&self, monitor_id: i64, user_initiated: bool) {
         if self.active.lock().unwrap().contains_key(&monitor_id) {
             return; // already recording
         }

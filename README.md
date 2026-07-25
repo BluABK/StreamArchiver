@@ -1772,6 +1772,45 @@ Partner names are resolved via Helix *Get Users* and cached persistently
 per live channel. Session history keeps the names **as observed at the
 time** — later renames don't rewrite it.
 
+### Follow raid 🏃
+
+When a monitored Twitch channel raids out to another channel, you can tune
+into (or auto-record) the raid target:
+
+- **Detection dependency** — raiding out is only ever visible via EventSub's
+  `channel.raid` subscription, in **conduit mode** (Client ID + Secret) with
+  **"Raids via EventSub"** on (*Settings → Accounts → Detection
+  credentials*). Chat only ever sees a raid coming **in**, never going out,
+  so without both of those this whole feature is inert — no other detection
+  path exists.
+- **Manual play** — a live instance's right-click menu gains **"▷🏃 Follow
+  raid"**, enabled once a recent raid-out is known: opens the target at the
+  live edge in your media player, same as ▷ Play new instance, without
+  recording.
+- **Auto-record (opt-in, default off)** — *Settings → Downloads → Follow
+  raid* has a master toggle (off by default — unlike most toggles here, this
+  creates new recordings of channels you didn't curate), overridable per
+  channel/instance ("Follow my raids") the usual global → channel → instance
+  way. When it fires:
+  - A raid target that's **already one of your tracked channels** gets
+    force-started using its own settings (tool/quality/output folder) if
+    it isn't already recording — the same "past Auto-record-off" mechanism
+    a manual ▶ Start already uses. Already recording it? Skipped (no
+    duplicate). Disabled (master switch or Auto-record off)? Skipped too,
+    unless **"Skip disabled raid targets"** (global, default on) is turned
+    off globally or overridden per-channel/instance via **"Record me when
+    I'm a raid target"** (Always/Never/Inherit).
+  - A raid target that **isn't** one of your tracked channels gets a
+    lightweight, ad-hoc capture instead: a plain file under the configured
+    **ad-hoc capture folder** (supports the `{name}` token) — no
+    `Channel`/`Monitor` row, no Streams-grid entry, no history/chapters/VOD
+    pipeline. Its only UI surface is a transient row in the Background
+    view while it's capturing.
+  - **Single-hop only**: records until the raid target's own stream ends —
+    Twitch has no formal "raid end" event, so this is the natural stop
+    signal. Following a raid CHAIN (the target itself raiding out further)
+    isn't implemented yet.
+
 ### Channel stats & viewer history 📈
 
 Live viewer counts (and, on Kick, follower totals) are **sampled into a

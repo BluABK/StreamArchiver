@@ -25,6 +25,11 @@ pub(super) struct ChannelForm {
     /// Chapter-embedding master toggle override for this channel (`None` =
     /// inherit global).
     pub(super) chapters_enabled: Option<bool>,
+    /// Follow-raid overrides for this channel (`None` = inherit global):
+    /// whether raiding out from this channel triggers follow-raid, and
+    /// whether this channel itself is ever auto-recorded as a raid target.
+    pub(super) follow_my_raids: Option<bool>,
+    pub(super) record_me_as_raid_target: Option<bool>,
 }
 /// Background load state of an import fetch (followed/subscriptions).
 pub(super) enum ImportLoadState {
@@ -405,6 +410,32 @@ impl StreamArchiverApp {
                                          Chapters).",
                                     );
                                 ui.end_row();
+
+                                ui.label("Follow my raids");
+                                tristate_combo(ui, "chform_follow_my_raids", &mut f.follow_my_raids)
+                                    .on_hover_text(
+                                        "When any instance in this channel raids out to another \
+                                         Twitch channel, follow it (tune in / auto-record per \
+                                         Settings → Follow raid). Inherit follows the global \
+                                         default there — off unless you've turned Follow raid on.",
+                                    );
+                                ui.end_row();
+
+                                ui.label("Record me when I'm a raid target");
+                                tristate_combo(
+                                    ui,
+                                    "chform_raid_target_record",
+                                    &mut f.record_me_as_raid_target,
+                                )
+                                .on_hover_text(
+                                    "Whether Follow raid may auto-record this channel when a \
+                                     followed raid lands on it. Always/Never override the \
+                                     \"skip disabled raid targets\" default too — set this to \
+                                     Always if you want this channel recorded via a raid even \
+                                     while disabled. Inherit follows that global default \
+                                     (Settings → Follow raid).",
+                                );
+                                ui.end_row();
                             });
                         if !renaming {
                             ui.label(
@@ -488,6 +519,18 @@ impl StreamArchiverApp {
                             &self.core.store,
                             cid,
                             &chapters_scope,
+                        );
+                        let _ = crate::raid_follow::save_bool_scope(
+                            &self.core.store,
+                            crate::raid_follow::K_CHANNEL_RAID_FOLLOW_SCOPE,
+                            cid,
+                            f.follow_my_raids,
+                        );
+                        let _ = crate::raid_follow::save_bool_scope(
+                            &self.core.store,
+                            crate::raid_follow::K_CHANNEL_RAID_TARGET_SCOPE,
+                            cid,
+                            f.record_me_as_raid_target,
                         );
                         let _ = crate::platform_pref::save_channel_primary_platform(
                             &self.core.store,
@@ -720,6 +763,8 @@ impl StreamArchiverApp {
                 }
             }
 
+            let latest_raid_out = self.core.store.latest_raid_outs_all().unwrap_or_default();
+
             // Per-recording ad-break detail (offsets) for the cut-list tooltips on
             // expanded history rows. Cached (cleared on reload) so we issue the SELECT
             // once per take with ads, not every rebuild; bounded by what's expanded.
@@ -786,6 +831,7 @@ impl StreamArchiverApp {
                 groups,
                 active_recordings,
                 twitch_login_to_mid,
+                latest_raid_out,
                 model,
                 platform_pref,
             });
@@ -842,6 +888,7 @@ impl StreamArchiverApp {
         let groups = &cache.groups;
         let active_recordings = &cache.active_recordings;
         let twitch_login_to_mid = &cache.twitch_login_to_mid;
+        let latest_raid_out = &cache.latest_raid_out;
         let model = &cache.model;
         let ad_breaks = &self.ad_break_cache;
         let meta_logs = &self.meta_change_cache;
@@ -1002,7 +1049,7 @@ impl StreamArchiverApp {
                             Vis::Instance { row: ri, depth } => {
                                 Self::instance_row(
                                     &mut tr, &self.rows[ri], depth, groups,
-                                    active_recordings, twitch_login_to_mid,
+                                    active_recordings, twitch_login_to_mid, latest_raid_out,
                                     &mut self.fs_probes, &self.settings,
                                     &self.scheduled_recordings, &ptex, now, active_ids,
                                     &finalizing_ids, &active_chat_ids, selected_monitor,
@@ -1235,6 +1282,16 @@ impl StreamArchiverApp {
                 mf.disposal_method = dsc.method;
                 mf.primary_pin = crate::platform_pref::monitor_is_pinned(&self.core.store, r.monitor.id);
                 mf.chapters_enabled = crate::chapters::load_monitor_chapters_scope(&self.core.store, r.monitor.id).enabled;
+                mf.follow_my_raids = crate::raid_follow::load_bool_scope(
+                    &self.core.store,
+                    crate::raid_follow::K_MONITOR_RAID_FOLLOW_SCOPE,
+                    r.monitor.id,
+                );
+                mf.record_me_as_raid_target = crate::raid_follow::load_bool_scope(
+                    &self.core.store,
+                    crate::raid_follow::K_MONITOR_RAID_TARGET_SCOPE,
+                    r.monitor.id,
+                );
                 self.form = Some(mf);
             }
         }
@@ -1302,6 +1359,16 @@ impl StreamArchiverApp {
                 let dsc = crate::disposal::load_channel_disposal_scope(&self.core.store, cid);
                 let platform_pref = crate::platform_pref::channel_primary_platform(&self.core.store, cid);
                 let chsc = crate::chapters::load_channel_chapters_scope(&self.core.store, cid);
+                let follow_my_raids = crate::raid_follow::load_bool_scope(
+                    &self.core.store,
+                    crate::raid_follow::K_CHANNEL_RAID_FOLLOW_SCOPE,
+                    cid,
+                );
+                let record_me_as_raid_target = crate::raid_follow::load_bool_scope(
+                    &self.core.store,
+                    crate::raid_follow::K_CHANNEL_RAID_TARGET_SCOPE,
+                    cid,
+                );
                 self.channel_form = Some(ChannelForm {
                     id: Some(cid),
                     name: c.name.clone(),
@@ -1314,6 +1381,8 @@ impl StreamArchiverApp {
                     disposal_method: dsc.method,
                     primary_platform_pref: platform_pref,
                     chapters_enabled: chsc.enabled,
+                    follow_my_raids,
+                    record_me_as_raid_target,
                 });
             }
         }
@@ -1432,6 +1501,16 @@ impl StreamArchiverApp {
                         self.status = msg;
                     }
                 }
+            }
+        }
+        if let Some(mid) = acts.follow_raid.take() {
+            let player = self.settings.media_player_path.trim().to_string();
+            if !player.is_empty()
+                && let Some(row) = self.rows.iter().find(|r| r.monitor.id == mid)
+                && let Ok(Some(raid)) = self.core.store.latest_raid_out(mid)
+                && let Some(msg) = spawn_follow_raid(row, &raid, &player, &self.settings, &self.core.store)
+            {
+                self.status = msg;
             }
         }
         if let Some(t) = copy_text {
@@ -2196,6 +2275,7 @@ impl StreamArchiverApp {
         groups: &HashMap<i64, Vec<StreamGroup>>,
         active_recordings: &HashMap<i64, Vec<crate::models::Recording>>,
         login_to_mid: &HashMap<String, i64>,
+        latest_raid_out: &HashMap<i64, crate::models::StreamEventRow>,
         fs_probes: &mut FsProbes,
         settings: &SettingsForm,
         scheduled_recordings: &[ScheduledRecordingWithNames],
@@ -2325,6 +2405,7 @@ impl StreamArchiverApp {
             stop_hold_desc,
             spark.get(&mid),
             &collab_plays,
+            latest_raid_out.get(&mid),
             col_order, &mut out.acts,
         ) {
             out.toggle_instance = Some(mid);

@@ -244,6 +244,8 @@ impl AppCore {
             tokio::sync::mpsc::unbounded_channel::<crate::events::LiveSignal>();
         let (offline_tx, offline_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::events::OfflineSignal>();
+        let (raid_out_tx, raid_out_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::events::RaidOutSignal>();
         let (manual_tx, manual_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::events::ManualCommand>();
         *self.manual_tx.lock().unwrap() = Some(manual_tx.clone());
@@ -277,7 +279,7 @@ impl AppCore {
         let es_store = self.store.clone();
         let es_shutdown = self.shutdown.clone();
         self.rt.spawn(async move {
-            crate::eventsub::run(es_store, live_tx, offline_tx, es_shutdown).await;
+            crate::eventsub::run(es_store, live_tx, offline_tx, raid_out_tx, es_shutdown).await;
         });
 
         // YouTube WebSub push via the VPS relay -> on-demand liveness checks
@@ -488,6 +490,14 @@ impl AppCore {
         let asset_jobs = self.jobs.clone();
         self.rt.spawn(async move {
             asset_sup.asset_refresh_loop(asset_shutdown, asset_jobs).await;
+        });
+
+        // Follow raid: EventSub raid-out pushes -> force-start/ad-hoc-capture
+        // orchestration (idles cheaply — the channel just never sends
+        // anything unless raid_eventsub + conduit mode are actually active).
+        let raid_follow_sup = supervisor.clone();
+        self.rt.spawn(async move {
+            raid_follow_sup.run_raid_follow(raid_out_rx).await;
         });
 
         // Scheduled recordings (schema v51): force-start/stop at a specific
