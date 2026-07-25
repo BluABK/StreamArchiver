@@ -28,13 +28,14 @@ fn quota_date_today() -> String {
 
 use crate::models::{
     AdBreak, AuthKind, Channel, Container, DailyRecordingStat, DetachedKind, DetachedRow,
-    DetectionMethod, GlobalStats, Monitor, MonitorStreamChange, MonitorWithChannel, Platform,
-    PollBucket, RecurrenceKind, SabrCodecPref, ScheduleSegment, ScheduledRecording,
-    ScheduledRecordingWithNames, StreamMetaChange, Tool, UpcomingStream, Video, now_unix,
+    DetectionMethod, FfmpegJobKind, FfmpegJobRow, GlobalStats, Monitor, MonitorStreamChange,
+    MonitorWithChannel, Platform, PollBucket, RecurrenceKind, SabrCodecPref, ScheduleSegment,
+    ScheduledRecording, ScheduledRecordingWithNames, StreamMetaChange, Tool, UpcomingStream, Video,
+    now_unix,
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 71;
+const SCHEMA_VERSION: i64 = 72;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -134,6 +135,7 @@ pub use alerts::{
 };
 mod collab;
 pub use collab::PartnerSessionRow;
+mod ffmpeg_jobs;
 mod migrations;
 mod monitors;
 mod posts;

@@ -1490,6 +1490,75 @@ pub struct DetachedRow {
     pub went_live_at: Option<i64>,
 }
 
+/// Which of the long-running ffmpeg `-c copy` post-processing passes an
+/// [`FfmpegJobRow`] tracks. `GapSplice` and `HeadBackfillJoin` both run through
+/// the same `concat_mkvs_n` primitive — the split exists so reconcile knows
+/// which in-session dedup guard (`gap_splice_jobs` vs `running_concats`) to
+/// re-populate on adopt (see `src/downloader/ffmpeg_job.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FfmpegJobKind {
+    ChaptersEmbed,
+    Remux,
+    ThumbnailEmbed,
+    GapSplice,
+    HeadBackfillJoin,
+    HeadBackfillSplitMerge,
+}
+
+impl FfmpegJobKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FfmpegJobKind::ChaptersEmbed => "chapters_embed",
+            FfmpegJobKind::Remux => "remux",
+            FfmpegJobKind::ThumbnailEmbed => "thumbnail_embed",
+            FfmpegJobKind::GapSplice => "gap_splice",
+            FfmpegJobKind::HeadBackfillJoin => "head_backfill_join",
+            FfmpegJobKind::HeadBackfillSplitMerge => "head_backfill_split_merge",
+        }
+    }
+    pub fn from_str(s: &str) -> Option<FfmpegJobKind> {
+        match s {
+            "chapters_embed" => Some(FfmpegJobKind::ChaptersEmbed),
+            "remux" => Some(FfmpegJobKind::Remux),
+            "thumbnail_embed" => Some(FfmpegJobKind::ThumbnailEmbed),
+            "gap_splice" => Some(FfmpegJobKind::GapSplice),
+            "head_backfill_join" => Some(FfmpegJobKind::HeadBackfillJoin),
+            "head_backfill_split_merge" => Some(FfmpegJobKind::HeadBackfillSplitMerge),
+            _ => None,
+        }
+    }
+}
+
+/// A persisted record of a still-running ffmpeg `-c copy` post-processing pass
+/// (chapters/thumbnail embed, remux, gap-splice/head-backfill concat, split-part
+/// merge), written right after spawn and deleted at finalize. Parallel to
+/// [`DetachedRow`] but for these jobs instead of capture/download/chat tools —
+/// see `src/downloader/ffmpeg_job.rs` for the spawn/reconcile/adopt machinery.
+#[derive(Clone, Debug)]
+pub struct FfmpegJobRow {
+    pub kind: FfmpegJobKind,
+    /// `recording.id` in every current kind.
+    pub ref_id: i64,
+    pub pid: u32,
+    /// OS process creation time (FILETIME 100ns ticks); guards against PID reuse.
+    pub proc_start: u64,
+    /// Named Win32 job object the tool was assigned to (re-openable by name).
+    pub job_name: String,
+    /// The `.tmp` sibling ffmpeg is writing.
+    pub tmp_path: String,
+    /// Where `tmp_path` gets renamed on success.
+    pub final_path: String,
+    /// The `-progress` output file, tailed for live progress on adopt.
+    pub progress_log: String,
+    /// Expected output duration (secs), recorded at spawn time — drives both
+    /// the live progress fraction and reconcile's "did it finish while we
+    /// were down" completeness check.
+    pub total_secs: Option<i64>,
+    pub started_at: i64,
+    /// [`crate::version::build_id`] of the build that spawned the job.
+    pub spawn_build: String,
+}
+
 /// One title or game/category change observed during a recording take.
 ///
 /// `at_secs` is the offset from the take's start (wall clock) when the change was

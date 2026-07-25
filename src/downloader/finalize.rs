@@ -602,6 +602,8 @@ pub(super) async fn persist_capture_start_pts(store: &Store, rec_id: i64, captur
 /// turn while the row still reads "recording" (the rec-652 stuck-finalize
 /// incident, 2026-07-12). The quick move branch never announces.
 pub(super) async fn promote_capture(
+    store: &Store,
+    shutdown: &Arc<AtomicBool>,
     plan: &DownloadPlan,
     opts: &crate::models::RemuxOpts,
     task: Option<(EventTx, u64)>,
@@ -641,7 +643,11 @@ pub(super) async fn promote_capture(
                 progress_info: None,
             }));
         }
-        let res = remux_ts_to_mkv(&effective, &dest, task.clone(), opts).await;
+        // The recording id doubles as the task id for takes (see this fn's
+        // doc comment) — reuse it to identify the job in the restart-survival
+        // registry too; `0` (no task) means no registration.
+        let ref_id = task.as_ref().map(|(_, id)| *id as i64).unwrap_or(0);
+        let res = remux_ts_to_mkv(store, shutdown, ref_id, &effective, &dest, task.clone(), opts).await;
         if let Some((tx, id)) = &task {
             let outcome = match &res {
                 Ok(()) => crate::events::TaskOutcome::Completed,

@@ -213,7 +213,17 @@ impl Supervisor {
         let total_duration = media_duration_secs(&output).await.map(|d| d as f64);
         let ffmetadata = ch::build_ffmetadata(&chapters, total_duration);
         let progress_tx = Some((self.events.clone(), task_id));
-        match embed_chapters_into_mkv(&output, &ffmetadata, total_duration, progress_tx).await {
+        match embed_chapters_into_mkv(
+            &self.store,
+            &self.shutdown,
+            rec_id,
+            &output,
+            &ffmetadata,
+            total_duration,
+            progress_tx,
+        )
+        .await
+        {
             Ok(()) => {
                 let _ = self.store.set_chapters_state(rec_id, "done");
                 if let Ok(json) = serde_json::to_string(&chapters) {

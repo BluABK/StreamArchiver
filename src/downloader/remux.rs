@@ -2,6 +2,7 @@
 //! embedding, media probes, stall sampling.
 
 use super::*;
+use super::ffmpeg_job;
 
 /// Resolve a video/stream's real title, channel/uploader, and id via yt-dlp (no
 /// download). Works for YouTube, Twitch VODs, Kick, and many sites; returns
@@ -161,13 +162,24 @@ pub async fn probe_formats(tool: Tool, url: &str, auth: &AuthSource) -> Result<S
 
 /// Losslessly concatenate two same-encode MKVs (`head` then `tail`) into
 /// `dst` — the exact 2-entry, no-trim case of [`concat_mkvs_n`].
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn concat_mkvs(
+    store: &Store,
+    shutdown: &Arc<AtomicBool>,
+    kind: FfmpegJobKind,
+    ref_id: i64,
+    total_secs: Option<i64>,
     list_dir: &Path,
     head: &Path,
     tail: &Path,
     dst: &Path,
 ) -> anyhow::Result<()> {
     concat_mkvs_n(
+        store,
+        shutdown,
+        kind,
+        ref_id,
+        total_secs,
         list_dir,
         &[ConcatEntry::whole(head), ConcatEntry::whole(tail)],
         dst,
@@ -207,13 +219,27 @@ impl<'a> ConcatEntry<'a> {
 /// error. `-c copy` seeking via `inpoint`/`outpoint` is keyframe-bound, not
 /// frame-exact — callers relying on a precise cut position (e.g.
 /// gap-splice) must independently verify where each seam actually landed;
-/// this function only builds and runs the concat.
+/// this function only builds and runs the concat. `ref_id` (`0` to opt out)
+/// identifies the job in the restart-survival registry (see
+/// `super::ffmpeg_job`) — `total_secs` (the entries' expected combined
+/// duration, if known) drives its "did a prior attempt already finish"
+/// completeness check.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn concat_mkvs_n(
+    store: &Store,
+    shutdown: &Arc<AtomicBool>,
+    kind: FfmpegJobKind,
+    ref_id: i64,
+    total_secs: Option<i64>,
     list_dir: &Path,
     entries: &[ConcatEntry<'_>],
     dst: &Path,
 ) -> anyhow::Result<()> {
     use std::process::Stdio;
+
+    if ffmpeg_job::adopt_or_clear_prior_ffmpeg_job(store, kind, ref_id, dst, total_secs, shutdown, None).await {
+        return Ok(());
+    }
 
     // ffconcat quoting: single-quote each path, escaping embedded quotes.
     fn quote(p: &Path) -> String {
@@ -265,21 +291,21 @@ pub(super) async fn concat_mkvs_n(
             .arg(dst)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .stderr(Stdio::piped());
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
 
         // spawn + wait_with_output (≡ output()) so the PID is sampleable.
-        let out = match cmd.spawn() {
-            Ok(child) => {
+        let spawned = ffmpeg_job::spawn_ffmpeg_job(store, kind, ref_id, cmd, dst, dst, "", total_secs).await;
+        let (out, job) = match spawned {
+            Ok((child, job)) => {
                 let _io_guard = crate::iomon::track_tool(child.id(), "ffmpeg", "concat", dst);
                 if let Some(pid) = child.id() {
                     gate.set_pid(pid);
                 }
-                child.wait_with_output().await
+                (child.wait_with_output().await, job)
             }
-            Err(e) => Err(e),
+            Err(e) => (Err(e), None),
         };
         if let Ok(out) = &out
             && !out.status.success()
@@ -288,6 +314,11 @@ pub(super) async fn concat_mkvs_n(
         {
             crate::io_gate::mark_readrate_unsupported();
             continue; // retry once without the throttle (latch is process-wide)
+        }
+        if let Ok(out) = &out
+            && out.status.success()
+        {
+            ffmpeg_job::finish_ffmpeg_job(store, kind, ref_id, job);
         }
         break out;
     };
@@ -312,20 +343,31 @@ pub(super) async fn concat_mkvs_n(
 }
 
 /// When `progress_tx` is `Some((tx, task_id))`, ffmpeg progress is streamed as
-/// `AppEvent::BackgroundTaskProgress` events on `tx`.
+/// `AppEvent::BackgroundTaskProgress` events on `tx`. `ref_id` (the
+/// recording id, `0` to opt out) identifies the job in the restart-survival
+/// registry (see `super::ffmpeg_job`) — a long remux on a busy disk now
+/// survives an app restart instead of losing all its progress.
+#[allow(clippy::too_many_arguments)]
 pub async fn remux_ts_to_mkv(
+    store: &Store,
+    shutdown: &Arc<AtomicBool>,
+    ref_id: i64,
     src: &Path,
     dst: &Path,
     progress_tx: Option<(EventTx, u64)>,
     opts: &crate::models::RemuxOpts,
 ) -> anyhow::Result<()> {
-    remux_ts_to_mkv_impl(src, dst, progress_tx, opts, true).await
+    remux_ts_to_mkv_impl(store, shutdown, ref_id, src, dst, progress_tx, opts, true).await
 }
 
 /// `allow_readrate: false` = the pacing-collapse retry (see below): the
 /// throttle is skipped for THIS file only, unlike the process-wide
 /// unsupported-flag latch.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn remux_ts_to_mkv_impl(
+    store: &Store,
+    shutdown: &Arc<AtomicBool>,
+    ref_id: i64,
     src: &Path,
     dst: &Path,
     progress_tx: Option<(EventTx, u64)>,
@@ -351,7 +393,7 @@ pub(super) async fn remux_ts_to_mkv_impl(
         }
         None => crate::io_gate::local_pass(&label, dst).await,
     };
-    remux_ts_to_mkv_gated(src, dst, progress_tx, opts, allow_readrate, gate).await
+    remux_ts_to_mkv_gated(store, shutdown, ref_id, src, dst, progress_tx, opts, allow_readrate, gate).await
 }
 
 /// The gated body of [`remux_ts_to_mkv_impl`]. The disk-gate permit is an
@@ -362,7 +404,11 @@ pub(super) async fn remux_ts_to_mkv_impl(
 /// watchdog, and rejoined the back: the whole queue carouseled for hours
 /// without a single file finishing (observed 2026-07-12, ~10 queued passes
 /// cycling across app restarts).
+#[allow(clippy::too_many_arguments)]
 async fn remux_ts_to_mkv_gated(
+    store: &Store,
+    shutdown: &Arc<AtomicBool>,
+    ref_id: i64,
     src: &Path,
     dst: &Path,
     progress_tx: Option<(EventTx, u64)>,
@@ -374,12 +420,27 @@ async fn remux_ts_to_mkv_gated(
 
     let readrate = if allow_readrate { crate::io_gate::readrate_for(dst) } else { None };
 
-    // Get total duration so we can compute a percentage from ffmpeg's output.
-    let total_us: Option<i64> = if progress_tx.is_some() {
-        media_duration_secs(src).await.map(|s| s * 1_000_000)
-    } else {
-        None
-    };
+    // Total duration for both the live progress fraction AND the
+    // restart-survival registry's "did a prior attempt already finish"
+    // completeness check (see `ffmpeg_job::adopt_or_clear_prior_ffmpeg_job`).
+    let total_secs = media_duration_secs(src).await;
+    let progress_log = dst.with_extension("remux.progress.log");
+
+    // ffmpeg writes `dst` directly (no separate `.tmp` sibling) — so
+    // "already done" means `dst` itself is already the complete result.
+    if ffmpeg_job::adopt_or_clear_prior_ffmpeg_job(
+        store,
+        FfmpegJobKind::Remux,
+        ref_id,
+        dst,
+        total_secs,
+        shutdown,
+        progress_tx.clone(),
+    )
+    .await
+    {
+        return Ok(());
+    }
 
     // Look for a thumbnail sidecar sitting next to the source TS (either our
     // HTTP fetch → `{stem}.thumbnail.jpg`, or yt-dlp's `--write-thumbnail` →
@@ -448,24 +509,34 @@ async fn remux_ts_to_mkv_gated(
     }
 
     cmd
-        // Write structured key=value progress lines to stdout.
-        .arg("-progress").arg("pipe:1")
+        // Write structured key=value progress lines to a file — a file (not
+        // a pipe) keeps growing after a restart, so a re-attach can tail it
+        // via the same `adopt_or_clear_prior_ffmpeg_job` call above.
+        .arg("-progress").arg(&progress_log)
         // Suppress the default per-frame stats line that goes to stderr.
         .arg("-nostats")
         .arg(dst)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
 
-    let mut child = cmd.spawn()?;
+    let (mut child, job) = ffmpeg_job::spawn_ffmpeg_job(
+        store,
+        FfmpegJobKind::Remux,
+        ref_id,
+        cmd,
+        dst,
+        dst,
+        &progress_log.to_string_lossy(),
+        total_secs,
+    )
+    .await?;
     let _io_guard = crate::iomon::track_tool(child.id(), "ffmpeg", "remux", dst);
     if let Some(pid) = child.id() {
         gate.set_pid(pid);
     }
-    let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
 
     // Collect stderr in background so we can report it on failure.
@@ -488,71 +559,48 @@ async fn remux_ts_to_mkv_gated(
     let pace_started = std::time::Instant::now();
     let mut pacing_broken = false;
 
-    // Read stdout for progress events.  ffmpeg's -progress writes one key=value
-    // per line; a block ends with `progress=continue` (or `progress=end`).
-    // `out_time_ms` is microseconds despite the name (historical ffmpeg quirk).
-    {
-        let mut reader = BufReader::new(stdout).lines();
-        // Per-block accumulators.
-        let mut blk_frame = String::new();
-        let mut blk_fps   = String::new();
-        let mut blk_speed = String::new();
-        let mut blk_pos   = String::new(); // out_time  HH:MM:SS.μs
-        let mut blk_us: Option<i64> = None; // out_time_ms in microseconds
+    // Progress is now tailed from a file (not read inline off stdout), so it
+    // runs as its own task concurrently with the wait/pacing-poll loop below
+    // — same shape `run_process` uses for capture-tool logs (`tail_log` +
+    // `done`). `last_us` is the pacing watchdog's own read of the media
+    // position; `events`/`task_id` (only set when the caller wants live UI
+    // progress) additionally emit `BackgroundTaskProgress`.
+    let done = Arc::new(AtomicBool::new(false));
+    let last_us = Arc::new(Mutex::new(None));
+    let tail = {
+        let events = progress_tx.clone().map(|(tx, _)| tx);
+        let task_id = progress_tx.as_ref().map(|(_, id)| *id).unwrap_or(0);
+        let log = progress_log.clone();
+        let done = done.clone();
+        let last_us = last_us.clone();
+        tokio::spawn(async move {
+            ffmpeg_job::tail_ffmpeg_progress(log, 0, total_secs, task_id, events, done, last_us).await
+        })
+    };
 
-        while let Ok(Some(line)) = reader.next_line().await {
-            if let Some((k, v)) = line.split_once('=') {
-                let (k, v) = (k.trim(), v.trim());
-                match k {
-                    "frame"       => blk_frame = v.to_string(),
-                    "fps"         => blk_fps   = v.to_string(),
-                    "speed"       => blk_speed = v.to_string(),
-                    "out_time"    => blk_pos   = v.to_string(),
-                    "out_time_ms" => blk_us    = v.parse::<i64>().ok(),
-                    "progress"    => {
-                        // End of block — fire one event.
-                        if let Some((ref tx, task_id)) = progress_tx {
-                            let progress = blk_us.and_then(|us| {
-                                total_us.filter(|&t| t > 0).map(|t| {
-                                    (us as f64 / t as f64).clamp(0.0, 1.0) as f32
-                                })
-                            });
-                            // Trim subsecond noise from out_time (keep HH:MM:SS).
-                            let pos_short = blk_pos.split('.').next().unwrap_or(&blk_pos);
-                            let info = format!(
-                                "frame={} fps={} speed={} pos={}",
-                                blk_frame, blk_fps, blk_speed, pos_short,
-                            );
-                            let _ = tx.send(AppEvent::BackgroundTaskProgress {
-                                id: task_id,
-                                progress,
-                                info,
-                            });
-                        }
-                        // Pacing watchdog: with a working -readrate the media
-                        // position advances at ~readrate× wall clock (disk
-                        // pressure might drag it lower, but never below a few
-                        // × realtime). Under 2× after 3 minutes = the pacing
-                        // math is broken for this file.
-                        if readrate.is_some() && !pacing_broken {
-                            let elapsed = pace_started.elapsed().as_secs_f64();
-                            let media_s = blk_us.unwrap_or(0) as f64 / 1e6;
-                            if elapsed > 180.0 && media_s < elapsed * 2.0 {
-                                pacing_broken = true;
-                                let _ = child.start_kill();
-                            }
-                        }
-                        // Reset for next block.
-                        blk_frame.clear(); blk_fps.clear();
-                        blk_speed.clear(); blk_pos.clear(); blk_us = None;
-                    }
-                    _ => {}
-                }
+    // Poll for exit (rather than blocking on `child.wait()` directly) so the
+    // pacing check below can run on the same cadence it always has, now that
+    // ffmpeg's progress lands in a file this task doesn't itself read.
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        // Pacing watchdog: with a working -readrate the media position
+        // advances at ~readrate× wall clock (disk pressure might drag it
+        // lower, but never below a few × realtime). Under 2× after 3
+        // minutes = the pacing math is broken for this file.
+        if readrate.is_some() && !pacing_broken {
+            let elapsed = pace_started.elapsed().as_secs_f64();
+            let media_s = last_us.lock().unwrap().unwrap_or(0) as f64 / 1e6;
+            if elapsed > 180.0 && media_s < elapsed * 2.0 {
+                pacing_broken = true;
+                let _ = child.start_kill();
             }
         }
-    }
-
-    let status = child.wait().await?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    done.store(true, Ordering::SeqCst);
+    let _ = tail.await;
     let stderr_lines = stderr_task.await.unwrap_or_default();
 
     if pacing_broken {
@@ -563,10 +611,11 @@ async fn remux_ts_to_mkv_gated(
              disk-gate turn: {}",
             src.display()
         );
-        return Box::pin(remux_ts_to_mkv_gated(src, dst, progress_tx, opts, false, gate)).await;
+        return Box::pin(remux_ts_to_mkv_gated(store, shutdown, ref_id, src, dst, progress_tx, opts, false, gate)).await;
     }
 
     if status.success() {
+        ffmpeg_job::finish_ffmpeg_job(store, FfmpegJobKind::Remux, ref_id, job);
         Ok(())
     } else {
         // Older ffmpeg (< 5.0) rejects -readrate outright: latch that
@@ -574,7 +623,7 @@ async fn remux_ts_to_mkv_gated(
         // keeping our disk-gate turn.
         if readrate.is_some() && crate::io_gate::is_readrate_error(&stderr_lines.join("\n")) {
             crate::io_gate::mark_readrate_unsupported();
-            return Box::pin(remux_ts_to_mkv_gated(src, dst, progress_tx, opts, true, gate)).await;
+            return Box::pin(remux_ts_to_mkv_gated(store, shutdown, ref_id, src, dst, progress_tx, opts, true, gate)).await;
         }
         let code = status.code().unwrap_or(-1);
         // Grab the last few non-empty lines of stderr — ffmpeg prints the
@@ -852,8 +901,17 @@ pub fn mkv_has_thumbnail(path: &Path) -> bool {
 }
 
 /// Embed `thumb` as a cover-art attachment into an existing MKV file in-place
-/// (remux to a temp file, then atomically replace the original).
-pub async fn embed_thumbnail_into_mkv(mkv: &Path, thumb: &Path) -> anyhow::Result<()> {
+/// (remux to a temp file, then atomically replace the original). `rec_id`
+/// (`0` to opt out) identifies the job in the restart-survival registry (see
+/// `super::ffmpeg_job`) so a restart mid-embed doesn't lose the pass or race
+/// a duplicate against the same `.tmp` file.
+pub async fn embed_thumbnail_into_mkv(
+    store: &Store,
+    shutdown: &Arc<AtomicBool>,
+    rec_id: i64,
+    mkv: &Path,
+    thumb: &Path,
+) -> anyhow::Result<()> {
     let tmp = mkv.with_extension("tmp.mkv");
     let ext = thumb.extension().and_then(|e| e.to_str()).unwrap_or("jpg").to_ascii_lowercase();
     let mime = match ext.as_str() {
@@ -862,6 +920,17 @@ pub async fn embed_thumbnail_into_mkv(mkv: &Path, thumb: &Path) -> anyhow::Resul
         _      => "image/jpeg",
     };
     let cover_name = format!("cover.{ext}");
+    let total_secs = media_duration_secs(mkv).await;
+
+    if ffmpeg_job::adopt_or_clear_prior_ffmpeg_job(
+        store, FfmpegJobKind::ThumbnailEmbed, rec_id, &tmp, total_secs, shutdown, None,
+    )
+    .await
+    {
+        crate::iomon::fs::rename(Cat::Thumbnail, &tmp, mkv).await?;
+        return Ok(());
+    }
+
     // One full-file pass at a time on the recordings drive (see io_gate).
     let gate =
         crate::io_gate::local_pass(&crate::io_gate::gate_label("embed-thumbnail", mkv), mkv).await;
@@ -882,12 +951,14 @@ pub async fn embed_thumbnail_into_mkv(mkv: &Path, thumb: &Path) -> anyhow::Resul
             .arg(&tmp)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .stderr(Stdio::piped());
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
         // spawn + wait_with_output (≡ output()) so the PID is sampleable.
-        let child = cmd.spawn()?;
+        let (child, job) = ffmpeg_job::spawn_ffmpeg_job(
+            store, FfmpegJobKind::ThumbnailEmbed, rec_id, cmd, &tmp, mkv, "", total_secs,
+        )
+        .await?;
         let _io_guard = crate::iomon::track_tool(child.id(), "ffmpeg", "embed-thumbnail", mkv);
         if let Some(pid) = child.id() {
             gate.set_pid(pid);
@@ -899,6 +970,9 @@ pub async fn embed_thumbnail_into_mkv(mkv: &Path, thumb: &Path) -> anyhow::Resul
         {
             crate::io_gate::mark_readrate_unsupported();
             continue; // retry without the throttle
+        }
+        if out.status.success() {
+            ffmpeg_job::finish_ffmpeg_job(store, FfmpegJobKind::ThumbnailEmbed, rec_id, job);
         }
         break out;
     };
@@ -994,22 +1068,44 @@ pub async fn embed_subtitles_into_mkv(mkv: &Path) -> anyhow::Result<bool> {
 /// are pulled from the new input via `-map_chapters 1` only.
 ///
 /// `total_duration_secs` (when known) and `progress_tx` let this report live
-/// position via ffmpeg's own `-progress pipe:1` — same key=value stream and
+/// position via ffmpeg's own `-progress` output — same key=value stream and
 /// `out_time_ms`-vs-duration fraction as [`remux_ts_to_mkv_gated`], since
 /// this is a whole-file `-c copy` pass too and can take a while on a large
-/// recording.
+/// recording. Progress is written to a file (not a pipe) and `rec_id`
+/// identifies the job in the restart-survival registry (see
+/// `super::ffmpeg_job`) — a multi-hour embed on a large recording now
+/// survives an app restart instead of losing all its progress.
 pub async fn embed_chapters_into_mkv(
+    store: &Store,
+    shutdown: &Arc<AtomicBool>,
+    rec_id: i64,
     mkv: &Path,
     ffmetadata: &str,
     total_duration_secs: Option<f64>,
     progress_tx: Option<(EventTx, u64)>,
 ) -> anyhow::Result<()> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-
     let chapters_txt = mkv.with_extension("chapters.ffmeta.txt");
     crate::iomon::fs::write(Cat::ConcatList, &chapters_txt, ffmetadata).await?;
     let tmp = mkv.with_extension("tmp.mkv");
-    let total_us: Option<i64> = total_duration_secs.map(|s| (s * 1_000_000.0) as i64);
+    let progress_log = mkv.with_extension("chapters.progress.log");
+    let total_secs = total_duration_secs.map(|s| s as i64);
+
+    if ffmpeg_job::adopt_or_clear_prior_ffmpeg_job(
+        store,
+        FfmpegJobKind::ChaptersEmbed,
+        rec_id,
+        &tmp,
+        total_secs,
+        shutdown,
+        progress_tx.clone(),
+    )
+    .await
+    {
+        let _ = crate::iomon::fs::remove_file(Cat::ConcatList, &chapters_txt).await;
+        crate::iomon::fs::rename(Cat::Thumbnail, &tmp, mkv).await?;
+        return Ok(());
+    }
+
     // One full-file pass at a time on the recordings drive (see io_gate).
     let gate =
         crate::io_gate::local_pass(&crate::io_gate::gate_label("embed-chapters", mkv), mkv).await;
@@ -1026,24 +1122,35 @@ pub async fn embed_chapters_into_mkv(
             .arg("-map_metadata").arg("0")
             .arg("-map_chapters").arg("1")
             .arg("-c").arg("copy")
-            // Write structured key=value progress lines to stdout.
-            .arg("-progress").arg("pipe:1")
+            // Write structured key=value progress lines to a file — a file
+            // (not a pipe) keeps growing after a restart, so a re-attach can
+            // tail it via the same `adopt_or_clear_prior_ffmpeg_job` call above.
+            .arg("-progress").arg(&progress_log)
             .arg("-nostats")
             .arg(&tmp)
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
-        let mut child = cmd.spawn()?;
+        let (mut child, job) = ffmpeg_job::spawn_ffmpeg_job(
+            store,
+            FfmpegJobKind::ChaptersEmbed,
+            rec_id,
+            cmd,
+            &tmp,
+            mkv,
+            &progress_log.to_string_lossy(),
+            total_secs,
+        )
+        .await?;
         let _io_guard = crate::iomon::track_tool(child.id(), "ffmpeg", "embed-chapters", mkv);
         if let Some(pid) = child.id() {
             gate.set_pid(pid);
         }
-        let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
         let stderr_task = tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
             let mut reader = BufReader::new(stderr).lines();
             let mut lines: Vec<String> = Vec::new();
             while let Ok(Some(line)) = reader.next_line().await {
@@ -1051,43 +1158,20 @@ pub async fn embed_chapters_into_mkv(
             }
             lines
         });
-        // Read stdout for progress events — same block format as
-        // `remux_ts_to_mkv_gated`: one key=value per line, block ends at
-        // `progress=continue`/`progress=end`, `out_time_ms` is microseconds.
-        {
-            let mut reader = BufReader::new(stdout).lines();
-            let mut blk_speed = String::new();
-            let mut blk_pos = String::new();
-            let mut blk_us: Option<i64> = None;
-            while let Ok(Some(line)) = reader.next_line().await {
-                if let Some((k, v)) = line.split_once('=') {
-                    let (k, v) = (k.trim(), v.trim());
-                    match k {
-                        "speed"       => blk_speed = v.to_string(),
-                        "out_time"    => blk_pos   = v.to_string(),
-                        "out_time_ms" => blk_us    = v.parse::<i64>().ok(),
-                        "progress"    => {
-                            if let Some((ref tx, task_id)) = progress_tx {
-                                let progress = blk_us.and_then(|us| {
-                                    total_us.filter(|&t| t > 0).map(|t| {
-                                        (us as f64 / t as f64).clamp(0.0, 1.0) as f32
-                                    })
-                                });
-                                let pos_short = blk_pos.split('.').next().unwrap_or(&blk_pos);
-                                let _ = tx.send(AppEvent::BackgroundTaskProgress {
-                                    id: task_id,
-                                    progress,
-                                    info: format!("speed={blk_speed} pos={pos_short}"),
-                                });
-                            }
-                            blk_speed.clear(); blk_pos.clear(); blk_us = None;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
+        let done = Arc::new(AtomicBool::new(false));
+        let tail = {
+            let events = progress_tx.clone().map(|(tx, _)| tx);
+            let task_id = progress_tx.as_ref().map(|(_, id)| *id).unwrap_or(0);
+            let log = progress_log.clone();
+            let done = done.clone();
+            let last_us = Arc::new(Mutex::new(None)); // no pacing watchdog for chapters
+            tokio::spawn(async move {
+                ffmpeg_job::tail_ffmpeg_progress(log, 0, total_secs, task_id, events, done, last_us).await
+            })
+        };
         let status = child.wait().await?;
+        done.store(true, Ordering::SeqCst);
+        let _ = tail.await;
         let stderr_bytes = stderr_task.await.unwrap_or_default().join("\n").into_bytes();
         let out = std::process::Output { status, stdout: Vec::new(), stderr: stderr_bytes };
         if !out.status.success()
@@ -1096,6 +1180,9 @@ pub async fn embed_chapters_into_mkv(
         {
             crate::io_gate::mark_readrate_unsupported();
             continue; // retry without the throttle
+        }
+        if out.status.success() {
+            ffmpeg_job::finish_ffmpeg_job(store, FfmpegJobKind::ChaptersEmbed, rec_id, job);
         }
         break out;
     };

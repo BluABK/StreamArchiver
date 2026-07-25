@@ -56,6 +56,9 @@ impl Supervisor {
             stop_holds,
             finalizing,
             raid_follow_ad_hoc: Arc::new(Mutex::new(HashSet::new())),
+            remux_jobs: Arc::new(Mutex::new(HashSet::new())),
+            thumbnail_jobs: Arc::new(Mutex::new(HashSet::new())),
+            split_merge_jobs: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -183,7 +186,14 @@ impl Supervisor {
     /// [`ManualCommand::ReRemux`]: re-remux one captured `.ts` to MKV in the
     /// background and update the recording row on success.
     fn cmd_re_remux(&self, rec_id: i64, capture: PathBuf, final_: PathBuf) {
+        // Guards against this racing a concurrent `ReRemuxAll` pass (or a
+        // second click) over the same rec_id — nothing did before.
+        if !self.remux_jobs.lock().unwrap().insert(rec_id) {
+            return;
+        }
         let store = self.store.clone();
+        let shutdown = self.shutdown.clone();
+        let remux_jobs = self.remux_jobs.clone();
         let tx = self.events.clone();
         let task_id = rec_id as u64;
         let src_name = capture
@@ -216,7 +226,7 @@ progress_info: None,
             // The user's embed settings apply to manual re-remuxes too (a
             // bare Default here silently skipped thumbnail/title/subs).
             let opts = remux_opts_for_recording(&store, rec_id);
-            match remux_ts_to_mkv(&capture, &final_, Some((tx2, task_id)), &opts).await {
+            match remux_ts_to_mkv(&store, &shutdown, rec_id, &capture, &final_, Some((tx2, task_id)), &opts).await {
                 Ok(()) => {
                     let _ = crate::iomon::fs::remove_file(Cat::CacheSweep, &capture).await;
                     let path_s = final_.to_string_lossy();
@@ -239,6 +249,7 @@ progress_info: None,
                     let _ = tx.send(AppEvent::RecordingUpdated { recording_id: rec_id });
                 }
             }
+            remux_jobs.lock().unwrap().remove(&rec_id);
         });
     }
 
@@ -246,6 +257,8 @@ progress_info: None,
     /// a `.ts` source next to its planned MKV.
     fn cmd_re_remux_all(&self) {
         let store = self.store.clone();
+        let shutdown = self.shutdown.clone();
+        let remux_jobs = self.remux_jobs.clone();
         let tx = self.events.clone();
         tokio::spawn(async move {
             let task_id = crate::events::next_task_id();
@@ -282,12 +295,18 @@ progress_info: None,
                     continue;
                 }
                 let mkv = path_with_safe_stem(&planned_mkv);
+                // Skip a rec_id a concurrent manual re-remux already owns —
+                // that job's own completion is this file done either way.
+                if !remux_jobs.lock().unwrap().insert(*rec_id) {
+                    done += 1;
+                    continue;
+                }
                 let _ = tx.send(AppEvent::BackgroundTaskProgress {
                     id: task_id,
                     progress: Some(done as f32 / total as f32),
                     info: format!("{}/{total}: {}", done + 1, mkv.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()),
                 });
-                match remux_ts_to_mkv(&ts, &mkv, None, &opts).await {
+                match remux_ts_to_mkv(&store, &shutdown, *rec_id, &ts, &mkv, None, &opts).await {
                     Ok(()) => {
                         let _ = crate::iomon::fs::remove_file(Cat::CacheSweep, &ts).await;
                         if mkv != planned_mkv {
@@ -297,6 +316,7 @@ progress_info: None,
                     }
                     Err(e) => warn!("re-remux-all failed for rec_id={rec_id}: {e:#}"),
                 }
+                remux_jobs.lock().unwrap().remove(rec_id);
                 done += 1;
             }
             let _ = tx.send(AppEvent::BackgroundTaskFinished {
@@ -512,6 +532,8 @@ progress_info: None,
     /// into all MKVs that don't already carry one.
     fn cmd_embed_missing_thumbnails(&self) {
         let store = self.store.clone();
+        let shutdown = self.shutdown.clone();
+        let thumbnail_jobs = self.thumbnail_jobs.clone();
         let tx = self.events.clone();
         tokio::spawn(async move {
             let task_id = crate::events::next_task_id();
@@ -548,13 +570,17 @@ progress_info: None,
                 let has = tokio::task::spawn_blocking(move || mkv_has_thumbnail(&mkv2)).await.unwrap_or(false);
                 if has { continue; }
                 if let Some(thumb) = find_thumbnail_for(&mkv) {
-                    match embed_thumbnail_into_mkv(&mkv, &thumb).await {
+                    if !thumbnail_jobs.lock().unwrap().insert(*rec_id) {
+                        continue; // a concurrent embed already owns this rec_id
+                    }
+                    match embed_thumbnail_into_mkv(&store, &shutdown, *rec_id, &mkv, &thumb).await {
                         Ok(()) => {
                             embedded += 1;
                             let _ = tx.send(AppEvent::RecordingUpdated { recording_id: *rec_id });
                         }
                         Err(e) => warn!("embed-thumbnail failed for rec_id={rec_id}: {e:#}"),
                     }
+                    thumbnail_jobs.lock().unwrap().remove(rec_id);
                 }
             }
             let _ = tx.send(AppEvent::BackgroundTaskFinished {
@@ -568,6 +594,8 @@ progress_info: None,
     /// thumbnails for recordings without a sidecar.
     fn cmd_fetch_missing_thumbnails(&self, embed: bool) {
         let store = self.store.clone();
+        let shutdown = self.shutdown.clone();
+        let thumbnail_jobs = self.thumbnail_jobs.clone();
         let tx = self.events.clone();
         tokio::spawn(async move {
             let task_id = crate::events::next_task_id();
@@ -608,12 +636,16 @@ progress_info: None,
                 info!("fetch-missing-thumbnails: rec_id={rec_id} has no thumbnail sidecar (manual implementation required per-platform)");
                 if embed {
                     if let Some(thumb) = find_thumbnail_for(&output) {
-                        if let Err(e) = embed_thumbnail_into_mkv(&output, &thumb).await {
+                        if !thumbnail_jobs.lock().unwrap().insert(*rec_id) {
+                            continue; // a concurrent embed already owns this rec_id
+                        }
+                        if let Err(e) = embed_thumbnail_into_mkv(&store, &shutdown, *rec_id, &output, &thumb).await {
                             warn!("embed after fetch failed rec_id={rec_id}: {e:#}");
                         } else {
                             fetched += 1;
                             let _ = tx.send(AppEvent::RecordingUpdated { recording_id: *rec_id });
                         }
+                        thumbnail_jobs.lock().unwrap().remove(rec_id);
                     }
                 }
             }
@@ -2157,7 +2189,7 @@ progress_info: None,
             .unwrap_or_default();
         let mut final_path;
         if plan.remux_to_mkv {
-            final_path = promote_capture(&plan, &self.store.remux_opts(), None).await;
+            final_path = promote_capture(&self.store, &self.shutdown, &plan, &self.store.remux_opts(), None).await;
         } else {
             let produced = if file_len(&plan.capture_path).await > 0 {
                 Some(plan.capture_path.clone())
@@ -3319,6 +3351,8 @@ progress_info: None,
         // first PTS must be saved before the remux resets timestamps.
         persist_capture_start_pts(&self.store, rec_id, &plan.capture_path).await;
         let mut final_path = promote_capture(
+            &self.store,
+            &self.shutdown,
             plan,
             &remux_opts_for_recording(&self.store, rec_id),
             Some((self.events.clone(), rec_id as u64)),
@@ -3664,7 +3698,7 @@ progress_info: None,
 
         // Promote the companion out of .cache\ (remux .ts→.mkv) on success; a failed
         // one stays in .cache\ for the sweep.
-        let final_path = promote_capture(&plan, &self.store.remux_opts(), None).await;
+        let final_path = promote_capture(&self.store, &self.shutdown, &plan, &self.store.remux_opts(), None).await;
         if final_path != plan.capture_path {
             if let Some(cache) = plan.capture_path.parent() {
                 let stem = plan

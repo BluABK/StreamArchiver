@@ -1403,7 +1403,38 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 71)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 71);
+        if version < 72 {
+            // Registry for still-running ffmpeg `-c copy` post-processing passes
+            // (chapters/thumbnail embed, remux, gap-splice/head-backfill concat,
+            // split-part merge) — parallel to `detached_process` but for these
+            // jobs instead of capture/download/chat tools. Written right after
+            // spawn, deleted at finalize. On the next launch the supervisor
+            // reconciles every row: re-attach to still-alive ones (tail the
+            // progress file), finalize ones whose `.tmp` output finished while
+            // the app was down, or clean up a genuinely-interrupted one and let
+            // the normal sweep re-queue it from scratch. See
+            // `src/downloader/ffmpeg_job.rs`. Added after the Nihmune chapters
+            // task lost 12+ hours of throttled `-c copy` progress to a restart.
+            conn.execute_batch(
+                "CREATE TABLE ffmpeg_job (
+                    id           INTEGER PRIMARY KEY,
+                    kind         TEXT NOT NULL,
+                    ref_id       INTEGER NOT NULL,
+                    pid          INTEGER NOT NULL,
+                    proc_start   INTEGER NOT NULL,
+                    job_name     TEXT NOT NULL DEFAULT '',
+                    tmp_path     TEXT NOT NULL DEFAULT '',
+                    final_path   TEXT NOT NULL DEFAULT '',
+                    progress_log TEXT NOT NULL DEFAULT '',
+                    total_secs   INTEGER,
+                    started_at   INTEGER NOT NULL,
+                    spawn_build  TEXT NOT NULL DEFAULT ''
+                );
+                CREATE UNIQUE INDEX idx_ffmpeg_job_kind_ref ON ffmpeg_job(kind, ref_id);",
+            )?;
+            conn.pragma_update(None, "user_version", 72)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 72);
         Ok(())
     }
 }

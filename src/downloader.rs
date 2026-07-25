@@ -25,9 +25,9 @@ use crate::detectors::{DetectContext, DetectItem, DetectOutcome};
 use crate::events::{AppEvent, EventTx, LiveSignal, ManualCommand};
 use crate::iomon::Cat;
 use crate::models::{
-    AuthKind, Container, DetachedKind, DetachedRow, DetectionMethod, K_FILENAME_MEDIA,
-    MediaInfoMode, Monitor, MonitorWithChannel, Platform, Recording, SabrCodecPref, Tool, Video,
-    now_unix,
+    AuthKind, Container, DetachedKind, DetachedRow, DetectionMethod, FfmpegJobKind, FfmpegJobRow,
+    K_FILENAME_MEDIA, MediaInfoMode, Monitor, MonitorWithChannel, Platform, Recording,
+    SabrCodecPref, Tool, Video, now_unix,
 };
 use crate::platform::DetachedJob;
 use crate::store::Store;
@@ -155,6 +155,7 @@ mod alerts;
 mod backfill;
 mod cache;
 mod chapters;
+mod ffmpeg_job;
 mod finalize;
 mod gap_recover;
 mod gap_splice;
@@ -386,6 +387,19 @@ pub struct Supervisor {
     /// currently in flight — dedups overlapping raid-outs into the same
     /// untracked channel (see `raid_follow.rs`).
     raid_follow_ad_hoc: Arc<Mutex<HashSet<String>>>,
+    /// rec_ids with a remux/re-remux job currently in flight — nothing
+    /// guarded against a manual re-remux racing `ReRemuxAll` before this;
+    /// same shape as `chapter_jobs`/`gap_splice_jobs`. Also re-populated by
+    /// `reconcile_ffmpeg_jobs` on adopt (`ffmpeg_job.rs`) so a restart can't
+    /// race a resumed remux against a fresh sweep spawn.
+    remux_jobs: Arc<Mutex<HashSet<i64>>>,
+    /// rec_ids with a thumbnail-embed job currently in flight — same shape
+    /// and purpose as `remux_jobs`.
+    thumbnail_jobs: Arc<Mutex<HashSet<i64>>>,
+    /// rec_ids with a head-backfill split-part merge currently in flight —
+    /// same shape and purpose as `remux_jobs` (closes a pre-existing latent
+    /// double-click hazard on the manual "Merge split capture" action too).
+    split_merge_jobs: Arc<Mutex<HashSet<i64>>>,
 }
 
 /// Why automatic restarts are suppressed for a monitor after a user Stop.

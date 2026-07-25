@@ -559,6 +559,15 @@ impl AppCore {
     /// wait for those tasks to remux `.ts` -> `.mkv` and finalize before returning.
     /// Finally shuts down the async runtime with a bounded timeout so the process
     /// never hangs indefinitely waiting for a stuck background task or blocking thread.
+    ///
+    /// Deliberately does NOT touch the `ffmpeg_job` registry (chapters/thumbnail
+    /// embed, remux, gap-splice/head-backfill concat, split-merge — see
+    /// `downloader::ffmpeg_job`): those post-processing passes are spawned
+    /// without `kill_on_drop` into a job object that survives this runtime
+    /// shutdown, same as capture/download tools, and are left running
+    /// unconditionally. A killed mid-write `.tmp` is worse than one quietly
+    /// finishing in the background — don't "fix" this by adding a kill loop
+    /// over `ffmpeg_job` rows without re-litigating that tradeoff.
     pub fn stop_all_recordings(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
         let initial = self.active.lock().unwrap().len()

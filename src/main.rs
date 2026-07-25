@@ -582,7 +582,13 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
             ts_len / 1024
         );
         if plan.remux_to_mkv && ts_len > 0 {
-            match downloader::remux_ts_to_mkv(&plan.capture_path, &plan.final_path, None, &Default::default()).await {
+            // Scratch store: this diagnostic path has no real DB — `ref_id = 0`
+            // means the restart-survival registry is never actually touched,
+            // but `remux_ts_to_mkv` still needs a `Store` handle to pass through.
+            let scratch_store = Store::open(&std::env::temp_dir().join("streamarchiver-diag.sqlite3"))
+                .context("scratch store")?;
+            let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            match downloader::remux_ts_to_mkv(&scratch_store, &shutdown, 0, &plan.capture_path, &plan.final_path, None, &Default::default()).await {
                 Ok(()) => {
                     let mkv = crate::iomon::fs::metadata(crate::iomon::Cat::Other, &plan.final_path)
                         .await

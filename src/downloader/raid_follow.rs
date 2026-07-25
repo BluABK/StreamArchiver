@@ -203,7 +203,9 @@ impl Supervisor {
                         embed_subs: false,
                         title_vars: None,
                     };
-                    match remux_ts_to_mkv(&ts_path, &mkv_path, None, &opts).await {
+                    // Untracked ad-hoc capture — `ref_id = 0` opts out of the
+                    // restart-survival registry (see `DetachReg`'s own convention).
+                    match remux_ts_to_mkv(&self.store, &self.shutdown, 0, &ts_path, &mkv_path, None, &opts).await {
                         Ok(()) => {
                             let _ = crate::iomon::fs::remove_file_sync(crate::iomon::Cat::Promote, &ts_path);
                             TaskOutcome::CompletedWithNote(mkv_path.display().to_string())

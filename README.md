@@ -968,7 +968,7 @@ dirs are still swept).
 
 The **⚠ Issues** button in the toolbar (turns amber with a count when issues exist) opens a panel listing recordings that need attention. The row-list sections (stale recordings, unmerged split captures, muted VODs, head mismatches) sit in their own scrollable region capped at a fixed height, so a long backlog (e.g. dozens of unmerged split captures) scrolls in place instead of pushing the toolbar and the main table off the bottom of the window; each section's rows are column-aligned (name, action, details) instead of packing left-to-right, so buttons line up regardless of how long each row's name/status text is.
 
-- **Needs re-remux** — a recording whose capture finished as `.ts` but was never successfully remuxed to MKV (e.g. after a crash, a detached process, or an automatic remux failure at finalization). The **🔄 Re-remux** button triggers a background ffmpeg remux; the status cell shows a live progress bar with fps / speed / position once ffmpeg is running. The source `.ts` is deleted only on success.
+- **Needs re-remux** — a recording whose capture finished as `.ts` but was never successfully remuxed to MKV (e.g. after a crash, a detached process, or an automatic remux failure at finalization). The **🔄 Re-remux** button triggers a background ffmpeg remux; the status cell shows a live progress bar with fps / speed / position once ffmpeg is running. The source `.ts` is deleted only on success. Like chapter embedding (see [Chapters](#chapters-)), an in-progress remux survives an app restart instead of losing its progress — the app re-attaches to it on the next launch rather than starting over.
 
   A startup **repair pass** feeds this section: any recording whose row claims
   a final output file that isn't actually on disk (the app died before or
@@ -1219,9 +1219,20 @@ take/stream row once embedding succeeds, and a matching **ℹ** button on any
 with the stream, the file path, and the full embedded chapter list with
 timestamps (survives in the Recent table's 100-entry history, so it's
 available long after the embed itself finished). The embed pass itself
-reports live progress via ffmpeg's `-progress pipe:1` (position/speed against
+reports live progress via ffmpeg's `-progress` output (position/speed against
 the recording's known duration), so its Active-table row shows a real
 percentage bar rather than just an elapsed timer while it runs.
+
+Because embedding is throttled alongside live captures on a busy disk drive,
+a large recording's embed can run for many real hours — long enough to
+outlast an app restart. The pass **survives** one: it's spawned into a Job
+Object that keeps running after the app quits or restarts (the same
+mechanism that lets in-progress recordings/downloads survive a restart), and
+on the next launch the app re-attaches to it — waiting for it to finish (its
+percentage keeps updating) rather than losing the progress and starting
+over. A restart that happens to land mid-write for a genuinely-interrupted
+pass (a hard crash, not a normal restart) is detected and cleanly re-queued
+from scratch instead of silently leaving a corrupt partial file around.
 
 **Existing recordings, and manual control.** A startup sweep retroactively
 embeds chapters into every already-finalized recording the first time it
@@ -1319,7 +1330,11 @@ independent detectors feeding the same table:
   a live countdown to the next run; each has its own on/off toggle (turning
   off **Live poll** pauses all detection/recording). Below that, **Active**
   and **Recent** tables show in-flight and just-finished tasks (head
-  backfills, re-remuxes, asset fetches) with live progress and outcome.
+  backfills, re-remuxes, asset fetches) with live progress and outcome. The
+  long `ffmpeg -c copy` passes among these (chapters/thumbnail embed, remux,
+  gap-splice/head-backfill concat, split-capture merge) all survive an app
+  restart instead of losing their progress — see [Chapters](#chapters-) for
+  the details.
 
   ![Background tab: job schedule plus active/recent task tables](doc/screenshots/background-jobs.png)
 - **🖥 Process manager** (top-bar button shows the live count, e.g. `🖥 3`) —
@@ -3014,5 +3029,4 @@ they cover (they exercise private items and compile out of release builds).
 - Installer / packaging (the AppUserModelID + branded toasts already work
   installer-free via HKCU registration).
 - macOS/Linux polish (tray via `ksni`, process-group kill).
-- Re-remux survival across app restarts (register ffmpeg in the detached-process registry so an in-progress `.ts` → MKV re-remux triggered from the Issues panel is not lost when the app is restarted; the `.ts` source is always preserved on failure or interruption, so the re-remux can be re-triggered from the Issues panel).
 - Kick chat logging.

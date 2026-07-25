@@ -2,6 +2,7 @@
 //! backfill concat.
 
 use super::*;
+use super::ffmpeg_job;
 
 impl Supervisor {
     /// Re-drive head backfills whose planned state (`head_backfill_state =
@@ -632,6 +633,12 @@ impl Supervisor {
     /// the final MKV, promotes it + any companions, and marks the recording
     /// completed. The parts are deleted only on success.
     pub async fn merge_split_capture(&self, rec_id: i64) {
+        // Guards against a double-click (or a restart-adopted merge racing a
+        // fresh manual retry) — nothing did before.
+        if !self.split_merge_jobs.lock().unwrap().insert(rec_id) {
+            return;
+        }
+        let _guard = ConcatGuard { set: self.split_merge_jobs.clone(), id: rec_id };
         let Ok(Some(rec)) = self.store.get_recording(rec_id) else {
             warn!(rec_id, "merge split capture: recording not found");
             return;
@@ -690,6 +697,50 @@ impl Supervisor {
         let final_path = path_with_safe_stem(&out_dir.join(format!("{stem}.mkv")));
         let tmp = cache.join(format!("{orig_stem}.merged.tmp.mkv"));
 
+        // Total duration for both the progress fraction (the video part spans
+        // the whole take; the audio part matches it) AND the restart-survival
+        // registry's "did a prior attempt already finish" completeness check
+        // (see `ffmpeg_job::adopt_or_clear_prior_ffmpeg_job`).
+        let total_secs = media_duration_secs(&parts[0]).await;
+        if ffmpeg_job::adopt_or_clear_prior_ffmpeg_job(
+            &self.store,
+            FfmpegJobKind::HeadBackfillSplitMerge,
+            rec_id,
+            &tmp,
+            total_secs,
+            &self.shutdown,
+            None,
+        )
+        .await
+        {
+            if let Err(e) = crate::iomon::fs::rename(Cat::Promote, &tmp, &final_path).await {
+                warn!(rec_id, "merge split capture: promote failed: {e:#}");
+                finish(crate::events::TaskOutcome::Failed(format!("promote: {e}")));
+                return;
+            }
+            move_companions(&cache, &out_dir, &orig_stem).await;
+            let bytes = crate::iomon::fs::metadata(Cat::Promote, &final_path)
+                .await
+                .map(|m| m.len() as i64)
+                .unwrap_or(0);
+            let _ = self.store.finish_recording(
+                rec_id,
+                rec.ended_at.unwrap_or_else(now_unix),
+                bytes,
+                rec.exit_code,
+                "completed",
+                &final_path.to_string_lossy(),
+                &rec.log_excerpt,
+            );
+            for p in &parts {
+                let _ = crate::iomon::fs::remove_file(Cat::CacheSweep, p).await;
+            }
+            let _ = self.events.send(AppEvent::RecordingUpdated { recording_id: rec_id });
+            info!(rec_id, bytes, "merged {} split part(s) -> {} (resumed after restart)", parts.len(), final_path.display());
+            finish(crate::events::TaskOutcome::Completed);
+            return;
+        }
+
         use tokio::io::{AsyncBufReadExt, BufReader};
         // One local full-file pass at a time (see io_gate) + readrate throttle.
         // The queue wait is reported as live progress so a queued merge is
@@ -707,9 +758,7 @@ impl Supervisor {
             })
             .await
         };
-        // Total duration for the progress fraction (the video part spans the
-        // whole take; the audio part matches it).
-        let total_us: Option<i64> = media_duration_secs(&parts[0]).await.map(|s| s * 1_000_000);
+        let total_us: Option<i64> = total_secs.map(|s| s * 1_000_000);
         let mut allow_readrate = true;
         let out: std::io::Result<(std::process::ExitStatus, String)> = loop {
             let readrate =
@@ -733,12 +782,22 @@ impl Supervisor {
                 .arg(&tmp)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true);
+                .stderr(Stdio::piped());
             #[cfg(windows)]
             cmd.creation_flags(CREATE_NO_WINDOW);
-            let mut child = match cmd.spawn() {
-                Ok(c) => c,
+            let (mut child, job) = match ffmpeg_job::spawn_ffmpeg_job(
+                &self.store,
+                FfmpegJobKind::HeadBackfillSplitMerge,
+                rec_id,
+                cmd,
+                &tmp,
+                &final_path,
+                "",
+                total_secs,
+            )
+            .await
+            {
+                Ok(cj) => cj,
                 Err(e) => break Err(e),
             };
             let _io_guard = crate::iomon::track_tool(
@@ -830,6 +889,9 @@ impl Supervisor {
             {
                 crate::io_gate::mark_readrate_unsupported();
                 continue; // retry once without the throttle
+            }
+            if status.success() {
+                ffmpeg_job::finish_ffmpeg_job(&self.store, FfmpegJobKind::HeadBackfillSplitMerge, rec_id, job);
             }
             break Ok((status, stderr_text));
         };
@@ -988,7 +1050,26 @@ impl Supervisor {
         let cache = cache_dir(&out_dir);
         let _ = crate::iomon::fs::create_dir_all(Cat::Promote, &cache).await;
         let tmp_full = cache.join(format!("{stem}.full.mkv"));
-        if let Err(e) = concat_mkvs(&cache, &head_p, &live_p, &tmp_full).await {
+        // Expected combined duration for the restart-survival registry's
+        // completeness check (see `ffmpeg_job::adopt_or_clear_prior_ffmpeg_job`).
+        let total_secs = head_info
+            .as_ref()
+            .and_then(|h| h.duration_secs)
+            .zip(live_info.as_ref().and_then(|l| l.duration_secs))
+            .map(|(h, l)| h + l);
+        if let Err(e) = concat_mkvs(
+            &self.store,
+            &self.shutdown,
+            FfmpegJobKind::HeadBackfillJoin,
+            rec_id,
+            total_secs,
+            &cache,
+            &head_p,
+            &live_p,
+            &tmp_full,
+        )
+        .await
+        {
             warn!(rec_id, "head concat failed: {e:#}");
             finish(crate::events::TaskOutcome::Failed(format!("{e:#}")));
             let _ = crate::iomon::fs::remove_file(Cat::Promote, &tmp_full).await;

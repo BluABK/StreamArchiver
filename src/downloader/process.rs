@@ -1023,6 +1023,8 @@ impl Supervisor {
         let final_pred = PathBuf::from(&row.final_path);
         let mut final_path = if row.remux_to_mkv {
             promote_capture(
+                &self.store,
+                &self.shutdown,
                 &DownloadPlan {
                     program: String::new(),
                     args: Vec::new(),
@@ -1366,6 +1368,8 @@ impl Supervisor {
                 .unwrap_or_else(|| src.clone())
                 .with_extension("mkv");
             promote_capture(
+                &self.store,
+                &self.shutdown,
                 &DownloadPlan {
                     program: String::new(),
                     args: Vec::new(),
@@ -1537,6 +1541,8 @@ impl Supervisor {
         // The raw `.ts`'s first PTS must be saved before the remux resets timestamps.
         persist_capture_start_pts(&self.store, rec_id, &plan.capture_path).await;
         let mut final_path = promote_capture(
+            &self.store,
+            &self.shutdown,
             &plan,
             &remux_opts_for_recording(&self.store, rec_id),
             Some((self.events.clone(), rec_id as u64)),

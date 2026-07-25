@@ -351,7 +351,21 @@ impl Supervisor {
             local_gaps.iter().map(|(s, e, p)| (*s, *e, p.as_path())).collect();
         let entries = build_gap_splice_entries(&output, base_duration, &refs);
         let tmp = cache.join(format!("{stem}.gapless.tmp.mkv"));
-        if let Err(e) = concat_mkvs_n(&cache, &entries, &tmp).await {
+        // Expected combined duration for the restart-survival registry's
+        // completeness check (see `ffmpeg_job::adopt_or_clear_prior_ffmpeg_job`).
+        let total_secs = base_duration.map(|b| (b + patch_durations.iter().sum::<f64>()) as i64);
+        if let Err(e) = concat_mkvs_n(
+            &self.store,
+            &self.shutdown,
+            FfmpegJobKind::GapSplice,
+            rec_id,
+            total_secs,
+            &cache,
+            &entries,
+            &tmp,
+        )
+        .await
+        {
             warn!(rec_id, "gap splice concat failed: {e:#}");
             let _ = self.store.set_gap_splice_state(rec_id, "verify_failed");
             finish(crate::events::TaskOutcome::Failed(format!("{e:#}")));
