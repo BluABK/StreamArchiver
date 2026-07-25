@@ -2038,17 +2038,25 @@ impl StreamArchiverApp {
                                             // A live capture is "🎥 video"; its DASH companion leg
                                             // gets a "· dash" suffix. An on-demand download is the
                                             // "📼 VOD" so the two video kinds stay distinguishable.
-                                            let t = match p.kind {
-                                                DetachedKind::Recording => {
-                                                    let base = ContentType::Video.tag();
-                                                    if p.secondary {
-                                                        format!("{base} · dash")
-                                                    } else {
-                                                        base
+                                            // A restart-survival ffmpeg post-processing job (from a
+                                            // separate registry entirely — see `ProcInfo::ffmpeg_kind`)
+                                            // takes priority over `p.kind`, which is a meaningless
+                                            // placeholder for these rows.
+                                            let t = if let Some(fk) = p.ffmpeg_kind {
+                                                fk.label().to_string()
+                                            } else {
+                                                match p.kind {
+                                                    DetachedKind::Recording => {
+                                                        let base = ContentType::Video.tag();
+                                                        if p.secondary {
+                                                            format!("{base} · dash")
+                                                        } else {
+                                                            base
+                                                        }
                                                     }
+                                                    DetachedKind::Video => ContentType::Vod.tag(),
+                                                    DetachedKind::Chat => ContentType::Chat.tag(),
                                                 }
-                                                DetachedKind::Video => ContentType::Vod.tag(),
-                                                DetachedKind::Chat => ContentType::Chat.tag(),
                                             };
                                             ui.label(t);
                                         }

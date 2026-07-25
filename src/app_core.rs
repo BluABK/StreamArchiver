@@ -53,6 +53,13 @@ pub struct ProcInfo {
     pub reattached: bool,
     pub capture_path: String,
     pub log_path: String,
+    /// `Some` only for a restart-survival ffmpeg post-processing job
+    /// (chapters/thumbnail embed, remux, gap-splice/head-backfill concat,
+    /// split-merge — see `downloader::ffmpeg_job`), sourced from the
+    /// `ffmpeg_job` registry rather than `detached_process`. When `Some`,
+    /// `kind`/`secondary`/`monitor_id` are meaningless placeholders — only
+    /// `ffmpeg_kind` should be consulted for what this row actually is.
+    pub ffmpeg_kind: Option<crate::models::FfmpegJobKind>,
 }
 
 pub struct AppCore {
@@ -719,8 +726,40 @@ impl AppCore {
                     spawn_build: r.spawn_build,
                     capture_path: r.capture_path,
                     log_path: r.log_path,
+                    ffmpeg_kind: None,
                 }
             })
+            .chain(
+                // Restart-survival ffmpeg post-processing jobs (chapters/
+                // thumbnail embed, remux, gap-splice/head-backfill concat,
+                // split-merge) — a separate registry (`ffmpeg_job`) from the
+                // capture/video/chat one above, so appended rather than
+                // merged into the same `list_detached()` mapping.
+                self.store
+                    .list_ffmpeg_jobs()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|r| crate::platform::pid_alive(r.pid))
+                    .map(|r| ProcInfo {
+                        reattached: r.spawn_build != build,
+                        kind: DetachedKind::Recording, // unused — see ffmpeg_kind's doc comment
+                        ref_id: r.ref_id,
+                        monitor_id: None,
+                        pid: r.pid,
+                        job_name: r.job_name,
+                        name: std::path::Path::new(&r.tmp_path)
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        tool: "ffmpeg".to_string(),
+                        secondary: false,
+                        started_at: r.started_at,
+                        spawn_build: r.spawn_build,
+                        capture_path: r.tmp_path,
+                        log_path: r.progress_log,
+                        ffmpeg_kind: Some(r.kind),
+                    }),
+            )
             .collect()
     }
 
@@ -738,9 +777,17 @@ impl AppCore {
     /// path so the take is finalized (remuxed, marked `stopped`). The DASH
     /// companion has no dedicated command, so it falls back to a tree kill (its
     /// own task still finalizes on the resulting process exit).
+    ///
+    /// An ffmpeg post-processing job (`ffmpeg_kind.is_some()`) has no
+    /// supervisor-coordinated "stop" path either — same fallback: a tree
+    /// kill. Its leftover `.tmp` is harmless (the next sweep/manual retry
+    /// re-runs it from scratch).
     pub fn stop_process(&self, p: &ProcInfo) {
         use crate::events::ManualCommand;
         use crate::models::DetachedKind;
+        if p.ffmpeg_kind.is_some() {
+            return self.force_kill(p.pid, &p.job_name);
+        }
         match (p.kind, p.secondary) {
             (DetachedKind::Recording, false) => {
                 self.manual(ManualCommand::Stop(p.monitor_id.unwrap_or(0)))

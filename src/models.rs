@@ -1527,6 +1527,19 @@ impl FfmpegJobKind {
             _ => None,
         }
     }
+    /// Human-readable label for the Process Manager's Type column. Plain
+    /// text, deliberately no emoji — unlike `ContentType`/`DetachedKind`,
+    /// this isn't yet verified against egui's NotoEmoji glyph subset.
+    pub fn label(self) -> &'static str {
+        match self {
+            FfmpegJobKind::ChaptersEmbed => "chapters embed",
+            FfmpegJobKind::Remux => "remux",
+            FfmpegJobKind::ThumbnailEmbed => "thumbnail embed",
+            FfmpegJobKind::GapSplice => "gap splice",
+            FfmpegJobKind::HeadBackfillJoin => "head-backfill join",
+            FfmpegJobKind::HeadBackfillSplitMerge => "split-capture merge",
+        }
+    }
 }
 
 /// A persisted record of a still-running ffmpeg `-c copy` post-processing pass

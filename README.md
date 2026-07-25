@@ -1346,8 +1346,11 @@ independent detectors feeding the same table:
   Per-process **Stop** (graceful), **Kill** (force-terminate the tree),
   **Log**, and **Folder** actions — useful for diagnosing a stuck capture
   without leaving the app. A post-processing pass re-attached after a
-  restart (see [Chapters](#chapters-)) shows up here too, tagged
-  `(re-attached)`, for the rest of its run.
+  restart (see [Chapters](#chapters-)) shows up here too (Type column names
+  the specific pass — chapters embed / remux / thumbnail embed / gap splice
+  / head-backfill join / split-capture merge — and the Status column tags
+  it **⛓ re-attached**); Stop and Kill both just force-terminate it, since
+  there's no supervisor-coordinated graceful stop for a raw ffmpeg pass.
 
   ![Process manager listing a running streamlink capture](doc/screenshots/process-manager.png)
 
