@@ -893,6 +893,44 @@ impl Store {
         Ok(row)
     }
 
+    /// This monitor's currently in-progress take, if any (at most one row
+    /// has `status='recording'` per monitor). Used by the live "play new
+    /// instance" watch-state hook — see `crate::models::stream_key`.
+    pub fn current_recording_for_monitor(
+        &self,
+        monitor_id: i64,
+    ) -> Result<Option<crate::models::Recording>> {
+        let conn = self.db();
+        let row = conn
+            .query_row(
+                &format!(
+                    "SELECT {} FROM recording WHERE monitor_id = ?1 AND status = 'recording' \
+                     ORDER BY id DESC LIMIT 1",
+                    Self::RECORDING_FULL_COLUMNS
+                ),
+                params![monitor_id],
+                Self::map_recording_row,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// All recording takes across every monitor, newest-first, capped at
+    /// `limit`. Backs the Backlog/Stream History views — checkbox filtering
+    /// happens client-side over this list (same convention as
+    /// `list_notifications`); callers increase `limit` for "Load more".
+    pub fn recordings_all(&self, limit: i64) -> Result<Vec<crate::models::Recording>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM recording ORDER BY started_at DESC LIMIT ?1",
+            Self::RECORDING_FULL_COLUMNS
+        ))?;
+        let rows = stmt
+            .query_map(params![limit], Self::map_recording_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// The newest recording's `(stream_id, went_live_at)` for a monitor — the
     /// broadcast identity a manual stop-hold is anchored to ("don't restart
     /// until a NEW stream" = a different id / newer go-live than this).

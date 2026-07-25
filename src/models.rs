@@ -2793,7 +2793,12 @@ fn same_stream(g: &StreamGroup, r: &Recording) -> bool {
     }
 }
 
-fn stream_key(r: &Recording) -> String {
+/// Stable per-broadcast key (spans reconnect takes) — `s{monitor_id}:{stream_id}`
+/// when a platform id is known, else `t{monitor_id}:{started_at}`. Also
+/// backs `StreamGroup::key`; widened to `pub(crate)` so callers with a raw
+/// `Recording` (no full grouping pass) can compute the same key, e.g. the
+/// live-in-progress-take lookup in `ui::player::spawn_play_new_instance`.
+pub(crate) fn stream_key(r: &Recording) -> String {
     match &r.stream_id {
         Some(id) => format!("s{}:{}", r.monitor_id, id),
         None => format!("t{}:{}", r.monitor_id, r.started_at),

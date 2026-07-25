@@ -660,6 +660,159 @@ impl StreamArchiverApp {
         !open
     }
 
+    /// Render every open VOD-status popup — Stream History's ℹ VOD button.
+    pub(super) fn vod_info_popup_windows(&mut self, ctx: &egui::Context) {
+        let mut closed: Vec<i64> = Vec::new();
+        for i in 0..self.vod_info_popups.len() {
+            let rid = self.vod_info_popups[i];
+            if self.vod_info_popup_window(ctx, rid) {
+                closed.push(rid);
+            }
+        }
+        if !closed.is_empty() {
+            self.vod_info_popups.retain(|r| !closed.contains(r));
+        }
+    }
+
+    /// Window showing one take's VOD/recovery/archive-download status;
+    /// returns true on close. No store read needed — the caller already had
+    /// the full `Recording` at click time (see `history::stream_history_view`).
+    #[allow(deprecated)]
+    pub(super) fn vod_info_popup_window(&mut self, ctx: &egui::Context, rid: i64) -> bool {
+        let Some((channel_name, rec)) = self.vod_info_popup_cache.get(&rid).cloned() else {
+            return true;
+        };
+        let mut open = true;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of(("vod_info_vp", rid)),
+            egui::ViewportBuilder::default()
+                .with_title(format!("{channel_name} — VOD status (take #{rid})"))
+                .with_inner_size([420.0, 280.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label(egui::RichText::new(&channel_name).strong());
+                    ui.add_space(6.0);
+                    egui::Grid::new("vod_info_grid").num_columns(2).spacing([8.0, 4.0]).show(
+                        ui,
+                        |ui| {
+                            ui.label("VOD state");
+                            ui.label(rec.vod_state.as_deref().unwrap_or("—"));
+                            ui.end_row();
+                            ui.label("VOD id");
+                            ui.label(rec.vod_id.as_deref().unwrap_or("—"));
+                            ui.end_row();
+                            ui.label("Muted seconds");
+                            ui.label(
+                                rec.vod_muted_secs
+                                    .map(fmt_duration)
+                                    .unwrap_or_else(|| "—".into()),
+                            );
+                            ui.end_row();
+                            ui.label("Views");
+                            ui.label(
+                                rec.vod_views.map(|v| v.to_string()).unwrap_or_else(|| "—".into()),
+                            );
+                            ui.end_row();
+                            ui.label("Recovery state");
+                            ui.label(rec.recovery_state.as_deref().unwrap_or("—"));
+                            ui.end_row();
+                            ui.label("Archive-download state");
+                            ui.label(rec.vod_dl_state.as_deref().unwrap_or("—"));
+                            ui.end_row();
+                        },
+                    );
+                    if let Some(p) = &rec.recovered_path {
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Recovered file:");
+                            ui.label(egui::RichText::new(p).monospace().small());
+                            if ui.small_button("📋").on_hover_text("Copy path").clicked() {
+                                ui.ctx().copy_text(p.clone());
+                            }
+                        });
+                    }
+                    if let Some(p) = &rec.vod_dl_path {
+                        ui.horizontal(|ui| {
+                            ui.label("Archived VOD:");
+                            ui.label(egui::RichText::new(p).monospace().small());
+                            if ui.small_button("📋").on_hover_text("Copy path").clicked() {
+                                ui.ctx().copy_text(p.clone());
+                            }
+                        });
+                    }
+                });
+            },
+        );
+        !open
+    }
+
+    /// Render every open remux-status popup — Stream History's ℹ Remux button.
+    pub(super) fn remux_info_popup_windows(&mut self, ctx: &egui::Context) {
+        let mut closed: Vec<i64> = Vec::new();
+        for i in 0..self.remux_info_popups.len() {
+            let rid = self.remux_info_popups[i];
+            if self.remux_info_popup_window(ctx, rid) {
+                closed.push(rid);
+            }
+        }
+        if !closed.is_empty() {
+            self.remux_info_popups.retain(|r| !closed.contains(r));
+        }
+    }
+
+    /// Window showing one take's remux/promote status; returns true on close.
+    #[allow(deprecated)]
+    pub(super) fn remux_info_popup_window(&mut self, ctx: &egui::Context, rid: i64) -> bool {
+        let Some((channel_name, rec)) = self.remux_info_popup_cache.get(&rid).cloned() else {
+            return true;
+        };
+        let mut open = true;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of(("remux_info_vp", rid)),
+            egui::ViewportBuilder::default()
+                .with_title(format!("{channel_name} — remux status (take #{rid})"))
+                .with_inner_size([460.0, 220.0]),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label(egui::RichText::new(&channel_name).strong());
+                    ui.horizontal(|ui| {
+                        ui.label("File:");
+                        ui.label(egui::RichText::new(&rec.output_path).monospace().small());
+                        if ui.small_button("📋").on_hover_text("Copy file path").clicked() {
+                            ui.ctx().copy_text(rec.output_path.clone());
+                        }
+                    });
+                    ui.add_space(6.0);
+                    if is_remux_pending(&rec) {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 140, 30),
+                            "⚠ Still a .ts capture in the cache dir — the automatic remux to \
+                             MKV failed.",
+                        );
+                        ui.label(
+                            "Right-click the take in Streams → \"🔄 Re-remux to MKV\" to retry.",
+                        );
+                    } else if is_stuck_in_cache(&rec) {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 140, 30),
+                            "⚠ Capture completed but the promote-to-output-dir move never \
+                             finished.",
+                        );
+                    } else {
+                        ui.label("Finished in its final container.");
+                    }
+                });
+            },
+        );
+        !open
+    }
+
     // (collab history helpers below; state struct + line formatter at the
     // bottom of this file)
 

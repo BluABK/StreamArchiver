@@ -1811,6 +1811,30 @@ into (or auto-record) the raid target:
     signal. Following a raid CHAIN (the target itself raiding out further)
     isn't implemented yet.
 
+### Backlog & Stream History 📥🗃
+
+Two cross-channel views over your entire recording history (every channel,
+newest 500 broadcasts by default — **⬇ Load more** raises the cap):
+
+- **📥 Backlog** — a to-do list for catching up. Every broadcast has a watch
+  state: **Unwatched** (default) → **Started** → **Skipped**/**Watched**.
+  Opening a finished take (▶/⏵, either the inline buttons or the context
+  menu) or tuning into a channel's live edge while it's actively recording
+  auto-advances Unwatched/Skipped → Started — it never downgrades a take
+  you've already marked Started or Watched. Each row also has its own four
+  toggle buttons for setting the state directly. The **Show:** chips at the
+  top filter which states are visible (defaults to hiding Watched). Watch
+  state belongs to the *broadcast*, not any one file — a reconnect that
+  produces multiple takes for the same stream shares one state.
+- **🗃 Stream History** — the same list with a checkbox filter bank instead:
+  Missing/deleted VOD, Muted VOD, VOD check pending, Recorded, Remux
+  pending, Remuxed, Chapters embedded/pending, Failed (unacked),
+  Head-backfill pending, Gap-recovered, and Stuck in cache (ticking several
+  shows rows matching *any* of them), plus a channel-name search box. Rows
+  with relevant state get **ℹ VOD** / **ℹ Remux** / **ℹ Chapters** buttons —
+  the chapters one opens the exact same detail window as the Background
+  view's chapters button.
+
 ### Channel stats & viewer history 📈
 
 Live viewer counts (and, on Kick, follower totals) are **sampled into a

@@ -112,6 +112,11 @@ struct StreamsOut {
     open_path: Option<std::path::PathBuf>,
     open_in_player: Option<StreamTarget>,
     play_new_instance_mid: Option<i64>,
+    /// `(StreamGroup::key, monitor_id)` — set alongside a finished-file play
+    /// action (open file / stream in player), never a folder-open or a live
+    /// "play new instance". Drives the Backlog auto-"started" transition;
+    /// see `crate::store::Store::stream_watch_state`.
+    mark_started_stream: Option<(String, i64)>,
     copy_text: Option<String>,
     delete_recording: Option<i64>,
     open_recording_props: Option<i64>,
@@ -1137,6 +1142,7 @@ impl StreamArchiverApp {
             open_path,
             open_in_player,
             play_new_instance_mid,
+            mark_started_stream,
             copy_text,
             delete_recording,
             open_recording_props,
@@ -1458,6 +1464,14 @@ impl StreamArchiverApp {
         }
         if let Some(p) = open_path {
             crate::platform::open_path(&p);
+        }
+        if let Some((key, mid)) = mark_started_stream {
+            // Never downgrades an already-started/watched broadcast; a
+            // never-touched key (no row yet) behaves as "unwatched".
+            let cur = self.core.store.stream_watch_state(&key).ok().flatten().map(|(s, _)| s);
+            if history::should_advance_to_started(cur.as_deref()) {
+                let _ = self.core.store.set_stream_watch_state(&key, mid, "started");
+            }
         }
         if let Some(target) = open_in_player.or_else(|| acts.stream_in_player.take()) {
             let player = self.settings.media_player_path.trim().to_string();
@@ -2617,6 +2631,7 @@ impl StreamArchiverApp {
                             .clicked()
                         {
                             out.open_in_player = grp_stream_target.clone();
+                            out.mark_started_stream = Some((g.key.clone(), mid));
                         }
                         if ui
                             .add_enabled(
@@ -2886,6 +2901,7 @@ impl StreamArchiverApp {
                         .clicked()
                     {
                         out.open_path = Some(std::path::PathBuf::from(f));
+                        out.mark_started_stream = Some((g.key.clone(), mid));
                         ui.close();
                     }
                     if ui.button("📋  Copy file path").clicked() {
@@ -2917,6 +2933,7 @@ impl StreamArchiverApp {
                     .clicked()
                 {
                     out.open_in_player = grp_stream_target.clone();
+                    out.mark_started_stream = Some((g.key.clone(), mid));
                     ui.close();
                 }
                 if ui
@@ -3171,6 +3188,7 @@ impl StreamArchiverApp {
                             {
                                 out.open_path =
                                     Some(std::path::PathBuf::from(&t.output_path));
+                                out.mark_started_stream = Some((g.key.clone(), mid));
                             }
                             let stream_target = if t.is_active() {
                                 fs_probes.target(&t.output_path)
@@ -3206,6 +3224,7 @@ impl StreamArchiverApp {
                                 .clicked()
                             {
                                 out.open_in_player = stream_target;
+                                out.mark_started_stream = Some((g.key.clone(), mid));
                             }
                             if ui
                                 .add_enabled(
@@ -3485,6 +3504,7 @@ impl StreamArchiverApp {
                 {
                     out.open_path =
                         Some(std::path::PathBuf::from(&t.output_path));
+                    out.mark_started_stream = Some((g.key.clone(), mid));
                     ui.close();
                 }
                 {
@@ -3522,6 +3542,7 @@ impl StreamArchiverApp {
                         .clicked()
                     {
                         out.open_in_player = stream_target;
+                        out.mark_started_stream = Some((g.key.clone(), mid));
                         ui.close();
                     }
                     if ui

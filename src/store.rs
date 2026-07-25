@@ -34,7 +34,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 70;
+const SCHEMA_VERSION: i64 = 71;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -143,6 +143,7 @@ mod stats_history;
 pub use stats_history::K_VH_DOWNSAMPLE_DAYS;
 mod videos;
 mod vod;
+mod watch;
 
 /// A new about-page capture to record (schema v45 `about_snapshot`). Keyed on
 /// `(channel_id, platform, account)` — one row per distinct content version;

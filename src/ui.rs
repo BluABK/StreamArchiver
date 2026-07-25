@@ -124,6 +124,12 @@ enum View {
     Posts,
     Background,
     Files,
+    /// Cross-channel recording history triaged by watch-state (unwatched /
+    /// started / skipped / watched) — see `history::backlog_view`.
+    Backlog,
+    /// Cross-channel recording history filtered by VOD/remux/chapters state
+    /// — see `history::stream_history_view`.
+    StreamHistory,
     Settings,
     /// Per-channel viewer/follower/event history ("Channel Stats" tab).
     ChannelStats,
@@ -374,6 +380,7 @@ mod files;
 mod format;
 mod grid;
 mod help;
+mod history;
 mod io_view;
 mod issues;
 mod player;
@@ -386,7 +393,7 @@ mod streams;
 mod videos;
 
 #[allow(unused_imports)]
-use {app::*, assets_helpers::*, background::*, calendar::*, chat::*, debug::*, dialogs::*, files::*, format::*, grid::*, help::*, io_view::*, issues::*, player::*, posts::*, properties::*, schedule::*, settings::*, streams::*, videos::*};
+use {app::*, assets_helpers::*, background::*, calendar::*, chat::*, debug::*, dialogs::*, files::*, format::*, grid::*, help::*, history::*, io_view::*, issues::*, player::*, posts::*, properties::*, schedule::*, settings::*, streams::*, videos::*};
 
 /// Backing state for the add/edit dialog. `name` is the channel (container) name;
 /// `url` is this *instance's* source URL (the platform is derived from it).
@@ -1283,6 +1290,33 @@ pub struct StreamArchiverApp {
     /// Lazy per-recording (channel name, file path, parsed chapter list) for
     /// the chapters detail popup, keyed by recording id; cleared on reload.
     chapters_popup_cache: HashMap<i64, (String, String, Vec<crate::chapters::Chapter>)>,
+    /// All-monitor recording history, newest-first, capped at
+    /// `history_load_limit` — shared by the Backlog and Stream History
+    /// views. Loaded lazily on first visit to either; see
+    /// `history::ensure_history_loaded`.
+    history_all: Vec<Recording>,
+    history_loaded: bool,
+    /// "Load more" cap for `recordings_all`; grows by 500 per click.
+    history_load_limit: i64,
+    /// Broadcast watch-state, keyed by `models::stream_key`/`StreamGroup::key`
+    /// — reloaded alongside `history_all`. A key absent here is `"unwatched"`
+    /// (see `history::effective_watch_state`).
+    history_watch: HashMap<String, (String, Option<i64>)>,
+    /// Stream History's checkbox filter bank (session-only, not persisted).
+    history_filters: history::HistoryFilters,
+    history_search: String,
+    /// Backlog: which watch states are currently shown (defaults to
+    /// everything but "watched" — a to-do list, not a full log).
+    backlog_show_states: HashSet<String>,
+    /// Recording id whose VOD-status popup is open (Stream History's ℹ VOD
+    /// button) + its cached (channel name, recording) — no extra store read
+    /// needed, the row already has the full `Recording`.
+    vod_info_popups: Vec<i64>,
+    vod_info_popup_cache: HashMap<i64, (String, Recording)>,
+    /// Recording id whose remux-status popup is open, same caching shape as
+    /// `vod_info_popup_cache`.
+    remux_info_popups: Vec<i64>,
+    remux_info_popup_cache: HashMap<i64, (String, Recording)>,
     /// Lazy per-monitor upcoming-schedule detail, keyed by monitor id; cleared on
     /// reload. Backs the Next stream popup.
     schedule_cache: HashMap<i64, Vec<ScheduleSegment>>,
@@ -1904,6 +1938,19 @@ impl eframe::App for StreamArchiverApp {
                              edits, DB path relocation.",
                         ),
                         (
+                            View::Backlog,
+                            "📥",
+                            "Backlog",
+                            "Streams awaiting a watch decision: unwatched, started, or skipped.",
+                        ),
+                        (
+                            View::StreamHistory,
+                            "🗃",
+                            "Stream History",
+                            "Full cross-channel recording history — VOD, remux, and \
+                             chapters status filters.",
+                        ),
+                        (
                             View::ChannelStats,
                             "📈",
                             "Channel Stats",
@@ -2296,6 +2343,8 @@ impl eframe::App for StreamArchiverApp {
             View::Posts => self.posts_view(ui),
             View::Background => self.background_view(ui),
             View::Files => self.files_view(ui),
+            View::Backlog => self.backlog_view(ui),
+            View::StreamHistory => self.stream_history_view(ui),
             View::Settings => self.settings_view(ui),
             View::ChannelStats => self.channel_stats_view(ui),
             View::Stats => self.stats_view(ui),
@@ -2342,7 +2391,8 @@ impl eframe::App for StreamArchiverApp {
                     }
                 }
                 View::Videos | View::ChannelStats | View::Stats | View::IoMonitor
-                | View::Debug | View::Posts | View::Files | View::Help => {}
+                | View::Debug | View::Posts | View::Files | View::Help
+                | View::Backlog | View::StreamHistory => {}
             }
         });
         if ctx_add_stream {
@@ -2395,6 +2445,8 @@ impl eframe::App for StreamArchiverApp {
         self.meta_popup_windows(ui.ctx());
         self.history_popup_windows(ui.ctx());
         self.chapters_popup_windows(ui.ctx());
+        self.vod_info_popup_windows(ui.ctx());
+        self.remux_info_popup_windows(ui.ctx());
         self.collab_history_window(ui.ctx());
         self.partner_sessions_window(ui.ctx());
         self.viewer_stats_window(ui.ctx());

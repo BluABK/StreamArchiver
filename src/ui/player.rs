@@ -824,6 +824,18 @@ pub(super) fn spawn_play_new_instance(
     use crate::models::{Platform, Tool};
 
     let m = &row.monitor;
+    // Watching at the live edge counts as "started" for whichever broadcast
+    // is currently recording for this monitor, if any — mirrors the
+    // finished-file playback hook in `ui/streams.rs`. A live-only tune-in
+    // with nothing actively recording has no broadcast identity yet, so
+    // there's nothing to mark (correctly a no-op).
+    if let Ok(Some(rec)) = store.current_recording_for_monitor(m.id) {
+        let key = crate::models::stream_key(&rec);
+        let cur = store.stream_watch_state(&key).ok().flatten().map(|(s, _)| s);
+        if history::should_advance_to_started(cur.as_deref()) {
+            let _ = store.set_stream_watch_state(&key, m.id, "started");
+        }
+    }
     // The settings form splits browser and profile; downloads need the
     // composed "browser:profile" form (a bare "firefox" would hit the
     // default profile, not the one holding the YouTube login).

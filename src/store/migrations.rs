@@ -1384,7 +1384,26 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 70)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 70);
+        if version < 71 {
+            // Watch-state for the Backlog/Stream History views (unwatched /
+            // started / skipped / watched). Keyed by the same stable
+            // broadcast key `models::stream_key()` computes for
+            // `StreamGroup::key` — state belongs to the broadcast, not any
+            // one take/file, so it survives reconnects without needing to
+            // pick a "representative" take. A broadcast with no row here is
+            // `'unwatched'` by convention (see `Store::stream_watch_states`)
+            // — cheaper than backfilling one row per pre-existing broadcast.
+            conn.execute_batch(
+                "CREATE TABLE stream_watch (
+                    stream_key TEXT PRIMARY KEY,
+                    monitor_id INTEGER NOT NULL,
+                    watch_state TEXT NOT NULL DEFAULT 'unwatched',
+                    watch_state_at INTEGER
+                );",
+            )?;
+            conn.pragma_update(None, "user_version", 71)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 71);
         Ok(())
     }
 }

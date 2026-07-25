@@ -559,6 +559,20 @@ impl StreamArchiverApp {
             history_popups: Vec::new(),
             chapters_popups: Vec::new(),
             chapters_popup_cache: HashMap::new(),
+            history_all: Vec::new(),
+            history_loaded: false,
+            history_load_limit: 500,
+            history_watch: HashMap::new(),
+            history_filters: crate::ui::history::HistoryFilters::default(),
+            history_search: String::new(),
+            backlog_show_states: ["unwatched", "started", "skipped"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            vod_info_popups: Vec::new(),
+            vod_info_popup_cache: HashMap::new(),
+            remux_info_popups: Vec::new(),
+            remux_info_popup_cache: HashMap::new(),
             schedule_cache: HashMap::new(),
             schedule_popups: Vec::new(),
             schedule_all: Vec::new(),
