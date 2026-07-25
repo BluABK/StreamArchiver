@@ -7,10 +7,10 @@
 //! the low-idle-footprint design: one timer, batched work, no thread/process
 //! per channel.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
@@ -43,6 +43,12 @@ pub async fn run(
     shutdown: Arc<AtomicBool>,
     jobs: crate::events::JobRegistry,
 ) {
+    // Persisted across ticks for the `self.active`/DB consistency check (see
+    // `tick`'s use of it) — monitor id -> when the mismatch was first
+    // observed, and which ids have already been warned about for the
+    // current, still-ongoing mismatch episode.
+    let mut active_desync_since: HashMap<i64, Instant> = HashMap::new();
+    let mut active_desync_warned: HashSet<i64> = HashSet::new();
     while !shutdown.load(Ordering::SeqCst) {
         // Live poll can be disabled from the Background view (a global pause of
         // detection/recording); idle-check for re-enable without polling.
@@ -50,7 +56,15 @@ pub async fn run(
             crate::app_core::sleep_cancellable(Duration::from_secs(10), &shutdown).await;
             continue;
         }
-        let wait = tick(&ctx, &events, &live_tx, &active).await;
+        let wait = tick(
+            &ctx,
+            &events,
+            &live_tx,
+            &active,
+            &mut active_desync_since,
+            &mut active_desync_warned,
+        )
+        .await;
         crate::events::mark_job(&jobs, "Live poll", wait as i64);
         crate::app_core::sleep_cancellable(Duration::from_secs(wait), &shutdown).await;
     }
@@ -61,6 +75,8 @@ async fn tick(
     events: &EventTx,
     live_tx: &mpsc::UnboundedSender<LiveSignal>,
     active: &ActiveSet,
+    active_desync_since: &mut HashMap<i64, Instant>,
+    active_desync_warned: &mut HashSet<i64>,
 ) -> u64 {
     let rows = match ctx.store.list_monitors_with_channels() {
         Ok(rows) => rows,
@@ -93,6 +109,51 @@ async fn tick(
 
     let recording: std::collections::HashSet<i64> =
         active.lock().unwrap().keys().copied().collect();
+
+    // Consistency check: a monitor whose DB row is still open (no `ended_at`)
+    // but missing from `self.active` is exactly the anomaly behind the
+    // 2026-07-24 Layna duplicate-recording incident — `self.active` silently
+    // lost track of a still-healthy recording, and (per this same tick's own
+    // `recording.contains(&m.id)` skip below) that's what let a second
+    // process start for the same monitor. A brief mismatch is routine:
+    // `self.active` frees its slot the instant the tool process exits,
+    // before the DB row's `ended_at` gets written moments later during
+    // finalize — so only warn once it's persisted past
+    // `ACTIVE_DESYNC_WARN_SECS`, well beyond normal finalize latency, and
+    // only once per continuous episode (not every tick after that).
+    const ACTIVE_DESYNC_WARN_SECS: u64 = 30;
+    match ctx.store.open_recordings_all() {
+        Ok(open) => {
+            let still_mismatched: HashSet<i64> = open
+                .iter()
+                .map(|&(mid, ..)| mid)
+                .filter(|mid| !recording.contains(mid))
+                .collect();
+            active_desync_since.retain(|mid, _| still_mismatched.contains(mid));
+            active_desync_warned.retain(|mid| still_mismatched.contains(mid));
+            for &(mid, rec_id, started_at) in &open {
+                if !still_mismatched.contains(&mid) {
+                    continue;
+                }
+                let since = *active_desync_since.entry(mid).or_insert_with(Instant::now);
+                if since.elapsed().as_secs() >= ACTIVE_DESYNC_WARN_SECS
+                    && active_desync_warned.insert(mid)
+                {
+                    warn!(
+                        monitor_id = mid,
+                        open_rec_id = rec_id,
+                        rec_started_at = started_at,
+                        desynced_for_secs = since.elapsed().as_secs(),
+                        "scheduler: DB shows an open recording for this monitor but \
+                         self.active doesn't have it — self.active has desynced from reality \
+                         (see the Layna incident, 2026-07-24); a duplicate recording may start \
+                         on the next live poll for this monitor"
+                    );
+                }
+            }
+        }
+        Err(e) => warn!("scheduler: active/DB consistency check failed to load recordings: {e:#}"),
+    }
 
     // Twitch monitors' logins + whether they currently show a collab — inputs
     // to the per-tick "Stream Together" refresh below.

@@ -593,7 +593,7 @@ impl Supervisor {
                 match self.store.get_monitor_with_channel(mid).ok().flatten() {
                     Some(mrow) => self.resume_recording(recording_from_detached(&row), mrow).await,
                     None => {
-                        self.active.lock().unwrap().remove(&mid);
+                        self.release_active(mid, "reattach_one: monitor row gone, can't resume — marking orphaned");
                         let _ = self.store.mark_recording_orphaned(row.ref_id);
                         let _ = self.store.clear_detached(row.kind, row.ref_id);
                     }
@@ -1413,7 +1413,7 @@ impl Supervisor {
         let rec_id = rec.id;
         let out_path = PathBuf::from(&rec.output_path);
         let Some(out_dir) = out_path.parent().map(Path::to_path_buf) else {
-            self.active.lock().unwrap().remove(&monitor_id);
+            self.release_active(monitor_id, "resume_recording: capture path has no parent dir");
             return;
         };
         let stem = out_path
@@ -1476,7 +1476,7 @@ impl Supervisor {
 
         let _permit = self.sem.acquire().await.expect("semaphore");
         if self.shutdown.load(Ordering::SeqCst) {
-            self.active.lock().unwrap().remove(&monitor_id);
+            self.release_active(monitor_id, "resume_recording: shutdown signaled while waiting on the semaphore");
             return;
         }
         if let Some(parent) = plan.capture_path.parent() {
@@ -1532,7 +1532,7 @@ impl Supervisor {
         // active slot NOW so polling resumes and a restarted stream can start
         // a fresh take instead of being blocked behind this remux.
         self.finalizing.lock().unwrap().insert(monitor_id, rec_id);
-        self.active.lock().unwrap().remove(&monitor_id);
+        self.release_active(monitor_id, "resume_recording: capture tool process exited, finalize begins");
         // Finalize: promote .cache → output dir, move companions, post-rename, purge.
         // The raw `.ts`'s first PTS must be saved before the remux resets timestamps.
         persist_capture_start_pts(&self.store, rec_id, &plan.capture_path).await;
@@ -1744,6 +1744,7 @@ impl Supervisor {
         let proc_start = crate::platform::process_start_time(pid).unwrap_or(0);
         if pid != 0 {
             active.lock().unwrap().insert(id, pid);
+            debug!(id, pid, "active: real pid recorded (run_process)");
         }
         // I/O-monitor registration for this tool + its descendants; the guard
         // drops (deregisters) when this function returns after child.wait().

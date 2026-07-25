@@ -1229,6 +1229,7 @@ progress_info: None,
             }
             active.insert(monitor_id, 0); // reserve; real PID set after spawn
         }
+        debug!(monitor_id, forced, "active: reserved (try_begin)");
         if bypass_backoff {
             self.backoff.lock().unwrap().remove(&monitor_id);
         }
@@ -1236,7 +1237,7 @@ progress_info: None,
         let mut row = match self.store.get_monitor_with_channel(monitor_id) {
             Ok(Some(r)) => r,
             _ => {
-                self.active.lock().unwrap().remove(&monitor_id);
+                self.release_active(monitor_id, "try_begin: monitor row vanished/query failed after reserving");
                 return false;
             }
         };
@@ -1276,7 +1277,7 @@ progress_info: None,
             let need_meta_for_trigger = !rules.is_empty() && auto_off;
             let need_meta_for_block = !block_rules.is_empty();
             if !has_meta && !forced && (need_meta_for_trigger || need_meta_for_block) {
-                self.active.lock().unwrap().remove(&monitor_id);
+                self.release_active(monitor_id, "try_begin: re-checking metadata for a trigger/blacklist rule before deciding");
                 let this = self.clone();
                 let row_bg = row.clone();
                 let stream_tags_bg = stream_tags.clone();
@@ -1352,7 +1353,7 @@ progress_info: None,
                 stream_game.as_deref(),
             )
         {
-            self.active.lock().unwrap().remove(&monitor_id);
+            self.release_active(monitor_id, "try_begin: blacklist trigger matched — vetoing automatic start");
             // Keep the UI's live state fresh exactly like the Auto-off path
             // below — the channel IS live, it's just not being recorded.
             let _ = self.store.set_monitor_check_result(monitor_id, "live", now_unix());
@@ -1411,7 +1412,7 @@ progress_info: None,
             // just written moments earlier in the same tick (every live poll
             // sends a LiveSignal here regardless of Auto) — see `manual_start`'s
             // parallel branch below, which already got this right.
-            self.active.lock().unwrap().remove(&monitor_id);
+            self.release_active(monitor_id, "try_begin: Auto-record is off for this channel/instance");
             let _ = self.store.set_monitor_check_result(monitor_id, "live", now_unix());
             let (live_since, live_since_approx) = match went_live_at {
                 Some(t) => (Some(t), approximate),
@@ -1438,7 +1439,7 @@ progress_info: None,
             && let Some((reason, true)) = &hold_block
         {
             tracing::debug!(monitor_id, "auto start suppressed (no trigger matched): {reason}");
-            self.active.lock().unwrap().remove(&monitor_id);
+            self.release_active(monitor_id, "try_begin: manual-stop hold blocks plain Auto-record");
             let _ = self.store.set_monitor_check_result(monitor_id, "live", now_unix());
             let (live_since, live_since_approx) = match went_live_at {
                 Some(t) => (Some(t), approximate),
@@ -2372,6 +2373,19 @@ progress_info: None,
         }
     }
 
+    /// Release this monitor's `self.active` reservation, logging why —
+    /// `self.active` has been observed to desync from reality (the Layna
+    /// incident, 2026-07-24: it silently lost track of a still-healthy
+    /// recording, letting a second process start for the same monitor; see
+    /// also the scheduler's own periodic consistency check in
+    /// `scheduler.rs`). Logging every release builds a paper trail so a
+    /// recurrence is diagnosable from the log instead of requiring file-size
+    /// forensics days later.
+    pub(super) fn release_active(&self, monitor_id: i64, reason: &str) {
+        let had = self.active.lock().unwrap().remove(&monitor_id);
+        debug!(monitor_id, reason, had_entry = had.is_some(), "active: released");
+    }
+
     /// Whether `path`'s mtime is within `fresh_secs` of now — an independent
     /// liveness signal for the duplicate-recording safety net in `record`,
     /// the same "trust the file, not just our own bookkeeping" technique the
@@ -2432,7 +2446,7 @@ progress_info: None,
                 "record: an earlier take for this monitor is still actively writing (fresh \
                  capture file) — refusing to start a duplicate recording"
             );
-            self.active.lock().unwrap().remove(&monitor_id);
+            self.release_active(monitor_id, "record: duplicate-recording safety net refused this start (see the warning above)");
             return;
         }
         let trigger_rule_json = trigger_rule
@@ -2465,7 +2479,7 @@ progress_info: None,
         let _permit = self.sem.acquire().await.expect("semaphore");
         // The probe + permit wait may have spanned a shutdown; don't start new work.
         if self.shutdown.load(Ordering::SeqCst) {
-            self.active.lock().unwrap().remove(&monitor_id);
+            self.release_active(monitor_id, "record: shutdown signaled while waiting on the auth probe/semaphore");
             return;
         }
         let (ytdlp_global_args, ytdlp_bins, started_at, plan) = self
@@ -2698,7 +2712,7 @@ progress_info: None,
         // restarted stream invisible for the whole wait (DougDoug, 2026-07-14:
         // his restart went uncaptured for 2+ h behind a 7 GB remux queue).
         self.finalizing.lock().unwrap().insert(monitor_id, rec_id);
-        self.active.lock().unwrap().remove(&monitor_id);
+        self.release_active(monitor_id, "record: capture tool process exited, finalize begins");
         self.ad_active.lock().unwrap().remove(&monitor_id);
         // Broadcast end ~= when the tool exited; snapshot it before remux so the
         // span (and thus lost-time) isn't inflated by remux duration.

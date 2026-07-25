@@ -477,7 +477,10 @@ already recording (or already recorded) that same span — if so, it skips
 entirely rather than re-downloading footage another take already has. A
 second, independent safety net also refuses to ever start a new recording
 for a monitor while an earlier take's own capture file is still being
-actively written to, so the two mechanisms can't produce a duplicate
+actively written to (logged as a warning if it ever fires — a scheduler
+consistency check also logs a warning on its own if a monitor's database
+row and internal bookkeeping ever disagree about whether it's recording),
+so the two mechanisms can't produce a duplicate
 recording between them even if something else briefly loses track of an
 in-progress take.
 

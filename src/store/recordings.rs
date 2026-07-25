@@ -943,6 +943,23 @@ impl Store {
         Ok(row)
     }
 
+    /// `(monitor_id, recording id, started_at)` for every currently-open take
+    /// (`ended_at IS NULL`) across all monitors — the scheduler's periodic
+    /// consistency check cross-references this against `self.active` to
+    /// catch a recurrence of the 2026-07-24 Layna incident (the in-memory
+    /// map silently losing track of a still-healthy recording) the moment it
+    /// happens, rather than only via its consequences days later.
+    pub fn open_recordings_all(&self) -> Result<Vec<(i64, i64, i64)>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT monitor_id, id, started_at FROM recording WHERE ended_at IS NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// This monitor's most recent still-open take (`ended_at IS NULL`), if
     /// any — unlike `current_recording_for_monitor` (which trusts
     /// `status='recording'` alone), this is read by the duplicate-recording
