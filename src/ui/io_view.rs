@@ -96,7 +96,7 @@ pub(super) fn io_summary_text(
     out
 }
 
-pub(super) fn fmt_bytes(bytes: i64) -> String {
+pub(crate) fn fmt_bytes(bytes: i64) -> String {
     let b = bytes.max(0) as f64;
     const KB: f64 = 1024.0;
     const MB: f64 = KB * 1024.0;

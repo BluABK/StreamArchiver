@@ -1345,12 +1345,20 @@ independent detectors feeding the same table:
   so you can spot which process is actually hammering a drive at a glance.
   Per-process **Stop** (graceful), **Kill** (force-terminate the tree),
   **Log**, and **Folder** actions — useful for diagnosing a stuck capture
-  without leaving the app. A post-processing pass re-attached after a
-  restart (see [Chapters](#chapters-)) shows up here too (Type column names
-  the specific pass — chapters embed / remux / thumbnail embed / gap splice
-  / head-backfill join / split-capture merge — and the Status column tags
-  it **⛓ re-attached**); Stop and Kill both just force-terminate it, since
-  there's no supervisor-coordinated graceful stop for a raw ffmpeg pass.
+  without leaving the app (**Log** is disabled, not a dead click into a
+  random Explorer window, for the rare row with no log file at all). A
+  post-processing pass re-attached after a restart (see
+  [Chapters](#chapters-)) shows up here too (Type column names the specific
+  pass — chapters embed / remux / thumbnail embed / gap splice /
+  head-backfill join / split-capture merge — and the Status column tags it
+  **⛓ re-attached**); Stop and Kill both just force-terminate it, since
+  there's no supervisor-coordinated graceful stop for a raw ffmpeg pass. Its
+  **Progress** column shows a coarse, size-based percentage sampled every
+  ~15s (chapters/thumbnail embed only, where the untouched source file's own
+  size is a reliable "expected total" — ffprobing the still-growing output's
+  *duration* instead would be misleading: a matroska muxer can pre-declare
+  the full final duration from the input's own metadata long before all the
+  frames are actually flushed) or just bytes written for the other kinds.
 
   ![Process manager listing a running streamlink capture](doc/screenshots/process-manager.png)
 

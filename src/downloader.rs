@@ -155,7 +155,7 @@ mod alerts;
 mod backfill;
 mod cache;
 mod chapters;
-mod ffmpeg_job;
+pub(crate) mod ffmpeg_job;
 mod finalize;
 mod gap_recover;
 mod gap_splice;

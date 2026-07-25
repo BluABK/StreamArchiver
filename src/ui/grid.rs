@@ -633,16 +633,17 @@ pub(super) const BG_RECENT_COLUMNS: [GridCol; 4] = [
 ];
 
 /// Processes window columns (no sort/filter — hide/reorder only).
-pub(super) const PROCESSES_COLUMNS: [GridCol; 9] = [
-    GridCol { id: "pid",     title: "PID",     tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
-    GridCol { id: "type",    title: "Type",    tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
-    GridCol { id: "name",    title: "Name",    tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: true },
-    GridCol { id: "tool",    title: "Tool",    tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
-    GridCol { id: "drive",   title: "Drive",   tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
-    GridCol { id: "io",      title: "I/O",     tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
-    GridCol { id: "status",  title: "Status",  tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
-    GridCol { id: "uptime",  title: "Uptime",  tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
-    GridCol { id: "actions", title: "Actions", tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
+pub(super) const PROCESSES_COLUMNS: [GridCol; 10] = [
+    GridCol { id: "pid",      title: "PID",      tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
+    GridCol { id: "type",     title: "Type",     tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
+    GridCol { id: "name",     title: "Name",     tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: true },
+    GridCol { id: "tool",     title: "Tool",     tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
+    GridCol { id: "drive",    title: "Drive",    tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
+    GridCol { id: "io",       title: "I/O",      tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
+    GridCol { id: "progress", title: "Progress", tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
+    GridCol { id: "status",   title: "Status",   tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
+    GridCol { id: "uptime",   title: "Uptime",   tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
+    GridCol { id: "actions",  title: "Actions",  tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
 ];
 
 /// Issues window columns (no sort/filter — hide/reorder only). Shared by all 5

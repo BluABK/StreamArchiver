@@ -60,6 +60,11 @@ pub struct ProcInfo {
     /// `kind`/`secondary`/`monitor_id` are meaningless placeholders — only
     /// `ffmpeg_kind` should be consulted for what this row actually is.
     pub ffmpeg_kind: Option<crate::models::FfmpegJobKind>,
+    /// Coarse progress for an ffmpeg-job row that was re-attached this
+    /// session (`downloader::ffmpeg_job::latest_progress`) — `None` if
+    /// nothing's been sampled yet (a fresh in-session spawn, or just not due
+    /// for its next sample).
+    pub progress: Option<crate::downloader::ffmpeg_job::PidProgressEntry>,
 }
 
 pub struct AppCore {
@@ -727,6 +732,7 @@ impl AppCore {
                     capture_path: r.capture_path,
                     log_path: r.log_path,
                     ffmpeg_kind: None,
+                    progress: None,
                 }
             })
             .chain(
@@ -758,6 +764,7 @@ impl AppCore {
                         capture_path: r.tmp_path,
                         log_path: r.progress_log,
                         ffmpeg_kind: Some(r.kind),
+                        progress: crate::downloader::ffmpeg_job::latest_progress(r.pid),
                     }),
             )
             .collect()

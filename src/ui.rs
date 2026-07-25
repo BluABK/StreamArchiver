@@ -381,7 +381,7 @@ mod format;
 mod grid;
 mod help;
 mod history;
-mod io_view;
+pub(crate) mod io_view;
 mod issues;
 mod player;
 mod posts;

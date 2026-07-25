@@ -2078,8 +2078,12 @@ impl StreamArchiverApp {
                                                     } else {
                                                         s.tree.clone()
                                                     };
-                                                    ui.label(format!(
-                                                        "↓{}/s ↑{}/s",
+                                                    // Fixed-width monospace so the column doesn't
+                                                    // visibly resize every refresh as the rate
+                                                    // crosses digit-count boundaries (e.g. "0 B/s"
+                                                    // vs "1.0 MB/s").
+                                                    ui.monospace(format!(
+                                                        "↓{:>8}/s ↑{:>8}/s",
                                                         fmt_bytes(s.read_bps as i64),
                                                         fmt_bytes(s.write_bps as i64),
                                                     ))
@@ -2103,6 +2107,29 @@ impl StreamArchiverApp {
                                                         "No I/O sample yet for this PID (the sampler \
                                                          ticks once a second).",
                                                     );
+                                                }
+                                            }
+                                        }
+                                        "progress" => {
+                                            // Only populated for a re-attached ffmpeg job (a fresh
+                                            // in-session spawn's progress is already visible on its
+                                            // Background-tab row instead) — a coarse, size-based
+                                            // signal sampled every ~15s (see
+                                            // `downloader::ffmpeg_job::poll_size_progress`).
+                                            match &p.progress {
+                                                Some((Some(frac), info)) => {
+                                                    ui.add(
+                                                        egui::ProgressBar::new(*frac)
+                                                            .text(format!("{:.0}%", frac * 100.0))
+                                                            .desired_width(80.0),
+                                                    )
+                                                    .on_hover_text(info);
+                                                }
+                                                Some((None, info)) => {
+                                                    ui.label(info);
+                                                }
+                                                None => {
+                                                    ui.weak("—");
                                                 }
                                             }
                                         }
@@ -2147,7 +2174,19 @@ impl StreamArchiverApp {
                                             {
                                                 act = Some(Act::Kill(i));
                                             }
-                                            if ui.small_button("Log").on_hover_text(&p.log_path).clicked() {
+                                            // Some re-attached ffmpeg jobs (chapters/thumbnail embed
+                                            // etc. from before this feature tracked a real progress
+                                            // file) have no log path at all — opening an empty path
+                                            // via `explorer.exe` just pops a "This PC" window, which
+                                            // reads as broken. Disable instead.
+                                            let has_log = !p.log_path.is_empty();
+                                            let log_btn = ui.add_enabled(has_log, egui::Button::new("Log").small());
+                                            let log_btn = if has_log {
+                                                log_btn.on_hover_text(&p.log_path)
+                                            } else {
+                                                log_btn.on_disabled_hover_text("No log file for this job")
+                                            };
+                                            if log_btn.clicked() {
                                                 act = Some(Act::RevealLog(i));
                                             }
                                             if ui.small_button("Folder").clicked() {

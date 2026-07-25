@@ -23,7 +23,7 @@
 
 use super::*;
 use super::process::line_aligned_tail_offset;
-use super::remux::media_duration_secs;
+use super::remux::packet_pts_near;
 use crate::platform::DetachedJob;
 
 /// Build the named Job Object + spawn `cmd` so the child can survive an app
@@ -87,15 +87,105 @@ pub(super) fn finish_ffmpeg_job(store: &Store, kind: FfmpegJobKind, ref_id: i64,
     let _ = store.clear_ffmpeg_job(kind, ref_id);
 }
 
-/// Whether a `.tmp` output is complete enough to treat as a finished ffmpeg
-/// pass without re-running it — pure so it's directly unit-testable. `None`
-/// for either duration means "can't verify," which must never be treated as
-/// complete.
-pub(super) fn ffmpeg_job_tmp_is_complete(total_secs: Option<i64>, tmp_duration_secs: Option<i64>) -> bool {
-    match (total_secs, tmp_duration_secs) {
-        (Some(total), Some(tmp)) if total > 0 => tmp as f64 >= total as f64 * 0.99,
-        _ => false,
+/// `(fraction 0.0..=1.0 or None, display string)` for one PID's coarsely
+/// sampled progress.
+pub(crate) type PidProgressEntry = (Option<f32>, String);
+
+/// Latest known coarse progress per PID, read by `AppCore::list_processes`
+/// for the Process Manager's Progress column — same static-registry shape
+/// as `iomon`'s child-tracking map. Only ever populated for an ADOPTED job
+/// (see `poll_size_progress`) — a fresh in-session spawn's progress is
+/// already visible via the Background tab's `BackgroundTaskProgress` events
+/// instead.
+static PID_PROGRESS: Mutex<Option<HashMap<u32, PidProgressEntry>>> = Mutex::new(None);
+
+/// Read [`PID_PROGRESS`] for `pid`, if anything has been sampled for it yet.
+pub(crate) fn latest_progress(pid: u32) -> Option<PidProgressEntry> {
+    PID_PROGRESS.lock().unwrap().as_ref()?.get(&pid).cloned()
+}
+
+fn set_progress(pid: u32, frac: Option<f32>, info: String) {
+    PID_PROGRESS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pid, (frac, info));
+}
+
+fn clear_progress(pid: u32) {
+    if let Some(m) = PID_PROGRESS.lock().unwrap().as_mut() {
+        m.remove(&pid);
     }
+}
+
+/// Coarse, always-available progress for an adopted job: periodically
+/// samples `tmp_path`'s size on disk, until `done` fires. For
+/// `ChaptersEmbed`/`ThumbnailEmbed` — the two kinds whose `final_path` is
+/// the untouched SOURCE file being copied, not the same file as `tmp_path`
+/// — also reads `final_path`'s size as the expected total and reports a
+/// real percentage; every other kind (remux writes directly to what would
+/// be its own "final_path"; concat/split-merge have no single analogous
+/// source file) just reports bytes written, with no percentage claimed.
+/// Deliberately size-based, not duration-based: ffprobing `format=duration`
+/// on a still-growing matroska output can misreport 100% from the very
+/// start (see `ffmpeg_job_tmp_looks_complete`'s doc comment) — a byte count
+/// can't lie the same way.
+async fn poll_size_progress(
+    pid: u32,
+    kind: FfmpegJobKind,
+    tmp_path: PathBuf,
+    final_path: PathBuf,
+    done: Arc<AtomicBool>,
+) {
+    let total_bytes = if matches!(kind, FfmpegJobKind::ChaptersEmbed | FfmpegJobKind::ThumbnailEmbed) {
+        crate::iomon::fs::metadata(Cat::FsProbe, &final_path).await.ok().map(|m| m.len())
+    } else {
+        None
+    };
+    loop {
+        if done.load(Ordering::SeqCst) {
+            clear_progress(pid);
+            return;
+        }
+        let cur = crate::iomon::fs::metadata(Cat::FsProbe, &tmp_path).await.ok().map(|m| m.len());
+        let frac = total_bytes
+            .zip(cur)
+            .filter(|(t, _)| *t > 0)
+            .map(|(t, c)| (c as f64 / t as f64).clamp(0.0, 1.0) as f32);
+        let info = match (cur, total_bytes) {
+            (Some(c), Some(t)) => format!("{} / {}", crate::ui::io_view::fmt_bytes(c as i64), crate::ui::io_view::fmt_bytes(t as i64)),
+            (Some(c), None) => format!("{} written", crate::ui::io_view::fmt_bytes(c as i64)),
+            (None, _) => "…".to_string(),
+        };
+        set_progress(pid, frac, info);
+        tokio::time::sleep(Duration::from_secs(15)).await;
+    }
+}
+
+/// The pure "is there even anything to check against" precondition for
+/// [`ffmpeg_job_tmp_looks_complete`] — split out so it's directly
+/// unit-testable without a real media file (the actual check needs one).
+fn ffmpeg_job_total_secs_usable(total_secs: Option<i64>) -> bool {
+    total_secs.is_some_and(|t| t > 0)
+}
+
+/// Whether a `.tmp` output is complete enough to treat as a finished ffmpeg
+/// pass without re-running it. Probes for an actual video packet landing
+/// near the expected end (`packet_pts_near`) rather than trusting ffprobe's
+/// own reported `format=duration` on the still-growing file — for a
+/// matroska-source-to-matroska-dest copy (chapters/thumbnail embed; likely
+/// concat/split-merge too), the muxer can pre-declare the FULL final
+/// duration in the output container's metadata as soon as writing starts,
+/// copied straight from the input's own already-known duration, well before
+/// all the frames are actually flushed. Confirmed live: `ffprobe
+/// format=duration` reported the complete ~93544s duration for an
+/// in-progress Nihmune chapters-embed `.tmp.mkv` that was genuinely only
+/// ~27% through (a `.ts`-sourced remux's still-growing output correctly
+/// reported no duration at all instead — MPEG-TS carries no such upfront
+/// value for the muxer to copy). A packet actually landing near the end is
+/// what proves the data is really there, immune to that trap either way.
+pub(super) async fn ffmpeg_job_tmp_looks_complete(tmp_path: &Path, total_secs: Option<i64>) -> bool {
+    if !ffmpeg_job_total_secs_usable(total_secs) {
+        return false;
+    }
+    let near = (total_secs.unwrap_or(0) as f64 - 5.0).max(0.0);
+    packet_pts_near(tmp_path, near).await.is_some()
 }
 
 /// Check the registry for a previous attempt at this exact `(kind, ref_id)`
@@ -179,16 +269,31 @@ pub(super) async fn adopt_or_clear_prior_ffmpeg_job(
                 tail_ffmpeg_progress(log, offset, total_secs, task_id, events, done, last_us).await;
             })
         });
+        // Independent of the file-based tail above (which only exists for
+        // chapters/remux, and only when `progress_log` was ever written —
+        // never true for a job re-attached from before this feature
+        // existed): a coarse, always-available progress signal for the
+        // Process Manager, sampling `tmp_path`'s own size on disk rather
+        // than trusting ffprobe's duration (see `ffmpeg_job_tmp_looks_complete`'s
+        // doc comment for why that misreports on a still-growing matroska
+        // output).
+        let size_poll = tokio::spawn(poll_size_progress(
+            row.pid,
+            kind,
+            tmp_path.to_path_buf(),
+            PathBuf::from(&row.final_path),
+            done.clone(),
+        ));
         let pid = row.pid;
         let shutdown = shutdown.clone();
         let _ = tokio::task::spawn_blocking(move || crate::platform::wait_pid(pid, &shutdown)).await;
         done.store(true, Ordering::SeqCst);
+        let _ = size_poll.await;
         if let Some(t) = tail {
             let _ = t.await;
         }
     }
-    let dur = media_duration_secs(tmp_path).await;
-    let complete = ffmpeg_job_tmp_is_complete(total_secs, dur);
+    let complete = ffmpeg_job_tmp_looks_complete(tmp_path, total_secs).await;
     // Either way, this row has served its purpose: a complete tmp is about to
     // be used as-is by the caller (no later fresh-spawn `finish_ffmpeg_job`
     // will run to clear it — that only fires on the fresh-spawn success
@@ -311,13 +416,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tmp_completeness_requires_both_durations_and_the_99_percent_cutoff() {
-        assert!(ffmpeg_job_tmp_is_complete(Some(3600), Some(3600)));
-        assert!(ffmpeg_job_tmp_is_complete(Some(3600), Some(3564)), "99% boundary");
-        assert!(!ffmpeg_job_tmp_is_complete(Some(3600), Some(3500)), "below the cutoff");
-        assert!(!ffmpeg_job_tmp_is_complete(Some(3600), None), "tmp duration unknown");
-        assert!(!ffmpeg_job_tmp_is_complete(None, Some(3600)), "expected duration unknown");
-        assert!(!ffmpeg_job_tmp_is_complete(Some(0), Some(0)), "zero expected duration never verifiable");
+    fn total_secs_usable_requires_a_positive_known_value() {
+        assert!(ffmpeg_job_total_secs_usable(Some(3600)));
+        assert!(!ffmpeg_job_total_secs_usable(Some(0)), "zero expected duration never verifiable");
+        assert!(!ffmpeg_job_total_secs_usable(Some(-1)));
+        assert!(!ffmpeg_job_total_secs_usable(None), "expected duration unknown");
     }
 
     #[test]
