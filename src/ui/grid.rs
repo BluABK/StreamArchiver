@@ -632,11 +632,14 @@ pub(super) const BG_RECENT_COLUMNS: [GridCol; 4] = [
     GridCol { id: "outcome", title: "Outcome",         tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
 ];
 
-/// Processes window columns (no sort/filter — hide/reorder only).
-pub(super) const PROCESSES_COLUMNS: [GridCol; 10] = [
+/// Processes window columns (no sort/filter — hide/reorder only). `filename`
+/// (the long capture/tmp-file name) is deliberately last and the only
+/// stretch column — every other column stays compact and visible instead of
+/// being squeezed off to the right by a long name in the middle.
+pub(super) const PROCESSES_COLUMNS: [GridCol; 11] = [
     GridCol { id: "pid",      title: "PID",      tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
     GridCol { id: "type",     title: "Type",     tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
-    GridCol { id: "name",     title: "Name",     tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: true },
+    GridCol { id: "name",     title: "Name",     tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
     GridCol { id: "tool",     title: "Tool",     tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
     GridCol { id: "drive",    title: "Drive",    tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
     GridCol { id: "io",       title: "I/O",      tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
@@ -644,6 +647,7 @@ pub(super) const PROCESSES_COLUMNS: [GridCol; 10] = [
     GridCol { id: "status",   title: "Status",   tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
     GridCol { id: "uptime",   title: "Uptime",   tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
     GridCol { id: "actions",  title: "Actions",  tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
+    GridCol { id: "filename", title: "Filename", tooltip: "", min_width: 120.0, initial: 0.0, sortable: false, stretch: true },
 ];
 
 /// Issues window columns (no sort/filter — hide/reorder only). Shared by all 5

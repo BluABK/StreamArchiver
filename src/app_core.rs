@@ -40,8 +40,13 @@ pub struct ProcInfo {
     pub monitor_id: Option<i64>,
     pub pid: u32,
     pub job_name: String,
-    /// Channel name (recording/chat) or video title.
+    /// Channel name (recording/chat/ffmpeg-job) or video title — always the
+    /// short human label, never the filename (see `filename`).
     pub name: String,
+    /// The actual file stem being worked on (e.g. the capture/`.tmp` file) —
+    /// often much longer than `name`, so it's a separate column placed last
+    /// rather than crowding out the others.
+    pub filename: String,
     /// Tool label (streamlink / yt-dlp / ffmpeg).
     pub tool: String,
     /// True for the DASH companion leg of a dual capture.
@@ -717,6 +722,10 @@ impl AppCore {
                         })
                         .unwrap_or_default(),
                 };
+                let filename = std::path::Path::new(&r.capture_path)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
                 ProcInfo {
                     reattached: r.spawn_build != build,
                     kind: r.kind,
@@ -725,6 +734,7 @@ impl AppCore {
                     pid: r.pid,
                     job_name: r.job_name,
                     name,
+                    filename,
                     tool,
                     secondary: r.secondary,
                     started_at: r.started_at,
@@ -746,17 +756,32 @@ impl AppCore {
                     .unwrap_or_default()
                     .into_iter()
                     .filter(|r| crate::platform::pid_alive(r.pid))
-                    .map(|r| ProcInfo {
+                    .map(|r| {
+                        let filename = std::path::Path::new(&r.tmp_path)
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        // Same short channel-name label the capture/video/chat
+                        // rows above show — via the recording this job is
+                        // for, rather than the long tmp-file stem (that's
+                        // `filename`, its own column now).
+                        let name = self
+                            .store
+                            .get_recording(r.ref_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|rec| self.store.get_monitor_with_channel(rec.monitor_id).ok().flatten())
+                            .map(|m| m.channel.name)
+                            .unwrap_or_else(|| filename.clone());
+                        ProcInfo {
                         reattached: r.spawn_build != build,
                         kind: DetachedKind::Recording, // unused — see ffmpeg_kind's doc comment
                         ref_id: r.ref_id,
                         monitor_id: None,
                         pid: r.pid,
                         job_name: r.job_name,
-                        name: std::path::Path::new(&r.tmp_path)
-                            .file_stem()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
+                        name,
+                        filename,
                         tool: "ffmpeg".to_string(),
                         secondary: false,
                         started_at: r.started_at,
@@ -765,6 +790,7 @@ impl AppCore {
                         log_path: r.progress_log,
                         ffmpeg_kind: Some(r.kind),
                         progress: crate::downloader::ffmpeg_job::latest_progress(r.pid),
+                        }
                     }),
             )
             .collect()

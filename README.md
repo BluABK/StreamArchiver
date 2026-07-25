@@ -1343,6 +1343,10 @@ independent detectors feeding the same table:
   a live **I/O** column (`↓ read/s ↑ write/s`, hover for lifetime totals and
   which descendant processes are rolled in — e.g. yt-dlp's own ffmpeg mux)
   so you can spot which process is actually hammering a drive at a glance.
+  Columns are resizable and remember their widths like every other table in
+  the app; **Name** is always the short channel label, with the (often much
+  longer) actual file name broken out into its own **Filename** column at
+  the far right, so a long name never crowds out the other columns.
   Per-process **Stop** (graceful), **Kill** (force-terminate the tree),
   **Log**, and **Folder** actions — useful for diagnosing a stuck capture
   without leaving the app (**Log** is disabled, not a dead click into a

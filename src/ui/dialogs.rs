@@ -2005,19 +2005,30 @@ impl StreamArchiverApp {
                     let mut tb = TableBuilder::new(ui)
                         .id_salt(GridTableId::Processes.key())
                         .striped(true)
+                        .resizable(true)
                         .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
                     if processes_reset {
                         tb.reset();
                     }
                     for &i in &processes_order {
                         let c = &PROCESSES_COLUMNS[i];
-                        let col = if c.stretch { Column::remainder().clip(true) } else { Column::auto() };
+                        // A hide/show/reorder-forced reset restores each column to
+                        // its last remembered width instead of snapping back to the
+                        // declared default — see `WidthMemory` (`grid_columns.rs`).
+                        let seed = self.processes_grid.widths.get(c.id);
+                        let col = if c.stretch {
+                            Column::remainder().at_least(c.min_width).clip(true)
+                        } else if processes_reset && let Some(w) = seed {
+                            Column::auto_with_initial_suggestion(w).at_least(c.min_width)
+                        } else {
+                            Column::auto().at_least(c.min_width)
+                        };
                         tb = tb.column(col);
                     }
                     tb.header(20.0, |mut h| {
                         for &i in &processes_order {
                             let c = &PROCESSES_COLUMNS[i];
-                            h.col(|ui| {
+                            let (rect, _) = h.col(|ui| {
                                 if grid_header_cell_plain(ui, GridTableId::Processes, c, &mut processes_entries, &PROCESSES_COLUMNS) {
                                     self.reorder_columns = Some(ReorderColumnsState {
                                         table: GridTableId::Processes,
@@ -2025,6 +2036,7 @@ impl StreamArchiverApp {
                                     });
                                 }
                             });
+                            self.processes_grid.widths.note(c.id, rect.width());
                         }
                     })
                     .body(|mut body| {
@@ -2192,6 +2204,9 @@ impl StreamArchiverApp {
                                             if ui.small_button("Folder").clicked() {
                                                 act = Some(Act::RevealDir(i));
                                             }
+                                        }
+                                        "filename" => {
+                                            ui.label(&p.filename).on_hover_text(&p.capture_path);
                                         }
                                         _ => {}
                                     });
