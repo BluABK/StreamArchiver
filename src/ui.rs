@@ -136,6 +136,10 @@ enum View {
     /// Cross-channel recording history filtered by VOD/remux/chapters state
     /// — see `history::stream_history_view`.
     StreamHistory,
+    /// Log of automatic media disposals (trash/Recycle Bin/permanent),
+    /// grouped by channel — restore or permanently delete a soft-deleted
+    /// (Trash-method) file. See `trash::trash_view`.
+    Trash,
     Settings,
     /// Per-channel viewer/follower/event history ("Channel Stats" tab).
     ChannelStats,
@@ -396,10 +400,11 @@ mod properties;
 mod schedule;
 mod settings;
 mod streams;
+mod trash;
 mod videos;
 
 #[allow(unused_imports)]
-use {app::*, assets_helpers::*, background::*, calendar::*, chat::*, debug::*, dialogs::*, files::*, format::*, grid::*, help::*, history::*, io_view::*, issues::*, player::*, posts::*, properties::*, schedule::*, settings::*, streams::*, videos::*};
+use {app::*, assets_helpers::*, background::*, calendar::*, chat::*, debug::*, dialogs::*, files::*, format::*, grid::*, help::*, history::*, io_view::*, issues::*, player::*, posts::*, properties::*, schedule::*, settings::*, streams::*, trash::*, videos::*};
 
 /// Backing state for the add/edit dialog. `name` is the channel (container) name;
 /// `url` is this *instance's* source URL (the platform is derived from it).
@@ -1009,6 +1014,9 @@ struct SettingsForm {
     disposal_method: crate::disposal::DisposalMethod,
     /// `;`-separated trash folder list, one per drive (same-drive moves only).
     disposal_trash_dirs: String,
+    /// `{drive}`-templated fallback trash root applied to any drive not
+    /// explicitly listed in `disposal_trash_dirs`. Empty = no default.
+    disposal_trash_default_root: String,
     // --- Follow raid (global defaults for the 3-level chain) ---
     /// Does raiding out from a monitored channel ever trigger a follow
     /// (play/auto-record)? Default OFF — opt-in, unlike most toggles here,
@@ -1344,6 +1352,28 @@ pub struct StreamArchiverApp {
     /// button) + its cached (channel name, recording) — no extra store read
     /// needed, the row already has the full `Recording`.
     vod_info_popups: Vec<i64>,
+    /// Every logged automatic disposal, newest first — the Trash view. Loaded
+    /// lazily on first visit and on every re-entry (`switch_view` resets
+    /// `trash_loaded`); see `trash::ensure_trash_loaded`.
+    trash_records: Vec<crate::store::DisposalRecordDisplay>,
+    trash_loaded: bool,
+    /// Case-insensitive channel-name filter for the Trash view.
+    trash_filter: String,
+    /// Set while a Restore/Permanently-delete action is running for that
+    /// record id, so its row can disable its buttons and show a spinner
+    /// instead of racing a second click against the same file.
+    trash_action_pending: HashSet<i64>,
+    /// Last Restore/Permanently-delete failure, shown as a dismissable banner
+    /// (file locked, already moved by the user, etc.).
+    trash_action_error: Option<String>,
+    /// `(record id, outcome)` for finished Restore/Permanently-delete actions
+    /// — filled from `core.rt.spawn`'d tasks (a background thread, so it
+    /// can't touch `self` directly), drained on the UI thread at the top of
+    /// `trash::trash_view` each frame.
+    trash_action_done: Arc<Mutex<Vec<TrashActionOutcome>>>,
+    /// Record id + trash path pending the "Permanently delete" confirmation
+    /// dialog (an irreversible action, unlike Restore).
+    confirm_permadelete_trash: Option<(i64, String)>,
     vod_info_popup_cache: HashMap<i64, (String, Recording)>,
     /// Recording id whose remux-status popup is open, same caching shape as
     /// `vod_info_popup_cache`.
@@ -2021,6 +2051,14 @@ impl eframe::App for StreamArchiverApp {
                              chapters status filters.",
                         ),
                         (
+                            View::Trash,
+                            "🗑",
+                            "Trash",
+                            "History of automatic media disposals — trash folder / Recycle \
+                             Bin / permanent — grouped by channel. Restore or permanently \
+                             delete a soft-deleted (trash-folder) file.",
+                        ),
+                        (
                             View::ChannelStats,
                             "📈",
                             "Channel Stats",
@@ -2416,6 +2454,7 @@ impl eframe::App for StreamArchiverApp {
             View::Files => self.files_view(ui),
             View::Backlog => self.backlog_view(ui),
             View::StreamHistory => self.stream_history_view(ui),
+            View::Trash => self.trash_view(ui),
             View::Settings => self.settings_view(ui),
             View::ChannelStats => self.channel_stats_view(ui),
             View::Stats => self.stats_view(ui),
@@ -2463,7 +2502,7 @@ impl eframe::App for StreamArchiverApp {
                 }
                 View::Videos | View::ChannelStats | View::Stats | View::IoMonitor
                 | View::Debug | View::Posts | View::Files | View::Help
-                | View::Backlog | View::StreamHistory => {}
+                | View::Backlog | View::StreamHistory | View::Trash => {}
             }
         });
         if ctx_add_stream {
@@ -2540,6 +2579,7 @@ impl eframe::App for StreamArchiverApp {
         self.scheduled_recordings_window(ui.ctx());
         self.scheduled_recording_form_window(ui.ctx());
         self.confirm_delete_scheduled_recording_window(ui.ctx());
+        self.confirm_permadelete_trash_window(ui.ctx());
         self.issues_window(ui.ctx());
         self.notifications_window(ui.ctx());
         self.warnings_window(ui.ctx());

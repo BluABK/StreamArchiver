@@ -25,8 +25,15 @@ use crate::store::Store;
 /// Global default: how automatic media deletions are executed.
 pub const K_DISPOSAL_METHOD: &str = "disposal_method";
 /// `;`-separated trash folder list, one per drive (same-drive moves only —
-/// mirrors `capture_cache_root`'s multi-root convention).
+/// mirrors `capture_cache_root`'s multi-root convention). Takes precedence
+/// over [`K_TRASH_DEFAULT_ROOT`] for any drive it explicitly lists.
 pub const K_TRASH_DIRS: &str = "disposal_trash_dirs";
+/// A `{drive}`-templated fallback trash root (e.g. `{drive}:\streams\.sa-trash`)
+/// applied to any drive [`K_TRASH_DIRS`] doesn't explicitly cover — so a new
+/// drive gets a trash folder automatically instead of falling back to the
+/// Recycle Bin until the user adds an explicit entry for it. Empty = no
+/// default (the pre-existing behavior: unlisted drives fall back to Recycle).
+pub const K_TRASH_DEFAULT_ROOT: &str = "disposal_trash_default_root";
 /// Global default: what happens to the head/live parts once `full.mkv` lands.
 pub const K_JOIN_CLEANUP: &str = "join_cleanup";
 pub const K_GAP_SPLICE_CLEANUP: &str = "gap_splice_cleanup";
@@ -324,6 +331,138 @@ pub fn effective_gap_splice_cleanup(
     effective_gap_splice_cleanup_from(global_gap_splice_cleanup(store), Some(&ch), Some(&mon))
 }
 
+// ---------- disposal history (the Trash view) ----------
+
+/// Current status of one logged disposal — drives the Trash view's actions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisposalRecordState {
+    /// A Trash-method disposal whose file still sits in its trash folder —
+    /// the only state with real actions: restore, or permanently delete.
+    SoftDeleted,
+    /// Terminal: a Recycle/Delete-method disposal, or a soft-deleted row the
+    /// user chose to permanently delete. Recycle Bin recovery is Windows'
+    /// own job, not tracked or actioned here.
+    Permanent,
+    /// A soft-deleted row the user moved back to `original_path`.
+    Restored,
+}
+
+impl DisposalRecordState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DisposalRecordState::SoftDeleted => "soft_deleted",
+            DisposalRecordState::Permanent => "permanent",
+            DisposalRecordState::Restored => "restored",
+        }
+    }
+    pub fn parse(s: &str) -> Option<DisposalRecordState> {
+        match s.trim() {
+            "soft_deleted" => Some(DisposalRecordState::SoftDeleted),
+            "permanent" => Some(DisposalRecordState::Permanent),
+            "restored" => Some(DisposalRecordState::Restored),
+            _ => None,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            DisposalRecordState::SoftDeleted => "In trash",
+            DisposalRecordState::Permanent => "Permanently deleted",
+            DisposalRecordState::Restored => "Restored",
+        }
+    }
+}
+
+/// One logged disposal event, as stored in / read from `disposal_record`
+/// (schema v73). `id` is `0` for a row not yet inserted.
+#[derive(Clone, Debug)]
+pub struct DisposalRecordRow {
+    pub id: i64,
+    /// The recording/take this file belonged to.
+    pub rec_id: i64,
+    /// Short human reason, e.g. "post-join cleanup: head" or "superseded old
+    /// head" — free text, not an enum, since the call sites' phrasing already
+    /// varies naturally and a closed set would just be re-parsed back to text
+    /// for display anyway.
+    pub reason: String,
+    pub method: DisposalMethod,
+    pub original_path: String,
+    /// Where the file currently lives when `state == SoftDeleted` (empty for
+    /// Recycle/Delete rows, which never had a trash-folder stop).
+    pub trash_path: String,
+    pub state: DisposalRecordState,
+    pub disposed_at: i64,
+    pub updated_at: i64,
+}
+
+/// Record a completed disposal for the Trash view. Best-effort: a logging
+/// failure must never undo or block the disposal itself, so callers only
+/// warn on error.
+pub fn log_disposal(store: &Store, rec_id: i64, reason: &str, original_path: &Path, disposed: &Disposed) {
+    let now = crate::models::now_unix();
+    let (method, trash_path, state) = match disposed {
+        Disposed::Trashed(p) => {
+            (DisposalMethod::Trash, p.to_string_lossy().into_owned(), DisposalRecordState::SoftDeleted)
+        }
+        Disposed::Recycled => (DisposalMethod::Recycle, String::new(), DisposalRecordState::Permanent),
+        Disposed::Deleted => (DisposalMethod::Delete, String::new(), DisposalRecordState::Permanent),
+    };
+    let row = DisposalRecordRow {
+        id: 0,
+        rec_id,
+        reason: reason.to_string(),
+        method,
+        original_path: original_path.to_string_lossy().into_owned(),
+        trash_path,
+        state,
+        disposed_at: now,
+        updated_at: now,
+    };
+    if let Err(e) = store.insert_disposal_record(&row) {
+        warn!("disposal: failed to log history row for {}: {e:#}", original_path.display());
+    }
+}
+
+/// Move a soft-deleted file back to its original path — the Trash view's
+/// "Restore" action. Only valid while the file is still sitting in the trash
+/// folder (`state == SoftDeleted`); fails closed on anything else so a
+/// double-click can't clobber an already-restored/deleted row.
+pub async fn restore_disposal_record(store: &Store, id: i64) -> anyhow::Result<()> {
+    let row = store
+        .get_disposal_record(id)?
+        .ok_or_else(|| anyhow::anyhow!("no such disposal record"))?;
+    if row.state != DisposalRecordState::SoftDeleted {
+        anyhow::bail!("not in trash (already {})", row.state.label().to_lowercase());
+    }
+    let from = Path::new(&row.trash_path);
+    let to = Path::new(&row.original_path);
+    if let Some(parent) = to.parent() {
+        crate::iomon::fs::create_dir_all(Cat::CacheSweep, parent).await?;
+    }
+    crate::iomon::fs::rename(Cat::CacheSweep, from, to).await?;
+    store.set_disposal_record_state(
+        id,
+        DisposalRecordState::Restored,
+        Some(""),
+        crate::models::now_unix(),
+    )?;
+    Ok(())
+}
+
+/// Delete a soft-deleted file for good — the Trash view's "Permanently
+/// delete" action. Only valid for a `SoftDeleted` row (same fail-closed
+/// reasoning as [`restore_disposal_record`]).
+pub async fn permanently_delete_disposal_record(store: &Store, id: i64) -> anyhow::Result<()> {
+    let row = store
+        .get_disposal_record(id)?
+        .ok_or_else(|| anyhow::anyhow!("no such disposal record"))?;
+    if row.state != DisposalRecordState::SoftDeleted {
+        anyhow::bail!("not in trash (already {})", row.state.label().to_lowercase());
+    }
+    crate::iomon::fs::remove_file(Cat::CacheSweep, Path::new(&row.trash_path)).await?;
+    store.set_disposal_record_state(id, DisposalRecordState::Permanent, None, crate::models::now_unix())?;
+    Ok(())
+}
+
 // ---------- executing a disposal ----------
 
 /// What actually happened to the file (for logs / task notes).
@@ -347,14 +486,30 @@ impl Disposed {
 
 /// The configured trash root on the same drive as `path`, if any. Cross-drive
 /// moves are never attempted (a multi-GB "delete" must not become a copy) —
-/// no same-drive root means the caller falls back to the Recycle Bin.
-pub fn pick_trash_root(dirs: &str, path: &Path) -> Option<PathBuf> {
+/// no same-drive root and no usable default template means the caller falls
+/// back to the Recycle Bin. `dirs` (explicit per-drive overrides) wins over
+/// `default_template` (the `{drive}`-templated fallback) when both apply.
+pub fn pick_trash_root(dirs: &str, default_template: &str, path: &Path) -> Option<PathBuf> {
     let drive = crate::downloader::drive_of(path)?;
-    dirs.split(';')
+    let explicit = dirs
+        .split(';')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .find(|r| crate::downloader::drive_of(r) == Some(drive))
+        .find(|r| crate::downloader::drive_of(r) == Some(drive));
+    explicit.or_else(|| expand_trash_default(default_template, drive))
+}
+
+/// Expands a `{drive}`-templated default trash root for one drive letter,
+/// e.g. `expand_trash_default("{drive}:\\streams\\.sa-trash", 'A')` →
+/// `A:\streams\.sa-trash`. Returns `None` for a blank template (the "no
+/// default configured" case).
+pub fn expand_trash_default(template: &str, drive: char) -> Option<PathBuf> {
+    let template = template.trim();
+    if template.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(template.replace("{drive}", &drive.to_string())))
 }
 
 /// A non-clobbering target name inside the trash dir: `name`, else
@@ -385,17 +540,23 @@ pub fn unique_trash_target(dir: &Path, name: &str, exists: impl Fn(&Path) -> boo
 /// disposal never escalates (a failed trash move or recycle NEVER falls
 /// through to a permanent delete; trash does fall back to the Recycle Bin when
 /// no same-drive trash root is configured, which is *less* destructive).
+/// `rec_id`/`reason` are only for the Trash view's history log (`log_disposal`)
+/// — they don't affect what gets done, only how it's later explained.
 pub async fn dispose_media(
     store: &Store,
     channel_id: i64,
     monitor_id: i64,
     path: &Path,
+    rec_id: i64,
+    reason: &str,
 ) -> std::io::Result<Disposed> {
     let method = effective_method(store, channel_id, monitor_id);
-    match method {
+    let result: std::io::Result<Disposed> = match method {
         DisposalMethod::Trash => {
             let dirs = store.get_setting(K_TRASH_DIRS).ok().flatten().unwrap_or_default();
-            let Some(root) = pick_trash_root(&dirs, path) else {
+            let default_root =
+                store.get_setting(K_TRASH_DEFAULT_ROOT).ok().flatten().unwrap_or_default();
+            let Some(root) = pick_trash_root(&dirs, &default_root, path) else {
                 warn!(
                     "disposal: no trash folder configured on {}'s drive — sending to the Recycle Bin instead",
                     path.display()
@@ -429,7 +590,11 @@ pub async fn dispose_media(
             crate::iomon::fs::remove_file(Cat::CacheSweep, path).await?;
             Ok(Disposed::Deleted)
         }
+    };
+    if let Ok(disposed) = &result {
+        log_disposal(store, rec_id, reason, path, disposed);
     }
+    result
 }
 
 async fn recycle(path: &Path) -> std::io::Result<Disposed> {
@@ -522,16 +687,47 @@ mod tests {
         use std::path::Path;
         let dirs = r"A:\streams\.sa-trash; G:\vods\.sa-trash";
         assert_eq!(
-            pick_trash_root(dirs, Path::new(r"A:\streams\Ch\x.head.mkv")),
+            pick_trash_root(dirs, "", Path::new(r"A:\streams\Ch\x.head.mkv")),
             Some(PathBuf::from(r"A:\streams\.sa-trash"))
         );
         assert_eq!(
-            pick_trash_root(dirs, Path::new(r"g:\vods\Ch\x.mkv")),
+            pick_trash_root(dirs, "", Path::new(r"g:\vods\Ch\x.mkv")),
             Some(PathBuf::from(r"G:\vods\.sa-trash"))
         );
-        // No root on that drive → None (caller falls back to the Recycle Bin).
-        assert_eq!(pick_trash_root(dirs, Path::new(r"D:\other\x.mkv")), None);
-        assert_eq!(pick_trash_root("", Path::new(r"A:\x.mkv")), None);
+        // No root on that drive and no default → None (falls back to Recycle Bin).
+        assert_eq!(pick_trash_root(dirs, "", Path::new(r"D:\other\x.mkv")), None);
+        assert_eq!(pick_trash_root("", "", Path::new(r"A:\x.mkv")), None);
+    }
+
+    #[test]
+    fn trash_root_default_template_fills_unlisted_drives() {
+        use std::path::Path;
+        let dirs = r"A:\streams\.sa-trash"; // explicit override for A: only
+        let default = r"{drive}:\streams\.sa-trash";
+        // A: keeps its explicit override, not the templated default.
+        assert_eq!(
+            pick_trash_root(dirs, default, Path::new(r"A:\streams\Ch\x.mkv")),
+            Some(PathBuf::from(r"A:\streams\.sa-trash"))
+        );
+        // D: has no explicit entry → falls through to the expanded template.
+        assert_eq!(
+            pick_trash_root(dirs, default, Path::new(r"D:\vods\Ch\x.mkv")),
+            Some(PathBuf::from(r"D:\streams\.sa-trash"))
+        );
+        // Blank default template → still None for an unlisted drive.
+        assert_eq!(pick_trash_root(dirs, "", Path::new(r"D:\vods\Ch\x.mkv")), None);
+    }
+
+    #[test]
+    fn expand_trash_default_substitutes_drive_letter_and_handles_blank() {
+        assert_eq!(
+            expand_trash_default(r"{drive}:\streams\.sa-trash", 'a'),
+            Some(PathBuf::from(r"a:\streams\.sa-trash"))
+        );
+        assert_eq!(expand_trash_default("  ", 'A'), None);
+        assert_eq!(expand_trash_default("", 'A'), None);
+        // No token at all — used verbatim (edge case, documented as such).
+        assert_eq!(expand_trash_default(r"D:\fixed-trash", 'A'), Some(PathBuf::from(r"D:\fixed-trash")));
     }
 
     #[test]

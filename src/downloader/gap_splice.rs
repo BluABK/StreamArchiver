@@ -498,8 +498,15 @@ impl Supervisor {
             if p.out_path.is_empty() || Path::new(&p.out_path) == gapless {
                 continue;
             }
-            match crate::disposal::dispose_media(&self.store, channel_id, monitor_id, Path::new(&p.out_path))
-                .await
+            match crate::disposal::dispose_media(
+                &self.store,
+                channel_id,
+                monitor_id,
+                Path::new(&p.out_path),
+                rec_id,
+                "gap splice cleanup: consumed patch",
+            )
+            .await
             {
                 Ok(_) => patches_disposed += 1,
                 Err(e) => warn!(rec_id, "gap splice cleanup: patch disposal failed: {e:#} (kept)"),
@@ -509,7 +516,16 @@ impl Supervisor {
         if cleanup != crate::disposal::GapSpliceCleanup::Both {
             return format!("{patch_note}, original kept");
         }
-        match crate::disposal::dispose_media(&self.store, channel_id, monitor_id, pre_splice).await {
+        match crate::disposal::dispose_media(
+            &self.store,
+            channel_id,
+            monitor_id,
+            pre_splice,
+            rec_id,
+            "gap splice cleanup: pre-splice original",
+        )
+        .await
+        {
             Ok(d) => format!("{patch_note}, original {}", d.describe()),
             Err(e) => {
                 warn!(rec_id, "gap splice cleanup: original disposal failed: {e:#} (kept)");

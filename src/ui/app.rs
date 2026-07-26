@@ -305,6 +305,7 @@ impl StreamArchiverApp {
             join_cleanup: crate::disposal::global_join_cleanup(&core.store),
             disposal_method: crate::disposal::global_method(&core.store),
             disposal_trash_dirs: setting_or_empty(&core, crate::disposal::K_TRASH_DIRS),
+            disposal_trash_default_root: setting_or_empty(&core, crate::disposal::K_TRASH_DEFAULT_ROOT),
             trigger_rules: crate::triggers::load_global_rules(&core.store),
             trigger_block_rules: crate::triggers::load_global_block_rules(&core.store),
             custom_tools: crate::downloader::load_custom_tools(&core.store),
@@ -583,6 +584,13 @@ impl StreamArchiverApp {
                 .collect(),
             vod_info_popups: Vec::new(),
             vod_info_popup_cache: HashMap::new(),
+            trash_records: Vec::new(),
+            trash_loaded: false,
+            trash_filter: String::new(),
+            trash_action_pending: HashSet::new(),
+            trash_action_error: None,
+            trash_action_done: Arc::new(Mutex::new(Vec::new())),
+            confirm_permadelete_trash: None,
             remux_info_popups: Vec::new(),
             remux_info_popup_cache: HashMap::new(),
             schedule_cache: HashMap::new(),
@@ -1737,6 +1745,7 @@ impl StreamArchiverApp {
             (crate::disposal::K_JOIN_CLEANUP, s.join_cleanup.as_str()),
             (crate::disposal::K_DISPOSAL_METHOD, s.disposal_method.as_str()),
             (crate::disposal::K_TRASH_DIRS, s.disposal_trash_dirs.trim()),
+            (crate::disposal::K_TRASH_DEFAULT_ROOT, s.disposal_trash_default_root.trim()),
         ];
         for (k, v) in pairs {
             if let Err(e) = self.core.store.set_setting(k, v) {
@@ -1853,6 +1862,7 @@ impl StreamArchiverApp {
                 self.stats_snapshot = None; // force reload on open
                 self.stats_history = None;
             }
+            View::Trash => self.trash_loaded = false, // force reload on open
             _ => {}
         }
     }

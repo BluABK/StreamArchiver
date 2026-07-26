@@ -511,17 +511,30 @@ chain (channel Properties / edit instance):
   setup. Note that drives without a bin (some removable media) delete
   permanently instead; that's a Windows shell behavior.
 - **Trash folder**: an instant same-drive rename into a folder you configure
-  and prune yourself. Like the capture cache, the **Trash folder(s)** setting
-  is a `;`-separated list with one folder per drive — a trashed file always
-  moves to the folder on *its own* drive (a multi-GB "delete" must never
-  become a cross-drive copy), and files on a drive with no folder listed fall
-  back to the Recycle Bin. Name collisions get a ` (1)` suffix.
+  and prune yourself — never a cross-drive copy of a multi-GB file. Two
+  settings work together: a **Default trash folder** template written once
+  with a `{drive}` token (e.g. `{drive}:\streams\.sa-trash`) that expands to
+  every drive automatically, and **Trash folder overrides** — like the
+  capture cache, a `;`-separated list with one explicit folder per drive,
+  which wins over the template for any drive it names. A drive covered by
+  neither falls back to the Recycle Bin. Name collisions get a ` (1)` suffix.
 - **Delete permanently**: gone immediately.
 
 A failed move or recycle always leaves the file in place (and logs why) — a
 disposal failure is never escalated to a more destructive method. Transient
 working files (playlists, cache leftovers, `.state`) are not media and are
 always plainly deleted regardless of these settings.
+
+**🗑 Trash view.** Every automatic disposal is logged here — reason (post-join
+cleanup, gap-splice cleanup, superseded old head, VOD replace), method, when,
+and its current path — grouped by channel like the Streams grid, with a
+channel-name filter. A **Trash folder** disposal is "soft-deleted": the file
+still exists in its trash folder, so its row gets **↩ Restore** (moves it back
+to where it lived) and **🗑 Permanently delete** (asks for confirmation, then
+removes it for good). Recycle Bin and permanent-delete rows are history only —
+Windows owns Recycle Bin recovery, and a permanent delete has nothing left to
+act on. Every row also has **▶ Open file** / **📂 Open folder**, enabled only
+while the shown path still exists on disk.
 
 **Manual "🧩 Backfill head."** Right-click an **instance** (targets its latest
 recording) or a specific **take** for a manual, on-demand head backfill —

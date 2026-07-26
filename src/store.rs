@@ -35,7 +35,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 72;
+const SCHEMA_VERSION: i64 = 73;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -135,6 +135,8 @@ pub use alerts::{
 };
 mod collab;
 pub use collab::PartnerSessionRow;
+mod disposal_records;
+pub use disposal_records::DisposalRecordDisplay;
 mod ffmpeg_jobs;
 mod migrations;
 mod monitors;

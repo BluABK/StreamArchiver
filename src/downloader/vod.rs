@@ -708,6 +708,8 @@ impl Supervisor {
                             channel_id,
                             monitor_id,
                             &backup,
+                            rec_id,
+                            "VOD replace: displaced live capture",
                         )
                         .await
                         {

@@ -496,8 +496,15 @@ impl Supervisor {
             let removed = if !crate::iomon::fs::is_file_sync(Cat::CacheSweep, &path) {
                 Some("already gone")
             } else {
-                match crate::disposal::dispose_media(&self.store, channel_id, monitor_id, &path)
-                    .await
+                match crate::disposal::dispose_media(
+                    &self.store,
+                    channel_id,
+                    monitor_id,
+                    &path,
+                    old_id,
+                    "superseded old head",
+                )
+                .await
                 {
                     Ok(d) => Some(d.describe()),
                     Err(e) => {
@@ -1173,7 +1180,15 @@ impl Supervisor {
         // Head first — only a successful disposal clears the DB pointer (the
         // 🧩 head badge follows `backfill_path`).
         let head_note =
-            match crate::disposal::dispose_media(&self.store, channel_id, monitor_id, head_p).await
+            match crate::disposal::dispose_media(
+                &self.store,
+                channel_id,
+                monitor_id,
+                head_p,
+                rec_id,
+                "post-join cleanup: head",
+            )
+            .await
             {
                 Ok(d) => {
                     let _ = self.store.clear_recording_backfill_path(rec_id);
@@ -1194,8 +1209,15 @@ impl Supervisor {
         let full_s = full.to_string_lossy().into_owned();
         let live_note = match self.store.update_recording_output_path(rec_id, &full_s) {
             Ok(()) => {
-                match crate::disposal::dispose_media(&self.store, channel_id, monitor_id, live_p)
-                    .await
+                match crate::disposal::dispose_media(
+                    &self.store,
+                    channel_id,
+                    monitor_id,
+                    live_p,
+                    rec_id,
+                    "post-join cleanup: live capture",
+                )
+                .await
                 {
                     Ok(d) => format!("capture {}", d.describe()),
                     Err(e) => {

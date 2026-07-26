@@ -2742,7 +2742,25 @@ impl StreamArchiverApp {
                     );
             });
             ui.horizontal(|ui| {
-                ui.label("Trash folder(s):");
+                ui.label("Default trash folder:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.settings.disposal_trash_default_root)
+                        .hint_text(r"{drive}:\streams\.sa-trash")
+                        .desired_width(240.0),
+                )
+                .on_hover_text(
+                    "Fallback trash root applied to ANY drive not explicitly listed \
+                     below — write it once with a '{drive}' token (e.g. \
+                     '{drive}:\\streams\\.sa-trash') and every drive automatically \
+                     gets its own trash folder in that shape, without moving files \
+                     across disks. Leave blank to require an explicit folder per \
+                     drive (the old behavior: unlisted drives fall back to the \
+                     Recycle Bin). An explicit override below always wins for its \
+                     drive.",
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Trash folder overrides:");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.settings.disposal_trash_dirs)
                         .hint_text(r"A:\streams\.sa-trash; G:\vods\.sa-trash")
@@ -2752,8 +2770,9 @@ impl StreamArchiverApp {
                     "Only used when \"Trash folder\" is the (effective) method. One \
                      folder per drive, ';'-separated — a trashed file is renamed into \
                      the folder on ITS OWN drive (a multi-GB \"delete\" must never \
-                     become a cross-drive copy). Files on a drive with no folder \
-                     listed here fall back to the Recycle Bin. Name collisions get a \
+                     become a cross-drive copy). Takes precedence over the default \
+                     template above for any drive listed here; drives listed in \
+                     neither fall back to the Recycle Bin. Name collisions get a \
                      \" (1)\" suffix.",
                 );
                 if ui

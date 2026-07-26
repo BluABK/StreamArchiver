@@ -1434,7 +1434,32 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 72)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 72);
+        if version < 73 {
+            // History of automatic media disposals (trash/Recycle Bin/permanent)
+            // for the Trash view — every `disposal::dispose_media` call inserts
+            // one row here. `state` distinguishes a Trash-method disposal still
+            // sitting in its trash folder ("soft_deleted", user-actionable:
+            // restore or permanently delete) from one that's already terminal
+            // ("permanent" — Recycle/Delete method, or a soft-deleted row the
+            // user permanently deleted) or reversed ("restored"). Recycle Bin
+            // rows are informational only — Windows owns that recovery path.
+            conn.execute_batch(
+                "CREATE TABLE disposal_record (
+                    id            INTEGER PRIMARY KEY,
+                    rec_id        INTEGER NOT NULL,
+                    reason        TEXT NOT NULL,
+                    method        TEXT NOT NULL,
+                    original_path TEXT NOT NULL,
+                    trash_path    TEXT NOT NULL DEFAULT '',
+                    state         TEXT NOT NULL,
+                    disposed_at   INTEGER NOT NULL,
+                    updated_at    INTEGER NOT NULL
+                );
+                CREATE INDEX idx_disposal_record_rec ON disposal_record(rec_id);",
+            )?;
+            conn.pragma_update(None, "user_version", 73)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 73);
         Ok(())
     }
 }
