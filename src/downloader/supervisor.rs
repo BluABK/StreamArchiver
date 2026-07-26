@@ -2781,6 +2781,7 @@ progress_info: None,
             sabr_stall,
             went_live_at,
             approximate,
+            ended,
         );
 
         // A manual stop already installed its own 120s cooldown (see `manual_stop`);
@@ -3522,6 +3523,12 @@ progress_info: None,
 
     /// Classify the outcome, finish the recording row, emit events, and kick
     /// off the post-take follow-ups (VOD check/archive, backfill concat).
+    /// `ended` is the capture-tool-exit timestamp snapshotted by the caller
+    /// *before* promoting/remuxing — never re-derive it with a fresh
+    /// `now_unix()` here, or `ended_at` (and everything computed from it:
+    /// the Streams grid's Duration column, the recording Properties dialog,
+    /// head-backfill's missed-secs estimate) balloons by however long this
+    /// take's remux happened to wait in the disk-gate queue.
     #[allow(clippy::too_many_arguments)]
     fn finalize_recording(
         &self,
@@ -3537,6 +3544,7 @@ progress_info: None,
         sabr_stall: bool,
         went_live_at: Option<i64>,
         approximate: bool,
+        ended: i64,
     ) {
         // A 0-byte capture isn't always a failure: a livestream that had already
         // ended (or hadn't started, or exposed no live video formats) leaves
@@ -3568,7 +3576,7 @@ progress_info: None,
         };
         let _ = self.store.finish_recording(
             rec_id,
-            now_unix(),
+            ended,
             bytes,
             outcome.exit_code,
             status,
@@ -3695,6 +3703,9 @@ progress_info: None,
             )
             .await
         };
+        // Broadcast end ~= when the tool exited; snapshot it before remux so the
+        // span (and thus ended_at) isn't inflated by remux duration.
+        let ended = now_unix();
 
         // Promote the companion out of .cache\ (remux .ts→.mkv) on success; a failed
         // one stays in .cache\ for the sweep.
@@ -3732,7 +3743,7 @@ progress_info: None,
         };
         let _ = self.store.finish_recording(
             rec_id,
-            now_unix(),
+            ended,
             bytes,
             outcome.exit_code,
             status,

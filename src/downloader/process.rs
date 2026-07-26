@@ -599,7 +599,11 @@ impl Supervisor {
                     }
                 }
             }
-            ReAction::Finalize => self.finalize_reattached(&row, &active).await,
+            // Already dead when startup reconcile found it — there's no true
+            // exit moment to recover, so "now" (captured as early as possible,
+            // before finalize_reattached's own queue-prone promote) is the
+            // best available approximation.
+            ReAction::Finalize => self.finalize_reattached(&row, &active, now_unix()).await,
             ReAction::Adopt => self.adopt_detached(row, active).await,
         }
     }
@@ -822,6 +826,10 @@ impl Supervisor {
         );
 
         let exited = self.wait_for_exit(row.pid).await;
+        // Broadcast end ~= when the tool exited — snapshot it now, before the
+        // watcher/tail drain below and finalize_reattached's own queue-prone
+        // promote, so ended_at isn't inflated by either.
+        let ended = now_unix();
         done.store(true, Ordering::SeqCst);
         stall.abort();
         watcher_done.store(true, Ordering::SeqCst);
@@ -841,7 +849,7 @@ impl Supervisor {
             active.lock().unwrap().remove(&key);
             return;
         }
-        self.finalize_reattached(&row, &active).await;
+        self.finalize_reattached(&row, &active, ended).await;
     }
 
     /// Block until `pid` truly exits, returning false if shutdown was requested
@@ -1008,7 +1016,14 @@ impl Supervisor {
     /// the capture into the output dir, do the same post-capture `{games}`/`{title}`/
     /// `{resolution}` rename + lost-time accounting the in-session path does, finalize
     /// the recording/video row, drop the registry entry, and free the active-map slot.
-    async fn finalize_reattached(&self, row: &DetachedRow, active: &ActiveSet) {
+    /// `ended` is the caller's best-known capture-exit timestamp — snapshotted
+    /// right after `wait_for_exit` when this session actually watched the
+    /// process die, or "now" (as early as possible, before the queue-prone
+    /// promote below) when reconcile found it already dead at startup. Either
+    /// way, never re-derive it with a fresh `now_unix()` after promoting, or
+    /// `ended_at` balloons by however long this take's remux waited at the
+    /// disk gate — same fix as the in-session finalize path.
+    async fn finalize_reattached(&self, row: &DetachedRow, active: &ActiveSet, ended: i64) {
         // The promote below can queue at the disk gate for hours — mark the
         // monitor "finalizing" for the UI and FREE ITS ACTIVE SLOT now (an
         // adopted capture held it through `wait_for_exit`), so polling resumes
@@ -1146,7 +1161,6 @@ impl Supervisor {
             }
         }
 
-        let ended = now_unix();
         // Lost-time: zero it only when the capture spans the whole broadcast (same
         // rule as the in-session finalize); else leave it for the provisional estimate.
         if row.kind == DetachedKind::Recording {
@@ -1646,7 +1660,7 @@ impl Supervisor {
         };
         let _ = self.store.finish_recording(
             rec_id,
-            now_unix(),
+            ended,
             bytes,
             outcome.exit_code,
             status,
