@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use tray_icon::TrayIcon;
 
 use crate::app_core::AppCore;
@@ -1220,6 +1220,15 @@ pub struct StreamArchiverApp {
     /// UI-freeze watchdog heartbeat: stamped each frame so a background thread can
     /// detect (and surface as a native dialog) a hung UI thread. See [`crate::watchdog`].
     heartbeat: crate::watchdog::Heartbeat,
+    /// One-shot startup self-heal (see `logic()`): eframe/winit can capture
+    /// a MINIMIZED window's degenerate geometry (0×0 inner size — Windows
+    /// reports a minimized window's client area as zero) if the app was last
+    /// closed while minimized, then restores that on the next launch, only
+    /// floored to a generic 64×64 (not this app's real usable minimum) —
+    /// producing exactly the "spawns as a sliver, resizing snaps it back"
+    /// bug this flag guards against. `false` until the fix has been checked
+    /// (and applied, if needed) once.
+    startup_window_size_checked: bool,
 
     view: View,
     /// Help/About view state, built lazily on first open (parses the embedded
@@ -1891,6 +1900,32 @@ impl eframe::App for StreamArchiverApp {
         let minimized = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
         self.heartbeat.set_active(!minimized);
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
+
+        // ── One-shot startup window-size self-heal ──────────────────────
+        // A previous session that closed while minimized can leave a
+        // degenerate (0×0) window size persisted (Windows reports a
+        // minimized window's client area as zero) — eframe/winit only
+        // floors that to a generic 64×64 on restore, not this app's real
+        // usable minimum (`with_min_inner_size` in main.rs), so the window
+        // opens as an unusable sliver until the user manually drags an
+        // edge. Nothing this far below the real minimum can be a legitimate
+        // interactive resize (the OS enforces that minimum while dragging),
+        // so it's safe to correct unconditionally, once, as soon as the
+        // backend reports real geometry (which can be `None` for the first
+        // frame or two).
+        if !self.startup_window_size_checked
+            && let Some(rect) = ctx.input(|i| i.viewport().inner_rect)
+        {
+            self.startup_window_size_checked = true;
+            if rect.width() < 300.0 || rect.height() < 200.0 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(960.0, 600.0)));
+                info!(
+                    width = rect.width(),
+                    height = rect.height(),
+                    "startup: restored window size was degenerate — reset to default"
+                );
+            }
+        }
 
         self.pump_messages(ctx);
         // Install filesystem-probe results the background worker finished

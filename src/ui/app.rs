@@ -521,6 +521,7 @@ impl StreamArchiverApp {
             inspector: crate::inspector::InspectorState::default(),
             quitting: false,
             heartbeat,
+            startup_window_size_checked: false,
             view: View::Streams,
             help: None,
             topbar: TopBarLayout::default(),
