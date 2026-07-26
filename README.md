@@ -2151,9 +2151,10 @@ YouTube sources as the Next stream column) in a calendar, with **Month**, **Week
   every launch). Each row carries the channel's **calendar color** as a
   swatch + tinted name, so the sidebar doubles as the legend for the event
   blocks.
-- **Channel avatars** appear on the sidebar list, every all-day bar, and every
-  timed event block (space permitting) — so a channel is identifiable by its
-  picture at a glance, not just its name or color.
+- **Channel avatars** appear on the sidebar list, every all-day bar, every
+  timed event block (space permitting), Month-view chips, and Agenda-view
+  rows — so a channel is identifiable by its picture at a glance, not just
+  its name or color.
 - **Channel colors** are the *same* ones the Streams list uses: a manually
   chosen custom color wins, else the streamer's own **Twitch name color**
   (darkened just enough that white block text stays readable), else the

@@ -730,7 +730,7 @@ impl StreamArchiverApp {
             match mode {
                 ScheduleMode::Month => {
                     self.schedule_month_grid(
-                        ui, anchor, today, &by_day, &collide, &ptex, &mut open_day, &signals,
+                        ui, anchor, today, &by_day, &collide, &ptex, &avatars, &mut open_day, &signals,
                     )
                 }
                 ScheduleMode::Week => {
@@ -745,7 +745,7 @@ impl StreamArchiverApp {
                     )
                 }
                 ScheduleMode::Agenda => {
-                    self.schedule_agenda_view(ui, anchor, &by_day, &collide, &ptex, &mut open_day, &signals)
+                    self.schedule_agenda_view(ui, anchor, &by_day, &collide, &ptex, &avatars, &mut open_day, &signals)
                 }
             }
         });
@@ -1540,12 +1540,14 @@ impl StreamArchiverApp {
     /// One compact calendar chip (colored stripe · ⚠ · platform icon · time range · channel)
     /// with a hover detail and the copy context menu. Returns the click response so
     /// the caller can react (e.g. open the day popup). Shared by month + week views.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn schedule_chip(
         &self,
         ui: &mut egui::Ui,
         i: usize,
         colliding: bool,
         ptex: &PlatformTextures,
+        avatars: &HashMap<i64, egui::TextureHandle>,
         signals: &HashMap<i64, EventSignals>,
     ) -> egui::Response {
         let s = &self.schedule_all[i];
@@ -1586,6 +1588,13 @@ impl StreamArchiverApp {
                     ui.colored_label(HL_COLLISION, "⚠");
                 }
                 platform_icon(ui, ptex, s.platform());
+                if let Some(tex) = avatars.get(&s.channel_id) {
+                    ui.add(
+                        egui::Image::from_texture(tex)
+                            .fit_to_exact_size(egui::vec2(12.0, 12.0))
+                            .corner_radius(egui::CornerRadius::same(2)),
+                    );
+                }
                 schedule_source_badge(ui, &s.source);
                 if !s.collab.is_empty() {
                     ui.add(egui::Label::new(egui::RichText::new("🤝").small()))
@@ -1622,6 +1631,7 @@ impl StreamArchiverApp {
         by_day: &HashMap<chrono::NaiveDate, Vec<usize>>,
         collide: &HashSet<usize>,
         ptex: &PlatformTextures,
+        avatars: &HashMap<i64, egui::TextureHandle>,
         open_day: &mut Option<chrono::NaiveDate>,
         signals: &HashMap<i64, EventSignals>,
     ) {
@@ -1698,6 +1708,7 @@ impl StreamArchiverApp {
                                         by_day.get(&day),
                                         collide,
                                         ptex,
+                                        avatars,
                                         open_day,
                                         sched_rec_by_day.get(&day),
                                         signals,
@@ -2058,6 +2069,7 @@ impl StreamArchiverApp {
         entries: Option<&Vec<usize>>,
         collide: &HashSet<usize>,
         ptex: &PlatformTextures,
+        avatars: &HashMap<i64, egui::TextureHandle>,
         open_day: &mut Option<chrono::NaiveDate>,
         sched_recs: Option<&Vec<String>>,
         signals: &HashMap<i64, EventSignals>,
@@ -2104,7 +2116,7 @@ impl StreamArchiverApp {
                 let shown = entries.len().min(max_chips);
                 for &i in &entries[..shown] {
                     let colliding = collide.contains(&i);
-                    if self.schedule_chip(ui, i, colliding, ptex, signals).clicked() {
+                    if self.schedule_chip(ui, i, colliding, ptex, avatars, signals).clicked() {
                         *open_day = Some(day);
                     }
                 }
@@ -2135,6 +2147,7 @@ impl StreamArchiverApp {
         by_day: &HashMap<chrono::NaiveDate, Vec<usize>>,
         collide: &HashSet<usize>,
         ptex: &PlatformTextures,
+        avatars: &HashMap<i64, egui::TextureHandle>,
         open_day: &mut Option<chrono::NaiveDate>,
         signals: &HashMap<i64, EventSignals>,
     ) {
@@ -2215,8 +2228,15 @@ impl StreamArchiverApp {
                                     .size(12.0 * zoom),
                             ));
 
-                            // Platform icon + source badge
+                            // Platform icon + avatar + source badge
                             platform_icon(ui, ptex, s.platform());
+                            if let Some(tex) = avatars.get(&s.channel_id) {
+                                ui.add(
+                                    egui::Image::from_texture(tex)
+                                        .fit_to_exact_size(egui::vec2(14.0, 14.0))
+                                        .corner_radius(egui::CornerRadius::same(2)),
+                                );
+                            }
                             schedule_source_badge(ui, &s.source);
 
                             // Channel name (bold or weak if hidden)
