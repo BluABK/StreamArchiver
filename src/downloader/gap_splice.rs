@@ -102,8 +102,11 @@ impl Supervisor {
     /// "actually" fired: (a) `gap_recover_job` after a range settles, (b)
     /// `finalize_recording` right after `status` flips to `completed`
     /// (covers ranges that already went terminal while still recording —
-    /// no later range-transition event would otherwise catch it), (c) the
-    /// startup sweep for anything missed across a restart.
+    /// no later range-transition event would otherwise catch it). Each of
+    /// these is a single recording reacting to its own event, so the
+    /// fire-and-forget `tokio::spawn` below is safe — NOT called by the
+    /// startup sweep, which processes its (potentially library-wide)
+    /// candidate list sequentially instead; see `sweep_pending_gap_splices`.
     pub(super) fn maybe_spawn_gap_splice(&self, rec_id: i64) {
         if !gap_splice_enabled(&self.store) {
             // Gap-splice itself never runs, so its own completion can never
@@ -130,11 +133,31 @@ impl Supervisor {
     }
 
     /// Startup sweep: anything left over after a restart interrupted a
-    /// splice before it could run (`maybe_spawn_gap_splice` re-checks every
-    /// precondition itself; this just supplies candidates).
+    /// splice before it could run. Deliberately does NOT call
+    /// `maybe_spawn_gap_splice` (fine for the single-event live triggers it
+    /// also serves, since one recording completing is never a flood risk) —
+    /// this sweep's candidate list can be the entire historical library on a
+    /// first run, same as `sweep_pending_chapters`'s, so every candidate is
+    /// processed sequentially (awaited in turn) instead of fanned out. This
+    /// matters most for the gap-splice-DISABLED case, which falls straight
+    /// through to a chapters-embed pass per candidate: on 2026-07-26, fanning
+    /// that shortcut out unthrottled fired ~18 concurrent chapters-embed
+    /// ffmpeg passes at once and overloaded the recordings enclosure. A
+    /// candidate already being handled by a live trigger (`gap_splice_jobs`
+    /// guard fails to insert) is skipped — that call's own completion still
+    /// chains into chapters on its own.
     pub async fn sweep_pending_gap_splices(&self) {
         for rec_id in self.store.recordings_needing_gap_splice_check().unwrap_or_default() {
-            self.maybe_spawn_gap_splice(rec_id);
+            if !gap_splice_enabled(&self.store) {
+                self.spawn_chapters_sequential(rec_id, Vec::new()).await;
+                continue;
+            }
+            if !self.gap_splice_jobs.lock().unwrap().insert(rec_id) {
+                continue;
+            }
+            let gap_meta = self.gap_splice_job(rec_id).await;
+            self.gap_splice_jobs.lock().unwrap().remove(&rec_id);
+            self.spawn_chapters_sequential(rec_id, gap_meta).await;
         }
     }
 

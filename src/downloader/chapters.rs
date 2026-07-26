@@ -49,18 +49,39 @@ impl Supervisor {
         });
     }
 
+    /// Same dedup guard and job as [`Self::maybe_spawn_chapters`], but
+    /// awaited in place instead of fanned out via `tokio::spawn`. For a
+    /// caller that's itself looping over many candidates (a sweep) — so one
+    /// candidate's embed fully finishes (or no-ops) before the next starts,
+    /// instead of every candidate's ffmpeg pass racing onto the disk-gate at
+    /// once. See `sweep_pending_chapters`'s "fresh" list and
+    /// `gap_splice::sweep_pending_gap_splices`'s gap-splice-disabled
+    /// shortcut — the latter used to call `maybe_spawn_chapters` directly,
+    /// which is exactly what turned an ordinary startup sweep into ~18
+    /// concurrent chapters-embed passes and overloaded the recordings
+    /// enclosure on 2026-07-26.
+    pub(super) async fn spawn_chapters_sequential(&self, rec_id: i64, gap_meta: Vec<SplicedGap>) {
+        if !self.chapter_jobs.lock().unwrap().insert(rec_id) {
+            return;
+        }
+        self.chapters_job(rec_id, gap_meta).await;
+        self.chapter_jobs.lock().unwrap().remove(&rec_id);
+    }
+
     /// Startup sweep: anything left over after a restart interrupted
     /// chapter embedding before it could run, PLUS — the first time this
     /// feature runs against an existing library — every pre-existing
     /// recording, since the new `chapters_state` column defaults to `''`
-    /// for all of them at once. Unlike `sweep_pending_gap_splices` (whose
-    /// candidate list is naturally tiny — it requires an actual `done` gap
-    /// range, rare in practice), this sweep's candidate list can be the
+    /// for all of them at once. This sweep's candidate list can be the
     /// entire historical library, so a *genuinely new* embed pass is awaited
     /// in turn instead of fanning out via `maybe_spawn_chapters` — the same
     /// "sequential, not fan-out" reasoning `cmd_reembed_chapters_all`
     /// already applies, to avoid flooding the shared disk-gate with a pile
     /// of concurrent full-file ffmpeg passes on top of live captures.
+    /// `sweep_pending_gap_splices`'s own candidate list can be just as large
+    /// when gap-splice is disabled (every candidate falls straight through
+    /// to a chapters pass there too) — it awaits each one via
+    /// `spawn_chapters_sequential` for the exact same reason.
     ///
     /// A candidate whose ffmpeg job already survived a restart (`FfmpegJobKind::
     /// ChaptersEmbed` row still alive) is fanned out instead: re-attaching adds
@@ -99,11 +120,7 @@ impl Supervisor {
             });
         }
         for rec_id in fresh {
-            if !self.chapter_jobs.lock().unwrap().insert(rec_id) {
-                continue;
-            }
-            self.chapters_job(rec_id, Vec::new()).await;
-            self.chapter_jobs.lock().unwrap().remove(&rec_id);
+            self.spawn_chapters_sequential(rec_id, Vec::new()).await;
         }
     }
 
