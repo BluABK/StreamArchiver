@@ -1081,6 +1081,18 @@ pub struct CollabPartner {
     /// rather than the Shared Chat session (heuristic, shown as `@name`).
     #[serde(default)]
     pub from_title: bool,
+    /// Whether Twitch currently shows this login as live (`Helix::Get
+    /// Streams`, refreshed alongside the rest of this partner's data every
+    /// collab poll) — `None` means never checked (e.g. the login is empty,
+    /// or the check itself failed this cycle), NOT confirmed offline. Being a
+    /// Shared Chat / collab-group partner only means their chat is merged
+    /// in, not that their own broadcast is still running — a member can stay
+    /// merged after their stream ends, hence this being worth tracking
+    /// separately at all. Never gates whether a play action fires — only
+    /// dims/marks the UI so a "nothing played" surprise has an explanation
+    /// up front, since this snapshot can itself go stale a moment later.
+    #[serde(default)]
+    pub is_live: Option<bool>,
 }
 
 /// The live collab state persisted on `monitor.last_collab` as JSON (like
@@ -1100,20 +1112,27 @@ pub struct CollabLive {
     pub partners: Vec<CollabPartner>,
 }
 
+impl CollabPartner {
+    /// This partner's display text, with a 💤 suffix when confirmed offline
+    /// (see [`Self::is_live`]) — never for `None` (unknown isn't "offline").
+    /// `at_mention` prefixes `@` for a title-mention partner's own styling.
+    pub fn display(&self, at_mention: bool) -> String {
+        let base = if at_mention { format!("@{}", self.name) } else { self.name.clone() };
+        if self.is_live == Some(false) { format!("{base} 💤") } else { base }
+    }
+}
+
 /// Comma-joined partner names: shared-chat partners first (display name),
-/// then title-mention partners as `@name`.
+/// then title-mention partners as `@name`. A partner confirmed offline (chat
+/// still merged, but their own broadcast isn't running) gets a 💤 suffix —
+/// see `CollabPartner::is_live`.
 pub fn collab_partner_names(partners: &[CollabPartner]) -> String {
     let mut parts: Vec<String> = partners
         .iter()
         .filter(|p| !p.from_title)
-        .map(|p| p.name.clone())
+        .map(|p| p.display(false))
         .collect();
-    parts.extend(
-        partners
-            .iter()
-            .filter(|p| p.from_title)
-            .map(|p| format!("@{}", p.name)),
-    );
+    parts.extend(partners.iter().filter(|p| p.from_title).map(|p| p.display(true)));
     parts.join(", ")
 }
 
@@ -1140,12 +1159,13 @@ impl CollabLive {
 
     /// Name-cell decoration: `" × A × B"` (shared-chat partners only — title
     /// mentions stay in the Collab column, the name cell is for confirmed
-    /// sessions).
+    /// sessions). A confirmed-offline partner (see `CollabPartner::is_live`)
+    /// gets a 💤 suffix, same as `collab_partner_names`.
     pub fn name_suffix(&self) -> String {
         let mut out = String::new();
         for p in self.partners.iter().filter(|p| !p.from_title) {
             out.push_str(" × ");
-            out.push_str(&p.name);
+            out.push_str(&p.display(false));
         }
         out
     }
@@ -3035,8 +3055,8 @@ mod tests {
             host_id: "650".into(),
             since_unix: 100,
             partners: vec![
-                CollabPartner { id: "100".into(), login: "shylily".into(), name: "Shylily".into(), from_title: false },
-                CollabPartner { id: String::new(), login: "zen".into(), name: "Zen".into(), from_title: true },
+                CollabPartner { id: "100".into(), login: "shylily".into(), name: "Shylily".into(), from_title: false, is_live: Some(true) },
+                CollabPartner { id: String::new(), login: "zen".into(), name: "Zen".into(), from_title: true, is_live: None },
             ],
         };
         let parsed = CollabLive::parse(&c.to_json()).unwrap();
@@ -3050,6 +3070,35 @@ mod tests {
             CollabLive::parse(&CollabLive::default().to_json()),
             None
         );
+    }
+
+    #[test]
+    fn collab_offline_partner_gets_sleep_marker_not_unknown() {
+        let live = CollabLive {
+            host_id: "1".into(),
+            since_unix: 1,
+            partners: vec![
+                // Confirmed offline: chat still merged, own stream ended.
+                CollabPartner {
+                    id: "2".into(),
+                    login: "nekrolina".into(),
+                    name: "Nekrolina".into(),
+                    from_title: false,
+                    is_live: Some(false),
+                },
+                // Never checked / check failed this cycle: no marker at all —
+                // `None` must never be shown as "offline".
+                CollabPartner {
+                    id: "3".into(),
+                    login: "barry".into(),
+                    name: "Barry".into(),
+                    from_title: false,
+                    is_live: None,
+                },
+            ],
+        };
+        assert_eq!(live.names(), "Nekrolina 💤, Barry");
+        assert_eq!(live.name_suffix(), " × Nekrolina 💤 × Barry");
     }
 
     #[test]

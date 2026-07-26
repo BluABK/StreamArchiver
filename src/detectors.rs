@@ -1164,6 +1164,47 @@ impl DetectContext {
             .collect()
     }
 
+    /// Which of these Twitch logins are currently live, via Helix Get Streams
+    /// (100/call, no caching — unlike `twitch_user_names`, this needs to be
+    /// fresh every poll, not stable). A login absent from the response is
+    /// offline (Get Streams only ever returns currently-live channels, never
+    /// an explicit "offline" entry) — a login absent from the RETURNED map
+    /// (as opposed to mapped to `false`) means the check itself couldn't run
+    /// (auth or request failure) and must be treated as unknown, not offline.
+    /// Used to stamp `CollabPartner::is_live` — Shared Chat / collab-group
+    /// membership only means a partner's chat is merged in, not that their
+    /// own broadcast is still running.
+    pub async fn twitch_streams_live(&self, logins: &[String]) -> HashMap<String, bool> {
+        let mut out: HashMap<String, bool> = HashMap::new();
+        if logins.is_empty() {
+            return out;
+        }
+        let Ok((client_id, token)) = self.twitch_helix_auth().await else { return out };
+        for chunk in logins.chunks(100) {
+            let query: Vec<(&str, &str)> =
+                chunk.iter().map(|l| ("user_login", l.as_str())).collect();
+            let resp = self
+                .http
+                .get("https://api.twitch.tv/helix/streams")
+                .header("Client-Id", &client_id)
+                .bearer_auth(&token)
+                .query(&query)
+                .send()
+                .await;
+            let Ok(resp) = resp else { continue };
+            let Ok(v) = resp.json::<serde_json::Value>().await else { continue };
+            for s in v["data"].as_array().into_iter().flatten() {
+                if let Some(login) = s["user_login"].as_str() {
+                    out.insert(login.to_ascii_lowercase(), true);
+                }
+            }
+            for l in chunk {
+                out.entry(l.to_ascii_lowercase()).or_insert(false);
+            }
+        }
+        out
+    }
+
     /// Whether the title `@mention` collab heuristic is on (default: on).
     /// Shared-chat/group partners are always confirmed regardless of this
     /// setting — it only gates the lower-confidence title-parsing fallback.
@@ -1229,6 +1270,7 @@ impl DetectContext {
                                 login: l,
                                 name: n,
                                 from_title: false,
+                                is_live: None,
                             }
                         })
                         .collect();
@@ -1297,6 +1339,7 @@ impl DetectContext {
                         login: l.clone(),
                         name: if n.is_empty() { l.clone() } else { n.clone() },
                         from_title: false,
+                        is_live: None,
                     })
                     .collect();
                 if !fresh.is_empty() {
@@ -1349,6 +1392,7 @@ impl DetectContext {
                 login: m.to_lowercase(),
                 name: m.clone(),
                 from_title: true,
+                is_live: None,
             })
             .collect();
         if !title_ps.is_empty() && !stream_id.is_empty() {
@@ -1387,6 +1431,22 @@ impl DetectContext {
         let json = if partners.is_empty() {
             String::new()
         } else {
+            // A confirmed collab partner only means their chat is merged in,
+            // not that their own broadcast is still running (a member can
+            // stay merged after their stream ends) — stamp each partner's
+            // current live status so the UI can flag "probably nothing to
+            // play here" up front instead of a silent no-op later.
+            let logins: Vec<String> = partners
+                .iter()
+                .filter(|p| !p.login.is_empty())
+                .map(|p| p.login.clone())
+                .collect();
+            let live = self.twitch_streams_live(&logins).await;
+            for p in &mut partners {
+                if let Some(&is_live) = live.get(&p.login) {
+                    p.is_live = Some(is_live);
+                }
+            }
             // Group-only collabs (no shared-chat session) carry no start
             // time; keep the previously-displayed one, else stamp now — a
             // 1970 "since" in the hover would be nonsense.

@@ -1894,7 +1894,14 @@ live, and archived:
   (confirmed partners only), and a **🤝 Collab** column lists everyone
   (shared-chat partners first, then `@mentions`). Hover for the host,
   session start, and source; **double-click** the cell for the history.
-  Stream/take rows show which collab a **past broadcast** was.
+  Stream/take rows show which collab a **past broadcast** was. A confirmed
+  partner whose OWN broadcast Twitch currently shows as offline (checked via
+  Helix alongside the rest of the collab poll) gets a **💤** marker
+  everywhere their name appears — Shared Chat can stay merged after a
+  member's stream ends, so being a confirmed partner never guaranteed they're
+  still live. No marker at all means "not checked yet" or "the check
+  failed," never "confirmed offline" — those two are deliberately never
+  conflated.
 - **Watch every angle** — while a collab is live, an instance's right-click
   menu gains **"👥⏵ Play all collab instances (current downloads)"** and
   **"👥▷ Play all collab instances (live edge)"**. "Current downloads" opens
@@ -1912,7 +1919,10 @@ live, and archived:
   Shared Chat member to stay merged after their own stream ends, so a synthetic
   instance can open to nothing playing (the player just quietly finds no live
   stream, same as pointing "▷ Play stream (live edge)" at any other offline
-  channel). For just one specific angle instead of all of them, the
+  channel). The **💤** marker described above is the heads-up for exactly
+  this — a partner already showing it is likely to open to nothing, though
+  the button always still tries (the 💤 check can itself be stale by the
+  time you click). For just one specific angle instead of all of them, the
   **"👥 Play collab instance…"** submenu lists each partner with its own
   Current download / Live edge pair, the same locally-tracked-vs-synthetic
   distinction applying to that Live edge button too.

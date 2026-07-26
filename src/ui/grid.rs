@@ -405,7 +405,7 @@ pub(super) fn collab_hover(c: &crate::models::CollabLive) -> String {
         } else {
             " (host: this channel)".to_string()
         };
-        let names: Vec<&str> = shared.iter().map(|p| p.name.as_str()).collect();
+        let names: Vec<String> = shared.iter().map(|p| p.display(false)).collect();
         lines.push(format!("Streaming together with {}{host}", names.join(", ")));
         if c.since_unix > 0 {
             lines.push(format!("Shared chat since {}", fmt_datetime_short(c.since_unix)));
@@ -415,7 +415,7 @@ pub(super) fn collab_hover(c: &crate::models::CollabLive) -> String {
         .partners
         .iter()
         .filter(|p| p.from_title)
-        .map(|p| format!("@{}", p.name))
+        .map(|p| p.display(true))
         .collect();
     if !mentions.is_empty() {
         lines.push(format!("@mentioned in the title (unconfirmed): {}", mentions.join(", ")));
@@ -2090,7 +2090,7 @@ pub(super) fn render_instance_row(
                             .as_ref()
                             .map(|t| playable_with(t, media_player))
                             .unwrap_or(false);
-                        ui.menu_button(partner.name.clone(), |ui| {
+                        ui.menu_button(partner.display(partner.from_title), |ui| {
                             if ui
                                 .add_enabled(
                                     !media_player.is_empty() && playable,
@@ -2118,12 +2118,22 @@ pub(super) fn render_instance_row(
                                     !media_player.is_empty() && (pmid.is_some() || untracked.is_some()),
                                     egui::Button::new("▷  Live edge"),
                                 )
-                                .on_hover_text(if pmid.is_some() {
-                                    "Tune in via this locally-tracked instance's own settings."
-                                } else {
-                                    "Not locally tracked — plays via a synthetic instance using \
-                                     this row's own tool/quality/auth settings."
-                                })
+                                .on_hover_text(format!(
+                                    "{}{}",
+                                    if pmid.is_some() {
+                                        "Tune in via this locally-tracked instance's own settings."
+                                    } else {
+                                        "Not locally tracked — plays via a synthetic instance \
+                                         using this row's own tool/quality/auth settings."
+                                    },
+                                    if partner.is_live == Some(false) {
+                                        "\n\n💤 Appears offline right now — Shared Chat can stay \
+                                         merged after a partner's own stream ends. Still tries \
+                                         to play; may just find nothing."
+                                    } else {
+                                        ""
+                                    }
+                                ))
                                 .on_disabled_hover_text(
                                     "Not a locally-tracked channel, and not a verified collab \
                                      partner (a title-mention guess is too unverified to \

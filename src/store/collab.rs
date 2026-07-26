@@ -358,6 +358,7 @@ mod tests {
             login: name.to_lowercase(),
             name: name.into(),
             from_title,
+            is_live: None,
         }
     }
 
