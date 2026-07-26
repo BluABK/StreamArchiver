@@ -178,18 +178,27 @@ impl StreamArchiverApp {
             .default_size(240.0)
             .show_inside(ui, |ui| {
                 ui.add_space(4.0);
+                // Right-to-left: the clear button claims its space FIRST, so
+                // the text edit's `desired_width(ui.available_width())` below
+                // sees the true remainder for this frame rather than a fixed
+                // guess — that guess (previously a hardcoded `- 24.0`) could
+                // be off by a pixel or two from the button's actual width,
+                // and on a resizable `Panel` that discrepancy compounds into
+                // the panel visibly creeping wider every single frame.
                 ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut state.filter)
-                            .hint_text("Filter sections…")
-                            .desired_width(ui.available_width() - 24.0),
-                    )
-                    .on_hover_text("Show only sections whose title matches.");
-                    if !state.filter.is_empty()
-                        && ui.button("✕").on_hover_text("Clear filter").clicked()
-                    {
-                        state.filter.clear();
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if !state.filter.is_empty()
+                            && ui.button("✕").on_hover_text("Clear filter").clicked()
+                        {
+                            state.filter.clear();
+                        }
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.filter)
+                                .hint_text("Filter sections…")
+                                .desired_width(ui.available_width()),
+                        )
+                        .on_hover_text("Show only sections whose title matches.");
+                    });
                 });
                 ui.separator();
                 let q = state.filter.trim().to_lowercase();

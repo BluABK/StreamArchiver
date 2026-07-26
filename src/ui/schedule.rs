@@ -928,19 +928,28 @@ impl StreamArchiverApp {
                 ui.add_space(4.0);
                 ui.heading("Channels");
                 ui.add_space(2.0);
+                // Right-to-left: the clear button claims its space FIRST, so
+                // the text edit's `desired_width(ui.available_width())` below
+                // sees the true remainder for this frame rather than a fixed
+                // guess — a guessed constant here (previously a hardcoded
+                // `- 24.0`) can be off by a pixel or two from the button's
+                // actual width, and on a resizable `Panel` that discrepancy
+                // compounds into the panel visibly creeping wider every frame.
                 ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.schedule_channel_filter)
-                            .hint_text("Filter…")
-                            .desired_width(ui.available_width() - 24.0),
-                    );
-                    if ui
-                        .add_enabled(!self.schedule_channel_filter.is_empty(), egui::Button::new("✕"))
-                        .on_hover_text("Clear filter")
-                        .clicked()
-                    {
-                        self.schedule_channel_filter.clear();
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(!self.schedule_channel_filter.is_empty(), egui::Button::new("✕"))
+                            .on_hover_text("Clear filter")
+                            .clicked()
+                        {
+                            self.schedule_channel_filter.clear();
+                        }
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.schedule_channel_filter)
+                                .hint_text("Filter…")
+                                .desired_width(ui.available_width()),
+                        );
+                    });
                 });
                 ui.add_space(2.0);
 
