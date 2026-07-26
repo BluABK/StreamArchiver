@@ -1395,6 +1395,11 @@ pub struct StreamArchiverApp {
     /// one-line chip at its start time (quick overview when many streams
     /// overlap). Persisted under [`K_SCHEDULE_COMPACT`].
     schedule_compact: bool,
+    /// Draw a bigger channel-avatar picture in the body of each non-compact
+    /// Week/Day event block (sized to fit; shrunk on a narrow block, never
+    /// upscaled past the source image). Persisted under
+    /// [`crate::ui::schedule::K_SCHEDULE_LARGE_AVATAR`].
+    schedule_large_avatar: bool,
     /// The day whose full stream list is shown in a popup (local date; None = closed).
     schedule_day_popup: Option<chrono::NaiveDate>,
     /// Whether the "Schedule sources" dialog is open.

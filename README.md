@@ -2152,9 +2152,11 @@ YouTube sources as the Next stream column) in a calendar, with **Month**, **Week
   swatch + tinted name, so the sidebar doubles as the legend for the event
   blocks.
 - **Channel avatars** appear on the sidebar list, every all-day bar, every
-  timed event block (space permitting), Month-view chips, and Agenda-view
-  rows — so a channel is identifiable by its picture at a glance, not just
-  its name or color.
+  timed event block, Month-view chips, and Agenda-view rows — so a channel is
+  identifiable by its picture at a glance, not just its name or color. On a
+  narrow block (many overlapping streams squeeze lanes thin) the icon shrinks
+  to fit rather than disappearing — it's most useful exactly when
+  similarly-colored blocks are hardest to tell apart.
 - **Channel colors** are the *same* ones the Streams list uses: a manually
   chosen custom color wins, else the streamer's own **Twitch name color**
   (darkened just enough that white block text stays readable), else the
@@ -2172,6 +2174,13 @@ YouTube sources as the Next stream column) in a calendar, with **Month**, **Week
   overlapping streams would otherwise shred the columns into slivers. Chips
   only split into side-by-side lanes when *start times* land within the same
   chip, not for the whole real duration; hover any chip for the full details.
+- **Large avatars** (header checkbox, persisted): draws a bigger channel
+  picture in the body of each non-compact Week/Day event block, below its
+  text — full size (the source profile pic's own resolution) when there's
+  room, shrunk to fit a narrow or short block, never enlarged past the
+  source image. Uses a sharper source than the small inline icon above,
+  since it's shown much bigger. Off by default; has no effect in Compact
+  mode (a one-line chip has no body to put it in).
 - **Auto-record tint**: an event whose instance isn't set to **Auto** (the
   Streams grid's Auto column) is dimmed on every surface — Month/Week/Day
   blocks, chips, the Agenda list, the day popup — so it's obvious at a

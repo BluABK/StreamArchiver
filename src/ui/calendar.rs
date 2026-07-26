@@ -763,6 +763,12 @@ pub(super) fn schedule_time_grid(
     // before each block's text so a channel is identifiable by its picture,
     // not just its name/color, at a glance.
     avatars: &HashMap<i64, egui::TextureHandle>,
+    // Full-res avatars (`App::schedule_channel_avatars_large`) for the
+    // "Large avatars" body picture below — empty unless that toggle is on.
+    large_avatars: &HashMap<i64, egui::TextureHandle>,
+    // "Large avatars" toggle: draw a bigger picture in a non-compact block's
+    // body (below its text), sized to fit the remaining space.
+    large_avatar_mode: bool,
     // Auto-record tint + recording-now/trigger-preview badges — precomputed
     // once per frame in `schedule_view`, keyed by `segment_id`.
     signals: &HashMap<i64, EventSignals>,
@@ -995,13 +1001,17 @@ pub(super) fn schedule_time_grid(
                         let sig_icon = sig.map(EventSignals::icon_prefix).unwrap_or_default();
                         // Channel avatar, before the name line — so a channel is
                         // identifiable by its picture, not just its name/color, at
-                        // a glance. Skipped on blocks too narrow for it to read as
-                        // anything but noise.
-                        let avatar_px = 12.0 * zoom;
+                        // a glance. Scaled down (never hidden outright) on a narrow
+                        // block — a heavily collision-packed day column can squeeze
+                        // lanes down to a fraction of their ideal width, and that's
+                        // exactly when a picture is most useful for telling
+                        // similarly-colored blocks apart. Only skipped once there's
+                        // truly not enough room to read as anything but noise.
                         let avatar_gap = 3.0 * zoom;
-                        let avatar = avatars
-                            .get(&s.channel_id)
-                            .filter(|_| text_rect.width() >= 50.0 * zoom);
+                        let min_avatar_px = 8.0 * zoom;
+                        let ideal_avatar_px = 12.0 * zoom;
+                        let avatar_px = ideal_avatar_px.min((text_rect.width() - avatar_gap).max(0.0));
+                        let avatar = avatars.get(&s.channel_id).filter(|_| avatar_px >= min_avatar_px);
                         let name_x0 = if avatar.is_some() { text_rect.left() + avatar_px + avatar_gap } else { text_rect.left() };
                         if let Some(tex) = avatar {
                             let avatar_y = if compact { block_rect.center().y - avatar_px / 2.0 } else { text_y };
@@ -1068,6 +1078,41 @@ pub(super) fn schedule_time_grid(
                                 time_font,
                                 title_color,
                             );
+                        }
+                        // "Large avatars": a bigger picture in the remaining
+                        // body space below the text lines just drawn — full
+                        // size (the source image's own resolution) when
+                        // there's room, shrunk to fit a narrow/short block,
+                        // never upscaled past the source.
+                        if large_avatar_mode
+                            && let Some(tex) = large_avatars.get(&s.channel_id)
+                        {
+                            let used_h = if block_h >= 56.0 * zoom && !s.title.is_empty() {
+                                38.0 * zoom
+                            } else if block_h >= 36.0 * zoom {
+                                25.0 * zoom
+                            } else {
+                                14.0 * zoom
+                            };
+                            let margin = 4.0 * zoom;
+                            let avail_w = (text_rect.width() - margin).max(0.0);
+                            let avail_h = (block_h - used_h - margin * 2.0).max(0.0);
+                            let native_side = tex.size_vec2().x.min(tex.size_vec2().y);
+                            let side = avail_w.min(avail_h).min(native_side);
+                            if side >= 16.0 * zoom {
+                                let cx = text_rect.left() + text_rect.width() / 2.0;
+                                let top = text_y + used_h + margin;
+                                let big_rect = egui::Rect::from_min_size(
+                                    egui::pos2(cx - side / 2.0, top),
+                                    egui::vec2(side, side),
+                                );
+                                text_painter.image(
+                                    tex.id(),
+                                    big_rect,
+                                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                    if is_hidden { egui::Color32::from_white_alpha(140) } else { egui::Color32::WHITE },
+                                );
+                            }
                         }
                         }
                     }

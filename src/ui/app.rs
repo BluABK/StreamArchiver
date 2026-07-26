@@ -77,6 +77,7 @@ impl StreamArchiverApp {
         let primary_platform_pref = crate::platform_pref::global_primary_platform(&core.store);
 
         let schedule_compact = setting_or_empty(&core, K_SCHEDULE_COMPACT) == "1";
+        let schedule_large_avatar = setting_or_empty(&core, K_SCHEDULE_LARGE_AVATAR) == "1";
         let schedule_hidden: HashSet<i64> = setting_or_empty(&core, K_SCHEDULE_HIDDEN_CHANNELS)
             .split(',')
             .filter_map(|s| s.trim().parse::<i64>().ok())
@@ -598,6 +599,7 @@ impl StreamArchiverApp {
             schedule_zoom: 1.0,
             schedule_chan_colors: HashMap::new(),
             schedule_compact,
+            schedule_large_avatar,
             schedule_day_popup: None,
             show_schedule_sources: false,
             schedule_sources_draft: Vec::new(),

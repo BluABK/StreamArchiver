@@ -59,6 +59,10 @@ pub(super) const K_SCHEDULE_COMPACT: &str = "schedule_compact_events";
 /// Setting key for the sidebar's per-channel hide list (`schedule_hidden`) —
 /// a comma-joined list of hidden channel ids.
 pub(super) const K_SCHEDULE_HIDDEN_CHANNELS: &str = "schedule_hidden_channels";
+/// Setting key for the "Large avatars" toggle — a bigger channel picture
+/// drawn in the body of each non-compact Week/Day event block, sized to fit
+/// (shrunk on a narrow block, never upscaled past the source image).
+pub(super) const K_SCHEDULE_LARGE_AVATAR: &str = "schedule_large_avatar";
 /// Local timestamp in the active [`DateFmt`] (empty if unset). Used for the
 /// Polled / Went Live / Started On columns and the history tree.
 /// A clickable row in the "Schedule sources" dialog's Available column: the
@@ -652,6 +656,14 @@ impl StreamArchiverApp {
         // built by `schedule_channel_avatars` (mutable) so the render
         // functions below (immutable) can just look them up by channel id.
         let avatars = self.schedule_channel_avatars(ui);
+        // Full-res avatars for the "Large avatars" event-body picture — only
+        // resolved when that toggle is on, since it's an extra pass over
+        // every visible channel beyond the small-icon map above.
+        let large_avatars = if self.schedule_large_avatar {
+            self.schedule_channel_avatars_large(ui)
+        } else {
+            HashMap::new()
+        };
 
         // Shared Streams-list channel colours for every surface below
         // (blocks, chips, stripes, sidebar legend).
@@ -736,12 +748,12 @@ impl StreamArchiverApp {
                 ScheduleMode::Week => {
                     self.schedule_week_grid(
                         ui, anchor, today, &by_day, &collide, &ptex, &mut open_day,
-                        &avatars, &all_day_events, &signals,
+                        &avatars, &large_avatars, &all_day_events, &signals,
                     )
                 }
                 ScheduleMode::Day => {
                     self.schedule_day_grid(
-                        ui, anchor, today, &by_day, &collide, &mut open_day, &avatars, &all_day_events, &signals,
+                        ui, anchor, today, &by_day, &collide, &mut open_day, &avatars, &large_avatars, &all_day_events, &signals,
                     )
                 }
                 ScheduleMode::Agenda => {
@@ -853,6 +865,38 @@ impl StreamArchiverApp {
                 .channel_icons_small
                 .entry(cid)
                 .or_insert_with(|| resolve_channel_icon_small(&channel, &accounts, ui.ctx()))
+                .clone();
+            if let Some(t) = tex {
+                avatars.insert(cid, t);
+            }
+        }
+        avatars
+    }
+
+    /// Full-resolution channel avatars (the same source `resolve_channel_icon`
+    /// uses for the Properties thumbnail strip — up to the source profile
+    /// pic's native size, not the 64px thumbnail `schedule_channel_avatars`
+    /// uses) — backs the "Large avatars" event-body picture, which needs a
+    /// sharper source since it's displayed much bigger than the small inline
+    /// icon. Only built when that toggle is on (see `schedule_view`), since
+    /// it's an extra resolve pass over every visible channel.
+    fn schedule_channel_avatars_large(&mut self, ui: &egui::Ui) -> HashMap<i64, egui::TextureHandle> {
+        let mut avatars: HashMap<i64, egui::TextureHandle> = HashMap::new();
+        let mut channel_ids: Vec<i64> = self.schedule_all.iter().map(|s| s.channel_id).collect();
+        channel_ids.sort_unstable();
+        channel_ids.dedup();
+        for cid in channel_ids {
+            let Some(channel) = self.rows.iter().find(|r| r.channel.id == cid).map(|r| r.channel.clone())
+            else {
+                continue;
+            };
+            let mons: Vec<&MonitorWithChannel> =
+                self.rows.iter().filter(|r| r.channel.id == cid).collect();
+            let accounts = channel_asset_accounts(&mons);
+            let tex = self
+                .channel_icons
+                .entry(cid)
+                .or_insert_with(|| resolve_channel_icon(&channel, &accounts, ui.ctx()))
                 .clone();
             if let Some(t) = tex {
                 avatars.insert(cid, t);
@@ -1254,6 +1298,22 @@ impl StreamArchiverApp {
                         .core
                         .store
                         .set_setting(K_SCHEDULE_COMPACT, if compact { "1" } else { "0" });
+                }
+                let mut large_avatar = self.schedule_large_avatar;
+                if ui
+                    .checkbox(&mut large_avatar, "Large avatars")
+                    .on_hover_text(
+                        "Draw a bigger channel picture in the body of each non-compact \
+                         Week/Day event block — full size when there's room, shrunk to \
+                         fit on a narrow block, never enlarged past the source image.",
+                    )
+                    .changed()
+                {
+                    self.schedule_large_avatar = large_avatar;
+                    let _ = self
+                        .core
+                        .store
+                        .set_setting(K_SCHEDULE_LARGE_AVATAR, if large_avatar { "1" } else { "0" });
                 }
                 if self.schedule_collisions && collisions_in_view > 0 {
                     ui.colored_label(HL_COLLISION, format!("⚠ {collisions_in_view}"))
@@ -1803,8 +1863,11 @@ impl StreamArchiverApp {
                     s.title,
                 )
             };
-            let avatar_px = 12.0 * zoom;
-            let avatar = avatars.get(&s.channel_id).filter(|_| rect.width() >= 60.0 * zoom);
+            // Scaled down (never hidden outright) on a narrow bar — see the
+            // matching comment in `schedule_time_grid` (calendar.rs).
+            let min_avatar_px = 8.0 * zoom;
+            let avatar_px = (12.0 * zoom).min((rect.width() - 10.0 * zoom).max(0.0));
+            let avatar = avatars.get(&s.channel_id).filter(|_| avatar_px >= min_avatar_px);
             let text_x0 = rect.left() + 5.0 * zoom + if avatar.is_some() { avatar_px + 3.0 * zoom } else { 0.0 };
             if let Some(tex) = avatar {
                 let avatar_rect = egui::Rect::from_min_size(
@@ -1857,6 +1920,7 @@ impl StreamArchiverApp {
         _ptex: &PlatformTextures,
         open_day: &mut Option<chrono::NaiveDate>,
         avatars: &HashMap<i64, egui::TextureHandle>,
+        large_avatars: &HashMap<i64, egui::TextureHandle>,
         all_day_events: &[usize],
         signals: &HashMap<i64, EventSignals>,
     ) {
@@ -1989,6 +2053,8 @@ impl StreamArchiverApp {
             &self.schedule_chan_colors,
             self.schedule_compact,
             avatars,
+            large_avatars,
+            self.schedule_large_avatar,
             signals,
         );
     }
@@ -2008,6 +2074,7 @@ impl StreamArchiverApp {
         collide: &HashSet<usize>,
         open_day: &mut Option<chrono::NaiveDate>,
         avatars: &HashMap<i64, egui::TextureHandle>,
+        large_avatars: &HashMap<i64, egui::TextureHandle>,
         all_day_events: &[usize],
         signals: &HashMap<i64, EventSignals>,
     ) {
@@ -2049,6 +2116,8 @@ impl StreamArchiverApp {
             &self.schedule_chan_colors,
             self.schedule_compact,
             avatars,
+            large_avatars,
+            self.schedule_large_avatar,
             signals,
         );
     }
