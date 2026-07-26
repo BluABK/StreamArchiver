@@ -1070,14 +1070,30 @@ pub(super) fn schedule_time_grid(
                                 time_color,
                             );
                         }
+                        // Tracks how much vertical space the lines above
+                        // actually used, so a long title wraps to fill genuinely
+                        // spare height instead of being clipped on one line
+                        // while the block sits mostly empty below it (and so
+                        // "Large avatars" places its picture below whatever
+                        // room the title really needed, not a fixed guess).
+                        let mut content_bottom = text_y + if block_h >= 36.0 * zoom { 25.0 * zoom } else { 12.0 * zoom };
                         if block_h >= 56.0 * zoom && !s.title.is_empty() {
-                            text_painter.text(
-                                egui::pos2(text_rect.left(), text_y + 26.0 * zoom),
-                                egui::Align2::LEFT_TOP,
-                                &s.title,
-                                time_font,
+                            let title_top = text_y + 26.0 * zoom;
+                            let wrap_width = text_rect.width().max(10.0);
+                            let row_h = time_font.size * 1.2;
+                            let max_rows = ((block_rect.bottom() - title_top) / row_h).floor().max(1.0) as usize;
+                            let mut job = egui::text::LayoutJob::simple(
+                                s.title.clone(),
+                                time_font.clone(),
                                 title_color,
+                                wrap_width,
                             );
+                            job.wrap.max_rows = max_rows;
+                            job.wrap.overflow_character = Some('…');
+                            let galley = text_painter.layout_job(job);
+                            let title_pos = egui::pos2(text_rect.left(), title_top);
+                            content_bottom = title_top + galley.size().y;
+                            text_painter.galley(title_pos, galley, title_color);
                         }
                         // "Large avatars": a bigger picture in the remaining
                         // body space below the text lines just drawn — full
@@ -1087,13 +1103,7 @@ pub(super) fn schedule_time_grid(
                         if large_avatar_mode
                             && let Some(tex) = large_avatars.get(&s.channel_id)
                         {
-                            let used_h = if block_h >= 56.0 * zoom && !s.title.is_empty() {
-                                38.0 * zoom
-                            } else if block_h >= 36.0 * zoom {
-                                25.0 * zoom
-                            } else {
-                                14.0 * zoom
-                            };
+                            let used_h = content_bottom - text_y;
                             let margin = 4.0 * zoom;
                             let avail_w = (text_rect.width() - margin).max(0.0);
                             let avail_h = (block_h - used_h - margin * 2.0).max(0.0);

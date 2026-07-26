@@ -2185,6 +2185,11 @@ YouTube sources as the Next stream column) in a calendar, with **Month**, **Week
     sharper source than the small inline icon, since it's shown much
     bigger. Off by default; has no effect in Compact mode (a one-line chip
     has no body to put it in).
+- **Title wrapping**: a non-compact Week/Day block's title wraps across
+  however many lines the block's actual height allows, instead of clipping
+  to a single line — a tall block (a long stream, or few overlapping lanes)
+  shows more of a long title rather than cutting it off while sitting mostly
+  empty below. Still clips (with an ellipsis) once even that space runs out.
 - **Auto-record tint**: an event whose instance isn't set to **Auto** (the
   Streams grid's Auto column) is dimmed on every surface — Month/Week/Day
   blocks, chips, the Agenda list, the day popup — so it's obvious at a
