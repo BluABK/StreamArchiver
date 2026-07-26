@@ -270,6 +270,7 @@ impl StreamArchiverApp {
             .unwrap_or_default(),
             chapters_enabled: crate::chapters::global_chapters_enabled(&core.store),
             raid_follow_record: crate::raid_follow::global_raid_follow_record(&core.store),
+            raid_follow_play: crate::raid_follow::global_raid_follow_play(&core.store),
             raid_follow_output_dir: crate::raid_follow::raid_follow_output_dir(&core.store),
             raid_skip_disabled_targets: crate::raid_follow::raid_skip_disabled_targets_enabled(&core.store),
             chapters_title: core.store.get_setting(crate::chapters::K_CHAPTERS_TITLE).ok().flatten().is_none_or(|v| v != "0"),
@@ -1327,6 +1328,8 @@ impl StreamArchiverApp {
         };
         let follow_my_raids = form.follow_my_raids;
         let record_me_as_raid_target = form.record_me_as_raid_target;
+        let follow_my_raids_play = form.follow_my_raids_play;
+        let exclude_from_auto_play = form.exclude_from_auto_play;
 
         // Close the form immediately so the UI stays responsive while the DB
         // work runs. On a background-thread error the status bar shows the error;
@@ -1388,6 +1391,18 @@ impl StreamArchiverApp {
                         crate::raid_follow::K_MONITOR_RAID_TARGET_SCOPE,
                         mid,
                         record_me_as_raid_target,
+                    );
+                    let _ = crate::raid_follow::save_bool_scope(
+                        &store,
+                        crate::raid_follow::K_MONITOR_RAID_FOLLOW_PLAY_SCOPE,
+                        mid,
+                        follow_my_raids_play,
+                    );
+                    let _ = crate::raid_follow::save_bool_scope(
+                        &store,
+                        crate::raid_follow::K_MONITOR_RAID_PLAY_EXCLUDE_SCOPE,
+                        mid,
+                        exclude_from_auto_play,
                     );
                     let _ = crate::platform_pref::save_monitor_pin(&store, mid, primary_pin);
                     let rows = store.list_monitors_with_channels().map_err(|e| e.to_string())?;
@@ -1738,6 +1753,7 @@ impl StreamArchiverApp {
             (crate::chapters::K_CHAPTERS_RAID_MIN_VIEWERS, s.chapters_raid_min_viewers.trim()),
             (crate::chapters::K_CHAPTERS_COALESCE_SECS, s.chapters_coalesce_secs.trim()),
             (crate::raid_follow::K_RAID_FOLLOW_RECORD, if s.raid_follow_record { "1" } else { "0" }),
+            (crate::raid_follow::K_RAID_FOLLOW_PLAY, if s.raid_follow_play { "1" } else { "0" }),
             (crate::raid_follow::K_RAID_FOLLOW_OUTPUT_DIR, s.raid_follow_output_dir.trim()),
             (crate::raid_follow::K_RAID_SKIP_DISABLED_TARGETS, if s.raid_skip_disabled_targets { "1" } else { "0" }),
             (crate::recovery::K_AUTO_RECOVER_MUTED, if s.auto_recover_muted { "1" } else { "0" }),

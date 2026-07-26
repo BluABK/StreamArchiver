@@ -3300,16 +3300,31 @@ impl StreamArchiverApp {
                 .show(ui, |ui| {
                     ui.checkbox(&mut self.settings.raid_follow_record, "Auto-record raid targets")
                         .on_hover_text(
-                            "Master on/off: does raiding out ever trigger a follow-record at \
-                             all? Off by default — unlike most toggles here, this creates new \
-                             recordings of channels you didn't curate. The manual \"Follow \
-                             raid\" play action (a channel's right-click menu) works regardless \
-                             of this setting — it's this auto-record behavior specifically that \
-                             it gates. Single-hop only: records until the raid target's own \
-                             stream ends — Twitch has no formal \"raid end\" event, and \
-                             following further raid chains isn't implemented yet.",
+                            "Master on/off: does raiding out ever trigger an auto-RECORD of the \
+                             target at all? Off by default — unlike most toggles here, this \
+                             creates new recordings of channels you didn't curate. Independent \
+                             of \"Auto-play raid targets\" below — either, both, or neither can \
+                             be on. The manual \"Follow raid\" play action (a channel's \
+                             right-click menu) works regardless of either setting. Single-hop \
+                             only: records until the raid target's own stream ends — Twitch has \
+                             no formal \"raid end\" event, and following further raid chains \
+                             isn't implemented yet.",
                         );
                     ui.label("Master on/off (default OFF). Single-hop only for now.");
+                    ui.end_row();
+
+                    ui.checkbox(&mut self.settings.raid_follow_play, "Auto-play raid targets")
+                        .on_hover_text(
+                            "Master on/off: does raiding out ever auto-OPEN the target at the \
+                             live edge in your media player — no recording, the automatic \
+                             equivalent of the manual \"▷🏃 Follow raid\" button? Off by \
+                             default. Independent of \"Auto-record raid targets\" above. Unlike \
+                             auto-record, this is never gated by the target's disabled state — \
+                             only by its own \"Exclude from auto-play\" override (channel \
+                             Properties / edit instance), since opening a player doesn't touch \
+                             the target's recording/disk configuration at all.",
+                        );
+                    ui.label("Master on/off (default OFF). Never gated by the target's disabled state.");
                     ui.end_row();
 
                     ui.label("Ad-hoc capture folder");
@@ -3335,11 +3350,13 @@ impl StreamArchiverApp {
                     ui.checkbox(&mut self.settings.raid_skip_disabled_targets, "Skip disabled raid targets")
                         .on_hover_text(
                             "Don't auto-record a TRACKED raid target that's currently disabled \
-                             (its master switch or Auto-record off, at either channel or \
-                             instance level) — on by default. A channel can override this \
-                             either way via its own \"Record me when I'm a raid target\" \
-                             setting (channel Properties / edit instance), which always wins \
-                             over this default.",
+                             (its master switch off, at either channel or instance level) — on \
+                             by default. Auto-record being off does NOT count as disabled here \
+                             (same as Trigger Words) — a channel you've deliberately left in \
+                             manual-only mode still gets recorded via a followed raid. A \
+                             channel can override this either way via its own \"Record me when \
+                             I'm a raid target\" setting (channel Properties / edit instance), \
+                             which always wins over this default.",
                         );
                     ui.label("Default on — a channel/instance override always wins.");
                     ui.end_row();

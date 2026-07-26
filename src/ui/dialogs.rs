@@ -2606,13 +2606,25 @@ impl StreamArchiverApp {
                         );
                         ui.end_row();
 
-                        ui.label("Follow my raids");
+                        ui.label("Auto-record my raids");
                         tristate_combo(ui, "form_follow_my_raids", &mut form.follow_my_raids)
                             .on_hover_text(
-                                "When this instance raids out to another Twitch channel, follow \
-                                 it (tune in / auto-record per Settings → Follow raid). Inherit \
+                                "When this instance raids out to another Twitch channel, \
+                                 auto-record the target (Settings → Follow raid). Inherit \
                                  follows the channel, then the global default there — off unless \
-                                 you've turned Follow raid on.",
+                                 you've turned it on. Independent of \"Auto-play my raids\" below.",
+                            );
+                        ui.end_row();
+
+                        ui.label("Auto-play my raids");
+                        tristate_combo(ui, "form_follow_my_raids_play", &mut form.follow_my_raids_play)
+                            .on_hover_text(
+                                "When this instance raids out to another Twitch channel, \
+                                 auto-open the target at the live edge in your media player — no \
+                                 recording, same as the manual \"▷🏃 Follow raid\" button but \
+                                 automatic (Settings → Follow raid). Inherit follows the channel, \
+                                 then the global default. Independent of \"Auto-record my raids\" \
+                                 above.",
                             );
                         ui.end_row();
 
@@ -2623,11 +2635,27 @@ impl StreamArchiverApp {
                             &mut form.record_me_as_raid_target,
                         )
                         .on_hover_text(
-                            "Whether Follow raid may auto-record this instance when a followed \
+                            "Whether Follow raid may auto-RECORD this instance when a followed \
                              raid lands on it. Always/Never override the \"skip disabled raid \
                              targets\" default too — set this to Always if you want this \
-                             instance recorded via a raid even while disabled. Inherit follows \
-                             the channel, then the global default (Settings → Follow raid).",
+                             instance recorded via a raid even while its master switch is off. \
+                             Inherit follows the channel, then the global default (Settings → \
+                             Follow raid).",
+                        );
+                        ui.end_row();
+
+                        ui.label("Exclude from auto-play");
+                        tristate_combo(
+                            ui,
+                            "form_raid_play_exclude",
+                            &mut form.exclude_from_auto_play,
+                        )
+                        .on_hover_text(
+                            "Set to Always to make sure this instance never gets an auto-opened \
+                             player when a followed raid lands on it. Unlike the record-side \
+                             setting above, auto-play otherwise ignores this instance's disabled \
+                             state entirely — this is the only way to opt it out. Inherit/Never \
+                             both mean \"allowed\".",
                         );
                         ui.end_row();
 

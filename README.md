@@ -1968,7 +1968,8 @@ time** — later renames don't rewrite it.
 ### Follow raid 🏃
 
 When a monitored Twitch channel raids out to another channel, you can tune
-into (or auto-record) the raid target:
+into and/or auto-record the raid target. Auto-record and auto-play are two
+fully independent behaviors — either, both, or neither can be on at once:
 
 - **Detection dependency** — raiding out is only ever visible via EventSub's
   `channel.raid` subscription, in **conduit mode** (Client ID + Secret) with
@@ -1979,30 +1980,47 @@ into (or auto-record) the raid target:
 - **Manual play** — a live instance's right-click menu gains **"▷🏃 Follow
   raid"**, enabled once a recent raid-out is known: opens the target at the
   live edge in your media player, same as ▷ Play stream (live edge), without
-  recording.
+  recording. Works regardless of either auto setting below.
 - **Auto-record (opt-in, default off)** — *Settings → Downloads → Follow
-  raid* has a master toggle (off by default — unlike most toggles here, this
-  creates new recordings of channels you didn't curate), overridable per
-  channel/instance ("Follow my raids") the usual global → channel → instance
-  way. When it fires:
+  raid* has a master toggle ("Auto-record raid targets", off by default —
+  unlike most toggles here, this creates new recordings of channels you
+  didn't curate), overridable per channel/instance ("Auto-record my raids")
+  the usual global → channel → instance way. When it fires:
   - A raid target that's **already one of your tracked channels** gets
     force-started using its own settings (tool/quality/output folder) if
     it isn't already recording — the same "past Auto-record-off" mechanism
     a manual ▶ Start already uses. Already recording it? Skipped (no
-    duplicate). Disabled (master switch or Auto-record off)? Skipped too,
-    unless **"Skip disabled raid targets"** (global, default on) is turned
-    off globally or overridden per-channel/instance via **"Record me when
-    I'm a raid target"** (Always/Never/Inherit).
+    duplicate). Disabled (**master switch** off, at either channel or
+    instance level)? Skipped too, unless **"Skip disabled raid targets"**
+    (global, default on) is turned off globally or overridden
+    per-channel/instance via **"Record me when I'm a raid target"**
+    (Always/Never/Inherit). Note that Auto-record being off does NOT count
+    as disabled here (same distinction Trigger Words draw) — a channel/
+    instance you've deliberately left in manual-only mode still gets
+    recorded via a followed raid; only the master switch means "leave this
+    alone entirely."
   - A raid target that **isn't** one of your tracked channels gets a
     lightweight, ad-hoc capture instead: a plain file under the configured
     **ad-hoc capture folder** (supports the `{name}` token) — no
     `Channel`/`Monitor` row, no Streams-grid entry, no history/chapters/VOD
     pipeline. Its only UI surface is a transient row in the Background
     view while it's capturing.
-  - **Single-hop only**: records until the raid target's own stream ends —
-    Twitch has no formal "raid end" event, so this is the natural stop
-    signal. Following a raid CHAIN (the target itself raiding out further)
-    isn't implemented yet.
+- **Auto-play (opt-in, default off)** — a second, fully independent master
+  toggle ("Auto-play raid targets") and per-channel/instance override
+  ("Auto-play my raids"), same inheritance shape as auto-record. When it
+  fires, it auto-opens the target at the live edge in your media player —
+  no recording — the automatic equivalent of the manual "▷🏃 Follow raid"
+  button, for BOTH tracked and untracked targets alike. Unlike auto-record,
+  it's never gated by the target's disabled state at all (opening a player
+  doesn't touch the target's recording/disk configuration) — the only way
+  to opt a channel/instance out is its own **"Exclude from auto-play"**
+  override (Always/Never/Inherit; default allowed).
+- **Single-hop only**: a followed recording runs until the raid target's own
+  stream ends — Twitch has no formal "raid end" event, so this is the
+  natural stop signal. A followed player window has no such lifecycle at
+  all (nothing tells the app when you close mpv). Following a raid CHAIN
+  (the target itself raiding out further) isn't implemented yet, for either
+  behavior.
 
 ### Backlog & Stream History 📥🗃
 

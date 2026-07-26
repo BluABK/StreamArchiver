@@ -1138,35 +1138,37 @@ pub(super) fn spawn_play_new_instance(
     }
 }
 
-/// "Follow raid": tune into `source_row`'s most recent raid-out target at
-/// the live edge, no recording — built from a synthetic, never-persisted
-/// `MonitorWithChannel` (id 0, url = the target's resolved
-/// `twitch.tv/<login>`, tool/quality/extra_args copied from the raiding
+/// "Follow raid": tune into a raid target at the live edge, no recording —
+/// built from a synthetic, never-persisted `MonitorWithChannel` (id 0, url =
+/// `twitch.tv/<to_login>`, tool/quality/extra_args copied from the raiding
 /// monitor's own settings) handed to the existing [`spawn_play_new_instance`]
 /// unmodified, the same way the collab-instance play actions reuse it for
-/// partner rows that aren't the clicked-on row.
-pub(super) fn spawn_follow_raid(
+/// partner rows that aren't the clicked-on row. `pub(crate)` (not just
+/// `pub(super)`) so the auto-play side of Follow raid
+/// (`downloader::raid_follow`) can call it directly — it's pure
+/// `std::process` + `&SettingsForm`/`&Arc<Store>`, no egui/ctx dependency.
+pub(crate) fn spawn_follow_raid(
     source_row: &crate::models::MonitorWithChannel,
-    raid: &crate::models::StreamEventRow,
+    to_login: &str,
+    to_display_name: &str,
     player: &str,
     settings: &SettingsForm,
     store: &Arc<crate::store::Store>,
 ) -> Option<String> {
-    if raid.detail.is_empty() {
+    if to_login.is_empty() {
         return Some(format!(
-            "Raid target login unknown for {} — Twitch didn't report it",
-            raid.target
+            "Raid target login unknown for {to_display_name} — Twitch didn't report it"
         ));
     }
     let mut row = source_row.clone();
     row.monitor.id = 0;
-    row.monitor.url = format!("https://twitch.tv/{}", raid.detail);
+    row.monitor.url = format!("https://twitch.tv/{to_login}");
     // The title fields belong to the SOURCE (raiding) channel, not the raid
     // target — carrying them over would mislabel the live-edge title with
     // the wrong channel's stale metadata. We only know the target's display
-    // name (`raid.target`), not its current title/game, so those are left
-    // blank rather than wrong.
-    row.channel.name = raid.target.clone();
+    // name, not its current title/game, so those are left blank rather than
+    // wrong.
+    row.channel.name = to_display_name.to_string();
     row.last_title.clear();
     row.last_game.clear();
     spawn_play_new_instance(&row, player, settings, store, false, None)

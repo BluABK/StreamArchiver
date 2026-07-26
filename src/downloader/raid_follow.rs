@@ -30,11 +30,19 @@ impl Supervisor {
         let Ok(Some(from_row)) = self.store.get_monitor_with_channel(sig.from_monitor_id) else {
             return;
         };
-        if !crate::raid_follow::effective_raid_follow_record(
+        // Record and play are fully independent — either, both, or neither
+        // may fire for the same raid.
+        let want_record = crate::raid_follow::effective_raid_follow_record(
             &self.store,
             from_row.channel.id,
             from_row.monitor.id,
-        ) {
+        );
+        let want_play = crate::raid_follow::effective_raid_follow_play(
+            &self.store,
+            from_row.channel.id,
+            from_row.monitor.id,
+        );
+        if !want_record && !want_play {
             return;
         }
         if sig.to_login.is_empty() {
@@ -59,9 +67,64 @@ impl Supervisor {
                     && crate::detectors::twitch_login(&r.monitor.url).as_deref()
                         == Some(sig.to_login.as_str())
             });
-        match target_row {
-            Some(row) => self.follow_raid_tracked(row, &sig).await,
-            None => self.follow_raid_ad_hoc(sig, from_row).await,
+        // Play doesn't consume `sig`/`from_row`/`target_row`, so it goes
+        // first — record's tracked/untracked branches take ownership.
+        if want_play {
+            self.try_follow_raid_play(&sig, target_row.as_ref()).await;
+        }
+        if want_record {
+            match target_row {
+                Some(row) => self.follow_raid_tracked(row, &sig).await,
+                None => self.follow_raid_ad_hoc(sig, from_row).await,
+            }
+        }
+    }
+
+    /// Auto-play side of Follow raid: open the target at the live edge, no
+    /// recording — the automatic equivalent of the manual "▷🏃 Follow raid"
+    /// button, via the same [`crate::ui::player::spawn_follow_raid`].
+    /// Unlike record, never gated by the target's disabled state — only by
+    /// its own explicit "Exclude from auto-play" override, since opening a
+    /// player touches nothing about the target's recording/disk config.
+    async fn try_follow_raid_play(&self, sig: &RaidOutSignal, target_row: Option<&MonitorWithChannel>) {
+        if let Some(row) = target_row
+            && crate::raid_follow::is_excluded_from_auto_play(&self.store, row.channel.id, row.monitor.id)
+        {
+            tracing::debug!(
+                monitor_id = row.monitor.id,
+                channel = row.channel.name.as_str(),
+                "follow-raid: target excluded from auto-play"
+            );
+            return;
+        }
+        let player = self
+            .store
+            .get_setting(crate::ui::K_MEDIA_PLAYER)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let player = player.trim();
+        if player.is_empty() {
+            tracing::debug!("follow-raid: no media player configured, skipping auto-play");
+            return;
+        }
+        let Ok(Some(from_row)) = self.store.get_monitor_with_channel(sig.from_monitor_id) else {
+            return;
+        };
+        let settings = crate::ui::SettingsForm::for_auto_play(&self.store);
+        if let Some(msg) = crate::ui::player::spawn_follow_raid(
+            &from_row,
+            &sig.to_login,
+            &sig.to_display_name,
+            player,
+            &settings,
+            &self.store,
+        ) {
+            tracing::info!(
+                to = sig.to_display_name.as_str(),
+                broadcaster_id = sig.to_broadcaster_id.as_str(),
+                "follow-raid: auto-play — {msg}"
+            );
         }
     }
 

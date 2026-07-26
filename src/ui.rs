@@ -108,8 +108,11 @@ const K_RENDER_EMOTES: &str = "render_emotes_in_chat";
 /// Whether animated emotes play (off ⇒ a static first frame). Default on; only an
 /// explicit `"0"` disables. Off is the perf/RAM escape hatch for heavy channels.
 const K_ANIMATE_EMOTES: &str = "animate_emotes_in_chat";
-/// Path to the media player binary used by "Play local recording (start)" on recording rows.
-const K_MEDIA_PLAYER: &str = "media_player_path";
+/// Path to the media player binary used by "Play local recording (start)" on
+/// recording rows. `pub(crate)`: also read directly by auto-play Follow raid
+/// (`downloader::raid_follow`), which builds its own minimal `SettingsForm`
+/// snapshot rather than depending on the UI's live one.
+pub(crate) const K_MEDIA_PLAYER: &str = "media_player_path";
 /// Window-title template for "Play stream (live edge)" — see
 /// [`crate::ui::player::render_live_title`] for the token list.
 const K_LIVE_TITLE_TEMPLATE: &str = "live_edge_title_template";
@@ -399,7 +402,7 @@ mod help;
 mod history;
 pub(crate) mod io_view;
 mod issues;
-mod player;
+pub(crate) mod player;
 mod posts;
 mod pot_log;
 mod properties;
@@ -500,6 +503,11 @@ struct MonitorForm {
     /// follow scope maps (`crate::raid_follow`).
     follow_my_raids: Option<bool>,
     record_me_as_raid_target: Option<bool>,
+    /// Auto-play (no recording) follow-raid override for this instance, and
+    /// whether this instance is excluded from ever being auto-played as a
+    /// raid target — both independent of the record-side fields above.
+    follow_my_raids_play: Option<bool>,
+    exclude_from_auto_play: Option<bool>,
 }
 
 impl MonitorForm {
@@ -556,6 +564,8 @@ impl MonitorForm {
             chapters_coalesce_secs: String::new(),
             follow_my_raids: None,
             record_me_as_raid_target: None,
+            follow_my_raids_play: None,
+            exclude_from_auto_play: None,
         }
     }
 
@@ -608,6 +618,8 @@ impl MonitorForm {
             chapters_coalesce_secs: String::new(),
             follow_my_raids: None,
             record_me_as_raid_target: None,
+            follow_my_raids_play: None,
+            exclude_from_auto_play: None,
         }
     }
 
@@ -659,6 +671,8 @@ impl MonitorForm {
             chapters_coalesce_secs: String::new(),
             follow_my_raids: None,
             record_me_as_raid_target: None,
+            follow_my_raids_play: None,
+            exclude_from_auto_play: None,
         }
     }
 }
@@ -793,8 +807,11 @@ impl VideoForm {
     }
 }
 
+// `pub(crate)`: auto-play Follow raid (`downloader::raid_follow`) constructs
+// a minimal instance of this directly (a couple of named fields + `..Default::default()`)
+// rather than depending on the UI's live one.
 #[derive(Default)]
-struct SettingsForm {
+pub(crate) struct SettingsForm {
     twitch_client_id: String,
     twitch_client_secret: String,
     /// Google OAuth client (TV/device type) for "Connect YouTube" → subscriptions
@@ -1034,18 +1051,24 @@ struct SettingsForm {
     /// explicitly listed in `disposal_trash_dirs`. Empty = no default.
     disposal_trash_default_root: String,
     // --- Follow raid (global defaults for the 3-level chain) ---
-    /// Does raiding out from a monitored channel ever trigger a follow
-    /// (play/auto-record)? Default OFF — opt-in, unlike most toggles here,
-    /// since it creates new recordings of channels the user didn't curate.
+    /// Does raiding out from a monitored channel ever trigger an auto-RECORD
+    /// of the target? Default OFF — opt-in, unlike most toggles here, since
+    /// it creates new recordings of channels the user didn't curate.
     /// Single-hop only — records until the raid target's own stream ends;
     /// chain-following (the target itself raiding out further) isn't
     /// implemented yet.
     raid_follow_record: bool,
+    /// Does raiding out from a monitored channel ever trigger an auto-PLAY
+    /// (live-edge player, no recording) of the target? Independent of
+    /// `raid_follow_record` — the automatic equivalent of the manual "▷🏃
+    /// Follow raid" button. Default OFF, single-hop only, same as above.
+    raid_follow_play: bool,
     /// Output directory for an UNTRACKED raid target's ad-hoc capture
     /// (supports the `{name}` token).
     raid_follow_output_dir: String,
-    /// Skip auto-recording a tracked raid target that's currently disabled.
-    /// Default on.
+    /// Skip auto-recording a tracked raid target that's currently disabled
+    /// (master switch off). Default on. Auto-play has no equivalent of this
+    /// — see `crate::raid_follow::is_excluded_from_auto_play` instead.
     raid_skip_disabled_targets: bool,
     /// Global trigger-word rules (start recording on title/game match even with
     /// Auto off). Channel/instance Properties can extend/replace/disable them.
@@ -1078,6 +1101,33 @@ struct SettingsForm {
     /// readrate/rate-limit live in `postproc_readrate`/`download_rate_limit`.
     disk_overrides: Vec<(String, crate::io_gate::DiskLimits)>,
 }
+
+impl SettingsForm {
+    /// Minimal snapshot for contexts outside the `ui` module that only need
+    /// player-launch fields — auto-play Follow raid
+    /// (`downloader::raid_follow`) builds one of these rather than depending
+    /// on the UI's live `SettingsForm`. Everything else defaults; only
+    /// `live_title_template`/`live_title_auto_update` are read by
+    /// `player::spawn_play_new_instance`'s Twitch/generic branches for this
+    /// launch path (`media_player_path` is passed as its own separate
+    /// argument, not read off the form).
+    pub(crate) fn for_auto_play(store: &crate::store::Store) -> SettingsForm {
+        SettingsForm {
+            live_title_template: store
+                .get_setting(K_LIVE_TITLE_TEMPLATE)
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+            live_title_auto_update: store
+                .get_setting(K_LIVE_TITLE_AUTO_UPDATE)
+                .ok()
+                .flatten()
+                .is_none_or(|v| v != "0"),
+            ..Default::default()
+        }
+    }
+}
+
 /// Lazy cache of decoded post images, keyed by content hash: an egui texture +
 /// its pixel dimensions, or `None` when the decode failed.
 type PostImageCache = HashMap<String, Option<(egui::TextureHandle, (u32, u32))>>;
@@ -2438,6 +2488,8 @@ impl eframe::App for StreamArchiverApp {
                                     chapters_coalesce_secs: String::new(),
                                     follow_my_raids: None,
                                     record_me_as_raid_target: None,
+                                    follow_my_raids_play: None,
+                                    exclude_from_auto_play: None,
                                 });
                             }
                             if ui
@@ -2551,6 +2603,8 @@ impl eframe::App for StreamArchiverApp {
                 chapters_coalesce_secs: String::new(),
                 follow_my_raids: None,
                 record_me_as_raid_target: None,
+                follow_my_raids_play: None,
+                exclude_from_auto_play: None,
             });
         }
         if ctx_refresh_schedule {

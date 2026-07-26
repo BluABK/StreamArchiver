@@ -29,10 +29,17 @@ pub(super) struct ChannelForm {
     /// (empty = inherit the global default).
     pub(super) chapters_coalesce_secs: String,
     /// Follow-raid overrides for this channel (`None` = inherit global):
-    /// whether raiding out from this channel triggers follow-raid, and
+    /// whether raiding out from this channel auto-records the target, and
     /// whether this channel itself is ever auto-recorded as a raid target.
     pub(super) follow_my_raids: Option<bool>,
     pub(super) record_me_as_raid_target: Option<bool>,
+    /// Whether raiding out from this channel auto-OPENS a live-edge player
+    /// for the target (no recording) — independent of `follow_my_raids`.
+    pub(super) follow_my_raids_play: Option<bool>,
+    /// Whether this channel is ever excluded from being auto-played as a
+    /// raid target — independent of `record_me_as_raid_target` (auto-play
+    /// isn't gated by the disabled-check at all, only by this).
+    pub(super) exclude_from_auto_play: Option<bool>,
 }
 /// Background load state of an import fetch (followed/subscriptions).
 pub(super) enum ImportLoadState {
@@ -433,13 +440,26 @@ impl StreamArchiverApp {
                                 );
                                 ui.end_row();
 
-                                ui.label("Follow my raids");
+                                ui.label("Auto-record my raids");
                                 tristate_combo(ui, "chform_follow_my_raids", &mut f.follow_my_raids)
                                     .on_hover_text(
                                         "When any instance in this channel raids out to another \
-                                         Twitch channel, follow it (tune in / auto-record per \
-                                         Settings → Follow raid). Inherit follows the global \
-                                         default there — off unless you've turned Follow raid on.",
+                                         Twitch channel, auto-record the target (Settings → \
+                                         Follow raid). Inherit follows the global default there \
+                                         — off unless you've turned it on. Independent of \
+                                         \"Auto-play my raids\" below.",
+                                    );
+                                ui.end_row();
+
+                                ui.label("Auto-play my raids");
+                                tristate_combo(ui, "chform_follow_my_raids_play", &mut f.follow_my_raids_play)
+                                    .on_hover_text(
+                                        "When any instance in this channel raids out to another \
+                                         Twitch channel, auto-open the target at the live edge in \
+                                         your media player — no recording, same as the manual \
+                                         \"▷🏃 Follow raid\" button but automatic (Settings → \
+                                         Follow raid). Inherit follows the global default there. \
+                                         Independent of \"Auto-record my raids\" above.",
                                     );
                                 ui.end_row();
 
@@ -450,12 +470,27 @@ impl StreamArchiverApp {
                                     &mut f.record_me_as_raid_target,
                                 )
                                 .on_hover_text(
-                                    "Whether Follow raid may auto-record this channel when a \
+                                    "Whether Follow raid may auto-RECORD this channel when a \
                                      followed raid lands on it. Always/Never override the \
                                      \"skip disabled raid targets\" default too — set this to \
                                      Always if you want this channel recorded via a raid even \
-                                     while disabled. Inherit follows that global default \
-                                     (Settings → Follow raid).",
+                                     while its master switch is off. Inherit follows that global \
+                                     default (Settings → Follow raid).",
+                                );
+                                ui.end_row();
+
+                                ui.label("Exclude from auto-play");
+                                tristate_combo(
+                                    ui,
+                                    "chform_raid_play_exclude",
+                                    &mut f.exclude_from_auto_play,
+                                )
+                                .on_hover_text(
+                                    "Set to Always to make sure this channel never gets an \
+                                     auto-opened player when a followed raid lands on it. Unlike \
+                                     the record-side setting above, auto-play otherwise ignores \
+                                     this channel's disabled state entirely — this is the only \
+                                     way to opt it out. Inherit/Never both mean \"allowed\".",
                                 );
                                 ui.end_row();
                             });
@@ -556,6 +591,18 @@ impl StreamArchiverApp {
                             crate::raid_follow::K_CHANNEL_RAID_TARGET_SCOPE,
                             cid,
                             f.record_me_as_raid_target,
+                        );
+                        let _ = crate::raid_follow::save_bool_scope(
+                            &self.core.store,
+                            crate::raid_follow::K_CHANNEL_RAID_FOLLOW_PLAY_SCOPE,
+                            cid,
+                            f.follow_my_raids_play,
+                        );
+                        let _ = crate::raid_follow::save_bool_scope(
+                            &self.core.store,
+                            crate::raid_follow::K_CHANNEL_RAID_PLAY_EXCLUDE_SCOPE,
+                            cid,
+                            f.exclude_from_auto_play,
                         );
                         let _ = crate::platform_pref::save_channel_primary_platform(
                             &self.core.store,
@@ -1321,6 +1368,16 @@ impl StreamArchiverApp {
                     crate::raid_follow::K_MONITOR_RAID_TARGET_SCOPE,
                     r.monitor.id,
                 );
+                mf.follow_my_raids_play = crate::raid_follow::load_bool_scope(
+                    &self.core.store,
+                    crate::raid_follow::K_MONITOR_RAID_FOLLOW_PLAY_SCOPE,
+                    r.monitor.id,
+                );
+                mf.exclude_from_auto_play = crate::raid_follow::load_bool_scope(
+                    &self.core.store,
+                    crate::raid_follow::K_MONITOR_RAID_PLAY_EXCLUDE_SCOPE,
+                    r.monitor.id,
+                );
                 self.form = Some(mf);
             }
         }
@@ -1400,6 +1457,16 @@ impl StreamArchiverApp {
                     crate::raid_follow::K_CHANNEL_RAID_TARGET_SCOPE,
                     cid,
                 );
+                let follow_my_raids_play = crate::raid_follow::load_bool_scope(
+                    &self.core.store,
+                    crate::raid_follow::K_CHANNEL_RAID_FOLLOW_PLAY_SCOPE,
+                    cid,
+                );
+                let exclude_from_auto_play = crate::raid_follow::load_bool_scope(
+                    &self.core.store,
+                    crate::raid_follow::K_CHANNEL_RAID_PLAY_EXCLUDE_SCOPE,
+                    cid,
+                );
                 self.channel_form = Some(ChannelForm {
                     id: Some(cid),
                     name: c.name.clone(),
@@ -1415,6 +1482,8 @@ impl StreamArchiverApp {
                     chapters_coalesce_secs,
                     follow_my_raids,
                     record_me_as_raid_target,
+                    follow_my_raids_play,
+                    exclude_from_auto_play,
                 });
             }
         }
@@ -1594,7 +1663,9 @@ impl StreamArchiverApp {
             if !player.is_empty()
                 && let Some(row) = self.rows.iter().find(|r| r.monitor.id == mid)
                 && let Ok(Some(raid)) = self.core.store.latest_raid_out(mid)
-                && let Some(msg) = spawn_follow_raid(row, &raid, &player, &self.settings, &self.core.store)
+                && let Some(msg) = spawn_follow_raid(
+                    row, &raid.detail, &raid.target, &player, &self.settings, &self.core.store,
+                )
             {
                 self.status = msg;
             }
