@@ -1889,19 +1889,22 @@ live, and archived:
   title** count as collaborators too, shown as `@name` and marked
   "unconfirmed" — a handle already confirmed via Shared Chat or the
   collaboration group is never added a second time as a title mention.
-- **Live display** — the channel/instance name gains a weak
+- **Live display** — the channel/instance name gains a
   `nihmune × Shylily`-style suffix while a shared-chat session is live
   (confirmed partners only), and a **🤝 Collab** column lists everyone
   (shared-chat partners first, then `@mentions`). Hover for the host,
-  session start, and source; **double-click** the cell for the history.
-  Stream/take rows show which collab a **past broadcast** was. A confirmed
-  partner whose OWN broadcast Twitch currently shows as offline (checked via
-  Helix alongside the rest of the collab poll) gets a **💤** marker
-  everywhere their name appears — Shared Chat can stay merged after a
-  member's stream ends, so being a confirmed partner never guaranteed they're
-  still live. No marker at all means "not checked yet" or "the check
-  failed," never "confirmed offline" — those two are deliberately never
-  conflated.
+  session start, and source; right-click the channel/instance row →
+  **🤝 Collab history**. Stream/take rows show which collab a **past
+  broadcast** was. A confirmed partner whose OWN broadcast Twitch currently
+  shows as offline (checked via Helix alongside the rest of the collab poll)
+  gets a **💤** marker everywhere their name appears — Shared Chat can stay
+  merged after a member's stream ends, so being a confirmed partner never
+  guaranteed they're still live. No marker at all means "not checked yet" or
+  "the check failed," never "confirmed offline" — those two are deliberately
+  never conflated. Any partner name that's also one of your own tracked
+  channels is coloured with that channel's Streams-grid colour and
+  underlined — click it to open that channel's Properties directly, without
+  hunting it down in the grid first.
 - **Watch every angle** — while a collab is live, an instance's right-click
   menu gains **"👥⏵ Play all collab instances (current downloads)"** and
   **"👥▷ Play all collab instances (live edge)"**. "Current downloads" opens
@@ -2032,6 +2035,13 @@ persistent time series** — one sample per minute while a channel is live,
 from the regular poll when idle and from the in-recording metadata refresh
 while recording. Discrete **stream events** are archived alongside:
 
+- **Tracked usernames are colour-coded and clickable** — an event's actor or
+  target, a top-gifter/cheerer leaderboard entry, or a 🤝 collab partner name
+  (see below) that happens to name one of your own tracked channels is shown
+  in that channel's Streams-grid colour (custom colour, else its fetched
+  Twitch broadcaster colour, else the deterministic palette) and underlined;
+  click it to open that channel's Properties. An untracked name (an ordinary
+  viewer) is shown plain, same as before.
 - **Subs, resubs, gift subs and bits** are parsed live out of the Twitch
   chat feed (IRC `USERNOTICE`s and `bits` tags), so they're captured whenever
   a recording with **Log chat** is running. Community gift batches count

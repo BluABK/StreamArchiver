@@ -1152,22 +1152,9 @@ impl CollabLive {
         serde_json::to_string(self).unwrap_or_default()
     }
 
-    /// Comma-joined partner names for the Collab cell.
+    /// Comma-joined partner names for the Collab cell's sort/filter text.
     pub fn names(&self) -> String {
         collab_partner_names(&self.partners)
-    }
-
-    /// Name-cell decoration: `" × A × B"` (shared-chat partners only — title
-    /// mentions stay in the Collab column, the name cell is for confirmed
-    /// sessions). A confirmed-offline partner (see `CollabPartner::is_live`)
-    /// gets a 💤 suffix, same as `collab_partner_names`.
-    pub fn name_suffix(&self) -> String {
-        let mut out = String::new();
-        for p in self.partners.iter().filter(|p| !p.from_title) {
-            out.push_str(" × ");
-            out.push_str(&p.display(false));
-        }
-        out
     }
 }
 
@@ -3062,8 +3049,6 @@ mod tests {
         let parsed = CollabLive::parse(&c.to_json()).unwrap();
         assert_eq!(parsed, c);
         assert_eq!(parsed.names(), "Shylily, @Zen");
-        // Name suffix shows confirmed shared-chat partners only.
-        assert_eq!(parsed.name_suffix(), " × Shylily");
         // Empty / partnerless JSON parses to None (renders as "no collab").
         assert_eq!(CollabLive::parse(""), None);
         assert_eq!(
@@ -3098,7 +3083,6 @@ mod tests {
             ],
         };
         assert_eq!(live.names(), "Nekrolina 💤, Barry");
-        assert_eq!(live.name_suffix(), " × Nekrolina 💤 × Barry");
     }
 
     #[test]

@@ -929,6 +929,27 @@ impl StreamArchiverApp {
         self.channel_scope_drafts.entry(id).or_insert(loaded.scope);
     }
 
+    /// Open (or bring to the front of) a channel's Properties window — the
+    /// single entry point for every trigger: the channel row's own "ℹ
+    /// Properties" context-menu item, or clicking a coloured/linked tracked-
+    /// channel name elsewhere in the app (Collab column, name-suffix, Stats
+    /// events/leaderboards).
+    pub(super) fn open_channel_properties(&mut self, cid: i64) {
+        if !self.channel_properties_popups.contains(&cid) {
+            self.channel_properties_popups.push(cid);
+        }
+        // Invalidate the full-size icon cache so the Properties window reloads it
+        // (assets may have been fetched since last open). We do NOT invalidate
+        // channel_icons_small here: the small avatar in the streams table is still
+        // referenced in this frame's paint commands, and dropping it now would free
+        // the texture from the shared painter before the main viewport paints.
+        self.channel_icons.remove(&cid);
+        self.channel_twitch_colors.remove(&cid);
+        self.channel_asset_thumbs.remove(&cid);
+        self.channel_emote_counts.remove(&cid);
+        self.channel_asset_status.remove(&cid);
+    }
+
     /// Render every open channel-Properties window (one per channel).
     pub(super) fn channel_properties_windows(&mut self, ctx: &egui::Context) {
         let mut closed: Vec<i64> = Vec::new();

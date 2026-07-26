@@ -95,44 +95,81 @@ fn event_label(kind: &str) -> &'static str {
     }
 }
 
-/// One readable line for the events table below the graphs.
-fn event_line(e: &StreamEventRow) -> String {
-    match e.kind.as_str() {
-        "sub" => format!("{} subscribed (tier {})", e.actor, tier_label(&e.tier)),
-        "resub" => format!(
-            "{} resubscribed — {} months (tier {})",
-            e.actor,
-            e.amount.max(1),
-            tier_label(&e.tier)
-        ),
-        "subgift" if e.target.is_empty() => {
-            format!("{} gifted {} sub(s) to the community", e.actor, e.amount.max(1))
+/// One piece of an event line: literal text, or a username that should be
+/// coloured/linked to its tracked channel when one resolves (see
+/// [`tracked_name_label`]) and left plain otherwise. Kept separate from the
+/// surrounding text so the events table can render/colour exactly the name
+/// substring instead of re-deriving it from the formatted sentence.
+enum EventLineSeg {
+    Text(String),
+    Name(String),
+}
+
+impl EventLineSeg {
+    fn as_str(&self) -> &str {
+        match self {
+            EventLineSeg::Text(s) | EventLineSeg::Name(s) => s,
         }
-        "subgift" => format!("{} gifted a sub to {}", e.actor, e.target),
-        "bits" => format!("{} cheered {} bits", e.actor, e.amount),
-        "raid_in" => format!("{} raided in with {} viewers", e.actor, e.amount),
-        "raid_out" => format!("raided out to {} with {} viewers", e.target, e.amount),
-        "msg_deleted" if e.detail.is_empty() => format!("{}'s message was deleted", e.actor),
-        "msg_deleted" => format!("{}'s message was deleted: \u{201c}{}\u{201d}", e.actor, e.detail),
-        "timeout" => format!("{} was timed out ({})", e.actor, fmt_timeout(e.amount)),
-        "ban" => format!("{} was banned", e.actor),
-        "chat_clear" => "chat was cleared".to_string(),
-        "chat_mode" => e.detail.clone(),
-        "role_change" => format!("{} {}", e.actor, e.detail),
+    }
+}
+
+/// One readable line for the events table below the graphs, split into
+/// segments so the actor/target substrings can be individually styled.
+fn event_line_segs(e: &StreamEventRow) -> Vec<EventLineSeg> {
+    use EventLineSeg::{Name, Text};
+    match e.kind.as_str() {
+        "sub" => vec![Name(e.actor.clone()), Text(format!(" subscribed (tier {})", tier_label(&e.tier)))],
+        "resub" => vec![
+            Name(e.actor.clone()),
+            Text(format!(" resubscribed — {} months (tier {})", e.amount.max(1), tier_label(&e.tier))),
+        ],
+        "subgift" if e.target.is_empty() => vec![
+            Name(e.actor.clone()),
+            Text(format!(" gifted {} sub(s) to the community", e.amount.max(1))),
+        ],
+        "subgift" => {
+            vec![Name(e.actor.clone()), Text(" gifted a sub to ".into()), Name(e.target.clone())]
+        }
+        "bits" => vec![Name(e.actor.clone()), Text(format!(" cheered {} bits", e.amount))],
+        "raid_in" => vec![Name(e.actor.clone()), Text(format!(" raided in with {} viewers", e.amount))],
+        "raid_out" => {
+            vec![Text("raided out to ".into()), Name(e.target.clone()), Text(format!(" with {} viewers", e.amount))]
+        }
+        "msg_deleted" if e.detail.is_empty() => {
+            vec![Name(e.actor.clone()), Text("'s message was deleted".into())]
+        }
+        "msg_deleted" => vec![
+            Name(e.actor.clone()),
+            Text(format!("'s message was deleted: \u{201c}{}\u{201d}", e.detail)),
+        ],
+        "timeout" => vec![Name(e.actor.clone()), Text(format!(" was timed out ({})", fmt_timeout(e.amount)))],
+        "ban" => vec![Name(e.actor.clone()), Text(" was banned".into())],
+        "chat_clear" => vec![Text("chat was cleared".into())],
+        "chat_mode" => vec![Text(e.detail.clone())],
+        "role_change" => vec![Name(e.actor.clone()), Text(format!(" {}", e.detail))],
         // The detail names its own source: "(confirmed)" = live GQL state
         // (level, points, conductors), "(inferred)" = chat-burst proxy,
         // "marked manually" = user-recorded via the 🚂 dialog.
-        "hype_train" => e.detail.clone(),
+        "hype_train" => vec![Text(e.detail.clone())],
         // Hype Chat: a paid pinned message (real on-platform money).
-        "dono" => format!("{} sent a {} Hype Chat", e.actor, e.detail),
-        "first_chat" if e.detail.is_empty() => format!("{} chatted for the first time", e.actor),
-        "first_chat" => {
-            format!("{} chatted for the first time: \u{201c}{}\u{201d}", e.actor, e.detail)
+        "dono" => vec![Name(e.actor.clone()), Text(format!(" sent a {} Hype Chat", e.detail))],
+        "first_chat" if e.detail.is_empty() => {
+            vec![Name(e.actor.clone()), Text(" chatted for the first time".into())]
         }
-        "milestone" => format!("{} hit a {}", e.actor, e.detail),
-        "announcement" => format!("📣 {}: {}", e.actor, e.detail),
-        other => format!("{other} by {}", e.actor),
+        "first_chat" => vec![
+            Name(e.actor.clone()),
+            Text(format!(" chatted for the first time: \u{201c}{}\u{201d}", e.detail)),
+        ],
+        "milestone" => vec![Name(e.actor.clone()), Text(format!(" hit a {}", e.detail))],
+        "announcement" => vec![Text("📣 ".into()), Name(e.actor.clone()), Text(format!(": {}", e.detail))],
+        other => vec![Text(format!("{other} by ")), Name(e.actor.clone())],
     }
+}
+
+/// Plain-string rendering of [`event_line_segs`] — for contexts that just
+/// need the sentence (the plot's who-did-it hover), not per-name styling.
+fn event_line(e: &StreamEventRow) -> String {
+    event_line_segs(e).iter().map(EventLineSeg::as_str).collect()
 }
 
 /// `600` → `10m`, `86400` → `24h` — timeout durations for event lines.
@@ -207,6 +244,45 @@ impl StreamArchiverApp {
                 (m.monitor.id, label)
             })
             .collect()
+    }
+
+    /// Case-insensitive channel display name → (channel id, Streams-grid
+    /// display colour), for every tracked channel — same precedence as the
+    /// Streams grid (custom colour > cached Twitch broadcaster colour >
+    /// deterministic palette). Used to colour/link a plain-text username
+    /// (stats-event actor/target, top-gifter/cheerer, collab partner) that
+    /// happens to name a channel we track. Computed fresh here rather than
+    /// reusing the Streams-tab cache, since Channel Stats can be viewed
+    /// without ever opening the Streams tab this session.
+    fn tracked_name_colors(&mut self) -> HashMap<String, (i64, egui::Color32)> {
+        let mut out = HashMap::new();
+        for ch in self.channels.clone() {
+            let cid = ch.id;
+            let color = if !ch.color.is_empty() {
+                channel_event_color(cid, &ch.color)
+            } else {
+                let mons: Vec<&MonitorWithChannel> =
+                    self.rows.iter().filter(|r| r.channel.id == cid).collect();
+                let accounts = channel_asset_accounts(&mons);
+                let tw = preferred_account_index(&ch.preferred_asset, &accounts)
+                    .filter(|&i| accounts[i].platform == Platform::Twitch)
+                    .or_else(|| accounts.iter().position(|a| a.platform == Platform::Twitch))
+                    .map(|i| accounts[i].account.clone());
+                match tw {
+                    Some(acct) => match *self
+                        .channel_twitch_colors
+                        .entry(cid)
+                        .or_insert_with(|| load_twitch_name_color(&ch.name, &acct))
+                    {
+                        Some(c) => block_safe_color(c),
+                        None => channel_event_color(cid, ""),
+                    },
+                    None => channel_event_color(cid, ""),
+                }
+            };
+            out.insert(ch.name.to_lowercase(), (cid, color));
+        }
+        out
     }
 
     pub(super) fn channel_stats_view(&mut self, ui: &mut egui::Ui) {
@@ -347,15 +423,20 @@ impl StreamArchiverApp {
                 self.load_chstats();
             }
 
+            let name_colors = self.tracked_name_colors();
             match self.chstats_channel {
-                None => self.chstats_overview_section(ui),
-                Some(cid) => self.chstats_channel_section(ui, cid),
+                None => self.chstats_overview_section(ui, &name_colors),
+                Some(cid) => self.chstats_channel_section(ui, cid, &name_colors),
             }
         });
     }
 
     /// All-channels comparison table + the 🤝 collab partner aggregate.
-    fn chstats_overview_section(&mut self, ui: &mut egui::Ui) {
+    fn chstats_overview_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        name_colors: &HashMap<String, (i64, egui::Color32)>,
+    ) {
         let Some(data) = &self.chstats_data else { return };
         ui.heading("Viewers").on_hover_text(
             "Per-channel viewer aggregates within the selected span, sampled \
@@ -451,6 +532,7 @@ impl StreamArchiverApp {
             ));
             ui.add_space(4.0);
             let mut drill_down: Option<String> = None;
+            let mut open_props: Option<i64> = None;
             egui::Grid::new("collab_stats_grid")
                 .num_columns(3)
                 .striped(true)
@@ -467,7 +549,16 @@ impl StreamArchiverApp {
                         .on_hover_text("When a session with them was last observed");
                     ui.end_row();
                     for (name, sessions, last_seen) in self.stats_collabs.iter().take(100) {
-                        ui.label(name);
+                        // `@name` = title-mention-only (unconfirmed) — strip it before
+                        // matching a tracked channel; it'll simply miss otherwise.
+                        let key = name.strip_prefix('@').unwrap_or(name).to_lowercase();
+                        let (cid, color) = match name_colors.get(&key) {
+                            Some(&(cid, color)) => (Some(cid), Some(color)),
+                            None => (None, None),
+                        };
+                        if let Some(pcid) = tracked_name_label(ui, name, cid, color) {
+                            open_props = Some(pcid);
+                        }
                         if ui
                             .add(
                                 egui::Label::new(sessions.to_string())
@@ -485,6 +576,9 @@ impl StreamArchiverApp {
             if let Some(name) = drill_down {
                 self.open_partner_sessions(&name);
             }
+            if let Some(cid) = open_props {
+                self.open_channel_properties(cid);
+            }
             if self.stats_collabs.len() > 100 {
                 ui.weak(format!(
                     "(+{} more, by session count)",
@@ -500,8 +594,16 @@ impl StreamArchiverApp {
     }
 
     /// Single-channel graphs + event list.
-    fn chstats_channel_section(&mut self, ui: &mut egui::Ui, channel_id: i64) {
+    fn chstats_channel_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        channel_id: i64,
+        name_colors: &HashMap<String, (i64, egui::Color32)>,
+    ) {
         let labels = self.monitor_labels(channel_id);
+        // Deferred until after `data` (borrowed from `self.chstats_data`
+        // below) is no longer needed — `open_channel_properties` needs `&mut self`.
+        let mut open_props: Option<i64> = None;
         let Some(data) = &self.chstats_data else { return };
         if data.viewer.is_empty() && data.events.is_empty() {
             ui.weak(
@@ -545,7 +647,13 @@ impl StreamArchiverApp {
                             .show(ui, |ui| {
                                 for (i, (name, total)) in gifters.iter().enumerate() {
                                     ui.label(rank_label(i));
-                                    ui.label(name);
+                                    let (cid, color) = match name_colors.get(&name.to_lowercase()) {
+                                        Some(&(cid, color)) => (Some(cid), Some(color)),
+                                        None => (None, None),
+                                    };
+                                    if let Some(cid) = tracked_name_label(ui, name, cid, color) {
+                                        open_props = Some(cid);
+                                    }
                                     ui.label(format!("🎁 {total}"));
                                     ui.end_row();
                                 }
@@ -567,7 +675,13 @@ impl StreamArchiverApp {
                             .show(ui, |ui| {
                                 for (i, (name, total)) in cheerers.iter().enumerate() {
                                     ui.label(rank_label(i));
-                                    ui.label(name);
+                                    let (cid, color) = match name_colors.get(&name.to_lowercase()) {
+                                        Some(&(cid, color)) => (Some(cid), Some(color)),
+                                        None => (None, None),
+                                    };
+                                    if let Some(cid) = tracked_name_label(ui, name, cid, color) {
+                                        open_props = Some(cid);
+                                    }
                                     ui.label(format!("💎 {total}"));
                                     ui.end_row();
                                 }
@@ -674,9 +788,13 @@ impl StreamArchiverApp {
         }
 
         ui.add_space(10.0);
-        let ev_out =
-            events_table_ui(ui, "chstats_events", &data.events, 200, &mut self.chstats_event_filter);
+        let ev_out = events_table_ui(
+            ui, "chstats_events", &data.events, 200, &mut self.chstats_event_filter, name_colors,
+        );
         self.apply_events_table_out(channel_id, ev_out);
+        if let Some(cid) = open_props {
+            self.open_channel_properties(cid);
+        }
 
         if let Some((started, ended)) = open_clip {
             let name = self
@@ -692,9 +810,13 @@ impl StreamArchiverApp {
 
     /// Execute the events table's right-click actions (shared by the Channel
     /// Stats view and the 📈 popup): open the 🚂 mark dialog prefilled with a
-    /// row's timestamp, or delete a hype row (tightening the tuning when an
-    /// INFERRED burst is deleted — that's a confirmed false positive).
+    /// row's timestamp, delete a hype row (tightening the tuning when an
+    /// INFERRED burst is deleted — that's a confirmed false positive), or
+    /// open a clicked tracked-channel name's Properties window.
     fn apply_events_table_out(&mut self, channel_id: i64, out: EventsTableOut) {
+        if let Some(cid) = out.open_channel_props {
+            self.open_channel_properties(cid);
+        }
         if let Some(at) = out.mark_at {
             self.hype_mark_channel = channel_id;
             self.hype_mark_abs = chrono::DateTime::from_timestamp(at, 0)
@@ -770,7 +892,13 @@ impl StreamArchiverApp {
 
     /// Render the 📈 popup viewport (registered at the end of `ui()`).
     pub(super) fn viewer_stats_window(&mut self, ctx: &egui::Context) {
-        let Some(popup) = &mut self.viewer_stats_popup else { return };
+        if self.viewer_stats_popup.is_none() {
+            return;
+        }
+        // Computed up front (needs `&mut self`) — `popup` below borrows
+        // `self.viewer_stats_popup` for the rest of this call.
+        let name_colors = self.tracked_name_colors();
+        let popup = self.viewer_stats_popup.as_mut().unwrap();
         // (Re)load lazily for the current span/range.
         if popup.data.is_none() {
             let (since, until, bucket) = match popup.range {
@@ -856,6 +984,7 @@ impl StreamArchiverApp {
                             events,
                             100,
                             &mut popup.filter,
+                            &name_colors,
                         );
                     });
                 });
@@ -1168,6 +1297,9 @@ pub(super) struct EventsTableOut {
     /// `tighten` is true for inferred rows (deleting one is a false-positive
     /// signal for the auto-tune).
     pub delete: Option<(i64, bool, i64, i64)>,
+    /// Channel id to open Properties for — set by clicking a coloured/linked
+    /// tracked-channel name within an event line.
+    pub open_channel_props: Option<i64>,
 }
 
 /// The recent-events table shown under the graphs, with a live text filter
@@ -1178,6 +1310,7 @@ fn events_table_ui(
     events: &[StreamEventRow],
     limit: usize,
     filter: &mut String,
+    name_colors: &HashMap<String, (i64, egui::Color32)>,
 ) -> EventsTableOut {
     let mut out = EventsTableOut::default();
     if events.is_empty() {
@@ -1230,7 +1363,27 @@ fn events_table_ui(
         for e in shown.iter().take(limit) {
             ui.label(fmt_datetime_short(e.at));
             ui.colored_label(event_color(&e.kind), event_label(&e.kind));
-            let line = ui.label(event_line(e));
+            let line = ui
+                .horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    for seg in event_line_segs(e) {
+                        match seg {
+                            EventLineSeg::Text(t) => {
+                                ui.label(t);
+                            }
+                            EventLineSeg::Name(n) => {
+                                let (cid, color) = match name_colors.get(&n.to_lowercase()) {
+                                    Some(&(cid, color)) => (Some(cid), Some(color)),
+                                    None => (None, None),
+                                };
+                                if let Some(cid) = tracked_name_label(ui, &n, cid, color) {
+                                    out.open_channel_props = Some(cid);
+                                }
+                            }
+                        }
+                    }
+                })
+                .response;
             // Row actions (labels are hover-sense — re-interact with click
             // sense on the same rect so right-click registers).
             let is_contrib =

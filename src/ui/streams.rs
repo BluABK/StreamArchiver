@@ -1064,7 +1064,7 @@ impl StreamArchiverApp {
                             Vis::Channel(ci) => {
                                 Self::channel_row(
                                     &mut tr, &chan_entries[ci], &self.rows, groups,
-                                    channel_avatars, channel_name_colors, &ptex,
+                                    channel_avatars, channel_name_colors, twitch_login_to_mid, &ptex,
                                     active_ids, &finalizing_ids, &active_chat_ids,
                                     &ad_running, &exp_channels, now, sel_color,
                                     status_bgcolor, &col_order, &self.spark_data,
@@ -1074,7 +1074,8 @@ impl StreamArchiverApp {
                             Vis::Instance { row: ri, depth } => {
                                 Self::instance_row(
                                     &mut tr, &self.rows[ri], depth, groups,
-                                    active_recordings, twitch_login_to_mid, latest_raid_out,
+                                    active_recordings, twitch_login_to_mid,
+                                    &self.rows, channel_name_colors, latest_raid_out,
                                     &mut self.fs_probes, &self.settings,
                                     &self.scheduled_recordings, &ptex, now, active_ids,
                                     &finalizing_ids, &active_chat_ids, selected_monitor,
@@ -1427,18 +1428,8 @@ impl StreamArchiverApp {
                 self.reload_rows();
             }
         }
-        if let Some(cid) = open_channel_props {
-            if !self.channel_properties_popups.contains(&cid) {
-                self.channel_properties_popups.push(cid);
-            }
-            // Same reasoning as acts.properties above: only drop the full-size icon
-            // (used inside the child viewport) — not the small avatar (still painted
-            // by the main viewport this frame).
-            self.channel_icons.remove(&cid);
-            self.channel_twitch_colors.remove(&cid);
-            self.channel_asset_thumbs.remove(&cid);
-            self.channel_emote_counts.remove(&cid);
-            self.channel_asset_status.remove(&cid);
+        if let Some(cid) = open_channel_props.or(acts.open_channel_props) {
+            self.open_channel_properties(cid);
         }
         if let Some(id) = acts.start {
             self.core.manual(ManualCommand::Start { id, user_initiated: true });
@@ -1797,6 +1788,7 @@ impl StreamArchiverApp {
         groups: &HashMap<i64, Vec<StreamGroup>>,
         channel_avatars: &HashMap<i64, egui::TextureHandle>,
         channel_name_colors: &HashMap<i64, (egui::Color32, bool)>,
+        login_to_mid: &HashMap<String, i64>,
         ptex: &PlatformTextures,
         active_ids: &HashSet<i64>,
         finalizing_ids: &HashSet<i64>,
@@ -1981,17 +1973,43 @@ impl StreamArchiverApp {
                                 .strong()
                                 .color(name_color),
                         );
-                        // "Stream Together" partners as a weak " × Partner"
-                        // suffix while a shared-chat session is live (title
-                        // @mentions stay in the 🤝 Collab column only).
+                        // "Stream Together" partners as a " × Partner" suffix
+                        // while a shared-chat session is live (title
+                        // @mentions stay in the 🤝 Collab column only) — each
+                        // name coloured/linked when it resolves to a tracked
+                        // channel (see `tracked_name_label`).
                         if let Some(c) = &cur_collab {
-                            let suffix = c.name_suffix();
-                            if !suffix.is_empty() {
-                                ui.add(
-                                    egui::Label::new(egui::RichText::new(suffix).weak())
-                                        .truncate(),
-                                )
-                                .on_hover_text(collab_hover(c));
+                            let shared: Vec<&crate::models::CollabPartner> =
+                                c.partners.iter().filter(|p| !p.from_title).collect();
+                            if !shared.is_empty() {
+                                let resp = ui
+                                    .horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 0.0;
+                                        for p in &shared {
+                                            ui.weak(" × ");
+                                            let pcid = login_to_mid.get(&p.login).and_then(|&mid| {
+                                                rows.iter()
+                                                    .find(|r| r.monitor.id == mid)
+                                                    .map(|r| r.channel.id)
+                                            });
+                                            let color = pcid.map(|pcid| {
+                                                let (base, adjust) = channel_name_colors
+                                                    .get(&pcid)
+                                                    .copied()
+                                                    .unwrap_or_else(|| (channel_event_color(pcid, ""), false));
+                                                if adjust {
+                                                    readable_color(base, tint.unwrap_or_else(|| ui.visuals().panel_fill))
+                                                } else {
+                                                    base
+                                                }
+                                            });
+                                            if let Some(pcid) = tracked_name_label(ui, &p.display(false), pcid, color) {
+                                                out.acts.open_channel_props = Some(pcid);
+                                            }
+                                        }
+                                    })
+                                    .response;
+                                resp.on_hover_text(collab_hover(c));
                             }
                         }
                         disc = clicked;
@@ -2171,8 +2189,10 @@ impl StreamArchiverApp {
                         meta_value_cell(ui, &cur_title);
                     }
                     "collab" => {
-                        if collab_cell(ui, cur_collab.as_ref()) {
-                            out.open_collab_history = Some(cid);
+                        if let Some(pcid) =
+                            collab_cell(ui, cur_collab.as_ref(), rows, login_to_mid, channel_name_colors, tint)
+                        {
+                            out.acts.open_channel_props = Some(pcid);
                         }
                     }
                     "viewers" => {
@@ -2284,6 +2304,19 @@ impl StreamArchiverApp {
                     ui.close();
                 }
                 if ui
+                    .button("🤝  Collab history")
+                    .on_hover_text(
+                        "Every \"Stream Together\" session recorded for this channel: \
+                         when, with whom, and who hosted (plus @mention-in-title \
+                         collabs). Also reachable by clicking a tracked partner's name \
+                         in the 🤝 Collab column.",
+                    )
+                    .clicked()
+                {
+                    out.open_collab_history = Some(cid);
+                    ui.close();
+                }
+                if ui
                     .button("🚂  Mark hype train…")
                     .on_hover_text(
                         "A hype train is running (or just ran) and wasn't captured? \
@@ -2370,6 +2403,8 @@ impl StreamArchiverApp {
         groups: &HashMap<i64, Vec<StreamGroup>>,
         active_recordings: &HashMap<i64, Vec<crate::models::Recording>>,
         login_to_mid: &HashMap<String, i64>,
+        rows: &[MonitorWithChannel],
+        channel_name_colors: &HashMap<i64, (egui::Color32, bool)>,
         latest_raid_out: &HashMap<i64, crate::models::StreamEventRow>,
         fs_probes: &mut FsProbes,
         settings: &SettingsForm,
@@ -2500,6 +2535,8 @@ impl StreamArchiverApp {
             stop_hold_desc,
             spark.get(&mid),
             &collab_plays,
+            rows,
+            channel_name_colors,
             latest_raid_out.get(&mid),
             col_order, &mut out.acts,
         ) {

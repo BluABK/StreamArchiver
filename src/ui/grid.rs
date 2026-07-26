@@ -373,22 +373,106 @@ pub(super) fn meta_value_cell(ui: &mut egui::Ui, value: &str) {
     ui.add(egui::Label::new(value).truncate());
 }
 
-/// Render a 🤝 Collab cell: comma-joined partner names (shared-chat partners
-/// first, title `@mentions` as `@name`), truncated to the column, with a
-/// detail hover (who, host, since-when, source). Blank when not collabing.
-/// Returns true on double-click (open the channel's 🤝 collab history).
-pub(super) fn collab_cell(ui: &mut egui::Ui, collab: Option<&crate::models::CollabLive>) -> bool {
-    let Some(c) = collab else { return false };
-    let names = c.names();
-    if names.is_empty() {
-        return false;
+/// Render a name as a plain label, or — when `cid` is `Some` (it resolves to
+/// a locally-tracked channel) — as `color`, underlined, with a click-to-open-
+/// Properties hyperlink. Returns `Some(cid)` when clicked. Shared by every
+/// place a tracked channel's name shows up as plain text outside its own
+/// Streams-grid row (Collab column, name-suffix, Stats events), so the same
+/// identity always reads as the same colour and is always a shortcut to its
+/// Properties window.
+pub(super) fn tracked_name_label(
+    ui: &mut egui::Ui,
+    name: &str,
+    cid: Option<i64>,
+    color: Option<egui::Color32>,
+) -> Option<i64> {
+    let Some(cid) = cid else {
+        ui.label(name);
+        return None;
+    };
+    let text = match color {
+        Some(c) => egui::RichText::new(name).color(c).underline(),
+        None => egui::RichText::new(name).underline(),
+    };
+    let resp = ui.add(egui::Label::new(text).sense(egui::Sense::click()));
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    ui.add(egui::Label::new(names).sense(egui::Sense::click()).truncate())
-        .on_hover_text(format!(
-            "{}\n\nDouble-click for the full collab history.",
-            collab_hover(c)
-        ))
-        .double_clicked()
+    resp.on_hover_text("Click to open this channel's Properties.").clicked().then_some(cid)
+}
+
+/// Resolve a collab partner login to its own tracked-channel colour, same
+/// precedence/readability-adjustment as a channel's own Streams-grid name.
+fn collab_partner_color(
+    pcid: i64,
+    channel_name_colors: &HashMap<i64, (egui::Color32, bool)>,
+    tint: Option<egui::Color32>,
+    ui: &egui::Ui,
+) -> egui::Color32 {
+    let (base, adjust) =
+        channel_name_colors.get(&pcid).copied().unwrap_or_else(|| (channel_event_color(pcid, ""), false));
+    if adjust { readable_color(base, tint.unwrap_or_else(|| ui.visuals().panel_fill)) } else { base }
+}
+
+/// Render a comma-joined run of collab partner names — shared-chat partners
+/// first, then title `@mentions` as `@name` — each coloured with its own
+/// tracked channel's Streams-grid colour and linked to its Properties window
+/// when `resolve` maps its login to one (see [`tracked_name_label`]); an
+/// untracked or unverified name stays plain. Returns the clicked channel's
+/// id (if any) plus the group's response, so the caller can attach its own
+/// hover text (it needs the full [`crate::models::CollabLive`] for
+/// host/since-when, not just the partners).
+pub(super) fn collab_names_row(
+    ui: &mut egui::Ui,
+    partners: &[crate::models::CollabPartner],
+    resolve: impl Fn(&str) -> Option<i64>,
+    channel_name_colors: &HashMap<i64, (egui::Color32, bool)>,
+    tint: Option<egui::Color32>,
+) -> (Option<i64>, egui::Response) {
+    let mut clicked = None;
+    let resp = ui
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let mut first = true;
+            for p in partners.iter().filter(|p| !p.from_title).chain(partners.iter().filter(|p| p.from_title)) {
+                if !first {
+                    ui.label(", ");
+                }
+                first = false;
+                let pcid = resolve(&p.login);
+                let color = pcid.map(|cid| collab_partner_color(cid, channel_name_colors, tint, ui));
+                if let Some(cid) = tracked_name_label(ui, &p.display(p.from_title), pcid, color) {
+                    clicked = Some(cid);
+                }
+            }
+        })
+        .response;
+    (clicked, resp)
+}
+
+/// Render a 🤝 Collab cell: comma-joined partner names, truncated to the
+/// column, with a detail hover (who, host, since-when, source). Blank when
+/// not collabing. See [`collab_names_row`] for the per-name colour/link
+/// behaviour. Returns the clicked channel's id, if any.
+pub(super) fn collab_cell(
+    ui: &mut egui::Ui,
+    collab: Option<&crate::models::CollabLive>,
+    rows: &[MonitorWithChannel],
+    login_to_mid: &HashMap<String, i64>,
+    channel_name_colors: &HashMap<i64, (egui::Color32, bool)>,
+    tint: Option<egui::Color32>,
+) -> Option<i64> {
+    let c = collab?;
+    if c.partners.is_empty() {
+        return None;
+    }
+    let hover = collab_hover(c);
+    let resolve = |login: &str| {
+        login_to_mid.get(login).and_then(|&mid| rows.iter().find(|r| r.monitor.id == mid).map(|r| r.channel.id))
+    };
+    let (clicked, resp) = collab_names_row(ui, &c.partners, resolve, channel_name_colors, tint);
+    resp.on_hover_text(hover);
+    clicked
 }
 
 /// The 🤝 hover text: shared-chat partners with the host called out, the
@@ -1817,6 +1901,9 @@ pub(super) struct RowActions {
     pub(super) open_schedule: Option<i64>,         // monitor id (open its Next stream popup)
     pub(super) open_collab_history: Option<i64>,   // channel id (open its 🤝 collab history)
     pub(super) open_viewer_stats: Option<i64>,     // channel id (open its 📈 viewer stats)
+    /// Channel id (open its ℹ Properties — set by clicking a coloured/linked
+    /// tracked-channel name, e.g. in the Collab column or a " × Partner" suffix).
+    pub(super) open_channel_props: Option<i64>,
     pub(super) mark_hype: Option<i64>,             // channel id (open the 🚂 mark-train dialog)
     pub(super) properties: Option<i64>,            // monitor id
     pub(super) reorganize_monitor: Option<i64>,    // monitor id
@@ -1903,6 +1990,11 @@ pub(super) fn render_instance_row(
     // tracked monitor with something actively downloading), and its resolved
     // monitor id (if locally tracked at all, for the live-edge action).
     collab_plays: &[(crate::models::CollabPartner, Option<StreamTarget>, Option<i64>)],
+    // All rows + the Streams-grid per-channel name colour cache, needed only
+    // to colour/link a collab partner's " × Partner" suffix to its own
+    // tracked channel (see `tracked_name_label`).
+    rows: &[MonitorWithChannel],
+    channel_name_colors: &HashMap<i64, (egui::Color32, bool)>,
     // This monitor's most recent `raid_out` event, if any — "Follow raid"'s
     // enabled state and target (re-resolved at click time in dispatch, not
     // read from this snapshot, to avoid acting on a stale target).
@@ -2368,13 +2460,39 @@ pub(super) fn render_instance_row(
                     avatar,
                     egui::RichText::new(instance_label(&row.monitor.url)).color(name_color),
                 );
-                // "Stream Together" partners as a weak " × Partner" suffix
-                // while this instance's shared-chat session is live.
+                // "Stream Together" partners as a " × Partner" suffix while
+                // this instance's shared-chat session is live — each name
+                // coloured/linked when it resolves to a tracked channel (see
+                // `collab_plays`'s per-partner monitor-id resolution).
                 if let Some(c) = &row.live_collab {
-                    let suffix = c.name_suffix();
-                    if !suffix.is_empty() {
-                        ui.add(egui::Label::new(egui::RichText::new(suffix).weak()).truncate())
-                            .on_hover_text(collab_hover(c));
+                    let shared: Vec<_> = collab_plays.iter().filter(|(p, _, _)| !p.from_title).collect();
+                    if !shared.is_empty() {
+                        let resp = ui
+                            .horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                for (p, _, pmid) in &shared {
+                                    ui.weak(" × ");
+                                    let pcid = pmid.and_then(|mid| {
+                                        rows.iter().find(|r| r.monitor.id == mid).map(|r| r.channel.id)
+                                    });
+                                    let color = pcid.map(|cid| {
+                                        let (base, adjust) = channel_name_colors
+                                            .get(&cid)
+                                            .copied()
+                                            .unwrap_or_else(|| (channel_event_color(cid, ""), false));
+                                        if adjust {
+                                            readable_color(base, tint.unwrap_or_else(|| ui.visuals().panel_fill))
+                                        } else {
+                                            base
+                                        }
+                                    });
+                                    if let Some(cid) = tracked_name_label(ui, &p.display(false), pcid, color) {
+                                        a.open_channel_props = Some(cid);
+                                    }
+                                }
+                            })
+                            .response;
+                        resp.on_hover_text(collab_hover(c));
                     }
                 }
                 // inspect_with: props are only built while the inspector is
@@ -2526,8 +2644,21 @@ pub(super) fn render_instance_row(
                 meta_value_cell(ui, v);
             }
             "collab" => {
-                if collab_cell(ui, row.live_collab.as_ref()) {
-                    a.open_collab_history = Some(row.channel.id);
+                if let Some(c) = &row.live_collab {
+                    let hover = collab_hover(c);
+                    let resolve = |login: &str| {
+                        collab_plays
+                            .iter()
+                            .find(|(p, _, _)| p.login == login)
+                            .and_then(|(_, _, pmid)| *pmid)
+                            .and_then(|mid| rows.iter().find(|r| r.monitor.id == mid).map(|r| r.channel.id))
+                    };
+                    let (clicked, resp) =
+                        collab_names_row(ui, &c.partners, resolve, channel_name_colors, tint);
+                    resp.on_hover_text(hover);
+                    if let Some(cid) = clicked {
+                        a.open_channel_props = Some(cid);
+                    }
                 }
             }
             "viewers" => {
