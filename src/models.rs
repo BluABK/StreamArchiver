@@ -2739,7 +2739,25 @@ impl Recording {
     pub fn duration_secs(&self, now: i64) -> i64 {
         (self.ended_at.unwrap_or(now) - self.started_at).max(0)
     }
+    /// Whether this take's `ended_at` was written before the fix that stamped
+    /// it from the capture's actual exit time instead of a fresh `now_unix()`
+    /// taken after its remux/promote (which could be hours later, queued
+    /// behind other disk-gate work) — see `ENDED_AT_ACCURACY_FIX_DEPLOYED_AT`.
+    /// A `true` result means `duration_secs`/`ended_at` here may read longer
+    /// than the broadcast actually was; it does NOT mean the capture itself
+    /// is incomplete — compare against the file's own probed duration to see
+    /// by how much, if at all.
+    pub fn ended_at_predates_accuracy_fix(&self) -> bool {
+        self.ended_at.is_some_and(|t| t < ENDED_AT_ACCURACY_FIX_DEPLOYED_AT)
+    }
 }
+
+/// Unix timestamp the first build with the `ended_at` accuracy fix went live
+/// (2026-07-26T03:12:33Z) — any recording finalized before this by an older
+/// build may have `ended_at` inflated by however long its remux queued at the
+/// disk gate. Recordings finalized at/after this instant were written by the
+/// fixed code and don't need a second look. See `Recording::ended_at_predates_accuracy_fix`.
+pub const ENDED_AT_ACCURACY_FIX_DEPLOYED_AT: i64 = 1785035553;
 
 /// A set of recording takes that belong to the same broadcast.
 #[derive(Clone, Debug)]

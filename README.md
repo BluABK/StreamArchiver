@@ -359,7 +359,13 @@ or the Duration column, for an average bitrate — a quick way to notice a take
 that captured at the wrong quality); a still-recording take shows its *live*
 size, not the stale 0 B a plain directory listing would give a file another
 process still has open for writing — it's read from the file handle directly
-and updates every couple of seconds.
+and updates every couple of seconds. A take finalized before 2026-07-26 may
+show a **⚠** on its Duration cell (and in the take's Properties window): a
+since-fixed bug stamped the end time *after* its remux finished rather than
+when the capture actually stopped, so a take whose remux happened to queue
+for hours at the disk gate can show a duration longer than the broadcast
+really was — the capture itself is still complete, only the timestamp is
+off; compare against the file's own duration to check.
 
 Once a channel has been recording long enough, its streams also subgroup into
 collapsible **Week → Month → Year** headers so the list doesn't turn into a

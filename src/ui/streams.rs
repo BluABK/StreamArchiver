@@ -2856,14 +2856,22 @@ impl StreamArchiverApp {
                         // entire length of an in-progress recording.
                         let total: u64 =
                             g.takes.iter().map(|t| take_size_bytes(fs_probes, t)).sum();
-                        ui.label(fmt_duration(g.captured_secs(now))).on_hover_text(
-                            format!(
-                                "{} captured across {} take(s) · span {}",
-                                fmt_bytes(total as i64),
-                                g.takes.len(),
-                                fmt_duration(span),
-                            ),
+                        let mut hover = format!(
+                            "{} captured across {} take(s) · span {}",
+                            fmt_bytes(total as i64),
+                            g.takes.len(),
+                            fmt_duration(span),
                         );
+                        if g.takes.iter().any(|t| t.ended_at_predates_accuracy_fix()) {
+                            hover.push_str(
+                                "\n\n⚠ At least one take here finished before a fix (2026-07-26) \
+                                 that stamps the end time from the capture's real exit — before \
+                                 then, a slow remux queued at the disk gate could push it hours \
+                                 later than the broadcast actually ended. Check the affected \
+                                 take's row for which one.",
+                            );
+                        }
+                        ui.label(fmt_duration(g.captured_secs(now))).on_hover_text(hover);
                     }
                     // "on"/"platform"/"tool"/"detection"/"polled"/
                     // "next_stream"/"ad_free"/"added" are n/a per stream.
@@ -3450,8 +3458,23 @@ impl StreamArchiverApp {
                     }
                     "duration" => {
                         let d = ui.label(fmt_duration(t.duration_secs(now)));
-                        if t.bytes > 0 {
-                            d.on_hover_text(fmt_bytes(t.bytes));
+                        let stale_note = t.ended_at_predates_accuracy_fix().then_some(
+                            "⚠ Finished before a fix (2026-07-26) that stamps the end time from \
+                             the capture's real exit — before then, a slow remux queued at the \
+                             disk gate could push this hours later than the broadcast actually \
+                             ended. The capture isn't necessarily incomplete; check the Recording \
+                             Properties dialog or probe the file directly to see by how much, if \
+                             at all.",
+                        );
+                        let bytes_note = (t.bytes > 0).then(|| fmt_bytes(t.bytes));
+                        let hover = match (stale_note, bytes_note) {
+                            (Some(s), Some(b)) => Some(format!("{s}\n\n{b}")),
+                            (Some(s), None) => Some(s.to_string()),
+                            (None, Some(b)) => Some(b),
+                            (None, None) => None,
+                        };
+                        if let Some(h) = hover {
+                            d.on_hover_text(h);
                         }
                     }
                     // "on"/"platform"/"tool"/"detection"/"polled"/

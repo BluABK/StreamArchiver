@@ -1177,13 +1177,27 @@ impl StreamArchiverApp {
                                 ui.label("Started");
                                 ui.label(fmt_datetime_short(rec.started_at));
                                 ui.end_row();
+                                let predates_fix = rec.ended_at_predates_accuracy_fix();
+                                let stale_hover = "This take finished before a fix (2026-07-26) that \
+                                     stamps this from the capture's real exit time — before then, a \
+                                     slow remux queued at the disk gate could push this hours later \
+                                     than the broadcast actually ended. The capture itself isn't \
+                                     necessarily incomplete; compare against the file's own duration \
+                                     (e.g. via a media prober) to see whether — and by how much — \
+                                     this is inflated.";
                                 if let Some(ended) = rec.ended_at {
                                     ui.label("Ended");
-                                    ui.label(fmt_datetime_short(ended));
+                                    let lbl = ui.label(fmt_datetime_short(ended));
+                                    if predates_fix {
+                                        lbl.on_hover_text(format!("⚠ {stale_hover}"));
+                                    }
                                     ui.end_row();
                                 }
                                 ui.label("Duration");
-                                ui.label(fmt_duration(rec.duration_secs(now)));
+                                let dur_lbl = ui.label(fmt_duration(rec.duration_secs(now)));
+                                if predates_fix {
+                                    dur_lbl.on_hover_text(format!("⚠ {stale_hover}"));
+                                }
                                 ui.end_row();
                                 if let Some(live) = rec.went_live_at {
                                     ui.label("Went live");
