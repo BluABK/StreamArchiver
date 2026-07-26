@@ -188,6 +188,26 @@ pub(super) async fn ffmpeg_job_tmp_looks_complete(tmp_path: &Path, total_secs: O
     packet_pts_near(tmp_path, near).await.is_some()
 }
 
+/// Whether a registered ffmpeg job row for `(kind, ref_id)` refers to a
+/// still-running process — the same liveness test [`adopt_or_clear_prior_ffmpeg_job`]
+/// uses internally, exposed so a caller can decide *how* to wait (block
+/// inline vs. fan out to a background task) before committing to it.
+pub(super) fn ffmpeg_job_is_alive(store: &Store, kind: FfmpegJobKind, ref_id: i64) -> bool {
+    if ref_id == 0 {
+        return false;
+    }
+    store
+        .list_ffmpeg_jobs()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|r| r.kind == kind && r.ref_id == ref_id)
+        .is_some_and(|row| {
+            row.proc_start != 0
+                && crate::platform::pid_alive(row.pid)
+                && crate::platform::process_start_time(row.pid) == Some(row.proc_start)
+        })
+}
+
 /// Check the registry for a previous attempt at this exact `(kind, ref_id)`
 /// before a caller builds a fresh ffmpeg pass targeting `tmp_path`. Ground
 /// truth for "is a prior attempt still alive" is the same PID + creation-time

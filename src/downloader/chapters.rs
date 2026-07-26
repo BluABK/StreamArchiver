@@ -9,6 +9,7 @@
 //! trigger sites without reasoning about which one "actually" fired.
 
 use super::*;
+use super::ffmpeg_job;
 use crate::chapters::{self as ch, ChapterKinds, SplicedGap};
 
 /// Whether chapter embedding may proceed for a recording in this state —
@@ -55,14 +56,34 @@ impl Supervisor {
     /// for all of them at once. Unlike `sweep_pending_gap_splices` (whose
     /// candidate list is naturally tiny — it requires an actual `done` gap
     /// range, rare in practice), this sweep's candidate list can be the
-    /// entire historical library, so it awaits each take's embed pass in
-    /// turn instead of fanning out via `maybe_spawn_chapters` — the same
+    /// entire historical library, so a *genuinely new* embed pass is awaited
+    /// in turn instead of fanning out via `maybe_spawn_chapters` — the same
     /// "sequential, not fan-out" reasoning `cmd_reembed_chapters_all`
-    /// already applies, to avoid flooding the shared disk-gate with a
-    /// pile of concurrent full-file ffmpeg passes on top of live captures.
+    /// already applies, to avoid flooding the shared disk-gate with a pile
+    /// of concurrent full-file ffmpeg passes on top of live captures.
+    ///
+    /// A candidate whose ffmpeg job already survived a restart (`FfmpegJobKind::
+    /// ChaptersEmbed` row still alive) is fanned out instead: re-attaching adds
+    /// no new disk-gate load (nothing new is spawned, just a tail on an
+    /// already-running process), so there's no flood risk to guard against —
+    /// and awaiting it inline would block every later candidate in id order
+    /// behind however long that one process takes to finish, which for an
+    /// hours-to-days-long pass starves their progress-tracking adoption and
+    /// finalization for just as long. Found via the Nihmune/Milk-Cweamcat
+    /// live rescue: Milk's adopted chapters pass (rec 226) blocked Nihmune's
+    /// (rec 1006) from ever finalizing while it ran.
     pub async fn sweep_pending_chapters(&self) {
         for rec_id in self.store.recordings_needing_chapters_check().unwrap_or_default() {
-            if self.chapter_jobs.lock().unwrap().insert(rec_id) {
+            if !self.chapter_jobs.lock().unwrap().insert(rec_id) {
+                continue;
+            }
+            if ffmpeg_job::ffmpeg_job_is_alive(&self.store, FfmpegJobKind::ChaptersEmbed, rec_id) {
+                let this = self.clone();
+                tokio::spawn(async move {
+                    this.chapters_job(rec_id, Vec::new()).await;
+                    this.chapter_jobs.lock().unwrap().remove(&rec_id);
+                });
+            } else {
                 self.chapters_job(rec_id, Vec::new()).await;
                 self.chapter_jobs.lock().unwrap().remove(&rec_id);
             }
