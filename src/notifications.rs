@@ -191,13 +191,17 @@ struct NotifMeta {
     recording_id: Option<i64>,
     /// Dedup key for the partial-unique index (`""` = never dedup).
     ref_key: String,
+    /// Still recorded in the in-app feed, but never surfaced as an OS toast —
+    /// used when a companion toast for the same went-live moment already (or
+    /// is about to) cover it, so the desktop isn't popped twice in a row.
+    skip_toast: bool,
 }
 
 /// Resolve one event into a toast, record it in the in-app notifications feed,
 /// then show the OS toast. The feed row is recorded **regardless** of the
 /// desktop-notification toggle (Settings promises the in-app views keep
-/// updating with toasts off); only the OS `show_toast` call is gated. Runs on a
-/// blocking thread.
+/// updating with toasts off) or of [`NotifMeta::skip_toast`]; only the OS
+/// `show_toast` call is gated on either. Runs on a blocking thread.
 fn handle(store: &Store, ev: AppEvent) {
     use crate::models::NotificationKind;
     let (content, meta) = match ev {
@@ -218,6 +222,17 @@ fn handle(store: &Store, ev: AppEvent) {
                     content.hero = Some(path.clone());
                 }
             }
+            // A trigger match already popped its own "trigger matched —
+            // recording started" toast for this exact went-live moment
+            // (`try_begin` sends `TriggerMatched` right before spawning the
+            // record task that leads here) — showing "channel is live" on
+            // top of it a few seconds later is a redundant second popup for
+            // the same event, so keep the feed row but skip the OS toast.
+            let triggered = store
+                .get_recording(recording_id)
+                .ok()
+                .flatten()
+                .is_some_and(|r| !r.trigger_info.is_empty());
             let meta = NotifMeta {
                 kind: NotificationKind::WentLive,
                 severity: "info",
@@ -225,6 +240,7 @@ fn handle(store: &Store, ev: AppEvent) {
                 channel: row.channel.name.clone(),
                 recording_id: Some(recording_id),
                 ref_key: format!("went_live:{recording_id}"),
+                skip_toast: triggered,
             };
             (content, meta)
         }
@@ -250,6 +266,7 @@ fn handle(store: &Store, ev: AppEvent) {
                 recording_id: None,
                 // One feed row per stream even if the capture restarts.
                 ref_key: format!("trigger:{monitor_id}:{went_live_at}"),
+                skip_toast: false,
             };
             (content, meta)
         }
@@ -271,6 +288,7 @@ fn handle(store: &Store, ev: AppEvent) {
                 recording_id: None,
                 // One feed row per stream even if the veto re-fires.
                 ref_key: format!("trigger_block:{monitor_id}:{went_live_at}"),
+                skip_toast: false,
             };
             (content, meta)
         }
@@ -325,6 +343,7 @@ fn handle(store: &Store, ev: AppEvent) {
                 channel: chan_name,
                 recording_id: Some(recording_id),
                 ref_key: format!("recfin:{recording_id}"),
+                skip_toast: false,
             };
             (content, meta)
         }
@@ -352,6 +371,7 @@ fn handle(store: &Store, ev: AppEvent) {
                 channel,
                 recording_id: Some(recording_id),
                 ref_key: format!("vodmuted:{recording_id}"),
+                skip_toast: false,
             };
             (content, meta)
         }
@@ -369,6 +389,7 @@ fn handle(store: &Store, ev: AppEvent) {
                 recording_id: None,
                 // Errors are treated as always-distinct (no dedup).
                 ref_key: String::new(),
+                skip_toast: false,
             };
             (content, meta)
         }
@@ -388,6 +409,7 @@ fn handle(store: &Store, ev: AppEvent) {
                 channel,
                 recording_id: None,
                 ref_key: format!("quality_upgrade:{monitor_id}:{to}"),
+                skip_toast: false,
             };
             (content, meta)
         }
@@ -453,7 +475,7 @@ fn handle(store: &Store, ev: AppEvent) {
     };
     let _ = store.insert_notification(&n);
 
-    if enabled(store) && !dnd_active(store) {
+    if !meta.skip_toast && enabled(store) && !dnd_active(store) {
         show_toast(content);
     }
 }

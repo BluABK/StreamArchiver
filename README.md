@@ -1318,7 +1318,10 @@ independent detectors feeding the same table:
   HKCU-only and refreshed on every launch; to remove it entirely, delete
   `HKCU\Software\Classes\AppUserModelId\BluABK.StreamArchiver`,
   `HKCU\Software\Classes\CLSID\{A4E2B7D1-5C3F-4B8E-9A61-0D2C47F3E9B2}`, and
-  `toast_icon.png` in the app data dir.
+  `toast_icon.png` in the app data dir. When a trigger word starts the
+  recording, only the "⚡ trigger matched" toast pops — the generic "channel
+  is live" toast for that same went-live moment is still logged to the 🔔
+  feed but not shown as a second desktop popup a few seconds later.
 
   ![Notifications window with a mixed feed of events](doc/screenshots/notifications-window.png)
   ![Desktop toast for a channel going live](doc/screenshots/live-toast-notification.png)
