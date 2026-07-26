@@ -1275,46 +1275,56 @@ impl StreamArchiverApp {
                 {
                     *open_sources = true;
                 }
-                let mut hc = self.schedule_collisions;
-                if ui
-                    .checkbox(&mut hc, "Highlight collisions")
-                    .on_hover_text("Flag streams whose scheduled times overlap")
-                    .changed()
-                {
-                    *set_collisions = Some(hc);
-                }
-                let mut compact = self.schedule_compact;
-                if ui
-                    .checkbox(&mut compact, "Compact")
-                    .on_hover_text(
-                        "Collapse Week/Day events to a one-line chip at their start time — \
-                         a quick overview when many streams overlap. Hover a chip for the \
-                         full details.",
-                    )
-                    .changed()
-                {
-                    self.schedule_compact = compact;
-                    let _ = self
-                        .core
-                        .store
-                        .set_setting(K_SCHEDULE_COMPACT, if compact { "1" } else { "0" });
-                }
-                let mut large_avatar = self.schedule_large_avatar;
-                if ui
-                    .checkbox(&mut large_avatar, "Large avatars")
-                    .on_hover_text(
-                        "Draw a bigger channel picture in the body of each non-compact \
-                         Week/Day event block — full size when there's room, shrunk to \
-                         fit on a narrow block, never enlarged past the source image.",
-                    )
-                    .changed()
-                {
-                    self.schedule_large_avatar = large_avatar;
-                    let _ = self
-                        .core
-                        .store
-                        .set_setting(K_SCHEDULE_LARGE_AVATAR, if large_avatar { "1" } else { "0" });
-                }
+                // ── ⋯ Display: the calendar's display toggles, collapsed into
+                // one dropdown — three checkboxes plus zoom/refresh/Sources
+                // and the date range/heading all fighting for the same row
+                // used to overlap at anything but a wide window. Stays open
+                // on toggle clicks (same "⋯ Display" pattern the main top bar
+                // already uses for its own overflow toggles). ──
+                ui.menu_button("⋯", |ui| {
+                    let mut hc = self.schedule_collisions;
+                    if ui
+                        .checkbox(&mut hc, "Highlight collisions")
+                        .on_hover_text("Flag streams whose scheduled times overlap")
+                        .changed()
+                    {
+                        *set_collisions = Some(hc);
+                    }
+                    let mut compact = self.schedule_compact;
+                    if ui
+                        .checkbox(&mut compact, "Compact")
+                        .on_hover_text(
+                            "Collapse Week/Day events to a one-line chip at their start time — \
+                             a quick overview when many streams overlap. Hover a chip for the \
+                             full details.",
+                        )
+                        .changed()
+                    {
+                        self.schedule_compact = compact;
+                        let _ = self
+                            .core
+                            .store
+                            .set_setting(K_SCHEDULE_COMPACT, if compact { "1" } else { "0" });
+                    }
+                    let mut large_avatar = self.schedule_large_avatar;
+                    if ui
+                        .checkbox(&mut large_avatar, "Large avatars")
+                        .on_hover_text(
+                            "Draw a bigger channel picture in the body of each non-compact \
+                             Week/Day event block — full size when there's room, shrunk to \
+                             fit on a narrow block, never enlarged past the source image.",
+                        )
+                        .changed()
+                    {
+                        self.schedule_large_avatar = large_avatar;
+                        let _ = self
+                            .core
+                            .store
+                            .set_setting(K_SCHEDULE_LARGE_AVATAR, if large_avatar { "1" } else { "0" });
+                    }
+                })
+                .response
+                .on_hover_text("Display options: collisions, Compact, Large avatars");
                 if self.schedule_collisions && collisions_in_view > 0 {
                     ui.colored_label(HL_COLLISION, format!("⚠ {collisions_in_view}"))
                         .on_hover_text("Overlapping streams in view");

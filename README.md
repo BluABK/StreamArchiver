@@ -2163,24 +2163,28 @@ YouTube sources as the Next stream column) in a calendar, with **Month**, **Week
   automatic palette. Every schedule surface — event blocks, month chips,
   agenda stripes, day lists, the sidebar legend — resolves through this one
   map, so an event is recognizable by color across views.
-- **Highlight collisions** (on by default) flags with a `⚠` any streams whose
-  times overlap — handy for spotting clashes across channels. YouTube upcoming
-  streams carry no end time, so they're treated as two hours long for the overlap
-  check. The header shows how many overlapping streams are visible in the current
-  view.
-- **Compact** (header checkbox, persisted): collapses every Week/Day event
-  block to a **one-line chip at its start time** (`HH:MM Channel — Title`)
-  instead of a duration-height block — a quick at-a-glance overview when many
-  overlapping streams would otherwise shred the columns into slivers. Chips
-  only split into side-by-side lanes when *start times* land within the same
-  chip, not for the whole real duration; hover any chip for the full details.
-- **Large avatars** (header checkbox, persisted): draws a bigger channel
-  picture in the body of each non-compact Week/Day event block, below its
-  text — full size (the source profile pic's own resolution) when there's
-  room, shrunk to fit a narrow or short block, never enlarged past the
-  source image. Uses a sharper source than the small inline icon above,
-  since it's shown much bigger. Off by default; has no effect in Compact
-  mode (a one-line chip has no body to put it in).
+- **⋯ Display** (header dropdown) holds three persisted toggles, collapsed
+  into one menu so the header doesn't fight the date/heading for room:
+  - **Highlight collisions** (on by default) flags with a `⚠` any streams
+    whose times overlap — handy for spotting clashes across channels.
+    YouTube upcoming streams carry no end time, so they're treated as two
+    hours long for the overlap check. A count of overlapping streams
+    visible in the current view stays shown in the header itself (not
+    inside the menu) whenever it's non-zero.
+  - **Compact** collapses every Week/Day event block to a **one-line chip
+    at its start time** (`HH:MM Channel — Title`) instead of a
+    duration-height block — a quick at-a-glance overview when many
+    overlapping streams would otherwise shred the columns into slivers.
+    Chips only split into side-by-side lanes when *start times* land
+    within the same chip, not for the whole real duration; hover any chip
+    for the full details.
+  - **Large avatars** draws a bigger channel picture in the body of each
+    non-compact Week/Day event block, below its text — full size (the
+    source profile pic's own resolution) when there's room, shrunk to fit
+    a narrow or short block, never enlarged past the source image. Uses a
+    sharper source than the small inline icon, since it's shown much
+    bigger. Off by default; has no effect in Compact mode (a one-line chip
+    has no body to put it in).
 - **Auto-record tint**: an event whose instance isn't set to **Auto** (the
   Streams grid's Auto column) is dimmed on every surface — Month/Week/Day
   blocks, chips, the Agenda list, the day popup — so it's obvious at a
