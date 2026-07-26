@@ -2296,12 +2296,25 @@ impl StreamArchiverApp {
             egui::ViewportId::from_hash_of("monitor_form_vp"),
             egui::ViewportBuilder::default()
                 .with_title(title.to_string())
-                .with_inner_size([700.0, 600.0]),
+                .with_inner_size([820.0, 760.0]),
             |ctx, _class| {
                 if ctx.input(|i| i.viewport().close_requested()) {
                     open = false;
                 }
+                egui::TopBottomPanel::bottom("monitor_form_bottom_bar").show(ctx, |ui| {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            do_save = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
+                    ui.add_space(4.0);
+                });
                 egui::CentralPanel::default().show(ctx, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 let form = self.form.as_mut().unwrap();
                 let platform = Platform::detect(&form.url);
                 // When the URL's platform changes, re-apply that platform's
@@ -2426,270 +2439,300 @@ impl StreamArchiverApp {
                         );
                         ui.end_row();
 
-                        ui.label("Log chat");
-                        ui.checkbox(&mut form.chat_log, "").on_hover_text(
-                            "Save chat alongside the recording. Twitch: a built-in \
-                             anonymous chat logger writes a .chat.jsonl sidecar. YouTube \
-                             (yt-dlp tool): yt-dlp's live_chat writes a .live_chat.json \
-                             sidecar. Other platforms/tools don't capture chat.",
-                        );
-                        ui.end_row();
+                    });
 
-                        ui.label("Fetch thumbnail");
-                        ui.checkbox(&mut form.fetch_thumbnail, "").on_hover_text(
-                            "Download the stream thumbnail alongside the recording \
-                             ({stem}.thumbnail.jpg). For yt-dlp, passes --write-thumbnail; \
-                             for Twitch/Kick/YouTube, fetches the URL from detection metadata.",
-                        );
-                        ui.end_row();
-
-                        ui.label("Thumbnail in notification");
-                        ui.add_enabled(
-                            form.fetch_thumbnail,
-                            egui::Checkbox::new(&mut form.thumbnail_in_toast, ""),
-                        ).on_hover_text(
-                            "Use the stream thumbnail as the hero image in the \
-                             recording-started notification (instead of the channel's \
-                             static banner). Most useful for YouTube, where each stream \
-                             has a unique thumbnail. Requires \"Fetch thumbnail\" to be on.",
-                        );
-                        ui.end_row();
-
-                        ui.label("Fetch chat assets");
-                        ui.checkbox(&mut form.fetch_chat_assets, "").on_hover_text(
-                            "Download channel icon, offline banner, Twitch badges, and \
-                             emotes (including BTTV, FFZ, 7TV) into channel_assets/ \
-                             alongside recordings. Needed for full offline chat replay. \
-                             Refreshed at most once per 24 hours.",
-                        );
-                        ui.end_row();
-
-                        ui.label("Capture from start");
-                        ui.checkbox(&mut form.capture_from_start, "").on_hover_text(
-                            "yt-dlp --live-from-start / streamlink --hls-live-restart",
-                        );
-                        ui.end_row();
-
-                        if Platform::detect(&form.url) == Platform::YouTube {
-                            ui.label("Dual capture (SABR + DASH)");
-                            ui.checkbox(&mut form.dual_capture, "").on_hover_text(
-                                "YouTube only: also run a second concurrent DASH capture \
-                                 (system yt-dlp, live edge) when wanted formats span both SABR \
-                                 and DASH. Produces a second recording in the same take. \
-                                 Needs Capture-from-start and a configured SABR build.",
-                            );
-                            ui.end_row();
-
-                            ui.label("Video codec / quality");
-                            egui::ComboBox::from_id_salt("form_sabr_codec_pref")
-                                .selected_text(form.sabr_codec_pref.label())
-                                .show_ui(ui, |ui| {
-                                    for &p in &SabrCodecPref::ALL {
-                                        ui.selectable_value(
-                                            &mut form.sabr_codec_pref,
-                                            p,
-                                            p.label(),
-                                        );
-                                    }
-                                })
-                                .response
-                                .on_hover_text(
-                                    "SABR video codec/quality for this instance. Inherit follows \
-                                     the global default in Settings. Best-quality/H.264 avoid the \
-                                     lower-bitrate VP9/AV1 rendition of the same resolution.",
-                                );
-                            ui.end_row();
-                            if form.sabr_codec_pref == SabrCodecPref::Custom {
-                                ui.label("Custom -S sort");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut form.sabr_codec_custom)
-                                        .hint_text("res,fps,vcodec:h264")
-                                        .desired_width(f32::INFINITY),
-                                )
-                                .on_hover_text(
-                                    "Raw yt-dlp -S format-sort. Lead with res,fps so \
-                                     resolution/fps win and codec/bitrate is only the tiebreak.",
+                ui.add_space(4.0);
+                // Two side-by-side grids instead of one long single-column
+                // list — this section alone used to be ~20 rows tall; most of
+                // it is short checkboxes/combos that don't need the full
+                // dialog width, so splitting them cuts the window's overall
+                // height roughly in half instead of relying on the user to
+                // resize/scroll through a wall of toggles.
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| {
+                        egui::Grid::new("form_grid_toggles_left")
+                            .num_columns(2)
+                            .spacing([12.0, 8.0])
+                            .show(ui, |ui| {
+                                ui.label("Log chat");
+                                ui.checkbox(&mut form.chat_log, "").on_hover_text(
+                                    "Save chat alongside the recording. Twitch: a built-in \
+                                     anonymous chat logger writes a .chat.jsonl sidecar. YouTube \
+                                     (yt-dlp tool): yt-dlp's live_chat writes a .live_chat.json \
+                                     sidecar. Other platforms/tools don't capture chat.",
                                 );
                                 ui.end_row();
-                            }
-                        }
 
-                        ui.label("Ad-free");
-                        ui.checkbox(&mut form.ad_free, "").on_hover_text(
-                            "Mark this instance ad-free for your account (YouTube \
-                             membership/Premium, Twitch Turbo/sub) so captures won't have \
-                             ad-break hard cuts. For Twitch with a connected account, sub \
-                             status is also detected automatically.",
-                        );
-                        ui.end_row();
+                                ui.label("Fetch thumbnail");
+                                ui.checkbox(&mut form.fetch_thumbnail, "").on_hover_text(
+                                    "Download the stream thumbnail alongside the recording \
+                                     ({stem}.thumbnail.jpg). For yt-dlp, passes --write-thumbnail; \
+                                     for Twitch/Kick/YouTube, fetches the URL from detection metadata.",
+                                );
+                                ui.end_row();
 
-                        ui.label("Download VOD after end");
-                        tristate_combo(ui, "form_vod_download", &mut form.vod_download)
-                            .on_hover_text(
-                                "Download the platform's published VOD after this instance's \
-                                 stream ends. Inherit follows the channel, then the global default.",
-                            );
-                        ui.end_row();
+                                ui.label("Thumbnail in notification");
+                                ui.add_enabled(
+                                    form.fetch_thumbnail,
+                                    egui::Checkbox::new(&mut form.thumbnail_in_toast, ""),
+                                ).on_hover_text(
+                                    "Use the stream thumbnail as the hero image in the \
+                                     recording-started notification (instead of the channel's \
+                                     static banner). Most useful for YouTube, where each stream \
+                                     has a unique thumbnail. Requires \"Fetch thumbnail\" to be on.",
+                                );
+                                ui.end_row();
 
-                        ui.label("Replace with VOD");
-                        tristate_combo(ui, "form_vod_replace", &mut form.vod_replace)
-                            .on_hover_text(
-                                "Replace the live recording with the downloaded VOD when it \
-                                 succeeds (never for a muted Twitch VOD). Inherit follows the \
-                                 channel, then the global default.",
-                            );
-                        ui.end_row();
+                                ui.label("Fetch chat assets");
+                                ui.checkbox(&mut form.fetch_chat_assets, "").on_hover_text(
+                                    "Download channel icon, offline banner, Twitch badges, and \
+                                     emotes (including BTTV, FFZ, 7TV) into channel_assets/ \
+                                     alongside recordings. Needed for full offline chat replay. \
+                                     Refreshed at most once per 24 hours.",
+                                );
+                                ui.end_row();
 
-                        ui.label("Fetch new head backfill on new take");
-                        tristate_combo(ui, "form_head_backfill_fetch", &mut form.head_backfill_fetch)
-                            .on_hover_text(
-                                "Capture-from-start only: fetch a fresh head backfill for a retake \
-                                 (reconnect mid-broadcast), not just the stream's first take. \
-                                 Inherit follows the channel, then the global default.",
-                            );
-                        ui.end_row();
+                                ui.label("Capture from start");
+                                ui.checkbox(&mut form.capture_from_start, "").on_hover_text(
+                                    "yt-dlp --live-from-start / streamlink --hls-live-restart",
+                                );
+                                ui.end_row();
 
-                        ui.label("Replace old head (if new is undamaged)");
-                        tristate_combo(ui, "form_head_backfill_replace", &mut form.head_backfill_replace)
-                            .on_hover_text(
-                                "Once a fresh head backfill passes its integrity checks, delete \
-                                 older takes' now-redundant head files for the same stream. Only \
-                                 takes effect when fetching a new head is also on. Inherit follows \
-                                 the channel, then the global default.",
-                            );
-                        ui.end_row();
+                                if Platform::detect(&form.url) == Platform::YouTube {
+                                    ui.label("Dual capture (SABR + DASH)");
+                                    ui.checkbox(&mut form.dual_capture, "").on_hover_text(
+                                        "YouTube only: also run a second concurrent DASH capture \
+                                         (system yt-dlp, live edge) when wanted formats span both SABR \
+                                         and DASH. Produces a second recording in the same take. \
+                                         Needs Capture-from-start and a configured SABR build.",
+                                    );
+                                    ui.end_row();
 
-                        ui.label("After full.mkv join");
-                        join_cleanup_combo(ui, "form_join_cleanup", &mut form.join_cleanup)
-                            .on_hover_text(
-                                "Once a verified full.mkv (head + live capture joined) lands for \
-                                 a take of this instance: keep both parts (safe, doubles the \
-                                 stream's disk cost), delete just the head, or delete both parts \
-                                 (the take then points at the full). Deletions follow the \
-                                 deletion method below. Inherit follows the channel, then the \
-                                 global default (Settings → Downloads → Automatic deletion).",
-                            );
-                        ui.end_row();
+                                    ui.label("Video codec / quality");
+                                    egui::ComboBox::from_id_salt("form_sabr_codec_pref")
+                                        .selected_text(form.sabr_codec_pref.label())
+                                        .show_ui(ui, |ui| {
+                                            for &p in &SabrCodecPref::ALL {
+                                                ui.selectable_value(
+                                                    &mut form.sabr_codec_pref,
+                                                    p,
+                                                    p.label(),
+                                                );
+                                            }
+                                        })
+                                        .response
+                                        .on_hover_text(
+                                            "SABR video codec/quality for this instance. Inherit follows \
+                                             the global default in Settings. Best-quality/H.264 avoid the \
+                                             lower-bitrate VP9/AV1 rendition of the same resolution.",
+                                        );
+                                    ui.end_row();
+                                    if form.sabr_codec_pref == SabrCodecPref::Custom {
+                                        ui.label("Custom -S sort");
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut form.sabr_codec_custom)
+                                                .hint_text("res,fps,vcodec:h264")
+                                                .desired_width(180.0),
+                                        )
+                                        .on_hover_text(
+                                            "Raw yt-dlp -S format-sort. Lead with res,fps so \
+                                             resolution/fps win and codec/bitrate is only the tiebreak.",
+                                        );
+                                        ui.end_row();
+                                    }
+                                }
 
-                        ui.label("Automatic deletes go to");
-                        disposal_method_combo(ui, "form_disposal_method", &mut form.disposal_method)
-                            .on_hover_text(
-                                "How automatic media deletions for this instance are executed \
-                                 (post-join cleanup, superseded heads, a live capture replaced \
-                                 by its VOD): moved to the configured trash folder, sent to the \
-                                 Recycle Bin, or deleted permanently. Inherit follows the \
-                                 channel, then the global default.",
-                            );
-                        ui.end_row();
+                                ui.label("Ad-free");
+                                ui.checkbox(&mut form.ad_free, "").on_hover_text(
+                                    "Mark this instance ad-free for your account (YouTube \
+                                     membership/Premium, Twitch Turbo/sub) so captures won't have \
+                                     ad-break hard cuts. For Twitch with a connected account, sub \
+                                     status is also detected automatically.",
+                                );
+                                ui.end_row();
 
-                        ui.label("Embed chapters");
-                        tristate_combo(ui, "form_chapters_enabled", &mut form.chapters_enabled)
-                            .on_hover_text(
-                                "Embed chapter markers (title/category changes, raids, \
-                                 recovered/muted gap-splice segments) into finalized recordings \
-                                 for this instance. Inherit follows the channel, then the global \
-                                 default (Settings → Downloads → Chapters).",
-                            );
-                        ui.end_row();
+                                ui.label("Pin as preferred platform");
+                                ui.checkbox(&mut form.primary_pin, "").on_hover_text(
+                                    "Always show THIS instance's info on the channel row while it's \
+                                     live, even if a sibling instance (another platform) went live \
+                                     earlier or the channel/global preference points elsewhere — the \
+                                     strongest of the three preference tiers.",
+                                );
+                                ui.end_row();
 
-                        ui.label("Title/game coalesce window (s)");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut form.chapters_coalesce_secs)
-                                .desired_width(80.0)
-                                .hint_text("Inherit"),
-                        )
-                        .on_hover_text(
-                            "How many seconds apart a title change and a category/game change \
-                             may land and still merge into one chapter, for this instance. Blank \
-                             inherits the channel, then the global default (Settings → Downloads \
-                             → Chapters).",
-                        );
-                        ui.end_row();
+                                ui.label("Enabled");
+                                ui.checkbox(&mut form.automation_enabled, "")
+                                    .on_hover_text(
+                                        "Master switch (same as the Enabled column). Off = fully \
+                                         dormant: no detection, recording, or asset/about/posts/schedule \
+                                         fetch until you act manually (▶ Start, ⟳ Refetch). Independent \
+                                         from Auto below.",
+                                    );
+                                ui.end_row();
 
-                        ui.label("Auto-record my raids");
-                        tristate_combo(ui, "form_follow_my_raids", &mut form.follow_my_raids)
-                            .on_hover_text(
-                                "When this instance raids out to another Twitch channel, \
-                                 auto-record the target (Settings → Follow raid). Inherit \
-                                 follows the channel, then the global default there — off unless \
-                                 you've turned it on. Independent of \"Auto-play my raids\" below.",
-                            );
-                        ui.end_row();
+                                ui.label("Auto");
+                                ui.checkbox(&mut form.enabled, "")
+                                    .on_hover_text(
+                                        "Auto-record: automatically record to disk when this channel \
+                                         goes live (a disk-space control; same as the Auto column). It \
+                                         does NOT gate detection, metadata, posts, schedules or assets — \
+                                         those run while the channel is Enabled. Recording only starts \
+                                         automatically when this is on; otherwise press ▶ yourself, or a \
+                                         trigger word matches the live title/game.",
+                                    );
+                                ui.end_row();
+                            });
+                    });
+                    ui.add_space(24.0);
+                    ui.vertical(|ui| {
+                        egui::Grid::new("form_grid_toggles_right")
+                            .num_columns(2)
+                            .spacing([12.0, 8.0])
+                            .show(ui, |ui| {
+                                ui.label("Download VOD after end");
+                                tristate_combo(ui, "form_vod_download", &mut form.vod_download)
+                                    .on_hover_text(
+                                        "Download the platform's published VOD after this instance's \
+                                         stream ends. Inherit follows the channel, then the global default.",
+                                    );
+                                ui.end_row();
 
-                        ui.label("Auto-play my raids");
-                        tristate_combo(ui, "form_follow_my_raids_play", &mut form.follow_my_raids_play)
-                            .on_hover_text(
-                                "When this instance raids out to another Twitch channel, \
-                                 auto-open the target at the live edge in your media player — no \
-                                 recording, same as the manual \"▷🏃 Follow raid\" button but \
-                                 automatic (Settings → Follow raid). Inherit follows the channel, \
-                                 then the global default. Independent of \"Auto-record my raids\" \
-                                 above.",
-                            );
-                        ui.end_row();
+                                ui.label("Replace with VOD");
+                                tristate_combo(ui, "form_vod_replace", &mut form.vod_replace)
+                                    .on_hover_text(
+                                        "Replace the live recording with the downloaded VOD when it \
+                                         succeeds (never for a muted Twitch VOD). Inherit follows the \
+                                         channel, then the global default.",
+                                    );
+                                ui.end_row();
 
-                        ui.label("Record me when I'm a raid target");
-                        tristate_combo(
-                            ui,
-                            "form_raid_target_record",
-                            &mut form.record_me_as_raid_target,
-                        )
-                        .on_hover_text(
-                            "Whether Follow raid may auto-RECORD this instance when a followed \
-                             raid lands on it. Always/Never override the \"skip disabled raid \
-                             targets\" default too — set this to Always if you want this \
-                             instance recorded via a raid even while its master switch is off. \
-                             Inherit follows the channel, then the global default (Settings → \
-                             Follow raid).",
-                        );
-                        ui.end_row();
+                                ui.label("Fetch new head backfill on new take");
+                                tristate_combo(ui, "form_head_backfill_fetch", &mut form.head_backfill_fetch)
+                                    .on_hover_text(
+                                        "Capture-from-start only: fetch a fresh head backfill for a retake \
+                                         (reconnect mid-broadcast), not just the stream's first take. \
+                                         Inherit follows the channel, then the global default.",
+                                    );
+                                ui.end_row();
 
-                        ui.label("Exclude from auto-play");
-                        tristate_combo(
-                            ui,
-                            "form_raid_play_exclude",
-                            &mut form.exclude_from_auto_play,
-                        )
-                        .on_hover_text(
-                            "Set to Always to make sure this instance never gets an auto-opened \
-                             player when a followed raid lands on it. Unlike the record-side \
-                             setting above, auto-play otherwise ignores this instance's disabled \
-                             state entirely — this is the only way to opt it out. Inherit/Never \
-                             both mean \"allowed\".",
-                        );
-                        ui.end_row();
+                                ui.label("Replace old head (if new is undamaged)");
+                                tristate_combo(ui, "form_head_backfill_replace", &mut form.head_backfill_replace)
+                                    .on_hover_text(
+                                        "Once a fresh head backfill passes its integrity checks, delete \
+                                         older takes' now-redundant head files for the same stream. Only \
+                                         takes effect when fetching a new head is also on. Inherit follows \
+                                         the channel, then the global default.",
+                                    );
+                                ui.end_row();
 
-                        ui.label("Pin as preferred platform");
-                        ui.checkbox(&mut form.primary_pin, "").on_hover_text(
-                            "Always show THIS instance's info on the channel row while it's \
-                             live, even if a sibling instance (another platform) went live \
-                             earlier or the channel/global preference points elsewhere — the \
-                             strongest of the three preference tiers.",
-                        );
-                        ui.end_row();
+                                ui.label("After full.mkv join");
+                                join_cleanup_combo(ui, "form_join_cleanup", &mut form.join_cleanup)
+                                    .on_hover_text(
+                                        "Once a verified full.mkv (head + live capture joined) lands for \
+                                         a take of this instance: keep both parts (safe, doubles the \
+                                         stream's disk cost), delete just the head, or delete both parts \
+                                         (the take then points at the full). Deletions follow the \
+                                         deletion method below. Inherit follows the channel, then the \
+                                         global default (Settings → Downloads → Automatic deletion).",
+                                    );
+                                ui.end_row();
 
-                        ui.label("Enabled");
-                        ui.checkbox(&mut form.automation_enabled, "")
-                            .on_hover_text(
-                                "Master switch (same as the Enabled column). Off = fully \
-                                 dormant: no detection, recording, or asset/about/posts/schedule \
-                                 fetch until you act manually (▶ Start, ⟳ Refetch). Independent \
-                                 from Auto below.",
-                            );
-                        ui.end_row();
+                                ui.label("Automatic deletes go to");
+                                disposal_method_combo(ui, "form_disposal_method", &mut form.disposal_method)
+                                    .on_hover_text(
+                                        "How automatic media deletions for this instance are executed \
+                                         (post-join cleanup, superseded heads, a live capture replaced \
+                                         by its VOD): moved to the configured trash folder, sent to the \
+                                         Recycle Bin, or deleted permanently. Inherit follows the \
+                                         channel, then the global default.",
+                                    );
+                                ui.end_row();
 
-                        ui.label("Auto");
-                        ui.checkbox(&mut form.enabled, "")
-                            .on_hover_text(
-                                "Auto-record: automatically record to disk when this channel \
-                                 goes live (a disk-space control; same as the Auto column). It \
-                                 does NOT gate detection, metadata, posts, schedules or assets — \
-                                 those run while the channel is Enabled. Recording only starts \
-                                 automatically when this is on; otherwise press ▶ yourself, or a \
-                                 trigger word matches the live title/game.",
-                            );
-                        ui.end_row();
+                                ui.label("Embed chapters");
+                                tristate_combo(ui, "form_chapters_enabled", &mut form.chapters_enabled)
+                                    .on_hover_text(
+                                        "Embed chapter markers (title/category changes, raids, \
+                                         recovered/muted gap-splice segments) into finalized recordings \
+                                         for this instance. Inherit follows the channel, then the global \
+                                         default (Settings → Downloads → Chapters).",
+                                    );
+                                ui.end_row();
 
+                                ui.label("Title/game coalesce window (s)");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut form.chapters_coalesce_secs)
+                                        .desired_width(80.0)
+                                        .hint_text("Inherit"),
+                                )
+                                .on_hover_text(
+                                    "How many seconds apart a title change and a category/game change \
+                                     may land and still merge into one chapter, for this instance. Blank \
+                                     inherits the channel, then the global default (Settings → Downloads \
+                                     → Chapters).",
+                                );
+                                ui.end_row();
+
+                                ui.label("Auto-record my raids");
+                                tristate_combo(ui, "form_follow_my_raids", &mut form.follow_my_raids)
+                                    .on_hover_text(
+                                        "When this instance raids out to another Twitch channel, \
+                                         auto-record the target (Settings → Follow raid). Inherit \
+                                         follows the channel, then the global default there — off unless \
+                                         you've turned it on. Independent of \"Auto-play my raids\" below.",
+                                    );
+                                ui.end_row();
+
+                                ui.label("Auto-play my raids");
+                                tristate_combo(ui, "form_follow_my_raids_play", &mut form.follow_my_raids_play)
+                                    .on_hover_text(
+                                        "When this instance raids out to another Twitch channel, \
+                                         auto-open the target at the live edge in your media player — no \
+                                         recording, same as the manual \"▷🏃 Follow raid\" button but \
+                                         automatic (Settings → Follow raid). Inherit follows the channel, \
+                                         then the global default. Independent of \"Auto-record my raids\" \
+                                         above.",
+                                    );
+                                ui.end_row();
+
+                                ui.label("Record me when I'm a raid target");
+                                tristate_combo(
+                                    ui,
+                                    "form_raid_target_record",
+                                    &mut form.record_me_as_raid_target,
+                                )
+                                .on_hover_text(
+                                    "Whether Follow raid may auto-RECORD this instance when a followed \
+                                     raid lands on it. Always/Never override the \"skip disabled raid \
+                                     targets\" default too — set this to Always if you want this \
+                                     instance recorded via a raid even while its master switch is off. \
+                                     Inherit follows the channel, then the global default (Settings → \
+                                     Follow raid).",
+                                );
+                                ui.end_row();
+
+                                ui.label("Exclude from auto-play");
+                                tristate_combo(
+                                    ui,
+                                    "form_raid_play_exclude",
+                                    &mut form.exclude_from_auto_play,
+                                )
+                                .on_hover_text(
+                                    "Set to Always to make sure this instance never gets an auto-opened \
+                                     player when a followed raid lands on it. Unlike the record-side \
+                                     setting above, auto-play otherwise ignores this instance's disabled \
+                                     state entirely — this is the only way to opt it out. Inherit/Never \
+                                     both mean \"allowed\".",
+                                );
+                                ui.end_row();
+                            });
+                    });
+                });
+                ui.add_space(4.0);
+
+                egui::Grid::new("form_grid_footer")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
                         ui.label("Auth");
                         egui::ComboBox::from_id_salt("auth_cb")
                             .selected_text(form.auth_kind.label())
@@ -2772,15 +2815,6 @@ impl StreamArchiverApp {
                         ui.text_edit_singleline(&mut form.extra_args);
                         ui.end_row();
                     });
-
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Save").clicked() {
-                        do_save = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        do_cancel = true;
-                    }
                 });
                 });
             },
