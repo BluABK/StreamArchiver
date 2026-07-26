@@ -19,6 +19,7 @@ mod fonts;
 mod google_oauth;
 mod grid_columns;
 mod disposal;
+mod disposal_backfill;
 mod head_backfill;
 mod hls_preview;
 mod hype;

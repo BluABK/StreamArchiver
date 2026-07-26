@@ -450,6 +450,86 @@ impl Store {
         )?;
         Ok(())
     }
+
+    // ----- historical-disposal candidate scans (see `disposal_backfill`) -----
+
+    /// Every completed gap-splice patch that still has a path on record —
+    /// `gap_range.out_path` is never cleared when a patch is later disposed
+    /// (unlike `recording.backfill_path`), so this is an exact trace, not a
+    /// guess. Paired with a disposal-timestamp proxy (the take's `ended_at`,
+    /// falling back to `started_at` for a take that never got one) since the
+    /// actual disposal time isn't recorded anywhere pre-dating the Trash view.
+    pub fn gap_splice_patch_candidates(&self) -> Result<Vec<(i64, GapRangeRow, i64)>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT g.id, g.recording_id, g.start_secs, g.end_secs, g.state,
+                    g.attempts, g.out_path, g.muted_segs,
+                    COALESCE(r.ended_at, r.started_at)
+             FROM gap_range g
+             JOIN recording r ON r.id = g.recording_id
+             WHERE g.state = 'done' AND g.out_path != ''",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                let row = GapRangeRow {
+                    id: r.get(0)?,
+                    recording_id: r.get(1)?,
+                    start_secs: r.get(2)?,
+                    end_secs: r.get(3)?,
+                    state: r.get(4)?,
+                    attempts: r.get(5)?,
+                    out_path: r.get(6)?,
+                    muted_segs: r.get(7)?,
+                };
+                Ok((row.recording_id, row, r.get(8)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Recordings whose live capture was displaced by *Replace with VOD* —
+    /// `(rec_id, current output_path, disposal-timestamp proxy)`. The
+    /// displaced file's exact path is a deterministic transform of
+    /// `output_path` (see `disposal_backfill::vod_backup_path`), following
+    /// the same `.pre-vod.bak` rule `vod::` itself uses, so this is exact,
+    /// not a guess — just not literally read back from a column.
+    pub fn vod_replace_candidates(&self) -> Result<Vec<(i64, String, i64)>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id, COALESCE(output_path, ''), COALESCE(ended_at, started_at)
+             FROM recording
+             WHERE vod_dl_state = 'replaced' AND output_path IS NOT NULL AND output_path != ''",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Recordings whose post-join cleanup disposed the head (and, when
+    /// `output_path == full_path`, the live capture too) —
+    /// `(rec_id, full_path, output_path, disposal-timestamp proxy)`.
+    /// `full_path IS NOT NULL AND backfill_path IS NULL` is a clean signal
+    /// that a join happened AND its head was disposed (the only two call
+    /// sites that null `backfill_path` are this cleanup and "superseded old
+    /// head" — see `clear_recording_backfill_path`'s callers — and a
+    /// superseded recording never reaches `full_path IS NOT NULL` through
+    /// its OWN join by construction). The exact disposed path(s) are only a
+    /// naming-convention guess from `full_path`, though — see
+    /// `disposal_backfill::head_guess_path`/`live_capture_guess_path`.
+    pub fn post_join_head_disposal_candidates(&self) -> Result<Vec<(i64, String, String, i64)>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT id, full_path, COALESCE(output_path, ''), COALESCE(ended_at, started_at)
+             FROM recording
+             WHERE full_path IS NOT NULL AND full_path != '' AND backfill_path IS NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Promote orphaned recordings that have a non-TS final output file to
     /// 'completed'. These are captures where the app crashed after the file was
     /// fully written but before the status column was updated — the content is
@@ -2060,6 +2140,81 @@ mod tests {
         assert!(store.recordings_with_backfill_for_stream(mid, "s1", take3).unwrap().is_empty());
         assert!(!store.recordings_pending_head_concat().unwrap().contains(&take1));
     }
+
+    #[test]
+    fn gap_splice_patch_candidates_only_sees_done_rows_with_a_path() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        let rec = store
+            .insert_recording(mid, 100, "C:/tmp/x.mkv", Some(50), false, Some("s1"), None, "", "")
+            .unwrap();
+        store.finish_recording(rec, 200, 500, Some(0), "completed", "C:/tmp/x.mkv", "").unwrap();
+
+        store.replace_pending_gap_ranges(rec, &[(10.0, 20.0), (30.0, 40.0), (50.0, 60.0)]).unwrap();
+        let pending = store.gap_ranges_in_state(rec, "pending").unwrap();
+        store.set_gap_range_state(pending[0].id, "done", "C:/tmp/x.gap10.mkv", 0).unwrap();
+        store.set_gap_range_state(pending[1].id, "done", "", 0).unwrap(); // done but no path
+        store.set_gap_range_state(pending[2].id, "failed", "C:/tmp/x.gap50.mkv", 0).unwrap();
+
+        let candidates = store.gap_splice_patch_candidates().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, rec);
+        assert_eq!(candidates[0].1.out_path, "C:/tmp/x.gap10.mkv");
+        assert_eq!(candidates[0].2, 200); // ended_at proxy
+    }
+
+    #[test]
+    fn vod_replace_candidates_requires_replaced_state_and_a_path() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        let replaced = store
+            .insert_recording(mid, 100, "C:/tmp/live.mkv", Some(50), false, Some("s1"), None, "", "")
+            .unwrap();
+        store.finish_recording(replaced, 200, 500, Some(0), "completed", "C:/tmp/live.mkv", "").unwrap();
+        store.set_recording_vod_archived(replaced, "C:/tmp/live.mkv", "replaced").unwrap();
+
+        let archived_only = store
+            .insert_recording(mid, 300, "C:/tmp/other.mkv", Some(50), false, Some("s1"), None, "", "")
+            .unwrap();
+        store.set_recording_vod_archived(archived_only, "C:/tmp/other.vod.mkv", "archived").unwrap();
+
+        let candidates = store.vod_replace_candidates().unwrap();
+        assert_eq!(candidates, vec![(replaced, "C:/tmp/live.mkv".to_string(), 200)]);
+    }
+
+    #[test]
+    fn post_join_head_disposal_candidates_needs_full_path_and_null_backfill() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+
+        // Head disposed post-join: full_path set, backfill_path cleared.
+        let disposed = store
+            .insert_recording(mid, 100, "C:/tmp/x.mkv", Some(50), false, Some("s1"), None, "", "")
+            .unwrap();
+        store.finish_recording(disposed, 200, 500, Some(0), "completed", "C:/tmp/x.mkv", "").unwrap();
+        store.set_recording_full_path(disposed, "C:/tmp/x.full.mkv").unwrap();
+
+        // Head kept (cleanup = Keep): full_path set, backfill_path still there.
+        let kept = store
+            .insert_recording(mid, 300, "C:/tmp/y.mkv", Some(50), false, Some("s1"), None, "", "")
+            .unwrap();
+        store.set_recording_backfill_path(kept, "C:/tmp/y.head.mkv").unwrap();
+        store.set_recording_full_path(kept, "C:/tmp/y.full.mkv").unwrap();
+
+        // Never joined at all: no signal either way.
+        let _never_joined = store
+            .insert_recording(mid, 500, "C:/tmp/z.mkv", Some(50), false, Some("s1"), None, "", "")
+            .unwrap();
+
+        let candidates = store.post_join_head_disposal_candidates().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, disposed);
+        assert_eq!(candidates[0].1, "C:/tmp/x.full.mkv");
+    }
+
     #[test]
     fn get_recording_roundtrip() {
         let store = Store::open_in_memory().unwrap();

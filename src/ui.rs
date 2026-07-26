@@ -1374,6 +1374,14 @@ pub struct StreamArchiverApp {
     /// Record id + trash path pending the "Permanently delete" confirmation
     /// dialog (an irreversible action, unlike Restore).
     confirm_permadelete_trash: Option<(i64, String)>,
+    /// True while the "Import history" (`disposal_backfill`) scan is
+    /// running, so the button disables and shows a spinner instead of
+    /// allowing an overlapping second scan.
+    trash_import_running: bool,
+    /// Finished import's summary, posted from a `core.rt.spawn`'d task (a
+    /// background thread) — drained on the UI thread at the top of
+    /// `trash::trash_view` each frame, same shape as `trash_action_done`.
+    trash_import_done: Arc<Mutex<Option<crate::disposal_backfill::BackfillReport>>>,
     vod_info_popup_cache: HashMap<i64, (String, Recording)>,
     /// Recording id whose remux-status popup is open, same caching shape as
     /// `vod_info_popup_cache`.

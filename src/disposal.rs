@@ -58,6 +58,14 @@ pub enum DisposalMethod {
     Recycle,
     /// Delete permanently.
     Delete,
+    /// The method used is genuinely unknown — only produced by the
+    /// historical-import scan (`disposal_backfill`) for a disposal that
+    /// predates the Trash view, where nothing records which of the three
+    /// real methods above was actually configured at the time. Never
+    /// returned by `effective_method`/produced by a live `dispose_media`
+    /// call, and deliberately excluded from `ALL` so it can't appear as a
+    /// choice in Settings.
+    Unknown,
 }
 
 impl DisposalMethod {
@@ -68,6 +76,7 @@ impl DisposalMethod {
             DisposalMethod::Trash => "trash",
             DisposalMethod::Recycle => "recycle",
             DisposalMethod::Delete => "delete",
+            DisposalMethod::Unknown => "unknown",
         }
     }
     pub fn parse(s: &str) -> Option<DisposalMethod> {
@@ -75,6 +84,7 @@ impl DisposalMethod {
             "trash" => Some(DisposalMethod::Trash),
             "recycle" => Some(DisposalMethod::Recycle),
             "delete" => Some(DisposalMethod::Delete),
+            "unknown" => Some(DisposalMethod::Unknown),
             _ => None,
         }
     }
@@ -83,6 +93,7 @@ impl DisposalMethod {
             DisposalMethod::Trash => "Trash folder",
             DisposalMethod::Recycle => "Recycle Bin",
             DisposalMethod::Delete => "Delete permanently",
+            DisposalMethod::Unknown => "Unknown (imported)",
         }
     }
 }
@@ -372,8 +383,53 @@ impl DisposalRecordState {
     }
 }
 
+/// How a disposal record came to exist — lets the Trash view tell a
+/// real-time-logged entry apart from a best-effort entry reconstructed after
+/// the fact (see `disposal_backfill`) for disposals that predate this
+/// feature, where the exact method/timestamp/path can't be known for sure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisposalConfidence {
+    /// Logged by `log_disposal` at the moment `dispose_media` ran it — the
+    /// method, path, and timestamp are all exactly what happened.
+    Live,
+    /// Reconstructed from a DB column that still held the exact original
+    /// path (or a deterministic transform of one, following the same naming
+    /// rule the app itself used to create the file) — verified absent from
+    /// disk before import, but the method and timestamp are unknown/proxied.
+    HistoricalExact,
+    /// Reconstructed from a filename NAMING CONVENTION rather than a column
+    /// that ever literally held this path — same absence verification, but
+    /// the path itself is an educated guess, not a read-back value.
+    HistoricalGuess,
+}
+
+impl DisposalConfidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DisposalConfidence::Live => "live",
+            DisposalConfidence::HistoricalExact => "historical_exact",
+            DisposalConfidence::HistoricalGuess => "historical_guess",
+        }
+    }
+    pub fn parse(s: &str) -> Option<DisposalConfidence> {
+        match s.trim() {
+            "live" => Some(DisposalConfidence::Live),
+            "historical_exact" => Some(DisposalConfidence::HistoricalExact),
+            "historical_guess" => Some(DisposalConfidence::HistoricalGuess),
+            _ => None,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            DisposalConfidence::Live => "Live",
+            DisposalConfidence::HistoricalExact => "Historical (exact path)",
+            DisposalConfidence::HistoricalGuess => "Historical (inferred path)",
+        }
+    }
+}
+
 /// One logged disposal event, as stored in / read from `disposal_record`
-/// (schema v73). `id` is `0` for a row not yet inserted.
+/// (schema v73/v74). `id` is `0` for a row not yet inserted.
 #[derive(Clone, Debug)]
 pub struct DisposalRecordRow {
     pub id: i64,
@@ -392,11 +448,14 @@ pub struct DisposalRecordRow {
     pub state: DisposalRecordState,
     pub disposed_at: i64,
     pub updated_at: i64,
+    pub confidence: DisposalConfidence,
 }
 
 /// Record a completed disposal for the Trash view. Best-effort: a logging
 /// failure must never undo or block the disposal itself, so callers only
-/// warn on error.
+/// warn on error. Always `DisposalConfidence::Live` — this runs at the exact
+/// moment `dispose_media` acted; see `disposal_backfill` for the historical-
+/// import path that produces the other two confidence levels.
 pub fn log_disposal(store: &Store, rec_id: i64, reason: &str, original_path: &Path, disposed: &Disposed) {
     let now = crate::models::now_unix();
     let (method, trash_path, state) = match disposed {
@@ -416,6 +475,7 @@ pub fn log_disposal(store: &Store, rec_id: i64, reason: &str, original_path: &Pa
         state,
         disposed_at: now,
         updated_at: now,
+        confidence: DisposalConfidence::Live,
     };
     if let Err(e) = store.insert_disposal_record(&row) {
         warn!("disposal: failed to log history row for {}: {e:#}", original_path.display());
@@ -589,6 +649,9 @@ pub async fn dispose_media(
         DisposalMethod::Delete => {
             crate::iomon::fs::remove_file(Cat::CacheSweep, path).await?;
             Ok(Disposed::Deleted)
+        }
+        DisposalMethod::Unknown => {
+            unreachable!("Unknown is only ever constructed by disposal_backfill, never resolved by effective_method")
         }
     };
     if let Ok(disposed) = &result {

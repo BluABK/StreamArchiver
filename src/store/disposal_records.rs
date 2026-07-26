@@ -4,7 +4,7 @@
 //! delete actions read one back (`get_disposal_record`), act on the file, then
 //! flip its `state` (`set_disposal_record_state`).
 
-use crate::disposal::{DisposalMethod, DisposalRecordRow, DisposalRecordState};
+use crate::disposal::{DisposalConfidence, DisposalMethod, DisposalRecordRow, DisposalRecordState};
 
 use super::*;
 
@@ -30,8 +30,8 @@ impl Store {
         conn.execute(
             "INSERT INTO disposal_record(
                  rec_id, reason, method, original_path, trash_path, state,
-                 disposed_at, updated_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                 disposed_at, updated_at, confidence)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
                 row.rec_id,
                 row.reason,
@@ -41,6 +41,7 @@ impl Store {
                 row.state.as_str(),
                 row.disposed_at,
                 row.updated_at,
+                row.confidence.as_str(),
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -49,6 +50,7 @@ impl Store {
     fn row_from(r: &rusqlite::Row) -> rusqlite::Result<DisposalRecordRow> {
         let method: String = r.get(2)?;
         let state: String = r.get(5)?;
+        let confidence: String = r.get(9)?;
         Ok(DisposalRecordRow {
             id: r.get(0)?,
             rec_id: r.get(1)?,
@@ -59,6 +61,7 @@ impl Store {
             state: DisposalRecordState::parse(&state).unwrap_or(DisposalRecordState::Permanent),
             disposed_at: r.get(7)?,
             updated_at: r.get(8)?,
+            confidence: DisposalConfidence::parse(&confidence).unwrap_or(DisposalConfidence::Live),
         })
     }
 
@@ -66,13 +69,25 @@ impl Store {
         let conn = self.db();
         conn.query_row(
             "SELECT id, rec_id, method, reason, original_path, state, trash_path,
-                    disposed_at, updated_at
+                    disposed_at, updated_at, confidence
              FROM disposal_record WHERE id=?1",
             params![id],
             Self::row_from,
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// `(rec_id, reason)` pairs already logged — the historical-import scan
+    /// (`disposal_backfill`) skips any candidate matching one of these, so
+    /// re-running the scan never duplicates an entry.
+    pub fn disposal_record_keys(&self) -> Result<std::collections::HashSet<(i64, String)>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare("SELECT rec_id, reason FROM disposal_record")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<std::collections::HashSet<(i64, String)>>>()?;
+        Ok(rows)
     }
 
     /// Flip a record's state (restore / permanently-delete). `trash_path`:
@@ -107,7 +122,7 @@ impl Store {
         let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT d.id, d.rec_id, d.method, d.reason, d.original_path, d.state,
-                    d.trash_path, d.disposed_at, d.updated_at,
+                    d.trash_path, d.disposed_at, d.updated_at, d.confidence,
                     c.id, c.name, r.started_at
              FROM disposal_record d
              LEFT JOIN recording r ON r.id = d.rec_id
@@ -119,9 +134,9 @@ impl Store {
             .query_map([], |r| {
                 Ok(DisposalRecordDisplay {
                     row: Self::row_from(r)?,
-                    channel_id: r.get(9)?,
-                    channel_name: r.get::<_, Option<String>>(10)?.unwrap_or_default(),
-                    take_started_at: r.get(11)?,
+                    channel_id: r.get(10)?,
+                    channel_name: r.get::<_, Option<String>>(11)?.unwrap_or_default(),
+                    take_started_at: r.get(12)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -144,6 +159,7 @@ mod tests {
             state,
             disposed_at: 1_000,
             updated_at: 1_000,
+            confidence: DisposalConfidence::Live,
         }
     }
 
@@ -191,5 +207,26 @@ mod tests {
         assert_eq!(list[1].row.disposed_at, 1_000);
         assert!(list[0].channel_id.is_none());
         assert_eq!(list[0].channel_name, "");
+    }
+
+    #[test]
+    fn confidence_round_trips_and_defaults_live() {
+        let store = Store::open_in_memory().unwrap();
+        let mut historical = sample(5, DisposalRecordState::Permanent);
+        historical.confidence = DisposalConfidence::HistoricalGuess;
+        let id = store.insert_disposal_record(&historical).unwrap();
+        assert_eq!(store.get_disposal_record(id).unwrap().unwrap().confidence, DisposalConfidence::HistoricalGuess);
+
+        let live_id = store.insert_disposal_record(&sample(6, DisposalRecordState::Permanent)).unwrap();
+        assert_eq!(store.get_disposal_record(live_id).unwrap().unwrap().confidence, DisposalConfidence::Live);
+    }
+
+    #[test]
+    fn disposal_record_keys_reflects_existing_rows() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert_disposal_record(&sample(1, DisposalRecordState::Permanent)).unwrap();
+        let keys = store.disposal_record_keys().unwrap();
+        assert!(keys.contains(&(1, "post-join cleanup: head".to_string())));
+        assert!(!keys.contains(&(2, "post-join cleanup: head".to_string())));
     }
 }

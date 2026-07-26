@@ -534,7 +534,20 @@ to where it lived) and **🗑 Permanently delete** (asks for confirmation, then
 removes it for good). Recycle Bin and permanent-delete rows are history only —
 Windows owns Recycle Bin recovery, and a permanent delete has nothing left to
 act on. Every row also has **▶ Open file** / **📂 Open folder**, enabled only
-while the shown path still exists on disk.
+while the shown path still exists on disk. A **Source** column marks each row
+**Live** (logged the instant it happened — exact method/path/time), or, from
+the **⤵ Import history** button, one of two backfilled tiers for disposals
+that predate this view: **Historical (exact path)** (gap-splice patches, VOD
+-replace backups — read from a DB column that still held the real path) or
+**Historical (inferred path)** (post-join head/live cleanup — guessed from the
+`{stem}.head.mkv` naming convention, since the DB pointer was cleared).
+Historical rows only import once their file is confirmed gone from a
+currently-reachable drive, are always read-only (no Restore/Permanently
+delete — the method and exact time are unknown), and re-running the import is
+safe — it never duplicates an already-logged row. "Superseded old head"
+disposals are deliberately never backfilled: nothing distinguishes a
+recording whose head was superseded from one that never had a head at all,
+so guessing would flood the view with false positives.
 
 **Manual "🧩 Backfill head."** Right-click an **instance** (targets its latest
 recording) or a specific **take** for a manual, on-demand head backfill —

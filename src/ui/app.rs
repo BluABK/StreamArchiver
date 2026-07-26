@@ -591,6 +591,8 @@ impl StreamArchiverApp {
             trash_action_error: None,
             trash_action_done: Arc::new(Mutex::new(Vec::new())),
             confirm_permadelete_trash: None,
+            trash_import_running: false,
+            trash_import_done: Arc::new(Mutex::new(None)),
             remux_info_popups: Vec::new(),
             remux_info_popup_cache: HashMap::new(),
             schedule_cache: HashMap::new(),

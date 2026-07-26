@@ -1459,7 +1459,23 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 73)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 73);
+        if version < 74 {
+            // Distinguishes a disposal logged live (`disposal::log_disposal`,
+            // at the exact moment it happened) from one reconstructed after
+            // the fact by the one-time historical-import scan
+            // (`disposal_backfill::run_historical_backfill`) for disposals
+            // that predate the Trash view — where the method and exact
+            // timestamp are unknowable and the path is either read back
+            // verbatim from a DB column that survived ("historical_exact")
+            // or inferred from a filename naming convention
+            // ("historical_guess"). Default 'live' backfills every existing
+            // row correctly, since the Trash view didn't exist before v73.
+            conn.execute_batch(
+                "ALTER TABLE disposal_record ADD COLUMN confidence TEXT NOT NULL DEFAULT 'live';",
+            )?;
+            conn.pragma_update(None, "user_version", 74)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 74);
         Ok(())
     }
 }

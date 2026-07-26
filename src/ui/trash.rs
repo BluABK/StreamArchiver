@@ -45,6 +45,38 @@ impl StreamArchiverApp {
         self.reload_trash();
     }
 
+    /// Drain a finished "Import history" scan (see `spawn_trash_import`) and
+    /// surface its summary in the status bar.
+    fn drain_trash_import_result(&mut self) {
+        let Some(report) = self.trash_import_done.lock().unwrap().take() else {
+            return;
+        };
+        self.trash_import_running = false;
+        self.status = report.summarize();
+        if report.imported_total() > 0 {
+            self.reload_trash();
+        }
+    }
+
+    /// One-time scan reconstructing best-effort Trash entries for disposals
+    /// that predate this feature (`disposal_backfill::run_historical_backfill`).
+    /// Runs on a blocking thread — it does many small `stat` calls on top of
+    /// the DB reads, same reasoning as any other bulk `Store` scan.
+    fn spawn_trash_import(&mut self, ctx: &egui::Context) {
+        self.trash_import_running = true;
+        let store = self.core.store.clone();
+        let done = self.trash_import_done.clone();
+        let ctx = ctx.clone();
+        self.core.rt.spawn(async move {
+            let report =
+                tokio::task::spawn_blocking(move || crate::disposal_backfill::run_historical_backfill(&store))
+                    .await
+                    .unwrap_or_default();
+            *done.lock().unwrap() = Some(report);
+            ctx.request_repaint();
+        });
+    }
+
     fn spawn_trash_restore(&mut self, ctx: &egui::Context, id: i64) {
         self.trash_action_pending.insert(id);
         let store = self.core.store.clone();
@@ -76,6 +108,7 @@ impl StreamArchiverApp {
     pub(super) fn trash_view(&mut self, ui: &mut egui::Ui) {
         self.ensure_trash_loaded();
         self.drain_trash_action_results();
+        self.drain_trash_import_result();
 
         if let Some(err) = self.trash_action_error.clone() {
             ui.horizontal(|ui| {
@@ -100,6 +133,25 @@ impl StreamArchiverApp {
                 .clicked()
             {
                 self.reload_trash();
+            }
+            ui.separator();
+            let ctx = ui.ctx().clone();
+            if ui
+                .add_enabled(!self.trash_import_running, egui::Button::new("⤵ Import history"))
+                .on_hover_text(
+                    "One-time scan for disposals that happened before this view existed — \
+                     reconstructed from surviving DB traces (gap-splice patch paths, VOD-replace \
+                     backups) and, for post-join head/live cleanup, a filename-naming guess. \
+                     Only imports a candidate whose file is confirmed gone from disk on a \
+                     currently-reachable drive. Imported rows show as read-only history \
+                     (method/exact time unknown) — safe to re-run any time.",
+                )
+                .clicked()
+            {
+                self.spawn_trash_import(&ctx);
+            }
+            if self.trash_import_running {
+                ui.spinner();
             }
         });
         ui.add_space(6.0);
@@ -160,7 +212,7 @@ impl StreamArchiverApp {
                     .default_open(true)
                     .show(ui, |ui| {
                         egui::Grid::new(("trash_grid", *cid))
-                            .num_columns(6)
+                            .num_columns(7)
                             .striped(true)
                             .spacing([10.0, 4.0])
                             .show(ui, |ui| {
@@ -168,6 +220,7 @@ impl StreamArchiverApp {
                                 ui.strong("Reason");
                                 ui.strong("Method");
                                 ui.strong("State");
+                                ui.strong("Source");
                                 ui.strong("Path");
                                 ui.strong("Actions");
                                 ui.end_row();
@@ -194,6 +247,27 @@ impl StreamArchiverApp {
         }
         ui.label(row.method.label());
         ui.label(row.state.label());
+
+        let source_color = match row.confidence {
+            crate::disposal::DisposalConfidence::Live => ui.visuals().text_color(),
+            crate::disposal::DisposalConfidence::HistoricalExact => egui::Color32::from_rgb(200, 170, 90),
+            crate::disposal::DisposalConfidence::HistoricalGuess => egui::Color32::from_rgb(210, 120, 90),
+        };
+        ui.colored_label(source_color, row.confidence.label()).on_hover_text(match row.confidence {
+            crate::disposal::DisposalConfidence::Live => {
+                "Logged the moment this disposal happened — method, path, and time are all exact."
+            }
+            crate::disposal::DisposalConfidence::HistoricalExact => {
+                "Reconstructed by \"Import history\" from a DB column that still held this exact \
+                 path, verified absent from disk. The method and \"When\" time are unknown — \
+                 \"When\" shows the take's end time as a stand-in, not the real disposal time."
+            }
+            crate::disposal::DisposalConfidence::HistoricalGuess => {
+                "Reconstructed by \"Import history\" from a filename naming convention, not a \
+                 stored path — an educated guess, verified absent from disk. The method and \
+                 \"When\" time are unknown — \"When\" shows the take's end time as a stand-in."
+            }
+        });
 
         let current_path: &str = match row.state {
             DisposalRecordState::SoftDeleted => &row.trash_path,
