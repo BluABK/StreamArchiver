@@ -1043,6 +1043,16 @@ pub(super) fn fmt_asset_stamp(asset_dir: &std::path::Path) -> String {
         .unwrap_or_else(|| "never".into())
 }
 
+/// Plain bilinear minification (egui's `LINEAR` default) looks soft/aliased
+/// once a texture is displayed well below its native resolution — exactly
+/// the "Large avatars" schedule feature's normal case (a ~300px source
+/// shrunk to fit a calendar block). Mipmapping is the standard fix (a
+/// properly pre-filtered smaller level instead of one bilinear tap on the
+/// full-res image) and this app's renderer (`egui_glow`, the only backend
+/// that currently supports it) is exactly the one that does.
+const CHAN_ICON_TEX_OPTS: egui::TextureOptions =
+    egui::TextureOptions::LINEAR.with_mipmap_mode(Some(egui::TextureFilter::Linear));
+
 /// Load a channel icon from `asset_dir/icon.*` into an egui texture.
 /// Returns `None` when no icon file is found or decoding fails.
 pub(super) fn load_channel_icon(
@@ -1056,11 +1066,7 @@ pub(super) fn load_channel_icon(
     let size = [img.width() as usize, img.height() as usize];
     let color_image =
         egui::ColorImage::from_rgba_unmultiplied(size, &img.into_raw());
-    Some(ctx.load_texture(
-        format!("chan_icon_{key}"),
-        color_image,
-        egui::TextureOptions::LINEAR,
-    ))
+    Some(ctx.load_texture(format!("chan_icon_{key}"), color_image, CHAN_ICON_TEX_OPTS))
 }
 
 /// Like [`load_channel_icon`] but loads the pre-scaled 64 px thumbnail
@@ -1077,11 +1083,7 @@ pub(super) fn load_channel_icon_small(
     let img = decode_rgba_bounded(&bytes)?;
     let size = [img.width() as usize, img.height() as usize];
     let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &img.into_raw());
-    Some(ctx.load_texture(
-        format!("chan_icon_small_{key}"),
-        color_image,
-        egui::TextureOptions::LINEAR,
-    ))
+    Some(ctx.load_texture(format!("chan_icon_small_{key}"), color_image, CHAN_ICON_TEX_OPTS))
 }
 
 /// Like [`resolve_channel_icon`] but uses the 64 px pre-scaled thumbnail for
