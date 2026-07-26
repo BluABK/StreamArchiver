@@ -189,6 +189,31 @@ pub fn path_in_cache(path: &str) -> bool {
     path.contains(CACHE_DIR_NAME) || path.contains(LEGACY_CACHE_DIR_NAME)
 }
 
+/// True if `name` is a recognized transient working-file pattern — safe for
+/// [`Supervisor::sweep_caches`] to delete by age alone. An **allowlist**, not
+/// a denylist: a genuine capture (`.ts`, `.mkv`, a bare per-format `.mp4`/
+/// `.webm` download) never matches, however long it's sat there. A 2026-07
+/// incident lost ~7.7h of a recording this way: a stale-but-unreferenced
+/// `.sa-cache\` `.ts` (left behind by a botched/interrupted promotion that
+/// silently produced a short final file) was swept as if it were leftover
+/// working-file litter, when it was actually the only complete copy. Recognize
+/// specific tool byproducts by name instead of assuming "any old file in a
+/// cache dir is disposable".
+pub(super) fn is_sweepable_cache_litter(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    const TRANSIENT_SUFFIXES: &[&str] = &[
+        ".tmp.mkv",          // interrupted embed pass (chapters/thumbnail/subs)
+        ".chapters.ffmeta.txt",
+        ".ffmeta.txt",
+        ".progress.log",     // ffmpeg_job restart-survival progress file
+        ".thumbnail.jpg",
+        ".part",             // yt-dlp SABR per-format piece, e.g. `.sq0.part`/`.sgN.part`
+        ".state",            // yt-dlp SABR resume state
+        ".ytdl",             // yt-dlp resume metadata
+    ];
+    TRANSIENT_SUFFIXES.iter().any(|s| lower.ends_with(s))
+}
+
 /// Best-effort growing working-dir file candidates for a still-recording take,
 /// keyed off its predicted final path's stem (mirrors how `build_plan`
 /// derives `capture_path`, without needing to re-derive SABR/container state
@@ -252,6 +277,13 @@ impl Supervisor {
     /// pass killed mid-flight (app crash, forced quit, power loss) — those
     /// never get renamed over the real file (only on success) and live
     /// OUTSIDE `.cache\`, so nothing else ever notices or removes them.
+    ///
+    /// Only deletes names matching [`is_sweepable_cache_litter`]'s allowlist of
+    /// known tool byproducts — a real capture (`.ts`/`.mkv`/a bare per-format
+    /// download) is never touched by age alone, however stale-looking. This
+    /// used to be an unconditional "any file, any age" sweep, which destroyed
+    /// the only complete copy of a recording once (see that function's doc
+    /// comment).
     /// Removes a `.cache\` dir that ends up empty. Best-effort; runs once at
     /// startup.
     pub async fn sweep_caches(&self, skip_stems: std::collections::HashSet<String>) {
@@ -302,6 +334,9 @@ impl Supervisor {
                 let mut removed = 0u32;
                 while let Ok(Some(entry)) = rd.next_entry().await {
                     let name = entry.file_name().to_string_lossy().into_owned();
+                    if !is_sweepable_cache_litter(&name) {
+                        continue; // not a recognized transient pattern — could be a real capture
+                    }
                     if skip_stems
                         .iter()
                         .any(|s| name.starts_with(&format!("{s}.")))
@@ -354,6 +389,35 @@ mod tests {
     use crate::models::{Channel, Container, DetectionMethod, Monitor, Tool};
     #[allow(unused_imports)]
     use crate::downloader::test_util::*;
+
+    #[test]
+    fn sweepable_cache_litter_never_matches_a_real_capture() {
+        // Recognized tool byproducts: safe to age-sweep.
+        for name in [
+            "Show.tmp.mkv",
+            "Show.chapters.ffmeta.txt",
+            "Show.ffmeta.txt",
+            "Show.chapters.progress.log",
+            "Show.thumbnail.jpg",
+            "Show.mkv.f140.mp4.sq0.part",
+            "Show.mkv.f140.mp4.state",
+            "Show.mkv.f140.mp4.ytdl",
+        ] {
+            assert!(is_sweepable_cache_litter(name), "expected {name} to be sweepable");
+        }
+        // A real capture, however it's named — including a bare per-format
+        // download whose merge never finished — must never match, however
+        // stale-looking: the exact class of file a 2026-07 incident lost
+        // ~7.7h of footage by deleting.
+        for name in [
+            "Show - 2026-07-17 19-26-54 - title-tba [games-tba] (1080p60 live h264 aac) - [twitch 319550633312].ts",
+            "Show.mkv",
+            "Show.mkv.f140.mp4",
+            "Show.webm",
+        ] {
+            assert!(!is_sweepable_cache_litter(name), "expected {name} to be protected");
+        }
+    }
 
     #[test]
     #[cfg(windows)]

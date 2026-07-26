@@ -1279,7 +1279,13 @@ also stays unset the whole time embedding is in progress, so the next
 startup's sweep just retries that take from scratch. Any leftover
 `{stem}.tmp.mkv`/`{stem}.chapters.ffmeta.txt` sidecar (from chapters,
 thumbnail, or subtitle embedding) is cleaned up automatically by the
-startup capture-cache sweep once it's over 24h old. Every step of the
+startup capture-cache sweep once it's over 24h old — the sweep only ever
+deletes recognized tool-byproduct patterns (`.tmp.mkv`, `.part`, `.state`,
+`.ffmeta.txt`, thumbnails, etc.); an actual `.ts`/`.mkv` capture is never
+touched by age alone, however long it's sat there (a 2026-07 incident lost
+~7.7h of a recording when an unconditional version of this sweep deleted a
+stale-but-unreferenced raw capture left behind by a botched promotion).
+Every step of the
 embed pipeline (start, success with timing, failure, and the bulk
 re-embed-all run) logs to the app's own log
 (`%APPDATA%\StreamArchiver\data\logs\`), so progress is visible without
