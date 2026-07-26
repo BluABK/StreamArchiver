@@ -1529,7 +1529,7 @@ impl StreamArchiverApp {
                 }
             }
         }
-        if let Some(mids) = acts.play_collab_all_live_edge.take() {
+        if let Some((source_mid, mids, untracked)) = acts.play_collab_all_live_edge.take() {
             let player = self.settings.media_player_path.trim().to_string();
             if !player.is_empty() {
                 for mid in mids {
@@ -1540,6 +1540,36 @@ impl StreamArchiverApp {
                         self.status = msg;
                     }
                 }
+                if !untracked.is_empty()
+                    && let Some(source_row) = self.rows.iter().find(|r| r.monitor.id == source_mid)
+                {
+                    for partner in untracked {
+                        if let Some(msg) = spawn_play_collab_partner(
+                            source_row,
+                            &partner,
+                            &player,
+                            &self.settings,
+                            &self.core.store,
+                        ) {
+                            self.status = msg;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((source_mid, partner)) = acts.play_collab_partner_live_edge.take() {
+            let player = self.settings.media_player_path.trim().to_string();
+            if !player.is_empty()
+                && let Some(source_row) = self.rows.iter().find(|r| r.monitor.id == source_mid)
+                && let Some(msg) = spawn_play_collab_partner(
+                    source_row,
+                    &partner,
+                    &player,
+                    &self.settings,
+                    &self.core.store,
+                )
+            {
+                self.status = msg;
             }
         }
         if let Some(mid) = acts.follow_raid.take() {

@@ -1897,14 +1897,20 @@ live, and archived:
   Stream/take rows show which collab a **past broadcast** was.
 - **Watch every angle** — while a collab is live, an instance's right-click
   menu gains **"👥⏵ Play all collab instances (current downloads)"** and
-  **"👥▷ Play all collab instances (live edge)"**, each opening one media-
-  player window per collab angle that's also a locally-tracked Twitch
-  instance (matched by login; partners you don't archive are silently
-  skipped, never duplicated). "Current downloads" reuses whatever's already
-  actively capturing for each angle; "live edge" tunes in fresh without
-  recording, same as **▷ Play stream (live edge)**. For just one specific angle
-  instead of all of them, the **"👥 Play collab instance…"** submenu lists
-  each partner with its own Current download / Live edge pair.
+  **"👥▷ Play all collab instances (live edge)"**. "Current downloads" opens
+  whatever's already actively capturing for each angle, so it can only ever
+  cover partners you also locally track (there's no local file for anyone
+  else). "Live edge" tunes in fresh without recording and covers more:
+  besides any locally-tracked angle, it also opens every OTHER partner
+  confirmed via Shared Chat — even one you don't archive at all — via a
+  synthetic instance that borrows this one's tool/quality/auth settings
+  (there's no configuration of its own to use). An `@mention` partner
+  ("unconfirmed") is never auto-opened this way, only a Shared-Chat-verified
+  one — a title mention is just a guess, not confirmation that's really
+  their handle. For just one specific angle instead of all of them, the
+  **"👥 Play collab instance…"** submenu lists each partner with its own
+  Current download / Live edge pair, the same locally-tracked-vs-synthetic
+  distinction applying to that Live edge button too.
 - **History** — every session is stored (who, host, when, how long, source)
   and linked to its broadcast. Right-click a stream row → **🤝 Collab
   history** for the channel's full list; the **Channel Stats** tab has a

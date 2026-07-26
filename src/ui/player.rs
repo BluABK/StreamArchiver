@@ -1148,6 +1148,28 @@ pub(super) fn spawn_follow_raid(
     spawn_play_new_instance(&row, player, settings, store)
 }
 
+/// Tune into a verified-but-untracked collab partner at the live edge, no
+/// recording — same synthetic-row fallback as [`spawn_follow_raid`] (id 0,
+/// url = `twitch.tv/<login>`, tool/quality/extra_args copied from
+/// `source_row`, the instance whose collab menu this partner came from).
+/// Collab partners are Twitch-only (see `models::CollabPartner`), so the
+/// URL is always a plain `twitch.tv` one, no platform dispatch needed.
+pub(super) fn spawn_play_collab_partner(
+    source_row: &crate::models::MonitorWithChannel,
+    partner: &crate::ui::grid::UntrackedCollabPartner,
+    player: &str,
+    settings: &SettingsForm,
+    store: &Arc<crate::store::Store>,
+) -> Option<String> {
+    let mut row = source_row.clone();
+    row.monitor.id = 0;
+    row.monitor.url = format!("https://twitch.tv/{}", partner.login);
+    row.channel.name = partner.name.clone();
+    row.last_title.clear();
+    row.last_game.clear();
+    spawn_play_new_instance(&row, player, settings, store)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::disallowed_methods)]

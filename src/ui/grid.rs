@@ -1831,13 +1831,33 @@ pub(super) struct RowActions {
     /// partner that resolves to a locally-tracked monitor with a currently-
     /// downloading capture (set by "Play all collab instances (current downloads)").
     pub(super) play_collab_all_current: Option<Vec<StreamTarget>>,
-    /// Monitor ids to open live-edge previews for — this instance plus every
-    /// collab partner that resolves to a locally-tracked monitor (set by
-    /// "Play all collab instances (live edge)").
-    pub(super) play_collab_all_live_edge: Option<Vec<i64>>,
+    /// `(source instance mid, tracked partner mids, verified-but-untracked
+    /// partners)` to open live-edge previews for (set by "Play all collab
+    /// instances (live edge)") — the source instance and every collab
+    /// partner, whether or not it resolves to a locally-tracked monitor. An
+    /// untracked partner is played via a synthetic row cloned from the
+    /// source instance's own tool/quality/auth settings (see
+    /// `player::spawn_play_collab_partner`), same fallback `spawn_follow_raid`
+    /// already uses for an untracked raid target — a title-mention guess
+    /// (unverified) is still skipped rather than auto-played.
+    pub(super) play_collab_all_live_edge: Option<(i64, Vec<i64>, Vec<UntrackedCollabPartner>)>,
+    /// `(source instance mid, partner)` for a single verified-but-untracked
+    /// collab partner's "▷ Live edge" action in the "Play collab instance…"
+    /// submenu — same fallback as `play_collab_all_live_edge`'s untracked case.
+    pub(super) play_collab_partner_live_edge: Option<(i64, UntrackedCollabPartner)>,
     /// Monitor id whose most recent raid-out target should open live-edge in
     /// the player, no recording (set by "Follow raid").
     pub(super) follow_raid: Option<i64>,
+}
+
+/// A collab partner confirmed via Twitch Shared Chat (`from_title == false`)
+/// that isn't a locally-tracked monitor — enough identity to play it live via
+/// a synthetic row, but title-mention heuristic hits are never carried this
+/// way (too unverified to auto-launch a player for).
+#[derive(Clone)]
+pub(super) struct UntrackedCollabPartner {
+    pub(super) login: String,
+    pub(super) name: String,
 }
 
 /// Render one capture-instance (monitor) row across all columns, with the Name
@@ -1990,11 +2010,12 @@ pub(super) fn render_instance_row(
             }
         }
         if row.live_collab.is_some() {
-            // "All angles": this instance plus every collab partner that
-            // resolves to a locally-tracked monitor — one player window per
-            // angle. Partners that aren't locally tracked (most collabs,
-            // realistically) are silently skipped rather than blocking the
-            // whole action.
+            // "All angles, current downloads": this instance plus every collab
+            // partner that resolves to a locally-tracked monitor WITH a
+            // currently-downloading capture — one player window per angle.
+            // Partners that aren't locally tracked have no local file to play
+            // at all, so they're silently skipped here regardless of
+            // verification (unlike the live-edge variant below).
             let all_current: Vec<StreamTarget> = stream_target
                 .cloned()
                 .into_iter()
@@ -2005,8 +2026,21 @@ pub(super) fn render_instance_row(
                 // handed a built mpv-flavored command.
                 .filter(|t| playable_with(t, media_player))
                 .collect();
-            let all_live_edge: Vec<i64> = std::iter::once(m.id)
+            // "All angles, live edge": this instance, every collab partner
+            // that resolves to a locally-tracked monitor, AND every verified
+            // (Shared-Chat-confirmed, not a title-mention guess) partner that
+            // ISN'T tracked — the latter play via a synthetic row cloned from
+            // this instance's own settings (see `UntrackedCollabPartner`).
+            let tracked_live_edge: Vec<i64> = std::iter::once(m.id)
                 .chain(collab_plays.iter().filter_map(|(_, _, mid)| *mid))
+                .collect();
+            let untracked_live_edge: Vec<UntrackedCollabPartner> = collab_plays
+                .iter()
+                .filter(|(partner, _, pmid)| pmid.is_none() && !partner.from_title)
+                .map(|(partner, _, _)| UntrackedCollabPartner {
+                    login: partner.login.clone(),
+                    name: partner.name.clone(),
+                })
                 .collect();
             if ui
                 .add_enabled(
@@ -2034,14 +2068,17 @@ pub(super) fn render_instance_row(
                     egui::Button::new("👥▷  Play all collab instances (live edge)"),
                 )
                 .on_hover_text(
-                    "Tune into every collab angle at the live edge in the media player \
-                     at once (does not record) — one window per angle that's a \
-                     locally-tracked channel, including this instance.",
+                    "Tune into every collab angle at the live edge in the media player at \
+                     once (does not record) — this instance, every locally-tracked collab \
+                     partner, and every OTHER verified partner too (a synthetic instance \
+                     using this one's tool/quality/auth settings, since there's no local \
+                     config for a channel you don't track). A title-mention guess that isn't \
+                     locally tracked is still skipped — too unverified to auto-launch.",
                 )
                 .on_disabled_hover_text("Set a media player in Settings → Defaults first")
                 .clicked()
             {
-                a.play_collab_all_live_edge = Some(all_live_edge);
+                a.play_collab_all_live_edge = Some((m.id, tracked_live_edge, untracked_live_edge));
                 ui.close();
             }
             if !collab_plays.is_empty() {
@@ -2069,15 +2106,35 @@ pub(super) fn render_instance_row(
                                 a.stream_in_player = target.clone();
                                 ui.close();
                             }
+                            let untracked = (pmid.is_none() && !partner.from_title).then(|| {
+                                UntrackedCollabPartner {
+                                    login: partner.login.clone(),
+                                    name: partner.name.clone(),
+                                }
+                            });
                             if ui
                                 .add_enabled(
-                                    !media_player.is_empty() && pmid.is_some(),
+                                    !media_player.is_empty() && (pmid.is_some() || untracked.is_some()),
                                     egui::Button::new("▷  Live edge"),
                                 )
-                                .on_disabled_hover_text("Not a locally-tracked channel")
+                                .on_hover_text(if pmid.is_some() {
+                                    "Tune in via this locally-tracked instance's own settings."
+                                } else {
+                                    "Not locally tracked — plays via a synthetic instance using \
+                                     this row's own tool/quality/auth settings."
+                                })
+                                .on_disabled_hover_text(
+                                    "Not a locally-tracked channel, and not a verified collab \
+                                     partner (a title-mention guess is too unverified to \
+                                     auto-launch)",
+                                )
                                 .clicked()
                             {
-                                a.play_new_instance = *pmid;
+                                if pmid.is_some() {
+                                    a.play_new_instance = *pmid;
+                                } else if let Some(u) = untracked {
+                                    a.play_collab_partner_live_edge = Some((m.id, u));
+                                }
                                 ui.close();
                             }
                         });
