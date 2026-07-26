@@ -590,6 +590,7 @@ impl StreamArchiverApp {
             schedule_mode,
             schedule_anchor: None,
             schedule_hidden,
+            schedule_channel_filter: String::new(),
             schedule_hidden_segments: HashSet::new(),
             schedule_show_hidden: false,
             schedule_collisions: true,

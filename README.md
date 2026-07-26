@@ -2118,9 +2118,13 @@ YouTube sources as the Next stream column) in a calendar, with **Month**, **Week
   block. A subathon reported by the platform as one recurring segment **per
   day** (each day's segment overlapping the next, rather than one clean
   multi-day segment — Twitch's own schedule API does this) still draws as
-  ONE continuous bar across every day it spans: adjacent/overlapping
-  same-channel, same-title segments are coalesced for display (hover the bar
-  — it says how many daily segments got combined).
+  ONE continuous bar across every day it spans, even when another channel's
+  own all-day event happens to start partway through it: adjacent/overlapping
+  same-channel, same-title segments are coalesced for display regardless of
+  what else is on the calendar that week (hover the bar — it says how many
+  daily segments got combined). When two channels both need an all-day row,
+  each stays in its own consistent lane across the whole visible range rather
+  than trading places from day to day.
 
   ![Week view with channel avatars and an all-day event bar spanning several days](doc/screenshots/schedule-week-view.png)
 - **Day** — a detailed, time-sorted list of one day's streams (time · platform ·
@@ -2138,13 +2142,18 @@ YouTube sources as the Next stream column) in a calendar, with **Month**, **Week
 - **Right-click** any stream (chip, day list, or popup) to **copy** its URL,
   platform, title, channel, or full details, or **open it in the browser**. The
   day popup also has **Copy all**. Hover a stream for its full details.
-- **Left sidebar** filters which channels are shown: an **All channels** toggle
-  plus a per-channel checkbox (with each channel's platform icon and upcoming
-  count). Newly-added channels default to visible; unchecking one **persists**
-  across a restart (e.g. a channel whose schedule is a permanent dummy
-  placeholder stays hidden without re-hiding it every launch). Each row
-  carries the channel's **calendar color** as a swatch + tinted name, so the
-  sidebar doubles as the legend for the event blocks.
+- **Left sidebar** filters which channels are shown: a **Filter…** box narrows
+  the list to matching channel names (case-insensitive substring), an **All
+  channels** toggle plus a per-channel checkbox (with each channel's avatar,
+  platform icon, and upcoming count). Newly-added channels default to
+  visible; unchecking one **persists** across a restart (e.g. a channel whose
+  schedule is a permanent dummy placeholder stays hidden without re-hiding it
+  every launch). Each row carries the channel's **calendar color** as a
+  swatch + tinted name, so the sidebar doubles as the legend for the event
+  blocks.
+- **Channel avatars** appear on the sidebar list, every all-day bar, and every
+  timed event block (space permitting) — so a channel is identifiable by its
+  picture at a glance, not just its name or color.
 - **Channel colors** are the *same* ones the Streams list uses: a manually
   chosen custom color wins, else the streamer's own **Twitch name color**
   (darkened just enough that white block text stays readable), else the

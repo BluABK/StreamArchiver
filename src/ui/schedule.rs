@@ -648,10 +648,10 @@ impl StreamArchiverApp {
             .get_or_insert_with(|| PlatformTextures::load(ui.ctx()))
             .clone();
 
-        // Channel avatars for the week-view header's "recording scheduled" row
-        // (schema v51) — built by `schedule_rec_avatars` (mutable) so
-        // `schedule_week_grid` (immutable) can just look them up by channel id.
-        let sched_rec_avatars = self.schedule_rec_avatars(ui);
+        // Channel avatars for every channel with an upcoming schedule entry —
+        // built by `schedule_channel_avatars` (mutable) so the render
+        // functions below (immutable) can just look them up by channel id.
+        let avatars = self.schedule_channel_avatars(ui);
 
         // Shared Streams-list channel colours for every surface below
         // (blocks, chips, stripes, sidebar legend).
@@ -681,6 +681,7 @@ impl StreamArchiverApp {
         self.schedule_sidebar(
             ui,
             &ptex,
+            &avatars,
             &mut clear_hidden,
             &mut hide_all,
             &mut toggle_channel,
@@ -735,12 +736,12 @@ impl StreamArchiverApp {
                 ScheduleMode::Week => {
                     self.schedule_week_grid(
                         ui, anchor, today, &by_day, &collide, &ptex, &mut open_day,
-                        &sched_rec_avatars, &all_day_events, &signals,
+                        &avatars, &all_day_events, &signals,
                     )
                 }
                 ScheduleMode::Day => {
                     self.schedule_day_grid(
-                        ui, anchor, today, &by_day, &collide, &mut open_day, &all_day_events, &signals,
+                        ui, anchor, today, &by_day, &collide, &mut open_day, &avatars, &all_day_events, &signals,
                     )
                 }
                 ScheduleMode::Agenda => {
@@ -821,19 +822,23 @@ impl StreamArchiverApp {
             .unwrap_or_else(|| channel_event_color(s.channel_id, &s.channel_color))
     }
 
-    /// Channel avatars for the week-view header's "recording scheduled" row
-    /// (schema v51) — same small-icon cache/pattern as the Streams grid,
-    /// built here (mutable) so `schedule_week_grid` (immutable) can just
-    /// look them up by channel id.
-    fn schedule_rec_avatars(&mut self, ui: &egui::Ui) -> HashMap<i64, egui::TextureHandle> {
-        let mut sched_rec_avatars: HashMap<i64, egui::TextureHandle> = HashMap::new();
-        let mut channel_ids: Vec<i64> = self
-            .scheduled_recordings
-            .iter()
-            .filter(|r| r.rec.enabled)
-            .filter_map(|r| self.rows.iter().find(|row| row.monitor.id == r.rec.monitor_id))
-            .map(|row| row.channel.id)
-            .collect();
+    /// Channel avatars for every channel with an upcoming schedule entry —
+    /// backs the week-view header's "recording scheduled" row (schema v51),
+    /// the sidebar list, and the small icon on every event block/all-day bar
+    /// (so a channel is identifiable by its picture, not just its name/color,
+    /// at a glance). Same small-icon cache/pattern as the Streams grid; built
+    /// here (mutable) so the render functions below (immutable) can just look
+    /// them up by channel id.
+    fn schedule_channel_avatars(&mut self, ui: &egui::Ui) -> HashMap<i64, egui::TextureHandle> {
+        let mut avatars: HashMap<i64, egui::TextureHandle> = HashMap::new();
+        let mut channel_ids: Vec<i64> = self.schedule_all.iter().map(|s| s.channel_id).collect();
+        channel_ids.extend(
+            self.scheduled_recordings
+                .iter()
+                .filter(|r| r.rec.enabled)
+                .filter_map(|r| self.rows.iter().find(|row| row.monitor.id == r.rec.monitor_id))
+                .map(|row| row.channel.id),
+        );
         channel_ids.sort_unstable();
         channel_ids.dedup();
         for cid in channel_ids {
@@ -850,10 +855,10 @@ impl StreamArchiverApp {
                 .or_insert_with(|| resolve_channel_icon_small(&channel, &accounts, ui.ctx()))
                 .clone();
             if let Some(t) = tex {
-                sched_rec_avatars.insert(cid, t);
+                avatars.insert(cid, t);
             }
         }
-        sched_rec_avatars
+        avatars
     }
 
     /// Precompute (immutable reads of `self`) what the calendar closures
@@ -904,10 +909,12 @@ impl StreamArchiverApp {
     }
 
     /// ── Left sidebar: per-channel filter + collision toggle. ──
+    #[allow(clippy::too_many_arguments)]
     fn schedule_sidebar(
-        &self,
+        &mut self,
         ui: &mut egui::Ui,
         ptex: &PlatformTextures,
+        avatars: &HashMap<i64, egui::TextureHandle>,
         clear_hidden: &mut bool,
         hide_all: &mut bool,
         toggle_channel: &mut Option<i64>,
@@ -921,12 +928,29 @@ impl StreamArchiverApp {
                 ui.add_space(4.0);
                 ui.heading("Channels");
                 ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.schedule_channel_filter)
+                            .hint_text("Filter…")
+                            .desired_width(ui.available_width() - 24.0),
+                    );
+                    if ui
+                        .add_enabled(!self.schedule_channel_filter.is_empty(), egui::Button::new("✕"))
+                        .on_hover_text("Clear filter")
+                        .clicked()
+                    {
+                        self.schedule_channel_filter.clear();
+                    }
+                });
+                ui.add_space(2.0);
 
-                // Distinct channels with upcoming streams, sorted by name.
+                // Distinct channels with upcoming streams, sorted by name,
+                // narrowed by the filter box above (case-insensitive substring).
+                let needle = self.schedule_channel_filter.trim().to_lowercase();
                 let mut chans: Vec<(i64, &str)> = Vec::new();
                 let mut seen: HashSet<i64> = HashSet::new();
                 for s in &self.schedule_all {
-                    if seen.insert(s.channel_id) {
+                    if seen.insert(s.channel_id) && (needle.is_empty() || s.channel_name.to_lowercase().contains(&needle)) {
                         chans.push((s.channel_id, s.channel_name.as_str()));
                     }
                 }
@@ -984,6 +1008,13 @@ impl StreamArchiverApp {
                                     egui::CornerRadius::same(2),
                                     color,
                                 );
+                                if let Some(tex) = avatars.get(&cid) {
+                                    ui.add(
+                                        egui::Image::from_texture(tex)
+                                            .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                                            .corner_radius(egui::CornerRadius::same(2)),
+                                    );
+                                }
                                 for &p in &plats {
                                     platform_icon(ui, ptex, p).on_hover_text(p.label());
                                 }
@@ -1688,6 +1719,7 @@ impl StreamArchiverApp {
         zoom: f32,
         all_day_events: &[usize],
         open_day: &mut Option<chrono::NaiveDate>,
+        avatars: &HashMap<i64, egui::TextureHandle>,
         signals: &HashMap<i64, EventSignals>,
     ) {
         let ds = days[0];
@@ -1710,25 +1742,14 @@ impl StreamArchiverApp {
             return;
         }
         bars.sort_by_key(|&(_, start, end)| (start, end));
-        let mut bars = coalesce_all_day_bars(&bars, &self.schedule_all); // (idx, start, end, merged_count)
-        let mut lane_end: Vec<i32> = Vec::new();
-        let mut placed: Vec<(usize, usize, usize, usize, usize)> = Vec::new(); // (idx, start, end, lane, merged_count)
-        for (idx, start, end, merged_count) in bars.drain(..) {
-            let lane = lane_end
-                .iter()
-                .position(|&le| le < start as i32)
-                .unwrap_or_else(|| {
-                    lane_end.push(-1);
-                    lane_end.len() - 1
-                });
-            lane_end[lane] = end as i32;
-            placed.push((idx, start, end, lane, merged_count));
-        }
+        let bars = coalesce_all_day_bars(&bars, &self.schedule_all); // (idx, start, end, merged_count)
+        let placed = layout_all_day_lanes(&bars, |idx| self.schedule_all[idx].channel_id);
+        let lane_count = placed.iter().map(|&(_, _, _, lane, _)| lane + 1).max().unwrap_or(0);
 
         let bar_h = SCHED_ALL_DAY_BAR_H * zoom;
         let bar_gap = SCHED_ALL_DAY_BAR_GAP * zoom;
         let strip_w = time_col_w + days.len() as f32 * (col_w + col_gap);
-        let strip_h = lane_end.len() as f32 * (bar_h + bar_gap);
+        let strip_h = lane_count as f32 * (bar_h + bar_gap);
         let (resp, painter) = ui.allocate_painter(egui::vec2(strip_w, strip_h), egui::Sense::hover());
         let origin = resp.rect.min;
         let mut clicked_day: Option<chrono::NaiveDate> = None;
@@ -1762,8 +1783,23 @@ impl StreamArchiverApp {
                     s.title,
                 )
             };
+            let avatar_px = 12.0 * zoom;
+            let avatar = avatars.get(&s.channel_id).filter(|_| rect.width() >= 60.0 * zoom);
+            let text_x0 = rect.left() + 5.0 * zoom + if avatar.is_some() { avatar_px + 3.0 * zoom } else { 0.0 };
+            if let Some(tex) = avatar {
+                let avatar_rect = egui::Rect::from_min_size(
+                    egui::pos2(rect.left() + 5.0 * zoom, rect.center().y - avatar_px / 2.0),
+                    egui::vec2(avatar_px, avatar_px),
+                );
+                painter.with_clip_rect(rect).image(
+                    tex.id(),
+                    avatar_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
             painter.with_clip_rect(rect).text(
-                egui::pos2(rect.left() + 5.0 * zoom, rect.center().y),
+                egui::pos2(text_x0, rect.center().y),
                 egui::Align2::LEFT_CENTER,
                 label,
                 egui::FontId::proportional(11.0 * zoom),
@@ -1800,7 +1836,7 @@ impl StreamArchiverApp {
         collide: &HashSet<usize>,
         _ptex: &PlatformTextures,
         open_day: &mut Option<chrono::NaiveDate>,
-        sched_rec_avatars: &HashMap<i64, egui::TextureHandle>,
+        avatars: &HashMap<i64, egui::TextureHandle>,
         all_day_events: &[usize],
         signals: &HashMap<i64, EventSignals>,
     ) {
@@ -1819,7 +1855,7 @@ impl StreamArchiverApp {
         // (only those we actually have an avatar for — no point bucketing
         // channels that'll render nothing).
         let mut sched_rec_channels_by_day: HashMap<chrono::NaiveDate, Vec<i64>> = HashMap::new();
-        if !sched_rec_avatars.is_empty() {
+        if !avatars.is_empty() {
             let range_start = local_midnight(ws) - 1;
             let range_end = local_midnight(add_days(ws, 7));
             for row in &self.scheduled_recordings {
@@ -1831,7 +1867,7 @@ impl StreamArchiverApp {
                     continue;
                 };
                 let cid = mon_row.channel.id;
-                if !sched_rec_avatars.contains_key(&cid) {
+                if !avatars.contains_key(&cid) {
                     continue;
                 }
                 for ts in crate::scheduled_recordings::occurrences_in_range(&row.rec, range_start, range_end) {
@@ -1876,7 +1912,7 @@ impl StreamArchiverApp {
                                 const MAX_AVATARS: usize = 5;
                                 if let Some(chans) = day_channels {
                                     for &cid in chans.iter().take(MAX_AVATARS) {
-                                        if let Some(tex) = sched_rec_avatars.get(&cid) {
+                                        if let Some(tex) = avatars.get(&cid) {
                                             let name = self
                                                 .rows
                                                 .iter()
@@ -1911,7 +1947,7 @@ impl StreamArchiverApp {
 
         // All-day event bar strip (Google-Calendar style) — shared with Day
         // view, see `schedule_all_day_bar`.
-        self.schedule_all_day_bar(ui, &days, time_col_w, col_w, col_gap, zoom, all_day_events, open_day, signals);
+        self.schedule_all_day_bar(ui, &days, time_col_w, col_w, col_gap, zoom, all_day_events, open_day, avatars, signals);
 
         ui.separator();
 
@@ -1932,6 +1968,7 @@ impl StreamArchiverApp {
             &self.schedule_merge_labels,
             &self.schedule_chan_colors,
             self.schedule_compact,
+            avatars,
             signals,
         );
     }
@@ -1950,6 +1987,7 @@ impl StreamArchiverApp {
         by_day: &HashMap<chrono::NaiveDate, Vec<usize>>,
         collide: &HashSet<usize>,
         open_day: &mut Option<chrono::NaiveDate>,
+        avatars: &HashMap<i64, egui::TextureHandle>,
         all_day_events: &[usize],
         signals: &HashMap<i64, EventSignals>,
     ) {
@@ -1970,7 +2008,7 @@ impl StreamArchiverApp {
         let avail_w = ui.available_width();
         let col_w = (avail_w - time_col_w - 2.0).max(80.0);
 
-        self.schedule_all_day_bar(ui, &[anchor], time_col_w, col_w, 0.0, zoom, all_day_events, open_day, signals);
+        self.schedule_all_day_bar(ui, &[anchor], time_col_w, col_w, 0.0, zoom, all_day_events, open_day, avatars, signals);
         ui.separator();
 
         let exclude_all_day: HashSet<usize> = all_day_events.iter().copied().collect();
@@ -1990,6 +2028,7 @@ impl StreamArchiverApp {
             &self.schedule_merge_labels,
             &self.schedule_chan_colors,
             self.schedule_compact,
+            avatars,
             signals,
         );
     }

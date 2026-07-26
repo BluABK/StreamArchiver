@@ -1363,6 +1363,9 @@ pub struct StreamArchiverApp {
     /// preference (e.g. a channel whose schedule is a permanent dummy
     /// placeholder), not a soft per-event hide meant to reset.
     schedule_hidden: HashSet<i64>,
+    /// Live substring filter over the sidebar's channel list (case-insensitive,
+    /// name match) — session-only, not persisted.
+    schedule_channel_filter: String,
     /// Individual segment IDs the user has soft-hidden (not tombstoned). Reset
     /// on app restart; use Delete for permanent suppression.
     schedule_hidden_segments: HashSet<i64>,

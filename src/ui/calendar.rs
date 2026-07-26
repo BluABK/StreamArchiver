@@ -651,26 +651,89 @@ pub(super) fn layout_event_lanes(
 /// end_col, merged_count)`, keeping the FIRST bar's `stream_idx` as the
 /// representative for each merged run (same title/channel by construction, so
 /// nothing meaningful is lost for click/hover/context-menu purposes).
+///
+/// Groups by `(channel_id, title)` FIRST and coalesces each group's own
+/// (already-sorted) run in isolation, rather than scanning the globally
+/// sorted list with a single "last bar" pointer — another channel's bar
+/// landing between two of this channel's segments in start-order (e.g. a
+/// placeholder event that starts partway through the subathon) must not
+/// break the subathon's own chain just because it's the most recently seen
+/// entry overall.
+/// A same-`(channel_id, title)` run of all-day bars, in the order they were
+/// first seen — grouping key for [`coalesce_all_day_bars`].
+type AllDayGroup<'a> = (i64, &'a str, Vec<(usize, usize, usize)>);
+
 pub(super) fn coalesce_all_day_bars(
     bars: &[(usize, usize, usize)],
     all: &[UpcomingStream],
 ) -> Vec<(usize, usize, usize, usize)> {
-    let mut merged: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(bars.len());
+    let mut groups: Vec<AllDayGroup> = Vec::new();
     for &(idx, start, end) in bars {
-        let can_merge = merged.last().is_some_and(|&(last_idx, _, last_end, _)| {
-            let a = &all[last_idx];
-            let b = &all[idx];
-            a.channel_id == b.channel_id && a.title == b.title && start <= last_end + 1
-        });
-        if can_merge {
-            let last = merged.last_mut().unwrap();
-            last.2 = last.2.max(end);
-            last.3 += 1;
-        } else {
-            merged.push((idx, start, end, 1));
+        let s = &all[idx];
+        match groups.iter_mut().find(|(ch, title, _)| *ch == s.channel_id && *title == s.title) {
+            Some((_, _, v)) => v.push((idx, start, end)),
+            None => groups.push((s.channel_id, s.title.as_str(), vec![(idx, start, end)])),
         }
     }
-    merged
+    let mut result: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(bars.len());
+    for (_, _, group_bars) in groups {
+        let mut run: Option<(usize, usize, usize, usize)> = None;
+        for (idx, start, end) in group_bars {
+            match &mut run {
+                Some(r) if start <= r.2 + 1 => {
+                    r.2 = r.2.max(end);
+                    r.3 += 1;
+                }
+                _ => {
+                    if let Some(r) = run.replace((idx, start, end, 1)) {
+                        result.push(r);
+                    }
+                }
+            }
+        }
+        if let Some(r) = run {
+            result.push(r);
+        }
+    }
+    result.sort_by_key(|&(_, start, end, _)| (start, end));
+    result
+}
+
+/// Assign each all-day bar a lane, greedily but PREFERRING — not requiring —
+/// a lane the same channel already occupies, so a channel with more than one
+/// bar in the visible range (a genuine gap broke coalescing, or another
+/// channel's bar happens to need a lane too) stays visually aligned in one
+/// row across the week instead of trading places with whichever channel
+/// happens to need a lane that day. `bars` is `(stream_idx, start_col,
+/// end_col, merged_count)`, pre-sorted by `(start_col, end_col)` (as returned
+/// by [`coalesce_all_day_bars`]). Returns `(stream_idx, start_col, end_col,
+/// lane, merged_count)`.
+pub(super) fn layout_all_day_lanes(
+    bars: &[(usize, usize, usize, usize)],
+    channel_of: impl Fn(usize) -> i64,
+) -> Vec<(usize, usize, usize, usize, usize)> {
+    let mut lane_end: Vec<i32> = Vec::new();
+    let mut lane_channel: Vec<i64> = Vec::new();
+    let mut placed = Vec::with_capacity(bars.len());
+    for &(idx, start, end, merged_count) in bars {
+        let channel_id = channel_of(idx);
+        let is_free = |le: &i32| *le < start as i32;
+        let lane = lane_end
+            .iter()
+            .enumerate()
+            .find(|&(i, le)| is_free(le) && lane_channel[i] == channel_id)
+            .map(|(i, _)| i)
+            .or_else(|| lane_end.iter().position(is_free))
+            .unwrap_or_else(|| {
+                lane_end.push(-1);
+                lane_channel.push(channel_id);
+                lane_end.len() - 1
+            });
+        lane_end[lane] = end as i32;
+        lane_channel[lane] = channel_id;
+        placed.push((idx, start, end, lane, merged_count));
+    }
+    placed
 }
 
 /// Draw a 24-hour time-grid for one or more day columns. Called by both the Week
@@ -696,6 +759,10 @@ pub(super) fn schedule_time_grid(
     chan_colors: &HashMap<i64, egui::Color32>,
     // Collapse every event to a one-line chip at its start time.
     compact: bool,
+    // Channel avatars (`App::schedule_channel_avatars`) — a small icon drawn
+    // before each block's text so a channel is identifiable by its picture,
+    // not just its name/color, at a glance.
+    avatars: &HashMap<i64, egui::TextureHandle>,
     // Auto-record tint + recording-now/trigger-preview badges — precomputed
     // once per frame in `schedule_view`, keyed by `segment_id`.
     signals: &HashMap<i64, EventSignals>,
@@ -926,6 +993,29 @@ pub(super) fn schedule_time_grid(
                         let merge_icon = if merge_label.is_some() { "🔀 " } else { "" };
                         // ⏺ recording-now / ⚡ trigger-would-fire / 🚫 blacklisted
                         let sig_icon = sig.map(EventSignals::icon_prefix).unwrap_or_default();
+                        // Channel avatar, before the name line — so a channel is
+                        // identifiable by its picture, not just its name/color, at
+                        // a glance. Skipped on blocks too narrow for it to read as
+                        // anything but noise.
+                        let avatar_px = 12.0 * zoom;
+                        let avatar_gap = 3.0 * zoom;
+                        let avatar = avatars
+                            .get(&s.channel_id)
+                            .filter(|_| text_rect.width() >= 50.0 * zoom);
+                        let name_x0 = if avatar.is_some() { text_rect.left() + avatar_px + avatar_gap } else { text_rect.left() };
+                        if let Some(tex) = avatar {
+                            let avatar_y = if compact { block_rect.center().y - avatar_px / 2.0 } else { text_y };
+                            let avatar_rect = egui::Rect::from_min_size(
+                                egui::pos2(text_rect.left(), avatar_y),
+                                egui::vec2(avatar_px, avatar_px),
+                            );
+                            text_painter.image(
+                                tex.id(),
+                                avatar_rect,
+                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                if is_hidden { egui::Color32::from_white_alpha(140) } else { egui::Color32::WHITE },
+                            );
+                        }
                         if compact {
                             // One line, start time first: "HH:MM Channel — Title".
                             let mut line = format!(
@@ -942,7 +1032,7 @@ pub(super) fn schedule_time_grid(
                                 line.push_str(&s.title);
                             }
                             text_painter.text(
-                                egui::pos2(text_rect.left(), block_rect.center().y),
+                                egui::pos2(name_x0, block_rect.center().y),
                                 egui::Align2::LEFT_CENTER,
                                 line,
                                 name_font,
@@ -955,7 +1045,7 @@ pub(super) fn schedule_time_grid(
                             format!("{}{}{} {}", sig_icon, merge_icon, badge, s.channel_name)
                         };
                         text_painter.text(
-                            egui::pos2(text_rect.left(), text_y),
+                            egui::pos2(name_x0, text_y),
                             egui::Align2::LEFT_TOP,
                             name_str,
                             name_font,
@@ -1097,6 +1187,63 @@ mod tests {
         let bars = [(0, 0, 1), (1, 4, 5)];
         let merged = coalesce_all_day_bars(&bars, &all);
         assert_eq!(merged, vec![(0, 0, 1, 1), (1, 4, 5, 1)]);
+    }
+
+    /// Regression: a different channel's bar starting midway through the
+    /// subathon (e.g. a placeholder event beginning Thursday) must not break
+    /// the subathon's own chain just because it sorts between two of the
+    /// subathon's segments in global start order — every subathon segment
+    /// still collapses into one Mon-Sun run, and the placeholder's own
+    /// same-channel/title segments (also daily, also overlapping) collapse
+    /// into their own single run too.
+    #[test]
+    fn coalesce_is_immune_to_another_channels_bar_interleaving_the_chain() {
+        let all = vec![
+            stream_ct(0, 27, "NUMI SUBATHON 2026"), // Mon-Tue
+            stream_ct(1, 27, "NUMI SUBATHON 2026"), // Tue-Wed
+            stream_ct(2, 27, "NUMI SUBATHON 2026"), // Wed-Thu
+            stream_ct(3, 99, "CHECK THE ABOUT TAB"), // Thu only — sorts between idx 2 and idx 4
+            stream_ct(4, 27, "NUMI SUBATHON 2026"), // Thu-Fri
+            stream_ct(5, 27, "NUMI SUBATHON 2026"), // Fri-Sat
+            stream_ct(6, 27, "NUMI SUBATHON 2026"), // Sat-Sun
+        ];
+        // Global (start, end) order: the placeholder (3, 3) sorts strictly
+        // before the subathon's Thu-Fri segment (3, 4) at the same start col.
+        let bars = [(0, 0, 1), (1, 1, 2), (2, 2, 3), (3, 3, 3), (4, 3, 4), (5, 4, 5), (6, 5, 6)];
+        let merged = coalesce_all_day_bars(&bars, &all);
+        assert_eq!(merged, vec![(0, 0, 6, 6), (3, 3, 3, 1)]);
+    }
+
+    #[test]
+    fn layout_all_day_lanes_prefers_a_channels_own_prior_lane() {
+        // Same shape as the reported bug: channel 27 spans the whole week
+        // (col 0-6), channel 99 needs a lane only for the tail (col 4-6).
+        // Without the same-channel preference, a fresh greedy pass would put
+        // 99 in lane 0 (free at col 4 once nothing there has ended yet — but
+        // 27 occupies lane 0 for the whole week, so 99 is forced to lane 1
+        // regardless; the preference only matters when 27 has genuinely
+        // split into two non-adjacent runs, covered below).
+        let bars = [(0, 0, 6, 7), (1, 4, 6, 3)];
+        let channel_of = |idx: usize| if idx == 0 { 27 } else { 99 };
+        let placed = layout_all_day_lanes(&bars, channel_of);
+        assert_eq!(placed, vec![(0, 0, 6, 0, 7), (1, 4, 6, 1, 3)]);
+    }
+
+    #[test]
+    fn layout_all_day_lanes_keeps_a_channel_in_its_own_lane_across_a_real_gap() {
+        // Channel 27 (idx 0, 3) has two separate runs with a real gap between
+        // them — not coalesced into one bar. Channel 99 (idx 1, 2) briefly
+        // overlaps 27's first run (forcing a genuine second lane), then has
+        // its own second run once 27's first run ends. Without the
+        // same-channel preference, plain first-fit would put channel 99's
+        // second run back in lane 0 (the first lane that's free by then),
+        // splitting each channel across both lanes instead of one each.
+        let bars = [(0, 0, 1, 1), (1, 0, 1, 1), (2, 2, 3, 1), (3, 4, 5, 1)];
+        let channel_of = |idx: usize| if idx == 1 || idx == 2 { 99 } else { 27 };
+        let placed = layout_all_day_lanes(&bars, channel_of);
+        assert_eq!(placed[0].3, placed[3].3, "channel 27's two runs share a lane");
+        assert_eq!(placed[1].3, placed[2].3, "channel 99's two runs share a lane");
+        assert_ne!(placed[0].3, placed[1].3, "the two channels don't share a lane");
     }
 
     /// Bright colours (e.g. fetched Twitch spring green) darken for white block
