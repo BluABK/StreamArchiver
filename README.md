@@ -2538,6 +2538,13 @@ Notes:
 - Unknown `{…}` tokens are left as literal text; only the variables above are
   substituted.
 - If a template expands to nothing usable, it falls back to `{name}_{date}_{time}`.
+- A restart landing in the narrow window between a capture's file landing at
+  its final path and the post-capture rename running can strand a `title-tba`/
+  `games-tba` placeholder permanently — the startup orphan-repair pass now
+  patches this on the next launch (once the real title/games are known),
+  swapping just those two markers in place rather than re-deriving the whole
+  filename (which would risk picking up a since-changed `{take}` count for an
+  old file).
 - **Token style & overrides** (Settings → Defaults): the machine-value tokens
   (`{vcodec}` `{acodec}` `{platform}` `{platform_short}` `{tool}` `{mode}`)
   default to the tools' own lowercase values (`h264`, `aac`, `twitch`).

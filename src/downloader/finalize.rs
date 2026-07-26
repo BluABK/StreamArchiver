@@ -296,6 +296,62 @@ pub(super) async fn rename_for_media(final_path: PathBuf, new_stem: &str) -> Pat
     }
 }
 
+/// Patch a stranded `title-tba`/`games-tba` placeholder in an already-landed
+/// filename now that the real value is known, without re-deriving the whole
+/// stem via `monitor_stem` (as [`rename_for_media`]'s normal callers do).
+/// This runs from the startup orphan-repair pass, which can fire days or
+/// weeks after the original capture — recomputing `{take}` from the
+/// monitor's CURRENT recording count would silently produce a wrong take
+/// number for a historical file, since newer takes may have happened since.
+/// A literal placeholder swap sidesteps that: only the two known-fixed
+/// marker strings change, everything else (date, time, take, quality, media
+/// info) stays exactly as originally rendered. No-op if neither marker is
+/// present, or if the real value still isn't known.
+pub(super) async fn patch_stuck_title_games_placeholder(
+    store: &Store,
+    rec_id: i64,
+    monitor_id: i64,
+    final_path: PathBuf,
+) -> PathBuf {
+    let Some(stem) = final_path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+        return final_path;
+    };
+    let has_title_tba = stem.contains("title-tba");
+    let has_games_tba = stem.contains("games-tba");
+    if !has_title_tba && !has_games_tba {
+        return final_path;
+    }
+    let template = match store.get_monitor_with_channel(monitor_id) {
+        Ok(Some(mrow)) => mrow.monitor.filename_template,
+        _ => return final_path,
+    };
+    let mut new_stem = stem.clone();
+    if has_title_tba {
+        let title = title_for_recording(store, rec_id);
+        if !title.is_empty() {
+            let rendered = if template.contains("{title_trimmed}") {
+                trim_title_commands(&title)
+            } else {
+                title
+            };
+            new_stem = new_stem.replace("title-tba", &rendered);
+        }
+    }
+    if has_games_tba {
+        let games = games_for_recording(store, rec_id);
+        if !games.is_empty() {
+            new_stem = new_stem.replace("games-tba", &games);
+        }
+    }
+    if new_stem == stem {
+        return final_path; // still unknown — leave the placeholder for a later pass
+    }
+    let new_stem = sanitize_filename(&new_stem);
+    let new_path = rename_for_media(final_path, &new_stem).await;
+    let _ = store.update_recording_output_path(rec_id, &new_path.to_string_lossy());
+    new_path
+}
+
 /// Find a thumbnail sidecar that lives alongside `src` in the same directory.
 ///
 /// Checked in priority order:
@@ -1390,6 +1446,18 @@ impl Supervisor {
                 } else {
                     promoted += 1;
                     info!(rec_id, bytes = final_len, "orphan repair: output file intact, promoted to 'completed'");
+                    if let Ok(Some(rec)) = self.store.get_recording(rec_id) {
+                        let patched = patch_stuck_title_games_placeholder(
+                            &self.store,
+                            rec_id,
+                            rec.monitor_id,
+                            final_path.clone(),
+                        )
+                        .await;
+                        if patched != final_path {
+                            info!(rec_id, "orphan repair: filled in a stranded title-tba/games-tba placeholder");
+                        }
+                    }
                 }
                 continue;
             }
@@ -1429,6 +1497,9 @@ impl Supervisor {
                     rec_id, prior_status = %status, bytes = cap_len,
                     "orphan repair: capture stuck in .cache — retargeted; fix via Issues → Recover: {cap_s}"
                 );
+                if let Ok(Some(rec)) = self.store.get_recording(rec_id) {
+                    patch_stuck_title_games_placeholder(&self.store, rec_id, rec.monitor_id, capture.clone()).await;
+                }
             }
             retargeted += 1;
         }
@@ -1447,6 +1518,76 @@ mod tests {
     use crate::models::{Channel, Container, DetectionMethod, Monitor, Tool};
     #[allow(unused_imports)]
     use crate::downloader::test_util::*;
+
+    #[tokio::test]
+    async fn placeholder_patch_fills_in_real_title_and_games_without_touching_take() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = crate::store::test_util::sample_monitor(cid);
+        m.filename_template = "{name} - {title} [{games}]".into();
+        let mid = store.insert_monitor(&m).unwrap();
+
+        let dir = std::env::temp_dir()
+            .join(format!("sa_placeholder_patch_{}_{}", std::process::id(), now_unix()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let stuck = dir.join("Streamer - title-tba [games-tba].mkv");
+        tokio::fs::write(&stuck, b"v").await.unwrap();
+
+        let rec_id = store
+            .insert_recording(mid, 1_000, &stuck.to_string_lossy(), None, false, None, None, "", "")
+            .unwrap();
+        store.insert_meta_change(rec_id, 0, "title", "", "GORP").unwrap();
+        store.insert_meta_change(rec_id, 0, "category", "", "Super Battle Golf").unwrap();
+        store.insert_meta_change(rec_id, 100, "category", "Super Battle Golf", "Just Chatting").unwrap();
+
+        let result = patch_stuck_title_games_placeholder(&store, rec_id, mid, stuck.clone()).await;
+
+        assert_eq!(
+            result.file_name().unwrap().to_str().unwrap(),
+            "Streamer - GORP [Super Battle Golf, Just Chatting].mkv"
+        );
+        assert!(result.exists());
+        assert!(!stuck.exists());
+        assert_eq!(
+            store.get_recording(rec_id).unwrap().unwrap().output_path,
+            result.to_string_lossy()
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn placeholder_patch_is_noop_without_a_placeholder_or_without_real_data() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let m = crate::store::test_util::sample_monitor(cid);
+        let mid = store.insert_monitor(&m).unwrap();
+
+        let dir = std::env::temp_dir()
+            .join(format!("sa_placeholder_noop_{}_{}", std::process::id(), now_unix()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // Already has a real name — nothing to patch.
+        let already_named = dir.join("Streamer - Real Title [Real Game].mkv");
+        tokio::fs::write(&already_named, b"v").await.unwrap();
+        let rec1 = store
+            .insert_recording(mid, 1_000, &already_named.to_string_lossy(), None, false, None, None, "", "")
+            .unwrap();
+        let result1 = patch_stuck_title_games_placeholder(&store, rec1, mid, already_named.clone()).await;
+        assert_eq!(result1, already_named);
+
+        // Placeholder present, but no meta_change rows logged yet — still unknown.
+        let stuck = dir.join("Streamer - title-tba [games-tba].mkv");
+        tokio::fs::write(&stuck, b"v").await.unwrap();
+        let rec2 = store
+            .insert_recording(mid, 1_000, &stuck.to_string_lossy(), None, false, None, None, "", "")
+            .unwrap();
+        let result2 = patch_stuck_title_games_placeholder(&store, rec2, mid, stuck.clone()).await;
+        assert_eq!(result2, stuck);
+        assert!(stuck.exists());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
 
     #[tokio::test]
     async fn companion_sidecars_follow_rename() {
