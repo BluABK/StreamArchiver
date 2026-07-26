@@ -4272,8 +4272,10 @@ async fn refresh_schedules_once(
     persist_schedule_fetched(ctx.store.as_ref(), last_fetched);
 }
 
-/// Extract the Twitch login from a channel URL (`twitch.tv/<login>`).
-pub(crate) fn twitch_login(url: &str) -> Option<String> {
+/// Extract the Twitch login from a channel URL (`twitch.tv/<login>`), preserving
+/// the case as typed in the URL. Used for filename tokens where the visual
+/// identity matters; API/lookup callers should use [`twitch_login`] instead.
+pub(crate) fn twitch_login_display(url: &str) -> Option<String> {
     let trimmed = url.trim().trim_end_matches('/');
     let lower = trimmed.to_lowercase();
     let pos = lower.find("twitch.tv/")?;
@@ -4282,8 +4284,14 @@ pub(crate) fn twitch_login(url: &str) -> Option<String> {
     if login.is_empty() {
         None
     } else {
-        Some(login.to_lowercase())
+        Some(login.to_string())
     }
+}
+
+/// Extract the Twitch login from a channel URL (`twitch.tv/<login>`), lowercased
+/// for API calls / cache keys / comparisons.
+pub(crate) fn twitch_login(url: &str) -> Option<String> {
+    twitch_login_display(url).map(|s| s.to_lowercase())
 }
 
 /// Extract the Kick channel slug from a URL (`kick.com/<slug>`).
@@ -5492,6 +5500,18 @@ mod tests {
         );
         assert_eq!(twitch_login("https://twitch.tv/").as_deref(), None);
         assert_eq!(twitch_login("https://youtube.com/foo").as_deref(), None);
+    }
+
+    #[test]
+    fn parse_twitch_login_display_preserves_case() {
+        assert_eq!(
+            twitch_login_display("https://www.twitch.tv/notGEEGA").as_deref(),
+            Some("notGEEGA")
+        );
+        assert_eq!(
+            twitch_login_display("https://twitch.tv/").as_deref(),
+            None
+        );
     }
 
     #[test]

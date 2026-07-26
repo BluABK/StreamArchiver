@@ -183,6 +183,8 @@ pub(super) fn build_preview_filename(
     template: &str,
 ) -> String {
     let ch_name = monitor.channel.name.as_str();
+    let instance_s =
+        crate::downloader::instance_login(&monitor.monitor.url, monitor.monitor.platform()).unwrap_or_default();
     let platform_s = monitor.monitor.platform().as_str().to_string();
     let tool_s = monitor.monitor.tool.label().to_string();
     let quality_s = monitor.monitor.quality.clone();
@@ -213,7 +215,7 @@ pub(super) fn build_preview_filename(
     let vars = crate::downloader::TemplateVars {
         name: ch_name,
         title: &title_s,
-        channel: ch_name,
+        channel: &instance_s,
         video_id: &stream_id_s,
         quality: &quality_s,
         resolution: "1920x1080",

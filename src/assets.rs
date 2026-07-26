@@ -79,7 +79,7 @@ pub fn account_slug(url: &str, platform: crate::models::Platform) -> String {
 
 /// YouTube account token from a channel URL: `@handle` (sans `@`), `/channel/UC…`
 /// id, or a `/c/{name}` / `/user/{name}` path segment — all lowercased.
-fn youtube_account_token(url: &str) -> Option<String> {
+pub(crate) fn youtube_account_token(url: &str) -> Option<String> {
     let lower = url.trim().to_lowercase();
     if let Some(pos) = lower.find("/@") {
         let handle = lower[pos + 2..].split(['/', '?', '#']).next()?.trim();

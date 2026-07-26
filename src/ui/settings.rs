@@ -2124,7 +2124,7 @@ impl StreamArchiverApp {
                                             .hint_text(&ft_hint)
                                             .desired_width(150.0),
                                     ).on_hover_text(
-                                        "Tokens: {name} {date} {time} {timestamp} {year} {month} {day} {hour} {minute} {second} {title} {title_trimmed} {games} {video_id} {quality} {resolution} {height} {width} {fps} {vcodec} {acodec} {take} {tool} {mode} {platform} {platform_short} {went_live_date} {went_live_time}",
+                                        "Tokens: {name} {channel} {date} {time} {timestamp} {year} {month} {day} {hour} {minute} {second} {title} {title_trimmed} {games} {video_id} {quality} {resolution} {height} {width} {fps} {vcodec} {acodec} {take} {tool} {mode} {platform} {platform_short} {went_live_date} {went_live_time}",
                                     );
                                 });
                                 ui.label("");

@@ -1752,7 +1752,7 @@ impl StreamArchiverApp {
         const TOKENS: &[(&str, &[(&str, &str)])] = &[
             ("Identity", &[
                 ("{name}", "Channel / stream name"),
-                ("{channel}", "Channel name (VOD downloads)"),
+                ("{channel}", "Per-instance account login (e.g. a Twitch alt account), or the detected uploader for VOD downloads — distinct from {name} when a Channel groups several instances"),
                 ("{video_id}", "Stream or video ID"),
                 ("{take}", "Recording attempt number"),
             ]),

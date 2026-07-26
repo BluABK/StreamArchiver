@@ -205,6 +205,23 @@ pub(super) fn media_info_mode(store: &Store) -> MediaInfoMode {
     )
 }
 
+/// The `{channel}` value for a monitor recording: the per-INSTANCE login/handle
+/// parsed directly from its own URL — e.g. the Twitch account "notGEEGA" for an
+/// alt-account instance grouped under a "GEEGA" Channel container. Deliberately
+/// distinct from `{name}` (the container's display name): a Channel can hold
+/// several instances (main + alt account, or the same creator on two
+/// platforms), and this is the only token that tells them apart. Case is
+/// preserved as typed in the URL (unlike `assets::account_slug`, which
+/// lowercases for stable directory naming).
+pub(crate) fn instance_login(url: &str, platform: Platform) -> Option<String> {
+    match platform {
+        Platform::Twitch => crate::detectors::twitch_login_display(url),
+        Platform::Kick => crate::detectors::kick_slug(url),
+        Platform::YouTube => crate::assets::youtube_account_token(url),
+        Platform::Nrk | Platform::Nebula | Platform::Generic => None,
+    }
+}
+
 /// Build a monitor recording's filename stem (no extension, no collision suffix).
 /// Shared by [`build_plan`] and the post-capture rename so they agree.
 #[allow(clippy::too_many_arguments)]
@@ -237,11 +254,13 @@ pub(super) fn monitor_stem(
     } else {
         games
     };
+    let instance = instance_login(&m.url, m.platform()).unwrap_or_default();
     expand_template(
         &m.filename_template,
         &TemplateVars {
             name: ch_name,
             title: title_val,
+            channel: &instance,
             video_id: stream_id.unwrap_or(""),
             quality,
             take: &take,
@@ -314,13 +333,18 @@ pub(super) fn video_stem(
     )
 }
 /// Inputs to [`expand_template`]. Each field maps to a `{…}` variable; empty
-/// fields render empty. `title`/`channel`/`video_id` are resolved metadata (empty
-/// for live recordings or id-less methods); `resolution`/`height`/`width`/`fps`/
+/// fields render empty. `title`/`video_id` are resolved metadata (empty for
+/// live recordings or id-less methods); `resolution`/`height`/`width`/`fps`/
 /// `vcodec` are actual media info (filled only when probing is enabled).
 #[derive(Default)]
 pub struct TemplateVars<'a> {
     pub name: &'a str,
     pub title: &'a str,
+    /// Per-instance account login/handle: the monitor's own URL-derived Twitch/
+    /// Kick/YouTube identity for live recordings ([`instance_login`]), or the
+    /// detected uploader/channel name for on-demand video downloads. Distinct
+    /// from `name`, which for live recordings is the parent Channel container's
+    /// display name (shared by every instance grouped under it).
     pub channel: &'a str,
     pub video_id: &'a str,
     /// Configured quality selector (e.g. `1080p60`, `best`).
@@ -1003,6 +1027,33 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[test]
+    fn instance_login_is_per_instance_not_per_channel() {
+        // The alt-account case this token exists for: two Twitch instances
+        // (main + alt) grouped under one Channel container must resolve to
+        // their OWN login, not the container's display name.
+        assert_eq!(
+            instance_login("https://www.twitch.tv/notGEEGA", Platform::Twitch).as_deref(),
+            Some("notGEEGA")
+        );
+        assert_eq!(
+            instance_login("https://twitch.tv/GEEGA", Platform::Twitch).as_deref(),
+            Some("GEEGA")
+        );
+        // Case is preserved (unlike assets::account_slug, which lowercases for
+        // directory-naming stability) — this is a display token.
+        assert_eq!(
+            instance_login("https://kick.com/CoolGuy", Platform::Kick).as_deref(),
+            Some("CoolGuy")
+        );
+        assert_eq!(
+            instance_login("https://www.youtube.com/@LofiGirl/live", Platform::YouTube).as_deref(),
+            Some("lofigirl")
+        );
+        // No per-instance identity parser for these — renders empty, not a guess.
+        assert_eq!(instance_login("https://example.com/x", Platform::Generic), None);
+    }
+
     #[test]
     fn is_name_too_long_matches_known_codes_only() {
         let too_long = |code: i32| std::io::Error::from_raw_os_error(code);
