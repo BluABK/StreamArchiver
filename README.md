@@ -1185,15 +1185,22 @@ gap-splice attempt for it resolved one way or another — the app can embed
 chapter markers into the finalized MKV so it's easy to scrub through in a
 player (mpv, VLC, …). Five independently-toggleable kinds:
 - **Title changes** and **category/game changes** — one chapter per change,
-  from the same title/category history the 📝 popup already shows. A title
-  and category change landing within a configurable **coalesce window**
-  (default 30s) of each other merge into one *"{category} — {title}"*
-  chapter instead of two — some streamers update both together instantly, so
-  a short window is enough; others update them minutes apart, so raise it
-  per channel/instance (the usual global → channel → instance override,
-  Settings → Downloads → Chapters / channel Properties / edit instance) if a
-  particular streamer's title and game changes are landing as separate
-  chapters when they shouldn't.
+  from the same title/category history the 📝 popup already shows, plus an
+  initial chapter at exactly `00:00:00.000` for whatever title/game the take
+  started on. A title and category change landing within a configurable
+  **coalesce window** (default 30s) of each other merge into one
+  *"{category} — {title}"* chapter instead of two — some streamers update
+  both together instantly, so a short window is enough; others update them
+  minutes apart, so raise it per channel/instance (the usual global →
+  channel → instance override, Settings → Downloads → Chapters / channel
+  Properties / edit instance) if a particular streamer's title and game
+  changes are landing as separate chapters when they shouldn't. A change is
+  judged by the value actually differing from the last one seen, not by
+  whether the history row happens to record what it changed *from* — the
+  in-memory watcher re-logs the current value fresh (no "from") whenever it
+  restarts, including mid-recording after an app restart, and a genuine
+  change that happened to land right on such a restart used to be silently
+  dropped instead of getting its own chapter.
 - **Raids** — one chapter per raid at or above a configurable minimum
   viewer count (default 50), so a string of 1-2-viewer raids doesn't spam
   the chapter list.

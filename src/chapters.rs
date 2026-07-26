@@ -228,9 +228,26 @@ const DEFAULT_CHAPTER_COALESCE_SECS: i64 = 30;
 
 /// Merge `stream_meta_change` rows (already loaded for one take) into
 /// `(at_secs, label)` chapter events — `at_secs` relative to the take's
-/// `started_at`, same frame [`rebase_to_final_secs`] expects. Baseline rows
-/// (`old_value` empty — the "this is what it started as" row every take
-/// gets) are dropped, matching `monitor_change_lines`' existing filter.
+/// `started_at`, same frame [`rebase_to_final_secs`] expects.
+///
+/// Notability is judged by **value actually differing from the last known
+/// one**, not by `old_value` being non-empty. A row's `old_value` is only
+/// ever empty for a "baseline" observation — logged whenever the in-memory
+/// watcher (re)starts, including mid-recording after an app restart — and it
+/// used to be the sole filter here, which silently dropped a genuine
+/// transition whenever the watcher happened to restart between the old and
+/// new value: the row that lands is a fresh baseline (empty `old_value`) for
+/// the *new* value, indistinguishable by that field alone from a harmless
+/// re-observation of a value that never changed. Tracking last-seen value
+/// per kind instead tells them apart directly and self-heals across the gap
+/// — the transition still gets a chapter, just anchored to when it was
+/// (re-)observed rather than the exact moment it happened, consistent with
+/// chapters being approximate, not PTS-exact (see the module doc).
+///
+/// The very first notable event is always the take's starting title/game —
+/// pinned to exactly `0.0` (a real "first chapter") rather than whatever
+/// moment the first poll happened to land on.
+///
 /// Title+category changes landing within `coalesce_secs` of each other merge
 /// into one chapter, preferring the more informative combined label over
 /// picking just one — callers resolve `coalesce_secs` via
@@ -240,23 +257,38 @@ pub fn coalesce_meta_events(
     changes: &[crate::models::StreamMetaChange],
     coalesce_secs: i64,
 ) -> Vec<(f64, String)> {
-    let mut relevant: Vec<&crate::models::StreamMetaChange> = changes
-        .iter()
-        .filter(|c| (c.kind == "title" || c.kind == "category") && !c.old_value.is_empty())
-        .collect();
+    let mut relevant: Vec<&crate::models::StreamMetaChange> =
+        changes.iter().filter(|c| c.kind == "title" || c.kind == "category").collect();
     relevant.sort_by_key(|c| c.at_secs);
+
+    let mut last_title: Option<&str> = None;
+    let mut last_category: Option<&str> = None;
+    let notable: Vec<&crate::models::StreamMetaChange> = relevant
+        .into_iter()
+        .filter(|c| match c.kind.as_str() {
+            "title" if last_title != Some(c.new_value.as_str()) => {
+                last_title = Some(&c.new_value);
+                true
+            }
+            "category" if last_category != Some(c.new_value.as_str()) => {
+                last_category = Some(&c.new_value);
+                true
+            }
+            _ => false,
+        })
+        .collect();
 
     let mut out = Vec::new();
     let mut i = 0;
-    while i < relevant.len() {
-        let group_start = relevant[i].at_secs;
+    while i < notable.len() {
+        let group_start = notable[i].at_secs;
         let mut title = None;
         let mut category = None;
         let mut j = i;
-        while j < relevant.len() && relevant[j].at_secs - group_start <= coalesce_secs {
-            match relevant[j].kind.as_str() {
-                "title" => title = Some(relevant[j].new_value.clone()),
-                "category" => category = Some(relevant[j].new_value.clone()),
+        while j < notable.len() && notable[j].at_secs - group_start <= coalesce_secs {
+            match notable[j].kind.as_str() {
+                "title" => title = Some(notable[j].new_value.clone()),
+                "category" => category = Some(notable[j].new_value.clone()),
                 _ => {}
             }
             j += 1;
@@ -267,7 +299,8 @@ pub fn coalesce_meta_events(
             (None, Some(t)) => t.clone(),
             (None, None) => unreachable!("group is never empty"),
         };
-        out.push((group_start as f64, label));
+        let at = if out.is_empty() { 0.0 } else { group_start as f64 };
+        out.push((at, label));
         i = j;
     }
     out
@@ -552,20 +585,26 @@ mod tests {
             meta(105, "title", "afk", "let's ring"),
         ];
         let events = coalesce_meta_events(&changes, DEFAULT_CHAPTER_COALESCE_SECS);
-        assert_eq!(events, vec![(100.0, "Elden Ring — let's ring".to_string())]);
+        // The very first notable event pins to 0.0 — a "first chapter", not
+        // whatever moment the first poll happened to land on.
+        assert_eq!(events, vec![(0.0, "Elden Ring — let's ring".to_string())]);
     }
 
     #[test]
     fn coalesce_keeps_title_only_and_category_only_separate_when_far_apart() {
         let changes = vec![
-            meta(0, "category", "", "Just Chatting"), // baseline row, dropped
+            meta(0, "category", "", "Just Chatting"), // baseline row: now the initial chapter, not dropped
             meta(100, "category", "Just Chatting", "Elden Ring"),
             meta(500, "title", "let's ring", "goodnight"),
         ];
         let events = coalesce_meta_events(&changes, DEFAULT_CHAPTER_COALESCE_SECS);
         assert_eq!(
             events,
-            vec![(100.0, "Elden Ring".to_string()), (500.0, "goodnight".to_string())]
+            vec![
+                (0.0, "Just Chatting".to_string()),
+                (100.0, "Elden Ring".to_string()),
+                (500.0, "goodnight".to_string())
+            ]
         );
     }
 
@@ -580,7 +619,39 @@ mod tests {
             meta(500, "title", "let's ring", "goodnight"),
         ];
         let events = coalesce_meta_events(&changes, 600);
-        assert_eq!(events, vec![(100.0, "Elden Ring — goodnight".to_string())]);
+        assert_eq!(events, vec![(0.0, "Elden Ring — goodnight".to_string())]);
+    }
+
+    #[test]
+    fn coalesce_survives_a_mid_recording_watcher_restart() {
+        // Reproduces a real incident: the in-memory metadata watcher restarted
+        // mid-recording (e.g. an app restart) and lost its "last known value"
+        // state. The category HAD genuinely changed while nothing was watching,
+        // but the watcher's first observation after restarting logs it as a
+        // fresh baseline (empty old_value) — indistinguishable from a harmless
+        // re-observation of an unchanged value by that field alone. Comparing
+        // against the last known value (not old_value) tells them apart: this
+        // one must still produce a chapter.
+        let changes = vec![
+            meta(0, "category", "", "Just Chatting"),
+            meta(100, "category", "Just Chatting", "Elden Ring"),
+            // Watcher restarts here; re-observes "Elden Ring" a few times
+            // (redundant, must NOT duplicate a chapter)...
+            meta(200, "category", "", "Elden Ring"),
+            meta(300, "category", "", "Elden Ring"),
+            // ...then the game genuinely changes while unwatched, and the
+            // watcher's next restart re-baselines the NEW value.
+            meta(1000, "category", "", "Dinoblade"),
+        ];
+        let events = coalesce_meta_events(&changes, DEFAULT_CHAPTER_COALESCE_SECS);
+        assert_eq!(
+            events,
+            vec![
+                (0.0, "Just Chatting".to_string()),
+                (100.0, "Elden Ring".to_string()),
+                (1000.0, "Dinoblade".to_string()),
+            ]
+        );
     }
 
     #[test]
