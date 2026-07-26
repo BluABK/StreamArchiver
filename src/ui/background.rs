@@ -163,6 +163,104 @@ impl StreamArchiverApp {
                 ui.add_space(12.0);
             }
 
+            // ── Queued (chapters embed / gap-splice backlog) ─────────────
+            // `sweep_pending_chapters`/`sweep_pending_gap_splices` work
+            // through their "fresh" (never-attempted) candidates strictly
+            // one at a time — awaited in sequence, oldest first — to avoid
+            // flooding the shared disk gate with a pile of concurrent
+            // full-file ffmpeg passes. Everything behind the one currently
+            // running has no disk-gate entry and no Active-panel row of its
+            // own, so a large backlog (e.g. a bulk re-embed, or the first
+            // run of a new feature against an existing library) would
+            // otherwise be entirely invisible until its turn comes.
+            {
+                let active_chapters: std::collections::HashSet<i64> = self
+                    .background_tasks
+                    .iter()
+                    .filter_map(|t| match t.kind {
+                        crate::events::BackgroundTaskKind::Chapters(id) => Some(id),
+                        _ => None,
+                    })
+                    .collect();
+                let active_splices: std::collections::HashSet<i64> = self
+                    .background_tasks
+                    .iter()
+                    .filter_map(|t| match t.kind {
+                        crate::events::BackgroundTaskKind::GapSplice(id) => Some(id),
+                        _ => None,
+                    })
+                    .collect();
+                let queued_chapters: Vec<_> = self
+                    .core
+                    .store
+                    .queued_chapters_embeds()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|q| !active_chapters.contains(&q.rec_id))
+                    .collect();
+                let queued_splices: Vec<_> = self
+                    .core
+                    .store
+                    .queued_gap_splices()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|q| !active_splices.contains(&q.rec_id))
+                    .collect();
+                const MAX_QUEUED_ROWS: usize = 15;
+                if !queued_chapters.is_empty() || !queued_splices.is_empty() {
+                    ui.strong("Queued");
+                    ui.label(
+                        egui::RichText::new(
+                            "Waiting for the sequential embed/splice backlog sweep to reach \
+                             them — processed one at a time, oldest first, so a large backlog \
+                             doesn't flood the disk gate.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.add_space(4.0);
+                    egui::Grid::new("bg_queued_grid")
+                        .num_columns(3)
+                        .striped(true)
+                        .spacing([16.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.strong("Channel");
+                            ui.strong("Job");
+                            ui.strong("Position");
+                            ui.end_row();
+                            let recorded_hover = |started_at: i64| -> String {
+                                use chrono::{Local, TimeZone};
+                                Local
+                                    .timestamp_opt(started_at, 0)
+                                    .single()
+                                    .map(|dt| format!("Recorded {}", dt.format("%Y-%m-%d %H:%M")))
+                                    .unwrap_or_default()
+                            };
+                            for (i, q) in queued_chapters.iter().take(MAX_QUEUED_ROWS).enumerate() {
+                                ui.label(&q.channel).on_hover_text(recorded_hover(q.started_at));
+                                ui.label("Chapters embed");
+                                ui.label(format!("{} of {}", i + 1, queued_chapters.len()));
+                                ui.end_row();
+                            }
+                            if queued_chapters.len() > MAX_QUEUED_ROWS {
+                                ui.weak(format!("(+{} more)", queued_chapters.len() - MAX_QUEUED_ROWS));
+                                ui.end_row();
+                            }
+                            for (i, q) in queued_splices.iter().take(MAX_QUEUED_ROWS).enumerate() {
+                                ui.label(&q.channel).on_hover_text(recorded_hover(q.started_at));
+                                ui.label("Gap splice");
+                                ui.label(format!("{} of {}", i + 1, queued_splices.len()));
+                                ui.end_row();
+                            }
+                            if queued_splices.len() > MAX_QUEUED_ROWS {
+                                ui.weak(format!("(+{} more)", queued_splices.len() - MAX_QUEUED_ROWS));
+                                ui.end_row();
+                            }
+                        });
+                    ui.add_space(12.0);
+                }
+            }
+
             // ── Active tasks ─────────────────────────────────────────────
             ui.strong("Active");
             // Live disk-gate status, ONE LINE PER DRIVE: bulk passes

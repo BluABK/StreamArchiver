@@ -1258,7 +1258,12 @@ long-running re-attached pass would block every later recording in the
 sweep from finalizing (or even showing live progress in the Processes
 window) until it finished, and on a library with a large first-run backlog
 a restart could otherwise take a long time to even notice an already-running
-pass again.
+pass again. The rest of that ordered queue — everything not yet reached, so
+not shown anywhere else — lists in the Background view's own **Queued**
+section (alongside the equivalent gap-splice backlog), oldest first with its
+position in line, so a large backlog (a first-run sweep, a bulk re-embed) is
+never invisible between "still in the database" and "showing up as an Active
+row."
 For more direct control: right-click a stream/take row → **📑 Embed
 chapters** (or **🔁 Re-embed chapters** once it already has some) to run it
 immediately instead of waiting for a restart, which also works as a retry

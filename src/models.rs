@@ -2696,6 +2696,17 @@ pub struct QueuedHeadBackfill {
     pub started_at: i64,
 }
 
+/// A recording awaiting its turn in a sequential, one-at-a-time backlog
+/// sweep (chapters embed / gap-splice) — the Background view's "Queued"
+/// section row. `rec_id` lets the UI drop whatever's currently in-flight
+/// (already showing in the Active table) out of the backlog count/list.
+#[derive(Clone, Debug)]
+pub struct QueuedEmbedJob {
+    pub rec_id: i64,
+    pub channel: String,
+    pub started_at: i64,
+}
+
 /// A recording whose published VOD came back DMCA-muted — a row of the Issues
 /// panel's muted-VOD category (with the recovered copy, when recovery produced one).
 #[derive(Clone, Debug)]

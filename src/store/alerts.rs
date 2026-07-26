@@ -444,6 +444,37 @@ impl Store {
         Ok(rows)
     }
 
+    /// Same candidates as [`Self::recordings_needing_gap_splice_check`],
+    /// joined with channel name and ordered oldest-first — the Background
+    /// view's "Queued" section, same rationale as [`Self::queued_chapters_embeds`].
+    pub fn queued_gap_splices(&self) -> Result<Vec<crate::models::QueuedEmbedJob>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT r.id, c.name, r.started_at
+             FROM recording r
+             JOIN monitor m ON m.id = r.monitor_id
+             JOIN channel c ON c.id = m.channel_id
+             WHERE r.gap_splice_state = ''
+               AND r.status = 'completed'
+               AND EXISTS (SELECT 1 FROM gap_range g WHERE g.recording_id = r.id AND g.state = 'done')
+               AND NOT EXISTS (
+                   SELECT 1 FROM gap_range g
+                   WHERE g.recording_id = r.id AND g.state IN ('pending', 'fetching')
+               )
+             ORDER BY r.started_at",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(crate::models::QueuedEmbedJob {
+                    rec_id: r.get(0)?,
+                    channel: r.get(1)?,
+                    started_at: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Recordings that are stable enough for chapter embedding to run
     /// (finished, no pending head-backfill, no gap ranges still resolving —
     /// deliberately NOT gated on `gap_splice_state` itself: an empty state
@@ -466,6 +497,40 @@ impl Store {
                )",
         )?;
         let rows = st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Same candidates as [`Self::recordings_needing_chapters_check`], joined
+    /// with channel name and ordered oldest-first — the Background view's
+    /// "Queued" section. `sweep_pending_chapters` works through its "fresh"
+    /// (never-attempted) candidates strictly one at a time to avoid flooding
+    /// the disk gate, so everything behind the one currently running has no
+    /// Active-panel row of its own; this is what makes that backlog visible.
+    pub fn queued_chapters_embeds(&self) -> Result<Vec<crate::models::QueuedEmbedJob>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare(
+            "SELECT r.id, c.name, r.started_at
+             FROM recording r
+             JOIN monitor m ON m.id = r.monitor_id
+             JOIN channel c ON c.id = m.channel_id
+             WHERE r.chapters_state = ''
+               AND r.status = 'completed'
+               AND r.head_backfill_state != 'queued'
+               AND NOT EXISTS (
+                   SELECT 1 FROM gap_range g
+                   WHERE g.recording_id = r.id AND g.state IN ('pending', 'fetching')
+               )
+             ORDER BY r.started_at",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(crate::models::QueuedEmbedJob {
+                    rec_id: r.get(0)?,
+                    channel: r.get(1)?,
+                    started_at: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
