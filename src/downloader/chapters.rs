@@ -12,12 +12,21 @@ use super::*;
 use super::ffmpeg_job;
 use crate::chapters::{self as ch, ChapterKinds, SplicedGap};
 
+/// Automatic retries allowed for a transient chapters-embed failure before
+/// it becomes the terminal `"failed"` (needing the manual "Re-embed
+/// chapters" button) — same shape as gap-recovery's `GAP_MAX_ATTEMPTS`.
+const MAX_CHAPTERS_ATTEMPTS: i64 = 5;
+
 /// Whether chapter embedding may proceed for a recording in this state —
 /// every condition must hold, or defer without touching anything. Pure so
 /// it's directly unit-testable. `take_group_size` is the number of
 /// recording rows sharing this take's `take_group` (`1` = solo) — multi-part
 /// merged recordings are excluded for the same reason gap-splice excludes
 /// them: `started_at`-relative event offsets aren't trustworthy across legs.
+/// `chapters_state == "queued"` is a transient failure awaiting automatic
+/// retry (see `record_chapters_failure`) — eligible exactly like `""`
+/// (never tried); `"done"`/`"skipped"`/`"failed"` (exhausted retries) stay
+/// terminal.
 fn chapters_precondition_met(
     status: &str,
     head_backfill_state: &str,
@@ -26,7 +35,7 @@ fn chapters_precondition_met(
 ) -> bool {
     status == "completed"
         && head_backfill_state != "queued"
-        && chapters_state.is_empty()
+        && (chapters_state.is_empty() || chapters_state == "queued")
         && take_group_size <= 1
 }
 
@@ -121,6 +130,32 @@ impl Supervisor {
         }
         for rec_id in fresh {
             self.spawn_chapters_sequential(rec_id, Vec::new()).await;
+        }
+    }
+
+    /// Periodic retry for transient chapters-embed failures
+    /// (`chapters_state = "queued"`, see `record_chapters_failure`) — so a
+    /// recording self-heals from e.g. a momentarily-overloaded disk without
+    /// needing the manual "Re-embed chapters" button. Hourly: enough backoff
+    /// for a transient I/O blip to clear without hammering a still-broken
+    /// enclosure, same cadence as `asset_refresh_loop`. Toggleable from the
+    /// Background view like every other periodic job (`TOGGLEABLE_JOBS`).
+    pub async fn retry_queued_chapters_loop(&self, shutdown: Arc<AtomicBool>, jobs: crate::events::JobRegistry) {
+        const INITIAL_DELAY_SECS: u64 = 90;
+        const TICK_SECS: u64 = 3600;
+
+        crate::app_core::sleep_cancellable(Duration::from_secs(INITIAL_DELAY_SECS), &shutdown).await;
+        loop {
+            if shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            if self.store.job_enabled("job_chapters_retry") {
+                for rec_id in self.store.recordings_with_queued_chapters().unwrap_or_default() {
+                    self.spawn_chapters_sequential(rec_id, Vec::new()).await;
+                }
+                crate::events::mark_job(&jobs, "Chapters retry", TICK_SECS as i64);
+            }
+            crate::app_core::sleep_cancellable(Duration::from_secs(TICK_SECS), &shutdown).await;
         }
     }
 
@@ -299,14 +334,22 @@ impl Supervisor {
                 )));
             }
             Err(e) => {
+                let next_attempts = rec.chapters_attempts + 1;
+                let exhausted = next_attempts >= MAX_CHAPTERS_ATTEMPTS;
                 warn!(
                     rec_id,
                     channel = %channel,
-                    "chapters: embed failed after {:.1}s: {e:#} — {}",
+                    attempt = next_attempts,
+                    "chapters: embed failed after {:.1}s: {e:#} — {} ({})",
                     started.elapsed().as_secs_f64(),
                     output.display(),
+                    if exhausted {
+                        "retries exhausted, giving up".to_string()
+                    } else {
+                        format!("will retry automatically, attempt {next_attempts}/{MAX_CHAPTERS_ATTEMPTS}")
+                    },
                 );
-                let _ = self.store.set_chapters_state(rec_id, "failed");
+                let _ = self.store.record_chapters_failure(rec_id, next_attempts, exhausted);
                 finish(crate::events::TaskOutcome::Failed(format!("{e:#}")));
             }
         }
@@ -417,5 +460,7 @@ mod tests {
         assert!(!chapters_precondition_met("completed", "", "done", 1), "already embedded — terminal");
         assert!(!chapters_precondition_met("completed", "", "skipped", 1), "already decided to skip — terminal");
         assert!(!chapters_precondition_met("completed", "", "", 2), "multi-leg capture");
+        assert!(chapters_precondition_met("completed", "", "queued", 1), "transient failure awaiting automatic retry");
+        assert!(!chapters_precondition_met("completed", "", "failed", 1), "retries exhausted — terminal until a manual re-embed");
     }
 }

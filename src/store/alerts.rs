@@ -488,7 +488,7 @@ impl Store {
         let conn = self.db();
         let mut st = conn.prepare(
             "SELECT r.id FROM recording r
-             WHERE r.chapters_state = ''
+             WHERE r.chapters_state IN ('', 'queued')
                AND r.status = 'completed'
                AND r.head_backfill_state != 'queued'
                AND NOT EXISTS (
@@ -681,6 +681,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::test_util::*;
 
     fn gap_alert(take: &str) -> NewCaptureAlert {
         NewCaptureAlert {
@@ -857,5 +858,41 @@ mod tests {
             .unwrap();
         assert_eq!(store.prune_capture_alerts(60).unwrap(), 1);
         assert!(store.list_capture_alerts(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn chapters_check_includes_never_tried_and_queued_retries_not_terminal_ones() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+
+        let never_tried = store
+            .insert_recording(mid, 100, "C:/tmp/a.mkv", Some(50), false, Some("s1"), None, "", "")
+            .unwrap();
+        store.finish_recording(never_tried, 200, 500, Some(0), "completed", "C:/tmp/a.mkv", "").unwrap();
+
+        let queued_retry = store
+            .insert_recording(mid, 300, "C:/tmp/b.mkv", Some(50), false, Some("s2"), None, "", "")
+            .unwrap();
+        store.finish_recording(queued_retry, 400, 500, Some(0), "completed", "C:/tmp/b.mkv", "").unwrap();
+        store.record_chapters_failure(queued_retry, 1, false).unwrap();
+
+        let done = store
+            .insert_recording(mid, 500, "C:/tmp/c.mkv", Some(50), false, Some("s3"), None, "", "")
+            .unwrap();
+        store.finish_recording(done, 600, 500, Some(0), "completed", "C:/tmp/c.mkv", "").unwrap();
+        store.set_chapters_state(done, "done").unwrap();
+
+        let exhausted = store
+            .insert_recording(mid, 700, "C:/tmp/d.mkv", Some(50), false, Some("s4"), None, "", "")
+            .unwrap();
+        store.finish_recording(exhausted, 800, 500, Some(0), "completed", "C:/tmp/d.mkv", "").unwrap();
+        store.record_chapters_failure(exhausted, 5, true).unwrap();
+
+        let candidates = store.recordings_needing_chapters_check().unwrap();
+        assert!(candidates.contains(&never_tried));
+        assert!(candidates.contains(&queued_retry));
+        assert!(!candidates.contains(&done));
+        assert!(!candidates.contains(&exhausted));
     }
 }

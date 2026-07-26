@@ -145,6 +145,7 @@ pub const TOGGLEABLE_JOBS: &[(&str, &str)] = &[
     ("Channel asset refresh", "job_asset_refresh"),
     ("YouTube posts refresh", "job_community_posts"),
     ("Scheduled recordings", "job_scheduled_recordings"),
+    ("Chapters retry", "job_chapters_retry"),
 ];
 
 pub fn job_registry() -> JobRegistry {

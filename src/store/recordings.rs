@@ -241,11 +241,42 @@ impl Store {
     /// [`crate::models::Recording::chapters_state`].
     pub fn set_chapters_state(&self, id: i64, state: &str) -> Result<()> {
         let conn = self.db();
+        // A reset to "" (manual retrigger, bulk re-embed) always means "start
+        // fresh" — zero the automatic-retry counter along with it, so a prior
+        // run of transient failures doesn't count against the new attempt.
         conn.execute(
-            "UPDATE recording SET chapters_state=?2 WHERE id=?1",
+            "UPDATE recording SET chapters_state=?2,
+                 chapters_attempts = CASE WHEN ?2 = '' THEN 0 ELSE chapters_attempts END
+             WHERE id=?1",
             params![id, state],
         )?;
         Ok(())
+    }
+
+    /// Record a failed chapters-embed attempt: bump `chapters_attempts` and
+    /// requeue (`chapters_state = "queued"`) for the automatic retry sweep to
+    /// pick up, unless `next_attempts` has reached `MAX_CHAPTERS_ATTEMPTS` —
+    /// then give up for good (`chapters_state = "failed"`, needing the manual
+    /// "Re-embed chapters" button). Same attempt-count-gated shape as
+    /// gap-recovery's `gap_range.attempts`.
+    pub fn record_chapters_failure(&self, id: i64, next_attempts: i64, exhausted: bool) -> Result<()> {
+        let conn = self.db();
+        let state = if exhausted { "failed" } else { "queued" };
+        conn.execute(
+            "UPDATE recording SET chapters_state=?2, chapters_attempts=?3 WHERE id=?1",
+            params![id, state, next_attempts],
+        )?;
+        Ok(())
+    }
+
+    /// Recordings currently queued for an automatic chapters-embed retry
+    /// (`chapters_state = "queued"`) — the periodic retry sweep's candidate
+    /// list. See `record_chapters_failure`.
+    pub fn recordings_with_queued_chapters(&self) -> Result<Vec<i64>> {
+        let conn = self.db();
+        let mut stmt = conn.prepare("SELECT id FROM recording WHERE chapters_state = 'queued'")?;
+        let rows = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<i64>>>()?;
+        Ok(rows)
     }
 
     /// Persist the actual embedded chapter list — see
@@ -868,7 +899,7 @@ impl Store {
                     backfill_path, full_path, COALESCE(trigger_info, ''),
                     head_backfill_state, COALESCE(trigger_rule_json, ''), vod_views,
                     gap_splice_state, err_ack, sabr_live_edge_fallback, chapters_state,
-                    COALESCE(chapters_json, '')
+                    COALESCE(chapters_json, ''), chapters_attempts
              FROM recording WHERE monitor_id = ?1 ORDER BY started_at, id",
         )?;
         let rows = stmt
@@ -913,6 +944,7 @@ impl Store {
                     sabr_live_edge_fallback: r.get::<_, i64>(36)? != 0,
                     chapters_state: r.get(37)?,
                     chapters_json: r.get(38)?,
+                    chapters_attempts: r.get(39)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -941,7 +973,7 @@ impl Store {
             backfill_path, full_path, COALESCE(trigger_info, ''),
             head_backfill_state, COALESCE(trigger_rule_json, ''), vod_views,
             gap_splice_state, err_ack, sabr_live_edge_fallback, chapters_state,
-            COALESCE(chapters_json, '')";
+            COALESCE(chapters_json, ''), chapters_attempts";
 
     fn map_recording_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::models::Recording> {
         Ok(crate::models::Recording {
@@ -984,6 +1016,7 @@ impl Store {
             sabr_live_edge_fallback: r.get::<_, i64>(36)? != 0,
             chapters_state: r.get(37)?,
             chapters_json: r.get(38)?,
+            chapters_attempts: r.get(39)?,
         })
     }
 
@@ -1209,6 +1242,7 @@ impl Store {
                     sabr_live_edge_fallback: false,
                     chapters_state: String::new(),
                     chapters_json: String::new(),
+                    chapters_attempts: 0,
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1276,6 +1310,7 @@ impl Store {
                     sabr_live_edge_fallback: false,
                     chapters_state: String::new(),
                     chapters_json: String::new(),
+                    chapters_attempts: 0,
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1366,6 +1401,7 @@ impl Store {
                     sabr_live_edge_fallback: false,
                     chapters_state: String::new(),
                     chapters_json: String::new(),
+                    chapters_attempts: 0,
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1449,6 +1485,7 @@ impl Store {
                     sabr_live_edge_fallback: false,
                     chapters_state: String::new(),
                     chapters_json: String::new(),
+                    chapters_attempts: 0,
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1512,6 +1549,7 @@ impl Store {
                     sabr_live_edge_fallback: false,
                     chapters_state: String::new(),
                     chapters_json: String::new(),
+                    chapters_attempts: 0,
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1713,6 +1751,7 @@ impl Store {
                     sabr_live_edge_fallback: false,
                     chapters_state: String::new(),
                     chapters_json: String::new(),
+                    chapters_attempts: 0,
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -2213,6 +2252,38 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].0, disposed);
         assert_eq!(candidates[0].1, "C:/tmp/x.full.mkv");
+    }
+
+    #[test]
+    fn record_chapters_failure_requeues_until_attempts_exhausted() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.upsert_channel("A", "https://twitch.tv/a", Platform::Twitch).unwrap();
+        let mid = store.insert_monitor(&sample_monitor(cid)).unwrap();
+        let rec = store
+            .insert_recording(mid, 100, "C:/tmp/x.mkv", Some(50), false, Some("s1"), None, "", "")
+            .unwrap();
+
+        // First few failures requeue (not yet at the cap).
+        store.record_chapters_failure(rec, 1, false).unwrap();
+        let row = store.get_recording(rec).unwrap().unwrap();
+        assert_eq!(row.chapters_state, "queued");
+        assert_eq!(row.chapters_attempts, 1);
+        assert_eq!(store.recordings_with_queued_chapters().unwrap(), vec![rec]);
+
+        // The caller decides "exhausted" (mirrors gap-recovery's own
+        // attempts-vs-cap check) — once true, it's terminal.
+        store.record_chapters_failure(rec, 5, true).unwrap();
+        let row = store.get_recording(rec).unwrap().unwrap();
+        assert_eq!(row.chapters_state, "failed");
+        assert_eq!(row.chapters_attempts, 5);
+        assert!(store.recordings_with_queued_chapters().unwrap().is_empty());
+
+        // A manual reset (retrigger / bulk re-embed) always zeroes the
+        // counter along with the state, regardless of how it got here.
+        store.set_chapters_state(rec, "").unwrap();
+        let row = store.get_recording(rec).unwrap().unwrap();
+        assert_eq!(row.chapters_state, "");
+        assert_eq!(row.chapters_attempts, 0);
     }
 
     #[test]

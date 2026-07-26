@@ -2686,6 +2686,13 @@ pub struct Recording {
     /// from the most recent successful embed, `""` otherwise — backs the
     /// Background view's chapters detail popup. See `chapters_state`.
     pub chapters_json: String,
+    /// How many automatic chapters-embed attempts have failed in a row since
+    /// the last `""` reset (manual retry or bulk re-embed). Gates the
+    /// automatic retry sweep: reaching `MAX_CHAPTERS_ATTEMPTS` moves
+    /// `chapters_state` to the terminal `"failed"` instead of requeuing, so a
+    /// permanently-broken source doesn't get retried forever. See
+    /// `downloader::chapters`.
+    pub chapters_attempts: i64,
 }
 
 /// A take awaiting a head-backfill decision — the Background view's "Planned"
@@ -3233,6 +3240,7 @@ mod tests {
             sabr_live_edge_fallback: false,
             chapters_state: String::new(),
             chapters_json: String::new(),
+            chapters_attempts: 0,
         }
     }
 

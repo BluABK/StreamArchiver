@@ -1340,6 +1340,16 @@ override (Inherit / On / Off, same chain as every other feature toggle).
 The four/five event kinds and the raid viewer threshold are global-only
 settings in the same section.
 
+**Self-healing after a transient failure** (a busy/overloaded drive, a
+momentary I/O error — not a corrupt source file): a failed embed pass
+requeues itself automatically rather than giving up immediately. An hourly
+background job (Settings → Background → *Chapters retry*, toggleable like
+every other periodic job) retries every recording still awaiting one, so a
+one-off disk hiccup clears up on its own within the hour — no manual click
+needed. After 5 automatic attempts still fail, it stops retrying and needs
+the manual **📑 Embed chapters**/Settings **Re-embed chapters** action to try
+again, so a genuinely broken source doesn't get hammered forever.
+
 **If the app closes mid-embed** (crash, forced quit, power loss): the
 recording itself is never at risk — embedding writes to a `{stem}.tmp.mkv`
 sidecar and only atomically renames over the original on full success, so

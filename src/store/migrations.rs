@@ -1475,7 +1475,23 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 74)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 74);
+        if version < 75 {
+            // How many automatic chapters-embed attempts have failed in a row
+            // since the last reset — gates the automatic retry sweep
+            // (`downloader::chapters::retry_queued_chapters_loop`): a
+            // transient failure (e.g. the disk was momentarily unreachable)
+            // requeues (`chapters_state = "queued"`) for a later retry, but
+            // once `MAX_CHAPTERS_ATTEMPTS` is reached it gives up for good
+            // (`chapters_state = "failed"`, same as before this existed)
+            // instead of retrying a permanently-broken source forever. Added
+            // after a USB enclosure overload left ~15 recordings stuck at
+            // `chapters_state = 'failed'` with no automatic way back.
+            conn.execute_batch(
+                "ALTER TABLE recording ADD COLUMN chapters_attempts INTEGER NOT NULL DEFAULT 0;",
+            )?;
+            conn.pragma_update(None, "user_version", 75)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 75);
         Ok(())
     }
 }

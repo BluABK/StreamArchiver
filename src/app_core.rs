@@ -509,6 +509,18 @@ impl AppCore {
             asset_sup.asset_refresh_loop(asset_shutdown, asset_jobs).await;
         });
 
+        // Periodic retry for chapters-embed failures left `"queued"` by a
+        // transient error (see `record_chapters_failure`) — self-heals
+        // without a manual "Re-embed chapters" click.
+        let chapters_retry_sup = supervisor.clone();
+        let chapters_retry_shutdown = self.shutdown.clone();
+        let chapters_retry_jobs = self.jobs.clone();
+        self.rt.spawn(async move {
+            chapters_retry_sup
+                .retry_queued_chapters_loop(chapters_retry_shutdown, chapters_retry_jobs)
+                .await;
+        });
+
         // Follow raid: EventSub raid-out pushes -> force-start/ad-hoc-capture
         // orchestration (idles cheaply — the channel just never sends
         // anything unless raid_eventsub + conduit mode are actually active).

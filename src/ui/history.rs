@@ -428,6 +428,7 @@ mod tests {
             sabr_live_edge_fallback: false,
             chapters_state: String::new(),
             chapters_json: String::new(),
+            chapters_attempts: 0,
         }
     }
 
