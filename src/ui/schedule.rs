@@ -56,6 +56,9 @@ pub(super) const K_SCHEDULE_DEFAULT_VIEW: &str = "schedule_default_view";
 /// Setting key for the "Compact" calendar toggle (events collapse to a
 /// one-line chip at their start time in the Week/Day views).
 pub(super) const K_SCHEDULE_COMPACT: &str = "schedule_compact_events";
+/// Setting key for the sidebar's per-channel hide list (`schedule_hidden`) —
+/// a comma-joined list of hidden channel ids.
+pub(super) const K_SCHEDULE_HIDDEN_CHANNELS: &str = "schedule_hidden_channels";
 /// Local timestamp in the active [`DateFmt`] (empty if unset). Used for the
 /// Polled / Went Live / Started On columns and the history tree.
 /// A clickable row in the "Schedule sources" dialog's Available column: the
@@ -1311,12 +1314,19 @@ impl StreamArchiverApp {
         if let Some(d) = nav_anchor {
             self.schedule_anchor = Some(d);
         }
+        // Every branch that touches `schedule_hidden` sets this so the sidebar's
+        // per-channel hide list persists across a restart (previously lost —
+        // a channel with a permanent dummy schedule had to be re-hidden every
+        // launch) without writing to the DB on every frame this fn runs.
+        let mut hidden_changed = false;
         if clear_hidden {
             self.schedule_hidden.clear();
+            hidden_changed = true;
         }
         if hide_all {
             let ids: Vec<i64> = self.schedule_all.iter().map(|s| s.channel_id).collect();
             self.schedule_hidden.extend(ids);
+            hidden_changed = true;
         }
         if let Some(id) = toggle_channel {
             // Toggle this channel's visibility.
@@ -1325,6 +1335,7 @@ impl StreamArchiverApp {
             } else {
                 self.schedule_hidden.insert(id);
             }
+            hidden_changed = true;
         }
         if let Some(v) = set_collisions {
             self.schedule_collisions = v;
@@ -1404,6 +1415,11 @@ impl StreamArchiverApp {
             } else {
                 self.schedule_hidden.insert(cid);
             }
+            hidden_changed = true;
+        }
+        if hidden_changed {
+            let joined = self.schedule_hidden.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+            let _ = self.core.store.set_setting(K_SCHEDULE_HIDDEN_CHANNELS, &joined);
         }
         if let Some(cid) = ui
             .ctx()
@@ -1694,9 +1710,10 @@ impl StreamArchiverApp {
             return;
         }
         bars.sort_by_key(|&(_, start, end)| (start, end));
+        let mut bars = coalesce_all_day_bars(&bars, &self.schedule_all); // (idx, start, end, merged_count)
         let mut lane_end: Vec<i32> = Vec::new();
-        let mut placed: Vec<(usize, usize, usize, usize)> = Vec::new(); // (idx, start, end, lane)
-        for (idx, start, end) in bars {
+        let mut placed: Vec<(usize, usize, usize, usize, usize)> = Vec::new(); // (idx, start, end, lane, merged_count)
+        for (idx, start, end, merged_count) in bars.drain(..) {
             let lane = lane_end
                 .iter()
                 .position(|&le| le < start as i32)
@@ -1705,7 +1722,7 @@ impl StreamArchiverApp {
                     lane_end.len() - 1
                 });
             lane_end[lane] = end as i32;
-            placed.push((idx, start, end, lane));
+            placed.push((idx, start, end, lane, merged_count));
         }
 
         let bar_h = SCHED_ALL_DAY_BAR_H * zoom;
@@ -1715,7 +1732,7 @@ impl StreamArchiverApp {
         let (resp, painter) = ui.allocate_painter(egui::vec2(strip_w, strip_h), egui::Sense::hover());
         let origin = resp.rect.min;
         let mut clicked_day: Option<chrono::NaiveDate> = None;
-        for (idx, start, end, lane) in &placed {
+        for (idx, start, end, lane, merged_count) in &placed {
             let s = &self.schedule_all[*idx];
             let x0 = origin.x + time_col_w + *start as f32 * (col_w + col_gap);
             let x1 = origin.x + time_col_w + (*end as f32 + 1.0) * (col_w + col_gap) - col_gap;
@@ -1756,8 +1773,11 @@ impl StreamArchiverApp {
                 clicked_day = Some(days[*start]);
             }
             let hover_extra = sig.map(EventSignals::hover_lines).unwrap_or_default();
+            let merge_label = (*merged_count > 1)
+                .then(|| format!("{merged_count} daily segments combined for display"));
+            let detail = schedule_detail_line_merged(s, merge_label.as_deref());
             evt_resp
-                .on_hover_text(format!("{}{hover_extra}", schedule_detail_line(s)))
+                .on_hover_text(format!("{detail}{hover_extra}"))
                 .context_menu(|ui| schedule_copy_menu(ui, s, false, None));
         }
         if let Some(d) = clicked_day {

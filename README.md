@@ -2115,7 +2115,12 @@ YouTube sources as the Next stream column) in a calendar, with **Month**, **Week
   to count as an **all-day event** (20h+ — covers both a full-day placeholder and
   a genuine multi-day range like a subathon) draws as a continuous horizontal bar
   under the day numbers, Google-Calendar style, instead of a clipped time-grid
-  block.
+  block. A subathon reported by the platform as one recurring segment **per
+  day** (each day's segment overlapping the next, rather than one clean
+  multi-day segment — Twitch's own schedule API does this) still draws as
+  ONE continuous bar across every day it spans: adjacent/overlapping
+  same-channel, same-title segments are coalesced for display (hover the bar
+  — it says how many daily segments got combined).
 
   ![Week view with channel avatars and an all-day event bar spanning several days](doc/screenshots/schedule-week-view.png)
 - **Day** — a detailed, time-sorted list of one day's streams (time · platform ·
@@ -2135,9 +2140,11 @@ YouTube sources as the Next stream column) in a calendar, with **Month**, **Week
   day popup also has **Copy all**. Hover a stream for its full details.
 - **Left sidebar** filters which channels are shown: an **All channels** toggle
   plus a per-channel checkbox (with each channel's platform icon and upcoming
-  count). Newly-added channels default to visible. Each row carries the
-  channel's **calendar color** as a swatch + tinted name, so the sidebar
-  doubles as the legend for the event blocks.
+  count). Newly-added channels default to visible; unchecking one **persists**
+  across a restart (e.g. a channel whose schedule is a permanent dummy
+  placeholder stays hidden without re-hiding it every launch). Each row
+  carries the channel's **calendar color** as a swatch + tinted name, so the
+  sidebar doubles as the legend for the event blocks.
 - **Channel colors** are the *same* ones the Streams list uses: a manually
   chosen custom color wins, else the streamer's own **Twitch name color**
   (darkened just enough that white block text stays readable), else the

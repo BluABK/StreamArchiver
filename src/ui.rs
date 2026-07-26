@@ -1358,6 +1358,10 @@ pub struct StreamArchiverApp {
     schedule_anchor: Option<chrono::NaiveDate>,
     /// Channel ids hidden from the Schedule calendar (sidebar filter). Tracking
     /// *hidden* (not visible) means newly-added channels default to visible.
+    /// Persisted under [`crate::ui::schedule::K_SCHEDULE_HIDDEN_CHANNELS`] —
+    /// unlike `schedule_hidden_segments` below, this is a deliberate per-channel
+    /// preference (e.g. a channel whose schedule is a permanent dummy
+    /// placeholder), not a soft per-event hide meant to reset.
     schedule_hidden: HashSet<i64>,
     /// Individual segment IDs the user has soft-hidden (not tombstoned). Reset
     /// on app restart; use Delete for permanent suppression.

@@ -77,6 +77,10 @@ impl StreamArchiverApp {
         let primary_platform_pref = crate::platform_pref::global_primary_platform(&core.store);
 
         let schedule_compact = setting_or_empty(&core, K_SCHEDULE_COMPACT) == "1";
+        let schedule_hidden: HashSet<i64> = setting_or_empty(&core, K_SCHEDULE_HIDDEN_CHANNELS)
+            .split(',')
+            .filter_map(|s| s.trim().parse::<i64>().ok())
+            .collect();
 
         let default_out = core
             .store
@@ -585,7 +589,7 @@ impl StreamArchiverApp {
             schedule_loaded: false,
             schedule_mode,
             schedule_anchor: None,
-            schedule_hidden: HashSet::new(),
+            schedule_hidden,
             schedule_hidden_segments: HashSet::new(),
             schedule_show_hidden: false,
             schedule_collisions: true,

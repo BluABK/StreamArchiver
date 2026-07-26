@@ -639,6 +639,40 @@ pub(super) fn layout_event_lanes(
     assignments.into_iter().map(|(i, l)| (i, l, total)).collect()
 }
 
+/// Coalesce adjacent/overlapping all-day bars for the same channel+title into
+/// one, before lane-packing — a genuine multi-day event can arrive as a
+/// SEQUENCE of near-day-length segments rather than one continuous one (e.g.
+/// Twitch's own schedule API reports a running subathon as one recurring
+/// segment per day, each overlapping the next by design: day N's reported end
+/// lands partway through day N+1's reported start), which would otherwise
+/// stack into extra lanes and read as several separate bars instead of one
+/// continuous week-long one. `bars` is `(stream_idx, start_col, end_col)`,
+/// pre-sorted by `(start_col, end_col)`. Returns `(stream_idx, start_col,
+/// end_col, merged_count)`, keeping the FIRST bar's `stream_idx` as the
+/// representative for each merged run (same title/channel by construction, so
+/// nothing meaningful is lost for click/hover/context-menu purposes).
+pub(super) fn coalesce_all_day_bars(
+    bars: &[(usize, usize, usize)],
+    all: &[UpcomingStream],
+) -> Vec<(usize, usize, usize, usize)> {
+    let mut merged: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(bars.len());
+    for &(idx, start, end) in bars {
+        let can_merge = merged.last().is_some_and(|&(last_idx, _, last_end, _)| {
+            let a = &all[last_idx];
+            let b = &all[idx];
+            a.channel_id == b.channel_id && a.title == b.title && start <= last_end + 1
+        });
+        if can_merge {
+            let last = merged.last_mut().unwrap();
+            last.2 = last.2.max(end);
+            last.3 += 1;
+        } else {
+            merged.push((idx, start, end, 1));
+        }
+    }
+    merged
+}
+
 /// Draw a 24-hour time-grid for one or more day columns. Called by both the Week
 /// and Day views. `days` lists the calendar dates; `col_w` is the per-column
 /// content width (excluding the time label column and gaps).
@@ -1016,6 +1050,53 @@ mod tests {
         let close = vec![stream(1, 0, Some(3600)), stream(2, 300, Some(3600))];
         let compact = layout_event_lanes(&[0, 1], &close, Some(660));
         assert!(compact.iter().all(|&(_, _, t)| t == 2));
+    }
+
+    /// A distinct-from-`stream()` builder that also sets `channel_id`/`title`
+    /// — the two fields [`coalesce_all_day_bars`] groups by.
+    fn stream_ct(id: i64, channel_id: i64, title: &str) -> crate::models::UpcomingStream {
+        crate::models::UpcomingStream { channel_id, title: title.into(), ..stream(id, 0, None) }
+    }
+
+    #[test]
+    fn coalesce_merges_adjacent_and_overlapping_same_channel_and_title() {
+        let all = vec![
+            stream_ct(1, 27, "NUMI SUBATHON 2026"), // Mon-Tue
+            stream_ct(2, 27, "NUMI SUBATHON 2026"), // Tue-Wed: overlaps bar 1 on Tue
+            stream_ct(3, 27, "NUMI SUBATHON 2026"), // Thu-Fri: adjacent (gap of 0) to bar 2's end
+        ];
+        let bars = [(0, 0, 1), (1, 1, 2), (2, 3, 4)];
+        let merged = coalesce_all_day_bars(&bars, &all);
+        // All three collapse into one run spanning col 0..4, keeping the
+        // first segment's idx, with a count of 3.
+        assert_eq!(merged, vec![(0, 0, 4, 3)]);
+    }
+
+    #[test]
+    fn coalesce_keeps_different_channels_and_titles_separate() {
+        let all = vec![
+            stream_ct(1, 27, "NUMI SUBATHON 2026"),
+            stream_ct(2, 99, "NUMI SUBATHON 2026"), // different channel
+            stream_ct(3, 27, "Some Other Event"),   // different title
+        ];
+        // All three are date-adjacent/overlapping, but grouping requires a
+        // channel+title match too.
+        let bars = [(0, 0, 1), (1, 1, 2), (2, 2, 3)];
+        let merged = coalesce_all_day_bars(&bars, &all);
+        assert_eq!(merged, vec![(0, 0, 1, 1), (1, 1, 2, 1), (2, 2, 3, 1)]);
+    }
+
+    #[test]
+    fn coalesce_does_not_bridge_a_real_gap() {
+        let all = vec![
+            stream_ct(1, 27, "NUMI SUBATHON 2026"),
+            stream_ct(2, 27, "NUMI SUBATHON 2026"),
+        ];
+        // A 2-day gap between bar 1's end (col 1) and bar 2's start (col 4)
+        // is a real break, not schedule-API overlap noise — stays separate.
+        let bars = [(0, 0, 1), (1, 4, 5)];
+        let merged = coalesce_all_day_bars(&bars, &all);
+        assert_eq!(merged, vec![(0, 0, 1, 1), (1, 4, 5, 1)]);
     }
 
     /// Bright colours (e.g. fetched Twitch spring green) darken for white block
