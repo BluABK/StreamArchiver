@@ -1212,6 +1212,25 @@ impl StreamArchiverApp {
                     );
                     ui.checkbox(&mut self.settings.live_title_auto_update, "");
                     ui.end_row();
+                    ui.label("Mute collab instances").on_hover_text(
+                        "Mute every OTHER angle opened by \"Play all collab instances \
+                         (live edge)\" — the instance you actually right-clicked keeps its \
+                         normal audio. Avoids several stream's worth of audio all playing \
+                         at once. mpv only.",
+                    );
+                    ui.checkbox(&mut self.settings.mute_collab_instances, "");
+                    ui.end_row();
+                    ui.label("Untracked collab partner title").on_hover_text(
+                        "Window title for a collab partner that ISN'T a channel you track \
+                         (played via a synthetic instance borrowing this row's own tool/\
+                         quality/auth settings) — separate from \"Live-edge player title\" \
+                         above since there's no known title/game to fill those tokens with, \
+                         only {channel} is meaningful here. Leave blank to fall back to the \
+                         same template as a tracked instance (its {game}/{title_trimmed} \
+                         will just render empty).",
+                    );
+                    ui.text_edit_singleline(&mut self.settings.collab_untracked_title_template);
+                    ui.end_row();
                     ui.label("Max concurrent downloads");
                     ui.text_edit_singleline(&mut self.settings.max_concurrent_downloads);
                     ui.end_row();

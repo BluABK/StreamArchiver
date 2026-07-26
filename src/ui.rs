@@ -116,6 +116,12 @@ const K_LIVE_TITLE_TEMPLATE: &str = "live_edge_title_template";
 /// Keep pushing an updated title (over mpv's IPC socket) as the monitor's
 /// title/game changes, for the launch paths this app spawns mpv directly for.
 const K_LIVE_TITLE_AUTO_UPDATE: &str = "live_edge_title_auto_update";
+/// Mute every non-clicked-on instance opened by "Play all collab instances
+/// (live edge)".
+const K_MUTE_COLLAB_INSTANCES: &str = "mute_collab_instances";
+/// Window-title template for an untracked collab partner (see
+/// [`crate::ui::player::spawn_play_collab_partner`]).
+const K_COLLAB_UNTRACKED_TITLE_TEMPLATE: &str = "collab_untracked_title_template";
 
 /// Browsers yt-dlp can read cookies from (for the Settings dropdown).
 const COOKIE_BROWSERS: [&str; 8] = [
@@ -935,6 +941,16 @@ struct SettingsForm {
     /// via mpv's IPC socket (only for the launch paths this app spawns mpv
     /// directly for — see `ui::player::apply_live_title_and_spawn_updater`).
     live_title_auto_update: bool,
+    /// Mute every collab-partner instance opened by "Play all collab
+    /// instances (live edge)" — the clicked-on instance itself always keeps
+    /// its normal audio. mpv only (same gate as the title auto-update).
+    mute_collab_instances: bool,
+    /// Window-title template for a collab partner that ISN'T locally tracked
+    /// (played via a synthetic instance — see
+    /// `ui::player::spawn_play_collab_partner`) — separate from
+    /// `live_title_template` since such a partner has no known title/game to
+    /// fill those tokens with. Only `{channel}` is meaningful here.
+    collab_untracked_title_template: String,
     /// Auto-compress viewer-history samples older than this many days into
     /// 10-minute buckets (`0` = off, keep full resolution forever). Persisted
     /// immediately as `viewer_history_downsample_days`.

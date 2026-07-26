@@ -246,6 +246,11 @@ impl StreamArchiverApp {
                 if v.is_empty() { "{channel}: 【{game}】- {title_trimmed}".into() } else { v }
             },
             live_title_auto_update: setting_or_empty(&core, K_LIVE_TITLE_AUTO_UPDATE) == "1",
+            mute_collab_instances: setting_or_empty(&core, K_MUTE_COLLAB_INSTANCES) != "0",
+            collab_untracked_title_template: {
+                let v = setting_or_empty(&core, K_COLLAB_UNTRACKED_TITLE_TEMPLATE);
+                if v.is_empty() { "{channel} (collab)".into() } else { v }
+            },
             viewer_downsample_days: setting_or_empty(
                 &core,
                 crate::store::K_VH_DOWNSAMPLE_DAYS,
@@ -1717,6 +1722,8 @@ impl StreamArchiverApp {
             (K_MEDIA_PLAYER, s.media_player_path.trim()),
             (K_LIVE_TITLE_TEMPLATE, s.live_title_template.trim()),
             (K_LIVE_TITLE_AUTO_UPDATE, if s.live_title_auto_update { "1" } else { "0" }),
+            (K_MUTE_COLLAB_INSTANCES, if s.mute_collab_instances { "1" } else { "0" }),
+            (K_COLLAB_UNTRACKED_TITLE_TEMPLATE, s.collab_untracked_title_template.trim()),
             (crate::downloader::K_TOKEN_STYLE, if s.token_style_branded { "branded" } else { "plain" }),
             (crate::downloader::K_TOKEN_OVERRIDES, s.token_overrides.trim()),
             (crate::downloader::K_GAP_RECOVER, if s.gap_recover { "1" } else { "0" }),

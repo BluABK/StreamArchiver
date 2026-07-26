@@ -1907,10 +1907,24 @@ live, and archived:
   (there's no configuration of its own to use). An `@mention` partner
   ("unconfirmed") is never auto-opened this way, only a Shared-Chat-verified
   one — a title mention is just a guess, not confirmation that's really
-  their handle. For just one specific angle instead of all of them, the
+  their handle. Note that "confirmed via Shared Chat" only means their chat
+  is merged in, not that they're currently broadcasting — Twitch allows a
+  Shared Chat member to stay merged after their own stream ends, so a synthetic
+  instance can open to nothing playing (the player just quietly finds no live
+  stream, same as pointing "▷ Play stream (live edge)" at any other offline
+  channel). For just one specific angle instead of all of them, the
   **"👥 Play collab instance…"** submenu lists each partner with its own
   Current download / Live edge pair, the same locally-tracked-vs-synthetic
   distinction applying to that Live edge button too.
+  Two Settings → Defaults options tune this: **Mute collab instances**
+  (default on) silences every OTHER angle opened by the bulk "Play all
+  collab instances (live edge)" action — the instance you actually
+  right-clicked always keeps its normal audio — so several streams' worth of
+  audio don't all play at once; and **Untracked collab partner title** is a
+  separate window-title template used only for a synthetic (untracked
+  -partner) instance, since it has no known title/game to fill the normal
+  **Live-edge player title** template's tokens with (only `{channel}` is
+  meaningful here) — default `{channel} (collab)`.
 - **History** — every session is stored (who, host, when, how long, source)
   and linked to its broadcast. Right-click a stream row → **🤝 Collab
   history** for the channel's full list; the **Channel Stats** tab has a

@@ -2031,9 +2031,10 @@ pub(super) fn render_instance_row(
             // (Shared-Chat-confirmed, not a title-mention guess) partner that
             // ISN'T tracked — the latter play via a synthetic row cloned from
             // this instance's own settings (see `UntrackedCollabPartner`).
-            let tracked_live_edge: Vec<i64> = std::iter::once(m.id)
-                .chain(collab_plays.iter().filter_map(|(_, _, mid)| *mid))
-                .collect();
+            // `m.id` (the clicked-on instance) is threaded separately from the
+            // partner mids so only the partners get muted, never this one.
+            let tracked_partner_mids: Vec<i64> =
+                collab_plays.iter().filter_map(|(_, _, mid)| *mid).collect();
             let untracked_live_edge: Vec<UntrackedCollabPartner> = collab_plays
                 .iter()
                 .filter(|(partner, _, pmid)| pmid.is_none() && !partner.from_title)
@@ -2078,7 +2079,7 @@ pub(super) fn render_instance_row(
                 .on_disabled_hover_text("Set a media player in Settings → Defaults first")
                 .clicked()
             {
-                a.play_collab_all_live_edge = Some((m.id, tracked_live_edge, untracked_live_edge));
+                a.play_collab_all_live_edge = Some((m.id, tracked_partner_mids, untracked_live_edge));
                 ui.close();
             }
             if !collab_plays.is_empty() {

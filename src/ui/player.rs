@@ -980,11 +980,19 @@ pub(super) fn spawn_live_preview(
 ///   spawns the player directly, so the title can auto-update (mpv only).
 /// - ffmpeg source: passes the URL directly. Same direct-spawn title support
 ///   as the yt-dlp pipe case.
+///
+/// `mute` (mpv only) and `title_template_override` are for the collab-instance
+/// play actions: muting every OTHER angle so they don't all play audio at
+/// once, and a separate template for a synthetic (untracked-partner) row
+/// that has no real title/game to fill the normal template's tokens with.
+/// Both are no-ops (`false`/`None`) for a normal single-instance play.
 pub(super) fn spawn_play_new_instance(
     row: &crate::models::MonitorWithChannel,
     player: &str,
     settings: &SettingsForm,
     store: &Arc<crate::store::Store>,
+    mute: bool,
+    title_template_override: Option<&str>,
 ) -> Option<String> {
     use crate::downloader::{
         push_track_args, resolve_auth, resolved_quality, split_args, AuthSource,
@@ -1028,7 +1036,7 @@ pub(super) fn spawn_play_new_instance(
             args.push("5".into());
             push_track_args(&mut args, Tool::Streamlink, &m.audio_tracks, &m.subtitle_tracks, false);
             args.extend(extra);
-            let title_template = settings.live_title_template.trim();
+            let title_template = title_template_override.unwrap_or(settings.live_title_template.trim());
             if !title_template.is_empty() {
                 args.push("--title".into());
                 args.push(streamlink_live_title(
@@ -1036,7 +1044,15 @@ pub(super) fn spawn_play_new_instance(
                 ));
             }
             args.push("--player".into());
-            args.push(player.to_string());
+            // Streamlink treats `--player` as a full command line (splitting
+            // it itself before appending the resolved stream) — this is the
+            // documented way to pass the player its own extra flags without a
+            // separate `--player-args`.
+            args.push(if mute && player_is_mpv(player) {
+                format!("{player} --mute")
+            } else {
+                player.to_string()
+            });
             args.push(m.url.clone());
             args.push(resolved_quality(&m.quality));
             let mut cmd = std::process::Command::new("streamlink");
@@ -1092,8 +1108,12 @@ pub(super) fn spawn_play_new_instance(
                     cmd.arg("-").stdin(Stdio::from(pipe));
                     apply_live_title_and_spawn_updater(
                         &mut cmd, player, m.id, &row.channel.name, &row.last_title, &row.last_game,
-                        settings.live_title_template.trim(), settings.live_title_auto_update, store,
+                        title_template_override.unwrap_or(settings.live_title_template.trim()),
+                        settings.live_title_auto_update, store,
                     );
+                    if mute && player_is_mpv(player) {
+                        cmd.arg("--mute");
+                    }
                     spawn_logged(cmd, "media player")
                 }
                 Err(e) => {
@@ -1106,8 +1126,12 @@ pub(super) fn spawn_play_new_instance(
             let mut cmd = std::process::Command::new(player);
             apply_live_title_and_spawn_updater(
                 &mut cmd, player, m.id, &row.channel.name, &row.last_title, &row.last_game,
-                settings.live_title_template.trim(), settings.live_title_auto_update, store,
+                title_template_override.unwrap_or(settings.live_title_template.trim()),
+                settings.live_title_auto_update, store,
             );
+            if mute && player_is_mpv(player) {
+                cmd.arg("--mute");
+            }
             cmd.arg(&m.url);
             spawn_logged(cmd, "media player")
         }
@@ -1145,7 +1169,7 @@ pub(super) fn spawn_follow_raid(
     row.channel.name = raid.target.clone();
     row.last_title.clear();
     row.last_game.clear();
-    spawn_play_new_instance(&row, player, settings, store)
+    spawn_play_new_instance(&row, player, settings, store, false, None)
 }
 
 /// Tune into a verified-but-untracked collab partner at the live edge, no
@@ -1160,6 +1184,8 @@ pub(super) fn spawn_play_collab_partner(
     player: &str,
     settings: &SettingsForm,
     store: &Arc<crate::store::Store>,
+    mute: bool,
+    title_template_override: Option<&str>,
 ) -> Option<String> {
     let mut row = source_row.clone();
     row.monitor.id = 0;
@@ -1167,7 +1193,7 @@ pub(super) fn spawn_play_collab_partner(
     row.channel.name = partner.name.clone();
     row.last_title.clear();
     row.last_game.clear();
-    spawn_play_new_instance(&row, player, settings, store)
+    spawn_play_new_instance(&row, player, settings, store, mute, title_template_override)
 }
 
 #[cfg(test)]

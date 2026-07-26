@@ -1512,7 +1512,7 @@ impl StreamArchiverApp {
             if !player.is_empty()
                 && let Some(row) = self.rows.iter().find(|r| r.monitor.id == mid)
                 && let Some(msg) =
-                    spawn_play_new_instance(row, &player, &self.settings, &self.core.store)
+                    spawn_play_new_instance(row, &player, &self.settings, &self.core.store, false, None)
             {
                 self.status = msg;
             }
@@ -1529,13 +1529,32 @@ impl StreamArchiverApp {
                 }
             }
         }
-        if let Some((source_mid, mids, untracked)) = acts.play_collab_all_live_edge.take() {
+        if let Some((source_mid, partner_mids, untracked)) = acts.play_collab_all_live_edge.take() {
             let player = self.settings.media_player_path.trim().to_string();
             if !player.is_empty() {
-                for mid in mids {
+                let mute_partners = self.settings.mute_collab_instances;
+                let untracked_template = self.settings.collab_untracked_title_template.trim().to_string();
+                let untracked_override =
+                    (!untracked_template.is_empty()).then_some(untracked_template.as_str());
+                // The clicked-on instance always keeps its own audio — only
+                // the OTHER angles (tracked partners, then untracked ones)
+                // respect the mute setting.
+                if let Some(row) = self.rows.iter().find(|r| r.monitor.id == source_mid)
+                    && let Some(msg) =
+                        spawn_play_new_instance(row, &player, &self.settings, &self.core.store, false, None)
+                {
+                    self.status = msg;
+                }
+                for mid in partner_mids {
                     if let Some(row) = self.rows.iter().find(|r| r.monitor.id == mid)
-                        && let Some(msg) =
-                            spawn_play_new_instance(row, &player, &self.settings, &self.core.store)
+                        && let Some(msg) = spawn_play_new_instance(
+                            row,
+                            &player,
+                            &self.settings,
+                            &self.core.store,
+                            mute_partners,
+                            None,
+                        )
                     {
                         self.status = msg;
                     }
@@ -1550,6 +1569,8 @@ impl StreamArchiverApp {
                             &player,
                             &self.settings,
                             &self.core.store,
+                            mute_partners,
+                            untracked_override,
                         ) {
                             self.status = msg;
                         }
@@ -1559,6 +1580,9 @@ impl StreamArchiverApp {
         }
         if let Some((source_mid, partner)) = acts.play_collab_partner_live_edge.take() {
             let player = self.settings.media_player_path.trim().to_string();
+            let untracked_template = self.settings.collab_untracked_title_template.trim().to_string();
+            let untracked_override =
+                (!untracked_template.is_empty()).then_some(untracked_template.as_str());
             if !player.is_empty()
                 && let Some(source_row) = self.rows.iter().find(|r| r.monitor.id == source_mid)
                 && let Some(msg) = spawn_play_collab_partner(
@@ -1567,6 +1591,8 @@ impl StreamArchiverApp {
                     &player,
                     &self.settings,
                     &self.core.store,
+                    false,
+                    untracked_override,
                 )
             {
                 self.status = msg;
