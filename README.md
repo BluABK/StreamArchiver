@@ -1347,8 +1347,16 @@ background job (Settings → Background → *Chapters retry*, toggleable like
 every other periodic job) retries every recording still awaiting one, so a
 one-off disk hiccup clears up on its own within the hour — no manual click
 needed. After 5 automatic attempts still fail, it stops retrying and needs
-the manual **📑 Embed chapters**/Settings **Re-embed chapters** action to try
-again, so a genuinely broken source doesn't get hammered forever.
+the manual **📑 Embed chapters** context-menu action on that one recording to
+try again. (Settings' **Re-embed chapters** button is a *different*,
+much blunter tool — it re-runs every eligible recording regardless of
+`chapters_state`, "even ones that already have them," so it's for a
+deliberate full-library redo (e.g. after changing which chapter kinds are
+enabled), not for nudging a handful of stuck ones: it would needlessly
+re-copy every already-embedded recording along the way.) A one-time
+migration (v76) also requeued every recording that was already stuck at
+`"failed"` from before this retry system existed, so a pre-existing backlog
+self-heals the same way instead of needing that bulk button either.
 
 **If the app closes mid-embed** (crash, forced quit, power loss): the
 recording itself is never at risk — embedding writes to a `{stem}.tmp.mkv`

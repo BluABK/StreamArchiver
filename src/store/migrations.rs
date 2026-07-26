@@ -1491,7 +1491,31 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 75)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 75);
+        if version < 76 {
+            // One-time repair for recordings already stuck at
+            // `chapters_state = 'failed'` from before the v75 retry system
+            // existed (the 2026-07-26 USB overload incident left ~15 like
+            // this) — requeue them into the SAME targeted self-heal path a
+            // fresh transient failure now uses, rather than needing the
+            // "Re-embed chapters" bulk button, which would also needlessly
+            // re-copy every already-`'done'` recording in the library.
+            // `chapters_attempts = 0` is the discriminator: the new system
+            // always bumps attempts to at least 1 before ever landing on
+            // `'failed'`, so a `'failed'` row still at 0 can only be a
+            // legacy one that never got a fair automatic retry — a row
+            // that's genuinely exhausted 5 real retries (`attempts = 5`) is
+            // deliberately left alone.
+            let n = conn.execute(
+                "UPDATE recording SET chapters_state='queued'
+                 WHERE chapters_state='failed' AND chapters_attempts=0",
+                [],
+            )?;
+            if n > 0 {
+                tracing::info!(count = n, "migration: requeued pre-existing failed chapters embeds for automatic retry");
+            }
+            conn.pragma_update(None, "user_version", 76)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 76);
         Ok(())
     }
 }
