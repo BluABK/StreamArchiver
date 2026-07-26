@@ -72,21 +72,38 @@ impl Supervisor {
     /// finalization for just as long. Found via the Nihmune/Milk-Cweamcat
     /// live rescue: Milk's adopted chapters pass (rec 226) blocked Nihmune's
     /// (rec 1006) from ever finalizing while it ran.
+    ///
+    /// Already-alive candidates are also fanned out *first*, ahead of the
+    /// ordered genuinely-new ones — re-attaching an existing process is a
+    /// restart-cost-only operation (no new disk I/O), so it shouldn't have to
+    /// wait behind however much of the genuinely-new backlog happens to sort
+    /// before it by id. Otherwise, on a library with a large first-run
+    /// backlog, every single restart resets an already-running pass's
+    /// visible progress back to blank until the sequential portion of the
+    /// sweep happens to churn back around to its id — noticed when Nihmune's
+    /// progress vanished from the Processes window again after an unrelated
+    /// restart, purely because the new process hadn't yet re-reached rec 1006.
     pub async fn sweep_pending_chapters(&self) {
-        for rec_id in self.store.recordings_needing_chapters_check().unwrap_or_default() {
+        let candidates = self.store.recordings_needing_chapters_check().unwrap_or_default();
+        let (alive, fresh): (Vec<i64>, Vec<i64>) = candidates
+            .into_iter()
+            .partition(|&rec_id| ffmpeg_job::ffmpeg_job_is_alive(&self.store, FfmpegJobKind::ChaptersEmbed, rec_id));
+        for rec_id in alive {
             if !self.chapter_jobs.lock().unwrap().insert(rec_id) {
                 continue;
             }
-            if ffmpeg_job::ffmpeg_job_is_alive(&self.store, FfmpegJobKind::ChaptersEmbed, rec_id) {
-                let this = self.clone();
-                tokio::spawn(async move {
-                    this.chapters_job(rec_id, Vec::new()).await;
-                    this.chapter_jobs.lock().unwrap().remove(&rec_id);
-                });
-            } else {
-                self.chapters_job(rec_id, Vec::new()).await;
-                self.chapter_jobs.lock().unwrap().remove(&rec_id);
+            let this = self.clone();
+            tokio::spawn(async move {
+                this.chapters_job(rec_id, Vec::new()).await;
+                this.chapter_jobs.lock().unwrap().remove(&rec_id);
+            });
+        }
+        for rec_id in fresh {
+            if !self.chapter_jobs.lock().unwrap().insert(rec_id) {
+                continue;
             }
+            self.chapters_job(rec_id, Vec::new()).await;
+            self.chapter_jobs.lock().unwrap().remove(&rec_id);
         }
     }
 

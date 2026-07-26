@@ -1240,9 +1240,12 @@ runs after this feature is enabled — no action needed for old recordings.
 Genuinely new embed passes in that sweep still run one at a time (to avoid
 piling up concurrent full-file ffmpeg passes on a busy drive), but a
 recording whose pass already survived a restart is re-attached in the
-background instead — otherwise one very long-running re-attached pass would
-block every later recording in the sweep from finalizing (or even showing
-live progress in the Processes window) until it finished.
+background first, ahead of that ordered queue — otherwise one very
+long-running re-attached pass would block every later recording in the
+sweep from finalizing (or even showing live progress in the Processes
+window) until it finished, and on a library with a large first-run backlog
+a restart could otherwise take a long time to even notice an already-running
+pass again.
 For more direct control: right-click a stream/take row → **📑 Embed
 chapters** (or **🔁 Re-embed chapters** once it already has some) to run it
 immediately instead of waiting for a restart, which also works as a retry
