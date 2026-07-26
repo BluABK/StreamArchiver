@@ -236,6 +236,11 @@ impl StreamArchiverApp {
                 let v = setting_or_empty(&core, K_MEDIA_PLAYER);
                 if v.is_empty() { r"C:\Progs\mpv\mpv.exe".into() } else { v }
             },
+            live_title_template: {
+                let v = setting_or_empty(&core, K_LIVE_TITLE_TEMPLATE);
+                if v.is_empty() { "{channel}: 【{game}】- {title_trimmed}".into() } else { v }
+            },
+            live_title_auto_update: setting_or_empty(&core, K_LIVE_TITLE_AUTO_UPDATE) == "1",
             viewer_downsample_days: setting_or_empty(
                 &core,
                 crate::store::K_VH_DOWNSAMPLE_DAYS,
@@ -1692,6 +1697,8 @@ impl StreamArchiverApp {
             (K_FILE_SPLIT_THUMBS, s.file_split_thumbs.trim()),
             (K_FILE_SPLIT_LOGS,   s.file_split_logs.trim()),
             (K_MEDIA_PLAYER, s.media_player_path.trim()),
+            (K_LIVE_TITLE_TEMPLATE, s.live_title_template.trim()),
+            (K_LIVE_TITLE_AUTO_UPDATE, if s.live_title_auto_update { "1" } else { "0" }),
             (crate::downloader::K_TOKEN_STYLE, if s.token_style_branded { "branded" } else { "plain" }),
             (crate::downloader::K_TOKEN_OVERRIDES, s.token_overrides.trim()),
             (crate::downloader::K_GAP_RECOVER, if s.gap_recover { "1" } else { "0" }),

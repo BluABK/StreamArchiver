@@ -548,7 +548,7 @@ can always start a fresh backfill.
 
 Left-click a row to select it; **right-click** any row — channel, instance,
 stream, or take — for a context menu with that row's actions. For an instance:
-Start/Stop recording, **Stream in player** / **Play new instance** (see
+Start/Stop recording, **Play local recording (start)** / **Play stream (live edge)** (see
 [Watching in a media player](#watching-in-a-media-player)), **Open channel URL**
 (browser), **Open output folder** (file manager), **Copy URL**, Edit…, Add tool
 instance, Enable/Disable, and Delete.
@@ -578,7 +578,7 @@ trigger's *only-while-matching* auto-stop, scheduled stops, the
 quality-upgrade restart) never hold. A stream/take row's menu offers the
 same two Stop submenus too, right on the take that's actually recording (or
 the stream currently capturing it) — not just the instance row — plus Open
-folder / Open file / Stream in player / Play new instance / Copy path (and
+folder / Open file / Play local recording (start) / Play stream (live edge) / Copy path (and
 Delete for a take). The inline per-row buttons (▶/⏹ ⏵ ▷ ✏ ➕ 🗑) do the same
 (the strict Stop, since inline buttons have no room for a submenu — use the
 context menu for "allow triggers").
@@ -606,16 +606,18 @@ Set **Settings → Defaults → Media player path** to a player binary (e.g.
 `C:\Progs\mpv\mpv.exe`) and every recording row — instance, stream, and take —
 gains two playback actions, as inline buttons and context-menu entries:
 
-- **⏵ Stream in player** — open *this* recording in the player. For a finished
-  take that's simply the output file; for an **in-progress** recording it opens
-  the growing capture straight out of `.sa-cache\`, so you can watch a recording
-  **from the start while it is still being captured**. On the instance and
-  stream rows it prefers the active capture and falls back to the most recent
-  finished file — this works whether or not the instance row is expanded to
-  show its take history.
-- **▷ Play new instance** — tune into the channel **at the live edge**, like
-  opening the stream in a browser, without touching the recording (and without
-  needing one to be running).
+- **⏵ Play local recording (start)** — open *this* recording in the player.
+  For a finished take that's simply the output file; for an **in-progress**
+  recording it opens the growing capture straight out of `.sa-cache\`, so you
+  can watch a recording **from the start while it is still being captured**.
+  On the instance and stream rows it prefers the active capture and falls
+  back to the most recent finished file — this works whether or not the
+  instance row is expanded to show its take history.
+- **▷ Play stream (live edge)** — tune into the channel **at the live edge**,
+  like opening the stream in a browser, without touching the recording (and
+  without needing one to be running). The player's window title can be
+  customized (and, for mpv on non-Twitch tune-ins, kept live-updating) — see
+  [Live-edge player title](#live-edge-player-title) below.
 
 [mpv](https://mpv.io) is strongly recommended — the app hands it live-viewing
 flags (`appending://` growing-file URLs, `--keep-open`, a generated live HLS
@@ -624,7 +626,7 @@ are **mpv-only** and their buttons say so when disabled. Any player opens
 finished files. With no player configured the buttons are disabled and **Open
 file** falls back to the Windows file association.
 
-| Row state | ⏵ Stream in player | ▷ Play new instance |
+| Row state | ⏵ Play local recording (start) | ▷ Play stream (live edge) |
 |---|---|---|
 | Finished take | opens the output file (any player) | live-edge stream, if the channel is live |
 | Recording — Twitch / HLS (`.ts`) | the growing `.ts`, from the start; mpv follows it as it grows | streamlink pipes the live edge to the player (`--player`) |
@@ -661,6 +663,35 @@ Caveats:
 - The preview download is killed when the player closes. If the app exits
   first, the downloader ends on its own when the stream does, and stale
   preview folders are swept on a later preview.
+
+### Live-edge player title
+
+**▷ Play stream (live edge)** used to hand the player nothing but the raw
+URL/filename, so its window title was whatever the player itself defaulted
+to. **Settings → Defaults → Live-edge player title** sets a template instead
+(default `{channel}: 【{game}】- {title_trimmed}`), with four tokens:
+`{channel}`, `{game}`, `{title_trimmed}` (the stream title with chat-command
+plugs stripped, same as the [filename token](#filename-templates) of the
+same name), and `{pos}` (current playback position, `HH:MM:SS`) — add `{pos}`
+to your own template if you want it; the default omits it. Leave the field
+blank to restore the old behavior (no title override at all).
+
+How live `{pos}` gets, and whether the title can update after the player
+opens, depends on which tool is actually launching the player:
+
+| Path | Player spawned by | `{pos}` | Auto-update on title/game change |
+|---|---|---|---|
+| Twitch (Streamlink) | Streamlink itself (`--title`, translated internally to mpv/VLC/PotPlayer's own title flag) | fixed `00:00:00` | never — Streamlink owns the player process, not this app |
+| YouTube / Kick / ffmpeg source | this app, directly | **ticks live** (mpv only) | **Settings → Defaults → Auto-update live title** (mpv only) |
+
+For the paths this app spawns mpv directly for, `{pos}` becomes mpv's own
+`${time-pos}` property-expansion token baked into the `--title` argument —
+mpv keeps that ticking on its own, no polling needed on this app's side. With
+**Auto-update live title** on (mpv + one of those paths), a background
+thread re-checks the channel's title/game every 20s over mpv's own
+`--input-ipc-server` socket and pushes a freshly rendered title the moment
+either changes — best-effort only: if mpv's IPC pipe never comes up, this
+silently no-ops and the title just stays as set at launch.
 
 ### Detection methods
 
@@ -1827,7 +1858,7 @@ live, and archived:
   instance (matched by login; partners you don't archive are silently
   skipped, never duplicated). "Current downloads" reuses whatever's already
   actively capturing for each angle; "live edge" tunes in fresh without
-  recording, same as **▷ Play new instance**. For just one specific angle
+  recording, same as **▷ Play stream (live edge)**. For just one specific angle
   instead of all of them, the **"👥 Play collab instance…"** submenu lists
   each partner with its own Current download / Live edge pair.
 - **History** — every session is stored (who, host, when, how long, source)
@@ -1870,7 +1901,7 @@ into (or auto-record) the raid target:
   path exists.
 - **Manual play** — a live instance's right-click menu gains **"▷🏃 Follow
   raid"**, enabled once a recent raid-out is known: opens the target at the
-  live edge in your media player, same as ▷ Play new instance, without
+  live edge in your media player, same as ▷ Play stream (live edge), without
   recording.
 - **Auto-record (opt-in, default off)** — *Settings → Downloads → Follow
   raid* has a master toggle (off by default — unlike most toggles here, this
@@ -2922,12 +2953,12 @@ error line. The actionable fix is almost always adding the capture cache dirs
 to that tool's exclusion list. The player features handle this
 (full behavior in [Watching in a media player](#watching-in-a-media-player)):
 
-- **⏵ Stream in player** finds the growing pair and merges it *in mpv*: the
-  video file plays via mpv's `appending://` protocol (which follows a growing
-  file) with the audio file attached as an external track — watchable from the
-  capture's very start, including deep-rewound footage, while the download
-  continues.
-- **▷ Play new instance** runs a second, throwaway SABR download from the
+- **⏵ Play local recording (start)** finds the growing pair and merges it *in
+  mpv*: the video file plays via mpv's `appending://` protocol (which follows
+  a growing file) with the audio file attached as an external track —
+  watchable from the capture's very start, including deep-rewound footage,
+  while the download continues.
+- **▷ Play stream (live edge)** runs a second, throwaway SABR download from the
   **live edge** into `%TEMP%\streamarchiver-preview\` and plays it as a
   **locally generated live HLS playlist**: the app walks the growing files'
   fragment structure, coalesces it into byte-range segments, and rewrites the

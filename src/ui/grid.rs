@@ -801,7 +801,7 @@ pub(super) struct StreamsViewCache {
     pub(super) groups: HashMap<i64, Vec<StreamGroup>>,
     /// Every currently-`"recording"` take, by monitor id — a cheap global
     /// query (unlike `groups`, which only holds data for expanded monitors)
-    /// so a live capture's "Stream in player"/"Backfill head" stay usable on
+    /// so a live capture's "Play local recording (start)"/"Backfill head" stay usable on
     /// a collapsed instance row instead of reading as "nothing to play".
     pub(super) active_recordings: HashMap<i64, Vec<crate::models::Recording>>,
     /// Lowercase Twitch login → monitor id, one entry per locally-tracked
@@ -1821,9 +1821,9 @@ pub(super) struct RowActions {
     pub(super) properties: Option<i64>,            // monitor id
     pub(super) reorganize_monitor: Option<i64>,    // monitor id
     pub(super) reorganize_channel: Option<i64>,    // channel id
-    /// Target to open in the configured media player (set by "Stream in player").
+    /// Target to open in the configured media player (set by "Play local recording (start)").
     pub(super) stream_in_player: Option<StreamTarget>,
-    /// Monitor id to open a live stream in the player without recording (set by "Play new instance").
+    /// Monitor id to open a live stream in the player without recording (set by "Play stream (live edge)").
     pub(super) play_new_instance: Option<i64>,
     /// Recording id to manually (re)trigger head backfill for (set by "Backfill head").
     pub(super) backfill_head: Option<i64>,
@@ -1931,7 +1931,7 @@ pub(super) fn render_instance_row(
             let ok = !media_player.is_empty()
                 && stream_target.map(|t| playable_with(t, media_player)).unwrap_or(false);
             if ui
-                .add_enabled(ok, egui::Button::new("⏵  Stream in player"))
+                .add_enabled(ok, egui::Button::new("⏵  Play local recording (start)"))
                 .on_hover_text(if recording {
                     "Open live capture in the configured media player"
                 } else {
@@ -1951,7 +1951,7 @@ pub(super) fn render_instance_row(
             }
         }
         if ui
-            .add_enabled(!media_player.is_empty(), egui::Button::new("▷  Play new instance"))
+            .add_enabled(!media_player.is_empty(), egui::Button::new("▷  Play stream (live edge)"))
             .on_hover_text("Tune into the stream at the live edge in the media player (does not record)")
             .on_disabled_hover_text("Set a media player in Settings → Defaults first")
             .clicked()
@@ -2241,7 +2241,7 @@ pub(super) fn render_instance_row(
                         let b = ui
                             .add_enabled(player_ok, egui::Button::new("⏵").small())
                             .on_hover_text(if recording {
-                                "Stream in player"
+                                "Play local recording (start)"
                             } else {
                                 "Open in player"
                             })
@@ -2260,7 +2260,7 @@ pub(super) fn render_instance_row(
                     {
                         let b = ui
                             .add_enabled(!media_player.is_empty(), egui::Button::new("▷").small())
-                            .on_hover_text("Play new instance in media player at the live edge (does not record)")
+                            .on_hover_text("Play stream (live edge) in the media player (does not record)")
                             .on_disabled_hover_text("Set a media player in Settings → Defaults first");
                         if b.clicked() {
                             a.play_new_instance = Some(m.id);

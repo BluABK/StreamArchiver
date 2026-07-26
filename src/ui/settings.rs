@@ -1167,7 +1167,7 @@ impl StreamArchiverApp {
                     });
                     ui.end_row();
                     ui.label("Media player path").on_hover_text(
-                        "Path to the media player used by \"Stream in player\" on recording rows. \
+                        "Path to the media player used by \"Play local recording (start)\" on recording rows. \
                          Passed the file path as the only argument (e.g. mpv.exe, vlc.exe). \
                          With mpv, in-progress recordings open with live-view flags that follow \
                          the growing file, and in-progress SABR captures (separate audio/video \
@@ -1187,6 +1187,30 @@ impl StreamArchiverApp {
                             ));
                         }
                     });
+                    ui.end_row();
+                    ui.label("Live-edge player title").on_hover_text(
+                        "Window title for \"Play stream (live edge)\" — the URL/filename \
+                         otherwise shown by default. Tokens: {channel}, {game}, \
+                         {title_trimmed} (command-plug-stripped stream title), {pos} \
+                         (current playback position, HH:MM:SS). {pos} only ever ticks \
+                         live for YouTube/Kick/ffmpeg-source tune-ins (mpv's own \
+                         ${time-pos} keeps it updating) — for Twitch (Streamlink owns \
+                         the player process, not this app), {pos} is fixed at 00:00:00 \
+                         and the title can't update afterward either way. Leave blank to \
+                         restore the old behavior (no title override).",
+                    );
+                    ui.text_edit_singleline(&mut self.settings.live_title_template);
+                    ui.end_row();
+                    ui.label("Auto-update live title").on_hover_text(
+                        "Push an updated title over mpv's IPC socket whenever this app \
+                         detects the channel's title/game changed, for as long as the \
+                         live-edge player stays open. Only takes effect for launch paths \
+                         this app spawns mpv directly for (YouTube/Kick/ffmpeg-source) — \
+                         Streamlink (Twitch) owns the player process itself, so its title \
+                         is set once at open and can't be pushed to afterward. Requires \
+                         mpv as the configured media player.",
+                    );
+                    ui.checkbox(&mut self.settings.live_title_auto_update, "");
                     ui.end_row();
                     ui.label("Max concurrent downloads");
                     ui.text_edit_singleline(&mut self.settings.max_concurrent_downloads);

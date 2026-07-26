@@ -352,7 +352,7 @@ pub(super) fn sabr_capture_args(
 }
 
 /// Build the yt-dlp SABR args for a throwaway live-edge preview download
-/// ("Play new instance"): identical to [`sabr_capture_args`] except it joins
+/// ("Play stream (live edge)"): identical to [`sabr_capture_args`] except it joins
 /// at the live edge instead of rewinding to the start — the whole point is
 /// that the preview files BEGIN at the edge, so the player needs no seeking —
 /// and it prefers fMP4-compatible formats: the preview is served to the
@@ -1064,7 +1064,7 @@ mod tests {
 
     #[test]
     fn sabr_preview_args_join_at_live_edge() {
-        // The live-edge preview ("Play new instance") must be the capture
+        // The live-edge preview ("Play stream (live edge)") must be the capture
         // command with from-start swapped for live-edge and an fMP4-first
         // format selector (HLS-playlist playback needs ISOBMFF files) —
         // nothing else.

@@ -2642,7 +2642,7 @@ impl StreamArchiverApp {
                                 egui::Button::new("⏵").small(),
                             )
                             .on_hover_text(if g.status() == "recording" {
-                                "Stream in player"
+                                "Play local recording (start)"
                             } else {
                                 "Open in player"
                             })
@@ -2663,7 +2663,7 @@ impl StreamArchiverApp {
                                 !media_player.is_empty(),
                                 egui::Button::new("▷").small(),
                             )
-                            .on_hover_text("Play new instance in media player at the live edge (does not record)")
+                            .on_hover_text("Play stream (live edge) in the media player (does not record)")
                             .on_disabled_hover_text("Set a media player in Settings → Defaults first")
                             .clicked()
                         {
@@ -2949,7 +2949,7 @@ impl StreamArchiverApp {
                                 .as_ref()
                                 .map(|t| playable_with(t, &media_player))
                                 .unwrap_or(false),
-                        egui::Button::new("⏵  Stream in player"),
+                        egui::Button::new("⏵  Play local recording (start)"),
                     )
                     .on_hover_text(if g.status() == "recording" {
                         "Open live capture in the configured media player"
@@ -2972,7 +2972,7 @@ impl StreamArchiverApp {
                 if ui
                     .add_enabled(
                         !media_player.is_empty(),
-                        egui::Button::new("▷  Play new instance"),
+                        egui::Button::new("▷  Play stream (live edge)"),
                     )
                     .on_hover_text("Tune into the stream at the live edge in the media player (does not record)")
                     .on_disabled_hover_text("Set a media player in Settings → Defaults first")
@@ -3243,7 +3243,7 @@ impl StreamArchiverApp {
                                     egui::Button::new("⏵").small(),
                                 )
                                 .on_hover_text(if t.is_active() {
-                                    "Stream in player (opens the live capture)"
+                                    "Play local recording (start) — opens the live capture"
                                 } else {
                                     "Open in player"
                                 })
@@ -3264,7 +3264,7 @@ impl StreamArchiverApp {
                                     !media_player.is_empty(),
                                     egui::Button::new("▷").small(),
                                 )
-                                .on_hover_text("Play new instance in media player at the live edge (does not record)")
+                                .on_hover_text("Play stream (live edge) in the media player (does not record)")
                                 .on_disabled_hover_text("Set a media player in Settings → Defaults first")
                                 .clicked()
                             {
@@ -3573,7 +3573,7 @@ impl StreamArchiverApp {
                     if ui
                         .add_enabled(
                             player_ok,
-                            egui::Button::new("⏵  Stream in player"),
+                            egui::Button::new("⏵  Play local recording (start)"),
                         )
                         .on_hover_text(if t.is_active() {
                             "Open live capture in the configured media player"
@@ -3596,7 +3596,7 @@ impl StreamArchiverApp {
                     if ui
                         .add_enabled(
                             !media_player.is_empty(),
-                            egui::Button::new("▷  Play new instance"),
+                            egui::Button::new("▷  Play stream (live edge)"),
                         )
                         .on_hover_text("Tune into the stream at the live edge in the media player (does not record)")
                         .on_disabled_hover_text("Set a media player in Settings → Defaults first")

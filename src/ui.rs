@@ -108,8 +108,14 @@ const K_RENDER_EMOTES: &str = "render_emotes_in_chat";
 /// Whether animated emotes play (off ⇒ a static first frame). Default on; only an
 /// explicit `"0"` disables. Off is the perf/RAM escape hatch for heavy channels.
 const K_ANIMATE_EMOTES: &str = "animate_emotes_in_chat";
-/// Path to the media player binary used by "Stream in player" on recording rows.
+/// Path to the media player binary used by "Play local recording (start)" on recording rows.
 const K_MEDIA_PLAYER: &str = "media_player_path";
+/// Window-title template for "Play stream (live edge)" — see
+/// [`crate::ui::player::render_live_title`] for the token list.
+const K_LIVE_TITLE_TEMPLATE: &str = "live_edge_title_template";
+/// Keep pushing an updated title (over mpv's IPC socket) as the monitor's
+/// title/game changes, for the launch paths this app spawns mpv directly for.
+const K_LIVE_TITLE_AUTO_UPDATE: &str = "live_edge_title_auto_update";
 
 /// Browsers yt-dlp can read cookies from (for the Settings dropdown).
 const COOKIE_BROWSERS: [&str; 8] = [
@@ -917,6 +923,13 @@ struct SettingsForm {
     maintenance_apply_all: bool,
     /// Path to the media player binary (e.g. `C:\Progs\mpv\mpv.exe`).
     media_player_path: String,
+    /// Window-title template for "Play stream (live edge)" — same
+    /// falls-back-to-default-on-empty convention as `media_player_path`.
+    live_title_template: String,
+    /// Auto-push title/game changes to an already-running live-edge player
+    /// via mpv's IPC socket (only for the launch paths this app spawns mpv
+    /// directly for — see `ui::player::apply_live_title_and_spawn_updater`).
+    live_title_auto_update: bool,
     /// Auto-compress viewer-history samples older than this many days into
     /// 10-minute buckets (`0` = off, keep full resolution forever). Persisted
     /// immediately as `viewer_history_downsample_days`.

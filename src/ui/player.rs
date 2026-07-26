@@ -46,7 +46,7 @@ pub(super) fn open_path(path: &std::path::Path) {
     let _ = std::process::Command::new("explorer").arg(path).spawn();
 }
 
-/// What "Stream in player" should open for a recording, and how.
+/// What "Play local recording (start)" should open for a recording, and how.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum StreamTarget {
     /// A completed output file — open plainly (works with any player).
@@ -504,6 +504,151 @@ pub(super) fn spawn_logged(mut cmd: std::process::Command, what: &str) -> Option
     }
 }
 
+// ----- Live-edge player title (configurable, optionally auto-updating) -----
+
+/// Substitute the tokens available in the "Live-edge player title" setting:
+/// `{channel}`, `{game}`, `{title_trimmed}`, `{pos}` (current playback
+/// position). `{pos}` only ever ticks live for the launch paths this app
+/// spawns mpv directly for (YouTube/Kick/ffmpeg-source, via
+/// [`mpv_live_title_arg`]) — mpv's own `--title` flag supports property
+/// expansion and keeps refreshing the window title on its own, unlike
+/// `--force-media-title` (verified against mpv issue trackers: the latter
+/// does not expand `${...}` properties, `--title` does). Streamlink
+/// (Twitch) resolves its own `--title` template once at launch and forwards
+/// it to mpv as `--force-media-title`, so there `{pos}` can only ever be the
+/// position at open, and never updates afterward — Streamlink owns the
+/// player process, not this app (see [`streamlink_live_title`]).
+pub(super) fn render_live_title(template: &str, channel: &str, game: &str, title_trimmed: &str, pos: &str) -> String {
+    template
+        .replace("{channel}", channel)
+        .replace("{game}", game)
+        .replace("{title_trimmed}", title_trimmed)
+        .replace("{pos}", pos)
+}
+
+/// The mpv `--title` VALUE for a live-edge spawn this app owns directly —
+/// `{pos}` becomes mpv's own `${time-pos}` property-expansion token (left as
+/// literal text, not a resolved value) so the title keeps ticking with
+/// actual playback position with no polling on our side. Used both as the
+/// initial `--title=` spawn argument and as the value pushed over IPC by
+/// [`run_live_title_updater`] on a later change.
+fn mpv_live_title_value(template: &str, channel: &str, last_title: &str, last_game: &str) -> String {
+    let trimmed = crate::downloader::trim_title_commands(last_title);
+    render_live_title(template, channel, last_game, &trimmed, "${time-pos}")
+}
+
+/// The Streamlink `--title` VALUE (not an mpv flag — Streamlink translates
+/// it internally) for a live-edge tune-in. Resolved once from this app's own
+/// known metadata (not Streamlink's own scrape) so the same template means
+/// the same thing on every launch path; `{pos}` is always `00:00:00` since
+/// neither live-ticking nor a later update is possible through Streamlink.
+fn streamlink_live_title(template: &str, channel: &str, last_title: &str, last_game: &str) -> String {
+    let trimmed = crate::downloader::trim_title_commands(last_title);
+    render_live_title(template, channel, last_game, &trimmed, "00:00:00")
+}
+
+/// How often [`run_live_title_updater`] re-checks the monitor's current
+/// title/game for a change worth pushing.
+const LIVE_TITLE_POLL: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long to wait for mpv to create its IPC pipe before giving up on
+/// auto-updating the title — this never blocks or fails the play action
+/// itself, it just silently stays at the title set at launch.
+const LIVE_TITLE_IPC_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A unique `\\.\pipe\...` path for one mpv instance's `--input-ipc-server`.
+fn new_mpv_ipc_pipe_path() -> String {
+    format!(r"\\.\pipe\streamarchiver-mpv-{}-{}", std::process::id(), crate::models::now_unix())
+}
+
+/// Send one `set_property title <value>` command over an already-open mpv
+/// JSON-IPC pipe (newline-delimited JSON, mpv's documented IPC protocol).
+fn send_mpv_title(pipe: &mut std::fs::File, title: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let line = serde_json::json!({"command": ["set_property", "title", title]}).to_string();
+    pipe.write_all(line.as_bytes())?;
+    pipe.write_all(b"\n")
+}
+
+/// Background loop started by [`apply_live_title_and_spawn_updater`]: connect
+/// to `pipe_path`, then poll `monitor_id`'s current title/game every
+/// [`LIVE_TITLE_POLL`] and push a freshly rendered title whenever either
+/// changed since the last push. Exits silently once the pipe write fails
+/// (mpv closed its IPC server, meaning the player quit) or the connect
+/// timeout elapses (mpv never came up, or doesn't support `--input-ipc-server`).
+fn run_live_title_updater(
+    pipe_path: String,
+    store: Arc<crate::store::Store>,
+    monitor_id: i64,
+    template: String,
+    mut last_title: String,
+    mut last_game: String,
+) {
+    let deadline = std::time::Instant::now() + LIVE_TITLE_IPC_CONNECT_TIMEOUT;
+    let mut pipe = loop {
+        match crate::iomon::fs::open_with_sync(crate::iomon::Cat::Preview, &pipe_path, |o| {
+            o.write(true);
+        }) {
+            Ok(f) => break f,
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) => {
+                warn!("live-title: mpv IPC pipe never came up, auto-update disabled: {e}");
+                return;
+            }
+        }
+    };
+    loop {
+        std::thread::sleep(LIVE_TITLE_POLL);
+        let Ok(Some(row)) = store.get_monitor_with_channel(monitor_id) else { continue };
+        if row.last_title == last_title && row.last_game == last_game {
+            continue;
+        }
+        last_title = row.last_title.clone();
+        last_game = row.last_game.clone();
+        let value = mpv_live_title_value(&template, &row.channel.name, &last_title, &last_game);
+        if send_mpv_title(&mut pipe, &value).is_err() {
+            return; // player closed
+        }
+    }
+}
+
+/// Add the configured live-edge title to an mpv `Command` this app spawns
+/// directly, and — when enabled — start [`run_live_title_updater`] once the
+/// player is running. Best-effort only: never blocks or fails the play
+/// action, and is a no-op for anything other than mpv (only mpv understands
+/// `--title` this way) or a blank template (old default-title behavior).
+#[allow(clippy::too_many_arguments)]
+fn apply_live_title_and_spawn_updater(
+    cmd: &mut std::process::Command,
+    player: &str,
+    monitor_id: i64,
+    channel: &str,
+    last_title: &str,
+    last_game: &str,
+    template: &str,
+    auto_update: bool,
+    store: &Arc<crate::store::Store>,
+) {
+    if !player_is_mpv(player) || template.is_empty() {
+        return;
+    }
+    cmd.arg(format!("--title={}", mpv_live_title_value(template, channel, last_title, last_game)));
+    if !auto_update || monitor_id == 0 {
+        return; // 0 = a synthetic follow-raid row with no real monitor to poll
+    }
+    let pipe_path = new_mpv_ipc_pipe_path();
+    cmd.arg(format!("--input-ipc-server={pipe_path}"));
+    let store = Arc::clone(store);
+    let template = template.to_string();
+    let last_title = last_title.to_string();
+    let last_game = last_game.to_string();
+    std::thread::spawn(move || {
+        run_live_title_updater(pipe_path, store, monitor_id, template, last_title, last_game);
+    });
+}
+
 /// Root for throwaway live-edge preview downloads (see [`spawn_live_preview`]).
 pub(super) fn preview_root() -> std::path::PathBuf {
     std::env::temp_dir().join("streamarchiver-preview")
@@ -540,7 +685,7 @@ pub(super) fn spawn_live_preview(
     row: &crate::models::MonitorWithChannel,
     player: &str,
     settings: &SettingsForm,
-    store: &crate::store::Store,
+    store: &Arc<crate::store::Store>,
 ) -> Option<String> {
     use crate::downloader::{load_ytdlp_bins, resolve_auth, sabr_preview_args, split_args, youtube_live_url, AuthSource};
     use crate::models::Platform;
@@ -640,6 +785,12 @@ pub(super) fn spawn_live_preview(
     );
     let player = player.to_string();
     let channel = row.channel.name.clone();
+    let monitor_id = m.id;
+    let last_title = row.last_title.clone();
+    let last_game = row.last_game.clone();
+    let title_template = settings.live_title_template.trim().to_string();
+    let title_auto_update = settings.live_title_auto_update;
+    let title_store = Arc::clone(store);
     std::thread::spawn(move || {
         let cleanup = |dl: &mut std::process::Child, tmp: &std::path::Path| {
             let pid = dl.id().to_string();
@@ -750,6 +901,10 @@ pub(super) fn spawn_live_preview(
                         // blocks by default for local files.
                         cmd.arg("--demuxer-lavf-o=allowed_extensions=ALL");
                         cmd.arg(fwd_slashes(&hp.master_path()));
+                        apply_live_title_and_spawn_updater(
+                            &mut cmd, &player, monitor_id, &channel, &last_title, &last_game,
+                            &title_template, title_auto_update, &title_store,
+                        );
                         match cmd.spawn() {
                             Ok(p) => return Some((p, Some(hp))),
                             Err(e) => {
@@ -760,7 +915,12 @@ pub(super) fn spawn_live_preview(
                     }
                     warn!(%channel, "live-preview: HLS playlists not ready in time, falling back to appending://");
                 }
-                match build_player_command(&player, &target).spawn() {
+                let mut cmd = build_player_command(&player, &target);
+                apply_live_title_and_spawn_updater(
+                    &mut cmd, &player, monitor_id, &channel, &last_title, &last_game,
+                    &title_template, title_auto_update, &title_store,
+                );
+                match cmd.spawn() {
                     Ok(p) => Some((p, None)),
                     Err(e) => {
                         warn!(%channel, "live-preview: failed to launch player: {e}");
@@ -801,22 +961,30 @@ pub(super) fn spawn_live_preview(
     Some(msg)
 }
 
-/// Spawn a "play new instance" command — tunes into the stream at the LIVE
-/// EDGE in the configured media player, without recording. (⏵ "Stream in
-/// player" is the from-start counterpart: it opens the in-progress capture.)
-/// Returns a status-bar message to show the user, or `None`.
+/// Spawn a "play stream (live edge)" command — tunes into the stream at the
+/// LIVE EDGE in the configured media player, without recording. (⏵ "Play
+/// local recording (start)" is the from-start counterpart: it opens the
+/// in-progress capture.) Returns a status-bar message to show the user, or
+/// `None`.
 ///
 /// - Streamlink: `--player <path>` routes output to the player (live edge).
+///   The live-edge title (see `render_live_title`) is passed via
+///   Streamlink's own `--title`, since Streamlink — not this app — owns the
+///   player process here; auto-updating it on a later title/game change
+///   isn't possible through this path (see `streamlink_live_title`'s doc
+///   comment).
 /// - yt-dlp + YouTube: throwaway live-edge preview download, see
 ///   [`spawn_live_preview`] — SABR-only streams can't be piped or URL-played.
 /// - yt-dlp + other platforms (Kick): pipes `-o -` stdout to the player's
-///   stdin (from the live edge — from-start capture can't pipe).
-/// - ffmpeg source: passes the URL directly.
+///   stdin (from the live edge — from-start capture can't pipe). This app
+///   spawns the player directly, so the title can auto-update (mpv only).
+/// - ffmpeg source: passes the URL directly. Same direct-spawn title support
+///   as the yt-dlp pipe case.
 pub(super) fn spawn_play_new_instance(
     row: &crate::models::MonitorWithChannel,
     player: &str,
     settings: &SettingsForm,
-    store: &crate::store::Store,
+    store: &Arc<crate::store::Store>,
 ) -> Option<String> {
     use crate::downloader::{
         push_track_args, resolve_auth, resolved_quality, split_args, AuthSource,
@@ -860,6 +1028,13 @@ pub(super) fn spawn_play_new_instance(
             args.push("5".into());
             push_track_args(&mut args, Tool::Streamlink, &m.audio_tracks, &m.subtitle_tracks, false);
             args.extend(extra);
+            let title_template = settings.live_title_template.trim();
+            if !title_template.is_empty() {
+                args.push("--title".into());
+                args.push(streamlink_live_title(
+                    title_template, &row.channel.name, &row.last_title, &row.last_game,
+                ));
+            }
             args.push("--player".into());
             args.push(player.to_string());
             args.push(m.url.clone());
@@ -915,6 +1090,10 @@ pub(super) fn spawn_play_new_instance(
                     let pipe = child.stdout.take()?;
                     let mut cmd = std::process::Command::new(player);
                     cmd.arg("-").stdin(Stdio::from(pipe));
+                    apply_live_title_and_spawn_updater(
+                        &mut cmd, player, m.id, &row.channel.name, &row.last_title, &row.last_game,
+                        settings.live_title_template.trim(), settings.live_title_auto_update, store,
+                    );
                     spawn_logged(cmd, "media player")
                 }
                 Err(e) => {
@@ -925,6 +1104,10 @@ pub(super) fn spawn_play_new_instance(
         }
         Tool::Ffmpeg => {
             let mut cmd = std::process::Command::new(player);
+            apply_live_title_and_spawn_updater(
+                &mut cmd, player, m.id, &row.channel.name, &row.last_title, &row.last_game,
+                settings.live_title_template.trim(), settings.live_title_auto_update, store,
+            );
             cmd.arg(&m.url);
             spawn_logged(cmd, "media player")
         }
@@ -943,7 +1126,7 @@ pub(super) fn spawn_follow_raid(
     raid: &crate::models::StreamEventRow,
     player: &str,
     settings: &SettingsForm,
-    store: &crate::store::Store,
+    store: &Arc<crate::store::Store>,
 ) -> Option<String> {
     if raid.detail.is_empty() {
         return Some(format!(
@@ -954,6 +1137,14 @@ pub(super) fn spawn_follow_raid(
     let mut row = source_row.clone();
     row.monitor.id = 0;
     row.monitor.url = format!("https://twitch.tv/{}", raid.detail);
+    // The title fields belong to the SOURCE (raiding) channel, not the raid
+    // target — carrying them over would mislabel the live-edge title with
+    // the wrong channel's stale metadata. We only know the target's display
+    // name (`raid.target`), not its current title/game, so those are left
+    // blank rather than wrong.
+    row.channel.name = raid.target.clone();
+    row.last_title.clear();
+    row.last_game.clear();
     spawn_play_new_instance(&row, player, settings, store)
 }
 
@@ -965,7 +1156,7 @@ mod tests {
     #[allow(unused_imports)]
     use std::path::PathBuf;
 
-    // ----- "Stream in player" target probing (incl. mid-SABR captures) -----
+    // ----- "Play local recording (start)" target probing (incl. mid-SABR captures) -----
 
     /// A fresh scratch dir mimicking a channel output dir with a `.cache\` inside.
     fn probe_dir(tag: &str) -> (PathBuf, PathBuf) {
@@ -1245,5 +1436,41 @@ mod tests {
         let single = StreamTarget::Growing(PathBuf::from("x.ts"));
         assert!(playable_with(&single, r"C:\VLC\vlc.exe"));
         assert!(playable_with(&StreamTarget::Finished(PathBuf::from("x.mkv")), ""));
+    }
+
+    // ----- Live-edge player title -----
+
+    #[test]
+    fn render_live_title_substitutes_every_token() {
+        assert_eq!(
+            render_live_title("{channel}: 【{game}】- {title_trimmed}", "Layna", "Just Chatting", "12 Hours.", "00:00:00"),
+            "Layna: 【Just Chatting】- 12 Hours."
+        );
+        // A repeated token gets every occurrence replaced.
+        assert_eq!(render_live_title("{channel}/{channel}", "X", "", "", ""), "X/X");
+        // Tokens absent from the template are simply never looked at.
+        assert_eq!(render_live_title("static text", "X", "Y", "Z", "W"), "static text");
+        // {pos} is a real token, distinct from the other three.
+        assert_eq!(render_live_title("{pos}", "", "", "", "00:12:34"), "00:12:34");
+    }
+
+    #[test]
+    fn mpv_live_title_value_embeds_the_live_time_pos_property_and_trims_commands() {
+        let v = mpv_live_title_value(
+            "{channel}: 【{game}】- {title_trimmed} [{pos}]",
+            "Layna",
+            "12 Hours. !gg !tts",
+            "Just Chatting",
+        );
+        // `{pos}` becomes mpv's own live property-expansion token, not a
+        // resolved value — this is what makes the position keep ticking
+        // without any polling on our side.
+        assert_eq!(v, "Layna: 【Just Chatting】- 12 Hours. [${time-pos}]");
+    }
+
+    #[test]
+    fn streamlink_live_title_fixes_pos_at_zero() {
+        let v = streamlink_live_title("{channel} [{pos}]", "Layna", "Hello !gg", "Just Chatting");
+        assert_eq!(v, "Layna [00:00:00]");
     }
 }
