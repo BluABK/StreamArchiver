@@ -35,7 +35,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 76;
+const SCHEMA_VERSION: i64 = 77;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -133,6 +133,7 @@ mod alerts;
 pub use alerts::{
     AlertDailyStat, AlertHealthTotals, CaptureAlertRow, GapRangeRow, NewCaptureAlert, RecAlertBadge,
 };
+mod channel_groups;
 mod collab;
 pub use collab::PartnerSessionRow;
 mod disposal_records;
@@ -694,6 +695,7 @@ impl Store {
             preferred_asset: crate::models::PreferredAssetSource::parse(&r.get::<_, String>(6)?),
             enabled: r.get::<_, i64>(7)? != 0,
             automation_enabled: r.get::<_, i64>(8)? != 0,
+            primary_group_id: r.get(9)?,
         })
     }
 }

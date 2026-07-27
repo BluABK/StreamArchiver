@@ -193,6 +193,29 @@ two tools on one URL.
    downloads, and **start at login** (autostart). Folder fields have a **Browse…**
    button.
 
+#### Channel groups (🏷)
+
+Organize channels into named groups from the Streams toolbar's **🏷 Groups**
+button (create/rename/delete — a group is just a label, deleting one never
+touches any channel's recordings or settings). A channel can belong to any
+number of groups, but has at most one **primary** group and any number of
+**secondary** ones — both set from that channel's own Properties dialog
+("Primary group" dropdown + "Also in these groups" checklist).
+
+- **Primary group** drives the Streams grid's default clustering: channels
+  render under a collapsible header per primary group (alphabetical,
+  ungrouped channels first, un-collapsed by default). A channel with no
+  primary group renders flat, exactly as if groups didn't exist — so this is
+  a zero-behavior-change default until you actually assign one.
+- **Secondary** groups don't affect that default clustering — they only
+  matter to the toolbar's **group filter** dropdown, which narrows the whole
+  grid to one group's members (primary or secondary alike) and — while
+  active — replaces the header clustering with a flat list of just that
+  group, since there's only one group in view.
+- Right-click a group's header for bulk actions: set **Auto** on/off, or
+  **Enable**/**Disable** (the master switch), for every channel currently in
+  that group at once.
+
 #### Bulk import: followed / subscribed channels (📥)
 
 Instead of adding channels one by one, import the ones you already follow:

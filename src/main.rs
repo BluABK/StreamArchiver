@@ -477,6 +477,7 @@ fn run_capture_test(args: &[String], pos: usize) -> Result<()> {
             preferred_asset: None,
             enabled: true,
             automation_enabled: true,
+            primary_group_id: None,
         },
         monitor: models::Monitor {
             id: 0,

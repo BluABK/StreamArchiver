@@ -1515,7 +1515,33 @@ impl Store {
             }
             conn.pragma_update(None, "user_version", 76)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 76);
+        if version < 77 {
+            // Channel groups: a channel can belong to any number of groups
+            // (`channel_group_member`, many-to-many), but has at most one
+            // *primary* group (`channel.primary_group_id`) — the one it
+            // clusters under in the Streams grid's default view. No FK
+            // constraint on `primary_group_id` itself (every other column
+            // added post-v1 to `channel` follows the same plain-ALTER
+            // convention — this codebase's FKs are only ever declared at a
+            // table's original CREATE TABLE); a deleted group clears any
+            // channel's `primary_group_id` that pointed at it explicitly, in
+            // application code (`delete_channel_group`).
+            conn.execute_batch(
+                "CREATE TABLE channel_group (
+                    id          INTEGER PRIMARY KEY,
+                    name        TEXT NOT NULL,
+                    created_at  INTEGER NOT NULL
+                );
+                CREATE TABLE channel_group_member (
+                    channel_id  INTEGER NOT NULL REFERENCES channel(id) ON DELETE CASCADE,
+                    group_id    INTEGER NOT NULL REFERENCES channel_group(id) ON DELETE CASCADE,
+                    PRIMARY KEY (channel_id, group_id)
+                );
+                ALTER TABLE channel ADD COLUMN primary_group_id INTEGER;",
+            )?;
+            conn.pragma_update(None, "user_version", 77)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 77);
         Ok(())
     }
 }

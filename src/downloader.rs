@@ -539,6 +539,7 @@ pub(crate) mod test_util {
                 preferred_asset: None,
                 enabled: true,
                 automation_enabled: true,
+                primary_group_id: None,
             },
             monitor: Monitor {
                 id: 7,

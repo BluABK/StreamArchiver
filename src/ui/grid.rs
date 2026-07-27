@@ -2746,6 +2746,7 @@ mod tests {
                 preferred_asset: None,
                 enabled: true,
                 automation_enabled: true,
+                primary_group_id: None,
             },
             monitor: Monitor {
                 id: monitor_id,
@@ -2974,6 +2975,7 @@ mod tests {
             preferred_asset: None,
             enabled: true,
             automation_enabled: true,
+            primary_group_id: None,
         };
         let recording_row = test_row(1, "recording", Some("recording"), Some(1_000_000), None, false);
         let live_row = test_row(2, "live", None, None, Some(1_000_000), false);

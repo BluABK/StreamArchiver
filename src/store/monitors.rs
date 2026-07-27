@@ -20,7 +20,7 @@ impl Store {
         let ch = conn
             .query_row(
                 "SELECT id, name, url, platform, created_at, color, preferred_platform, enabled, \
-                 automation_enabled FROM channel WHERE url = ?1",
+                 automation_enabled, primary_group_id FROM channel WHERE url = ?1",
                 params![url],
                 Self::map_channel,
             )
@@ -57,7 +57,7 @@ impl Store {
         let conn = self.db();
         let mut stmt = conn.prepare(
             "SELECT id, name, url, platform, created_at, color, preferred_platform, enabled, \
-             automation_enabled FROM channel
+             automation_enabled, primary_group_id FROM channel
              ORDER BY name COLLATE NOCASE, id",
         )?;
         let rows = stmt

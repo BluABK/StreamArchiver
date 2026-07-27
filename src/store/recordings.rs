@@ -839,7 +839,7 @@ impl Store {
                 m.automation_enabled, c.automation_enabled,
                 m.last_title, m.last_game, m.last_thumbnail_url, m.last_viewers,
                 m.last_live_since, m.last_live_since_approx, m.last_collab,
-                m.capture_offline, m.last_tags, m.last_language, r.err_ack
+                m.capture_offline, m.last_tags, m.last_language, r.err_ack, c.primary_group_id
              FROM monitor m
              JOIN channel c ON c.id = m.channel_id
              LEFT JOIN recording r
@@ -860,6 +860,7 @@ impl Store {
                     ),
                     enabled: r.get::<_, i64>(47)? != 0,
                     automation_enabled: r.get::<_, i64>(52)? != 0,
+                    primary_group_id: r.get(64)?,
                 };
                 let monitor = Monitor {
                     id: r.get(5)?,

@@ -1313,6 +1313,10 @@ pub struct StreamArchiverApp {
     rows: Vec<MonitorWithChannel>,
     /// All channel containers (incl. empty ones), for the Streams tree.
     channels: Vec<Channel>,
+    /// All channel groups, alphabetical — feeds the channel form's group
+    /// pickers, the Manage Groups dialog, and the Streams grid's group
+    /// header/filter. Reloaded in `reload_rows` and after any group CRUD.
+    channel_groups: Vec<crate::models::ChannelGroup>,
     videos: Vec<Video>,
     form: Option<MonitorForm>,
     video_form: VideoForm,
@@ -1345,6 +1349,12 @@ pub struct StreamArchiverApp {
     confirm_delete_segment: Option<i64>,
     /// Backing state for the create/rename-channel dialog.
     channel_form: Option<ChannelForm>,
+    /// "Manage groups" dialog: open flag, new-group name draft, and an
+    /// in-progress inline rename (group id + draft text; `None` = not
+    /// renaming any row).
+    show_group_manager: bool,
+    group_manager_new_name: String,
+    group_manager_rename: Option<(i64, String)>,
     /// Scheduled recordings (schema v51): the management window's open flag +
     /// last-loaded rows (refreshed in `reload_rows`, cheap — one small table),
     /// the add/edit dialog (`None` = closed), and a pending delete confirmation.
@@ -1371,6 +1381,17 @@ pub struct StreamArchiverApp {
     /// level, closed otherwise), not the open state itself. See
     /// `streams::period_open`.
     period_toggles: HashSet<String>,
+    /// Channel-group headers the user has explicitly collapsed — presence =
+    /// collapsed (a group defaults open, opposite convention from
+    /// `expanded_channels` et al., since you want to see channels the moment
+    /// you group them). No header renders at all — and this set is
+    /// meaningless — for any channel with no `primary_group_id` set, or
+    /// while `streams_group_filter` narrows to a single group.
+    collapsed_channel_groups: HashSet<i64>,
+    /// Streams grid's "Group" filter (toolbar dropdown): `Some(id)` narrows
+    /// the channel list to that group's members (primary or secondary),
+    /// bypassing the primary-group header clustering entirely.
+    streams_group_filter: Option<i64>,
     rec_cache: HashMap<i64, Vec<Recording>>,
     /// Lazy per-recording ad-break detail (cut list), keyed by recording id;
     /// cleared on reload. Avoids a per-frame DB query for tooltips/the popup.
@@ -2490,7 +2511,63 @@ impl eframe::App for StreamArchiverApp {
                                     record_me_as_raid_target: None,
                                     follow_my_raids_play: None,
                                     exclude_from_auto_play: None,
+                                    primary_group: None,
+                                    groups: Default::default(),
                                 });
+                            }
+                            if ui
+                                .button("🏷 Groups")
+                                .on_hover_text(
+                                    "Manage channel groups\nCreate/rename/delete groups; assign \
+                                     a channel's primary + secondary groups from its own \
+                                     Properties dialog.",
+                                )
+                                .clicked()
+                            {
+                                self.show_group_manager = true;
+                            }
+                            {
+                                // Extracted local: a ComboBox iterating
+                                // `self.channel_groups` while also mutating
+                                // `self.streams_group_filter` inside the same
+                                // closure is exactly the disjoint-field-borrow
+                                // shape the channel/group-manager dialogs hit —
+                                // see their own comments on the same pattern.
+                                let groups = self.channel_groups.clone();
+                                let selected_label = self
+                                    .streams_group_filter
+                                    .and_then(|gid| groups.iter().find(|g| g.id == gid))
+                                    .map(|g| g.name.as_str())
+                                    .unwrap_or("All channels");
+                                egui::ComboBox::from_id_salt("streams_group_filter")
+                                    .selected_text(selected_label)
+                                    .show_ui(ui, |ui| {
+                                        if ui
+                                            .selectable_label(self.streams_group_filter.is_none(), "All channels")
+                                            .clicked()
+                                        {
+                                            self.streams_group_filter = None;
+                                            self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
+                                        }
+                                        for g in &groups {
+                                            if ui
+                                                .selectable_label(
+                                                    self.streams_group_filter == Some(g.id),
+                                                    &g.name,
+                                                )
+                                                .clicked()
+                                            {
+                                                self.streams_group_filter = Some(g.id);
+                                                self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
+                                            }
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(
+                                        "Narrow the Streams grid to one group's members \
+                                         (primary or secondary) — the primary-group headers \
+                                         above don't apply while this is set.",
+                                    );
                             }
                             if ui
                                 .button("⇔")
@@ -2605,6 +2682,8 @@ impl eframe::App for StreamArchiverApp {
                 record_me_as_raid_target: None,
                 follow_my_raids_play: None,
                 exclude_from_auto_play: None,
+                primary_group: None,
+                groups: Default::default(),
             });
         }
         if ctx_refresh_schedule {
@@ -2622,6 +2701,7 @@ impl eframe::App for StreamArchiverApp {
 
         self.form_window(ui.ctx());
         self.channel_form_window(ui.ctx());
+        self.group_manager_window(ui.ctx());
         self.confirm_delete_window(ui.ctx());
         self.confirm_delete_channel_window(ui.ctx());
         self.confirm_delete_segment_window(ui.ctx());

@@ -535,6 +535,7 @@ impl StreamArchiverApp {
             topbar: TopBarLayout::default(),
             rows: Vec::new(),
             channels: Vec::new(),
+            channel_groups: Vec::new(),
             videos: Vec::new(),
             form: None,
             video_form: VideoForm::new(),
@@ -553,6 +554,9 @@ impl StreamArchiverApp {
             confirm_delete_channel: None,
             confirm_delete_segment: None,
             channel_form: None,
+            show_group_manager: false,
+            group_manager_new_name: String::new(),
+            group_manager_rename: None,
             show_scheduled_recordings: false,
             scheduled_recordings: Vec::new(),
             scheduled_recording_form: None,
@@ -569,6 +573,8 @@ impl StreamArchiverApp {
             expanded_instances: HashSet::new(),
             expanded_streams: HashSet::new(),
             period_toggles: HashSet::new(),
+            collapsed_channel_groups: HashSet::new(),
+            streams_group_filter: None,
             rec_cache: HashMap::new(),
             ad_break_cache: HashMap::new(),
             ad_popups: Vec::new(),
@@ -815,6 +821,11 @@ impl StreamArchiverApp {
         match self.core.store.list_channels() {
             Ok(chs) => self.channels = chs,
             Err(e) => warn!("failed to load channels: {e:#}"),
+        }
+        // Channel groups — small table, cheap to reload in full.
+        match self.core.store.list_channel_groups() {
+            Ok(gs) => self.channel_groups = gs,
+            Err(e) => warn!("failed to load channel groups: {e:#}"),
         }
         // Scheduled recordings (schema v51) — small table, cheap to reload
         // in full; drives the toolbar count and the grid column.

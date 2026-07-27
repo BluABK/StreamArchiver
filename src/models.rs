@@ -821,6 +821,22 @@ pub struct Channel {
     /// only manual actions work). Automation runs only when both this AND
     /// `monitor.automation_enabled` are true.
     pub automation_enabled: bool,
+    /// The [`ChannelGroup`] this channel clusters under in the Streams
+    /// grid's default view. `None` = ungrouped there. Independent of
+    /// [`ChannelGroup`] *membership* (`channel_group_member`) — a channel
+    /// can belong to any number of groups but has at most one primary; see
+    /// `Store::set_channel_primary_group`.
+    pub primary_group_id: Option<i64>,
+}
+
+/// A named collection of channels (`channel_group` table) — a channel can be
+/// a *member* of any number of groups (`channel_group_member`, many-to-many)
+/// but has at most one designated as its `primary_group_id` on [`Channel`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChannelGroup {
+    pub id: i64,
+    pub name: String,
+    pub created_at: i64,
 }
 
 /// The channel's chosen icon/banner source, persisted in the legacy

@@ -40,6 +40,13 @@ pub(super) struct ChannelForm {
     /// raid target — independent of `record_me_as_raid_target` (auto-play
     /// isn't gated by the disabled-check at all, only by this).
     pub(super) exclude_from_auto_play: Option<bool>,
+    /// The group this channel clusters under in the Streams grid's default
+    /// view (`None` = ungrouped there). Always a member of `groups` too —
+    /// see `models::Channel::primary_group_id`.
+    pub(super) primary_group: Option<i64>,
+    /// Every group this channel belongs to (primary included). Diffed
+    /// against the DB's current membership on save.
+    pub(super) groups: std::collections::HashSet<i64>,
 }
 /// Background load state of an import fetch (followed/subscriptions).
 pub(super) enum ImportLoadState {
@@ -119,6 +126,11 @@ struct StreamsOut {
     toggle_stream: Option<String>,
     /// A Year/Month/Week header's triangle was clicked — see `period_toggles`.
     toggle_period: Option<String>,
+    /// A channel-group header's triangle was clicked — see `collapsed_channel_groups`.
+    toggle_channel_group: Option<i64>,
+    /// A channel-group header's bulk Auto/Enabled action — (group id, on).
+    bulk_set_group_enabled: Option<(i64, bool)>,
+    bulk_set_group_automation: Option<(i64, bool)>,
     open_path: Option<std::path::PathBuf>,
     open_in_player: Option<StreamTarget>,
     play_new_instance_mid: Option<i64>,
@@ -184,6 +196,13 @@ enum PeriodKind {
 }
 #[derive(Clone, Copy)]
 enum Vis {
+    /// A primary-group header — see `build_vis_rows`'s clustering pass. The
+    /// group's name is looked up from `group_id` at render time (kept out of
+    /// this Copy enum on purpose — same reasoning as `Period` resolving its
+    /// label from `groups[&mid][gi_start..gi_end]` rather than storing it).
+    /// Never emitted for an ungrouped run of channels, and never emitted at
+    /// all while `streams_group_filter` narrows to a single group.
+    ChannelGroup { group_id: i64, count: usize, expanded: bool },
     Channel(usize),
     Instance { row: usize, depth: usize },
     /// `gi_start..gi_end` is the absolute index range into `groups[&mid]`
@@ -307,6 +326,7 @@ impl StreamArchiverApp {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                         let f = self.channel_form.as_mut().unwrap();
+                        let channel_groups = &self.channel_groups;
                         egui::Grid::new("channel_form_grid")
                             .num_columns(2)
                             .spacing([8.0, 6.0])
@@ -493,6 +513,65 @@ impl StreamArchiverApp {
                                      way to opt it out. Inherit/Never both mean \"allowed\".",
                                 );
                                 ui.end_row();
+
+                                ui.label("Primary group");
+                                egui::ComboBox::from_id_salt("chform_primary_group")
+                                    .selected_text(
+                                        f.primary_group
+                                            .and_then(|gid| channel_groups.iter().find(|g| g.id == gid))
+                                            .map(|g| g.name.as_str())
+                                            .unwrap_or("(ungrouped)"),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        if ui.selectable_label(f.primary_group.is_none(), "(ungrouped)").clicked() {
+                                            f.primary_group = None;
+                                        }
+                                        for g in channel_groups {
+                                            if ui.selectable_label(f.primary_group == Some(g.id), &g.name).clicked() {
+                                                f.primary_group = Some(g.id);
+                                                f.groups.insert(g.id);
+                                            }
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(
+                                        "Which group this channel clusters under in the Streams \
+                                         grid's default view. A channel can also belong to other \
+                                         groups (below) — those just don't drive the default \
+                                         clustering, only the group filter.",
+                                    );
+                                ui.end_row();
+
+                                ui.label("Also in these groups");
+                                ui.vertical(|ui| {
+                                    if channel_groups.is_empty() {
+                                        ui.weak("No groups yet — create one from the Streams toolbar.");
+                                    }
+                                    for g in channel_groups {
+                                        let mut member = f.groups.contains(&g.id);
+                                        let is_primary = f.primary_group == Some(g.id);
+                                        ui.add_enabled_ui(!is_primary, |ui| {
+                                            let resp = ui.checkbox(&mut member, &g.name);
+                                            if is_primary {
+                                                resp.on_hover_text("Already included as the primary group above.");
+                                            }
+                                        });
+                                        if !is_primary {
+                                            if member {
+                                                f.groups.insert(g.id);
+                                            } else {
+                                                f.groups.remove(&g.id);
+                                            }
+                                        }
+                                    }
+                                })
+                                .response
+                                .on_hover_text(
+                                    "Secondary memberships — this channel shows up when the \
+                                     Streams grid is filtered to any of these groups too, not \
+                                     just its primary one.",
+                                );
+                                ui.end_row();
                             });
                         if !renaming {
                             ui.label(
@@ -536,6 +615,8 @@ impl StreamArchiverApp {
                     enabled: f.chapters_enabled,
                     coalesce_secs: f.chapters_coalesce_secs.trim().parse().ok(),
                 };
+                let target_groups = f.groups.clone();
+                let target_primary = f.primary_group;
                 let res = match id_opt {
                     Some(id) => {
                         let old_name = self.channels.iter().find(|c| c.id == id).map(|c| c.name.clone());
@@ -604,6 +685,25 @@ impl StreamArchiverApp {
                             cid,
                             f.exclude_from_auto_play,
                         );
+                        // Diff target membership against what's currently saved
+                        // (empty for a brand-new channel) rather than blindly
+                        // clearing + re-inserting — cheaper, and avoids
+                        // needlessly bouncing `primary_group_id` through NULL
+                        // for a group that isn't actually changing.
+                        let current_groups: std::collections::HashSet<i64> = self
+                            .core
+                            .store
+                            .channel_groups_for_channel(cid)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .collect();
+                        for gid in current_groups.difference(&target_groups) {
+                            let _ = self.core.store.set_channel_group_member(cid, *gid, false);
+                        }
+                        for gid in target_groups.difference(&current_groups) {
+                            let _ = self.core.store.set_channel_group_member(cid, *gid, true);
+                        }
+                        let _ = self.core.store.set_channel_primary_group(cid, target_primary);
                         let _ = crate::platform_pref::save_channel_primary_platform(
                             &self.core.store,
                             cid,
@@ -644,6 +744,135 @@ impl StreamArchiverApp {
             self.channel_form = None;
         }
     }
+
+    /// "Manage groups" dialog: create/rename/delete channel groups.
+    /// Assigning a *channel* to groups happens in that channel's own
+    /// Properties dialog ([`Self::channel_form_window`]) — this window only
+    /// manages the groups themselves.
+    pub(super) fn group_manager_window(&mut self, ctx: &egui::Context) {
+        if !self.show_group_manager {
+            return;
+        }
+        // Snapshot/take everything the closure needs as plain locals up
+        // front — same reasoning as `channel_form_window`'s `f`/`channel_groups`
+        // locals: a nested `egui::Window`/`egui::Grid` closure borrowing
+        // several different `self` fields (some mutably) at once is exactly
+        // the shape the borrow checker can't reason through, closure capture
+        // or not.
+        let mut open = true;
+        let groups = self.channel_groups.clone();
+        let member_counts: HashMap<i64, usize> = groups
+            .iter()
+            .map(|g| (g.id, self.core.store.channel_ids_in_group(g.id).map(|s| s.len()).unwrap_or(0)))
+            .collect();
+        let mut new_name = std::mem::take(&mut self.group_manager_new_name);
+        let mut rename_state = self.group_manager_rename.take();
+        let mut add_clicked = false;
+        let mut renamed: Option<(i64, String)> = None;
+        let mut cancel_rename = false;
+        let mut deleted: Option<i64> = None;
+
+        egui::Window::new("Manage channel groups")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(320.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut new_name)
+                            .hint_text("New group name")
+                            .desired_width(200.0),
+                    );
+                    if ui.add_enabled(!new_name.trim().is_empty(), egui::Button::new("➕ Add")).clicked() {
+                        add_clicked = true;
+                    }
+                });
+                ui.separator();
+                if groups.is_empty() {
+                    ui.weak("No groups yet.");
+                }
+                egui::Grid::new("group_manager_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 4.0])
+                    .show(ui, |ui| {
+                        for g in &groups {
+                            let count = member_counts.get(&g.id).copied().unwrap_or(0);
+                            if rename_state.as_ref().is_some_and(|(id, _)| *id == g.id) {
+                                let draft = &mut rename_state.as_mut().unwrap().1;
+                                let resp = ui.text_edit_singleline(draft);
+                                let commit = (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                                    || ui.small_button("✔").clicked();
+                                if commit {
+                                    renamed = Some((g.id, draft.trim().to_string()));
+                                }
+                                if ui.small_button("✕").clicked() {
+                                    cancel_rename = true;
+                                }
+                            } else {
+                                ui.label(format!("{} ({count})", g.name));
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("✏").on_hover_text("Rename").clicked() {
+                                        rename_state = Some((g.id, g.name.clone()));
+                                    }
+                                    if ui
+                                        .small_button("🗑")
+                                        .on_hover_text(
+                                            "Delete this group. Channels in it are unaffected \
+                                             (they just lose the grouping — this doesn't touch \
+                                             any recordings/settings).",
+                                        )
+                                        .clicked()
+                                    {
+                                        deleted = Some(g.id);
+                                    }
+                                });
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+
+        self.group_manager_new_name = new_name;
+        if add_clicked {
+            let name = self.group_manager_new_name.trim().to_string();
+            match self.core.store.create_channel_group(&name) {
+                Ok(_) => {
+                    self.group_manager_new_name.clear();
+                    self.reload_rows();
+                }
+                Err(e) => self.status = format!("Error: {e}"),
+            }
+        }
+        if let Some((id, name)) = renamed {
+            if name.is_empty() {
+                self.status = "Group name can't be empty.".into();
+                self.group_manager_rename = rename_state;
+            } else {
+                if let Err(e) = self.core.store.rename_channel_group(id, &name) {
+                    self.status = format!("Error: {e}");
+                } else {
+                    self.reload_rows();
+                }
+                self.group_manager_rename = None;
+            }
+        } else if cancel_rename {
+            self.group_manager_rename = None;
+        } else {
+            self.group_manager_rename = rename_state;
+        }
+        if let Some(id) = deleted {
+            if let Err(e) = self.core.store.delete_channel_group(id) {
+                self.status = format!("Error: {e}");
+            } else {
+                self.reload_rows();
+            }
+        }
+        if !open {
+            self.show_group_manager = false;
+        }
+    }
+
     pub(super) fn channels_view(&mut self, ui: &mut egui::Ui) {
         if self.channels.is_empty() {
             self.streams_cache = None;
@@ -931,6 +1160,16 @@ impl StreamArchiverApp {
         let exp_instances = self.expanded_instances.clone();
         let exp_streams = self.expanded_streams.clone();
         let period_toggles = self.period_toggles.clone();
+        let collapsed_channel_groups = self.collapsed_channel_groups.clone();
+        let group_names: HashMap<i64, String> =
+            self.channel_groups.iter().map(|g| (g.id, g.name.clone())).collect();
+        // Group filter: resolves the selected group's membership every frame
+        // while active — a small indexed query (this whole table already
+        // re-sorts/re-flattens the full tree every frame; see `build_vis_rows`
+        // below), so it's negligible next to that.
+        let group_filter_members: Option<(i64, HashSet<i64>)> = self.streams_group_filter.map(|gid| {
+            (gid, self.core.store.channel_ids_in_group(gid).unwrap_or_default())
+        });
         // Snapshot live VOD-backfill download progress (video_id -> 0.0..=1.0),
         // same map the Videos tab reads (`core.video_progress`) — joined via
         // `Recording.vod_dl_video_id` for the VodJob backfill row's progress bar.
@@ -1069,6 +1308,8 @@ impl StreamArchiverApp {
                 let vis = Self::build_vis_rows(
                     model, &sort, &filters, chan_entries, &self.rows, groups,
                     &exp_channels, &exp_instances, &exp_streams, &period_toggles,
+                    &self.channel_groups, &collapsed_channel_groups,
+                    group_filter_members.as_ref().map(|(gid, members)| (*gid, members)),
                 );
                 // Scroll a newly-added channel into view (rows are virtualized,
                 // so the in-cell scroll_to_cursor approach can't work — the
@@ -1108,6 +1349,12 @@ impl StreamArchiverApp {
                     // per-row loop rebuilt every widget of every row each frame.
                     body.rows(24.0, vis.len(), |mut tr| {
                         match vis[tr.index()] {
+                            Vis::ChannelGroup { group_id, count, expanded } => {
+                                Self::group_row(
+                                    &mut tr, group_id, &group_names, count, expanded,
+                                    &col_order, &mut out,
+                                );
+                            }
                             Vis::Channel(ci) => {
                                 Self::channel_row(
                                     &mut tr, &chan_entries[ci], &self.rows, groups,
@@ -1207,6 +1454,9 @@ impl StreamArchiverApp {
             toggle_instance,
             toggle_stream,
             toggle_period,
+            toggle_channel_group,
+            bulk_set_group_enabled,
+            bulk_set_group_automation,
             open_path,
             open_in_player,
             play_new_instance_mid,
@@ -1315,6 +1565,7 @@ impl StreamArchiverApp {
             || toggle_instance.is_some()
             || toggle_stream.is_some()
             || toggle_period.is_some()
+            || toggle_channel_group.is_some()
         {
             // Expansion feeds the cached view data — rebuild it right away.
             self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
@@ -1341,6 +1592,28 @@ impl StreamArchiverApp {
             if !self.period_toggles.remove(&k) {
                 self.period_toggles.insert(k);
             }
+        }
+        if let Some(gid) = toggle_channel_group {
+            // Presence = collapsed — opposite convention from `period_toggles`
+            // (a group defaults OPEN; see `collapsed_channel_groups`'s doc
+            // comment), so this is a plain flip, not a XOR-default dance.
+            if !self.collapsed_channel_groups.remove(&gid) {
+                self.collapsed_channel_groups.insert(gid);
+            }
+        }
+        if let Some((gid, on)) = bulk_set_group_enabled {
+            let members = self.core.store.channel_ids_in_group(gid).unwrap_or_default();
+            for cid in members {
+                let _ = self.core.store.set_channel_enabled(cid, on);
+            }
+            self.reload_rows();
+        }
+        if let Some((gid, on)) = bulk_set_group_automation {
+            let members = self.core.store.channel_ids_in_group(gid).unwrap_or_default();
+            for cid in members {
+                let _ = self.core.store.set_channel_automation_enabled(cid, on);
+            }
+            self.reload_rows();
         }
         if let Some(mid) = acts.edit {
             if let Some(r) = self.rows.iter().find(|r| r.monitor.id == mid) {
@@ -1467,6 +1740,14 @@ impl StreamArchiverApp {
                     crate::raid_follow::K_CHANNEL_RAID_PLAY_EXCLUDE_SCOPE,
                     cid,
                 );
+                let primary_group = c.primary_group_id;
+                let groups = self
+                    .core
+                    .store
+                    .channel_groups_for_channel(cid)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
                 self.channel_form = Some(ChannelForm {
                     id: Some(cid),
                     name: c.name.clone(),
@@ -1484,6 +1765,8 @@ impl StreamArchiverApp {
                     record_me_as_raid_target,
                     follow_my_raids_play,
                     exclude_from_auto_play,
+                    primary_group,
+                    groups,
                 });
             }
         }
@@ -1725,11 +2008,51 @@ impl StreamArchiverApp {
         exp_instances: &HashSet<i64>,
         exp_streams: &HashSet<String>,
         period_toggles: &HashSet<String>,
+        channel_groups: &[crate::models::ChannelGroup],
+        collapsed_channel_groups: &HashSet<i64>,
+        // `Some((group_id, members))` narrows to one group's members
+        // (primary or secondary) and disables header clustering entirely —
+        // see the toolbar's group filter dropdown.
+        group_filter: Option<(i64, &HashSet<i64>)>,
     ) -> Vec<Vis> {
         use chrono::Datelike;
-        let order = ordered_rows(model, sort, filters);
+        let mut order = ordered_rows(model, sort, filters);
+        if let Some((_, members)) = group_filter {
+            order.retain(|&ci| members.contains(&chan_entries[ci].channel.id));
+        }
+        // Cluster by primary group, alphabetical by group name, ungrouped
+        // channels first — a stable sort so each cluster's internal order
+        // still respects the user's actual sort/filter. Skipped while a
+        // group filter is active (single flat list, no clustering needed).
+        let group_name: HashMap<i64, &str> =
+            channel_groups.iter().map(|g| (g.id, g.name.as_str())).collect();
+        let mut grouped_order = order.clone();
+        if group_filter.is_none() {
+            grouped_order.sort_by_key(|&ci| {
+                chan_entries[ci]
+                    .channel
+                    .primary_group_id
+                    .map(|gid| group_name.get(&gid).copied().unwrap_or(""))
+            });
+        }
         let mut vis: Vec<Vis> = Vec::new();
-        for &ci in &order {
+        for chunk in grouped_order.chunk_by(|&a, &b| {
+            group_filter.is_some()
+                || chan_entries[a].channel.primary_group_id == chan_entries[b].channel.primary_group_id
+        }) {
+            let gid = if group_filter.is_some() {
+                None
+            } else {
+                chan_entries[chunk[0]].channel.primary_group_id
+            };
+            let collapsed = gid.is_some_and(|g| collapsed_channel_groups.contains(&g));
+            if let Some(g) = gid {
+                vis.push(Vis::ChannelGroup { group_id: g, count: chunk.len(), expanded: !collapsed });
+                if collapsed {
+                    continue;
+                }
+            }
+        for &ci in chunk {
             let e = &chan_entries[ci];
             vis.push(Vis::Channel(ci));
             if !exp_channels.contains(&e.channel.id) {
@@ -1845,6 +2168,7 @@ impl StreamArchiverApp {
                     yi += year_chunk.len();
                 }
             }
+        }
         }
         vis
     }
@@ -2612,6 +2936,53 @@ impl StreamArchiverApp {
             col_order, &mut out.acts,
         ) {
             out.toggle_instance = Some(mid);
+        }
+    }
+
+    /// Render one primary-group header (see [`Vis::ChannelGroup`]) — pure
+    /// navigation/summary + bulk actions, so only the "name" column is
+    /// populated; every other `STREAM_COLUMNS` id falls through blank.
+    fn group_row(
+        tr: &mut egui_extras::TableRow<'_, '_>,
+        group_id: i64,
+        group_names: &HashMap<i64, String>,
+        count: usize,
+        expanded: bool,
+        col_order: &[usize],
+        out: &mut StreamsOut,
+    ) {
+        let label = group_names.get(&group_id).map(String::as_str).unwrap_or("(deleted group)");
+        let noun = if count == 1 { "channel" } else { "channels" };
+        let mut disc = false;
+        for &ci in col_order {
+            tr.col(|ui| {
+                if STREAM_COLUMNS[ci].id == "name" {
+                    disc = tree_name(ui, 0, true, expanded, None, egui::RichText::new(label).strong());
+                    ui.weak(format!("· {count} {noun}"));
+                }
+            });
+        }
+        tr.response().context_menu(|ui| {
+            if ui.button("🔴 Set Auto on for all in group").clicked() {
+                out.bulk_set_group_enabled = Some((group_id, true));
+                ui.close();
+            }
+            if ui.button("⏸ Set Auto off for all in group").clicked() {
+                out.bulk_set_group_enabled = Some((group_id, false));
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("▶ Enable all in group").clicked() {
+                out.bulk_set_group_automation = Some((group_id, true));
+                ui.close();
+            }
+            if ui.button("⏸ Disable (dormant) all in group").clicked() {
+                out.bulk_set_group_automation = Some((group_id, false));
+                ui.close();
+            }
+        });
+        if disc {
+            out.toggle_channel_group = Some(group_id);
         }
     }
 
