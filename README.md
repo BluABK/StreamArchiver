@@ -1318,9 +1318,10 @@ a restart could otherwise take a long time to even notice an already-running
 pass again. The rest of that ordered queue — everything not yet reached, so
 not shown anywhere else — lists in the Background view's own **Queued**
 section (alongside the equivalent gap-splice backlog), oldest first with its
-position in line, so a large backlog (a first-run sweep, a bulk re-embed) is
-never invisible between "still in the database" and "showing up as an Active
-row."
+position in line, the drive its output file lives on, and when it entered
+the queue plus how long it's been waiting there, so a large backlog (a
+first-run sweep, a bulk re-embed) is never invisible between "still in the
+database" and "showing up as an Active row."
 For more direct control: right-click a stream/take row → **📑 Embed
 chapters** (or **🔁 Re-embed chapters** once it already has some) to run it
 immediately instead of waiting for a restart, which also works as a retry
@@ -1439,13 +1440,17 @@ independent detectors feeding the same table:
   Schedule refresh, Ad-free/sub refresh, YouTube WebSub poll, Channel asset
   refresh, YouTube posts refresh, Scheduled recordings) with its interval and
   a live countdown to the next run; each has its own on/off toggle (turning
-  off **Live poll** pauses all detection/recording). Below that, **Active**
-  and **Recent** tables show in-flight and just-finished tasks (head
-  backfills, re-remuxes, asset fetches) with live progress and outcome. The
-  long `ffmpeg -c copy` passes among these (chapters/thumbnail embed, remux,
-  gap-splice/head-backfill concat, split-capture merge) all survive an app
-  restart instead of losing their progress — see [Chapters](#chapters-) for
-  the details.
+  off **Live poll** pauses all detection/recording). Below that, **Active**,
+  **Queued**, and **Recent** — in that order — show the disk-gate status plus
+  in-flight tasks, the chapters/gap-splice backlog (channel, position in
+  line, drive, and when it was queued / how long it's been waiting), and
+  just-finished tasks (head backfills, re-remuxes, asset fetches) with live
+  progress and outcome. Every section header is collapsible (▶/▼, click to
+  toggle) so a long **Recent** history doesn't push **Active**/**Queued** off
+  screen. The long `ffmpeg -c copy` passes among these (chapters/thumbnail
+  embed, remux, gap-splice/head-backfill concat, split-capture merge) all
+  survive an app restart instead of losing their progress — see
+  [Chapters](#chapters-) for the details.
 
   ![Background tab: job schedule plus active/recent task tables](doc/screenshots/background-jobs.png)
 - **🖥 Process manager** (top-bar button shows the live count, e.g. `🖥 3`) —

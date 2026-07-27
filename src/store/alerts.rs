@@ -450,7 +450,7 @@ impl Store {
     pub fn queued_gap_splices(&self) -> Result<Vec<crate::models::QueuedEmbedJob>> {
         let conn = self.db();
         let mut stmt = conn.prepare(
-            "SELECT r.id, c.name, r.started_at
+            "SELECT r.id, c.name, r.started_at, COALESCE(r.ended_at, r.started_at), COALESCE(r.output_path, '')
              FROM recording r
              JOIN monitor m ON m.id = r.monitor_id
              JOIN channel c ON c.id = m.channel_id
@@ -469,6 +469,8 @@ impl Store {
                     rec_id: r.get(0)?,
                     channel: r.get(1)?,
                     started_at: r.get(2)?,
+                    queued_at: r.get(3)?,
+                    output_path: r.get(4)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -509,7 +511,7 @@ impl Store {
     pub fn queued_chapters_embeds(&self) -> Result<Vec<crate::models::QueuedEmbedJob>> {
         let conn = self.db();
         let mut stmt = conn.prepare(
-            "SELECT r.id, c.name, r.started_at
+            "SELECT r.id, c.name, r.started_at, COALESCE(r.ended_at, r.started_at), COALESCE(r.output_path, '')
              FROM recording r
              JOIN monitor m ON m.id = r.monitor_id
              JOIN channel c ON c.id = m.channel_id
@@ -528,6 +530,8 @@ impl Store {
                     rec_id: r.get(0)?,
                     channel: r.get(1)?,
                     started_at: r.get(2)?,
+                    queued_at: r.get(3)?,
+                    output_path: r.get(4)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

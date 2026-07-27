@@ -30,44 +30,47 @@ impl StreamArchiverApp {
             ui.add_space(8.0);
 
             // ── Scheduled (periodic jobs) ────────────────────────────────
-            ui.strong("Scheduled");
-            ui.label(
-                egui::RichText::new(
-                    "Recurring background jobs. Untick to disable — turning off Live poll \
-                     pauses all detection/recording.",
-                )
-                .small()
-                .weak(),
-            );
-            ui.add_space(4.0);
-            egui::Grid::new("bg_scheduled_grid")
-                .num_columns(4)
-                .striped(true)
-                .spacing([16.0, 6.0])
+            egui::CollapsingHeader::new("Scheduled")
+                .default_open(true)
                 .show(ui, |ui| {
-                    ui.strong("On");
-                    ui.strong("Job");
-                    ui.strong("Every");
-                    ui.strong("Next run");
-                    ui.end_row();
-                    for (name, _key, en) in toggles.iter_mut() {
-                        ui.checkbox(en, "");
-                        ui.label(*name);
-                        let r = reg.iter().find(|j| j.name == *name);
-                        ui.label(
-                            r.map(|j| fmt_duration_secs(j.interval_secs))
-                                .unwrap_or_else(|| "—".into()),
-                        );
-                        if !*en {
-                            ui.weak("disabled");
-                        } else {
-                            ui.label(
-                                r.map(|j| fmt_relative_future(j.next_run_at - now))
-                                    .unwrap_or_else(|| "pending".into()),
-                            );
-                        }
-                        ui.end_row();
-                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "Recurring background jobs. Untick to disable — turning off Live poll \
+                             pauses all detection/recording.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.add_space(4.0);
+                    egui::Grid::new("bg_scheduled_grid")
+                        .num_columns(4)
+                        .striped(true)
+                        .spacing([16.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.strong("On");
+                            ui.strong("Job");
+                            ui.strong("Every");
+                            ui.strong("Next run");
+                            ui.end_row();
+                            for (name, _key, en) in toggles.iter_mut() {
+                                ui.checkbox(en, "");
+                                ui.label(*name);
+                                let r = reg.iter().find(|j| j.name == *name);
+                                ui.label(
+                                    r.map(|j| fmt_duration_secs(j.interval_secs))
+                                        .unwrap_or_else(|| "—".into()),
+                                );
+                                if !*en {
+                                    ui.weak("disabled");
+                                } else {
+                                    ui.label(
+                                        r.map(|j| fmt_relative_future(j.next_run_at - now))
+                                            .unwrap_or_else(|| "pending".into()),
+                                    );
+                                }
+                                ui.end_row();
+                            }
+                        });
                 });
 
             ui.add_space(12.0);
@@ -137,31 +140,260 @@ impl StreamArchiverApp {
             // with nothing to do; see `Recording::head_backfill_state`.
             let planned = self.core.store.queued_head_backfills().unwrap_or_default();
             if !planned.is_empty() {
-                ui.strong("Planned");
-                ui.add_space(4.0);
-                egui::Grid::new("bg_planned_grid")
-                    .num_columns(3)
-                    .striped(true)
-                    .spacing([16.0, 6.0])
+                egui::CollapsingHeader::new(format!("Planned ({})", planned.len()))
+                    .default_open(true)
                     .show(ui, |ui| {
-                        ui.strong("Channel");
-                        ui.strong("Job");
-                        ui.strong("Starts");
-                        ui.end_row();
-                        for p in &planned {
-                            ui.label(&p.channel);
-                            ui.label("Head backfill");
-                            let eta = p.started_at + crate::downloader::HEAD_BACKFILL_SETTLE_SECS - now;
-                            ui.label(fmt_relative_future(eta)).on_hover_text(
-                                "Waiting for the CDN's live-VOD folder to appear and \
-                                 streamlink's own rewind (if any) to settle before checking \
-                                 whether anything needs backfilling.",
-                            );
-                            ui.end_row();
-                        }
+                        egui::Grid::new("bg_planned_grid")
+                            .num_columns(3)
+                            .striped(true)
+                            .spacing([16.0, 6.0])
+                            .show(ui, |ui| {
+                                ui.strong("Channel");
+                                ui.strong("Job");
+                                ui.strong("Starts");
+                                ui.end_row();
+                                for p in &planned {
+                                    ui.label(&p.channel);
+                                    ui.label("Head backfill");
+                                    let eta = p.started_at + crate::downloader::HEAD_BACKFILL_SETTLE_SECS - now;
+                                    ui.label(fmt_relative_future(eta)).on_hover_text(
+                                        "Waiting for the CDN's live-VOD folder to appear and \
+                                         streamlink's own rewind (if any) to settle before checking \
+                                         whether anything needs backfilling.",
+                                    );
+                                    ui.end_row();
+                                }
+                            });
                     });
                 ui.add_space(12.0);
             }
+
+            // ── Active tasks ─────────────────────────────────────────────
+            egui::CollapsingHeader::new(format!("Active ({})", self.background_tasks.len()))
+                .default_open(true)
+                .show(ui, |ui| {
+                    // Live disk-gate status, ONE LINE PER DRIVE: bulk passes
+                    // (remux/merge/concat/embed) run one at a time per disk — this is
+                    // the authoritative "what is actually running right now, and how
+                    // many are queued behind it" line for those jobs. Per-drive (not
+                    // one global summary) so the emergency Pause/Kill controls below
+                    // apply to the right disk during an actual crisis.
+                    {
+                        let disk_cfg = crate::io_gate::disk_limits_config();
+                        let effective_paused = |drive: &str| {
+                            disk_cfg.drives.get(drive).map(|d| d.paused).unwrap_or(disk_cfg.default.paused)
+                        };
+                        let active_drives = crate::io_gate::local_gate_status_by_drive();
+                        // A paused drive with nothing left to show (I/O has fully
+                        // drained) stays in the list anyway — a pause with no visible
+                        // activity left is exactly the state you could otherwise
+                        // forget about and never un-pause; it must stay reachable
+                        // from here. Covers both an explicit per-drive override AND
+                        // a paused Default row (checked against every drive that's
+                        // done bulk I/O this session, same set Settings' Default row
+                        // itself uses for its live readout).
+                        let mut drives: Vec<String> = active_drives.iter().map(|(d, ..)| d.clone()).collect();
+                        for letter in crate::io_gate::active_gate_letters() {
+                            if effective_paused(&letter) {
+                                drives.push(letter);
+                            }
+                        }
+                        drives.sort();
+                        drives.dedup();
+                        for drive in drives {
+                            let (holders, waiting) = active_drives
+                                .iter()
+                                .find(|(d, ..)| *d == drive)
+                                .map(|(_, h, w)| (h.clone(), *w))
+                                .unwrap_or_default();
+                            let paused = effective_paused(&drive);
+                            let resp = ui
+                                .horizontal(|ui| {
+                                    ui.label(format!("🖴 Disk gate [{drive}:]:"));
+                                    if holders.is_empty() {
+                                        ui.weak(if paused { "paused" } else { "turning over…" });
+                                    }
+                                    if waiting > 0 {
+                                        ui.weak(format!("· {waiting} queued"));
+                                        let toggle =
+                                            if self.bg_show_gate_queue { "▼ Hide queue" } else { "▶ View queue" };
+                                        if ui.small_button(toggle).clicked() {
+                                            self.bg_show_gate_queue = !self.bg_show_gate_queue;
+                                        }
+                                    }
+                                    // Emergency controls. Pause blocks new concat/
+                                    // remux/embed passes on THIS drive only — gap
+                                    // recovery, head-backfill fetch, VOD recovery, and
+                                    // live captures use a separate gate and are never
+                                    // affected. Kill force-terminates whatever's
+                                    // running right now (pause alone can't — nothing
+                                    // preempts an in-flight pass).
+                                    let pause_label = if paused { "▶ Resume" } else { "⏸ Pause" };
+                                    if ui
+                                        .small_button(pause_label)
+                                        .on_hover_text(if paused {
+                                            "Let new concat/remux/embed passes start on this drive again."
+                                        } else {
+                                            "Block new concat/remux/embed passes on this drive — gap \
+                                             recovery/head-backfill fetch/VOD recovery/live captures are \
+                                             unaffected (separate gate). Doesn't stop anything already \
+                                             running; use Kill current for that."
+                                        })
+                                        .clicked()
+                                    {
+                                        let drive = drive.clone();
+                                        crate::io_gate::modify_disk_limits(|cfg| {
+                                            let default = cfg.default.clone();
+                                            let entry = cfg.drives.entry(drive.clone()).or_insert(default);
+                                            entry.paused = !paused;
+                                        });
+                                        self.status = format!(
+                                            "{} local passes (concat/remux/embeds) on drive {drive}:",
+                                            if paused { "Resumed" } else { "Paused" }
+                                        );
+                                    }
+                                    if !holders.is_empty()
+                                        && ui
+                                            .small_button("🗑 Kill current")
+                                            .on_hover_text(
+                                                "Force-terminate whatever's running on this drive's \
+                                                 local-pass gate right now (discards its progress — the \
+                                                 source files are untouched, it just restarts from \
+                                                 scratch later).",
+                                            )
+                                            .clicked()
+                                    {
+                                        let n = crate::io_gate::kill_local_holder(&drive);
+                                        self.status =
+                                            format!("Killed {n} pass(es) on drive {drive}: — they'll retry later.");
+                                    }
+                                })
+                                .response;
+                            let all: String = holders
+                                .iter()
+                                .map(|(l, h)| format!("{l} — running {}", fmt_duration(*h as i64)))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            resp.on_hover_text(format!(
+                                "Bulk local passes take turns per disk (permits per Settings → \
+                                 Recording → Disk I/O limits). Queued passes list their wait in \
+                                 their own task row.\n\n{all}"
+                            ));
+                            // Every pass CURRENTLY holding a permit on this drive, one
+                            // indented line each — this drive allows more than one
+                            // concurrent pass whenever its permit count is above 1
+                            // (Settings → Recording → Disk I/O limits, static or
+                            // Dynamic), so all of them can be genuinely running at
+                            // once, not just the longest-running one.
+                            for (label, held) in &holders {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(24.0);
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(80, 160, 220),
+                                        format!("{label} — running {}", fmt_duration(*held as i64)),
+                                    );
+                                });
+                            }
+                            // The queue itself: every pass waiting for a gate on THIS
+                            // drive, in line order — includes passes that have no
+                            // task row of their own (batch re-remux items, embeds,
+                            // head joins).
+                            if self.bg_show_gate_queue && waiting > 0 {
+                                for (i, (label, secs)) in crate::io_gate::local_gate_queue()
+                                    .into_iter()
+                                    .filter(|(_, d, _)| *d == drive)
+                                    .map(|(l, _, s)| (l, s))
+                                    .enumerate()
+                                {
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(24.0);
+                                        ui.weak(format!(
+                                            "{}. {label} — waiting {}",
+                                            i + 1,
+                                            fmt_duration(secs as i64)
+                                        ));
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    ui.add_space(4.0);
+
+                    if self.background_tasks.is_empty() {
+                        ui.weak("No tasks running.");
+                    } else {
+                        ui.push_id("bg_active", |ui| {
+                            let mut tb = TableBuilder::new(ui)
+                                .id_salt(GridTableId::BgActive.key())
+                                .striped(true)
+                                .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+                            if bg_active_reset {
+                                tb.reset();
+                            }
+                            for &i in &bg_active_order {
+                                let c = &BG_ACTIVE_COLUMNS[i];
+                                let col = if c.stretch { Column::remainder().clip(true) } else { Column::auto() };
+                                tb = tb.column(col);
+                            }
+                            tb.header(20.0, |mut h| {
+                                for &i in &bg_active_order {
+                                    let c = &BG_ACTIVE_COLUMNS[i];
+                                    h.col(|ui| {
+                                        if grid_header_cell_plain(ui, GridTableId::BgActive, c, &mut bg_active_entries, &BG_ACTIVE_COLUMNS) {
+                                            self.reorder_columns = Some(ReorderColumnsState {
+                                                table: GridTableId::BgActive,
+                                                draft: bg_active_entries.clone(),
+                                            });
+                                        }
+                                    });
+                                }
+                            })
+                            .body(|mut body| {
+                                for task in &self.background_tasks {
+                                    body.row(20.0, |mut row| {
+                                        for &i in &bg_active_order {
+                                            row.col(|ui| match BG_ACTIVE_COLUMNS[i].id {
+                                                "channel" => { ui.label(&task.label); }
+                                                "task" => { ui.label(task.kind.label()); }
+                                                "detail" => {
+                                                    // Show live ffmpeg stats when available; fall back to static detail.
+                                                    let text = task.progress_info.as_deref().unwrap_or(&task.detail);
+                                                    if let Some(p) = task.progress {
+                                                        ui.add(egui::ProgressBar::new(p).show_percentage().desired_width(90.0));
+                                                        ui.label(text);
+                                                    } else {
+                                                        ui.label(text);
+                                                    }
+                                                    if let crate::events::BackgroundTaskKind::Chapters(rec_id) = task.kind
+                                                        && ui
+                                                            .small_button("ℹ")
+                                                            .on_hover_text(
+                                                                "Which stream, which file, and which \
+                                                                 chapters at which timestamp.",
+                                                            )
+                                                            .clicked()
+                                                        && !self.chapters_popups.contains(&rec_id)
+                                                    {
+                                                        self.chapters_popups.push(rec_id);
+                                                    }
+                                                }
+                                                "elapsed" => {
+                                                    ui.label(format!(
+                                                        "⏳ {}",
+                                                        fmt_duration_secs(now - task.started_at)
+                                                    ));
+                                                }
+                                                _ => {}
+                                            });
+                                        }
+                                    });
+                                }
+                            });
+                        });
+                    }
+                });
+
+            ui.add_space(12.0);
 
             // ── Queued (chapters embed / gap-splice backlog) ─────────────
             // `sweep_pending_chapters`/`sweep_pending_gap_splices` work
@@ -207,378 +439,171 @@ impl StreamArchiverApp {
                     .filter(|q| !active_splices.contains(&q.rec_id))
                     .collect();
                 const MAX_QUEUED_ROWS: usize = 15;
-                if !queued_chapters.is_empty() || !queued_splices.is_empty() {
-                    ui.strong("Queued");
-                    ui.label(
-                        egui::RichText::new(
-                            "Waiting for the sequential embed/splice backlog sweep to reach \
-                             them — processed one at a time, oldest first, so a large backlog \
-                             doesn't flood the disk gate.",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                    ui.add_space(4.0);
-                    egui::Grid::new("bg_queued_grid")
-                        .num_columns(3)
-                        .striped(true)
-                        .spacing([16.0, 6.0])
+                let total_queued = queued_chapters.len() + queued_splices.len();
+                if total_queued > 0 {
+                    egui::CollapsingHeader::new(format!("Queued ({total_queued})"))
+                        .default_open(true)
                         .show(ui, |ui| {
-                            ui.strong("Channel");
-                            ui.strong("Job");
-                            ui.strong("Position");
-                            ui.end_row();
-                            let recorded_hover = |started_at: i64| -> String {
-                                use chrono::{Local, TimeZone};
-                                Local
-                                    .timestamp_opt(started_at, 0)
-                                    .single()
-                                    .map(|dt| format!("Recorded {}", dt.format("%Y-%m-%d %H:%M")))
-                                    .unwrap_or_default()
-                            };
-                            for (i, q) in queued_chapters.iter().take(MAX_QUEUED_ROWS).enumerate() {
-                                ui.label(&q.channel).on_hover_text(recorded_hover(q.started_at));
-                                ui.label("Chapters embed");
-                                ui.label(format!("{} of {}", i + 1, queued_chapters.len()));
-                                ui.end_row();
-                            }
-                            if queued_chapters.len() > MAX_QUEUED_ROWS {
-                                ui.weak(format!("(+{} more)", queued_chapters.len() - MAX_QUEUED_ROWS));
-                                ui.end_row();
-                            }
-                            for (i, q) in queued_splices.iter().take(MAX_QUEUED_ROWS).enumerate() {
-                                ui.label(&q.channel).on_hover_text(recorded_hover(q.started_at));
-                                ui.label("Gap splice");
-                                ui.label(format!("{} of {}", i + 1, queued_splices.len()));
-                                ui.end_row();
-                            }
-                            if queued_splices.len() > MAX_QUEUED_ROWS {
-                                ui.weak(format!("(+{} more)", queued_splices.len() - MAX_QUEUED_ROWS));
-                                ui.end_row();
-                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "Waiting for the sequential embed/splice backlog sweep to reach \
+                                     them — processed one at a time, oldest first, so a large backlog \
+                                     doesn't flood the disk gate.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                            ui.add_space(4.0);
+                            egui::Grid::new("bg_queued_grid")
+                                .num_columns(6)
+                                .striped(true)
+                                .spacing([16.0, 6.0])
+                                .show(ui, |ui| {
+                                    ui.strong("Channel");
+                                    ui.strong("Job");
+                                    ui.strong("Position");
+                                    ui.strong("Drive");
+                                    ui.strong("Added to queue");
+                                    ui.strong("Time in queue");
+                                    ui.end_row();
+                                    let recorded_hover = |started_at: i64| -> String {
+                                        use chrono::{Local, TimeZone};
+                                        Local
+                                            .timestamp_opt(started_at, 0)
+                                            .single()
+                                            .map(|dt| format!("Recorded {}", dt.format("%Y-%m-%d %H:%M")))
+                                            .unwrap_or_default()
+                                    };
+                                    let drive_label = |q: &crate::models::QueuedEmbedJob| -> String {
+                                        crate::iomon::drive_letter(std::path::Path::new(&q.output_path))
+                                            .map(|d| format!("{d}:"))
+                                            .unwrap_or_else(|| "—".to_string())
+                                    };
+                                    let queued_row = |ui: &mut egui::Ui, q: &crate::models::QueuedEmbedJob, job: &str, pos: usize, total: usize| {
+                                        ui.label(&q.channel).on_hover_text(recorded_hover(q.started_at));
+                                        ui.label(job);
+                                        ui.label(format!("{pos} of {total}"));
+                                        ui.label(drive_label(q));
+                                        ui.label(fmt_datetime_short(q.queued_at));
+                                        ui.label(fmt_duration_secs((now - q.queued_at).max(0)));
+                                        ui.end_row();
+                                    };
+                                    for (i, q) in queued_chapters.iter().take(MAX_QUEUED_ROWS).enumerate() {
+                                        queued_row(ui, q, "Chapters embed", i + 1, queued_chapters.len());
+                                    }
+                                    if queued_chapters.len() > MAX_QUEUED_ROWS {
+                                        ui.weak(format!("(+{} more)", queued_chapters.len() - MAX_QUEUED_ROWS));
+                                        ui.end_row();
+                                    }
+                                    for (i, q) in queued_splices.iter().take(MAX_QUEUED_ROWS).enumerate() {
+                                        queued_row(ui, q, "Gap splice", i + 1, queued_splices.len());
+                                    }
+                                    if queued_splices.len() > MAX_QUEUED_ROWS {
+                                        ui.weak(format!("(+{} more)", queued_splices.len() - MAX_QUEUED_ROWS));
+                                        ui.end_row();
+                                    }
+                                });
                         });
                     ui.add_space(12.0);
                 }
             }
-
-            // ── Active tasks ─────────────────────────────────────────────
-            ui.strong("Active");
-            // Live disk-gate status, ONE LINE PER DRIVE: bulk passes
-            // (remux/merge/concat/embed) run one at a time per disk — this is
-            // the authoritative "what is actually running right now, and how
-            // many are queued behind it" line for those jobs. Per-drive (not
-            // one global summary) so the emergency Pause/Kill controls below
-            // apply to the right disk during an actual crisis.
-            {
-                let disk_cfg = crate::io_gate::disk_limits_config();
-                let effective_paused = |drive: &str| {
-                    disk_cfg.drives.get(drive).map(|d| d.paused).unwrap_or(disk_cfg.default.paused)
-                };
-                let active_drives = crate::io_gate::local_gate_status_by_drive();
-                // A paused drive with nothing left to show (I/O has fully
-                // drained) stays in the list anyway — a pause with no visible
-                // activity left is exactly the state you could otherwise
-                // forget about and never un-pause; it must stay reachable
-                // from here. Covers both an explicit per-drive override AND
-                // a paused Default row (checked against every drive that's
-                // done bulk I/O this session, same set Settings' Default row
-                // itself uses for its live readout).
-                let mut drives: Vec<String> = active_drives.iter().map(|(d, ..)| d.clone()).collect();
-                for letter in crate::io_gate::active_gate_letters() {
-                    if effective_paused(&letter) {
-                        drives.push(letter);
-                    }
-                }
-                drives.sort();
-                drives.dedup();
-                for drive in drives {
-                    let (holders, waiting) = active_drives
-                        .iter()
-                        .find(|(d, ..)| *d == drive)
-                        .map(|(_, h, w)| (h.clone(), *w))
-                        .unwrap_or_default();
-                    let paused = effective_paused(&drive);
-                    let resp = ui
-                        .horizontal(|ui| {
-                            ui.label(format!("🖴 Disk gate [{drive}:]:"));
-                            if holders.is_empty() {
-                                ui.weak(if paused { "paused" } else { "turning over…" });
-                            }
-                            if waiting > 0 {
-                                ui.weak(format!("· {waiting} queued"));
-                                let toggle =
-                                    if self.bg_show_gate_queue { "▼ Hide queue" } else { "▶ View queue" };
-                                if ui.small_button(toggle).clicked() {
-                                    self.bg_show_gate_queue = !self.bg_show_gate_queue;
-                                }
-                            }
-                            // Emergency controls. Pause blocks new concat/
-                            // remux/embed passes on THIS drive only — gap
-                            // recovery, head-backfill fetch, VOD recovery, and
-                            // live captures use a separate gate and are never
-                            // affected. Kill force-terminates whatever's
-                            // running right now (pause alone can't — nothing
-                            // preempts an in-flight pass).
-                            let pause_label = if paused { "▶ Resume" } else { "⏸ Pause" };
-                            if ui
-                                .small_button(pause_label)
-                                .on_hover_text(if paused {
-                                    "Let new concat/remux/embed passes start on this drive again."
-                                } else {
-                                    "Block new concat/remux/embed passes on this drive — gap \
-                                     recovery/head-backfill fetch/VOD recovery/live captures are \
-                                     unaffected (separate gate). Doesn't stop anything already \
-                                     running; use Kill current for that."
-                                })
-                                .clicked()
-                            {
-                                let drive = drive.clone();
-                                crate::io_gate::modify_disk_limits(|cfg| {
-                                    let default = cfg.default.clone();
-                                    let entry = cfg.drives.entry(drive.clone()).or_insert(default);
-                                    entry.paused = !paused;
-                                });
-                                self.status = format!(
-                                    "{} local passes (concat/remux/embeds) on drive {drive}:",
-                                    if paused { "Resumed" } else { "Paused" }
-                                );
-                            }
-                            if !holders.is_empty()
-                                && ui
-                                    .small_button("🗑 Kill current")
-                                    .on_hover_text(
-                                        "Force-terminate whatever's running on this drive's \
-                                         local-pass gate right now (discards its progress — the \
-                                         source files are untouched, it just restarts from \
-                                         scratch later).",
-                                    )
-                                    .clicked()
-                            {
-                                let n = crate::io_gate::kill_local_holder(&drive);
-                                self.status =
-                                    format!("Killed {n} pass(es) on drive {drive}: — they'll retry later.");
-                            }
-                        })
-                        .response;
-                    let all: String = holders
-                        .iter()
-                        .map(|(l, h)| format!("{l} — running {}", fmt_duration(*h as i64)))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    resp.on_hover_text(format!(
-                        "Bulk local passes take turns per disk (permits per Settings → \
-                         Recording → Disk I/O limits). Queued passes list their wait in \
-                         their own task row.\n\n{all}"
-                    ));
-                    // Every pass CURRENTLY holding a permit on this drive, one
-                    // indented line each — this drive allows more than one
-                    // concurrent pass whenever its permit count is above 1
-                    // (Settings → Recording → Disk I/O limits, static or
-                    // Dynamic), so all of them can be genuinely running at
-                    // once, not just the longest-running one.
-                    for (label, held) in &holders {
-                        ui.horizontal(|ui| {
-                            ui.add_space(24.0);
-                            ui.colored_label(
-                                egui::Color32::from_rgb(80, 160, 220),
-                                format!("{label} — running {}", fmt_duration(*held as i64)),
-                            );
-                        });
-                    }
-                    // The queue itself: every pass waiting for a gate on THIS
-                    // drive, in line order — includes passes that have no
-                    // task row of their own (batch re-remux items, embeds,
-                    // head joins).
-                    if self.bg_show_gate_queue && waiting > 0 {
-                        for (i, (label, secs)) in crate::io_gate::local_gate_queue()
-                            .into_iter()
-                            .filter(|(_, d, _)| *d == drive)
-                            .map(|(l, _, s)| (l, s))
-                            .enumerate()
-                        {
-                            ui.horizontal(|ui| {
-                                ui.add_space(24.0);
-                                ui.weak(format!(
-                                    "{}. {label} — waiting {}",
-                                    i + 1,
-                                    fmt_duration(secs as i64)
-                                ));
-                            });
-                        }
-                    }
-                }
-            }
-            ui.add_space(4.0);
-
-            if self.background_tasks.is_empty() {
-                ui.weak("No tasks running.");
-            } else {
-                ui.push_id("bg_active", |ui| {
-                    let mut tb = TableBuilder::new(ui)
-                        .id_salt(GridTableId::BgActive.key())
-                        .striped(true)
-                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
-                    if bg_active_reset {
-                        tb.reset();
-                    }
-                    for &i in &bg_active_order {
-                        let c = &BG_ACTIVE_COLUMNS[i];
-                        let col = if c.stretch { Column::remainder().clip(true) } else { Column::auto() };
-                        tb = tb.column(col);
-                    }
-                    tb.header(20.0, |mut h| {
-                        for &i in &bg_active_order {
-                            let c = &BG_ACTIVE_COLUMNS[i];
-                            h.col(|ui| {
-                                if grid_header_cell_plain(ui, GridTableId::BgActive, c, &mut bg_active_entries, &BG_ACTIVE_COLUMNS) {
-                                    self.reorder_columns = Some(ReorderColumnsState {
-                                        table: GridTableId::BgActive,
-                                        draft: bg_active_entries.clone(),
-                                    });
-                                }
-                            });
-                        }
-                    })
-                    .body(|mut body| {
-                        for task in &self.background_tasks {
-                            body.row(20.0, |mut row| {
-                                for &i in &bg_active_order {
-                                    row.col(|ui| match BG_ACTIVE_COLUMNS[i].id {
-                                        "channel" => { ui.label(&task.label); }
-                                        "task" => { ui.label(task.kind.label()); }
-                                        "detail" => {
-                                            // Show live ffmpeg stats when available; fall back to static detail.
-                                            let text = task.progress_info.as_deref().unwrap_or(&task.detail);
-                                            if let Some(p) = task.progress {
-                                                ui.add(egui::ProgressBar::new(p).show_percentage().desired_width(90.0));
-                                                ui.label(text);
-                                            } else {
-                                                ui.label(text);
-                                            }
-                                            if let crate::events::BackgroundTaskKind::Chapters(rec_id) = task.kind
-                                                && ui
-                                                    .small_button("ℹ")
-                                                    .on_hover_text(
-                                                        "Which stream, which file, and which \
-                                                         chapters at which timestamp.",
-                                                    )
-                                                    .clicked()
-                                                && !self.chapters_popups.contains(&rec_id)
-                                            {
-                                                self.chapters_popups.push(rec_id);
-                                            }
-                                        }
-                                        "elapsed" => {
-                                            ui.label(format!(
-                                                "⏳ {}",
-                                                fmt_duration_secs(now - task.started_at)
-                                            ));
-                                        }
-                                        _ => {}
-                                    });
-                                }
-                            });
-                        }
-                    });
-                });
-            }
-
             ui.add_space(12.0);
 
             // ── Recent completed / failed ────────────────────────────────
-            ui.strong("Recent");
-            ui.add_space(4.0);
-
-            if self.finished_tasks.is_empty() {
-                ui.weak("No completed tasks yet.");
-            } else {
-                ui.push_id("bg_recent", |ui| {
-                    let mut tb = TableBuilder::new(ui)
-                        .id_salt(GridTableId::BgRecent.key())
-                        .striped(true)
-                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
-                    if bg_recent_reset {
-                        tb.reset();
-                    }
-                    for &i in &bg_recent_order {
-                        let c = &BG_RECENT_COLUMNS[i];
-                        let col = if c.stretch { Column::remainder().clip(true) } else { Column::auto() };
-                        tb = tb.column(col);
-                    }
-                    tb.header(20.0, |mut h| {
-                        for &i in &bg_recent_order {
-                            let c = &BG_RECENT_COLUMNS[i];
-                            h.col(|ui| {
-                                if grid_header_cell_plain(ui, GridTableId::BgRecent, c, &mut bg_recent_entries, &BG_RECENT_COLUMNS) {
-                                    self.reorder_columns = Some(ReorderColumnsState {
-                                        table: GridTableId::BgRecent,
-                                        draft: bg_recent_entries.clone(),
+            egui::CollapsingHeader::new(format!("Recent ({})", self.finished_tasks.len()))
+                .default_open(true)
+                .show(ui, |ui| {
+                    if self.finished_tasks.is_empty() {
+                        ui.weak("No completed tasks yet.");
+                    } else {
+                        ui.push_id("bg_recent", |ui| {
+                            let mut tb = TableBuilder::new(ui)
+                                .id_salt(GridTableId::BgRecent.key())
+                                .striped(true)
+                                .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+                            if bg_recent_reset {
+                                tb.reset();
+                            }
+                            for &i in &bg_recent_order {
+                                let c = &BG_RECENT_COLUMNS[i];
+                                let col = if c.stretch { Column::remainder().clip(true) } else { Column::auto() };
+                                tb = tb.column(col);
+                            }
+                            tb.header(20.0, |mut h| {
+                                for &i in &bg_recent_order {
+                                    let c = &BG_RECENT_COLUMNS[i];
+                                    h.col(|ui| {
+                                        if grid_header_cell_plain(ui, GridTableId::BgRecent, c, &mut bg_recent_entries, &BG_RECENT_COLUMNS) {
+                                            self.reorder_columns = Some(ReorderColumnsState {
+                                                table: GridTableId::BgRecent,
+                                                draft: bg_recent_entries.clone(),
+                                            });
+                                        }
                                     });
                                 }
-                            });
-                        }
-                    })
-                    .body(|mut body| {
-                        for (task, outcome, finished_at) in &self.finished_tasks {
-                            let dur = fmt_duration_secs(finished_at - task.started_at);
-                            body.row(20.0, |mut row| {
-                                for &i in &bg_recent_order {
-                                    row.col(|ui| match BG_RECENT_COLUMNS[i].id {
-                                        "channel" => { ui.label(&task.label); }
-                                        "task" => { ui.label(task.kind.label()); }
-                                        "detail" => {
-                                            ui.label(&task.detail);
-                                            if let crate::events::BackgroundTaskKind::Chapters(rec_id) = task.kind
-                                                && ui
-                                                    .small_button("ℹ")
-                                                    .on_hover_text(
-                                                        "Which stream, which file, and which \
-                                                         chapters at which timestamp.",
-                                                    )
-                                                    .clicked()
-                                                && !self.chapters_popups.contains(&rec_id)
-                                            {
-                                                self.chapters_popups.push(rec_id);
-                                            }
-                                        }
-                                        "outcome" => {
-                                            match outcome {
-                                                crate::events::TaskOutcome::Completed => {
-                                                    ui.label(format!("✔ OK ({dur})"));
-                                                }
-                                                crate::events::TaskOutcome::CompletedWithNote(note) => {
-                                                    // "0 events" is a soft-warn (OCR ran but found
-                                                    // nothing); anything else is a normal success.
-                                                    let zero = note.starts_with("0 ");
-                                                    let text = format!("{} ({dur})", note);
-                                                    if zero {
-                                                        ui.colored_label(
-                                                            egui::Color32::from_rgb(200, 160, 50),
-                                                            format!("⚠ {text}"),
-                                                        );
-                                                    } else {
-                                                        ui.colored_label(
-                                                            egui::Color32::from_rgb(80, 200, 120),
-                                                            format!("✔ {text}"),
-                                                        );
+                            })
+                            .body(|mut body| {
+                                for (task, outcome, finished_at) in &self.finished_tasks {
+                                    let dur = fmt_duration_secs(finished_at - task.started_at);
+                                    body.row(20.0, |mut row| {
+                                        for &i in &bg_recent_order {
+                                            row.col(|ui| match BG_RECENT_COLUMNS[i].id {
+                                                "channel" => { ui.label(&task.label); }
+                                                "task" => { ui.label(task.kind.label()); }
+                                                "detail" => {
+                                                    ui.label(&task.detail);
+                                                    if let crate::events::BackgroundTaskKind::Chapters(rec_id) = task.kind
+                                                        && ui
+                                                            .small_button("ℹ")
+                                                            .on_hover_text(
+                                                                "Which stream, which file, and which \
+                                                                 chapters at which timestamp.",
+                                                            )
+                                                            .clicked()
+                                                        && !self.chapters_popups.contains(&rec_id)
+                                                    {
+                                                        self.chapters_popups.push(rec_id);
                                                     }
                                                 }
-                                                crate::events::TaskOutcome::Failed(e) => {
-                                                    ui.colored_label(
-                                                        egui::Color32::from_rgb(220, 80, 80),
-                                                        format!("✘ {e}"),
-                                                    );
+                                                "outcome" => {
+                                                    match outcome {
+                                                        crate::events::TaskOutcome::Completed => {
+                                                            ui.label(format!("✔ OK ({dur})"));
+                                                        }
+                                                        crate::events::TaskOutcome::CompletedWithNote(note) => {
+                                                            // "0 events" is a soft-warn (OCR ran but found
+                                                            // nothing); anything else is a normal success.
+                                                            let zero = note.starts_with("0 ");
+                                                            let text = format!("{} ({dur})", note);
+                                                            if zero {
+                                                                ui.colored_label(
+                                                                    egui::Color32::from_rgb(200, 160, 50),
+                                                                    format!("⚠ {text}"),
+                                                                );
+                                                            } else {
+                                                                ui.colored_label(
+                                                                    egui::Color32::from_rgb(80, 200, 120),
+                                                                    format!("✔ {text}"),
+                                                                );
+                                                            }
+                                                        }
+                                                        crate::events::TaskOutcome::Failed(e) => {
+                                                            ui.colored_label(
+                                                                egui::Color32::from_rgb(220, 80, 80),
+                                                                format!("✘ {e}"),
+                                                            );
+                                                        }
+                                                    }
                                                 }
-                                            }
+                                                _ => {}
+                                            });
                                         }
-                                        _ => {}
                                     });
                                 }
                             });
-                        }
-                    });
+                        });
+                    }
                 });
-            }
 
             ui.add_space(8.0);
         });

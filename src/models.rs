@@ -2714,11 +2714,17 @@ pub struct QueuedHeadBackfill {
 /// sweep (chapters embed / gap-splice) — the Background view's "Queued"
 /// section row. `rec_id` lets the UI drop whatever's currently in-flight
 /// (already showing in the Active table) out of the backlog count/list.
+/// `queued_at` is the take's `ended_at` (falling back to `started_at` for
+/// the rare row missing it) — the earliest moment this recording could have
+/// become eligible for the backlog, not an exact enqueue timestamp (the
+/// settle wait and precondition checks each sweep re-runs happen after it).
 #[derive(Clone, Debug)]
 pub struct QueuedEmbedJob {
     pub rec_id: i64,
     pub channel: String,
     pub started_at: i64,
+    pub queued_at: i64,
+    pub output_path: String,
 }
 
 /// A recording whose published VOD came back DMCA-muted — a row of the Issues
