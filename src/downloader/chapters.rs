@@ -19,24 +19,21 @@ const MAX_CHAPTERS_ATTEMPTS: i64 = 5;
 
 /// Whether chapter embedding may proceed for a recording in this state —
 /// every condition must hold, or defer without touching anything. Pure so
-/// it's directly unit-testable. `take_group_size` is the number of
-/// recording rows sharing this take's `take_group` (`1` = solo) — multi-part
-/// merged recordings are excluded for the same reason gap-splice excludes
-/// them: `started_at`-relative event offsets aren't trustworthy across legs.
+/// it's directly unit-testable. Unlike gap-splice, this does NOT exclude
+/// `take_group` pairs (SABR+DASH dual capture): each leg is rebased off its
+/// *own* `started_at`/`ended_at` (see `collect_chapter_events`), not a
+/// shared anchor, so per-leg event offsets stay trustworthy even though the
+/// two legs' files differ — excluding them here just meant a dual-captured
+/// take's chapters never embedded at all, since a successful pair's group
+/// size never drops back to 1.
 /// `chapters_state == "queued"` is a transient failure awaiting automatic
 /// retry (see `record_chapters_failure`) — eligible exactly like `""`
 /// (never tried); `"done"`/`"skipped"`/`"failed"` (exhausted retries) stay
 /// terminal.
-fn chapters_precondition_met(
-    status: &str,
-    head_backfill_state: &str,
-    chapters_state: &str,
-    take_group_size: i64,
-) -> bool {
+fn chapters_precondition_met(status: &str, head_backfill_state: &str, chapters_state: &str) -> bool {
     status == "completed"
         && head_backfill_state != "queued"
         && (chapters_state.is_empty() || chapters_state == "queued")
-        && take_group_size <= 1
 }
 
 impl Supervisor {
@@ -226,8 +223,7 @@ impl Supervisor {
 
     async fn chapters_job(&self, rec_id: i64, gap_meta: Vec<SplicedGap>) {
         let Some(rec) = self.store.get_recording(rec_id).ok().flatten() else { return };
-        let take_group_size = self.store.recording_take_group_size(rec_id).unwrap_or(1);
-        if !chapters_precondition_met(&rec.status, &rec.head_backfill_state, &rec.chapters_state, take_group_size) {
+        if !chapters_precondition_met(&rec.status, &rec.head_backfill_state, &rec.chapters_state) {
             return;
         }
         // Gap ranges might still be resolving even when `gap_meta` is empty
@@ -465,14 +461,13 @@ mod tests {
 
     #[test]
     fn precondition_requires_every_condition() {
-        assert!(chapters_precondition_met("completed", "", "", 1));
-        assert!(chapters_precondition_met("completed", "mismatch", "", 1), "unrelated head-join state name is fine");
-        assert!(!chapters_precondition_met("recording", "", "", 1), "still recording");
-        assert!(!chapters_precondition_met("completed", "queued", "", 1), "head-join still pending");
-        assert!(!chapters_precondition_met("completed", "", "done", 1), "already embedded — terminal");
-        assert!(!chapters_precondition_met("completed", "", "skipped", 1), "already decided to skip — terminal");
-        assert!(!chapters_precondition_met("completed", "", "", 2), "multi-leg capture");
-        assert!(chapters_precondition_met("completed", "", "queued", 1), "transient failure awaiting automatic retry");
-        assert!(!chapters_precondition_met("completed", "", "failed", 1), "retries exhausted — terminal until a manual re-embed");
+        assert!(chapters_precondition_met("completed", "", ""));
+        assert!(chapters_precondition_met("completed", "mismatch", ""), "unrelated head-join state name is fine");
+        assert!(!chapters_precondition_met("recording", "", ""), "still recording");
+        assert!(!chapters_precondition_met("completed", "queued", ""), "head-join still pending");
+        assert!(!chapters_precondition_met("completed", "", "done"), "already embedded — terminal");
+        assert!(!chapters_precondition_met("completed", "", "skipped"), "already decided to skip — terminal");
+        assert!(chapters_precondition_met("completed", "", "queued"), "transient failure awaiting automatic retry");
+        assert!(!chapters_precondition_met("completed", "", "failed"), "retries exhausted — terminal until a manual re-embed");
     }
 }

@@ -3253,7 +3253,7 @@ impl StreamArchiverApp {
                              sweep — also works as a retry after a failed/skipped attempt, \
                              or to pick up a change to which chapter kinds are enabled. \
                              No-ops quietly if this take isn't actually eligible (still \
-                             resolving a gap-splice, or a multi-part merged capture).",
+                             resolving a gap-splice, or a head backfill still in progress).",
                         )
                         .clicked()
                     {
@@ -3884,7 +3884,7 @@ impl StreamArchiverApp {
                              works as a retry after a failed/skipped attempt, or to pick up \
                              a change to which chapter kinds are enabled. No-ops quietly if \
                              this take isn't actually eligible (still resolving a \
-                             gap-splice, or a multi-part merged capture).",
+                             gap-splice, or a head backfill still in progress).",
                         )
                         .clicked()
                     {
