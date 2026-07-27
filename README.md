@@ -1154,6 +1154,13 @@ superseded** badge instead of a red one — no manual ack needed. (Takes with
 outstanding lost ranges keep their normal recovered/unrecovered rendering;
 this only applies where a sibling take genuinely covers the broadcast.)
 
+**💽 Drive offline.** Unrelated to log scanning: if the chapters-embed or
+gap-splice startup sweep finds a finalized recording whose output file lives
+on a drive that's currently disconnected (an unplugged USB enclosure, say),
+it doesn't spam one deferral line per recording — it files one red **Drive
+offline** alert per drive (growing the same row's count as more recordings
+on that drive are found) and defers them until the drive reconnects.
+
 **In-tree badges & trends.** The Streams grid mirrors the alert state right
 on the rows (all clickable — they open the Warnings window): a take (and its
 stream row, summed over takes/dual-capture legs) shows **🚨 lost data

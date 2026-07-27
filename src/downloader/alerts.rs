@@ -125,6 +125,7 @@ pub fn alert_category(kind: &str, last_line: &str) -> (&'static str, &'static st
         "sequence_gap" => return ("⛔", "Lost segments"),
         "fetch_failed" => return ("⛔", "Failed fetches"),
         "ad_probe_degraded" => return ("🛰", "Ad probe degraded"),
+        "offline_drive" => return ("💽", "Drive offline"),
         _ => {}
     }
     let l = last_line.to_lowercase();
@@ -401,6 +402,82 @@ impl Supervisor {
                 }
             }
         }
+    }
+
+    /// Checks whether `output`'s drive is currently disconnected, and if so
+    /// files (or grows) ONE coalesced `capture_alert` per drive instead of
+    /// logging/alerting per recording — `sweep_pending_chapters`/
+    /// `sweep_pending_gap_splices` can hit dozens of candidates on the same
+    /// offline drive at startup (e.g. a USB enclosure that isn't currently
+    /// plugged in), and a debug line per recording just buries the log.
+    /// `take_key` is the drive letter, so `upsert_capture_alert`'s own
+    /// dedup naturally coalesces every later hit into the same row (growing
+    /// `count`) without a second toast/log line. Returns `true` when the
+    /// drive really is offline, so callers skip their own per-recording
+    /// "file not found" log in that case (kept only for a file that's
+    /// missing on a drive that IS mounted — a genuinely different, rarer
+    /// signal worth its own line).
+    pub(super) async fn defer_for_offline_drive(
+        &self,
+        output: &std::path::Path,
+        rec_id: i64,
+        monitor_id: i64,
+        channel: &str,
+    ) -> bool {
+        let Some(letter) = crate::iomon::drive_letter(output) else { return false };
+        // GetDiskFreeSpaceExW is a blocking syscall — never inline on an
+        // async task (same reasoning as the Files view's own probe: it can
+        // spin up a sleeping USB drive, or simply stall waiting on a truly
+        // disconnected one).
+        let offline = tokio::task::spawn_blocking(move || crate::platform::disk_space(letter).is_none())
+            .await
+            .unwrap_or(false);
+        if !offline {
+            return false;
+        }
+        let alert = crate::store::NewCaptureAlert {
+            kind: "offline_drive".to_string(),
+            severity: "error".to_string(),
+            source: "chapters/gap-splice sweep".to_string(),
+            take_key: format!("offline_drive:{letter}"),
+            monitor_id: Some(monitor_id),
+            recording_id: Some(rec_id),
+            video_id: None,
+            channel: channel.to_string(),
+            count: 1,
+            lost_segments: 0,
+            last_line: format!(
+                "Recording #{rec_id}'s output file is on drive {letter}: — not currently \
+                 connected, so chapter embedding / gap-splicing is deferred until it is."
+            ),
+        };
+        match self.store.upsert_capture_alert(&alert) {
+            Ok((alert_id, was_new)) => {
+                if was_new {
+                    error!(
+                        rec_id,
+                        drive = %letter,
+                        "chapters/gap-splice: drive {letter}: is offline — deferring affected \
+                         recording(s) (see 🚨 Warnings)"
+                    );
+                    let _ = self.events.send(AppEvent::CaptureAlert {
+                        severity: "error".to_string(),
+                        title: format!("Drive {letter}: offline"),
+                        body: format!(
+                            "One or more finalized recordings live on drive {letter}:, which \
+                             isn't currently connected — chapter embedding / gap-splicing is \
+                             deferred until it's reconnected."
+                        ),
+                        monitor_id: Some(monitor_id),
+                        channel: channel.to_string(),
+                        recording_id: Some(rec_id),
+                        ref_key: format!("capalert:{alert_id}"),
+                    });
+                }
+            }
+            Err(e) => warn!(rec_id, "offline-drive alert upsert failed: {e:#}"),
+        }
+        true
     }
 
     /// Spawn the recovery job for a recording whose pending ranges the VOD

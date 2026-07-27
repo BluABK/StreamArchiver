@@ -249,9 +249,21 @@ impl Supervisor {
             return;
         }
 
+        if rec.output_path.is_empty() {
+            // `output_path` was deliberately blanked (e.g. the Issues panel's
+            // "dismiss dead entry" action after the file was deleted/moved) —
+            // status stays 'completed' but there's nothing left to embed
+            // into. Terminal, not deferred, so the sweep doesn't retry this
+            // forever every startup.
+            debug!(rec_id, "chapters: output_path is empty (dismissed via Issues) — skipping");
+            let _ = self.store.set_chapters_state(rec_id, "skipped");
+            return;
+        }
         let output = PathBuf::from(&rec.output_path);
         if !crate::iomon::fs::is_file_sync(Cat::Promote, &output) {
-            debug!(rec_id, "chapters: output file not found on disk — deferring");
+            if !self.defer_for_offline_drive(&output, rec_id, row.monitor.id, &row.channel.name).await {
+                debug!(rec_id, "chapters: output file not found on disk — deferring");
+            }
             return;
         }
 

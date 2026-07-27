@@ -195,8 +195,26 @@ impl Supervisor {
             return Vec::new();
         }
 
+        if rec.output_path.is_empty() {
+            // `output_path` was deliberately blanked (e.g. the Issues panel's
+            // "dismiss dead entry" action after the file was deleted/moved) —
+            // status stays 'completed' but there's nothing left to splice
+            // into. Terminal (same state the Issues panel's own manual
+            // "Dismiss" button uses), so the sweep doesn't retry this
+            // forever every startup.
+            let _ = self.store.set_gap_splice_state(rec_id, "dismissed");
+            return Vec::new();
+        }
         let output = PathBuf::from(&rec.output_path);
         if !crate::iomon::fs::is_file_sync(Cat::Promote, &output) {
+            let channel = self
+                .store
+                .get_monitor_with_channel(rec.monitor_id)
+                .ok()
+                .flatten()
+                .map(|row| row.channel.name)
+                .unwrap_or_default();
+            self.defer_for_offline_drive(&output, rec_id, rec.monitor_id, &channel).await;
             return Vec::new();
         }
 
