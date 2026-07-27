@@ -1340,6 +1340,7 @@ pub(super) fn state_icon(state: &str) -> (&'static str, egui::Color32) {
         "stopped" => ("⏹", Color32::from_gray(0xa0)),               // gray
         "aborted" => ("⚡", Color32::from_rgb(0xe0, 0xa8, 0x50)),   // amber
         "ended" => ("✔", Color32::from_gray(0xa0)),                  // gray
+        "not_recorded" => ("👁", Color32::from_gray(0xa0)),          // gray — seen live, Auto was off
         "completed" => ("✔", SUCCESS_GREEN),                         // green
         _ => ("○", Color32::from_gray(0x70)),                        // idle/unknown — dim
     }
@@ -3021,7 +3022,7 @@ mod tests {
         assert_eq!(unacked_color, state_icon("failed").1, "unacked must match state_icon exactly");
         // err_ack only means something for "failed" — every other state is
         // completely unaffected regardless of the flag.
-        for state in ["recording", "live", "completed", "ended", "aborted", "idle"] {
+        for state in ["recording", "live", "completed", "ended", "not_recorded", "aborted", "idle"] {
             assert_eq!(state_icon_ack(state, true), state_icon(state));
             assert_eq!(state_icon_ack(state, false), state_icon(state));
         }

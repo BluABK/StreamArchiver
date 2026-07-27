@@ -33,6 +33,62 @@ impl Store {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Currently-open "seen live but not recorded" session for this monitor
+    /// (`status = 'not_recorded'`, `ended_at IS NULL`), if any — `(id,
+    /// started_at)`. Used both to avoid opening a second session while one is
+    /// already tracking the same broadcast, and to compute a take-relative
+    /// `at_secs` offset when mirroring a title/category change into it.
+    pub fn open_not_recorded_session(&self, monitor_id: i64) -> Result<Option<(i64, i64)>> {
+        let conn = self.db();
+        conn.query_row(
+            "SELECT id, started_at FROM recording
+             WHERE monitor_id = ?1 AND status = 'not_recorded' AND ended_at IS NULL
+             ORDER BY id DESC LIMIT 1",
+            params![monitor_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Record that a broadcast was seen live while Auto-record was off — a
+    /// take-shaped row (so it slots into the Streams grid's normal
+    /// take-grouping/numbering) with no capture behind it: `output_path`
+    /// stays empty, `bytes` stays 0, nothing here ever spawns a process or
+    /// touches disk. Closed by [`Self::close_open_not_recorded_sessions`]
+    /// once the broadcast ends (or a real recording starts and supersedes it).
+    pub fn insert_not_recorded_session(
+        &self,
+        monitor_id: i64,
+        started_at: i64,
+        went_live_at: Option<i64>,
+        went_live_approx: bool,
+        stream_id: Option<&str>,
+    ) -> Result<i64> {
+        let conn = self.db();
+        conn.execute(
+            "INSERT INTO recording(monitor_id, started_at, output_path, status, went_live_at, went_live_approx, stream_id)
+             VALUES(?1, ?2, '', 'not_recorded', ?3, ?4, ?5)",
+            params![monitor_id, started_at, went_live_at, went_live_approx as i64, stream_id],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Close any open not-recorded session for this monitor (see
+    /// [`Self::open_not_recorded_session`]) — the broadcast ended, or a real
+    /// recording just started and supersedes it. A no-op (0 rows) when none
+    /// is open, so callers can call this unconditionally on every relevant
+    /// transition without checking first.
+    pub fn close_open_not_recorded_sessions(&self, monitor_id: i64, ended_at: i64) -> Result<usize> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE recording SET ended_at = ?2
+             WHERE monitor_id = ?1 AND status = 'not_recorded' AND ended_at IS NULL",
+            params![monitor_id, ended_at],
+        )
+        .map_err(Into::into)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn finish_recording(
         &self,
@@ -1857,6 +1913,41 @@ mod tests {
             .unwrap();
         let found = store.open_recording_for_monitor(mid).unwrap().unwrap();
         assert_eq!(found.id, open);
+    }
+
+    #[test]
+    fn not_recorded_session_lifecycle() {
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        assert!(store.open_not_recorded_session(mid).unwrap().is_none());
+
+        let id = store.insert_not_recorded_session(mid, 1_000, Some(1_000), false, Some("s1")).unwrap();
+        let (open_id, started_at) = store.open_not_recorded_session(mid).unwrap().unwrap();
+        assert_eq!(open_id, id);
+        assert_eq!(started_at, 1_000);
+
+        // The row reads back as a real take (status/stream_id/empty output_path)
+        // so it slots into the normal Streams-grid listing unmodified.
+        let all = store.recordings_for_monitor(mid).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].status, "not_recorded");
+        assert_eq!(all[0].stream_id.as_deref(), Some("s1"));
+        assert!(all[0].output_path.is_empty());
+        assert!(all[0].ended_at.is_none());
+
+        // Closing clears the "open" lookup and stamps ended_at.
+        let closed = store.close_open_not_recorded_sessions(mid, 2_000).unwrap();
+        assert_eq!(closed, 1);
+        assert!(store.open_not_recorded_session(mid).unwrap().is_none());
+        let all = store.recordings_for_monitor(mid).unwrap();
+        assert_eq!(all[0].ended_at, Some(2_000));
+
+        // Closing again (no open session) is a harmless no-op.
+        assert_eq!(store.close_open_not_recorded_sessions(mid, 3_000).unwrap(), 0);
     }
 
     #[test]

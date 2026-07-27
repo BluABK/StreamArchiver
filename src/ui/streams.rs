@@ -3514,6 +3514,12 @@ impl StreamArchiverApp {
                                 "The stream had already ended or wasn't live when we \
                                  tried — nothing to capture (not a failure).",
                             );
+                        } else if t.status == "not_recorded" {
+                            resp.on_hover_text(
+                                "Not recorded — Auto-record was off for this channel/instance \
+                                 while this stream was live, so nothing was captured. Kept as \
+                                 a history entry (title/category/duration) only.",
+                            );
                         } else if let Some(code) = t.exit_code {
                             resp.on_hover_text(format!("exit code {code}"));
                         } else {

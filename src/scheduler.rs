@@ -349,15 +349,33 @@ async fn tick(
         if o.live && !o.error
             && let Some((prev_title, prev_game, prev_tags)) = prev_meta_values.get(&o.monitor_id)
         {
+            // Also mirror into the take-shaped "not recorded" session's own
+            // per-take history (`stream_meta_change`), if one is open for
+            // this monitor — same table/shape `meta_watcher` writes to for
+            // an actual recording, so the Streams grid's take-title lookup
+            // (which only ever reads `stream_meta_change`) works unchanged
+            // for a not-recorded take too. `at_secs` is relative to the
+            // session's own `started_at`, same convention as a real take.
+            let open_session = ctx.store.open_not_recorded_session(o.monitor_id).ok().flatten();
             if title != prev_title {
                 let _ = ctx.store.insert_monitor_stream_change(
                     o.monitor_id, checked_at, "title", prev_title, title,
                 );
+                if let Some((rec_id, rec_started_at)) = open_session {
+                    let _ = ctx.store.insert_meta_change(
+                        rec_id, checked_at - rec_started_at, "title", prev_title, title,
+                    );
+                }
             }
             if game != prev_game {
                 let _ = ctx.store.insert_monitor_stream_change(
                     o.monitor_id, checked_at, "category", prev_game, game,
                 );
+                if let Some((rec_id, rec_started_at)) = open_session {
+                    let _ = ctx.store.insert_meta_change(
+                        rec_id, checked_at - rec_started_at, "category", prev_game, game,
+                    );
+                }
             }
             // Only when the source actually carries tags: a Twitch poll with
             // none genuinely means "no tags", but a source that omits them
@@ -414,6 +432,13 @@ async fn tick(
             );
         }
         let changed = old_state != Some(new_state);
+        // The broadcast just ended: close any open not-recorded session for
+        // it (see `insert_not_recorded_session`). Deliberately NOT on
+        // "error" — a transient poll failure shouldn't fragment one
+        // continuous broadcast's history into two sessions.
+        if old_state == Some("live") && new_state == "offline" {
+            let _ = ctx.store.close_open_not_recorded_sessions(o.monitor_id, checked_at);
+        }
 
         // Readable per-poll logging: name [method] result (+ go-live / error
         // detail). A state change is INFO; a routine poll is DEBUG.

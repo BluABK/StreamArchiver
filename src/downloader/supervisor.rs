@@ -1460,6 +1460,32 @@ progress_info: None,
                 live_since_approx,
                 stream_tags.as_deref().unwrap_or(""),
             );
+            // Not recording, but the broadcast still happened — track it as a
+            // take-shaped row with no capture behind it (see
+            // `insert_not_recorded_session`'s doc comment), so it shows up in
+            // the Streams grid with a "not recorded" note instead of leaving
+            // no trace at all that Auto-off channels went live. One session
+            // per broadcast: `try_begin` re-runs on every poll while the
+            // stream stays live, so skip if one's already open.
+            if matches!(self.store.open_not_recorded_session(monitor_id), Ok(None)) {
+                match self.store.insert_not_recorded_session(
+                    monitor_id,
+                    live_since.unwrap_or_else(now_unix),
+                    went_live_at,
+                    live_since_approx,
+                    stream_id.as_deref(),
+                ) {
+                    Ok(rec_id) => {
+                        if let Some(t) = stream_title.as_deref().filter(|t| !t.is_empty()) {
+                            let _ = self.store.insert_meta_change(rec_id, 0, "title", "", t);
+                        }
+                        if let Some(g) = stream_game.as_deref().filter(|g| !g.is_empty()) {
+                            let _ = self.store.insert_meta_change(rec_id, 0, "category", "", g);
+                        }
+                    }
+                    Err(e) => warn!(monitor_id, "failed to record not-recorded stream session: {e:#}"),
+                }
+            }
             return false;
         }
         // A "Stop (allow triggers)" hold still blocks plain Auto-record: only
@@ -2875,6 +2901,14 @@ progress_info: None,
         trigger_info: &str,
         trigger_rule_json: &str,
     ) -> (String, i64) {
+        // A real capture is starting for this monitor — if a "seen live but
+        // not recorded" session (see `insert_not_recorded_session`) was still
+        // open for it (e.g. Auto just got turned on, or a trigger matched
+        // mid-broadcast after Auto-off had already opened one), close it now
+        // rather than leaving it open forever: the scheduler stops polling
+        // (and thus stops seeing "went offline") for any monitor that's
+        // actively recording.
+        let _ = self.store.close_open_not_recorded_sessions(monitor_id, started_at);
         // A take key links the recordings of this capture attempt: the primary
         // and, in dual capture, the DASH companion share it (they're one "take").
         let take_group = format!("{monitor_id}:{started_at}");

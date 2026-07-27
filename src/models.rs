@@ -2870,13 +2870,23 @@ impl StreamGroup {
             "aborted"
         } else if self.takes.iter().all(|t| t.status == "orphaned") {
             "orphaned"
+        } else if self.takes.iter().any(|t| t.status == "not_recorded")
+            && self
+                .takes
+                .iter()
+                .all(|t| matches!(t.status.as_str(), "not_recorded" | "orphaned"))
+        {
+            // Every take that isn't a benign crash-orphan was simply seen
+            // live with Auto off — not attempted, so not a failure either.
+            "not_recorded"
         } else if self
             .takes
             .iter()
-            .all(|t| matches!(t.status.as_str(), "ended" | "orphaned"))
+            .all(|t| matches!(t.status.as_str(), "ended" | "not_recorded" | "orphaned"))
         {
             // No footage, but the broadcast had simply ended / wasn't live when we
-            // tried — not a failure (see the downloader's `ended` classification).
+            // tried (or wasn't attempted at all) — not a failure (see the
+            // downloader's `ended` classification).
             "ended"
         } else {
             "failed"
@@ -3359,6 +3369,51 @@ mod tests {
         assert_eq!(
             group_of(vec![
                 take_with_status(1, "ended"),
+                rec(2, 2000, Some(2100), None), // completed (bytes=1)
+            ])
+            .status(),
+            "completed",
+        );
+    }
+
+    #[test]
+    fn not_recorded_takes_dont_roll_up_to_failed() {
+        // Seen live with Auto off, never attempted — not a failure.
+        assert_eq!(group_of(vec![take_with_status(1, "not_recorded")]).status(), "not_recorded");
+        // not_recorded + a crash-orphan (both footage-less, benign) still reads
+        // as not_recorded.
+        assert_eq!(
+            group_of(vec![
+                take_with_status(1, "not_recorded"),
+                take_with_status(2, "orphaned"),
+            ])
+            .status(),
+            "not_recorded",
+        );
+        // Mixed with a genuine "ended" take (attempted, but nothing to
+        // capture) rolls up to `ended` — still benign, just a different
+        // "nothing captured" reason.
+        assert_eq!(
+            group_of(vec![
+                take_with_status(1, "not_recorded"),
+                take_with_status(2, "ended"),
+            ])
+            .status(),
+            "ended",
+        );
+        // A real failure anywhere in the broadcast keeps it `failed`.
+        assert_eq!(
+            group_of(vec![
+                take_with_status(1, "not_recorded"),
+                take_with_status(2, "failed"),
+            ])
+            .status(),
+            "failed",
+        );
+        // A completed take wins regardless.
+        assert_eq!(
+            group_of(vec![
+                take_with_status(1, "not_recorded"),
                 rec(2, 2000, Some(2100), None), // completed (bytes=1)
             ])
             .status(),

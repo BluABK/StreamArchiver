@@ -129,6 +129,13 @@ two tools on one URL.
      On/Duration come from detection's own go-live tracking in this case (the
      same "known even without a recording" data as Title/Game) — Started On
      mirrors Went Live and Lost time is blank, since nothing is being captured.
+     The stream isn't forgotten once it ends, either: it gets its own **👁 not
+     recorded** take row in the Streams grid (title/category/start/end time,
+     no file — hover the state icon for the note), the same way a real
+     recording would, so an Auto-off channel's history still shows *that* it
+     streamed even though nothing was captured. Turning Auto on (or a
+     trigger/manual Start firing) mid-broadcast closes that row and starts a
+     real recording take right after it.
 
    A **channel** (container) row rolls up its instances: the State column shows
    a live/recording indicator when **any** instance is live (with a count after
@@ -1662,7 +1669,10 @@ section). Semantics:
   only) — but with the stream still matching, the take won't auto-restart
   after a stop.
 - Detection/metadata keep running: the channel still shows **live** with
-  title/game/thumbnail in the Streams grid, it's just not recorded.
+  title/game/thumbnail in the Streams grid, it's just not recorded. Unlike
+  plain Auto-off (above), a blacklist veto does **not** get its own
+  **👁 not recorded** take row — an explicit "never archive this" is treated
+  as "don't keep a history entry either", not just "don't capture footage".
 - When a start is vetoed you get a one-per-broadcast **🚫 Blacklist blocked**
   notification (which rule matched and the matching text).
 - Push signals without a title (Twitch EventSub) fetch the metadata via a
