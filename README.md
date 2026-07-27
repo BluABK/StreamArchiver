@@ -1318,10 +1318,11 @@ a restart could otherwise take a long time to even notice an already-running
 pass again. The rest of that ordered queue — everything not yet reached, so
 not shown anywhere else — lists in the Background view's own **Queued**
 section (alongside the equivalent gap-splice backlog), oldest first with its
-position in line, the drive its output file lives on, and when it entered
-the queue plus how long it's been waiting there, so a large backlog (a
-first-run sweep, a bulk re-embed) is never invisible between "still in the
-database" and "showing up as an Active row."
+take number, position in line, the drive its output file lives on, when it
+entered the queue and how long it's been waiting there, and its stream title
+(truncated to 40 characters with a hover for the full text), so a large
+backlog (a first-run sweep, a bulk re-embed) is never invisible between
+"still in the database" and "showing up as an Active row."
 For more direct control: right-click a stream/take row → **📑 Embed
 chapters** (or **🔁 Re-embed chapters** once it already has some) to run it
 immediately instead of waiting for a restart, which also works as a retry

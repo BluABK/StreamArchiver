@@ -455,17 +455,20 @@ impl StreamArchiverApp {
                             );
                             ui.add_space(4.0);
                             egui::Grid::new("bg_queued_grid")
-                                .num_columns(6)
+                                .num_columns(8)
                                 .striped(true)
                                 .spacing([16.0, 6.0])
                                 .show(ui, |ui| {
                                     ui.strong("Channel");
+                                    ui.strong("Take");
                                     ui.strong("Job");
                                     ui.strong("Position");
                                     ui.strong("Drive");
                                     ui.strong("Added to queue");
                                     ui.strong("Time in queue");
+                                    ui.strong("Title");
                                     ui.end_row();
+                                    const TITLE_MAX_CHARS: usize = 40;
                                     let recorded_hover = |started_at: i64| -> String {
                                         use chrono::{Local, TimeZone};
                                         Local
@@ -481,11 +484,21 @@ impl StreamArchiverApp {
                                     };
                                     let queued_row = |ui: &mut egui::Ui, q: &crate::models::QueuedEmbedJob, job: &str, pos: usize, total: usize| {
                                         ui.label(&q.channel).on_hover_text(recorded_hover(q.started_at));
+                                        ui.label(format!("Take {}", q.take_number));
                                         ui.label(job);
                                         ui.label(format!("{pos} of {total}"));
                                         ui.label(drive_label(q));
                                         ui.label(fmt_datetime_short(q.queued_at));
                                         ui.label(fmt_duration_secs((now - q.queued_at).max(0)));
+                                        if q.title.is_empty() {
+                                            ui.weak("—");
+                                        } else {
+                                            let short = super::chat::truncate_label(&q.title, TITLE_MAX_CHARS);
+                                            let label = ui.label(&short);
+                                            if short != q.title {
+                                                label.on_hover_text(&q.title);
+                                            }
+                                        }
                                         ui.end_row();
                                     };
                                     for (i, q) in queued_chapters.iter().take(MAX_QUEUED_ROWS).enumerate() {

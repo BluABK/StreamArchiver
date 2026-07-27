@@ -450,7 +450,16 @@ impl Store {
     pub fn queued_gap_splices(&self) -> Result<Vec<crate::models::QueuedEmbedJob>> {
         let conn = self.db();
         let mut stmt = conn.prepare(
-            "SELECT r.id, c.name, r.started_at, COALESCE(r.ended_at, r.started_at), COALESCE(r.output_path, '')
+            "SELECT r.id, c.name, r.started_at, COALESCE(r.ended_at, r.started_at), COALESCE(r.output_path, ''),
+                    COALESCE((SELECT new_value FROM stream_meta_change smc
+                              WHERE smc.recording_id = r.id AND smc.kind = 'title'
+                              ORDER BY smc.at_secs DESC, smc.id DESC LIMIT 1), ''),
+                    CASE WHEN r.stream_id IS NULL THEN 1
+                         ELSE (SELECT COUNT(*) FROM recording r2
+                               WHERE r2.monitor_id = r.monitor_id AND r2.stream_id = r.stream_id
+                                 AND (r2.started_at < r.started_at
+                                      OR (r2.started_at = r.started_at AND r2.id <= r.id)))
+                    END
              FROM recording r
              JOIN monitor m ON m.id = r.monitor_id
              JOIN channel c ON c.id = m.channel_id
@@ -471,6 +480,8 @@ impl Store {
                     started_at: r.get(2)?,
                     queued_at: r.get(3)?,
                     output_path: r.get(4)?,
+                    title: r.get(5)?,
+                    take_number: r.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -511,7 +522,16 @@ impl Store {
     pub fn queued_chapters_embeds(&self) -> Result<Vec<crate::models::QueuedEmbedJob>> {
         let conn = self.db();
         let mut stmt = conn.prepare(
-            "SELECT r.id, c.name, r.started_at, COALESCE(r.ended_at, r.started_at), COALESCE(r.output_path, '')
+            "SELECT r.id, c.name, r.started_at, COALESCE(r.ended_at, r.started_at), COALESCE(r.output_path, ''),
+                    COALESCE((SELECT new_value FROM stream_meta_change smc
+                              WHERE smc.recording_id = r.id AND smc.kind = 'title'
+                              ORDER BY smc.at_secs DESC, smc.id DESC LIMIT 1), ''),
+                    CASE WHEN r.stream_id IS NULL THEN 1
+                         ELSE (SELECT COUNT(*) FROM recording r2
+                               WHERE r2.monitor_id = r.monitor_id AND r2.stream_id = r.stream_id
+                                 AND (r2.started_at < r.started_at
+                                      OR (r2.started_at = r.started_at AND r2.id <= r.id)))
+                    END
              FROM recording r
              JOIN monitor m ON m.id = r.monitor_id
              JOIN channel c ON c.id = m.channel_id
@@ -532,6 +552,8 @@ impl Store {
                     started_at: r.get(2)?,
                     queued_at: r.get(3)?,
                     output_path: r.get(4)?,
+                    title: r.get(5)?,
+                    take_number: r.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

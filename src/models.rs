@@ -2725,6 +2725,15 @@ pub struct QueuedEmbedJob {
     pub started_at: i64,
     pub queued_at: i64,
     pub output_path: String,
+    /// Last known stream title (from `stream_meta_change`), empty if none was
+    /// ever logged for this take.
+    pub title: String,
+    /// 1-based position of this take within its broadcast (matches the
+    /// Streams grid's "Take N" numbering) when a platform `stream_id` is
+    /// known; id-less takes (older/edge-case recordings) always read `1`
+    /// rather than replicating `group_recordings`' full time-based
+    /// clustering here.
+    pub take_number: i64,
 }
 
 /// A recording whose published VOD came back DMCA-muted — a row of the Issues
