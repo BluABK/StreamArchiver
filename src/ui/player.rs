@@ -686,6 +686,8 @@ pub(super) fn spawn_live_preview(
     player: &str,
     settings: &SettingsForm,
     store: &Arc<crate::store::Store>,
+    mute: bool,
+    title_template_override: Option<&str>,
 ) -> Option<String> {
     use crate::downloader::{load_ytdlp_bins, resolve_auth, sabr_preview_args, split_args, youtube_live_url, AuthSource};
     use crate::models::Platform;
@@ -788,7 +790,7 @@ pub(super) fn spawn_live_preview(
     let monitor_id = m.id;
     let last_title = row.last_title.clone();
     let last_game = row.last_game.clone();
-    let title_template = settings.live_title_template.trim().to_string();
+    let title_template = title_template_override.unwrap_or(settings.live_title_template.trim()).to_string();
     let title_auto_update = settings.live_title_auto_update;
     let title_store = Arc::clone(store);
     std::thread::spawn(move || {
@@ -901,6 +903,9 @@ pub(super) fn spawn_live_preview(
                         // blocks by default for local files.
                         cmd.arg("--demuxer-lavf-o=allowed_extensions=ALL");
                         cmd.arg(fwd_slashes(&hp.master_path()));
+                        if mute {
+                            cmd.arg("--mute");
+                        }
                         apply_live_title_and_spawn_updater(
                             &mut cmd, &player, monitor_id, &channel, &last_title, &last_game,
                             &title_template, title_auto_update, &title_store,
@@ -916,6 +921,9 @@ pub(super) fn spawn_live_preview(
                     warn!(%channel, "live-preview: HLS playlists not ready in time, falling back to appending://");
                 }
                 let mut cmd = build_player_command(&player, &target);
+                if mute && player_is_mpv(&player) {
+                    cmd.arg("--mute");
+                }
                 apply_live_title_and_spawn_updater(
                     &mut cmd, &player, monitor_id, &channel, &last_title, &last_game,
                     &title_template, title_auto_update, &title_store,
@@ -1044,15 +1052,19 @@ pub(super) fn spawn_play_new_instance(
                 ));
             }
             args.push("--player".into());
-            // Streamlink treats `--player` as a full command line (splitting
-            // it itself before appending the resolved stream) — this is the
-            // documented way to pass the player its own extra flags without a
-            // separate `--player-args`.
-            args.push(if mute && player_is_mpv(player) {
-                format!("{player} --mute")
-            } else {
-                player.to_string()
-            });
+            args.push(player.to_string());
+            if mute && player_is_mpv(player) {
+                // A separate --player-args flag, NOT embedded in --player's
+                // own value: Streamlink re-splits `--player` as its own
+                // command line, and on Windows a value handed to it as
+                // "<path> --mute" can come back mis-split into a single
+                // executable name — reported live as `error: Failed to
+                // start player: C:\...\mpv.exe --mute (Player executable
+                // not found)`. --player-args isn't re-split against the
+                // player path, so it can't suffer the same failure.
+                args.push("--player-args".into());
+                args.push("--mute {filename}".into());
+            }
             args.push(m.url.clone());
             args.push(resolved_quality(&m.quality));
             let mut cmd = std::process::Command::new("streamlink");
@@ -1060,7 +1072,7 @@ pub(super) fn spawn_play_new_instance(
             spawn_logged(cmd, "streamlink")
         }
         Tool::YtDlp if m.platform() == Platform::YouTube => {
-            spawn_live_preview(row, player, settings, store)
+            spawn_live_preview(row, player, settings, store, mute, title_template_override)
         }
         Tool::YtDlp => {
             let ytdlp_bin = if settings.ytdlp_binary_path.trim().is_empty() {
