@@ -2452,7 +2452,7 @@ Many streamers publish their weekly schedule as an **image** — a Twitch offlin
 | Source | Platform | Notes |
 |---|---|---|
 | **Twitch schedule** | Twitch | Helix `/schedule` API; needs Twitch credentials. Default: on. |
-| **YouTube Data API** | YouTube | `search.list` + `videos.list`; self-gates on a configured API key. Default: on when key is set. |
+| **YouTube Data API** | YouTube | `search.list` + `videos.list`; needs a configured API key. Spends real quota (`search.list` is 100 units/call) — **opt-in, default: off**, even once a key is set. |
 | **YouTube scrape** | YouTube | `/streams` page scrape; no API key needed. Default: on. |
 | **Twitch banner OCR** | Twitch | OCR the already-downloaded offline banner via the `claude` CLI. |
 | **YouTube community post OCR** | YouTube | Fetches recent community posts and OCRs the latest attached schedule image. |

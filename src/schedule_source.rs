@@ -246,10 +246,12 @@ fn default_order(store: &Store) -> Vec<SourceEntry> {
             enabled: match k {
                 ScheduleSourceKind::Discord => discord_on,
                 // The two free platform schedules are on by default; everything
-                // else (API, OCR, scraping) is opt-in.
-                ScheduleSourceKind::TwitchSchedule
-                | ScheduleSourceKind::YouTubeScrape
-                | ScheduleSourceKind::YouTubeApi => true,
+                // else (API — spends quota, OCR, scraping) is opt-in. YouTubeApi
+                // sits ahead of YouTubeScrape in DEFAULT_ORDER, so defaulting it
+                // on here meant it was tried (100 quota units) for every YouTube
+                // channel before ever reaching the free scrape fallback — found
+                // 2026-07-28 burning ~80-99% of the daily search.list quota.
+                ScheduleSourceKind::TwitchSchedule | ScheduleSourceKind::YouTubeScrape => true,
                 _ => false,
             },
         })
@@ -548,6 +550,24 @@ mod tests {
         let ids: std::collections::HashSet<_> =
             ScheduleSourceKind::DEFAULT_ORDER.iter().map(|k| k.id()).collect();
         assert_eq!(ids.len(), ScheduleSourceKind::DEFAULT_ORDER.len());
+    }
+
+    #[test]
+    fn default_order_keeps_the_paid_data_api_source_opt_in() {
+        // YouTubeApi spends real quota (100 units/call) and sits ahead of the
+        // free YouTubeScrape in DEFAULT_ORDER — if it defaulted on, it would be
+        // tried first for every YouTube channel on every refresh with no
+        // activity-driven reason (found live 2026-07-28: ~80-99% of the daily
+        // search.list quota spent this way with an API key merely configured).
+        let store = Store::open_in_memory().unwrap();
+        let order = load_source_order(&store);
+        let api = order.iter().find(|e| e.id == ScheduleSourceKind::YouTubeApi.id()).unwrap();
+        assert!(!api.enabled, "YouTubeApi must default OFF — it's opt-in, not a free platform source");
+        // The two genuinely free sources still default on, unaffected.
+        let twitch = order.iter().find(|e| e.id == ScheduleSourceKind::TwitchSchedule.id()).unwrap();
+        let yt_scrape = order.iter().find(|e| e.id == ScheduleSourceKind::YouTubeScrape.id()).unwrap();
+        assert!(twitch.enabled);
+        assert!(yt_scrape.enabled);
     }
 
     #[test]
