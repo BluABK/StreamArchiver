@@ -2509,14 +2509,18 @@ period selector (**Day / Week / Month / Year**):
   days elapsed so far (not a flat week/month/year), so it isn't dragged down
   by days that haven't happened yet.
 
-Underneath the daily unit total, a **"Units spent by call type today"**
-breakdown splits the day's units across `search.list` (100 units/call —
-live-detection polls and the upcoming-schedule refresh), `videos.list` (1
-unit/call — title/scheduled-start/actual-start lookups), and `channels.list`
-(1 unit/call — resolving an `@handle` URL to its channel id; a monitor added
-via `/channel/UC…` never needs this call). This is the same total shown above
-it, just split out so a sudden jump is traceable to a specific cause instead
-of an opaque number.
+The daily unit bar itself is color-segmented by call type, iPod-storage-bar
+style, instead of one flat fill — each segment's width is that call type's
+share of the daily cutoff, and hovering a segment shows its exact unit count
+and what it's for. Underneath, a **"Units spent by call type today"**
+breakdown grid repeats the same numbers with matching color swatches, split
+across `search.list` (orange — 100 units/call — live-detection polls and the
+upcoming-schedule refresh), `videos.list` (blue — 1 unit/call —
+title/scheduled-start/actual-start lookups), and `channels.list` (green — 1
+unit/call — resolving an `@handle` URL to its channel id; a monitor added via
+`/channel/UC…` never needs this call). This is the same total as the bar
+above it, just split out so a sudden jump is traceable to a specific cause
+instead of an opaque number.
 
 **Detection / API requests** (same tab) tracks cumulative poll/detect request
 counts **per platform** (Twitch, YouTube, Kick, NRK, Nebula, Generic) across every

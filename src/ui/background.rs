@@ -2,6 +2,54 @@
 
 use super::*;
 
+/// Colors for the YouTube Data API quota bar's per-call-type segments
+/// (`quota_segmented_bar`) — also reused for the matching swatches in the
+/// "Units spent by call type today" breakdown grid so the two visually tie
+/// together. Order matches decreasing typical cost (search.list dwarfs the
+/// other two at 100 units/call vs. 1 unit/call).
+const YT_QUOTA_SEARCH_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 126, 34);
+const YT_QUOTA_VIDEOS_COLOR: egui::Color32 = egui::Color32::from_rgb(52, 152, 219);
+const YT_QUOTA_CHANNELS_COLOR: egui::Color32 = egui::Color32::from_rgb(46, 204, 113);
+
+/// Paints an iPod-storage-bar-style progress bar: one colored rectangle per
+/// `(label, value, color, hover_text)` segment, left to right in the given
+/// order, each segment's width proportional to `value / scale`. Any leftover
+/// width (scale minus the segments' sum) stays the panel's empty-bar color.
+/// Hovering a segment shows its own label/value/hover_text tooltip — there's
+/// no single combined tooltip for the bar as a whole since each segment
+/// already carries what it is and why.
+fn quota_segmented_bar(
+    ui: &mut egui::Ui,
+    segments: &[(&str, f32, egui::Color32, &str)],
+    scale: f32,
+    height: f32,
+) {
+    let desired_size = egui::vec2(ui.available_width(), height);
+    let (rect, _response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
+    let rounding = egui::CornerRadius::same((height / 2.5) as u8);
+    ui.painter()
+        .rect_filled(rect, rounding, ui.visuals().extreme_bg_color);
+    if scale <= 0.0 {
+        return;
+    }
+    let mut x = rect.left();
+    for (i, (label, value, color, hover)) in segments.iter().enumerate() {
+        if *value <= 0.0 || x >= rect.right() {
+            continue;
+        }
+        let w = (rect.width() * (value / scale)).min(rect.right() - x);
+        if w <= 0.0 {
+            continue;
+        }
+        let seg_rect =
+            egui::Rect::from_min_max(egui::pos2(x, rect.top()), egui::pos2(x + w, rect.bottom()));
+        ui.painter().rect_filled(seg_rect, egui::CornerRadius::ZERO, *color);
+        ui.interact(seg_rect, ui.id().with("quota_bar_seg").with(i), egui::Sense::hover())
+            .on_hover_text(format!("{label}: {value:.0} units — {hover}"));
+        x += w;
+    }
+}
+
 impl StreamArchiverApp {
     pub(super) fn background_view(&mut self, ui: &mut egui::Ui) {
         use egui_extras::{Column, TableBuilder};
@@ -835,11 +883,32 @@ impl StreamArchiverApp {
                         ui.strong(format!("{search_cutoff}"));
                         ui.end_row();
                     });
-                let frac = (quota_today as f32 / cutoff as f32).clamp(0.0, 1.0);
-                ui.add(
-                    egui::ProgressBar::new(frac)
-                        .text(format!("{quota_today} / {cutoff} units")),
-                );
+                let ep_search = self.yt_ep_search_today;
+                let ep_videos = self.yt_ep_videos_today;
+                let ep_channels = self.yt_ep_channels_today;
+                let quota_segments: [(&str, f32, egui::Color32, &str); 3] = [
+                    (
+                        "search.list",
+                        ep_search as f32,
+                        YT_QUOTA_SEARCH_COLOR,
+                        "Live-detection polls and the upcoming-schedule refresh — 100 units/call.",
+                    ),
+                    (
+                        "videos.list",
+                        ep_videos as f32,
+                        YT_QUOTA_VIDEOS_COLOR,
+                        "Title/scheduled-start/actual-start lookups by video id — 1 unit/call.",
+                    ),
+                    (
+                        "channels.list",
+                        ep_channels as f32,
+                        YT_QUOTA_CHANNELS_COLOR,
+                        "Handle-to-channel-id resolution for @handle URLs — 1 unit/call.",
+                    ),
+                ];
+                quota_segmented_bar(ui, &quota_segments, cutoff.max(1) as f32, 18.0);
+                ui.label(format!("{quota_today} / {cutoff} units"));
+
                 let search_frac = (search_today as f32 / search_cutoff.max(1) as f32).clamp(0.0, 1.0);
                 ui.add(
                     egui::ProgressBar::new(search_frac)
@@ -847,34 +916,26 @@ impl StreamArchiverApp {
                 );
 
                 ui.add_space(6.0);
-                let ep_search = self.yt_ep_search_today;
-                let ep_videos = self.yt_ep_videos_today;
-                let ep_channels = self.yt_ep_channels_today;
                 ui.label(egui::RichText::new("Units spent by call type today").strong())
                     .on_hover_text(
-                        "Where the total above is actually going. search.list costs 100 \
-                         units/call (by far the most expensive) — videos.list and \
-                         channels.list cost 1 unit/call each. A monitor added by @handle \
-                         (rather than a /channel/UC… URL) pays an extra channels.list call \
-                         on every poll to resolve the handle, on top of the poll's own \
-                         search.list/videos.list calls.",
+                        "Where the bar above is actually going, colored to match its \
+                         segments. search.list costs 100 units/call (by far the most \
+                         expensive) — videos.list and channels.list cost 1 unit/call each. \
+                         A monitor added by @handle (rather than a /channel/UC… URL) pays \
+                         an extra channels.list call on every poll to resolve the handle, \
+                         on top of the poll's own search.list/videos.list calls.",
                     );
                 egui::Grid::new("quota_breakdown_grid")
-                    .num_columns(6)
-                    .spacing([24.0, 6.0])
+                    .num_columns(9)
+                    .spacing([12.0, 6.0])
                     .show(ui, |ui| {
-                        ui.label("search.list");
-                        ui.strong(format!("{ep_search}")).on_hover_text(
-                            "Live-detection polls and the upcoming-schedule refresh — 100 units/call.",
-                        );
-                        ui.label("videos.list");
-                        ui.strong(format!("{ep_videos}")).on_hover_text(
-                            "Title/scheduled-start/actual-start lookups by video id — 1 unit/call.",
-                        );
-                        ui.label("channels.list");
-                        ui.strong(format!("{ep_channels}")).on_hover_text(
-                            "Handle-to-channel-id resolution for @handle URLs — 1 unit/call.",
-                        );
+                        for (label, value, color, hover) in quota_segments {
+                            let (swatch_rect, _) =
+                                ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                            ui.painter().rect_filled(swatch_rect, 2.0, color);
+                            ui.label(label);
+                            ui.strong(format!("{value:.0}")).on_hover_text(hover);
+                        }
                         ui.end_row();
                     });
             }
