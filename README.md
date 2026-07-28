@@ -623,6 +623,32 @@ already-running ffmpeg mux is killed rather than left to finish, any partial
 capture is left completely untouched. A later stream restart or manual retry
 can always start a fresh backfill.
 
+### Database backups 🗄
+
+**Settings → System → Database backups** takes periodic, self-contained
+snapshots of the app database (channels, monitors, recording metadata,
+chapters, settings — not the video files themselves, which live separately on
+disk), so a destructive mistake against the live database or a corrupted
+database file has something recent to restore from instead of nothing.
+
+- **Enable rolling backups** (default on): each snapshot is a `VACUUM INTO`
+  copy taken on its own read-only connection to the database, so a backup —
+  which can take a few seconds on a large database — never blocks the app's
+  own database access (a recording writing metadata, the scheduler, the UI).
+- **Interval (hours)** (default 24) and **Keep** (default 14): how often a new
+  backup is taken and how many rolling snapshots survive before the oldest is
+  deleted. Both are re-checked at most once a day-equivalent while running
+  (same self-throttling shape as log retention below), not just at startup.
+- **Back up now**: takes one immediately, regardless of the interval.
+- **Open backups folder**: reveals `%APPDATA%\StreamArchiver\data\backups\` in
+  Explorer, where snapshots are named `streamarchiver-{unix timestamp}.sqlite3`
+  — each one a complete, independently-openable database file.
+
+To restore one: close the app, rename/move the current
+`streamarchiver.sqlite3` (plus any `-wal`/`-shm` files next to it) out of the
+way, copy a backup file into its place as `streamarchiver.sqlite3`, and
+relaunch.
+
 ### Row actions & shortcuts
 
 ![Right-click context menu on an instance row](doc/screenshots/row-context-menu.png)
@@ -3185,6 +3211,8 @@ Both SABR paths are **mpv-only**; other players get the DASH companion's `.ts`
 - Config/state DB: `%APPDATA%\StreamArchiver\data\streamarchiver.sqlite3` (SQLite, WAL).
 - Override the DB path with `STREAMARCHIVER_DB`, default output dir with
   `STREAMARCHIVER_OUT` (handy for testing).
+- Rolling database backups: `%APPDATA%\StreamArchiver\data\backups\` — see
+  *Database backups* (Settings → System).
 - Recordings + sidecars (`.chat.jsonl`, `.live_chat.json`, subtitle `.vtt`): your
   configured output folder (default: `Videos\StreamArchiver\`). Companion video
   files share the recording's stem: `{stem}.vod.mkv` (downloaded published VOD),

@@ -9,6 +9,7 @@ mod browser_ua;
 mod chapters;
 mod chat;
 mod compat;
+mod db_backup;
 mod detectors;
 mod downloader;
 mod emoji;

@@ -1,6 +1,6 @@
 //! Filesystem locations for config, database, and default recording output.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use directories::{ProjectDirs, UserDirs};
 
@@ -104,6 +104,18 @@ pub fn platform_assets_dir() -> PathBuf {
 /// Directory for rotating log files, e.g. `%APPDATA%\StreamArchiver\data\logs\`.
 pub fn logs_dir() -> PathBuf {
     let dir = data_dir().join("logs");
+    ensure_dir(&dir);
+    dir
+}
+
+/// Directory for rolling database backups (see `crate::db_backup`), e.g.
+/// `%APPDATA%\StreamArchiver\data\backups\`. Derived from [`db_path`] (not
+/// [`data_dir`] directly) so the `STREAMARCHIVER_DB` test/portable-install
+/// override relocates backups alongside it too, instead of a test run ever
+/// writing (and pruning!) files under the real user data directory.
+pub fn backups_dir() -> PathBuf {
+    let base = db_path().parent().map(Path::to_path_buf).unwrap_or_else(data_dir);
+    let dir = base.join("backups");
     ensure_dir(&dir);
     dir
 }

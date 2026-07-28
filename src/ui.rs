@@ -1100,6 +1100,16 @@ pub(crate) struct SettingsForm {
     /// Per-drive I/O limit overrides: (drive letter, limits). The default
     /// readrate/rate-limit live in `postproc_readrate`/`download_rate_limit`.
     disk_overrides: Vec<(String, crate::io_gate::DiskLimits)>,
+    // --- Rolling database backups ---
+    /// Periodically `VACUUM INTO` a timestamped snapshot of the live database
+    /// (see `crate::db_backup`). Default on — a safety net, not an opt-in.
+    db_backup_enabled: bool,
+    /// Hours between backups (parsed on save; empty/invalid falls back to
+    /// `db_backup::DEFAULT_INTERVAL_HOURS`).
+    db_backup_interval_hours: String,
+    /// How many rolling snapshots to keep before pruning the oldest (parsed
+    /// on save; empty/invalid falls back to `db_backup::DEFAULT_RETENTION_COUNT`).
+    db_backup_retention_count: String,
 }
 
 impl SettingsForm {

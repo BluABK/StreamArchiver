@@ -549,6 +549,7 @@ impl StreamArchiverApp {
             self.settings_stats_history_section(ui);
             self.settings_hype_trains_section(ui);
             self.settings_maintenance_section(ui);
+            self.settings_db_backup_section(ui);
             self.settings_diagnostics_section(ui);
 
             ui.add_space(16.0);
@@ -3751,6 +3752,90 @@ impl StreamArchiverApp {
                 });
             }
 
+            }
+    }
+
+    fn settings_db_backup_section(&mut self, ui: &mut egui::Ui) {
+            if self.section_shown(SettingsTab::System, "Database backups", &["backup", "backups", "vacuum", "restore", "rolling", "snapshot", "incident"]) {
+            ui.add_space(12.0);
+            ui.heading("Database backups 🗄");
+            ui.label(
+                "Periodic, self-contained snapshots of the app database (channels, monitors, \
+                 recording metadata, chapters, settings — not the video files themselves), so a \
+                 destructive mistake or a corrupted database file has something recent to \
+                 restore from instead of nothing.",
+            );
+            ui.add_space(6.0);
+            ui.checkbox(&mut self.settings.db_backup_enabled, "Enable rolling backups")
+                .on_hover_text(
+                    "On by default. When off, no automatic backups are taken (existing ones \
+                     are left alone — this only stops new ones).",
+                );
+            egui::Grid::new("db_backup_grid")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("Interval (hours)");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.db_backup_interval_hours)
+                            .desired_width(60.0),
+                    )
+                    .on_hover_text(format!(
+                        "How often a new backup is taken. Empty or invalid defaults to {}.",
+                        crate::db_backup::DEFAULT_INTERVAL_HOURS
+                    ));
+                    ui.end_row();
+
+                    ui.label("Keep");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.db_backup_retention_count)
+                            .desired_width(60.0),
+                    )
+                    .on_hover_text(format!(
+                        "How many rolling backups to keep before the oldest is deleted. Empty \
+                         or invalid defaults to {}.",
+                        crate::db_backup::DEFAULT_RETENTION_COUNT
+                    ));
+                    ui.end_row();
+                });
+            ui.add_space(6.0);
+
+            let last = crate::db_backup::last_run(&self.core.store);
+            let now = crate::models::now_unix();
+            let last_label = if last <= 0 {
+                "never".to_string()
+            } else {
+                format!("{} ago", fmt_duration_secs((now - last).max(0)))
+            };
+            let backups = crate::db_backup::list_backups();
+            let total_bytes: i64 = backups.iter().map(|(_, _, sz)| *sz as i64).sum();
+
+            ui.horizontal(|ui| {
+                if ui.button("Back up now").clicked() {
+                    let keep = self
+                        .settings
+                        .db_backup_retention_count
+                        .trim()
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|v| *v > 0)
+                        .unwrap_or(crate::db_backup::DEFAULT_RETENTION_COUNT);
+                    match crate::db_backup::run_backup_now(now, keep) {
+                        Ok(path) => {
+                            self.status = format!("Backup written: {}", path.display());
+                        }
+                        Err(e) => self.status = format!("Backup failed: {e:#}"),
+                    }
+                }
+                if ui.button("Open backups folder").clicked() {
+                    crate::platform::open_path(&crate::app_paths::backups_dir());
+                }
+                ui.label(format!(
+                    "Last backup: {last_label} · {} kept ({})",
+                    backups.len(),
+                    fmt_bytes(total_bytes)
+                ));
+            });
             }
     }
 

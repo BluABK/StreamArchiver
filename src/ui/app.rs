@@ -327,6 +327,9 @@ impl StreamArchiverApp {
                 v.sort_by(|a, b| a.0.cmp(&b.0));
                 v
             },
+            db_backup_enabled: crate::db_backup::enabled(&core.store),
+            db_backup_interval_hours: setting_or_empty(&core, crate::db_backup::K_INTERVAL_HOURS),
+            db_backup_retention_count: setting_or_empty(&core, crate::db_backup::K_RETENTION_COUNT),
         };
         // Apply the loaded date format + short-timestamp pattern before the first render.
         set_active_date_fmt(settings.date_fmt);
@@ -1793,6 +1796,9 @@ impl StreamArchiverApp {
             (crate::disposal::K_DISPOSAL_METHOD, s.disposal_method.as_str()),
             (crate::disposal::K_TRASH_DIRS, s.disposal_trash_dirs.trim()),
             (crate::disposal::K_TRASH_DEFAULT_ROOT, s.disposal_trash_default_root.trim()),
+            (crate::db_backup::K_ENABLED, if s.db_backup_enabled { "1" } else { "0" }),
+            (crate::db_backup::K_INTERVAL_HOURS, s.db_backup_interval_hours.trim()),
+            (crate::db_backup::K_RETENTION_COUNT, s.db_backup_retention_count.trim()),
         ];
         for (k, v) in pairs {
             if let Err(e) = self.core.store.set_setting(k, v) {

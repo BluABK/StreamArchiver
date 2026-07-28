@@ -517,6 +517,8 @@ async fn tick(
     // Logs-directory retention sweep (runs at most daily; see its own doc
     // comment for why this can't just be the one-shot startup prune).
     crate::app_paths::maybe_prune_old_logs(&ctx.store, checked_at);
+    // Rolling database backup sweep (runs at most every `db_backup_interval_hours`).
+    crate::db_backup::maybe_run_backup(&ctx.store, checked_at);
 
     // ── Twitch "Stream Together" collab refresh ──
     // Piggybacks each monitor's own poll cadence (only monitors polled this
