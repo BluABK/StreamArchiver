@@ -216,6 +216,31 @@ number of groups, but has at most one **primary** group and any number of
   **Enable**/**Disable** (the master switch), for every channel currently in
   that group at once.
 
+#### Recording groups — tagging streams across a span of time
+
+Unlike channel groups (organize *channels*), a **recording group** is a
+free-form tag spanning any number of *streams* (broadcasts) — e.g. "Numi
+Subathon 2025" tying together every stream across a week-long subathon,
+regardless of which day or how many takes each one has.
+
+- **Select streams**: ctrl/shift-click Stream rows in the Streams grid (a
+  plain click selects just the one clicked) — selected rows tint like a
+  keyboard-selected row. A bar appears above the grid showing the count, an
+  **➕ Add to group…** button, and **✕ Clear**.
+- **➕ Add to group…** opens a small dialog to add every take of every
+  selected stream to an existing recording group or a brand-new one (typed
+  inline). Manage existing groups (rename/delete) from the same **🏷
+  Groups** dialog channel groups use — it's a second section there.
+- The toolbar's second dropdown (next to the channel-group filter) narrows
+  the Streams grid to one recording group: channels/instances with no
+  matching stream are hidden entirely, and the ones that remain
+  force-expand down to their matching streams — no manual expanding needed
+  to see the whole collection at a glance. Right-click a stream while this
+  filter is active for a one-click **➖ Remove from "…"**.
+- Deleting a channel or a take cascades its recording-group memberships
+  automatically; deleting a recording group only drops the tag, never
+  touches any recording/file.
+
 #### Bulk import: followed / subscribed channels (📥)
 
 Instead of adding channels one by one, import the ones you already follow:

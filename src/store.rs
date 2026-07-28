@@ -35,7 +35,7 @@ use crate::models::{
 };
 
 /// Latest schema version understood by this build.
-const SCHEMA_VERSION: i64 = 77;
+const SCHEMA_VERSION: i64 = 78;
 
 pub struct Store {
     conn: FairMutex<Connection>,
@@ -144,6 +144,7 @@ mod monitors;
 mod posts;
 mod recordings;
 pub use recordings::EarlierTakeRow;
+mod recording_groups;
 mod scheduled;
 mod stats_history;
 pub use stats_history::K_VH_DOWNSAMPLE_DAYS;

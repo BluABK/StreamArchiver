@@ -839,6 +839,19 @@ pub struct ChannelGroup {
     pub created_at: i64,
 }
 
+/// A named, cross-cutting tag spanning any number of *takes*
+/// (`recording_group_member`) — e.g. "Numi Subathon 2025" tying together
+/// every take of every broadcast across a week. Unlike [`ChannelGroup`],
+/// there's no "primary" concept: a take's place in the tree is always its
+/// channel/instance; this is purely a filterable label. See
+/// `Store::add_recordings_to_group`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordingGroup {
+    pub id: i64,
+    pub name: String,
+    pub created_at: i64,
+}
+
 /// The channel's chosen icon/banner source, persisted in the legacy
 /// `channel.preferred_platform` TEXT column as `platform[:account]` —
 /// backward-compatible: a bare `"twitch"` (pre-account rows) parses with

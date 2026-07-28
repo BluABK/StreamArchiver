@@ -1541,7 +1541,33 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 77)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 77);
+        if version < 78 {
+            // Recording groups: a free-form label spanning any number of
+            // *takes* (`recording_group_member`, many-to-many on
+            // `recording.id`), e.g. "Numi Subathon 2025" tying together every
+            // take of every broadcast across a week. No "primary" concept
+            // (unlike channel groups) — a take's home in the tree is always
+            // its channel/instance, unaffected by this; a recording group is
+            // a pure cross-cutting tag, surfaced only via the Streams grid's
+            // group filter. Adding a *Stream* (a broadcast, possibly several
+            // takes) to a group inserts membership rows for every one of its
+            // takes at once (`Store::add_recordings_to_group`), so "is this
+            // stream in group G" is answerable by checking any one take.
+            conn.execute_batch(
+                "CREATE TABLE recording_group (
+                    id          INTEGER PRIMARY KEY,
+                    name        TEXT NOT NULL,
+                    created_at  INTEGER NOT NULL
+                );
+                CREATE TABLE recording_group_member (
+                    recording_id  INTEGER NOT NULL REFERENCES recording(id) ON DELETE CASCADE,
+                    group_id      INTEGER NOT NULL REFERENCES recording_group(id) ON DELETE CASCADE,
+                    PRIMARY KEY (recording_id, group_id)
+                );",
+            )?;
+            conn.pragma_update(None, "user_version", 78)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 78);
         Ok(())
     }
 }

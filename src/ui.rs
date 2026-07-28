@@ -1355,6 +1355,17 @@ pub struct StreamArchiverApp {
     show_group_manager: bool,
     group_manager_new_name: String,
     group_manager_rename: Option<(i64, String)>,
+    /// Recording groups' own new-name draft + inline rename, alongside the
+    /// channel-group ones in the same "Manage groups" window (two sections,
+    /// separate state so they can't stomp each other).
+    recording_group_manager_new_name: String,
+    recording_group_manager_rename: Option<(i64, String)>,
+    /// All recording groups, alphabetical — feeds the "Add to group…"
+    /// dialog's existing-group picker. Reloaded in `reload_rows` and after
+    /// any recording-group CRUD.
+    recording_groups: Vec<crate::models::RecordingGroup>,
+    /// Backing state for the "Add to group…" dialog (`None` = closed).
+    add_to_recording_group: Option<AddToRecordingGroupDialog>,
     /// Scheduled recordings (schema v51): the management window's open flag +
     /// last-loaded rows (refreshed in `reload_rows`, cheap — one small table),
     /// the add/edit dialog (`None` = closed), and a pending delete confirmation.
@@ -1376,6 +1387,15 @@ pub struct StreamArchiverApp {
     expanded_channels: HashSet<i64>,
     expanded_instances: HashSet<i64>,
     expanded_streams: HashSet<String>,
+    /// Multi-selected Stream rows (keyed by `StreamGroup::key` → its take
+    /// ids, ctrl/shift-click to add, plain click replaces) — feeds the "Add
+    /// to group…" bulk action. Take ids are captured at click time (not
+    /// re-resolved from the frame cache later, which only holds data for
+    /// currently-expanded instances) so a stream added to the selection
+    /// stays addable even if its instance gets collapsed before "Add to
+    /// group…" is confirmed. Unlike `selected_monitor` (single, cosmetic/
+    /// keyboard-shortcut target), this is a real multi-select set.
+    selected_streams: HashMap<String, Vec<i64>>,
     /// Year/Month/Week grouping-header toggles — deviations from the
     /// computed default (open for the single newest bucket at each shown
     /// level, closed otherwise), not the open state itself. See
@@ -1392,6 +1412,11 @@ pub struct StreamArchiverApp {
     /// the channel list to that group's members (primary or secondary),
     /// bypassing the primary-group header clustering entirely.
     streams_group_filter: Option<i64>,
+    /// Streams grid's "Recording group" filter (toolbar dropdown): `Some(id)`
+    /// hides any channel/instance with no take in that group, and
+    /// force-expands the ones that remain down to their matching streams —
+    /// see `build_vis_rows`'s `recording_group_filter` param.
+    streams_recording_group_filter: Option<i64>,
     rec_cache: HashMap<i64, Vec<Recording>>,
     /// Lazy per-recording ad-break detail (cut list), keyed by recording id;
     /// cleared on reload. Avoids a per-frame DB query for tooltips/the popup.
@@ -2569,6 +2594,49 @@ impl eframe::App for StreamArchiverApp {
                                          above don't apply while this is set.",
                                     );
                             }
+                            {
+                                let rgroups = self.recording_groups.clone();
+                                let selected_label = self
+                                    .streams_recording_group_filter
+                                    .and_then(|gid| rgroups.iter().find(|g| g.id == gid))
+                                    .map(|g| g.name.as_str())
+                                    .unwrap_or("All streams");
+                                egui::ComboBox::from_id_salt("streams_recording_group_filter")
+                                    .selected_text(selected_label)
+                                    .show_ui(ui, |ui| {
+                                        if ui
+                                            .selectable_label(
+                                                self.streams_recording_group_filter.is_none(),
+                                                "All streams",
+                                            )
+                                            .clicked()
+                                        {
+                                            self.streams_recording_group_filter = None;
+                                            self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
+                                        }
+                                        for g in &rgroups {
+                                            if ui
+                                                .selectable_label(
+                                                    self.streams_recording_group_filter == Some(g.id),
+                                                    &g.name,
+                                                )
+                                                .clicked()
+                                            {
+                                                self.streams_recording_group_filter = Some(g.id);
+                                                self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
+                                            }
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(
+                                        "Narrow the Streams grid to one recording group's \
+                                         streams (e.g. \"Numi Subathon 2025\") — channels/\
+                                         instances with no matching stream are hidden, and the \
+                                         ones that remain force-expand down to their matching \
+                                         streams. Select streams (ctrl/shift-click) and use \
+                                         \"➕ Add to group…\" to build one.",
+                                    );
+                            }
                             if ui
                                 .button("⇔")
                                 .on_hover_text("Auto-fit all columns to their content width")
@@ -2702,6 +2770,7 @@ impl eframe::App for StreamArchiverApp {
         self.form_window(ui.ctx());
         self.channel_form_window(ui.ctx());
         self.group_manager_window(ui.ctx());
+        self.add_to_recording_group_window(ui.ctx());
         self.confirm_delete_window(ui.ctx());
         self.confirm_delete_channel_window(ui.ctx());
         self.confirm_delete_segment_window(ui.ctx());

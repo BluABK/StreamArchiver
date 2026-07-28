@@ -2,6 +2,16 @@
 
 use super::*;
 
+/// Backing state for the "Add to group…" dialog (bulk-adds `selected_streams`
+/// to a recording group — new or existing). `pick` wins over `new_name` when
+/// both are set (picking an existing group after having typed a name that's
+/// then abandoned).
+#[derive(Default)]
+pub(super) struct AddToRecordingGroupDialog {
+    pick: Option<i64>,
+    new_name: String,
+}
+
 /// Backing state for the create/rename channel-container dialog.
 pub(super) struct ChannelForm {
     /// `Some(id)` = renaming an existing channel; `None` = creating a new one.
@@ -131,6 +141,14 @@ struct StreamsOut {
     /// A channel-group header's bulk Auto/Enabled action — (group id, on).
     bulk_set_group_enabled: Option<(i64, bool)>,
     bulk_set_group_automation: Option<(i64, bool)>,
+    /// Ctrl/shift-clicked a Stream row — toggle `(key, take ids)` in
+    /// `selected_streams`. Take ids captured now (see that field's doc
+    /// comment) rather than re-resolved later.
+    toggle_select_stream: Option<(String, Vec<i64>)>,
+    /// Plain-clicked a Stream row — replace the selection with just this one.
+    select_only_stream: Option<(String, Vec<i64>)>,
+    /// "Remove from \"…\"" on a Stream row's context menu — (group id, take ids).
+    remove_from_recording_group: Option<(i64, Vec<i64>)>,
     open_path: Option<std::path::PathBuf>,
     open_in_player: Option<StreamTarget>,
     play_new_instance_mid: Option<i64>,
@@ -771,13 +789,26 @@ impl StreamArchiverApp {
         let mut renamed: Option<(i64, String)> = None;
         let mut cancel_rename = false;
         let mut deleted: Option<i64> = None;
+        // Same shape, second section — recording groups.
+        let rgroups = self.recording_groups.clone();
+        let r_member_counts: HashMap<i64, usize> = rgroups
+            .iter()
+            .map(|g| (g.id, self.core.store.recording_ids_in_group(g.id).map(|s| s.len()).unwrap_or(0)))
+            .collect();
+        let mut r_new_name = std::mem::take(&mut self.recording_group_manager_new_name);
+        let mut r_rename_state = self.recording_group_manager_rename.take();
+        let mut r_add_clicked = false;
+        let mut r_renamed: Option<(i64, String)> = None;
+        let mut r_cancel_rename = false;
+        let mut r_deleted: Option<i64> = None;
 
-        egui::Window::new("Manage channel groups")
+        egui::Window::new("Manage groups")
             .collapsible(false)
             .resizable(true)
             .default_width(320.0)
             .open(&mut open)
             .show(ctx, |ui| {
+                ui.label(egui::RichText::new("Channel groups").strong());
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut new_name)
@@ -831,6 +862,67 @@ impl StreamArchiverApp {
                             ui.end_row();
                         }
                     });
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.label(egui::RichText::new("Recording groups").strong());
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut r_new_name)
+                            .hint_text("e.g. Numi Subathon 2025")
+                            .desired_width(200.0),
+                    );
+                    if ui.add_enabled(!r_new_name.trim().is_empty(), egui::Button::new("➕ Add")).clicked() {
+                        r_add_clicked = true;
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "A named tag spanning any number of streams — see the Streams grid's \
+                     multi-select (\"➕ Add to group…\") for building one up.",
+                );
+                ui.separator();
+                if rgroups.is_empty() {
+                    ui.weak("No recording groups yet.");
+                }
+                egui::Grid::new("recording_group_manager_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 4.0])
+                    .show(ui, |ui| {
+                        for g in &rgroups {
+                            let count = r_member_counts.get(&g.id).copied().unwrap_or(0);
+                            if r_rename_state.as_ref().is_some_and(|(id, _)| *id == g.id) {
+                                let draft = &mut r_rename_state.as_mut().unwrap().1;
+                                let resp = ui.text_edit_singleline(draft);
+                                let commit = (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                                    || ui.small_button("✔").clicked();
+                                if commit {
+                                    r_renamed = Some((g.id, draft.trim().to_string()));
+                                }
+                                if ui.small_button("✕").clicked() {
+                                    r_cancel_rename = true;
+                                }
+                            } else {
+                                ui.label(format!("{} ({count} take(s))", g.name));
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("✏").on_hover_text("Rename").clicked() {
+                                        r_rename_state = Some((g.id, g.name.clone()));
+                                    }
+                                    if ui
+                                        .small_button("🗑")
+                                        .on_hover_text(
+                                            "Delete this group. Recordings in it are unaffected \
+                                             — this only drops the tag.",
+                                        )
+                                        .clicked()
+                                    {
+                                        r_deleted = Some(g.id);
+                                    }
+                                });
+                            }
+                            ui.end_row();
+                        }
+                    });
             });
 
         self.group_manager_new_name = new_name;
@@ -865,11 +957,144 @@ impl StreamArchiverApp {
             if let Err(e) = self.core.store.delete_channel_group(id) {
                 self.status = format!("Error: {e}");
             } else {
+                if self.streams_group_filter == Some(id) {
+                    self.streams_group_filter = None;
+                    self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
+                }
+                self.reload_rows();
+            }
+        }
+
+        self.recording_group_manager_new_name = r_new_name;
+        if r_add_clicked {
+            let name = self.recording_group_manager_new_name.trim().to_string();
+            match self.core.store.create_recording_group(&name) {
+                Ok(_) => {
+                    self.recording_group_manager_new_name.clear();
+                    self.reload_rows();
+                }
+                Err(e) => self.status = format!("Error: {e}"),
+            }
+        }
+        if let Some((id, name)) = r_renamed {
+            if name.is_empty() {
+                self.status = "Group name can't be empty.".into();
+                self.recording_group_manager_rename = r_rename_state;
+            } else {
+                if let Err(e) = self.core.store.rename_recording_group(id, &name) {
+                    self.status = format!("Error: {e}");
+                } else {
+                    self.reload_rows();
+                }
+                self.recording_group_manager_rename = None;
+            }
+        } else if r_cancel_rename {
+            self.recording_group_manager_rename = None;
+        } else {
+            self.recording_group_manager_rename = r_rename_state;
+        }
+        if let Some(id) = r_deleted {
+            if let Err(e) = self.core.store.delete_recording_group(id) {
+                self.status = format!("Error: {e}");
+            } else {
+                if self.streams_recording_group_filter == Some(id) {
+                    self.streams_recording_group_filter = None;
+                    self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
+                }
                 self.reload_rows();
             }
         }
         if !open {
             self.show_group_manager = false;
+        }
+    }
+
+    /// "Add to group…" dialog: bulk-adds every take of every stream in
+    /// `selected_streams` to a recording group (existing pick, or a new one
+    /// typed in). Closing/confirming clears the selection either way.
+    pub(super) fn add_to_recording_group_window(&mut self, ctx: &egui::Context) {
+        if self.add_to_recording_group.is_none() {
+            return;
+        }
+        let n_sel = self.selected_streams.len();
+        let mut open = true;
+        let groups = self.recording_groups.clone();
+        let mut pick = self.add_to_recording_group.as_ref().unwrap().pick;
+        let mut new_name = std::mem::take(&mut self.add_to_recording_group.as_mut().unwrap().new_name);
+        let mut confirm_clicked = false;
+
+        egui::Window::new("Add to recording group")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(320.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(format!("Adding {n_sel} stream(s) (every take) to:"));
+                ui.separator();
+                if !groups.is_empty() {
+                    egui::Grid::new("add_to_recgroup_grid").num_columns(1).show(ui, |ui| {
+                        for g in &groups {
+                            if ui.selectable_label(pick == Some(g.id), &g.name).clicked() {
+                                pick = Some(g.id);
+                                new_name.clear();
+                            }
+                            ui.end_row();
+                        }
+                    });
+                    ui.separator();
+                }
+                ui.horizontal(|ui| {
+                    ui.label("New group:");
+                    if ui
+                        .add(egui::TextEdit::singleline(&mut new_name).hint_text("e.g. Numi Subathon 2025"))
+                        .changed()
+                        && !new_name.trim().is_empty()
+                    {
+                        pick = None;
+                    }
+                });
+                ui.add_space(8.0);
+                let can_confirm = pick.is_some() || !new_name.trim().is_empty();
+                if ui.add_enabled(can_confirm, egui::Button::new("Add")).clicked() {
+                    confirm_clicked = true;
+                }
+            });
+
+        if confirm_clicked {
+            let group_id = match pick {
+                Some(gid) => Some(gid),
+                None => match self.core.store.create_recording_group(new_name.trim()) {
+                    Ok(gid) => Some(gid),
+                    Err(e) => {
+                        self.status = format!("Error: {e}");
+                        None
+                    }
+                },
+            };
+            if let Some(gid) = group_id {
+                // Take ids were captured at click time (see `selected_streams`'s
+                // doc comment) — no re-resolution against the (expansion-gated)
+                // frame cache needed, and no risk of silently dropping a
+                // stream whose instance got collapsed in the meantime.
+                let rec_ids: Vec<i64> = self.selected_streams.values().flatten().copied().collect();
+                match self.core.store.add_recordings_to_group(&rec_ids, gid) {
+                    Ok(()) => {
+                        self.status = format!("Added {n_sel} stream(s) to the group.");
+                        self.selected_streams.clear();
+                        self.reload_rows();
+                    }
+                    Err(e) => self.status = format!("Error: {e}"),
+                }
+            }
+            self.add_to_recording_group = None;
+            return;
+        }
+        if let Some(d) = self.add_to_recording_group.as_mut() {
+            d.pick = pick;
+            d.new_name = new_name;
+        }
+        if !open {
+            self.add_to_recording_group = None;
         }
     }
 
@@ -902,8 +1127,43 @@ impl StreamArchiverApp {
             self.core.active.lock().unwrap().keys().copied().collect();
 
         self.rebuild_streams_cache(ui.ctx(), &active_ids, now);
+        self.streams_selection_bar(ui);
         let out = self.channels_table(ui, now, &active_ids);
         self.apply_streams_actions(ui, out, any_active);
+    }
+
+    /// Bar shown above the Streams grid while one or more Stream rows are
+    /// multi-selected (ctrl/shift-click) — mirrors `schedule_selection_bar`'s
+    /// shape. The only bulk action today is adding the selection to a
+    /// recording group; more could land here later the same way.
+    fn streams_selection_bar(&mut self, ui: &mut egui::Ui) {
+        let n_sel = self.selected_streams.len();
+        if n_sel == 0 {
+            return;
+        }
+        let accent = ui.visuals().selection.bg_fill;
+        ui.horizontal(|ui| {
+            ui.colored_label(accent, format!("{n_sel} stream(s) selected"));
+            ui.separator();
+            if ui
+                .button("➕ Add to group…")
+                .on_hover_text(
+                    "Add every take of the selected stream(s) to a recording group \
+                     (new or existing) — e.g. \"Numi Subathon 2025\" spanning several \
+                     broadcasts. Ctrl/shift-click more Stream rows to extend the \
+                     selection first.",
+                )
+                .clicked()
+            {
+                self.add_to_recording_group = Some(AddToRecordingGroupDialog::default());
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("✕ Clear").on_hover_text("Clear selection").clicked() {
+                    self.selected_streams.clear();
+                }
+            });
+        });
+        ui.separator();
     }
 
     /// Rebuild the frame-invariant Streams-view data (`streams_cache`) when
@@ -1159,6 +1419,7 @@ impl StreamArchiverApp {
         let exp_channels = self.expanded_channels.clone();
         let exp_instances = self.expanded_instances.clone();
         let exp_streams = self.expanded_streams.clone();
+        let selected_streams = self.selected_streams.clone();
         let period_toggles = self.period_toggles.clone();
         let collapsed_channel_groups = self.collapsed_channel_groups.clone();
         let group_names: HashMap<i64, String> =
@@ -1169,6 +1430,12 @@ impl StreamArchiverApp {
         // below), so it's negligible next to that.
         let group_filter_members: Option<(i64, HashSet<i64>)> = self.streams_group_filter.map(|gid| {
             (gid, self.core.store.channel_ids_in_group(gid).unwrap_or_default())
+        });
+        let recording_group_filter_members: Option<HashSet<i64>> = self
+            .streams_recording_group_filter
+            .map(|gid| self.core.store.recording_ids_in_group(gid).unwrap_or_default());
+        let current_recording_group: Option<(i64, String)> = self.streams_recording_group_filter.and_then(|gid| {
+            self.recording_groups.iter().find(|g| g.id == gid).map(|g| (gid, g.name.clone()))
         });
         // Snapshot live VOD-backfill download progress (video_id -> 0.0..=1.0),
         // same map the Videos tab reads (`core.video_progress`) — joined via
@@ -1310,6 +1577,7 @@ impl StreamArchiverApp {
                     &exp_channels, &exp_instances, &exp_streams, &period_toggles,
                     &self.channel_groups, &collapsed_channel_groups,
                     group_filter_members.as_ref().map(|(gid, members)| (*gid, members)),
+                    recording_group_filter_members.as_ref(),
                 );
                 // Scroll a newly-added channel into view (rows are virtualized,
                 // so the in-cell scroll_to_cursor approach can't work — the
@@ -1390,7 +1658,10 @@ impl StreamArchiverApp {
                                     &mut tr, &groups[&mid][gi], mid, depth, &self.rows,
                                     &mut self.fs_probes, &self.settings,
                                     &self.background_tasks, &finalizing_recs, ad_breaks,
-                                    meta_logs, &self.collab_by_stream, &exp_streams, now,
+                                    meta_logs, &self.collab_by_stream, &exp_streams,
+                                    &selected_streams, sel_color,
+                                    current_recording_group.as_ref().map(|(id, name)| (*id, name.as_str())),
+                                    now,
                                     &col_order, &self.rec_alert_badges,
                                     active_ids, &finalizing_ids, &mut out,
                                 );
@@ -1457,6 +1728,9 @@ impl StreamArchiverApp {
             toggle_channel_group,
             bulk_set_group_enabled,
             bulk_set_group_automation,
+            toggle_select_stream,
+            select_only_stream,
+            remove_from_recording_group,
             open_path,
             open_in_player,
             play_new_instance_mid,
@@ -1583,6 +1857,22 @@ impl StreamArchiverApp {
         if let Some(k) = toggle_stream {
             if !self.expanded_streams.remove(&k) {
                 self.expanded_streams.insert(k);
+            }
+        }
+        if let Some((k, ids)) = toggle_select_stream {
+            if self.selected_streams.remove(&k).is_none() {
+                self.selected_streams.insert(k, ids);
+            }
+        }
+        if let Some((k, ids)) = select_only_stream {
+            self.selected_streams.clear();
+            self.selected_streams.insert(k, ids);
+        }
+        if let Some((gid, ids)) = remove_from_recording_group {
+            if let Err(e) = self.core.store.remove_recordings_from_group(&ids, gid) {
+                self.status = format!("Error: {e}");
+            } else {
+                self.reload_rows();
             }
         }
         if let Some(k) = toggle_period {
@@ -2014,11 +2304,30 @@ impl StreamArchiverApp {
         // (primary or secondary) and disables header clustering entirely —
         // see the toolbar's group filter dropdown.
         group_filter: Option<(i64, &HashSet<i64>)>,
+        // `Some(recording_ids)` narrows to streams with at least one take in
+        // the set — channels/instances with no qualifying stream are hidden
+        // entirely, and the ones that remain force-expand down to their
+        // matching streams regardless of `exp_channels`/`exp_instances`
+        // (there's no point showing a match and then hiding it behind a
+        // collapsed triangle the user has to know to click).
+        recording_group_filter: Option<&HashSet<i64>>,
     ) -> Vec<Vis> {
         use chrono::Datelike;
         let mut order = ordered_rows(model, sort, filters);
         if let Some((_, members)) = group_filter {
             order.retain(|&ci| members.contains(&chan_entries[ci].channel.id));
+        }
+        let qualifying_monitors: Option<HashSet<i64>> = recording_group_filter.map(|rec_filter| {
+            groups
+                .iter()
+                .filter(|(_, grps)| {
+                    grps.iter().any(|g| g.takes.iter().any(|t| rec_filter.contains(&t.id)))
+                })
+                .map(|(&mid, _)| mid)
+                .collect()
+        });
+        if let Some(qm) = &qualifying_monitors {
+            order.retain(|&ci| chan_entries[ci].rows.iter().any(|&ri| qm.contains(&rows[ri].monitor.id)));
         }
         // Cluster by primary group, alphabetical by group name, ungrouped
         // channels first — a stable sort so each cluster's internal order
@@ -2055,18 +2364,57 @@ impl StreamArchiverApp {
         for &ci in chunk {
             let e = &chan_entries[ci];
             vis.push(Vis::Channel(ci));
-            if !exp_channels.contains(&e.channel.id) {
+            if qualifying_monitors.is_none() && !exp_channels.contains(&e.channel.id) {
                 continue;
             }
             // Channel container -> its instances -> each instance's
             // stream history -> takes.
             for &ri in &e.rows {
                 let mid = rows[ri].monitor.id;
+                if let Some(qm) = &qualifying_monitors
+                    && !qm.contains(&mid)
+                {
+                    // Not this filter's business — no matching stream here.
+                    continue;
+                }
                 vis.push(Vis::Instance { row: ri, depth: 1 });
-                if !exp_instances.contains(&mid) {
+                if qualifying_monitors.is_none() && !exp_instances.contains(&mid) {
                     continue;
                 }
                 let Some(grps) = groups.get(&mid) else { continue };
+                if let Some(rec_filter) = recording_group_filter {
+                    // Flat, no Year/Month/Week headers: `Period`'s
+                    // `gi_start..gi_end` assumes a CONTIGUOUS index range
+                    // into `groups[&mid]`, which recording-group filtering
+                    // (skipping individual, possibly non-adjacent streams)
+                    // would break. `gi` stays a valid index into the
+                    // UNFILTERED `grps` either way — only which entries get
+                    // pushed to `vis` is filtered.
+                    for (gi, g) in grps.iter().enumerate() {
+                        if !g.takes.iter().any(|t| rec_filter.contains(&t.id)) {
+                            continue;
+                        }
+                        vis.push(Vis::Stream { mid, gi, depth: 2 });
+                        if stream_has_children(g) && exp_streams.contains(&g.key) {
+                            for (ti, t) in g.takes.iter().enumerate() {
+                                if g.takes.len() > 1 {
+                                    vis.push(Vis::Take { mid, gi, ti, depth: 3 });
+                                }
+                                if t.recovery_state.is_some() {
+                                    vis.push(Vis::VodJob {
+                                        mid, gi, ti, kind: VodJobKind::Recovery, depth: 3,
+                                    });
+                                }
+                                if t.vod_dl_state.is_some() {
+                                    vis.push(Vis::VodJob {
+                                        mid, gi, ti, kind: VodJobKind::Backfill, depth: 3,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let dates: Vec<chrono::NaiveDate> = grps.iter().map(period_anchor_date).collect();
                 let (show_years, show_months, show_weeks) = period_levels_needed(&dates);
                 // Fixed for this instance — doesn't depend on which bucket,
@@ -3063,6 +3411,12 @@ impl StreamArchiverApp {
         meta_logs: &HashMap<i64, Vec<StreamMetaChange>>,
         collab_by_stream: &HashMap<(i64, String), String>,
         exp_streams: &HashSet<String>,
+        selected_streams: &HashMap<String, Vec<i64>>,
+        sel_color: egui::Color32,
+        // The recording group currently filtered to, if any — offers a
+        // one-click "remove this stream from it" in the context menu
+        // instead of needing a per-row live membership query.
+        current_recording_group: Option<(i64, &str)>,
         now: i64,
         col_order: &[usize],
         rec_alerts: &HashMap<i64, crate::store::RecAlertBadge>,
@@ -3074,6 +3428,11 @@ impl StreamArchiverApp {
         finalizing_ids: &HashSet<i64>,
         out: &mut StreamsOut,
     ) {
+        // Multi-select tint (ctrl/shift-click) — see `selected_streams`'s doc
+        // comment. Stream rows otherwise carry no background tint at all
+        // (status is conveyed by the state icon column only), so this is
+        // the only case that paints one.
+        let tint = selected_streams.contains_key(&g.key).then_some(sel_color);
         // Both must agree: the DB status ties the live process to THIS
         // broadcast specifically (the monitor could already be capturing a
         // newer one while an older StreamGroup's row is still on screen),
@@ -3152,10 +3511,11 @@ impl StreamArchiverApp {
                         ))
                 })
         };
+        let mut ctrl_or_shift = false;
         {
             let mut disc = false;
             for &ci2 in col_order {
-                tr.col(|ui| match STREAM_COLUMNS[ci2].id {
+                tr.col(|ui| { tint_cell(ui, tint); match STREAM_COLUMNS[ci2].id {
                     "actions" => {
                         let ok =
                             dir.as_ref().is_some_and(|d| fs_probes.is_dir(d));
@@ -3206,6 +3566,7 @@ impl StreamArchiverApp {
                         }
                     }
                     "name" => {
+                        ctrl_or_shift = ui.input(|i| i.modifiers.ctrl || i.modifiers.shift);
                         disc = tree_name(
                             ui, depth, has_takes, expanded, None,
                             egui::RichText::new(label.clone()),
@@ -3411,13 +3772,31 @@ impl StreamArchiverApp {
                     // "on"/"platform"/"tool"/"detection"/"polled"/
                     // "next_stream"/"ad_free"/"added" are n/a per stream.
                     _ => {}
-                });
+                }});
             }
-            tr.response().context_menu(|ui| {
+            let row_resp = tr.response();
+            if row_resp.clicked() {
+                let take_ids: Vec<i64> = g.takes.iter().map(|t| t.id).collect();
+                if ctrl_or_shift {
+                    out.toggle_select_stream = Some((g.key.clone(), take_ids));
+                } else {
+                    out.select_only_stream = Some((g.key.clone(), take_ids));
+                }
+            }
+            row_resp.context_menu(|ui| {
                 ui.set_min_width(180.0);
                 if recording {
                     stop_recording_submenus(ui, mid, &mut out.acts);
                     ui.separator();
+                }
+                if let Some((gid, gname)) = current_recording_group
+                    && ui
+                        .button(format!("➖  Remove from \"{gname}\""))
+                        .on_hover_text("Remove this stream's takes from the recording group currently filtered to.")
+                        .clicked()
+                {
+                    out.remove_from_recording_group = Some((gid, g.takes.iter().map(|t| t.id).collect()));
+                    ui.close();
                 }
                 if g.status() == "failed"
                     && let Some(last) = g.takes.last()

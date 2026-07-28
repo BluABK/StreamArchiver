@@ -557,6 +557,10 @@ impl StreamArchiverApp {
             show_group_manager: false,
             group_manager_new_name: String::new(),
             group_manager_rename: None,
+            recording_group_manager_new_name: String::new(),
+            recording_group_manager_rename: None,
+            recording_groups: Vec::new(),
+            add_to_recording_group: None,
             show_scheduled_recordings: false,
             scheduled_recordings: Vec::new(),
             scheduled_recording_form: None,
@@ -572,9 +576,11 @@ impl StreamArchiverApp {
             expanded_channels: HashSet::new(),
             expanded_instances: HashSet::new(),
             expanded_streams: HashSet::new(),
+            selected_streams: HashMap::new(),
             period_toggles: HashSet::new(),
             collapsed_channel_groups: HashSet::new(),
             streams_group_filter: None,
+            streams_recording_group_filter: None,
             rec_cache: HashMap::new(),
             ad_break_cache: HashMap::new(),
             ad_popups: Vec::new(),
@@ -826,6 +832,11 @@ impl StreamArchiverApp {
         match self.core.store.list_channel_groups() {
             Ok(gs) => self.channel_groups = gs,
             Err(e) => warn!("failed to load channel groups: {e:#}"),
+        }
+        // Recording groups — same, small table.
+        match self.core.store.list_recording_groups() {
+            Ok(gs) => self.recording_groups = gs,
+            Err(e) => warn!("failed to load recording groups: {e:#}"),
         }
         // Scheduled recordings (schema v51) — small table, cheap to reload
         // in full; drives the toolbar count and the grid column.
