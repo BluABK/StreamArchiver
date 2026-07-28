@@ -1565,9 +1565,18 @@ progress_info: None,
         if self.active.lock().unwrap().contains_key(&monitor_id) {
             return;
         }
-        let _ = self
-            .store
-            .set_monitor_check_result(monitor_id, "offline", now_unix());
+        let now = now_unix();
+        let _ = self.store.set_monitor_check_result(monitor_id, "offline", now);
+        // This push is the only "went offline" signal this monitor gets when
+        // EventSub beats the scheduler's own poll to writing `last_state`
+        // (routine for a hybrid eventsub_helix monitor) — the scheduler's
+        // tick-based close (see its `old_state == Some("live")` check) never
+        // observes a live->offline edge in that case, since by the time it
+        // polls, `last_state` here has already flipped to "offline". Without
+        // this, any not-recorded session (Auto off; see
+        // `insert_not_recorded_session`) opened for this broadcast is left
+        // open forever (found live 2026-07-28: monitor 50/GEEGA, rec_id=1098).
+        let _ = self.store.close_open_not_recorded_sessions(monitor_id, now);
     }
 
     /// "Start" command: check the channel now and record if live. A

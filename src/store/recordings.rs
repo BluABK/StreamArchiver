@@ -1119,10 +1119,17 @@ impl Store {
     /// catch a recurrence of the 2026-07-24 Layna incident (the in-memory
     /// map silently losing track of a still-healthy recording) the moment it
     /// happens, rather than only via its consequences days later.
+    ///
+    /// Excludes `status = 'not_recorded'` rows (see
+    /// [`Self::insert_not_recorded_session`]): those are deliberately open
+    /// with no capture behind them and never have a `self.active` entry to
+    /// begin with, so they'd permanently false-positive this check instead
+    /// of ever indicating a real desync.
     pub fn open_recordings_all(&self) -> Result<Vec<(i64, i64, i64)>> {
         let conn = self.db();
         let mut stmt = conn.prepare(
-            "SELECT monitor_id, id, started_at FROM recording WHERE ended_at IS NULL",
+            "SELECT monitor_id, id, started_at FROM recording
+             WHERE ended_at IS NULL AND status != 'not_recorded'",
         )?;
         let rows = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
@@ -1949,6 +1956,30 @@ mod tests {
 
         // Closing again (no open session) is a harmless no-op.
         assert_eq!(store.close_open_not_recorded_sessions(mid, 3_000).unwrap(), 0);
+    }
+
+    #[test]
+    fn open_recordings_all_excludes_not_recorded_sessions() {
+        // A `not_recorded` session (Auto off) is deliberately open with no
+        // capture behind it and never has a `self.active` entry — it must
+        // never appear in the scheduler's active/DB desync check, or an
+        // Auto-off broadcast whose offline transition arrived via EventSub
+        // (see `Supervisor::handle_offline_signal`) would false-positive it
+        // forever (found live 2026-07-28: monitor 50/GEEGA, rec_id=1098).
+        let store = Store::open_in_memory().unwrap();
+        let cid = store.create_container("Streamer").unwrap();
+        let mut m = sample_monitor(cid);
+        m.channel_id = cid;
+        let mid = store.insert_monitor(&m).unwrap();
+
+        let not_recorded = store.insert_not_recorded_session(mid, 1_000, Some(1_000), false, Some("s1")).unwrap();
+        let real_open = store
+            .insert_recording(mid, 3_000, "C:/rec/.cache/take2.ts", Some(1_000), false, Some("s1"), None, "", "")
+            .unwrap();
+
+        let open: Vec<i64> = store.open_recordings_all().unwrap().into_iter().map(|(_, id, _)| id).collect();
+        assert!(open.contains(&real_open));
+        assert!(!open.contains(&not_recorded));
     }
 
     #[test]
