@@ -534,6 +534,61 @@ fn styled_token(kind: &str, raw: &str, st: &TokenStyle) -> String {
 /// output path is known in advance: `{name} {title} {channel} {video_id}
 /// {quality} {resolution} {height} {width} {fps} {vcodec} {take} {games} {date}
 /// {time} {timestamp}`.
+/// Substitute every token in `tmpl` EXCEPT `{title}`/`{title_trimmed}`/
+/// `{games}`/`{category}`, whose values are passed in separately — see
+/// `expand_template`'s two-pass overflow handling, which needs to measure
+/// (and then re-run with shortened values for) just these two, never the
+/// identity tokens (`{channel}`, `{video_id}`, `{date}`, …) also expanded
+/// here.
+#[allow(clippy::too_many_arguments)]
+fn expand_non_sacrificial(
+    tmpl: &str,
+    v: &TemplateVars,
+    date: &str,
+    time: &str,
+    wl_date: &str,
+    wl_time: &str,
+    style: &TokenStyle,
+    title_val: &str,
+    title_trimmed_val: &str,
+    games_val: &str,
+) -> String {
+    let (y, mo, d, h, mi, s) = civil_from_unix_utc(v.secs);
+    tmpl.replace("{name}", v.name)
+        .replace("{title_trimmed}", title_trimmed_val)
+        .replace("{title}", title_val)
+        .replace("{channel}", v.channel)
+        .replace("{video_id}", v.video_id)
+        .replace("{quality}", v.quality)
+        .replace("{resolution}", v.resolution)
+        .replace("{height}", v.height)
+        .replace("{width}", v.width)
+        .replace("{fps}", v.fps)
+        .replace("{vcodec}", &styled_token("vcodec", v.vcodec, style))
+        .replace("{acodec}", &styled_token("acodec", v.acodec, style))
+        .replace("{tool}", &styled_token("tool", v.tool, style))
+        .replace("{mode}", &styled_token("mode", v.mode, style))
+        .replace("{platform_short}", &styled_token("platform_short", v.platform, style))
+        .replace("{platform}", &styled_token("platform", v.platform, style))
+        .replace("{take}", v.take)
+        .replace("{games}", games_val)
+        .replace("{date}", date)
+        .replace("{time}", time)
+        .replace("{timestamp}", &v.secs.to_string())
+        .replace("{year}", &format!("{y:04}"))
+        .replace("{month}", &format!("{mo:02}"))
+        .replace("{day}", &format!("{d:02}"))
+        .replace("{hour}", &format!("{h:02}"))
+        .replace("{minute}", &format!("{mi:02}"))
+        .replace("{second}", &format!("{s:02}"))
+        .replace("{went_live_date}", wl_date)
+        .replace("{went_live_time}", wl_time)
+        // backward-compat aliases for tokens listed in the old tooltip
+        .replace("{id}", v.video_id)
+        .replace("{ts}", &v.secs.to_string())
+        .replace("{category}", games_val)
+}
+
 pub(super) fn expand_template(template: &str, v: &TemplateVars) -> String {
     let (y, mo, d, h, mi, s) = civil_from_unix_utc(v.secs);
     let date = format!("{y:04}{mo:02}{d:02}");
@@ -557,46 +612,53 @@ pub(super) fn expand_template(template: &str, v: &TemplateVars) -> String {
             &global
         }
     };
-    let expanded = tmpl
-        .replace("{name}", v.name)
-        .replace("{title_trimmed}", &trim_title_commands(v.title))
-        .replace("{title}", v.title)
-        .replace("{channel}", v.channel)
-        .replace("{video_id}", v.video_id)
-        .replace("{quality}", v.quality)
-        .replace("{resolution}", v.resolution)
-        .replace("{height}", v.height)
-        .replace("{width}", v.width)
-        .replace("{fps}", v.fps)
-        .replace("{vcodec}", &styled_token("vcodec", v.vcodec, style))
-        .replace("{acodec}", &styled_token("acodec", v.acodec, style))
-        .replace("{tool}", &styled_token("tool", v.tool, style))
-        .replace("{mode}", &styled_token("mode", v.mode, style))
-        .replace("{platform_short}", &styled_token("platform_short", v.platform, style))
-        .replace("{platform}", &styled_token("platform", v.platform, style))
-        .replace("{take}", v.take)
-        .replace("{games}", v.games)
-        .replace("{date}", &date)
-        .replace("{time}", &time)
-        .replace("{timestamp}", &v.secs.to_string())
-        .replace("{year}", &format!("{y:04}"))
-        .replace("{month}", &format!("{mo:02}"))
-        .replace("{day}", &format!("{d:02}"))
-        .replace("{hour}", &format!("{h:02}"))
-        .replace("{minute}", &format!("{mi:02}"))
-        .replace("{second}", &format!("{s:02}"))
-        .replace("{went_live_date}", &wl_date)
-        .replace("{went_live_time}", &wl_time)
-        // backward-compat aliases for tokens listed in the old tooltip
-        .replace("{id}", v.video_id)
-        .replace("{ts}", &v.secs.to_string())
-        .replace("{category}", v.games);
+    let title_trimmed = trim_title_commands(v.title);
+
+    // Overflow must be absorbed by `{title}`/`{title_trimmed}` and
+    // `{games}`/`{category}` — the only unbounded, streamer-controlled text
+    // — never by an identity token (`{channel}`, `{video_id}`, `{date}`,
+    // the platform tag, …), which is the only sure-fire way to trace a take
+    // back to its source later. Measure the "skeleton" (everything BUT
+    // those two) first, so shortening never touches them.
+    let skeleton = expand_non_sacrificial(tmpl, v, &date, &time, &wl_date, &wl_time, style, "", "", "");
+    let skeleton_units = skeleton.encode_utf16().count();
+    let sacrificial_budget = MAX_STEM_UTF16_LEN.saturating_sub(skeleton_units);
+
+    let title_val = if tmpl.contains("{title_trimmed}") { title_trimmed.as_str() } else { v.title };
+    let (title_units, games_units) =
+        (title_val.encode_utf16().count(), v.games.encode_utf16().count());
+    let (title_final, games_final);
+    if title_units + games_units <= sacrificial_budget {
+        title_final = title_val.to_string();
+        games_final = v.games.to_string();
+    } else {
+        // Split the shared budget proportionally to each value's own
+        // length, so a long title absorbs most of the cut while a short
+        // `{games}` list stays intact (and vice versa) — `stem_fitting_budget`
+        // is already a no-op for a value that fits its share.
+        let title_budget = (sacrificial_budget * title_units).checked_div(title_units + games_units).unwrap_or(0);
+        let games_budget = sacrificial_budget.saturating_sub(title_budget);
+        title_final = stem_fitting_budget(title_val, title_budget);
+        games_final = stem_fitting_budget(v.games, games_budget);
+    }
+    // `{title_trimmed}` is derived from the (possibly just-shortened)
+    // title, not re-trimmed from the original — trimming a command list
+    // off an already-ellipsized title could reintroduce overflow.
+    let title_trimmed_final =
+        if tmpl.contains("{title_trimmed}") { title_final.clone() } else { trim_title_commands(&title_final) };
+
+    let expanded = expand_non_sacrificial(
+        tmpl, v, &date, &time, &wl_date, &wl_time, style,
+        &title_final, &title_trimmed_final, &games_final,
+    );
     let cleaned = sanitize_filename(&expanded);
-    // Bound the stem so it plus any companion suffix (the longest is
-    // `.live_chat.json`) plus a collision suffix never exceeds NTFS's
-    // per-component limit — see `MAX_STEM_UTF16_LEN`. Re-sanitize the trailing
-    // edge: a cut can land on a space/period, which `sanitize_filename`'s trim
-    // already handled for the untruncated end but not for a newly-created one.
+    // Reactive backstop for whatever the proportional split above didn't
+    // anticipate (sanitization revealing a new trailing space/period,
+    // marker overhead, or a pathological skeleton that's already over
+    // budget on its own) — truncates from the end same as before. In
+    // practice this now only ever trims into the tail of the (already
+    // shortened) sacrificial text, since the skeleton alone essentially
+    // never approaches `MAX_STEM_UTF16_LEN`.
     let cleaned = if cleaned.encode_utf16().count() > MAX_STEM_UTF16_LEN {
         truncate_utf16(&cleaned, MAX_STEM_UTF16_LEN)
             .trim_end_matches([' ', '.'])
@@ -1491,6 +1553,50 @@ mod tests {
         // Must not have been chopped mid-surrogate-pair (would be invalid
         // UTF-8 / panic on construction) and must not end in a bare '.'/' '.
         assert!(!out.ends_with('.') && !out.ends_with(' '));
+        // Identity tokens (channel, date/time, platform, video id) must
+        // survive completely intact — only {title}/{games} may be cut.
+        assert!(out.starts_with("CottontailVA - 20250704 "), "channel/date clipped: {out}");
+        assert!(out.ends_with("(1080p60 live h264 aac) - [twitch 318342459223]"), "video id clipped: {out}");
+    }
+
+    #[test]
+    fn expand_template_shortens_title_and_games_never_the_trailing_video_id() {
+        // 2026-07-28 fix: a stem overflow used to be absorbed by blindly
+        // truncating the FINAL flattened string, which could cut into
+        // whatever token happened to sit at the tail — for the default
+        // template that's `[{platform} {video_id}]`. Reproduces the exact
+        // shape that triggered it (Shylily, 2026-06-30): a long emoji-laden
+        // title plus 3 logged categories.
+        let categories: Vec<String> =
+            ["Just Chatting", "Neverness to Everness", "Dave the Diver"].iter().map(|s| s.to_string()).collect();
+        let games = format_games(&categories);
+        let title = "🦐 GAMING & CHILL~  SPECIAL DEBUT EVENT THIS SATURDAY JULY 4TH!  🗣️📢 New GGSupps AFK Flavor at -> !GG";
+        let out = expand_template(
+            "{name} - {date} {time} - {title} [{games}] ({quality} {mode} {vcodec} {acodec}) - [{platform} {video_id}]",
+            &TemplateVars {
+                name: "Shylily",
+                title,
+                games: &games,
+                quality: "1080p60",
+                mode: "live",
+                vcodec: "h264",
+                acodec: "aac",
+                platform: "twitch",
+                video_id: "317622900711",
+                secs: 1_782_844_618,
+                ..Default::default()
+            },
+        );
+        let out_units = out.encode_utf16().count();
+        assert!(out_units <= MAX_STEM_UTF16_LEN, "stem itself must respect the cap: {out_units}");
+        assert!(
+            out.ends_with("(1080p60 live h264 aac) - [twitch 317622900711]"),
+            "the video id (the only sure-fire way to trace this take back to its source) was clipped: {out}"
+        );
+        assert!(out.starts_with("Shylily - "), "channel clipped: {out}");
+        // The title (the unbounded, streamer-controlled part) is what
+        // actually absorbed the cut.
+        assert!(out.contains("..."), "expected the sacrificial title/games text to show a cut marker: {out}");
     }
 
     #[test]
