@@ -37,13 +37,23 @@ fn quota_segmented_bar(
         if *value <= 0.0 || x >= rect.right() {
             continue;
         }
+        let is_first = x <= rect.left() + 0.5;
         let w = (rect.width() * (value / scale)).min(rect.right() - x);
         if w <= 0.0 {
             continue;
         }
+        // Square-cornered segments painted over the rounded background rect
+        // squared off the bar's left/right edges wherever a segment touched
+        // them. Round just the edges this segment actually occupies, so the
+        // bar's overall silhouette stays pill-shaped regardless of how many
+        // segments it's split into.
+        let reaches_right = x + w >= rect.right() - 0.5;
+        let left_r = if is_first { rounding.nw } else { 0 };
+        let right_r = if reaches_right { rounding.ne } else { 0 };
+        let seg_rounding = egui::CornerRadius { nw: left_r, ne: right_r, sw: left_r, se: right_r };
         let seg_rect =
             egui::Rect::from_min_max(egui::pos2(x, rect.top()), egui::pos2(x + w, rect.bottom()));
-        ui.painter().rect_filled(seg_rect, egui::CornerRadius::ZERO, *color);
+        ui.painter().rect_filled(seg_rect, seg_rounding, *color);
         ui.interact(seg_rect, ui.id().with("quota_bar_seg").with(i), egui::Sense::hover())
             .on_hover_text(format!("{label}: {value:.0} units — {hover}"));
         x += w;
