@@ -63,7 +63,24 @@ opt-level = 2
 # Speed over size: "z" (size) visibly slows egui's per-frame layout and
 # tessellation; the binary grows some, but the UI is what we ship.
 opt-level = 3
-lto = true
-codegen-units = 1
+# Thin (not fat) LTO: parallelizes across modules instead of one big
+# whole-program pass, several minutes faster to link on this codebase for
+# a small, usually-imperceptible runtime cost vs. fat LTO. codegen-units
+# left at Cargo's own release default (16, i.e. unset here) so our crate's
+# own codegen also runs in parallel — LTO still does cross-unit
+# optimization regardless of this number, so it isn't giving up much.
+lto = "thin"
 strip = true
 panic = "abort"
+
+# Distribution build for cutting an actual GitHub release binary: fat LTO +
+# a single codegen unit for every last bit of runtime perf, at the cost of
+# the much slower link `release` above avoids for day-to-day iteration.
+# `cargo build --profile dist` (own target/dist/ output dir — doesn't
+# collide with target/release/). Best run from a clean clone/target dir
+# rather than the day-to-day one, since it's meant to be built at leisure,
+# not on every rebuild-and-verify cycle.
+[profile.dist]
+inherits = "release"
+lto = true
+codegen-units = 1
