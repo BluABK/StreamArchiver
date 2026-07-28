@@ -701,16 +701,18 @@ pub(super) const VIDEO_COLUMNS: [GridCol; 10] = [
 pub(super) const VIDEO_COLS: usize = 9;
 
 /// Background "Active tasks" columns (no sort/filter — hide/reorder only).
-pub(super) const BG_ACTIVE_COLUMNS: [GridCol; 4] = [
+pub(super) const BG_ACTIVE_COLUMNS: [GridCol; 5] = [
     GridCol { id: "channel", title: "Channel / Label", tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
+    GridCol { id: "rec_id",  title: "Rec ID",          tooltip: "The recording id this task is working on — cross-reference against the app log's `rec_id=…` fields. Blank for tasks not tied to one recording.", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
     GridCol { id: "task",    title: "Task",            tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
     GridCol { id: "detail",  title: "Detail",          tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: true },
     GridCol { id: "elapsed", title: "Elapsed",         tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
 ];
 
 /// Background "Recent" columns (no sort/filter — hide/reorder only).
-pub(super) const BG_RECENT_COLUMNS: [GridCol; 4] = [
+pub(super) const BG_RECENT_COLUMNS: [GridCol; 5] = [
     GridCol { id: "channel", title: "Channel / Label", tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
+    GridCol { id: "rec_id",  title: "Rec ID",          tooltip: "The recording id this task worked on — cross-reference against the app log's `rec_id=…` fields. Blank for tasks not tied to one recording.", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
     GridCol { id: "task",    title: "Task",            tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },
     GridCol { id: "detail",  title: "Detail",          tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: true },
     GridCol { id: "outcome", title: "Outcome",         tooltip: "", min_width: 0.0, initial: 0.0, sortable: false, stretch: false },

@@ -686,14 +686,16 @@ pub(super) async fn promote_capture(
         // the write instead of reactively after it (see path_with_safe_stem).
         let dest = path_with_safe_stem(&plan.final_path);
         if let Some((tx, id)) = &task {
+            let rec_id = *id as i64;
+            let filename = effective
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
             let _ = tx.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
                 id: *id,
-                kind: crate::events::BackgroundTaskKind::Remux,
-                label: effective
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-                detail: "finalize: remux to MKV (may wait for the disk gate)".into(),
+                kind: crate::events::BackgroundTaskKind::Remux(rec_id),
+                label: archive_channel_name(store, rec_id).unwrap_or_default(),
+                detail: format!("finalize: remux to MKV (may wait for the disk gate) — {filename}"),
                 started_at: now_unix(),
                 progress: None,
                 progress_info: None,

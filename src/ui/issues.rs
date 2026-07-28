@@ -814,7 +814,7 @@ impl StreamArchiverApp {
         let has_active_remux = self
             .background_tasks
             .iter()
-            .any(|bt| bt.kind == crate::events::BackgroundTaskKind::Remux);
+            .any(|bt| matches!(bt.kind, crate::events::BackgroundTaskKind::Remux(_)));
 
         // Sizes go through the TTL probe cache — this runs every frame while
         // the Issues window is open.
@@ -1221,7 +1221,7 @@ impl StreamArchiverApp {
                     // or a manual action) is a Remux background task keyed by the
                     // recording id.
                     let task = self.background_tasks.iter().find(|bt| {
-                        bt.kind == crate::events::BackgroundTaskKind::Remux
+                        matches!(bt.kind, crate::events::BackgroundTaskKind::Remux(_))
                             && bt.id == rec.id as u64
                     });
                     ui.horizontal(|ui| {
@@ -1331,7 +1331,7 @@ impl StreamArchiverApp {
                         // gate) — keyed by the recording id. Show its live state
                         // instead of the button.
                         let merge_task = self.background_tasks.iter().find(|bt| {
-                            bt.kind == crate::events::BackgroundTaskKind::Remux
+                            matches!(bt.kind, crate::events::BackgroundTaskKind::Remux(_))
                                 && bt.id == rec.id as u64
                         });
                         ui.horizontal(|ui| {
@@ -1716,13 +1716,13 @@ impl StreamArchiverApp {
             // Parse the recording mode from "(p <mode>  )" in the filename.
             let mode = parse_capture_mode(&fname).unwrap_or_default();
             let remux_task = self.background_tasks.iter().find(|bt| {
-                bt.kind == crate::events::BackgroundTaskKind::Remux
+                matches!(bt.kind, crate::events::BackgroundTaskKind::Remux(_))
                     && bt.id == rec.id as u64
             });
             let remuxing = remux_task.is_some();
             // Check finished_tasks for a prior failed remux attempt.
             let remux_err = self.finished_tasks.iter().find_map(|(t, outcome, _)| {
-                if t.kind == crate::events::BackgroundTaskKind::Remux
+                if matches!(t.kind, crate::events::BackgroundTaskKind::Remux(_))
                     && t.id == rec.id as u64
                 {
                     if let crate::events::TaskOutcome::Failed(msg) = outcome {

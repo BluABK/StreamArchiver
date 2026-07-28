@@ -1570,9 +1570,12 @@ independent detectors feeding the same table:
   in-flight tasks, the chapters/gap-splice backlog (channel, position in
   line, drive, and when it was queued / how long it's been waiting), and
   just-finished tasks (head backfills, re-remuxes, asset fetches) with live
-  progress and outcome. Every section header is collapsible (▶/▼, click to
-  toggle) so a long **Recent** history doesn't push **Active**/**Queued** off
-  screen. The long `ffmpeg -c copy` passes among these (chapters/thumbnail
+  progress and outcome. **Active**/**Recent** both have a **Rec ID** column —
+  the recording id a task is working on, for cross-referencing a row against
+  the app log's `rec_id=…` fields; blank for tasks not tied to one recording
+  (bulk sweeps, asset/thumbnail fetches, an untracked follow-raid capture).
+  Every section header is collapsible (▶/▼, click to toggle) so a long
+  **Recent** history doesn't push **Active**/**Queued** off screen. The long `ffmpeg -c copy` passes among these (chapters/thumbnail
   embed, remux, gap-splice/head-backfill concat, split-capture merge) all
   survive an app restart instead of losing their progress — see
   [Chapters](#chapters-) for the details.

@@ -4481,7 +4481,7 @@ impl StreamArchiverApp {
                         let needs_remux = t.output_path.ends_with(".ts")
                             && crate::downloader::path_in_cache(&t.output_path);
                         let remuxing = background_tasks.iter().any(|bt| {
-                            bt.kind == crate::events::BackgroundTaskKind::Remux
+                            matches!(bt.kind, crate::events::BackgroundTaskKind::Remux(_))
                                 && bt.id == t.id as u64
                         });
                         if remuxing {

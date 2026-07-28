@@ -491,6 +491,12 @@ impl StreamArchiverApp {
                                         for &i in &bg_active_order {
                                             row.col(|ui| match BG_ACTIVE_COLUMNS[i].id {
                                                 "channel" => { ui.label(&task.label); }
+                                                "rec_id" => {
+                                                    match task.kind.recording_id() {
+                                                        Some(id) => { ui.label(id.to_string()); }
+                                                        None => { ui.weak("—"); }
+                                                    }
+                                                }
                                                 "task" => { ui.label(task.kind.label()); }
                                                 "detail" => {
                                                     // Show live ffmpeg stats when available; fall back to static detail.
@@ -699,6 +705,12 @@ impl StreamArchiverApp {
                                         for &i in &bg_recent_order {
                                             row.col(|ui| match BG_RECENT_COLUMNS[i].id {
                                                 "channel" => { ui.label(&task.label); }
+                                                "rec_id" => {
+                                                    match task.kind.recording_id() {
+                                                        Some(id) => { ui.label(id.to_string()); }
+                                                        None => { ui.weak("—"); }
+                                                    }
+                                                }
                                                 "task" => { ui.label(task.kind.label()); }
                                                 "detail" => {
                                                     ui.label(&task.detail);

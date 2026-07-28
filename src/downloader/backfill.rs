@@ -665,15 +665,16 @@ impl Supervisor {
         // Keyed by the recording id (like re-remux/finalize tasks) so grid and
         // Issues rows can match the running merge to their recording.
         let task_id = rec_id as u64;
+        let channel = archive_channel_name(&self.store, rec_id).unwrap_or_default();
         let name = capture
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         let _ = self.events.send(AppEvent::BackgroundTaskStarted(crate::events::BackgroundTask {
             id: task_id,
-            kind: crate::events::BackgroundTaskKind::Remux,
-            label: name,
-            detail: format!("merging {} split part(s)", parts.len()),
+            kind: crate::events::BackgroundTaskKind::Remux(rec_id),
+            label: channel,
+            detail: format!("merging {} split part(s) — {name}", parts.len()),
             started_at: now_unix(),
             progress: None,
             progress_info: None,

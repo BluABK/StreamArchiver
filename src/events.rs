@@ -25,7 +25,12 @@ pub enum BackgroundTaskKind {
     AssetFetch,
     ThumbnailFetch,
     OcrCall,
-    Remux,
+    /// Remuxing/promoting one capture (finalize, manual re-remux, or merging
+    /// stranded split-format parts). Carries the recording id (mirrors
+    /// `HeadBackfill`/`Chapters`/etc.) — the task's own `id` already equals
+    /// it by convention, but callers building a UI row want it typed rather
+    /// than re-deriving `bt.id as i64`.
+    Remux(i64),
     ReRemuxAll,
     EmbedMissingThumbnails,
     FetchMissingThumbnails,
@@ -73,7 +78,7 @@ impl BackgroundTaskKind {
             BackgroundTaskKind::AssetFetch => "Asset fetch",
             BackgroundTaskKind::ThumbnailFetch => "Thumbnail",
             BackgroundTaskKind::OcrCall => "Schedule OCR",
-            BackgroundTaskKind::Remux => "Re-remux",
+            BackgroundTaskKind::Remux(_) => "Re-remux",
             BackgroundTaskKind::ReRemuxAll => "Re-remux all",
             BackgroundTaskKind::EmbedMissingThumbnails => "Embed thumbnails",
             BackgroundTaskKind::FetchMissingThumbnails => "Fetch thumbnails",
@@ -90,6 +95,36 @@ impl BackgroundTaskKind {
             BackgroundTaskKind::Chapters(_) => "Chapters",
             BackgroundTaskKind::ReembedChaptersAll => "Re-embed chapters (all)",
             BackgroundTaskKind::RaidFollow => "Follow raid",
+        }
+    }
+
+    /// The recording this task is working on, for the Background view's
+    /// "Rec ID" column (cross-referencing a row against the app log, which
+    /// logs `rec_id=…` on most of these paths). `None` for kinds that aren't
+    /// tied to one recording (bulk sweeps, asset/thumbnail/OCR fetches, an
+    /// untracked follow-raid capture, ...).
+    pub fn recording_id(&self) -> Option<i64> {
+        match self {
+            BackgroundTaskKind::ReorganizeTake(id)
+            | BackgroundTaskKind::HeadBackfill(id)
+            | BackgroundTaskKind::GapRecover(id)
+            | BackgroundTaskKind::GapSplice(id)
+            | BackgroundTaskKind::Chapters(id)
+            | BackgroundTaskKind::Remux(id) => Some(*id),
+            BackgroundTaskKind::RecoverVod(id) => *id,
+            BackgroundTaskKind::AssetFetch
+            | BackgroundTaskKind::ThumbnailFetch
+            | BackgroundTaskKind::OcrCall
+            | BackgroundTaskKind::ReRemuxAll
+            | BackgroundTaskKind::EmbedMissingThumbnails
+            | BackgroundTaskKind::FetchMissingThumbnails
+            | BackgroundTaskKind::ReorganizeAll
+            | BackgroundTaskKind::ReorganizeMonitor(_)
+            | BackgroundTaskKind::ReorganizeChannel(_)
+            | BackgroundTaskKind::RecoverVodScan
+            | BackgroundTaskKind::RefreshCdnHosts
+            | BackgroundTaskKind::ReembedChaptersAll
+            | BackgroundTaskKind::RaidFollow => None,
         }
     }
 }

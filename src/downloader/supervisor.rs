@@ -196,10 +196,7 @@ impl Supervisor {
         let remux_jobs = self.remux_jobs.clone();
         let tx = self.events.clone();
         let task_id = rec_id as u64;
-        let src_name = capture
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let channel = archive_channel_name(&store, rec_id).unwrap_or_default();
         let dst_name = final_
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -207,8 +204,8 @@ impl Supervisor {
         let _ = tx.send(AppEvent::BackgroundTaskStarted(
             crate::events::BackgroundTask {
                 id: task_id,
-                kind: crate::events::BackgroundTaskKind::Remux,
-                label: src_name,
+                kind: crate::events::BackgroundTaskKind::Remux(rec_id),
+                label: channel,
                 detail: format!("→ {dst_name}"),
                 started_at: now_unix(),
                 progress: None,
