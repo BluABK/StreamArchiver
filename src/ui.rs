@@ -2688,6 +2688,13 @@ impl eframe::App for StreamArchiverApp {
                                     self.streams_active_view.as_deref().unwrap_or("Views");
                                 egui::ComboBox::from_id_salt("streams_view_select")
                                     .selected_text(selected_label)
+                                    // ComboBox defaults to closing on ANY click inside
+                                    // its popup (egui::PopupCloseBehavior::CloseOnClick,
+                                    // meant for plain option lists) — this popup also
+                                    // holds a TextEdit and per-row action buttons the
+                                    // user needs to interact with repeatedly without the
+                                    // popup vanishing after the first click.
+                                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                                     .show_ui(ui, |ui| {
                                         self.views_combo_popup(ui);
                                     })
