@@ -38,6 +38,7 @@ use crate::imports::{self, ImportCandidate};
 use crate::inspector::Inspectable;
 use crate::oauth::{self, AuthFlow};
 use crate::platform::AutoStart;
+use crate::saved_views::{self, SavedView};
 use crate::schedule_source::{
     ScheduleSourceKind, SourceEntry, load_channel_cfg, load_channel_scope, load_monitor_scope,
     load_source_order, save_channel_cfg, save_channel_scope, save_monitor_scope, save_source_order,
@@ -1427,6 +1428,26 @@ pub struct StreamArchiverApp {
     /// force-expands the ones that remain down to their matching streams —
     /// see `build_vis_rows`'s `recording_group_filter` param.
     streams_recording_group_filter: Option<i64>,
+    /// Streams grid "Group" checkbox: show/hide the channel-group header
+    /// clustering (`collapsed_channel_groups`/primary-group headers) — off
+    /// yields a flat list even for channels that have a primary group
+    /// assigned. Persisted immediately on toggle (own key, not part of the
+    /// batched Settings form — same shape as Schedule's `schedule_compact`).
+    /// Also the `group_visually` field a saved view snapshots/restores.
+    streams_group_visually: bool,
+    /// Streams grid's saved views (`crate::saved_views`): the currently-
+    /// applied view's name (session-only — re-applying one is a single
+    /// click, so this isn't persisted across restarts) and the last-loaded
+    /// view list (reloaded after any CRUD, mirroring `recording_groups`).
+    streams_active_view: Option<String>,
+    streams_views: Vec<SavedView>,
+    /// "Manage views" dialog: open flag, new-view-name draft, and an
+    /// in-progress inline rename (old name + draft text; `None` = not
+    /// renaming any row) — same shape as `group_manager_new_name`/
+    /// `group_manager_rename`.
+    show_views_manager: bool,
+    views_manager_new_name: String,
+    views_manager_rename: Option<(String, String)>,
     rec_cache: HashMap<i64, Vec<Recording>>,
     /// Lazy per-recording ad-break detail (cut list), keyed by recording id;
     /// cleared on reload. Avoids a per-frame DB query for tooltips/the popup.
@@ -2648,6 +2669,65 @@ impl eframe::App for StreamArchiverApp {
                                     );
                             }
                             if ui
+                                .checkbox(&mut self.streams_group_visually, "Group")
+                                .on_hover_text(
+                                    "Cluster channels under their primary-group headers \
+                                     (🏷 Groups). Off shows a flat list even for channels \
+                                     that have a group assigned — handy for a \"flat, \
+                                     sorted by last added\" view.",
+                                )
+                                .changed()
+                            {
+                                let _ = self.core.store.set_setting(
+                                    K_STREAMS_GROUP_VISUALLY,
+                                    if self.streams_group_visually { "1" } else { "0" },
+                                );
+                                self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
+                            }
+                            {
+                                // Same disjoint-borrow shape as the Group/Recording group
+                                // dropdowns just above: clone the list up front so the
+                                // closure iterating it can also mutate `self` freely.
+                                let views = self.streams_views.clone();
+                                let selected_label =
+                                    self.streams_active_view.as_deref().unwrap_or("Views");
+                                egui::ComboBox::from_id_salt("streams_view_select")
+                                    .selected_text(selected_label)
+                                    .show_ui(ui, |ui| {
+                                        if views.is_empty() {
+                                            ui.weak("No saved views yet");
+                                        }
+                                        for v in &views {
+                                            if ui
+                                                .selectable_label(
+                                                    self.streams_active_view.as_deref() == Some(v.name.as_str()),
+                                                    &v.name,
+                                                )
+                                                .clicked()
+                                            {
+                                                self.apply_streams_view(&v.name);
+                                            }
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(
+                                        "Apply a saved view — a named snapshot of this \
+                                         grid's sort, \"Group\" toggle, per-column filters, \
+                                         and Group/Recording group selections. Manage them \
+                                         from \"👁 Views\".",
+                                    );
+                            }
+                            if ui
+                                .button("👁 Views")
+                                .on_hover_text(
+                                    "Save/apply/rename/delete Streams grid views — sort, \
+                                     grouping, and filter presets you can switch between.",
+                                )
+                                .clicked()
+                            {
+                                self.show_views_manager = true;
+                            }
+                            if ui
                                 .button("⇔")
                                 .on_hover_text("Auto-fit all columns to their content width")
                                 .clicked()
@@ -2780,6 +2860,7 @@ impl eframe::App for StreamArchiverApp {
         self.form_window(ui.ctx());
         self.channel_form_window(ui.ctx());
         self.group_manager_window(ui.ctx());
+        self.views_manager_window(ui.ctx());
         self.add_to_recording_group_window(ui.ctx());
         self.confirm_delete_window(ui.ctx());
         self.confirm_delete_channel_window(ui.ctx());

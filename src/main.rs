@@ -37,6 +37,7 @@ mod platform_pref;
 mod pot_server;
 mod raid_follow;
 mod recovery;
+mod saved_views;
 mod schedule_ocr;
 mod schedule_source;
 mod scheduled_recordings;

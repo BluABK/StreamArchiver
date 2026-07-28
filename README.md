@@ -241,6 +241,31 @@ regardless of which day or how many takes each one has.
   automatically; deleting a recording group only drops the tag, never
   touches any recording/file.
 
+#### Saved views: sort, grouping, and filter presets
+
+The Streams toolbar's **Group** checkbox turns primary-group header
+clustering (above) on or off independent of whether a channel actually has a
+primary group assigned — off always shows a flat list, e.g. for a layout
+sorted purely by "last added" where clustering would just get in the way.
+
+A **saved view** bundles that checkbox together with the grid's column
+sort, per-column filters, and the Group/Recording-group toolbar selections
+under a name you choose, so you can jump between layouts (grouped and
+sorted by name, flat and sorted by last-added, filtered to one platform,
+…) with one click instead of re-configuring every control by hand:
+
+- The **View** dropdown (next to **Group**) lists your saved views —
+  clicking one applies its whole snapshot immediately.
+- **👁 Views** opens the management window: type a name and **💾 Save
+  current as new** to snapshot the grid's current state, or per existing
+  view, **▶** apply it, **💾** overwrite it with the current state, **✏**
+  rename it, or **🗑** delete it (no confirmation prompt, same as channel/
+  recording groups — deleting a view never touches any data, only the
+  preset itself).
+- Views are per-install (stored in the local database, not per-channel/
+  recording), and which view is currently applied is session-only — it
+  isn't remembered across a restart, though the views themselves are.
+
 #### Bulk import: followed / subscribed channels (📥)
 
 Instead of adding channels one by one, import the ones you already follow:

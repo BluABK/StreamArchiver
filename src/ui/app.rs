@@ -392,6 +392,16 @@ impl StreamArchiverApp {
             .flatten()
             .map(|v| v != "0")
             .unwrap_or(true);
+        // Streams grid channel-group clustering defaults on (it always has
+        // been); only an explicit "0" flattens it.
+        let streams_group_visually = core
+            .store
+            .get_setting(K_STREAMS_GROUP_VISUALLY)
+            .ok()
+            .flatten()
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        let streams_views = crate::saved_views::list_views(&core.store, GridTableId::Streams);
 
         let mut download_defaults = core
             .store
@@ -584,6 +594,12 @@ impl StreamArchiverApp {
             collapsed_channel_groups: HashSet::new(),
             streams_group_filter: None,
             streams_recording_group_filter: None,
+            streams_group_visually,
+            streams_active_view: None,
+            streams_views,
+            show_views_manager: false,
+            views_manager_new_name: String::new(),
+            views_manager_rename: None,
             rec_cache: HashMap::new(),
             ad_break_cache: HashMap::new(),
             ad_popups: Vec::new(),

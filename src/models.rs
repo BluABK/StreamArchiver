@@ -2133,6 +2133,14 @@ pub const K_GRID_COLUMNS: &str = "grid_columns_v1";
 /// `{table_key -> PersistedSort}`); see [`crate::grid_columns`].
 pub const K_GRID_SORT: &str = "grid_sort_v1";
 
+/// `app_settings` key for every grid table's saved views (JSON
+/// `{table_key -> Vec<SavedView>}`); see [`crate::saved_views`]. A view is a
+/// named, user-created snapshot of a table's sort/grouping/filters/group-
+/// filter selections — lets a user build up e.g. one view that shows
+/// channels grouped and sorted by name, another flat and sorted by last
+/// added, without the app needing to hardcode a fixed set of "modes".
+pub const K_SAVED_VIEWS: &str = "saved_views_v1";
+
 /// `app_settings` key for per-channel schedule-source config (JSON map
 /// `{channel_id -> ChannelSourceConfig}`): Twitter/X handle, a manual schedule
 /// image path/URL, and per-channel OCR overrides. See [`crate::schedule_source`].

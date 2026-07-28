@@ -2,6 +2,12 @@
 
 use super::*;
 
+/// `app_settings` key for the Streams grid's "Group" checkbox (channel-group
+/// header clustering) — `"1"`/`"0"`, defaults to on (clustering has always
+/// been the default behavior). Saved immediately on toggle, not part of the
+/// batched Settings form — same shape as `K_SCHEDULE_COMPACT`.
+pub(super) const K_STREAMS_GROUP_VISUALLY: &str = "streams_group_visually";
+
 /// Backing state for the "Add to group…" dialog (bulk-adds `selected_streams`
 /// to a recording group — new or existing). `pick` wins over `new_name` when
 /// both are set (picking an existing group after having typed a name that's
@@ -1009,6 +1015,208 @@ impl StreamArchiverApp {
         }
     }
 
+    /// Snapshot the Streams grid's current sort/grouping/filters/group-filter
+    /// selections into a saved view under `name` (creating or overwriting —
+    /// see `saved_views::upsert_view`), and make it the active view.
+    pub(super) fn save_current_streams_view(&mut self, name: &str) {
+        let keys: Vec<(usize, bool)> =
+            self.streams_sort.keys.iter().map(|l| (l.col, l.ascending)).collect();
+        let view = SavedView {
+            name: name.to_string(),
+            sort: grid_columns::unresolve_sort(&STREAM_COLUMNS, &keys),
+            group_visually: self.streams_group_visually,
+            filters: saved_views::unresolve_filters(&STREAM_COLUMNS, &self.streams_filters),
+            channel_group_id: self.streams_group_filter,
+            recording_group_id: self.streams_recording_group_filter,
+        };
+        saved_views::upsert_view(&self.core.store, GridTableId::Streams, view);
+        self.streams_views = saved_views::list_views(&self.core.store, GridTableId::Streams);
+        self.streams_active_view = Some(name.to_string());
+    }
+
+    /// Apply a saved view's sort/grouping/filters/group-filter selections to
+    /// the live grid state, and persist the sort the same way any manual
+    /// column-header sort change already does (see `channels_table`'s tail)
+    /// — so the sort also becomes the ad hoc "current" sort a fresh session
+    /// (with no view re-applied) would start from. No-op if `name` doesn't
+    /// resolve to a saved view.
+    pub(super) fn apply_streams_view(&mut self, name: &str) {
+        let Some(view) = self.streams_views.iter().find(|v| v.name == name).cloned() else {
+            return;
+        };
+        self.streams_sort = SortState {
+            keys: grid_columns::resolve_sort(&STREAM_COLUMNS, &view.sort)
+                .into_iter()
+                .map(|(col, ascending)| SortLevel { col, ascending })
+                .collect(),
+        };
+        grid_columns::save_sort(&self.core.store, GridTableId::Streams, &view.sort);
+        self.streams_filters = saved_views::resolve_filters(&STREAM_COLUMNS, &view.filters);
+        self.streams_group_visually = view.group_visually;
+        let _ = self.core.store.set_setting(
+            K_STREAMS_GROUP_VISUALLY,
+            if view.group_visually { "1" } else { "0" },
+        );
+        self.streams_group_filter = view.channel_group_id;
+        self.streams_recording_group_filter = view.recording_group_id;
+        self.streams_active_view = Some(name.to_string());
+        self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
+    }
+
+    /// "Manage views" dialog: save the Streams grid's current sort/grouping/
+    /// filters/group-filter selections as a named, reusable preset; apply,
+    /// rename, update (overwrite with the current live state), or delete any
+    /// saved view. Mirrors `group_manager_window`'s shape (snapshot locals up
+    /// front, mutate `self` once after the window closure) — deletion has no
+    /// confirmation dialog either, matching channel/recording groups.
+    pub(super) fn views_manager_window(&mut self, ctx: &egui::Context) {
+        if !self.show_views_manager {
+            return;
+        }
+        let mut open = true;
+        let views = self.streams_views.clone();
+        let active = self.streams_active_view.clone();
+        let mut new_name = std::mem::take(&mut self.views_manager_new_name);
+        let mut rename_state = self.views_manager_rename.take();
+        let mut save_new_clicked = false;
+        let mut renamed: Option<(String, String)> = None;
+        let mut cancel_rename = false;
+        let mut deleted: Option<String> = None;
+        let mut applied: Option<String> = None;
+        let mut updated: Option<String> = None;
+
+        egui::Window::new("Manage views")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(360.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(
+                    "A view remembers this grid's sort, the \"Group\" toggle, per-column \
+                     filters, and the Group/Recording group toolbar selections — build one \
+                     for each layout you switch between (e.g. grouped-by-name vs. flat, \
+                     sorted by last-added).",
+                );
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut new_name)
+                            .hint_text("New view name")
+                            .desired_width(200.0),
+                    );
+                    if ui
+                        .add_enabled(!new_name.trim().is_empty(), egui::Button::new("💾 Save current as new"))
+                        .on_hover_text(
+                            "Snapshot the grid's current sort/grouping/filters under this name.",
+                        )
+                        .clicked()
+                    {
+                        save_new_clicked = true;
+                    }
+                });
+                ui.separator();
+                if views.is_empty() {
+                    ui.weak("No saved views yet.");
+                }
+                egui::Grid::new("views_manager_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 4.0])
+                    .show(ui, |ui| {
+                        for v in &views {
+                            let is_active = active.as_deref() == Some(v.name.as_str());
+                            if rename_state.as_ref().is_some_and(|(n, _)| n == &v.name) {
+                                let draft = &mut rename_state.as_mut().unwrap().1;
+                                let resp = ui.text_edit_singleline(draft);
+                                let commit = (resp.lost_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                                    || ui.small_button("✔").clicked();
+                                if commit {
+                                    renamed = Some((v.name.clone(), draft.trim().to_string()));
+                                }
+                                if ui.small_button("✕").clicked() {
+                                    cancel_rename = true;
+                                }
+                            } else {
+                                let mut label = egui::RichText::new(&v.name);
+                                if is_active {
+                                    label = label.strong();
+                                }
+                                ui.label(label);
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("▶").on_hover_text("Apply this view").clicked() {
+                                        applied = Some(v.name.clone());
+                                    }
+                                    if ui
+                                        .small_button("💾")
+                                        .on_hover_text(
+                                            "Overwrite this view with the grid's current sort/\
+                                             grouping/filters",
+                                        )
+                                        .clicked()
+                                    {
+                                        updated = Some(v.name.clone());
+                                    }
+                                    if ui.small_button("✏").on_hover_text("Rename").clicked() {
+                                        rename_state = Some((v.name.clone(), v.name.clone()));
+                                    }
+                                    if ui.small_button("🗑").on_hover_text("Delete this view").clicked() {
+                                        deleted = Some(v.name.clone());
+                                    }
+                                });
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+
+        self.views_manager_new_name = new_name;
+        if save_new_clicked {
+            let name = self.views_manager_new_name.trim().to_string();
+            if views.iter().any(|v| v.name == name) {
+                self.status = format!("A view named \"{name}\" already exists.");
+            } else {
+                self.save_current_streams_view(&name);
+                self.views_manager_new_name.clear();
+            }
+        }
+        if let Some((old, new)) = renamed {
+            if new.is_empty() {
+                self.status = "View name can't be empty.".into();
+                self.views_manager_rename = rename_state;
+            } else if new != old && views.iter().any(|v| v.name == new) {
+                self.status = format!("A view named \"{new}\" already exists.");
+                self.views_manager_rename = rename_state;
+            } else {
+                saved_views::rename_view(&self.core.store, GridTableId::Streams, &old, &new);
+                self.streams_views = saved_views::list_views(&self.core.store, GridTableId::Streams);
+                if self.streams_active_view.as_deref() == Some(old.as_str()) {
+                    self.streams_active_view = Some(new);
+                }
+                self.views_manager_rename = None;
+            }
+        } else if cancel_rename {
+            self.views_manager_rename = None;
+        } else {
+            self.views_manager_rename = rename_state;
+        }
+        if let Some(name) = deleted {
+            saved_views::delete_view(&self.core.store, GridTableId::Streams, &name);
+            self.streams_views = saved_views::list_views(&self.core.store, GridTableId::Streams);
+            if self.streams_active_view.as_deref() == Some(name.as_str()) {
+                self.streams_active_view = None;
+            }
+        }
+        if let Some(name) = updated {
+            self.save_current_streams_view(&name);
+        }
+        if let Some(name) = applied {
+            self.apply_streams_view(&name);
+        }
+        if !open {
+            self.show_views_manager = false;
+        }
+    }
+
     /// "Add to group…" dialog: bulk-adds every take of every stream in
     /// `selected_streams` to a recording group (existing pick, or a new one
     /// typed in). Closing/confirming clears the selection either way.
@@ -1576,6 +1784,7 @@ impl StreamArchiverApp {
                     model, &sort, &filters, chan_entries, &self.rows, groups,
                     &exp_channels, &exp_instances, &exp_streams, &period_toggles,
                     &self.channel_groups, &collapsed_channel_groups,
+                    self.streams_group_visually,
                     group_filter_members.as_ref().map(|(gid, members)| (*gid, members)),
                     recording_group_filter_members.as_ref(),
                 );
@@ -2300,6 +2509,10 @@ impl StreamArchiverApp {
         period_toggles: &HashSet<String>,
         channel_groups: &[crate::models::ChannelGroup],
         collapsed_channel_groups: &HashSet<i64>,
+        // The Streams toolbar's "Group" checkbox — off flattens the list
+        // exactly like an active `group_filter` does below, just without
+        // narrowing membership.
+        group_visually: bool,
         // `Some((group_id, members))` narrows to one group's members
         // (primary or secondary) and disables header clustering entirely —
         // see the toolbar's group filter dropdown.
@@ -2331,12 +2544,14 @@ impl StreamArchiverApp {
         }
         // Cluster by primary group, alphabetical by group name, ungrouped
         // channels first — a stable sort so each cluster's internal order
-        // still respects the user's actual sort/filter. Skipped while a
-        // group filter is active (single flat list, no clustering needed).
+        // still respects the user's actual sort/filter. Skipped (flat list,
+        // no header clustering) while a group filter is active OR the
+        // toolbar's "Group" checkbox is off.
+        let flatten = group_filter.is_some() || !group_visually;
         let group_name: HashMap<i64, &str> =
             channel_groups.iter().map(|g| (g.id, g.name.as_str())).collect();
         let mut grouped_order = order.clone();
-        if group_filter.is_none() {
+        if !flatten {
             grouped_order.sort_by_key(|&ci| {
                 chan_entries[ci]
                     .channel
@@ -2346,10 +2561,10 @@ impl StreamArchiverApp {
         }
         let mut vis: Vec<Vis> = Vec::new();
         for chunk in grouped_order.chunk_by(|&a, &b| {
-            group_filter.is_some()
+            flatten
                 || chan_entries[a].channel.primary_group_id == chan_entries[b].channel.primary_group_id
         }) {
-            let gid = if group_filter.is_some() {
+            let gid = if flatten {
                 None
             } else {
                 chan_entries[chunk[0]].channel.primary_group_id
