@@ -254,14 +254,15 @@ under a name you choose, so you can jump between layouts (grouped and
 sorted by name, flat and sorted by last-added, filtered to one platform,
 …) with one click instead of re-configuring every control by hand:
 
-- The **View** dropdown (next to **Group**) lists your saved views —
-  clicking one applies its whole snapshot immediately.
-- **👁 Views** opens the management window: type a name and **💾 Save
-  current as new** to snapshot the grid's current state, or per existing
-  view, **▶** apply it, **💾** overwrite it with the current state, **✏**
-  rename it, or **🗑** delete it (no confirmation prompt, same as channel/
-  recording groups — deleting a view never touches any data, only the
-  preset itself).
+- The **Views** dropdown (next to **Group**) is both the switcher and the
+  manager — no separate window. Open it to see a name field (**💾** to
+  snapshot the grid's current state under that name) plus one row per
+  existing view: click the name to apply it, **💾** overwrites it with the
+  current state, **✏** renames it in place, **🗑** deletes it (no
+  confirmation prompt, same as channel/recording groups — deleting a view
+  never touches any data, only the preset itself). The dropdown stays open
+  across these clicks, same as any egui popup, so you can rename/delete
+  several in one go.
 - Views are per-install (stored in the local database, not per-channel/
   recording), and which view is currently applied is session-only — it
   isn't remembered across a restart, though the views themselves are.

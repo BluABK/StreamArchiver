@@ -1441,11 +1441,10 @@ pub struct StreamArchiverApp {
     /// view list (reloaded after any CRUD, mirroring `recording_groups`).
     streams_active_view: Option<String>,
     streams_views: Vec<SavedView>,
-    /// "Manage views" dialog: open flag, new-view-name draft, and an
-    /// in-progress inline rename (old name + draft text; `None` = not
-    /// renaming any row) — same shape as `group_manager_new_name`/
-    /// `group_manager_rename`.
-    show_views_manager: bool,
+    /// Backing state for the "Views" dropdown's popup body (`views_combo_popup`):
+    /// the new-view-name draft, and an in-progress inline rename (old name +
+    /// draft text; `None` = not renaming any row) — same shape as
+    /// `group_manager_new_name`/`group_manager_rename`.
     views_manager_new_name: String,
     views_manager_rename: Option<(String, String)>,
     rec_cache: HashMap<i64, Vec<Recording>>,
@@ -2685,47 +2684,20 @@ impl eframe::App for StreamArchiverApp {
                                 self.streams_cache_rev = self.streams_cache_rev.wrapping_add(1);
                             }
                             {
-                                // Same disjoint-borrow shape as the Group/Recording group
-                                // dropdowns just above: clone the list up front so the
-                                // closure iterating it can also mutate `self` freely.
-                                let views = self.streams_views.clone();
                                 let selected_label =
                                     self.streams_active_view.as_deref().unwrap_or("Views");
                                 egui::ComboBox::from_id_salt("streams_view_select")
                                     .selected_text(selected_label)
                                     .show_ui(ui, |ui| {
-                                        if views.is_empty() {
-                                            ui.weak("No saved views yet");
-                                        }
-                                        for v in &views {
-                                            if ui
-                                                .selectable_label(
-                                                    self.streams_active_view.as_deref() == Some(v.name.as_str()),
-                                                    &v.name,
-                                                )
-                                                .clicked()
-                                            {
-                                                self.apply_streams_view(&v.name);
-                                            }
-                                        }
+                                        self.views_combo_popup(ui);
                                     })
                                     .response
                                     .on_hover_text(
-                                        "Apply a saved view — a named snapshot of this \
-                                         grid's sort, \"Group\" toggle, per-column filters, \
-                                         and Group/Recording group selections. Manage them \
-                                         from \"👁 Views\".",
+                                        "Streams grid views — named presets of this grid's \
+                                         sort, \"Group\" toggle, per-column filters, and \
+                                         Group/Recording group selections. Open it to apply, \
+                                         save, rename, or delete one.",
                                     );
-                            }
-                            if ui
-                                .button("👁 Views")
-                                .on_hover_text(
-                                    "Save/apply/rename/delete Streams grid views — sort, \
-                                     grouping, and filter presets you can switch between.",
-                                )
-                                .clicked()
-                            {
-                                self.show_views_manager = true;
                             }
                             if ui
                                 .button("⇔")
@@ -2860,7 +2832,6 @@ impl eframe::App for StreamArchiverApp {
         self.form_window(ui.ctx());
         self.channel_form_window(ui.ctx());
         self.group_manager_window(ui.ctx());
-        self.views_manager_window(ui.ctx());
         self.add_to_recording_group_window(ui.ctx());
         self.confirm_delete_window(ui.ctx());
         self.confirm_delete_channel_window(ui.ctx());

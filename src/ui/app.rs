@@ -597,7 +597,6 @@ impl StreamArchiverApp {
             streams_group_visually,
             streams_active_view: None,
             streams_views,
-            show_views_manager: false,
             views_manager_new_name: String::new(),
             views_manager_rename: None,
             rec_cache: HashMap::new(),

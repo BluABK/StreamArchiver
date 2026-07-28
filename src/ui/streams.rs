@@ -1069,152 +1069,106 @@ impl StreamArchiverApp {
     /// saved view. Mirrors `group_manager_window`'s shape (snapshot locals up
     /// front, mutate `self` once after the window closure) — deletion has no
     /// confirmation dialog either, matching channel/recording groups.
-    pub(super) fn views_manager_window(&mut self, ctx: &egui::Context) {
-        if !self.show_views_manager {
+    /// Body of the Streams toolbar's "Views" dropdown popup: an inline
+    /// "save current as new" row, then one row per saved view — click the
+    /// name to apply it, **💾** overwrites it with the grid's current state,
+    /// **✏** renames it in place, **🗑** deletes it (no confirmation, same
+    /// as channel/recording groups). Folded directly into the combo instead
+    /// of a separate management window/button, since egui popups stay open
+    /// across clicks inside themselves (only an outside click/Escape closes
+    /// one) — there's no need for a whole extra window just to fit a text
+    /// field and a handful of per-row buttons.
+    pub(super) fn views_combo_popup(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.views_manager_new_name)
+                    .hint_text("New view name")
+                    .desired_width(140.0),
+            );
+            if ui
+                .add_enabled(
+                    !self.views_manager_new_name.trim().is_empty(),
+                    egui::Button::new("💾"),
+                )
+                .on_hover_text("Save the grid's current sort/grouping/filters under this name")
+                .clicked()
+            {
+                let name = self.views_manager_new_name.trim().to_string();
+                if self.streams_views.iter().any(|v| v.name == name) {
+                    self.status = format!("A view named \"{name}\" already exists.");
+                } else {
+                    self.save_current_streams_view(&name);
+                    self.views_manager_new_name.clear();
+                }
+            }
+        });
+        ui.separator();
+        if self.streams_views.is_empty() {
+            ui.weak("No saved views yet");
             return;
         }
-        let mut open = true;
         let views = self.streams_views.clone();
         let active = self.streams_active_view.clone();
-        let mut new_name = std::mem::take(&mut self.views_manager_new_name);
         let mut rename_state = self.views_manager_rename.take();
-        let mut save_new_clicked = false;
-        let mut renamed: Option<(String, String)> = None;
-        let mut cancel_rename = false;
-        let mut deleted: Option<String> = None;
-        let mut applied: Option<String> = None;
-        let mut updated: Option<String> = None;
-
-        egui::Window::new("Manage views")
-            .collapsible(false)
-            .resizable(true)
-            .default_width(360.0)
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.label(
-                    "A view remembers this grid's sort, the \"Group\" toggle, per-column \
-                     filters, and the Group/Recording group toolbar selections — build one \
-                     for each layout you switch between (e.g. grouped-by-name vs. flat, \
-                     sorted by last-added).",
-                );
-                ui.separator();
+        for v in &views {
+            if rename_state.as_ref().is_some_and(|(n, _)| n == &v.name) {
                 ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut new_name)
-                            .hint_text("New view name")
-                            .desired_width(200.0),
-                    );
-                    if ui
-                        .add_enabled(!new_name.trim().is_empty(), egui::Button::new("💾 Save current as new"))
-                        .on_hover_text(
-                            "Snapshot the grid's current sort/grouping/filters under this name.",
-                        )
-                        .clicked()
-                    {
-                        save_new_clicked = true;
+                    let draft = &mut rename_state.as_mut().unwrap().1;
+                    let resp = ui.text_edit_singleline(draft);
+                    let commit = (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                        || ui.small_button("✔").clicked();
+                    let cancel = ui.small_button("✕").clicked();
+                    if commit {
+                        let (old, new) = rename_state.take().unwrap();
+                        let new = new.trim().to_string();
+                        if new.is_empty() {
+                            self.status = "View name can't be empty.".into();
+                        } else if new != old && self.streams_views.iter().any(|v| v.name == new) {
+                            self.status = format!("A view named \"{new}\" already exists.");
+                        } else {
+                            saved_views::rename_view(&self.core.store, GridTableId::Streams, &old, &new);
+                            self.streams_views =
+                                saved_views::list_views(&self.core.store, GridTableId::Streams);
+                            if self.streams_active_view.as_deref() == Some(old.as_str()) {
+                                self.streams_active_view = Some(new);
+                            }
+                        }
+                    } else if cancel {
+                        rename_state = None;
                     }
                 });
-                ui.separator();
-                if views.is_empty() {
-                    ui.weak("No saved views yet.");
-                }
-                egui::Grid::new("views_manager_grid")
-                    .num_columns(2)
-                    .spacing([8.0, 4.0])
-                    .show(ui, |ui| {
-                        for v in &views {
-                            let is_active = active.as_deref() == Some(v.name.as_str());
-                            if rename_state.as_ref().is_some_and(|(n, _)| n == &v.name) {
-                                let draft = &mut rename_state.as_mut().unwrap().1;
-                                let resp = ui.text_edit_singleline(draft);
-                                let commit = (resp.lost_focus()
-                                    && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                                    || ui.small_button("✔").clicked();
-                                if commit {
-                                    renamed = Some((v.name.clone(), draft.trim().to_string()));
-                                }
-                                if ui.small_button("✕").clicked() {
-                                    cancel_rename = true;
-                                }
-                            } else {
-                                let mut label = egui::RichText::new(&v.name);
-                                if is_active {
-                                    label = label.strong();
-                                }
-                                ui.label(label);
-                                ui.horizontal(|ui| {
-                                    if ui.small_button("▶").on_hover_text("Apply this view").clicked() {
-                                        applied = Some(v.name.clone());
-                                    }
-                                    if ui
-                                        .small_button("💾")
-                                        .on_hover_text(
-                                            "Overwrite this view with the grid's current sort/\
-                                             grouping/filters",
-                                        )
-                                        .clicked()
-                                    {
-                                        updated = Some(v.name.clone());
-                                    }
-                                    if ui.small_button("✏").on_hover_text("Rename").clicked() {
-                                        rename_state = Some((v.name.clone(), v.name.clone()));
-                                    }
-                                    if ui.small_button("🗑").on_hover_text("Delete this view").clicked() {
-                                        deleted = Some(v.name.clone());
-                                    }
-                                });
-                            }
-                            ui.end_row();
+            } else {
+                ui.horizontal(|ui| {
+                    let is_active = active.as_deref() == Some(v.name.as_str());
+                    let mut label = egui::RichText::new(&v.name);
+                    if is_active {
+                        label = label.strong();
+                    }
+                    if ui.selectable_label(is_active, label).on_hover_text("Apply this view").clicked() {
+                        self.apply_streams_view(&v.name);
+                    }
+                    if ui
+                        .small_button("💾")
+                        .on_hover_text("Overwrite this view with the grid's current sort/grouping/filters")
+                        .clicked()
+                    {
+                        self.save_current_streams_view(&v.name);
+                    }
+                    if ui.small_button("✏").on_hover_text("Rename").clicked() {
+                        rename_state = Some((v.name.clone(), v.name.clone()));
+                    }
+                    if ui.small_button("🗑").on_hover_text("Delete this view").clicked() {
+                        saved_views::delete_view(&self.core.store, GridTableId::Streams, &v.name);
+                        self.streams_views =
+                            saved_views::list_views(&self.core.store, GridTableId::Streams);
+                        if self.streams_active_view.as_deref() == Some(v.name.as_str()) {
+                            self.streams_active_view = None;
                         }
-                    });
-            });
-
-        self.views_manager_new_name = new_name;
-        if save_new_clicked {
-            let name = self.views_manager_new_name.trim().to_string();
-            if views.iter().any(|v| v.name == name) {
-                self.status = format!("A view named \"{name}\" already exists.");
-            } else {
-                self.save_current_streams_view(&name);
-                self.views_manager_new_name.clear();
+                    }
+                });
             }
         }
-        if let Some((old, new)) = renamed {
-            if new.is_empty() {
-                self.status = "View name can't be empty.".into();
-                self.views_manager_rename = rename_state;
-            } else if new != old && views.iter().any(|v| v.name == new) {
-                self.status = format!("A view named \"{new}\" already exists.");
-                self.views_manager_rename = rename_state;
-            } else {
-                saved_views::rename_view(&self.core.store, GridTableId::Streams, &old, &new);
-                self.streams_views = saved_views::list_views(&self.core.store, GridTableId::Streams);
-                if self.streams_active_view.as_deref() == Some(old.as_str()) {
-                    self.streams_active_view = Some(new);
-                }
-                self.views_manager_rename = None;
-            }
-        } else if cancel_rename {
-            self.views_manager_rename = None;
-        } else {
-            self.views_manager_rename = rename_state;
-        }
-        if let Some(name) = deleted {
-            saved_views::delete_view(&self.core.store, GridTableId::Streams, &name);
-            self.streams_views = saved_views::list_views(&self.core.store, GridTableId::Streams);
-            if self.streams_active_view.as_deref() == Some(name.as_str()) {
-                self.streams_active_view = None;
-            }
-        }
-        if let Some(name) = updated {
-            self.save_current_streams_view(&name);
-        }
-        if let Some(name) = applied {
-            self.apply_streams_view(&name);
-        }
-        if !open {
-            self.show_views_manager = false;
-        }
+        self.views_manager_rename = rename_state;
     }
 
     /// "Add to group…" dialog: bulk-adds every take of every stream in
