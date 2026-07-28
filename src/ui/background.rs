@@ -169,6 +169,29 @@ impl StreamArchiverApp {
                          didn't spawn is answering there (used as-is, never killed).",
                         st.base_url
                     ));
+                    // Quick actions — the routine Start/Stop, mirroring Settings →
+                    // Downloads → GVS PO token server. Stop external/Take control
+                    // (the rarer External-mode actions) stay Settings-only.
+                    let can_start =
+                        matches!(st.mode, PotMode::Down | PotMode::Disabled | PotMode::Failed { .. });
+                    let can_stop = matches!(st.mode, PotMode::Managed { .. } | PotMode::Starting);
+                    if ui
+                        .add_enabled(can_start, egui::Button::new("▶").small())
+                        .on_hover_text("Start the server now and keep it running this session.")
+                        .clicked()
+                    {
+                        crate::pot_server::request_start();
+                    }
+                    if ui
+                        .add_enabled(can_stop, egui::Button::new("⏹").small())
+                        .on_hover_text(
+                            "Stop the managed server and keep it stopped this session \
+                             (Settings has Stop external / Take control for an External server).",
+                        )
+                        .clicked()
+                    {
+                        crate::pot_server::request_stop();
+                    }
                     if ui
                         .small_button("📜 Log")
                         .on_hover_text("Open a live tail of the server's log window.")
@@ -177,6 +200,72 @@ impl StreamArchiverApp {
                         self.show_pot_server_log = true;
                     }
                 });
+            }
+
+            ui.add_space(12.0);
+
+            // ── YouTube WebSub relay (headless VPS — we only poll it) ─────
+            {
+                let st = crate::websub::status();
+                let fmt_hms = |secs: f64| {
+                    let s = secs as u64;
+                    format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+                };
+                let (txt, color) = if !st.configured {
+                    ("not configured".to_string(), egui::Color32::GRAY)
+                } else if st.reachable {
+                    (
+                        format!(
+                            "● reachable · {} sub(s){}{}",
+                            st.subs_active.unwrap_or(0),
+                            st.uptime_secs.map(|s| format!(" · up {}", fmt_hms(s))).unwrap_or_default(),
+                            st.version.as_deref().map(|v| format!(" · v{v}")).unwrap_or_default(),
+                        ),
+                        egui::Color32::from_rgb(0x39, 0xb0, 0x54),
+                    )
+                } else {
+                    (
+                        format!(
+                            "○ unreachable{}",
+                            st.last_error.as_deref().map(|e| format!(" — {e}")).unwrap_or_default()
+                        ),
+                        egui::Color32::from_rgb(0xd9, 0x53, 0x4f),
+                    )
+                };
+                ui.horizontal(|ui| {
+                    ui.strong("📡 WebSub relay:").on_hover_text(
+                        "The yt-websub VPS relay: streamarchiver isn't reachable from the \
+                         internet to receive YouTube's push notifications directly, so this \
+                         relay runs headless on your own VPS, subscribes on our behalf, and \
+                         this app polls it. It's outside this app's process control — no \
+                         Start/Stop, only an immediate poll. Configure under Settings → \
+                         YouTube WebSub.",
+                    );
+                    ui.label(egui::RichText::new(txt).color(color)).on_hover_text(format!(
+                        "Health-checked via GET {}/api/health once per poll cycle. Last \
+                         successful contact: {}. Cursor {} / server max {}.",
+                        if st.base_url.is_empty() { "(not set)" } else { &st.base_url },
+                        st.last_ok_at
+                            .map(|t| format!("{:.0}s ago", t.elapsed().as_secs_f64()))
+                            .unwrap_or_else(|| "never".to_string()),
+                        st.cursor.map(|c| c.to_string()).unwrap_or_else(|| "—".to_string()),
+                        st.max_seq.map(|c| c.to_string()).unwrap_or_else(|| "—".to_string()),
+                    ));
+                    if ui
+                        .add_enabled(st.configured, egui::Button::new("🔄 Poll now").small())
+                        .on_hover_text(
+                            "Check the VPS immediately instead of waiting out the rest of \
+                             the poll interval.",
+                        )
+                        .clicked()
+                    {
+                        crate::websub::nudge();
+                        self.status = "Nudged the WebSub poller for an immediate check.".into();
+                    }
+                });
+                if st.configured && st.monitors == 0 {
+                    ui.weak("No monitors are using WebSub detection right now.");
+                }
             }
 
             ui.add_space(12.0);

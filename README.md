@@ -879,6 +879,16 @@ YouTube monitors' **Detection** to **YouTube WebSub (VPS push)**. streamarchiver
 auto-resolves each channel to its `UC…` id, pushes the set to the VPS, and the VPS
 manages the hub subscriptions.
 
+Since the relay runs headless on a VPS outside this app's process control, the
+**Background** view's **📡 WebSub relay** row is how you'd actually notice it
+went down: reachable/unreachable (colored like the PO token server row), the
+VPS's own subscription count, and — on a yt-websub build new enough to report
+them — its process **uptime** and **version**. Hovering the status shows the
+last successful contact time and the event cursor vs. the VPS's current max
+sequence (how far behind, if at all). There's no Start/Stop here (nothing
+local to restart) — **🔄 Poll now** just triggers an immediate check instead
+of waiting out the rest of the poll interval.
+
 > Tool tip: use **streamlink for Twitch** (reaches 1440p/2K HEVC) and **yt-dlp for
 > YouTube** (`--live-from-start`; streamlink hits YouTube segment 403s). The app
 > defaults accordingly. **Note:** YouTube `--live-from-start` now requires the SABR
@@ -3136,7 +3146,9 @@ the app manages the server itself instead of assuming it's running:
 `failed: …`), **▶ Start** / **⏹ Stop** buttons (Stop only applies to a managed
 server and holds for the session), **📜 View log** (a live-tailing window), and
 **📂 Open log file**. The **Background** view shows the same status one-liner
-with a log shortcut.
+with the same **▶**/**⏹** quick actions plus a **📜 Log** shortcut — routine
+restarts don't need a trip to Settings; Stop external/Take control (the rarer
+external-server actions) stay Settings-only.
 
 When the server is **external**, two extra buttons appear: **⏹ Stop
 external** looks up which process owns the listening port (IPv4 or IPv6) and

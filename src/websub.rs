@@ -23,7 +23,7 @@
 //! there are no WebSub monitors or the VPS isn't configured.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -33,7 +33,6 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, info, warn};
 
-use crate::app_core::sleep_cancellable;
 use crate::events::ManualCommand;
 use crate::models::{DetectionMethod, Platform};
 use crate::store::Store;
@@ -65,6 +64,70 @@ struct Event {
     video_id: String,
 }
 
+/// One `/api/health` response from the VPS. `uptime_secs`/`version` are
+/// populated only by a yt-websub build new enough to report them (added
+/// alongside this UI) — an older deployment simply omits the fields, so
+/// they're optional rather than failing the whole health check.
+struct VpsHealth {
+    subs_active: u64,
+    max_seq: u64,
+    uptime_secs: Option<f64>,
+    version: Option<String>,
+}
+
+/// UI-facing snapshot of the WebSub poller + its VPS relay's health,
+/// refreshed once per poll cycle (`poll_secs`, default 15s) — the same idea
+/// as `pot_server::status()`, but for a server we can only observe over
+/// HTTP: it runs headless on a remote VPS this app doesn't spawn or own, so
+/// there's no local process to restart, only a poll to nudge sooner.
+#[derive(Clone, Debug, Default)]
+pub struct WebsubStatus {
+    /// VPS URL + token are both set (Settings -> YouTube WebSub).
+    pub configured: bool,
+    pub base_url: String,
+    /// Count of monitors using WebSub/WebSubOnly detection right now.
+    pub monitors: usize,
+    /// Last `/api/health` call succeeded.
+    pub reachable: bool,
+    pub last_error: Option<String>,
+    /// When `reachable` last went true — `None` if it never has this run.
+    pub last_ok_at: Option<Instant>,
+    pub subs_active: Option<u64>,
+    pub cursor: Option<u64>,
+    pub max_seq: Option<u64>,
+    /// The VPS process's own uptime, from a new-enough yt-websub build.
+    pub uptime_secs: Option<f64>,
+    pub version: Option<String>,
+}
+
+static STATUS: Mutex<Option<WebsubStatus>> = Mutex::new(None);
+/// Set by [`nudge`], consumed (and cleared) by the poller's wait — lets a
+/// "poll now" UI action cut the current wait short instead of blocking for
+/// up to `poll_secs`.
+static NUDGE: AtomicBool = AtomicBool::new(false);
+
+/// Current UI-facing status snapshot (Background view's WebSub row).
+pub fn status() -> WebsubStatus {
+    STATUS.lock().unwrap().clone().unwrap_or_default()
+}
+
+/// Wake the poller for an immediate cycle instead of waiting out the rest of
+/// the current interval — the Background view's "🔄 Poll now" button.
+pub fn nudge() {
+    NUDGE.store(true, Ordering::SeqCst);
+}
+
+/// Same as `app_core::sleep_cancellable`, but also cut short by [`nudge`].
+async fn sleep_cancellable_or_nudged(dur: Duration, shutdown: &Arc<AtomicBool>) {
+    let steps = (dur.as_millis() / 200).max(1);
+    for _ in 0..steps {
+        if shutdown.load(Ordering::SeqCst) || NUDGE.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// Run the WebSub poller until shutdown. Idles cheaply when unused.
 pub async fn run(
     store: Arc<Store>,
@@ -83,6 +146,10 @@ pub async fn run(
     let mut last_sig: Option<String> = None;
     let mut cursor: Option<u64> = None;
     let mut warned_no_config = false;
+    // Only [`publish_status`] touches this — carried across cycles so a
+    // transient health-check failure doesn't blank out the last time we
+    // actually heard from the VPS.
+    let mut last_ok_at: Option<Instant> = None;
     // Tracks when each (monitor_id, video_id) last triggered a liveness check,
     // so repeated hub pings for the same ended-stream video don't re-check every
     // poll cycle.  Pruned to a 1-hour horizon each cycle to prevent growth.
@@ -91,7 +158,23 @@ pub async fn run(
     while !shutdown.load(Ordering::SeqCst) {
         // Toggleable from the Background view; idle-check for re-enable when off.
         if !store.job_enabled("job_websub_poll") {
-            sleep_cancellable(IDLE, &shutdown).await;
+            let cfg = config(&store);
+            publish_status(
+                PublishArgs {
+                    configured: cfg.is_some(),
+                    base: cfg.as_ref().map(|(b, _)| b.as_str()).unwrap_or(""),
+                    monitors: 0,
+                    reachable: false,
+                    last_error: Some("WebSub poll job is disabled".into()),
+                    subs_active: None,
+                    cursor: None,
+                    max_seq: None,
+                    uptime_secs: None,
+                    version: None,
+                },
+                &mut last_ok_at,
+            );
+            sleep_cancellable_or_nudged(IDLE, &shutdown).await;
             continue;
         }
         let monitors = load_websub_monitors(&store);
@@ -104,10 +187,47 @@ pub async fn run(
                 );
                 warned_no_config = true;
             }
-            sleep_cancellable(IDLE, &shutdown).await;
+            publish_status(
+                PublishArgs {
+                    configured: false,
+                    base: "",
+                    monitors: monitors.len(),
+                    reachable: false,
+                    last_error: None,
+                    subs_active: None,
+                    cursor: None,
+                    max_seq: None,
+                    uptime_secs: None,
+                    version: None,
+                },
+                &mut last_ok_at,
+            );
+            sleep_cancellable_or_nudged(IDLE, &shutdown).await;
             continue;
         };
         warned_no_config = false;
+
+        // Health-check every cycle (not just at cursor init) so the Background
+        // view's status stays live even when there's nothing else to do this
+        // cycle — the VPS is our own and this is cheap, same reasoning as the
+        // PO token server's 30s ping.
+        let health_result = fetch_health(&http, &base, &token).await;
+        let mut current_max_seq = health_result.as_ref().ok().map(|h| h.max_seq);
+        publish_status(
+            PublishArgs {
+                configured: true,
+                base: &base,
+                monitors: monitors.len(),
+                reachable: health_result.is_ok(),
+                last_error: health_result.as_ref().err().map(|e| format!("{e:#}")),
+                subs_active: health_result.as_ref().ok().map(|h| h.subs_active),
+                cursor,
+                max_seq: current_max_seq,
+                uptime_secs: health_result.as_ref().ok().and_then(|h| h.uptime_secs),
+                version: health_result.as_ref().ok().and_then(|h| h.version.clone()),
+            },
+            &mut last_ok_at,
+        );
 
         // Resolve every monitored channel to its UC id so events map back.
         let mut uc_to_monitors: HashMap<String, Vec<i64>> = HashMap::new();
@@ -144,7 +264,7 @@ pub async fn run(
         }
 
         if uc_to_monitors.is_empty() {
-            sleep_cancellable(IDLE, &shutdown).await;
+            sleep_cancellable_or_nudged(IDLE, &shutdown).await;
             continue;
         }
 
@@ -153,11 +273,11 @@ pub async fn run(
         if cursor.is_none() {
             cursor = match load_cursor(&store) {
                 Some(c) => Some(c),
-                None => match health(&http, &base, &token).await {
-                    Ok(max_seq) => {
-                        save_cursor(&store, max_seq);
-                        debug!("websub: starting at cursor {max_seq} (skipping backlog)");
-                        Some(max_seq)
+                None => match &health_result {
+                    Ok(h) => {
+                        save_cursor(&store, h.max_seq);
+                        debug!("websub: starting at cursor {} (skipping backlog)", h.max_seq);
+                        Some(h.max_seq)
                     }
                     Err(e) => {
                         warn!("websub: health failed: {e:#}");
@@ -166,7 +286,7 @@ pub async fn run(
                 },
             };
             if cursor.is_none() {
-                sleep_cancellable(IDLE, &shutdown).await;
+                sleep_cancellable_or_nudged(IDLE, &shutdown).await;
                 continue;
             }
         }
@@ -183,6 +303,7 @@ pub async fn run(
                     break;
                 }
             };
+            current_max_seq = Some(max_seq);
             let full_page = events.len() >= EVENTS_PAGE;
             // Advance the cursor ONLY to the highest event actually received (never
             // to the server's max_seq) so a >1-page backlog isn't skipped. Dedupe
@@ -256,10 +377,65 @@ pub async fn run(
             }
         }
 
+        // Refresh cursor/pending after draining — subs_active/uptime/version
+        // stay whatever this cycle's single health check reported.
+        publish_status(
+            PublishArgs {
+                configured: true,
+                base: &base,
+                monitors: monitors.len(),
+                reachable: health_result.is_ok(),
+                last_error: health_result.as_ref().err().map(|e| format!("{e:#}")),
+                subs_active: health_result.as_ref().ok().map(|h| h.subs_active),
+                cursor,
+                max_seq: current_max_seq,
+                uptime_secs: health_result.as_ref().ok().and_then(|h| h.uptime_secs),
+                version: health_result.as_ref().ok().and_then(|h| h.version.clone()),
+            },
+            &mut last_ok_at,
+        );
+
         let poll = poll_secs(&store);
         crate::events::mark_job(&jobs, "YouTube WebSub poll", poll as i64);
-        sleep_cancellable(Duration::from_secs(poll), &shutdown).await;
+        sleep_cancellable_or_nudged(Duration::from_secs(poll), &shutdown).await;
     }
+}
+
+/// Arguments for [`publish_status`], bundled to keep the call sites above
+/// from turning into unreadable 10-positional-argument calls.
+struct PublishArgs<'a> {
+    configured: bool,
+    base: &'a str,
+    monitors: usize,
+    reachable: bool,
+    last_error: Option<String>,
+    subs_active: Option<u64>,
+    cursor: Option<u64>,
+    max_seq: Option<u64>,
+    uptime_secs: Option<f64>,
+    version: Option<String>,
+}
+
+/// Publish a fresh [`WebsubStatus`] snapshot for the Background view.
+/// `last_ok_at` is carried by the caller across cycles so a transient
+/// failure doesn't blank out the last time the VPS actually answered.
+fn publish_status(args: PublishArgs, last_ok_at: &mut Option<Instant>) {
+    if args.reachable {
+        *last_ok_at = Some(Instant::now());
+    }
+    *STATUS.lock().unwrap() = Some(WebsubStatus {
+        configured: args.configured,
+        base_url: args.base.to_string(),
+        monitors: args.monitors,
+        reachable: args.reachable,
+        last_error: args.last_error,
+        last_ok_at: *last_ok_at,
+        subs_active: args.subs_active,
+        cursor: args.cursor,
+        max_seq: args.max_seq,
+        uptime_secs: args.uptime_secs,
+        version: args.version,
+    });
 }
 
 /// YouTube monitors using the WebSub or WebSubOnly method, as `(channel_url, monitor_id)`.
@@ -341,8 +517,11 @@ async fn post_channels(
     ))
 }
 
-/// `GET /api/health` -> current `max_seq`.
-async fn health(http: &Client, base: &str, token: &str) -> Result<u64> {
+/// `GET /api/health` -> subs_active/max_seq, plus `uptime_secs`/`version` on
+/// a yt-websub build new enough to report them (older deployments simply
+/// omit the fields — that's fine, they're surfaced as "—" in the UI rather
+/// than failing the whole health check).
+async fn fetch_health(http: &Client, base: &str, token: &str) -> Result<VpsHealth> {
     let resp = http
         .get(format!("{base}/api/health"))
         .bearer_auth(token)
@@ -352,7 +531,12 @@ async fn health(http: &Client, base: &str, token: &str) -> Result<u64> {
         bail!("health {}", resp.status());
     }
     let v: Value = resp.json().await?;
-    Ok(v["max_seq"].as_u64().unwrap_or(0))
+    Ok(VpsHealth {
+        subs_active: v["subs_active"].as_u64().unwrap_or(0),
+        max_seq: v["max_seq"].as_u64().unwrap_or(0),
+        uptime_secs: v["uptime_secs"].as_f64(),
+        version: v["version"].as_str().map(|s| s.to_string()),
+    })
 }
 
 /// `GET /api/events?after=<cursor>` -> `(events, max_seq)`.
