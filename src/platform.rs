@@ -1,6 +1,6 @@
 //! OS integration: single-instance guard, tray icon image, and autostart.
 
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 
 use anyhow::Result;
 use auto_launch::{AutoLaunch, AutoLaunchBuilder};
@@ -11,9 +11,30 @@ const SINGLE_INSTANCE_PORT: u16 = 47835;
 /// Try to acquire the single-instance lock by binding a loopback port.
 ///
 /// Returns `Some(listener)` if we are the first instance (keep it alive for the
-/// process lifetime), or `None` if another instance already holds it.
+/// process lifetime), or `None` if another instance already holds it. On
+/// success, also spawns a background thread that accepts connections on the
+/// port for the app's lifetime and focuses the UI whenever one comes in — the
+/// doorbell a second launch rings via [`notify_running_instance`]. No payload
+/// is read; the connection itself is the whole signal.
 pub fn acquire_single_instance() -> Option<TcpListener> {
-    TcpListener::bind(("127.0.0.1", SINGLE_INSTANCE_PORT)).ok()
+    let listener = TcpListener::bind(("127.0.0.1", SINGLE_INSTANCE_PORT)).ok()?;
+    let accept_listener = listener.try_clone().ok()?;
+    std::thread::spawn(move || {
+        for stream in accept_listener.incoming().flatten() {
+            drop(stream);
+            crate::toast_activation::focus_running_instance();
+        }
+    });
+    Some(listener)
+}
+
+/// Ring the doorbell on an already-running instance's single-instance port,
+/// so it shows and focuses its window instead of a second launch just
+/// silently doing nothing visible. Best-effort: called only after
+/// [`acquire_single_instance`] has already failed, so there's nothing more
+/// useful to do here if this also fails.
+pub fn notify_running_instance() {
+    let _ = TcpStream::connect(("127.0.0.1", SINGLE_INSTANCE_PORT));
 }
 
 /// Build the tray/window icon: a purple tile with a red "record" dot.

@@ -3,6 +3,19 @@
 
 use super::*;
 
+/// Show, un-minimize, and focus the main window — the shared "raise" used by
+/// the tray's "Open StreamArchiver", a toast click, a second launch's
+/// single-instance doorbell, and the quit-confirmation dialog. `Visible` and
+/// `Focus` alone don't undo a genuine OS-level minimize (that's a distinct
+/// iconic state from a hidden-to-tray window), so `Minimized(false)` is
+/// included unconditionally — a harmless no-op when the window wasn't
+/// actually minimized.
+fn raise_window(ctx: &egui::Context) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+}
+
 impl StreamArchiverApp {
     pub fn new(
         core: Arc<AppCore>,
@@ -1112,12 +1125,10 @@ impl StreamArchiverApp {
         while let Ok(cmd) = self.ui_rx.try_recv() {
             match cmd {
                 UiCommand::ShowWindow => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    raise_window(ctx);
                 }
                 UiCommand::ShowNotifications => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    raise_window(ctx);
                     // Mirror the 🔔 bell button: open, refresh, mark read.
                     self.show_notifications = true;
                     self.notif_refreshed = None;
@@ -1135,8 +1146,7 @@ impl StreamArchiverApp {
                     // Show confirmation before stopping active recordings.
                     self.confirm_quit_stop = true;
                     // Bring the window to the foreground so the dialog is visible.
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    raise_window(ctx);
                 }
             }
         }

@@ -111,7 +111,8 @@ fn main() -> Result<()> {
     let _instance_guard = match platform::acquire_single_instance() {
         Some(guard) => guard,
         None => {
-            info!("another StreamArchiver instance is already running; exiting");
+            info!("another StreamArchiver instance is already running; focusing it and exiting");
+            platform::notify_running_instance();
             return Ok(());
         }
     };

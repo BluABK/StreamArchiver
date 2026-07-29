@@ -44,6 +44,11 @@ cargo build --release
 Right-click the tray icon → **Open** / **Quit**. Quitting gracefully stops any active
 recordings (finalizing the MKV) before exiting.
 
+Only one instance runs at a time (a loopback-port guard, held for the process's
+lifetime). Launching the app again while it's already running — including
+minimized — un-minimizes and focuses the existing window instead of opening a
+second copy or silently doing nothing.
+
 The window has three tabs: **Streams** (monitor channels for live broadcasts),
 **Videos** (on-demand downloads), and **Settings**.
 

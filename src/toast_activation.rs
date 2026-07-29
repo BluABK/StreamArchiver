@@ -16,7 +16,9 @@
 //!
 //! Known benign race: a toast clicked while the app is still starting (factory
 //! not yet registered) makes COM spawn a second `-Embedding` instance, which
-//! loses the single-instance port guard and exits — that one click is lost.
+//! loses the single-instance port guard and exits — the specific toast
+//! action (e.g. "open notifications") is lost, but [`focus_running_instance`]
+//! still raises the window via the single-instance doorbell on its way out.
 
 use parking_lot::Mutex;
 
@@ -76,8 +78,18 @@ pub fn set_ui_sink(tx: std::sync::mpsc::Sender<UiCommand>, ctx: eframe::egui::Co
     }
 }
 
+/// Ask the running UI to show and focus its window — called by the
+/// single-instance guard (`platform::acquire_single_instance`) when a second
+/// launch rings the doorbell, reusing the same delivery path as a toast
+/// click. This also covers the "known benign race" documented above: the
+/// COM-spawned second `-Embedding` instance loses the port guard the same
+/// way a plain double-launch would, so its click now still raises the window
+/// instead of being silently dropped.
+pub fn focus_running_instance() {
+    deliver(ToastNav::Focus);
+}
+
 /// Route one activation to the UI, or stash it if the UI isn't up yet.
-#[cfg_attr(not(windows), allow(dead_code))]
 fn deliver(nav: ToastNav) {
     let guard = SINK.lock();
     match &*guard {
