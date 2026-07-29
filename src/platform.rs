@@ -6,26 +6,46 @@ use anyhow::Result;
 use auto_launch::{AutoLaunch, AutoLaunchBuilder};
 
 /// Loopback port used purely as a cross-platform single-instance guard.
-const SINGLE_INSTANCE_PORT: u16 = 47835;
+///
+/// Moved off 47835 because builds between the doorbell landing and the
+/// `try_clone` fix below leaked an inheritable copy of that socket into every
+/// capture process they spawned. Those captures are detached and outlive the
+/// app, so a leaked 47835 can still be LISTENING right now — and a fixed build
+/// binding it would mistake that dead socket for a running instance and exit.
+/// A fresh port steps around any socket a pre-fix run left behind; it costs
+/// nothing, since the port is an internal detail with no on-disk state.
+const SINGLE_INSTANCE_PORT: u16 = 47836;
+
+/// Held for the process lifetime by whoever won the single-instance race. The
+/// socket itself lives in the accept thread (see [`acquire_single_instance`]),
+/// which never returns, so this is a marker rather than the listener.
+pub struct InstanceGuard;
 
 /// Try to acquire the single-instance lock by binding a loopback port.
 ///
-/// Returns `Some(listener)` if we are the first instance (keep it alive for the
+/// Returns `Some(guard)` if we are the first instance (keep it alive for the
 /// process lifetime), or `None` if another instance already holds it. On
-/// success, also spawns a background thread that accepts connections on the
-/// port for the app's lifetime and focuses the UI whenever one comes in — the
-/// doorbell a second launch rings via [`notify_running_instance`]. No payload
-/// is read; the connection itself is the whole signal.
-pub fn acquire_single_instance() -> Option<TcpListener> {
+/// success the listener is moved into a background thread that accepts
+/// connections for the app's lifetime and focuses the UI whenever one comes in
+/// — the doorbell a second launch rings via [`notify_running_instance`]. No
+/// payload is read; the connection itself is the whole signal.
+///
+/// The thread owns the *original* listener deliberately: `TcpListener::
+/// try_clone` duplicates the handle as INHERITABLE on Windows, so the copy
+/// leaks into every child process spawned afterwards. Capture tools are
+/// detached on purpose and outlive the app, so a cloned handle kept the port
+/// bound long after the app exited — the next launch then saw its own dead
+/// socket as "already running" and refused to start. Verified: bind + spawn a
+/// child frees the port on exit; bind + `try_clone` + spawn a child does not.
+pub fn acquire_single_instance() -> Option<InstanceGuard> {
     let listener = TcpListener::bind(("127.0.0.1", SINGLE_INSTANCE_PORT)).ok()?;
-    let accept_listener = listener.try_clone().ok()?;
     std::thread::spawn(move || {
-        for stream in accept_listener.incoming().flatten() {
+        for stream in listener.incoming().flatten() {
             drop(stream);
             crate::toast_activation::focus_running_instance();
         }
     });
-    Some(listener)
+    Some(InstanceGuard)
 }
 
 /// Ring the doorbell on an already-running instance's single-instance port,
