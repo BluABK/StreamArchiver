@@ -550,6 +550,7 @@ impl StreamArchiverApp {
             posts_channel_filter: None,
             posts_show_viewer: false,
             posts_render_limit: POSTS_PAGE_SIZE,
+            posts_focus_post: None,
             post_img_cache: HashMap::new(),
             show_inspector: false,
             inspector: crate::inspector::InspectorState::default(),

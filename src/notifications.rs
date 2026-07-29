@@ -2,7 +2,7 @@
 //!
 //! On Windows we build a rich toast directly via WinRT (`Windows.UI.Notifications`):
 //! the channel's profile pic as a circular app-logo, its banner as the hero
-//! image, the channel name + stream title + game as text, and a "Watch stream"
+//! image, the channel name + stream title + game as text, and a "Watch on Web"
 //! button that opens the channel URL (protocol activation — handled by Windows,
 //! no app callback needed). On other platforms we fall back to `notify_rust`.
 //!
@@ -135,7 +135,7 @@ impl ToastContent {
 }
 
 /// Fire a test toast for the given channel/monitor parameters. Constructs a rich
-/// toast (with profile pic + banner from disk if available, a "Watch stream"
+/// toast (with profile pic + banner from disk if available, a "Watch on Web"
 /// button, and the supplied title/game) and shows it immediately on the calling
 /// thread. Intended for the debug view's "Send test toast" button.
 pub fn send_test_toast(
@@ -154,7 +154,7 @@ pub fn send_test_toast(
         lines.push(game.to_string());
     }
     let action = (!channel_url.trim().is_empty()).then(|| ToastAction {
-        label: "Watch stream".to_string(),
+        label: "Watch on Web".to_string(),
         url: channel_url.to_string(),
     });
     show_toast(ToastContent {
@@ -210,7 +210,7 @@ fn handle(store: &Store, ev: AppEvent) {
                 return;
             };
             let heading = format!("{} is live", row.channel.name);
-            let mut content = content_for(&row, heading, "Watch stream");
+            let mut content = content_for(&row, heading, "Watch on Web");
             // Prefer the stream thumbnail as the hero image when the monitor
             // opts in and the file has been fetched. The fetch is concurrent so
             // check existence here rather than assuming it's ready.
@@ -249,7 +249,7 @@ fn handle(store: &Store, ev: AppEvent) {
                 return;
             };
             let heading = format!("⚡ {} — trigger matched", row.channel.name);
-            let mut content = content_for(&row, heading, "Watch stream");
+            let mut content = content_for(&row, heading, "Watch on Web");
             content.lines = vec![
                 format!("\u{201c}{matched}\u{201d}"),
                 if forced_start {
@@ -275,7 +275,7 @@ fn handle(store: &Store, ev: AppEvent) {
                 return;
             };
             let heading = format!("🚫 {} — blacklist blocked recording", row.channel.name);
-            let mut content = content_for(&row, heading, "Watch stream");
+            let mut content = content_for(&row, heading, "Watch on Web");
             content.lines = vec![
                 format!("\u{201c}{matched}\u{201d}"),
                 format!("{desc} — automatic recording suppressed (manual ▶ Start still records)"),

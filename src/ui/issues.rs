@@ -140,6 +140,103 @@ enum Act {
     ViewError(String, String),
 }
 
+/// Row tint + accent colour for one 🔔 notifications-feed row, as
+/// `((r, g, b), accent)`. Severity wins — an error is red whichever kind
+/// produced it — and otherwise every kind gets its own hue so the feed can be
+/// skimmed by colour, the way the 🚨 Warnings window's rows are. Read rows use
+/// the same hue at a much lower alpha (see the call site).
+fn notif_colors(
+    kind: Option<crate::models::NotificationKind>,
+    severity: &str,
+) -> ((u8, u8, u8), egui::Color32) {
+    use crate::models::NotificationKind as K;
+    const RED: ((u8, u8, u8), egui::Color32) =
+        ((120, 25, 25), egui::Color32::from_rgb(230, 100, 100));
+    const AMBER: ((u8, u8, u8), egui::Color32) =
+        ((120, 95, 10), egui::Color32::from_rgb(220, 175, 60));
+    match (severity, kind) {
+        ("error", _) | (_, Some(K::Error | K::TaskFailed)) => RED,
+        ("warn", _) | (_, Some(K::CaptureAlert)) => AMBER,
+        // Live/positive events: went-live purple (the Twitch hue), a fired
+        // trigger green (it did the thing), a vetoed one orange.
+        (_, Some(K::WentLive)) => ((70, 40, 120), egui::Color32::from_rgb(185, 150, 255)),
+        (_, Some(K::TriggerMatched)) => ((25, 95, 45), egui::Color32::from_rgb(110, 200, 130)),
+        (_, Some(K::TriggerBlocked)) => ((120, 70, 15), egui::Color32::from_rgb(235, 160, 70)),
+        (_, Some(K::RecordingFinished)) => ((25, 60, 110), egui::Color32::from_rgb(120, 175, 245)),
+        (_, Some(K::QualityUpgrade)) => ((15, 90, 90), egui::Color32::from_rgb(100, 210, 210)),
+        (_, Some(K::ScheduleAdded | K::ScheduleUpdated)) => {
+            ((45, 55, 120), egui::Color32::from_rgb(135, 150, 245))
+        }
+        (_, Some(K::YoutubePost)) => ((105, 35, 95), egui::Color32::from_rgb(230, 130, 210)),
+        (_, Some(K::VodMuted)) => ((95, 45, 95), egui::Color32::from_rgb(215, 130, 215)),
+        _ => ((60, 60, 60), egui::Color32::from_rgb(170, 170, 170)),
+    }
+}
+
+/// Display label for a feed row's link button. Rows written before the wording
+/// changed still carry the old label in the DB, so remap here rather than
+/// migrating — the URL behind the button never changed, only what it's called.
+fn notif_action_label(stored: &str) -> &str {
+    match stored {
+        "" => "Open",
+        "Watch stream" => "Watch on Web",
+        "Open post" => "View on YouTube",
+        s => s,
+    }
+}
+
+/// Whether a feed row's action URL points at a channel that was LIVE at the
+/// time (rather than a VOD, a post, or nothing) — those rows get the "Watch in
+/// player" companion button next to the web link.
+fn notif_is_live_stream(kind: Option<crate::models::NotificationKind>) -> bool {
+    use crate::models::NotificationKind as K;
+    matches!(
+        kind,
+        Some(K::WentLive | K::TriggerMatched | K::TriggerBlocked | K::QualityUpgrade)
+    )
+}
+
+/// The community-post id a `youtube_post` feed row refers to. Prefers the
+/// dedup key it was inserted with (`post:{monitor}:{post_id}`) and falls back
+/// to the trailing segment of the `youtube.com/post/…` action URL.
+fn notif_post_id(r: &crate::store::NotificationRow) -> Option<String> {
+    if let Some(id) = r.ref_key.strip_prefix("post:").and_then(|s| s.split_once(':')).map(|(_, id)| id)
+        && !id.is_empty()
+    {
+        return Some(id.to_string());
+    }
+    let id = r.action_url.rsplit('/').next().unwrap_or_default();
+    (!id.is_empty() && r.action_url.contains("/post/")).then(|| id.to_string())
+}
+
+/// Render a feed row's title with the channel's name inside it drawn in that
+/// channel's own colour (the same one the Streams grid uses). Titles are built
+/// as `"{channel} is live"`, `"⚡ {channel} — trigger matched"`, … so the name
+/// is a plain substring; rows without one (generic errors, schedule changes)
+/// render the title whole.
+fn notif_title(ui: &mut egui::Ui, title: &str, channel: &str, name_color: Option<egui::Color32>) {
+    let hit = name_color
+        .filter(|_| !channel.is_empty())
+        .zip(title.find(channel))
+        .map(|(c, at)| (at, c));
+    let Some((at, color)) = hit else {
+        ui.label(egui::RichText::new(title).strong());
+        return;
+    };
+    let (head, rest) = title.split_at(at);
+    let (name, tail) = rest.split_at(channel.len());
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        if !head.is_empty() {
+            ui.label(egui::RichText::new(head).strong());
+        }
+        ui.label(egui::RichText::new(name).strong().color(color));
+        if !tail.is_empty() {
+            ui.label(egui::RichText::new(tail).strong());
+        }
+    });
+}
+
 /// Status-column explainer for stuck-in-cache rows (hover AND 🔍 window).
 const STUCK_IN_CACHE_DETAILS: &str =
     "The recording finished successfully, but moving it out of the hidden \
@@ -215,8 +312,76 @@ impl StreamArchiverApp {
         enum Act {
             OpenUrl(String),
             MarkAllRead,
+            /// Show one community post in the 📣 Posts window (`post_id`).
+            ViewPost(String),
+            /// Tune into a channel's live edge in the media player (`monitor_id`).
+            WatchInPlayer(i64),
         }
         let mut act: Option<Act> = None;
+
+        // Per-row channel identity — the instance's own avatar plus the name
+        // colour the Streams grid gives that channel. Resolved out here because
+        // the viewport closure below borrows `self` for the row data and so
+        // can't also fill the texture/colour caches. Rows whose monitor was
+        // deleted still match by channel name where one is still tracked.
+        // Resolved once per distinct instance rather than per feed row — the
+        // feed holds up to 500 rows and this runs every frame the window is open.
+        let by_mid: HashMap<i64, usize> =
+            self.rows.iter().enumerate().map(|(i, r)| (r.monitor.id, i)).collect();
+        let mut by_name: HashMap<&str, usize> = HashMap::new();
+        for (i, r) in self.rows.iter().enumerate() {
+            by_name.entry(r.channel.name.as_str()).or_insert(i);
+        }
+        // notification id → (row index, that row's own monitor id when the
+        // notification actually named it — a name-only match resolves a colour,
+        // not a source URL to tune into).
+        let resolved: Vec<(i64, usize, Option<i64>)> = self
+            .notifications
+            .iter()
+            .filter_map(|r| {
+                let ri = r
+                    .monitor_id
+                    .and_then(|mid| by_mid.get(&mid).copied())
+                    .or_else(|| {
+                        (!r.channel.is_empty())
+                            .then(|| by_name.get(r.channel.as_str()).copied())
+                            .flatten()
+                    })?;
+                Some((r.id, ri, r.monitor_id.filter(|mid| by_mid.contains_key(mid))))
+            })
+            .collect();
+        let mut avatars: HashMap<usize, egui::TextureHandle> = HashMap::new();
+        let mut colors: HashMap<i64, (egui::Color32, bool)> = HashMap::new();
+        for &(_, ri, _) in &resolved {
+            let (mid, cid) = (self.rows[ri].monitor.id, self.rows[ri].channel.id);
+            if let std::collections::hash_map::Entry::Vacant(e) = avatars.entry(ri) {
+                if !self.instance_icons_small.contains_key(&mid) {
+                    let tex = resolve_instance_icon_small(&self.rows[ri], ctx);
+                    self.instance_icons_small.insert(mid, tex);
+                }
+                if let Some(tex) = self.instance_icons_small.get(&mid).and_then(|t| t.clone()) {
+                    e.insert(tex);
+                }
+            }
+            if let std::collections::hash_map::Entry::Vacant(e) = colors.entry(cid) {
+                // Can't `or_insert_with` — resolving a name colour needs `&mut
+                // self` (it fills the fetched-colour cache) and the closure
+                // would already be holding the map.
+                let color = self.channel_name_color(cid);
+                e.insert(color);
+            }
+        }
+        let ident: HashMap<i64, (Option<&egui::TextureHandle>, (egui::Color32, bool))> = resolved
+            .iter()
+            .map(|&(nid, ri, _)| {
+                let cid = self.rows[ri].channel.id;
+                (nid, (avatars.get(&ri), colors[&cid]))
+            })
+            .collect();
+        // Which feed rows can offer "Watch in player".
+        let live_mids: HashMap<i64, i64> =
+            resolved.iter().filter_map(|&(nid, _, mid)| Some((nid, mid?))).collect();
+        let have_player = !self.settings.media_player_path.trim().is_empty();
 
         // Session-only category + text filter over the loaded rows → surviving
         // indices (recomputed each frame from last frame's filter values).
@@ -297,51 +462,117 @@ impl StreamArchiverApp {
                         .show(ui, |ui| {
                             for &i in &visible {
                                 let r = &self.notifications[i];
-                                let accent = match r.severity.as_str() {
-                                    "error" => egui::Color32::from_rgb(220, 90, 90),
-                                    "warn" => egui::Color32::from_rgb(210, 160, 60),
-                                    _ => ui.visuals().hyperlink_color,
+                                let kind = crate::models::NotificationKind::from_id(&r.kind);
+                                let icon = kind.map(|k| k.icon()).unwrap_or("•");
+                                // Row tint by severity/kind; read rows keep the
+                                // hue but fade back, so the feed still reads as
+                                // a list rather than a wall of paint.
+                                let (rgb, accent) = notif_colors(kind, &r.severity);
+                                let alpha = if r.read { 22 } else { 70 };
+                                let tint = egui::Color32::from_rgba_unmultiplied(
+                                    rgb.0, rgb.1, rgb.2, alpha,
+                                );
+                                let (avatar, name_color) = match ident.get(&r.id) {
+                                    Some((a, (base, adjust))) => (
+                                        *a,
+                                        Some(if *adjust {
+                                            readable_color(*base, tint)
+                                        } else {
+                                            *base
+                                        }),
+                                    ),
+                                    None => (None, None),
                                 };
-                                let icon = crate::models::NotificationKind::from_id(&r.kind)
-                                    .map(|k| k.icon())
-                                    .unwrap_or("•");
-                                egui::Frame::group(ui.style()).show(ui, |ui| {
+                                egui::Frame::group(ui.style()).fill(tint).show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         // Unread rows show a filled accent dot; read rows a dim one.
                                         ui.label(
                                             egui::RichText::new(if r.read { "○" } else { "●" })
                                                 .small()
                                                 .color(accent),
-                                        );
-                                        ui.label(egui::RichText::new(icon).color(accent));
+                                        )
+                                        .on_hover_text(if r.read {
+                                            "Read"
+                                        } else {
+                                            "Unread — counts toward the 🔔 badge until \
+                                             the feed is opened or marked read"
+                                        });
+                                        ui.label(egui::RichText::new(icon).color(accent))
+                                            .on_hover_text(
+                                                kind.map(|k| k.label()).unwrap_or("Notification"),
+                                            );
+                                        if let Some(tex) = avatar {
+                                            let resp = ui.add(
+                                                egui::Image::from_texture(tex)
+                                                    .fit_to_exact_size(egui::vec2(24.0, 24.0))
+                                                    .corner_radius(egui::CornerRadius::same(4)),
+                                            );
+                                            queue_alt_image_preview(ui.ctx(), &resp, tex);
+                                            ui.add_space(2.0);
+                                        }
                                         ui.vertical(|ui| {
-                                            let mut title = egui::RichText::new(&r.title).strong();
-                                            if !r.read {
-                                                title = title.color(accent);
-                                            }
-                                            ui.label(title);
+                                            ui.horizontal(|ui| {
+                                                let when = fmt_datetime_short(r.created_at);
+                                                if !when.is_empty() {
+                                                    ui.label(egui::RichText::new(when).weak());
+                                                }
+                                                notif_title(ui, &r.title, &r.channel, name_color);
+                                            });
                                             if !r.body.is_empty() {
                                                 ui.label(egui::RichText::new(&r.body).weak());
                                             }
-                                            ui.horizontal(|ui| {
-                                                ui.small(fmt_datetime_short(r.created_at));
-                                                if !r.channel.is_empty() {
-                                                    ui.small(format!("· {}", r.channel));
-                                                }
-                                            });
                                         });
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
+                                                // Rightmost first (right-to-left layout):
+                                                // the web link, then the in-app companion.
                                                 if !r.action_url.is_empty() {
-                                                    let label = if r.action_label.is_empty() {
-                                                        "Open"
-                                                    } else {
-                                                        r.action_label.as_str()
-                                                    };
-                                                    if ui.button(label).clicked() {
-                                                        act = Some(Act::OpenUrl(r.action_url.clone()));
+                                                    let label =
+                                                        notif_action_label(&r.action_label);
+                                                    if ui
+                                                        .button(label)
+                                                        .on_hover_text(format!(
+                                                            "Open in your browser:\n{}",
+                                                            r.action_url
+                                                        ))
+                                                        .clicked()
+                                                    {
+                                                        act =
+                                                            Some(Act::OpenUrl(r.action_url.clone()));
                                                     }
+                                                }
+                                                if kind
+                                                    == Some(
+                                                        crate::models::NotificationKind::YoutubePost,
+                                                    )
+                                                    && let Some(pid) = notif_post_id(r)
+                                                    && ui
+                                                        .button("View post")
+                                                        .on_hover_text(
+                                                            "Show this post in the app's own 📣 \
+                                                             Posts window — full text, images \
+                                                             and poll, archived locally.",
+                                                        )
+                                                        .clicked()
+                                                {
+                                                    act = Some(Act::ViewPost(pid));
+                                                }
+                                                if have_player
+                                                    && notif_is_live_stream(kind)
+                                                    && let Some(&mid) = live_mids.get(&r.id)
+                                                    && ui
+                                                        .button("Watch in player")
+                                                        .on_hover_text(
+                                                            "Tune into this channel's live edge \
+                                                             in your media player — same as \
+                                                             ▶ Play in the Streams grid. Only \
+                                                             works while the channel is still \
+                                                             live.",
+                                                        )
+                                                        .clicked()
+                                                {
+                                                    act = Some(Act::WatchInPlayer(mid));
                                                 }
                                             },
                                         );
@@ -350,6 +581,9 @@ impl StreamArchiverApp {
                             }
                         });
                 });
+                // Child viewports draw their own copy of the Alt-hover overlay —
+                // the main viewport's draw call can't reach here.
+                draw_alt_image_preview(ctx);
             },
         );
 
@@ -363,6 +597,35 @@ impl StreamArchiverApp {
                 self.notif_unread = 0;
                 for r in &mut self.notifications {
                     r.read = true;
+                }
+            }
+            Some(Act::ViewPost(post_id)) => {
+                // Focus overrides the feed's own filters (see `posts_focus_post`)
+                // so the post can't be hidden by whatever the Posts window was
+                // last filtered to.
+                self.posts_focus_post = Some(post_id);
+                self.posts_render_limit = POSTS_PAGE_SIZE;
+                self.posts_refreshed = None; // pick up a just-ingested post
+                self.show_posts_window = true;
+            }
+            Some(Act::WatchInPlayer(mid)) => {
+                let player = self.settings.media_player_path.trim().to_string();
+                match self.rows.iter().find(|r| r.monitor.id == mid) {
+                    Some(row) => {
+                        if let Some(msg) = spawn_play_new_instance(
+                            row,
+                            &player,
+                            &self.settings,
+                            &self.core.store,
+                            false,
+                            None,
+                        ) {
+                            self.status = msg;
+                        }
+                    }
+                    None => {
+                        self.status = "That channel instance no longer exists.".into();
+                    }
                 }
             }
             None => {}
@@ -2574,5 +2837,76 @@ mod tests {
         // Real tool errors must not be blamed on the network.
         assert!(network_failure_hint("ERROR: This live event has ended.").is_none());
         assert!(network_failure_hint("").is_none());
+    }
+
+    /// Rows written before the wording changed keep the old label in the DB —
+    /// the feed must show the new one without a migration.
+    #[test]
+    fn notif_action_labels_remap_legacy_rows() {
+        assert_eq!(notif_action_label("Watch stream"), "Watch on Web");
+        assert_eq!(notif_action_label("Open post"), "View on YouTube");
+        // Current labels and unrelated ones pass through untouched.
+        assert_eq!(notif_action_label("Watch on Web"), "Watch on Web");
+        assert_eq!(notif_action_label("Watch VOD"), "Watch VOD");
+        assert_eq!(notif_action_label(""), "Open");
+    }
+
+    #[test]
+    fn notif_post_id_prefers_ref_key_then_url() {
+        let row = |ref_key: &str, action_url: &str| crate::store::NotificationRow {
+            id: 1,
+            created_at: 0,
+            kind: "youtube_post".into(),
+            severity: "info".into(),
+            title: String::new(),
+            body: String::new(),
+            monitor_id: Some(7),
+            channel: String::new(),
+            recording_id: None,
+            action_label: String::new(),
+            action_url: action_url.into(),
+            image_path: String::new(),
+            ref_key: ref_key.into(),
+            read: false,
+        };
+        assert_eq!(
+            notif_post_id(&row("post:7:UgkxABC", "")).as_deref(),
+            Some("UgkxABC")
+        );
+        // Post ids can themselves contain ':' — only the first two fields are ours.
+        assert_eq!(
+            notif_post_id(&row("post:7:Ugkx:ABC", "")).as_deref(),
+            Some("Ugkx:ABC")
+        );
+        assert_eq!(
+            notif_post_id(&row("", "https://www.youtube.com/post/UgkxDEF")).as_deref(),
+            Some("UgkxDEF")
+        );
+        // A non-post URL must not be mined for an id.
+        assert_eq!(notif_post_id(&row("", "https://twitch.tv/geega")), None);
+        assert_eq!(notif_post_id(&row("", "")), None);
+    }
+
+    /// Severity outranks kind: an errored recording is red, not
+    /// recording-finished blue.
+    #[test]
+    fn notif_colors_put_severity_first() {
+        use crate::models::NotificationKind as K;
+        let err = notif_colors(Some(K::RecordingFinished), "error");
+        assert_eq!(err, notif_colors(Some(K::Error), "error"));
+        assert_ne!(err, notif_colors(Some(K::RecordingFinished), "info"));
+        // Unknown/stale kind ids still get a neutral tint rather than panicking.
+        assert_eq!(notif_colors(None, "info").1, egui::Color32::from_rgb(170, 170, 170));
+    }
+
+    #[test]
+    fn only_live_channel_kinds_offer_the_player_button() {
+        use crate::models::NotificationKind as K;
+        assert!(notif_is_live_stream(Some(K::WentLive)));
+        assert!(notif_is_live_stream(Some(K::TriggerMatched)));
+        // A finished recording's action URL is a VOD page, not a live stream.
+        assert!(!notif_is_live_stream(Some(K::RecordingFinished)));
+        assert!(!notif_is_live_stream(Some(K::YoutubePost)));
+        assert!(!notif_is_live_stream(None));
     }
 }

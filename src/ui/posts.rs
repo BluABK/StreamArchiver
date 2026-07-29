@@ -169,25 +169,64 @@ impl StreamArchiverApp {
                 }
             });
         });
+        // Narrowed to one post by the 🔔 feed's "View post" button: say so, and
+        // offer the way back. The banner sits above the list, under the toolbar,
+        // so the filters it overrides stay visible and unchanged.
+        if let Some(pid) = self.posts_focus_post.clone() {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("🔎 Showing one post from a notification").weak())
+                    .on_hover_text(format!(
+                        "Post {pid} — the channel/search filters above are ignored while \
+                         this is showing."
+                    ));
+                if ui
+                    .small_button("✕ Show all")
+                    .on_hover_text("Back to the whole feed, with the filters above applied again.")
+                    .clicked()
+                {
+                    self.posts_focus_post = None;
+                }
+            });
+        }
         ui.separator();
 
         let q = self.posts_search.trim().to_lowercase();
         let cf = self.posts_channel_filter;
         let show_viewer = self.posts_show_viewer;
+        let focus = self.posts_focus_post.clone();
         let visible: Vec<usize> = posts
             .iter()
             .enumerate()
-            .filter(|(_, p)| {
-                (show_viewer || p.author_kind != "viewer")
-                    && cf.map(|c| p.channel_id == c).unwrap_or(true)
-                    && (q.is_empty()
-                        || p.author.to_lowercase().contains(&q)
-                        || p.body_text.to_lowercase().contains(&q)
-                        || p.channel.to_lowercase().contains(&q))
+            .filter(|(_, p)| match &focus {
+                // A focused post bypasses every other filter (that's the point).
+                Some(pid) => &p.post_id == pid,
+                None => {
+                    (show_viewer || p.author_kind != "viewer")
+                        && cf.map(|c| p.channel_id == c).unwrap_or(true)
+                        && (q.is_empty()
+                            || p.author.to_lowercase().contains(&q)
+                            || p.body_text.to_lowercase().contains(&q)
+                            || p.channel.to_lowercase().contains(&q))
+                }
             })
             .map(|(i, _)| i)
             .collect();
 
+        if focus.is_some() && visible.is_empty() {
+            ui.add_space(24.0);
+            ui.vertical_centered(|ui| {
+                ui.weak("That post isn't in the feed.");
+                ui.weak(
+                    "Only the newest 500 posts are loaded — use “View on YouTube” \
+                     on the notification instead.",
+                );
+                if ui.button("✕ Show all").clicked() {
+                    self.posts_focus_post = None;
+                }
+            });
+            self.posts = posts;
+            return;
+        }
         if posts.is_empty() {
             ui.add_space(24.0);
             ui.vertical_centered(|ui| {

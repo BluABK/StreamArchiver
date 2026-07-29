@@ -82,24 +82,27 @@ pub struct NewNotification {
 /// UI (mirrors [`ArchivedPost`]'s `#[allow(dead_code)]` convention).
 #[derive(Clone, Debug)]
 pub struct NotificationRow {
-    #[allow(dead_code)]
     pub id: i64,
     pub created_at: i64,
     pub kind: String,
     pub severity: String,
     pub title: String,
     pub body: String,
-    #[allow(dead_code)]
+    /// The instance the row is about, when it has one — the feed resolves it to
+    /// that channel's avatar/name colour and its "Watch in player" button.
     pub monitor_id: Option<i64>,
     pub channel: String,
     #[allow(dead_code)]
     pub recording_id: Option<i64>,
     pub action_label: String,
     pub action_url: String,
-    /// Resolved hero/logo image on disk (rendered inline in a later phase).
+    /// Resolved hero/logo image on disk. The feed draws the channel's own
+    /// avatar instead (consistent with the Streams grid); this stays the toast's
+    /// picture.
     #[allow(dead_code)]
     pub image_path: String,
-    #[allow(dead_code)]
+    /// Dedup key the row was inserted with — also how a `youtube_post` row
+    /// names the post its "View post" button opens (`post:{monitor}:{post_id}`).
     pub ref_key: String,
     pub read: bool,
 }

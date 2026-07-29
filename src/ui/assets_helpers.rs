@@ -1128,6 +1128,50 @@ pub(super) fn resolve_instance_icon_small(
         .find_map(|d| load_channel_icon_small(d, ctx, &key))
 }
 
+impl StreamArchiverApp {
+    /// The display colour for a channel's *name*, as `(base, adjust)`: a manual
+    /// custom colour wins, else the streamer's own (cached) Twitch broadcaster
+    /// colour from the preferred — or first — Twitch account, else the
+    /// automatic per-channel palette. `adjust = true` marks a raw broadcaster
+    /// colour that still has to be run through [`readable_color`] against the
+    /// background it's actually drawn on (rows tint, so the caller knows that
+    /// background, not this function).
+    ///
+    /// Shared by every surface that names a channel (Streams grid, 🔔
+    /// notifications feed) so one channel is never two different colours.
+    pub(super) fn channel_name_color(&mut self, cid: i64) -> (egui::Color32, bool) {
+        // Resolve everything that reads `self.rows` first: the colour cache
+        // below needs `&mut self`, so the row borrows must be released by then.
+        let (custom, name, twitch_account) = {
+            let mons: Vec<&MonitorWithChannel> =
+                self.rows.iter().filter(|r| r.channel.id == cid).collect();
+            let Some(first) = mons.first() else {
+                return (channel_event_color(cid, ""), false);
+            };
+            let channel = first.channel.clone();
+            let accounts = channel_asset_accounts(&mons);
+            let account = preferred_account_index(&channel.preferred_asset, &accounts)
+                .filter(|&i| accounts[i].platform == Platform::Twitch)
+                .map(|i| &accounts[i])
+                .or_else(|| accounts.iter().find(|a| a.platform == Platform::Twitch))
+                .map(|a| a.account.clone());
+            (channel.color, channel.name, account)
+        };
+        if !custom.is_empty() {
+            return (channel_event_color(cid, &custom), false);
+        }
+        if let Some(account) = twitch_account
+            && let Some(c) = *self
+                .channel_twitch_colors
+                .entry(cid)
+                .or_insert_with(|| load_twitch_name_color(&name, &account))
+        {
+            return (c, true); // raw broadcaster colour → readability at render
+        }
+        (channel_event_color(cid, ""), false)
+    }
+}
+
 // ---------- Alt-hover full-resolution image preview ----------
 
 /// When the user holds Alt while hovering `resp`, queue `tex` for a

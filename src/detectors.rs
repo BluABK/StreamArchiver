@@ -2717,7 +2717,7 @@ impl DetectContext {
                 body: snippet,
                 monitor_id: Some(row.monitor.id),
                 channel: row.channel.name.clone(),
-                action_label: "Open post".to_string(),
+                action_label: "View on YouTube".to_string(),
                 action_url: format!("https://www.youtube.com/post/{}", p.post_id),
                 image_path: first_image.unwrap_or_default(),
                 ref_key: format!("post:{}:{}", row.monitor.id, p.post_id),

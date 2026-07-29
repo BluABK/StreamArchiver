@@ -1541,9 +1541,24 @@ independent detectors feeding the same table:
 - **🔔 Notifications** — the bell button in the toolbar (badges with the unread
   count) opens a window logging live/offline transitions, VOD/recovery
   completions, trigger matches, new community posts, and more, with a kind
-  filter and text search; **Mark all read** clears the badge. The same events
-  also raise a **desktop toast** (with a "Watch stream"/"Watch VOD" action
-  where relevant). On Windows the toasts are attributed to **StreamArchiver**
+  filter and text search; **Mark all read** clears the badge. Each row carries
+  the channel's **profile picture** (Alt-hover for the full-resolution one) and
+  names it in that channel's **own colour** — the streamer's Twitch chat colour
+  where they set one, same as the Streams grid — with the timestamp leading the
+  title line. Rows are **tinted by kind and severity** the way 🚨 Warnings rows
+  are (red errors, amber warnings, purple went-live, green trigger matched, …);
+  already-read rows keep the hue but fade back. The action buttons are:
+  - **Watch on Web** — opens the channel/VOD/post page in the browser.
+  - **Watch in player** — on live-stream rows (went live, trigger matched or
+    blocked, quality upgrade) whose instance still exists, tunes into the live
+    edge in the configured media player, exactly like ▶ Play in the Streams
+    grid. Only shown when a media player is configured.
+  - **View post** — on community-post rows, opens that post in the app's own
+    📣 Posts window (locally archived text, images and poll) instead of the
+    browser; the Posts feed narrows to it and offers **✕ Show all** to go back.
+
+  The same events also raise a **desktop toast** (with a "Watch on Web"/"Watch
+  VOD" action where relevant). On Windows the toasts are attributed to **StreamArchiver**
   (own name + icon, registered at startup — no installer needed), and
   clicking a toast's body calls back into the app: it focuses the window (or
   relaunches the app to the tray and raises it if it wasn't running), and

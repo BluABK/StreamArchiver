@@ -1401,29 +1401,10 @@ impl StreamArchiverApp {
                         instance_avatars.insert(mid, t);
                     }
                 }
-                // Name colour: a manual custom colour wins; otherwise tint Twitch
-                // channels with the streamer's own (cached) name colour — from the
-                // preferred icon-source account when set, else the first Twitch
-                // account; otherwise the automatic palette.
-                let name_color = if !e.channel.color.is_empty() {
-                    (channel_event_color(cid, &e.channel.color), false)
-                } else if let Some(tw) = preferred_account_index(&e.channel.preferred_asset, &accounts)
-                    .filter(|&i| accounts[i].platform == Platform::Twitch)
-                    .map(|i| &accounts[i])
-                    .or_else(|| accounts.iter().find(|a| a.platform == Platform::Twitch))
-                {
-                    match *self
-                        .channel_twitch_colors
-                        .entry(cid)
-                        .or_insert_with(|| load_twitch_name_color(&e.channel.name, &tw.account))
-                    {
-                        Some(c) => (c, true), // raw broadcaster colour → readability at render
-                        None => (channel_event_color(cid, ""), false),
-                    }
-                } else {
-                    (channel_event_color(cid, ""), false)
-                };
-                channel_name_colors.insert(cid, name_color);
+                // Name colour: manual custom colour > the streamer's own (cached)
+                // Twitch colour > the automatic palette. Shared with the 🔔
+                // notifications feed so a channel reads the same colour there.
+                channel_name_colors.insert(cid, self.channel_name_color(cid));
             }
             // Drop small-icon entries for monitors that no longer exist so deleted
             // instances don't pin their textures forever.

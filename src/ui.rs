@@ -1296,6 +1296,12 @@ pub struct StreamArchiverApp {
     /// front; a "Show more" button at the bottom raises it. Session-only,
     /// reset to the default whenever the filter/search narrows the visible set.
     posts_render_limit: usize,
+    /// A single post the feed has been narrowed to, by `post_id` — set by the
+    /// 🔔 notifications feed's "View post" button so the post it names can't be
+    /// hidden by whatever the Posts window was last filtered to. Overrides the
+    /// channel/search/viewer filters entirely while set; the "✕ Show all"
+    /// button (and any filter edit) clears it.
+    posts_focus_post: Option<String>,
     post_img_cache: PostImageCache,
     /// The widget inspector (F12): whether the window is open (session-only,
     /// like the other window flags) and its tab/selection/snapshot state.
