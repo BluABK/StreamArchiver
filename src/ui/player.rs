@@ -510,7 +510,7 @@ pub(super) fn spawn_logged(mut cmd: std::process::Command, what: &str) -> Option
 /// `{channel}`, `{game}`, `{title_trimmed}`, `{pos}` (current playback
 /// position). `{pos}` only ever ticks live for the launch paths this app
 /// spawns mpv directly for (YouTube/Kick/ffmpeg-source, via
-/// [`mpv_live_title_arg`]) — mpv's own `--title` flag supports property
+/// [`mpv_live_title_value`]) — mpv's own `--title` flag supports property
 /// expansion and keeps refreshing the window title on its own, unlike
 /// `--force-media-title` (verified against mpv issue trackers: the latter
 /// does not expand `${...}` properties, `--title` does). Streamlink (Twitch)
