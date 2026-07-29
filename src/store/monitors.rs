@@ -289,6 +289,26 @@ impl Store {
         Ok(())
     }
 
+    /// Narrow title/game setter for the in-recording refresh (`meta_watcher`)
+    /// — the recording-time half of the [`Self::set_monitor_live_meta`] feed,
+    /// same split rationale as [`Self::set_monitor_viewers`]: `scheduler::tick`
+    /// skips an actively-recording monitor entirely, so without this the
+    /// monitor's title/game would freeze at whatever the last poll before the
+    /// recording started saw and stay frozen for the whole take — for a
+    /// 12-hour stream, half a day of "wrong title" for everything that reads
+    /// the monitor row (the live-edge player title being the one that made it
+    /// visible). Deliberately narrow: leaves thumbnail/viewers/live-since to
+    /// their own writers, and never clears on offline (a stream ending is the
+    /// scheduler's business once the capture releases the monitor).
+    pub fn set_monitor_title_game(&self, id: i64, title: &str, game: &str) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE monitor SET last_title = ?2, last_game = ?3 WHERE id = ?1",
+            params![id, title, game],
+        )?;
+        Ok(())
+    }
+
     /// Narrow tags-only setter for the in-recording refresh (`meta_watcher`)
     /// — mirrors [`Store::set_monitor_viewers`]'s single-column rationale.
     pub fn set_monitor_tags(&self, id: i64, tags: &str) -> Result<()> {
@@ -610,6 +630,16 @@ mod tests {
         assert_eq!(r.last_viewers, 1234);
         assert_eq!(r.monitor.last_live_since, Some(1_000_000));
         assert!(r.monitor.last_live_since_approx);
+
+        // The in-recording title/game refresh (`meta_watcher`) touches ONLY
+        // those two columns — the rest of the live meta is other writers'.
+        store.set_monitor_title_game(mid, "Now playing NTE", "NTE").unwrap();
+        let r = row(&store);
+        assert_eq!(r.last_title, "Now playing NTE");
+        assert_eq!(r.last_game, "NTE");
+        assert_eq!(r.last_thumbnail_url, "https://t/x.jpg", "left alone");
+        assert_eq!(r.last_viewers, 1234, "left alone");
+        assert_eq!(r.monitor.last_live_since, Some(1_000_000), "left alone");
 
         store
             .set_monitor_live_meta(mid, "", "", "", -1, None, false, "")

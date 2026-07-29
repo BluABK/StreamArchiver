@@ -513,11 +513,12 @@ pub(super) fn spawn_logged(mut cmd: std::process::Command, what: &str) -> Option
 /// [`mpv_live_title_arg`]) — mpv's own `--title` flag supports property
 /// expansion and keeps refreshing the window title on its own, unlike
 /// `--force-media-title` (verified against mpv issue trackers: the latter
-/// does not expand `${...}` properties, `--title` does). Streamlink
-/// (Twitch) resolves its own `--title` template once at launch and forwards
-/// it to mpv as `--force-media-title`, so there `{pos}` can only ever be the
-/// position at open, and never updates afterward — Streamlink owns the
-/// player process, not this app (see [`streamlink_live_title`]).
+/// does not expand `${...}` properties, `--title` does). Streamlink (Twitch)
+/// resolves its own `--title` template once at launch and forwards it to mpv
+/// as `--force-media-title`, so the title it sets can never tick or update —
+/// which is why that path asks Streamlink for an mpv IPC socket (see
+/// [`streamlink_player_args`]) and replaces the whole title over IPC the
+/// moment mpv is up, with a real `${time-pos}` in it.
 pub(super) fn render_live_title(template: &str, channel: &str, game: &str, title_trimmed: &str, pos: &str) -> String {
     template
         .replace("{channel}", channel)
@@ -540,8 +541,11 @@ fn mpv_live_title_value(template: &str, channel: &str, last_title: &str, last_ga
 /// The Streamlink `--title` VALUE (not an mpv flag — Streamlink translates
 /// it internally) for a live-edge tune-in. Resolved once from this app's own
 /// known metadata (not Streamlink's own scrape) so the same template means
-/// the same thing on every launch path; `{pos}` is always `00:00:00` since
-/// neither live-ticking nor a later update is possible through Streamlink.
+/// the same thing on every launch path; `{pos}` is a fixed `00:00:00` because
+/// Streamlink's title can't tick. It only shows for the moment before mpv's
+/// IPC socket comes up, after which [`run_live_title_updater`]'s first push
+/// replaces it with the ticking form — and with a blank template, or
+/// auto-update off, it stays the whole time.
 fn streamlink_live_title(template: &str, channel: &str, last_title: &str, last_game: &str) -> String {
     let trimmed = crate::downloader::trim_title_commands(last_title);
     render_live_title(template, channel, last_game, &trimmed, "00:00:00")
@@ -553,12 +557,34 @@ const LIVE_TITLE_POLL: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// How long to wait for mpv to create its IPC pipe before giving up on
 /// auto-updating the title — this never blocks or fails the play action
-/// itself, it just silently stays at the title set at launch.
+/// itself, it just silently stays at the title set at launch. Used by the
+/// paths where this app spawns mpv itself, so the pipe appears within
+/// milliseconds.
 const LIVE_TITLE_IPC_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The same wait for the Streamlink path, where *Streamlink* spawns mpv only
+/// after resolving the stream and opening the HLS session — and, with
+/// `--retry-streams 3 --retry-max 5`, possibly after ~15 s of retries first.
+/// Generous because the cost of waiting is one thread polling a pipe open
+/// every 200 ms, while the cost of being too short is a silently frozen title.
+const LIVE_TITLE_IPC_CONNECT_TIMEOUT_STREAMLINK: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
 /// A unique `\\.\pipe\...` path for one mpv instance's `--input-ipc-server`.
+///
+/// The process-wide counter is what makes it unique: a timestamp alone repeats
+/// within the same second, and the collab "play every angle" action spawns
+/// three or four players in one go. Two mpv instances handed the same pipe
+/// name fight over it — the loser silently gets no IPC server at all, and
+/// title pushes meant for it land on the winner's window instead.
 fn new_mpv_ipc_pipe_path() -> String {
-    format!(r"\\.\pipe\streamarchiver-mpv-{}-{}", std::process::id(), crate::models::now_unix())
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!(
+        r"\\.\pipe\streamarchiver-mpv-{}-{}-{seq}",
+        std::process::id(),
+        crate::models::now_unix()
+    )
 }
 
 /// Send one `set_property title <value>` command over an already-open mpv
@@ -570,12 +596,22 @@ fn send_mpv_title(pipe: &mut std::fs::File, title: &str) -> std::io::Result<()> 
     pipe.write_all(b"\n")
 }
 
-/// Background loop started by [`apply_live_title_and_spawn_updater`]: connect
-/// to `pipe_path`, then poll `monitor_id`'s current title/game every
-/// [`LIVE_TITLE_POLL`] and push a freshly rendered title whenever either
-/// changed since the last push. Exits silently once the pipe write fails
-/// (mpv closed its IPC server, meaning the player quit) or the connect
-/// timeout elapses (mpv never came up, or doesn't support `--input-ipc-server`).
+/// Background loop started by [`apply_live_title_and_spawn_updater`] (and by
+/// the Streamlink branch of [`spawn_play_new_instance`]): connect to
+/// `pipe_path`, push the current title once the pipe is up, then poll
+/// `monitor_id`'s title/game every [`LIVE_TITLE_POLL`] and push a freshly
+/// rendered title whenever either changed since the last push. Exits silently
+/// once the pipe write fails (mpv closed its IPC server, meaning the player
+/// quit) or `connect_timeout` elapses (mpv never came up, or doesn't support
+/// `--input-ipc-server`).
+///
+/// The push-on-connect isn't redundant: on the Streamlink path our `--title`
+/// never reaches mpv at all (Streamlink resolves its own `--title` once and
+/// hands mpv `--force-media-title`, verified against Streamlink 8's
+/// `PlayerArgsMPV::get_title`), so this first push is what puts the configured
+/// template on the window — and starts `{pos}` ticking. On the paths that do
+/// pass `--title=` themselves it re-sends the value already showing, which
+/// costs one pipe write.
 fn run_live_title_updater(
     pipe_path: String,
     store: Arc<crate::store::Store>,
@@ -583,8 +619,9 @@ fn run_live_title_updater(
     template: String,
     mut last_title: String,
     mut last_game: String,
+    connect_timeout: std::time::Duration,
 ) {
-    let deadline = std::time::Instant::now() + LIVE_TITLE_IPC_CONNECT_TIMEOUT;
+    let deadline = std::time::Instant::now() + connect_timeout;
     let mut pipe = loop {
         match crate::iomon::fs::open_with_sync(crate::iomon::Cat::Preview, &pipe_path, |o| {
             o.write(true);
@@ -599,18 +636,21 @@ fn run_live_title_updater(
             }
         }
     };
+    tracing::debug!(monitor_id, "live-title: mpv IPC connected, pushing title");
+    let mut force = true;
     loop {
+        if let Ok(Some(row)) = store.get_monitor_with_channel(monitor_id)
+            && (force || row.last_title != last_title || row.last_game != last_game)
+        {
+            force = false;
+            last_title = row.last_title.clone();
+            last_game = row.last_game.clone();
+            let value = mpv_live_title_value(&template, &row.channel.name, &last_title, &last_game);
+            if send_mpv_title(&mut pipe, &value).is_err() {
+                return; // player closed
+            }
+        }
         std::thread::sleep(LIVE_TITLE_POLL);
-        let Ok(Some(row)) = store.get_monitor_with_channel(monitor_id) else { continue };
-        if row.last_title == last_title && row.last_game == last_game {
-            continue;
-        }
-        last_title = row.last_title.clone();
-        last_game = row.last_game.clone();
-        let value = mpv_live_title_value(&template, &row.channel.name, &last_title, &last_game);
-        if send_mpv_title(&mut pipe, &value).is_err() {
-            return; // player closed
-        }
     }
 }
 
@@ -640,13 +680,60 @@ fn apply_live_title_and_spawn_updater(
     }
     let pipe_path = new_mpv_ipc_pipe_path();
     cmd.arg(format!("--input-ipc-server={pipe_path}"));
+    spawn_live_title_updater(
+        pipe_path, store, monitor_id, template, last_title, last_game,
+        LIVE_TITLE_IPC_CONNECT_TIMEOUT,
+    );
+}
+
+/// Start [`run_live_title_updater`] on its own thread. Shared by the paths
+/// that spawn mpv directly (via [`apply_live_title_and_spawn_updater`]) and
+/// the Streamlink path, which can only reach mpv through `--player-args`.
+fn spawn_live_title_updater(
+    pipe_path: String,
+    store: &Arc<crate::store::Store>,
+    monitor_id: i64,
+    template: &str,
+    last_title: &str,
+    last_game: &str,
+    connect_timeout: std::time::Duration,
+) {
     let store = Arc::clone(store);
-    let template = template.to_string();
-    let last_title = last_title.to_string();
-    let last_game = last_game.to_string();
+    let (template, last_title, last_game) =
+        (template.to_string(), last_title.to_string(), last_game.to_string());
     std::thread::spawn(move || {
-        run_live_title_updater(pipe_path, store, monitor_id, template, last_title, last_game);
+        run_live_title_updater(
+            pipe_path, store, monitor_id, template, last_title, last_game, connect_timeout,
+        );
     });
+}
+
+/// The mpv flags this app needs Streamlink to pass on its behalf, as a
+/// `--player-args` VALUE — Streamlink spawns the player there, so anything mpv
+/// needs has to travel through this one string.
+///
+/// Two quoting rules, both verified against Streamlink 8.1.0's
+/// `PlayerArgs.build()`:
+///
+/// - Values are `shlex.split` in **POSIX mode**, on Windows too, so a bare
+///   `\\.\pipe\name` comes out the far end as `.pipename` — every backslash
+///   eaten as an escape. Single-quoting the value makes shlex pass it through
+///   byte-for-byte.
+/// - The stream input placeholder is `{playerinput}`. `{filename}` was
+///   Streamlink ≤5 spelling and is now an *unknown* variable, which its
+///   formatter leaves as literal text — mpv then gets `{filename}` as a
+///   playlist entry (a file that doesn't exist) *and* the real input appended
+///   after it, since Streamlink adds the input itself when the placeholder is
+///   missing.
+fn streamlink_player_args(ipc_pipe: Option<&str>, mute: bool) -> Option<String> {
+    let mut args: Vec<String> = Vec::new();
+    if let Some(pipe) = ipc_pipe {
+        args.push(format!("--input-ipc-server='{pipe}'"));
+    }
+    if mute {
+        args.push("--mute".into());
+    }
+    (!args.is_empty()).then(|| format!("{} {{playerinput}}", args.join(" ")))
 }
 
 /// Root for throwaway live-edge preview downloads (see [`spawn_live_preview`]).
@@ -976,11 +1063,12 @@ pub(super) fn spawn_live_preview(
 /// `None`.
 ///
 /// - Streamlink: `--player <path>` routes output to the player (live edge).
-///   The live-edge title (see `render_live_title`) is passed via
-///   Streamlink's own `--title`, since Streamlink — not this app — owns the
-///   player process here; auto-updating it on a later title/game change
-///   isn't possible through this path (see `streamlink_live_title`'s doc
-///   comment).
+///   The live-edge title (see `render_live_title`) is passed via Streamlink's
+///   own `--title`, since Streamlink — not this app — owns the player process
+///   here. With mpv + auto-update on, this path additionally asks Streamlink
+///   to hand mpv an `--input-ipc-server` socket (see
+///   [`streamlink_player_args`]) and drives the title over that, which is how
+///   it keeps up with title/game changes despite not owning the process.
 /// - yt-dlp + YouTube: throwaway live-edge preview download, see
 ///   [`spawn_live_preview`] — SABR-only streams can't be piped or URL-played.
 /// - yt-dlp + other platforms (Kick): pipes `-o -` stdout to the player's
@@ -1053,23 +1141,43 @@ pub(super) fn spawn_play_new_instance(
             }
             args.push("--player".into());
             args.push(player.to_string());
-            if mute && player_is_mpv(player) {
-                // A separate --player-args flag, NOT embedded in --player's
-                // own value: Streamlink re-splits `--player` as its own
-                // command line, and on Windows a value handed to it as
-                // "<path> --mute" can come back mis-split into a single
-                // executable name — reported live as `error: Failed to
-                // start player: C:\...\mpv.exe --mute (Player executable
-                // not found)`. --player-args isn't re-split against the
-                // player path, so it can't suffer the same failure.
+            // Streamlink owns the player process here, so mpv's IPC socket —
+            // the only way to update the title after launch, since Streamlink
+            // resolves its own --title once and never revisits it — has to be
+            // requested through --player-args. Skipped for a synthetic row
+            // (id 0: follow-raid/collab partner), which has no monitor to poll.
+            let ipc_pipe = (!title_template.is_empty()
+                && settings.live_title_auto_update
+                && player_is_mpv(player)
+                && m.id != 0)
+                .then(new_mpv_ipc_pipe_path);
+            // A separate --player-args flag, NOT embedded in --player's own
+            // value: Streamlink re-splits `--player` as its own command line,
+            // and on Windows a value handed to it as "<path> --mute" can come
+            // back mis-split into a single executable name — reported live as
+            // `error: Failed to start player: C:\...\mpv.exe --mute (Player
+            // executable not found)`. --player-args isn't re-split against the
+            // player path, so it can't suffer the same failure.
+            if let Some(player_args) =
+                streamlink_player_args(ipc_pipe.as_deref(), mute && player_is_mpv(player))
+            {
                 args.push("--player-args".into());
-                args.push("--mute {filename}".into());
+                args.push(player_args);
             }
             args.push(m.url.clone());
             args.push(resolved_quality(&m.quality));
             let mut cmd = std::process::Command::new("streamlink");
             cmd.args(&args);
-            spawn_logged(cmd, "streamlink")
+            let status = spawn_logged(cmd, "streamlink");
+            // Only if Streamlink actually started — otherwise the updater would
+            // sit on a pipe that can never appear and log a spurious warning.
+            if let Some(pipe) = ipc_pipe.filter(|_| status.is_none()) {
+                spawn_live_title_updater(
+                    pipe, store, m.id, title_template, &row.last_title, &row.last_game,
+                    LIVE_TITLE_IPC_CONNECT_TIMEOUT_STREAMLINK,
+                );
+            }
+            status
         }
         Tool::YtDlp if m.platform() == Platform::YouTube => {
             spawn_live_preview(row, player, settings, store, mute, title_template_override)
@@ -1534,5 +1642,43 @@ mod tests {
     fn streamlink_live_title_fixes_pos_at_zero() {
         let v = streamlink_live_title("{channel} [{pos}]", "Layna", "Hello !gg", "Just Chatting");
         assert_eq!(v, "Layna [00:00:00]");
+    }
+
+    #[test]
+    fn streamlink_player_args_quote_the_pipe_and_use_the_current_input_token() {
+        let pipe = r"\\.\pipe\streamarchiver-mpv-1234-99";
+        let v = streamlink_player_args(Some(pipe), false).unwrap();
+        // The pipe path MUST be single-quoted: Streamlink shlex-splits this
+        // value in POSIX mode even on Windows, so an unquoted `\\.\pipe\x`
+        // arrives as `.pipex` with every backslash eaten as an escape.
+        assert_eq!(v, format!("--input-ipc-server='{pipe}' {{playerinput}}"));
+        // `{playerinput}`, never the removed `{filename}` — an unknown
+        // variable survives as literal text and mpv treats it as a file to
+        // play (Streamlink then appends the real input after it anyway).
+        assert!(!v.contains("{filename}"));
+
+        // Mute composes into the SAME value: a second --player-args would
+        // just override the first.
+        let both = streamlink_player_args(Some(pipe), true).unwrap();
+        assert_eq!(both, format!("--input-ipc-server='{pipe}' --mute {{playerinput}}"));
+        assert_eq!(both.matches("{playerinput}").count(), 1);
+
+        // Mute alone still works, and nothing at all means no flag.
+        assert_eq!(streamlink_player_args(None, true).unwrap(), "--mute {playerinput}");
+        assert_eq!(streamlink_player_args(None, false), None);
+    }
+
+    #[test]
+    fn mpv_ipc_pipe_paths_are_unique_per_instance() {
+        // Two players opened in the same second must not share a socket, or a
+        // title push for one lands on the other (collab "play every angle"
+        // spawns several at once).
+        let paths: std::collections::HashSet<String> =
+            (0..8).map(|_| new_mpv_ipc_pipe_path()).collect();
+        assert_eq!(paths.len(), 8, "pipe paths collided: {paths:?}");
+        for p in &paths {
+            assert!(p.starts_with(r"\\.\pipe\streamarchiver-mpv-"));
+            assert!(!p.contains(' '), "a space here would break --player-args splitting");
+        }
     }
 }

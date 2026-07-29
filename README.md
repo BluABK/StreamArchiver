@@ -814,22 +814,32 @@ same name), and `{pos}` (current playback position, `HH:MM:SS`) — add `{pos}`
 to your own template if you want it; the default omits it. Leave the field
 blank to restore the old behavior (no title override at all).
 
-How live `{pos}` gets, and whether the title can update after the player
-opens, depends on which tool is actually launching the player:
+How live `{pos}` gets, and how the title keeps up after the player opens,
+depends on which tool is actually launching the player:
 
-| Path | Player spawned by | `{pos}` | Auto-update on title/game change |
+| Path | Player spawned by | Title at open | `{pos}` + auto-update |
 |---|---|---|---|
-| Twitch (Streamlink) | Streamlink itself (`--title`, translated internally to mpv/VLC/PotPlayer's own title flag) | fixed `00:00:00` | never — Streamlink owns the player process, not this app |
-| YouTube / Kick / ffmpeg source | this app, directly | **ticks live** (mpv only) | **Settings → Defaults → Auto-update live title** (mpv only) |
+| YouTube / Kick / ffmpeg source | this app, directly | mpv `--title` | **ticks live**; auto-updates (mpv only) |
+| Twitch (Streamlink) | Streamlink itself (`--title`, translated internally to mpv/VLC/PotPlayer's own title flag) | Streamlink's fixed title, `{pos}` = `00:00:00` | **ticks live**; auto-updates once mpv's IPC socket is up, ~a second in (mpv only) |
 
-For the paths this app spawns mpv directly for, `{pos}` becomes mpv's own
-`${time-pos}` property-expansion token baked into the `--title` argument —
-mpv keeps that ticking on its own, no polling needed on this app's side. With
-**Auto-update live title** on (mpv + one of those paths), a background
-thread re-checks the channel's title/game every 20s over mpv's own
-`--input-ipc-server` socket and pushes a freshly rendered title the moment
-either changes — best-effort only: if mpv's IPC pipe never comes up, this
-silently no-ops and the title just stays as set at launch.
+`{pos}` becomes mpv's own `${time-pos}` property-expansion token rather than a
+resolved value, so mpv keeps it ticking with no polling on this app's side.
+With **Settings → Defaults → Auto-update live title** on (mpv only), a
+background thread talks to mpv over its `--input-ipc-server` socket: it pushes
+the rendered title once as soon as the socket is up, then re-checks the
+channel's title/game every 20s and pushes again whenever either changed.
+
+That first push is what makes Twitch work at all. Streamlink — not this app —
+spawns the player there, resolving its own `--title` once and handing mpv
+`--force-media-title`, which can neither tick nor be revisited; so the socket
+is requested *through* Streamlink (`--player-args`) and the title is taken
+over from it the moment mpv answers. Best-effort throughout: if the socket
+never comes up, the title simply stays as opened.
+
+The pushed title tracks the *channel's* current title/game, which the app
+keeps current while a recording is in progress as well as while it's merely
+watching — a channel switching game two hours into a 12-hour stream retitles
+the open player, not just the [Streams grid](#streams-live-monitoring).
 
 ### Detection methods
 

@@ -949,14 +949,17 @@ pub(super) const META_POLL_INTERVAL_SECS: i64 = 60;
 /// (crate::detectors::MetaFetch) — only `Failed` counts as a broken refresh).
 ///
 /// Also refreshes `monitor.last_viewers` every cycle (Twitch/Kick exactly;
-/// YouTube from the watch page's scraped "watching now"). This is the ONLY place that field
-/// gets updated while a recording is active: `scheduler::tick` skips an
-/// actively-recording monitor entirely (the supervisor owns its state until
-/// the tool exits), so without this the Viewers column would freeze at
-/// whatever it last read before the recording started (or stay unknown,
-/// since a push-triggered start never had a poll outcome to read one from).
-/// Unlike title/game, the count isn't logged as a "change" — it fluctuates
-/// continuously, so every fetch just overwrites it directly.
+/// YouTube from the watch page's scraped "watching now") and
+/// `monitor.last_title`/`last_game` on every change. This is the ONLY place
+/// those fields get updated while a recording is active: `scheduler::tick`
+/// skips an actively-recording monitor entirely (the supervisor owns its state
+/// until the tool exits), so without this they would freeze at whatever the
+/// last poll before the recording started saw (or stay unknown, since a
+/// push-triggered start never had a poll outcome to read one from) — for the
+/// whole take, which for a long stream means hours of a wrong title on every
+/// surface reading the monitor row, the live-edge player title included.
+/// Unlike title/game, the viewer count isn't logged as a "change" — it
+/// fluctuates continuously, so every fetch just overwrites it directly.
 /// Also enforces a trigger rule's "only recording while matching"
 /// (`stop_rule`, `Some` only when the rule that started this recording has
 /// `stop_on_unmatch` on): each cycle re-checks the rule against the freshly-
@@ -981,9 +984,9 @@ pub(super) async fn meta_watcher(
     manual_tx: mpsc::UnboundedSender<ManualCommand>,
     stop_rule: Option<crate::triggers::TriggerRule>,
     // Monitor-persisted title/game at take start — seeds the continuous,
-    // all-time `monitor_stream_change` ledger (see below) separately from
-    // `last_title`/`last_game`, which track this *take's* own baseline for
-    // the per-recording `stream_meta_change` popup. Without this split, every
+    // all-time `monitor_stream_change` ledger (see below) separately from the
+    // local `last_title`/`last_game` below, which track this *take's* own
+    // baseline for the per-recording `stream_meta_change` popup. Without this split, every
     // take start would log a spurious "changed from empty" event into the
     // continuous history even when the title genuinely hadn't changed.
     cont_title: String,
@@ -1099,6 +1102,7 @@ pub(super) async fn meta_watcher(
             // baseline, so a take starting mid-broadcast (title already known
             // from the live poll before recording began) doesn't log a false
             // "changed from empty" event.
+            let mut cont_changed = false;
             if meta.title != cont_title {
                 if let Err(e) = store.insert_monitor_stream_change(
                     monitor_id, now_unix(), "title", &cont_title, &meta.title,
@@ -1106,6 +1110,7 @@ pub(super) async fn meta_watcher(
                     warn!("insert monitor title change failed: {e:#}");
                 }
                 cont_title = meta.title.clone();
+                cont_changed = true;
             }
             if meta.game != cont_game {
                 if let Err(e) = store.insert_monitor_stream_change(
@@ -1114,6 +1119,16 @@ pub(super) async fn meta_watcher(
                     warn!("insert monitor category change failed: {e:#}");
                 }
                 cont_game = meta.game.clone();
+                cont_changed = true;
+            }
+            // Keep the monitor's own last-known title/game current too — the
+            // recording-time half of that field's feed, exactly like viewers
+            // and tags below. Only on a real change (the ledger above already
+            // established there was one), so a quiet take costs no writes.
+            if cont_changed
+                && let Err(e) = store.set_monitor_title_game(monitor_id, &cont_title, &cont_game)
+            {
+                warn!("update live title/game failed: {e:#}");
             }
             // Title: log the initial non-empty value, then every transition.
             if last_title.as_deref() != Some(meta.title.as_str()) {

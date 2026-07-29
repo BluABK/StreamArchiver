@@ -1193,23 +1193,26 @@ impl StreamArchiverApp {
                         "Window title for \"Play stream (live edge)\" — the URL/filename \
                          otherwise shown by default. Tokens: {channel}, {game}, \
                          {title_trimmed} (command-plug-stripped stream title), {pos} \
-                         (current playback position, HH:MM:SS). {pos} only ever ticks \
-                         live for YouTube/Kick/ffmpeg-source tune-ins (mpv's own \
-                         ${time-pos} keeps it updating) — for Twitch (Streamlink owns \
-                         the player process, not this app), {pos} is fixed at 00:00:00 \
-                         and the title can't update afterward either way. Leave blank to \
-                         restore the old behavior (no title override).",
+                         (current playback position, HH:MM:SS). {pos} ticks live in mpv \
+                         (its own ${time-pos} keeps it updating). On Twitch, Streamlink \
+                         opens the player and can only set a fixed title, so {pos} shows \
+                         00:00:00 for the second or two before this app takes the title \
+                         over via mpv's IPC socket — which needs \"Auto-update live \
+                         title\" below on. Leave blank to restore the old behavior (no \
+                         title override).",
                     );
                     ui.text_edit_singleline(&mut self.settings.live_title_template);
                     ui.end_row();
                     ui.label("Auto-update live title").on_hover_text(
                         "Push an updated title over mpv's IPC socket whenever this app \
                          detects the channel's title/game changed, for as long as the \
-                         live-edge player stays open. Only takes effect for launch paths \
-                         this app spawns mpv directly for (YouTube/Kick/ffmpeg-source) — \
-                         Streamlink (Twitch) owns the player process itself, so its title \
-                         is set once at open and can't be pushed to afterward. Requires \
-                         mpv as the configured media player.",
+                         live-edge player stays open. Works on every launch path, \
+                         including Twitch: Streamlink spawns the player there, so this \
+                         asks it to hand mpv an IPC socket and then drives the title \
+                         over that (also making {pos} tick, which Streamlink's own \
+                         fixed title can't). Requires mpv as the configured media \
+                         player; best-effort — if the socket never comes up the title \
+                         just stays as opened.",
                     );
                     ui.checkbox(&mut self.settings.live_title_auto_update, "");
                     ui.end_row();
