@@ -74,6 +74,20 @@ impl Store {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Point a take at the chat sidecar a **chat-only session** is writing
+    /// (see [`crate::models::Recording::chat_path`]). Only ever called for
+    /// `not_recorded` sessions, which have no `output_path` for the usual
+    /// extension-swap lookup to work from; an ordinary take's sidecar is
+    /// still derived from its video path and this column stays empty.
+    pub fn set_recording_chat_path(&self, rec_id: i64, chat_path: &str) -> Result<()> {
+        let conn = self.db();
+        conn.execute(
+            "UPDATE recording SET chat_path = ?2 WHERE id = ?1",
+            params![rec_id, chat_path],
+        )?;
+        Ok(())
+    }
+
     /// Close any open not-recorded session for this monitor (see
     /// [`Self::open_not_recorded_session`]) — the broadcast ended, or a real
     /// recording just started and supersedes it. A no-op (0 rows) when none
@@ -956,7 +970,7 @@ impl Store {
                     backfill_path, full_path, COALESCE(trigger_info, ''),
                     head_backfill_state, COALESCE(trigger_rule_json, ''), vod_views,
                     gap_splice_state, err_ack, sabr_live_edge_fallback, chapters_state,
-                    COALESCE(chapters_json, ''), chapters_attempts
+                    COALESCE(chapters_json, ''), chapters_attempts, chat_path
              FROM recording WHERE monitor_id = ?1 ORDER BY started_at, id",
         )?;
         let rows = stmt
@@ -1002,6 +1016,7 @@ impl Store {
                     chapters_state: r.get(37)?,
                     chapters_json: r.get(38)?,
                     chapters_attempts: r.get(39)?,
+                    chat_path: r.get(40)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1030,7 +1045,7 @@ impl Store {
             backfill_path, full_path, COALESCE(trigger_info, ''),
             head_backfill_state, COALESCE(trigger_rule_json, ''), vod_views,
             gap_splice_state, err_ack, sabr_live_edge_fallback, chapters_state,
-            COALESCE(chapters_json, ''), chapters_attempts";
+            COALESCE(chapters_json, ''), chapters_attempts, chat_path";
 
     fn map_recording_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::models::Recording> {
         Ok(crate::models::Recording {
@@ -1074,6 +1089,7 @@ impl Store {
             chapters_state: r.get(37)?,
             chapters_json: r.get(38)?,
             chapters_attempts: r.get(39)?,
+            chat_path: r.get(40)?,
         })
     }
 
@@ -1307,6 +1323,7 @@ impl Store {
                     chapters_state: String::new(),
                     chapters_json: String::new(),
                     chapters_attempts: 0,
+                    chat_path: String::new(),
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1375,6 +1392,7 @@ impl Store {
                     chapters_state: String::new(),
                     chapters_json: String::new(),
                     chapters_attempts: 0,
+                    chat_path: String::new(),
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1466,6 +1484,7 @@ impl Store {
                     chapters_state: String::new(),
                     chapters_json: String::new(),
                     chapters_attempts: 0,
+                    chat_path: String::new(),
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1550,6 +1569,7 @@ impl Store {
                     chapters_state: String::new(),
                     chapters_json: String::new(),
                     chapters_attempts: 0,
+                    chat_path: String::new(),
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1614,6 +1634,7 @@ impl Store {
                     chapters_state: String::new(),
                     chapters_json: String::new(),
                     chapters_attempts: 0,
+                    chat_path: String::new(),
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1816,6 +1837,7 @@ impl Store {
                     chapters_state: String::new(),
                     chapters_json: String::new(),
                     chapters_attempts: 0,
+                    chat_path: String::new(),
                     trigger_rule_json: String::new(),
                 })
             })?
@@ -1946,6 +1968,20 @@ mod tests {
         assert_eq!(all[0].stream_id.as_deref(), Some("s1"));
         assert!(all[0].output_path.is_empty());
         assert!(all[0].ended_at.is_none());
+        assert!(all[0].chat_path.is_empty(), "no chat capture attached yet");
+
+        // A chat-only capture (see `downloader::chat_only`) attaches its
+        // sidecar here — the session has no `output_path` to derive one from,
+        // so this column is the only way the chat replay can find it.
+        store.set_recording_chat_path(id, "C:/rec/Streamer - live.chat.jsonl").unwrap();
+        let all = store.recordings_for_monitor(mid).unwrap();
+        assert_eq!(all[0].chat_path, "C:/rec/Streamer - live.chat.jsonl");
+        assert!(all[0].output_path.is_empty(), "still no video — this is not a capture");
+        // Single-row lookups read the same column list.
+        assert_eq!(
+            store.get_recording(id).unwrap().unwrap().chat_path,
+            "C:/rec/Streamer - live.chat.jsonl"
+        );
 
         // Closing clears the "open" lookup and stamps ended_at.
         let closed = store.close_open_not_recorded_sessions(mid, 2_000).unwrap();

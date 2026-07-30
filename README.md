@@ -138,9 +138,12 @@ two tools on one URL.
      recorded** take row in the Streams grid (title/category/start/end time,
      no file — hover the state icon for the note), the same way a real
      recording would, so an Auto-off channel's history still shows *that* it
-     streamed even though nothing was captured. Turning Auto on (or a
-     trigger/manual Start firing) mid-broadcast closes that row and starts a
-     real recording take right after it.
+     streamed even though nothing was captured. **Chat still is**, though —
+     by default an Auto-off broadcast gets a chat-only sidecar attached to
+     that row (see *Chat without a recording*), because chat is tiny and
+     can't be fetched back later. Turning Auto on (or a trigger/manual Start
+     firing) mid-broadcast closes that row and starts a real recording take
+     right after it.
 
    A **channel** (container) row rolls up its instances: the State column shows
    a live/recording indicator when **any** instance is live (with a count after
@@ -1816,6 +1819,8 @@ section). Semantics:
   plain Auto-off (above), a blacklist veto does **not** get its own
   **👁 not recorded** take row — an explicit "never archive this" is treated
   as "don't keep a history entry either", not just "don't capture footage".
+  For the same reason it gets no chat-only sidecar either (see *Chat without
+  a recording*), and neither does a broadcast held back by a **Stop** hold.
 - When a start is vetoed you get a one-per-broadcast **🚫 Blacklist blocked**
   notification (which rule matched and the matching text).
 - Push signals without a title (Twitch EventSub) fetch the metadata via a
@@ -2228,7 +2233,9 @@ while recording. Discrete **stream events** are archived alongside:
   viewer) is shown plain, same as before.
 - **Subs, resubs, gift subs and bits** are parsed live out of the Twitch
   chat feed (IRC `USERNOTICE`s and `bits` tags), so they're captured whenever
-  a recording with **Log chat** is running. Community gift batches count
+  the chat logger is running — which, by default, includes broadcasts that
+  aren't being recorded at all (see *Chat without a recording*). Community
+  gift batches count
   once (the batch announcement carries the size; its per-recipient notices
   are skipped so nothing double-counts). Resubs carry the shared **streak**,
   gifts the gifter's **lifetime total**. Third-party donations only appear
@@ -2241,11 +2248,11 @@ while recording. Discrete **stream events** are archived alongside:
 - **Raids** (incoming *and* your channels' outgoing raid targets) arrive via
   EventSub `channel.raid` in conduit mode (no extra scopes; toggle under
   *Settings → Accounts → Detection credentials*, default on) — even while
-  nothing is recording. Incoming raids are also caught from chat while
-  recording; the two sources dedup against each other.
+  nothing is recording. Incoming raids are also caught from chat whenever the
+  chat logger is running; the two sources dedup against each other.
 - **Moderation events** — message deletions (with the deleted text), timeouts,
   bans, chat clears, chat-mode changes and badge-inferred role changes, also
-  from the recorded chat (see *Chat logs* below for the replay integration).
+  from the logged chat (see *Chat logs* below for the replay integration).
   Deletions + timeouts + bans roll up as **Mod acts** in the overview table.
 - **Hype trains** are captured three ways, one event row per train:
   - **Confirmed** — the app polls Twitch's *public* hype-train state
@@ -2617,6 +2624,41 @@ download captures `live_chat` (e.g. a YouTube VOD's chat replay) the same way.
 
 Chat sidecars sit next to the video and **follow it** if the file is renamed
 (see *Filename media info*), so they stay matched to their recording.
+
+#### Chat without a recording
+
+**Auto-record off doesn't mean chat off.** Auto-record is a *disk-space*
+control — "don't spend 30 GB on this stream" — while a chat log is a few MB
+and, unlike the video, is **unrecoverable** once the broadcast ends: Twitch
+publishes no transcript and YouTube's live-chat replay dies with the stream.
+So when a monitored channel goes live with **Auto** off, chat is still
+captured on its own. This is on by default and switched off under
+**Settings → Downloads → Chat logging**.
+
+- It still needs the instance's own **Log chat** tick, and the same
+  platform support as above (Twitch, or YouTube with yt-dlp). Turning **Log
+  chat** off for an instance turns this off for it too.
+- The sidecar is exactly the file a recorded take would have produced —
+  `<name>.chat.jsonl` / `<name>.mkv.live_chat.json` in the instance's output
+  folder, named from its usual filename template — so the chat replay, the
+  subdirectory split (*File management*), and the 💬 badge all work
+  unchanged. `{title}` and `{games}` are filled from what detection knows at
+  the time rather than the usual `title-tba` placeholders, since there's no
+  post-capture rename pass to resolve them later.
+- It hangs off the same **👁 "seen live, not recorded"** take row the Streams
+  grid already shows for an Auto-off broadcast, so it starts and ends with
+  that broadcast, and **💬 View chat** on that row opens it. If the app is
+  restarted mid-broadcast the session resumes into a *new* sidecar rather
+  than reopening the old one (never append to a file we can't vouch for);
+  the take row then points at the newer file, and the earlier part stays on
+  disk next to it.
+- If a recording *does* start mid-broadcast (a trigger word matched, or you
+  hit ▶ Start), the chat-only capture is stopped first and the recording's
+  own chat logger takes over — you get two sidecars for the broadcast, one
+  per session, never two writers at once.
+- Deliberately **not** applied when a **blacklist trigger** vetoed the
+  recording or a **Stop hold** is active: those both mean "skip this
+  broadcast", not "save the disk".
 
 **Moderation is archived too** (Twitch): the logger records single-message
 **deletions**, **timeouts/bans** and **full chat clears**, chat-mode changes

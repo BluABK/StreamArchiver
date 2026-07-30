@@ -2737,6 +2737,15 @@ pub struct Recording {
     /// permanently-broken source doesn't get retried forever. See
     /// `downloader::chapters`.
     pub chapters_attempts: i64,
+    /// Explicit chat-sidecar path for takes whose chat log ISN'T derivable
+    /// from [`Self::output_path`] — today only a **chat-only session** (a
+    /// `not_recorded` take that captured chat while Auto-record was off; see
+    /// `downloader::chat_only`), which has no video file and therefore no
+    /// stem to swap an extension on. Empty for every ordinary take: its
+    /// sidecar is still located from `output_path` (see
+    /// `ui::chat::chat_file_candidates`), so this is an override, not a
+    /// replacement.
+    pub chat_path: String,
 }
 
 /// A take awaiting a head-backfill decision — the Background view's "Planned"
@@ -3336,6 +3345,7 @@ mod tests {
             chapters_state: String::new(),
             chapters_json: String::new(),
             chapters_attempts: 0,
+            chat_path: String::new(),
         }
     }
 

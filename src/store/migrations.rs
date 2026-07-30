@@ -1567,7 +1567,21 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 78)?;
         }
-        debug_assert_eq!(SCHEMA_VERSION, 78);
+        if version < 79 {
+            // Where this take's chat log lives, when it ISN'T derivable from
+            // `output_path` — i.e. a chat-only session (`status =
+            // 'not_recorded'` with chat capture on; see
+            // `downloader::chat_only`), which has no video file at all and so
+            // no stem for `ui::chat::chat_file_candidates` to swap an
+            // extension on. Empty for every ordinary take, whose sidecar is
+            // still found from `output_path` exactly as before — this column
+            // is an override, not a replacement.
+            conn.execute_batch(
+                "ALTER TABLE recording ADD COLUMN chat_path TEXT NOT NULL DEFAULT '';",
+            )?;
+            conn.pragma_update(None, "user_version", 79)?;
+        }
+        debug_assert_eq!(SCHEMA_VERSION, 79);
         Ok(())
     }
 }

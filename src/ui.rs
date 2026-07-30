@@ -1024,6 +1024,12 @@ pub(crate) struct SettingsForm {
     /// streamlink's own (fragile) log line. Default on; never affects the
     /// capture itself.
     ad_probe: bool,
+    // --- Chat without recording ---
+    /// Keep logging chat for a broadcast that isn't being recorded (Auto-record
+    /// off). Default on — chat is a few MB and, unlike the video, can't be
+    /// fetched back after the stream ends. Still gated by the instance's own
+    /// "Log chat" toggle.
+    chat_log_without_recording: bool,
     // --- Post-stream VOD download (global defaults for the 3-level chain) ---
     /// Download the platform's published VOD after a stream ends (alongside).
     vod_dl_enabled: bool,

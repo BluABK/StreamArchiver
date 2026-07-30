@@ -429,6 +429,7 @@ mod tests {
             chapters_state: String::new(),
             chapters_json: String::new(),
             chapters_attempts: 0,
+            chat_path: String::new(),
         }
     }
 

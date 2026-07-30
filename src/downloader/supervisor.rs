@@ -42,6 +42,8 @@ impl Supervisor {
             blocked_notified: Arc::new(Mutex::new(HashMap::new())),
             active_chats,
             stopping_chats: Arc::new(Mutex::new(HashSet::new())),
+            chat_only: Arc::new(Mutex::new(HashSet::new())),
+            chat_only_user_stopped: Arc::new(Mutex::new(HashMap::new())),
             shutdown,
             manual_tx,
             ctx,
@@ -106,7 +108,12 @@ impl Supervisor {
                 }
             }
             ManualCommand::StopVideo(id) => self.stop_video(id),
-            ManualCommand::StopChat(id) => self.stop_chat_download(id),
+            ManualCommand::StopChat(id) => {
+                // A user Stop on a chat-only session has to STAY stopped —
+                // `try_begin` would otherwise restart it on the next poll.
+                self.note_chat_only_user_stop(id);
+                self.stop_chat_download(id);
+            }
             ManualCommand::RefetchAssets(id) => {
                 if let Ok(Some(row)) = self.store.get_monitor_with_channel(id) {
                     // Manual: bypass the 24h stamp + the fetch_chat_assets
@@ -1463,9 +1470,12 @@ progress_info: None,
             // the Streams grid with a "not recorded" note instead of leaving
             // no trace at all that Auto-off channels went live. One session
             // per broadcast: `try_begin` re-runs on every poll while the
-            // stream stays live, so skip if one's already open.
-            if matches!(self.store.open_not_recorded_session(monitor_id), Ok(None)) {
-                match self.store.insert_not_recorded_session(
+            // stream stays live, so reuse the open one rather than inserting
+            // a second — either way we end up holding the session the
+            // chat-only capture below hangs off.
+            let session = match self.store.open_not_recorded_session(monitor_id) {
+                Ok(Some(open)) => Some(open),
+                Ok(None) => match self.store.insert_not_recorded_session(
                     monitor_id,
                     live_since.unwrap_or_else(now_unix),
                     went_live_at,
@@ -1479,9 +1489,34 @@ progress_info: None,
                         if let Some(g) = stream_game.as_deref().filter(|g| !g.is_empty()) {
                             let _ = self.store.insert_meta_change(rec_id, 0, "category", "", g);
                         }
+                        Some((rec_id, live_since.unwrap_or_else(now_unix)))
                     }
-                    Err(e) => warn!(monitor_id, "failed to record not-recorded stream session: {e:#}"),
+                    Err(e) => {
+                        warn!(monitor_id, "failed to record not-recorded stream session: {e:#}");
+                        None
+                    }
+                },
+                Err(e) => {
+                    warn!(monitor_id, "failed to look up the not-recorded stream session: {e:#}");
+                    None
                 }
+            };
+            // Not recording the video doesn't mean not archiving the chat:
+            // Auto-record is a disk-space control, and chat is both tiny and
+            // unrecoverable once the broadcast ends (see `chat_only.rs`).
+            // Attached to the session above so it starts and stops with the
+            // broadcast; a no-op when already running, which matters because
+            // this branch re-runs on every poll while the stream stays live.
+            if let Some((rec_id, session_started_at)) = session {
+                self.maybe_start_chat_only(
+                    &row,
+                    rec_id,
+                    session_started_at,
+                    stream_id.as_deref(),
+                    stream_title.as_deref(),
+                    stream_game.as_deref(),
+                    went_live_at,
+                );
             }
             return false;
         }
@@ -1857,7 +1892,10 @@ progress_info: None,
     }
 
     /// Stop the live-chat sidecar download for a monitor, if one is running.
-    fn stop_chat_download(&self, monitor_id: i64) {
+    /// A registered PID of 0 (a chat-only session's in-process Twitch logger —
+    /// see `chat_only.rs`) has nothing to kill; the stop is delivered purely
+    /// through `stopping_chats`, which that session's watcher polls.
+    pub(super) fn stop_chat_download(&self, monitor_id: i64) {
         let pid = self.active_chats.lock().unwrap().get(&monitor_id).copied();
         let Some(pid) = pid else { return };
         self.stopping_chats.lock().unwrap().insert(monitor_id);
@@ -1890,7 +1928,9 @@ progress_info: None,
     /// only chat alongside the video recording. Registers its PID in
     /// `active_chats` (visible to the UI), and removes it when the process exits
     /// (either stream ended naturally, or the user called `stop_chat_download`).
-    async fn run_chat_download(&self, monitor_id: i64, platform: Platform, plan: DownloadPlan) {
+    /// Also used verbatim by a chat-only session (`chat_only.rs`), which
+    /// differs only in there being no video capture alongside it.
+    pub(super) async fn run_chat_download(&self, monitor_id: i64, platform: Platform, plan: DownloadPlan) {
         if self.shutdown.load(Ordering::SeqCst) {
             return;
         }
@@ -2513,6 +2553,16 @@ progress_info: None,
             self.release_active(monitor_id, "record: duplicate-recording safety net refused this start (see the warning above)");
             return;
         }
+        // This broadcast is about to get a real capture, whose own chat logger
+        // owns the monitor's chat from here on. Any chat-only session running
+        // for it (Auto was off; a trigger word or manual Start just overrode
+        // that) has to be wound down FIRST — both platforms' loggers key their
+        // bookkeeping on `monitor_id`, so two of them would fight over
+        // `active_chats` and write a second, redundant sidecar. Done here, up
+        // front, rather than next to `spawn_chat_loggers`: everything between
+        // is auth probing and a semaphore wait, so the stop overlaps work that
+        // was going to happen anyway.
+        self.stop_chat_only(monitor_id).await;
         let trigger_rule_json = trigger_rule
             .as_ref()
             .map(|r| serde_json::to_string(r).unwrap_or_default())

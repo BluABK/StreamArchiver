@@ -546,6 +546,7 @@ impl StreamArchiverApp {
             self.settings_chapters_section(ui);
             self.settings_raid_follow_section(ui);
             self.settings_ad_probe_section(ui);
+            self.settings_chat_section(ui);
             self.settings_stats_history_section(ui);
             self.settings_hype_trains_section(ui);
             self.settings_maintenance_section(ui);
@@ -3392,6 +3393,43 @@ impl StreamArchiverApp {
                      Degrades soft on failure — a sustained problem shows up as an 🚨 Warnings \
                      alert instead of failing silently.",
                 );
+        }
+    }
+
+    fn settings_chat_section(&mut self, ui: &mut egui::Ui) {
+        if self.section_shown(
+            SettingsTab::Downloads,
+            "Chat logging",
+            &["chat", "chat log", "jsonl", "live_chat", "irc", "auto", "not recorded", "💬"],
+        ) {
+            ui.add_space(12.0);
+            ui.heading("Chat logging 💬");
+            ui.label(
+                "Whether an instance logs chat at all is its own \"Log chat\" toggle — this \
+                 decides whether that toggle keeps applying to broadcasts nobody is recording.",
+            );
+            ui.add_space(6.0);
+            ui.checkbox(
+                &mut self.settings.chat_log_without_recording,
+                "Log chat even when the stream isn't being recorded",
+            )
+            .on_hover_text(
+                "Auto-record off means \"don't spend the disk on this stream\", not \"don't \
+                 archive it\" — so when a monitored channel goes live with Auto off, chat is \
+                 still captured on its own. A chat log is a few MB where the video is tens of \
+                 GB, and unlike the video it can't be fetched back later: Twitch publishes no \
+                 transcript, and YouTube's chat replay dies with the stream. The sidecar is the \
+                 same file a recorded take produces (Twitch: .chat.jsonl from the built-in \
+                 anonymous logger; YouTube + yt-dlp: .live_chat.json), lands in the instance's \
+                 output folder, and is opened from the \"seen live, not recorded\" 👁 take row \
+                 via 💬 View chat. Turn OFF to capture chat only alongside an actual recording. \
+                 Not applied when a blacklist trigger vetoed the recording or a Stop hold is \
+                 active — those mean \"skip this broadcast\", not \"save the disk\".",
+            );
+            ui.label(
+                "Default on. Still requires the instance's own \"Log chat\"; Twitch and \
+                 YouTube (yt-dlp) only.",
+            );
         }
     }
 

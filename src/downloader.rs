@@ -155,6 +155,7 @@ mod alerts;
 mod backfill;
 mod cache;
 mod chapters;
+mod chat_only;
 pub(crate) mod ffmpeg_job;
 mod finalize;
 mod gap_recover;
@@ -170,9 +171,10 @@ mod tools;
 mod vod;
 
 #[allow(unused_imports)]
-use {ad_probe::*, alerts::*, backfill::*, gap_recover::*, gap_splice::*, supervisor::*, vod::*};
+use {ad_probe::*, alerts::*, backfill::*, chat_only::*, gap_recover::*, gap_splice::*, supervisor::*, vod::*};
 pub use alerts::alert_category;
 pub use ad_probe::K_AD_PROBE;
+pub use chat_only::K_CHAT_NO_RECORD;
 pub use gap_recover::K_GAP_RECOVER;
 pub use gap_splice::K_GAP_SPLICE;
 #[allow(unused_imports)]
@@ -315,6 +317,21 @@ pub struct Supervisor {
     finalizing: Finalizing,
     /// monitor_ids whose chat download was asked to stop.
     stopping_chats: Arc<Mutex<HashSet<i64>>>,
+    /// monitor_ids with a **chat-only** capture in flight — chat logged for a
+    /// broadcast nobody is recording (Auto-record off; see
+    /// `downloader::chat_only`). Presence IS "a chat-only session is running
+    /// for this monitor", so it both dedups the repeat starts `try_begin`
+    /// makes on every poll and tells `record` there's one to stop before a
+    /// real capture takes over the monitor's chat.
+    chat_only: Arc<Mutex<HashSet<i64>>>,
+    /// monitor_id -> the not-recorded session (`recording.id`) whose chat-only
+    /// capture the **user** stopped from the UI. Without this, `try_begin`'s
+    /// next poll — seconds later, since it re-runs for the whole broadcast —
+    /// would cheerfully start it again and a 💬 Stop chat download click
+    /// would do nothing. Keyed by session, not just monitor, so the
+    /// suppression expires with the broadcast instead of needing to be
+    /// cleared: the channel's *next* stream is a different `rec_id`.
+    chat_only_user_stopped: Arc<Mutex<HashMap<i64, i64>>>,
     shutdown: Arc<AtomicBool>,
     /// A clone of the manual-command sender, so background poller tasks (the VOD
     /// archivers) can enqueue+start a Video download without a Supervisor handle.

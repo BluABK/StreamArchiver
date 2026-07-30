@@ -491,9 +491,18 @@ pub(super) fn chat_file_for_recording(rec: &Recording) -> Option<std::path::Path
 }
 
 /// The candidate sidecar paths [`chat_file_for_recording`] probes, in order.
-pub(super) fn chat_file_candidates(rec: &Recording) -> [std::path::PathBuf; 4] {
+///
+/// An explicit [`Recording::chat_path`] always comes first and, when set, is
+/// the only candidate that can match anything: it exists precisely for takes
+/// whose sidecar ISN'T derivable from `output_path` — a chat-only session
+/// (`downloader::chat_only`) has no video file, so every derived form below
+/// would be built from an empty stem.
+pub(super) fn chat_file_candidates(rec: &Recording) -> Vec<std::path::PathBuf> {
+    if !rec.chat_path.is_empty() {
+        return vec![std::path::PathBuf::from(&rec.chat_path)];
+    }
     let base = Path::new(&rec.output_path);
-    [
+    vec![
         // YouTube (yt-dlp append form): `<output_path>.live_chat.json`.
         std::path::PathBuf::from(format!("{}.live_chat.json", rec.output_path)),
         // Twitch native logger (extension replace): `<stem>.chat.jsonl`.
@@ -2745,6 +2754,7 @@ mod tests {
             chapters_state: String::new(),
             chapters_json: String::new(),
             chapters_attempts: 0,
+            chat_path: String::new(),
         }
     }
 
@@ -2766,6 +2776,39 @@ mod tests {
         std::fs::write(tout.with_extension("chat.jsonl"), "{}").unwrap();
         let tfound = chat_file_for_recording(&rec_with_output(&tout.to_string_lossy()));
         assert_eq!(tfound.as_deref(), Some(tout.with_extension("chat.jsonl").as_path()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A chat-only session (`downloader::chat_only`) has no video file, so its
+    /// sidecar can only be found through the explicit `chat_path` column.
+    #[test]
+    fn explicit_chat_path_wins_over_the_derived_forms() {
+        let dir = std::env::temp_dir().join(format!("sa-chatpath-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sidecar = dir.join("Streamer - live.chat.jsonl");
+        std::fs::write(&sidecar, "{}").unwrap();
+
+        // The not-recorded take that owns it: no output_path at all.
+        let mut rec = rec_with_output("");
+        rec.chat_path = sidecar.to_string_lossy().into_owned();
+        assert_eq!(chat_file_for_recording(&rec).as_deref(), Some(sidecar.as_path()));
+
+        // It's also the ONLY candidate: an ordinary take's derived paths must
+        // not be probed alongside it and accidentally match a neighbour.
+        let mut rec = rec_with_output(&dir.join("Streamer - live.mkv").to_string_lossy());
+        std::fs::write(dir.join("Streamer - live.mkv.live_chat.json"), "{}").unwrap();
+        rec.chat_path = sidecar.to_string_lossy().into_owned();
+        assert_eq!(chat_file_candidates(&rec).len(), 1);
+        assert_eq!(chat_file_for_recording(&rec).as_deref(), Some(sidecar.as_path()));
+
+        // Empty `chat_path` (every ordinary take) keeps the old behaviour.
+        rec.chat_path.clear();
+        assert_eq!(
+            chat_file_for_recording(&rec).as_deref(),
+            Some(dir.join("Streamer - live.mkv.live_chat.json").as_path())
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

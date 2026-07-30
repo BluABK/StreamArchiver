@@ -2459,7 +2459,11 @@ impl StreamArchiverApp {
                                     "Save chat alongside the recording. Twitch: a built-in \
                                      anonymous chat logger writes a .chat.jsonl sidecar. YouTube \
                                      (yt-dlp tool): yt-dlp's live_chat writes a .live_chat.json \
-                                     sidecar. Other platforms/tools don't capture chat.",
+                                     sidecar. Other platforms/tools don't capture chat. \
+                                     By default this also applies when the stream ISN'T being \
+                                     recorded (Auto-record off) — chat is tiny and unrecoverable \
+                                     after the fact; see Settings → Downloads → Chat logging to \
+                                     restrict it to actual recordings.",
                                 );
                                 ui.end_row();
 
